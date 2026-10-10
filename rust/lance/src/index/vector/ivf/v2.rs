@@ -7589,6 +7589,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: num_partitions,
             maximum_nprobes: Some(num_partitions),
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),

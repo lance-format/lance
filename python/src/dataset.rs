@@ -1552,6 +1552,7 @@ impl Dataset {
                 ef,
                 query_parallelism,
                 approx_mode,
+                search_effort,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1607,7 +1608,7 @@ impl Dataset {
                 };
 
             scanner
-                .map(|s| {
+                .and_then(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
                     if let Some(maximum_nprobes) = maximum_nprobes {
                         s = s.maximum_nprobes(maximum_nprobes);
@@ -1623,11 +1624,12 @@ impl Dataset {
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
+                    s = s.search_effort(search_effort)?;
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
                     }
-                    s
+                    Ok(s)
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
@@ -5671,6 +5673,7 @@ type VectorQueryParams = (
     Option<usize>,
     i32,
     ApproxMode,
+    f64,
 );
 
 fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
@@ -5816,6 +5819,11 @@ fn vector_query_params_from_dict(
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
     let approx_mode = vector_query_approx_mode_from_dict(dict)?;
+    let search_effort = dict
+        .get_item("search_effort")?
+        .map(|value| value.extract::<f64>())
+        .transpose()?
+        .unwrap_or(0.5);
 
     Ok((
         column,
@@ -5829,6 +5837,7 @@ fn vector_query_params_from_dict(
         ef,
         query_parallelism,
         approx_mode,
+        search_effort,
     ))
 }
 
@@ -5866,6 +5875,7 @@ impl PySearchFilter {
             ef,
             query_parallelism,
             approx_mode,
+            search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -5885,7 +5895,11 @@ impl PySearchFilter {
             query_parallelism,
             dist_q_c: 0.0,
             approx_mode,
+            search_effort,
         };
+        vector_query
+            .validate_search_effort()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(Self {
             inner: QueryFilter::Vector(vector_query),

@@ -134,6 +134,16 @@ pub struct Query {
     /// ALL partitions will be searched, if needed, to satisfy k results.
     pub maximum_nprobes: Option<usize>,
 
+    /// Continuous initial IVF search budget in [0, 1], default 0.5.
+    ///
+    /// At 0.5, preserve Auto probing. At 0, start at the caller minimum (at
+    /// least one available partition); at 1, start at all available partitions,
+    /// subject to the caller maximum. Intermediate values interpolate
+    /// geometrically around Auto. Later candidate-count expansion is unchanged.
+    /// Non-default effort cannot be combined with fixed probes. This does not
+    /// control quantization accuracy, HNSW ef, or refinement.
+    pub search_effort: f64,
+
     /// The number of candidates to reserve while searching.
     /// this is an optional parameter for HNSW related index types.
     pub ef: Option<usize>,
@@ -169,6 +179,25 @@ pub struct Query {
     /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
     /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
+}
+
+impl Query {
+    /// Validate the effort range and its compatibility with fixed probes.
+    pub fn validate_search_effort(&self) -> Result<()> {
+        if !self.search_effort.is_finite() || !(0.0..=1.0).contains(&self.search_effort) {
+            return Err(Error::invalid_input(format!(
+                "search_effort must be finite and in [0, 1], got {}",
+                self.search_effort
+            )));
+        }
+        if self.search_effort != 0.5 && self.maximum_nprobes == Some(self.minimum_nprobes) {
+            return Err(Error::invalid_input(format!(
+                "search_effort={} cannot be combined with fixed nprobes={}",
+                self.search_effort, self.minimum_nprobes
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl From<pb::VectorMetricType> for DistanceType {

@@ -80,7 +80,9 @@ def fixed_budgets(calibration, name, k):
     return sorted(budgets)
 
 
-def run_query(dataset, vector, k, metric, policy, partitions, lookup, flt):
+def run_query(
+    dataset, vector, k, metric, policy, partitions, lookup, flt, *, search_effort=None
+):
     nearest = {
         "column": "vector",
         "q": vector,
@@ -88,6 +90,8 @@ def run_query(dataset, vector, k, metric, policy, partitions, lookup, flt):
         "metric": metric,
         "query_parallelism": 1,
     }
+    if search_effort is not None:
+        nearest["search_effort"] = search_effort
     if policy.startswith("fixed"):
         nearest["nprobes"] = int(policy.removeprefix("fixed"))
     elif policy == "legacy":

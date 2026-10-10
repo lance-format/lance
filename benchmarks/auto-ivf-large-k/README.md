@@ -217,3 +217,46 @@ The 512-query held-out matrix covers k=1, 10, 100, 200, 500 and 1000. Recall
 collection uses concurrent workers and does not establish latency benefits.
 The full-partition RQ5 arm includes normal-mode quantized scoring and pruning;
 its recall is not assumed to combine independently with FLAT routing recall.
+
+## Continuous search effort
+
+`search_effort` is a finite value in `[0, 1]`; its default `0.5` preserves the
+current Auto budget exactly. Zero starts at the caller minimum (at least one
+available partition), and one starts at all available partitions, subject to
+`maximum_nprobes`. Intermediate values interpolate geometrically around Auto.
+Later candidate-count expansion is unchanged. Non-default effort conflicts
+with fixed `nprobes`. Approximation mode, refinement and HNSW `ef` remain
+independent, so a larger effort is not a guaranteed recall level.
+
+```python
+result = dataset.to_table(
+    nearest={"column": "vector", "q": query, "k": 10, "search_effort": 0.75}
+)
+```
+
+[SEARCH_EFFORT_PROTOCOL.md](SEARCH_EFFORT_PROTOCOL.md) freezes the paired RQ5
+experiment. Preserve the baseline at PR head `40fa85849` and its binary hash
+before building the candidate. Reuse the existing RQ5 models, indices and
+float64 top-100000 truth. `$EFFORT_STUDY` is a new output directory containing
+`baseline-binary.sha256` and `candidate-binary.sha256`; `$RQ5_STUDY` contains the
+frozen `prepared.json` and `rq5.lance` for each corpus.
+
+```bash
+export LANCE_CPU_THREADS=16 RAYON_NUM_THREADS=16
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+taskset -c 0-15 uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/search_effort.py measure "$EFFORT_STUDY" all --indices "$RQ5_STUDY" --baseline-runtime "$BASELINE_RUNTIME"
+uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/search_effort.py audit "$EFFORT_STUDY" all --indices "$RQ5_STUDY"
+```
+
+The first 128 held-out queries contribute recall at each k and effort; the
+first 64 are timed serially with rotating arm order. Remaining queries run
+separately with eight workers and their timings are diagnostic only. The
+actual old binary runs as a separate warm process, with latency measured
+inside that process. The audit requires default-effort ID/count identity,
+full partition coverage at effort one, exact recall recomputation, complete
+query coverage, unique valid IDs and zero measured storage reads.
+
+[SEARCH_EFFORT_RESULTS.md](SEARCH_EFFORT_RESULTS.md) reports every effort/k
+operating point, the matched old-binary control, measured partition counts,
+environment and validation. [search-effort-results.csv](search-effort-results.csv)
+contains all 180 groups, including recall and latency distributions.

@@ -51,6 +51,7 @@ impl AutoProbePolicy {
         index: &dyn VectorIndex,
         read_config: impl FnOnce(&Query, DistanceType) -> DataFusionResult<Option<AutoProbeConfig>>,
     ) -> DataFusionResult<Self> {
+        query.validate_search_effort()?;
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(Self::Fixed);
         }
@@ -67,11 +68,40 @@ impl AutoProbePolicy {
     }
 
     pub(super) fn apply(self, query: &mut Query, distances: &[f32], metric: DistanceType) {
+        let caller_minimum = query.minimum_nprobes;
         match self {
             Self::Fixed => {}
             Self::Legacy => apply_legacy_probes(query, distances),
             Self::Adaptive(config) => config.apply(query, distances, metric),
         }
+        // Preserve the original budget exactly, including legacy rounding and
+        // clipping behavior, when the new option is omitted or set to default.
+        if query.search_effort == 0.5 {
+            return;
+        }
+        let upper = distances
+            .len()
+            .min(query.maximum_nprobes.unwrap_or(distances.len()));
+        if upper == 0 {
+            query.minimum_nprobes = 0;
+            return;
+        }
+        let lower = caller_minimum.max(1).min(upper);
+        let auto = query.minimum_nprobes.clamp(lower, upper);
+        let effort = query.search_effort;
+        // Round-off near 0.5 can move the geometric budget past Auto. Bound
+        // each half separately so increasing effort preserves the midpoint.
+        query.minimum_nprobes = if effort == 0.0 {
+            lower
+        } else if effort == 1.0 {
+            upper
+        } else if effort < 0.5 {
+            let budget = lower as f64 * (auto as f64 / lower as f64).powf(2.0 * effort);
+            (budget.ceil() as usize).clamp(lower, auto)
+        } else {
+            let budget = auto as f64 * (upper as f64 / auto as f64).powf(2.0 * effort - 1.0);
+            (budget.ceil() as usize).clamp(auto, upper)
+        };
     }
 }
 
@@ -318,6 +348,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: None,
@@ -326,6 +357,131 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         }
+    }
+
+    #[rstest]
+    #[case::minimum(0.0, 1)]
+    #[case::below_auto(0.25, 4)]
+    #[case::auto(0.5, 16)]
+    #[case::above_auto(0.75, 32)]
+    #[case::all(1.0, 64)]
+    fn test_search_effort_interpolation(#[case] effort: f64, #[case] expected: usize) {
+        let mut query = query();
+        query.search_effort = effort;
+        AutoProbePolicy::Adaptive(AutoProbeConfig {
+            min_initial_nprobes: 16,
+            margin: 0.0,
+            max_initial_nprobes: Some(16),
+        })
+        .apply(&mut query, &[1.0; 64], DistanceType::L2);
+        // The learned floor/cap must not be reapplied after interpolation.
+        assert_eq!(query.minimum_nprobes, expected);
+        assert_eq!(query.maximum_nprobes, None);
+    }
+
+    #[rstest]
+    fn test_search_effort_bounds_and_monotonicity(
+        #[values(0, 1, 7, 11, 64, 100)] caller_minimum: usize,
+        #[values(None, Some(0), Some(16), Some(128))] maximum: Option<usize>,
+        #[values(0, 1, 64)] available: usize,
+    ) {
+        let config = AutoProbeConfig {
+            min_initial_nprobes: 25,
+            margin: 0.0,
+            max_initial_nprobes: Some(25),
+        };
+        let distances = vec![1.0; available];
+        let upper = available.min(maximum.unwrap_or(available));
+        let lower = caller_minimum.max(1).min(upper);
+        let mut previous = lower;
+        let mut efforts = (0..=100)
+            .map(|step| f64::from(step) / 100.0)
+            .collect::<Vec<_>>();
+        efforts.extend([
+            f64::from_bits(0.5_f64.to_bits() - 1),
+            f64::from_bits(0.5_f64.to_bits() + 1),
+        ]);
+        efforts.sort_by(f64::total_cmp);
+        for (step, effort) in efforts.into_iter().enumerate() {
+            let mut query = query();
+            query.minimum_nprobes = caller_minimum;
+            query.maximum_nprobes = maximum;
+            query.search_effort = effort;
+            // Equal caller bounds intentionally select fixed probing, which
+            // rejects non-default effort at the API boundary.
+            if maximum == Some(caller_minimum) {
+                continue;
+            }
+            AutoProbePolicy::Adaptive(config).apply(&mut query, &distances, DistanceType::L2);
+            assert!((lower..=upper).contains(&query.minimum_nprobes));
+            assert!(
+                query.minimum_nprobes >= previous,
+                "search_effort={effort}, budget={} must be at least previous budget={previous}",
+                query.minimum_nprobes,
+            );
+            assert_eq!(query.maximum_nprobes, maximum);
+            previous = query.minimum_nprobes;
+            if step == 0 {
+                assert_eq!(query.minimum_nprobes, lower);
+            }
+        }
+        if maximum != Some(caller_minimum) {
+            assert_eq!(previous, upper);
+        }
+    }
+
+    #[rstest]
+    fn test_search_effort_default_preserves_policy(
+        #[values(0, 1, 100)] minimum: usize,
+        #[values(None, Some(8))] maximum: Option<usize>,
+        #[values(0, 16)] available: usize,
+        #[values(AutoProbePolicy::Fixed, AutoProbePolicy::Legacy)] policy: AutoProbePolicy,
+    ) {
+        let mut actual = query();
+        actual.minimum_nprobes = minimum;
+        actual.maximum_nprobes = maximum;
+        let mut expected = actual.clone();
+        let distances = vec![1.0; available];
+        if policy == AutoProbePolicy::Legacy {
+            apply_legacy_probes(&mut expected, &distances);
+        }
+        policy.apply(&mut actual, &distances, DistanceType::Hamming);
+        assert_eq!(actual.minimum_nprobes, expected.minimum_nprobes);
+        assert_eq!(actual.maximum_nprobes, expected.maximum_nprobes);
+    }
+
+    #[rstest]
+    #[case::negative(-0.01)]
+    #[case::too_large(1.01)]
+    #[case::nan(f64::NAN)]
+    #[case::positive_infinity(f64::INFINITY)]
+    #[case::negative_infinity(f64::NEG_INFINITY)]
+    fn test_search_effort_invalid(#[case] effort: f64) {
+        let mut query = query();
+        query.search_effort = effort;
+        let error = query.validate_search_effort().unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("search_effort must be finite and in [0, 1]")
+        );
+    }
+
+    #[rstest]
+    fn test_search_effort_fixed_conflict(#[values(0.0, 0.25, 0.75, 1.0)] effort: f64) {
+        let mut query = query();
+        query.minimum_nprobes = 8;
+        query.maximum_nprobes = Some(8);
+        query.validate_search_effort().unwrap();
+        query.search_effort = effort;
+        let error = query.validate_search_effort().unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with fixed nprobes=8")
+        );
     }
 
     #[rstest]

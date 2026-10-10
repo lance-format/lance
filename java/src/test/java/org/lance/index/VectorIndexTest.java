@@ -33,8 +33,8 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
@@ -139,9 +139,9 @@ public class VectorIndexTest {
   }
 
   @ParameterizedTest
-  @ValueSource(booleans = {false, true})
-  public void testCreateIvfFlatIndexDistributively(boolean async, @TempDir Path tempDir)
-      throws Exception {
+  @CsvSource({"false, 0.0", "false, 1.0", "true, 0.0", "true, 1.0"})
+  public void testCreateIvfFlatIndexDistributively(
+      boolean async, double effort, @TempDir Path tempDir) throws Exception {
     try (TestVectorDataset testVectorDataset =
         new TestVectorDataset(tempDir.resolve("merge_ivfflat_index_metadata"))) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -214,7 +214,7 @@ public class VectorIndexTest {
                 .setColumn(TestVectorDataset.vectorColumnName)
                 .setKey(key)
                 .setK(5)
-                .setNprobes(2)
+                .setSearchEffort(effort)
                 .build();
         // Each fragment repeats the vectors but has distinct row IDs. Selecting a segment
         // must exclude equally close rows in the other segments and unindexed fragments.
@@ -222,23 +222,35 @@ public class VectorIndexTest {
           ScanOptions options =
               new ScanOptions.Builder()
                   .nearest(query)
+                  .collectStats(!async)
                   .indexSegments(List.of(segment == 0 ? firstSegment.uuid() : secondSegment.uuid()))
                   .build();
           try (RootAllocator allocator = new RootAllocator();
               AutoCloseable scanner =
                   async
                       ? AsyncScanner.create(dataset, options, allocator)
-                      : dataset.newScan(options);
-              ArrowReader reader =
-                  async
-                      ? ((AsyncScanner) scanner).scanBatchesAsync().get(10, TimeUnit.SECONDS)
-                      : ((LanceScanner) scanner).scanBatches()) {
+                      : dataset.newScan(options)) {
             Set<Integer> actual = new HashSet<>();
-            while (reader.loadNextBatch()) {
-              IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
-              for (int row = 0; row < ids.getValueCount(); row++) {
-                actual.add(ids.get(row));
+            try (ArrowReader reader =
+                async
+                    ? ((AsyncScanner) scanner).scanBatchesAsync().get(10, TimeUnit.SECONDS)
+                    : ((LanceScanner) scanner).scanBatches()) {
+              while (reader.loadNextBatch()) {
+                IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+                for (int row = 0; row < ids.getValueCount(); row++) {
+                  actual.add(ids.get(row));
+                }
               }
+            }
+            if (!async) {
+              assertEquals(
+                  effort == 0 ? 1L : 2L,
+                  ((LanceScanner) scanner)
+                      .getStats()
+                      .orElseThrow()
+                      .getAllCounts()
+                      .get("partitions_searched")
+                      .longValue());
             }
             int base = segment * 80;
             assertEquals(Set.of(base, base + 1, base + 2, base + 3, base + 4), actual);
@@ -252,10 +264,21 @@ public class VectorIndexTest {
                 new ScanOptions.Builder()
                     .nearest(query)
                     .indexSegments(List.of(UUID.randomUUID()))
+                    .build(),
+                new ScanOptions.Builder()
+                    .nearest(
+                        new Query.Builder()
+                            .setColumn(TestVectorDataset.vectorColumnName)
+                            .setKey(key)
+                            .setSearchEffort(Double.NaN)
+                            .build())
                     .build());
         List<String> errors =
             List.of(
-                "empty segment list", "only supported for vector search", "unknown index segments");
+                "empty segment list",
+                "only supported for vector search",
+                "unknown index segments",
+                "search_effort");
         for (int i = 0; i < invalidOptions.size(); i++) {
           ScanOptions options = invalidOptions.get(i);
           Exception failure =

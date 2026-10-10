@@ -21,7 +21,7 @@ import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
-from lance.dataset import VectorIndexReader
+from lance.dataset import VectorIndexReader, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
@@ -2915,6 +2915,130 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
         prefilter=True,
     )
     assert len(res) == 10
+
+
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
+@pytest.mark.parametrize(
+    "effort,probes", [(0, 1), (0.25, 2), (0.5, 4), (0.75, 8), (1, 16)]
+)
+def test_vector_search_effort(
+    tmp_path, monkeypatch, metric, index_type, effort, probes
+):
+    centroids = np.eye(16, dtype=np.float32)
+    vectors = np.repeat(centroids, 16, axis=0)
+    vectors += (
+        np.random.default_rng(2254).normal(0, 0.001, vectors.shape).astype("float32")
+    )
+    table = vec_to_table(vectors).append_column("id", pa.array(np.arange(len(vectors))))
+    table = table.append_column("text", pa.array(["match"] * len(vectors)))
+    ds = lance.write_dataset(table, tmp_path / "effort.lance", max_rows_per_file=32)
+    ds.create_index(
+        "vector",
+        index_type,
+        metric=metric,
+        num_partitions=16,
+        ivf_centroids=centroids,
+        **({"num_bits": 5} if index_type == "IVF_RQ" else {}),
+    )
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "0")
+    monkeypatch.setenv("LANCE_AUTO_MIN_INITIAL_NPROBES", "4")
+    monkeypatch.setenv("LANCE_AUTO_MAX_INITIAL_NPROBES", "4")
+    nearest = {"column": "vector", "q": centroids[0], "k": 8, "metric": metric}
+    captured = []
+    actual = ds.scanner(
+        columns=["id"],
+        nearest={**nearest, "search_effort": effort},
+        scan_stats_callback=captured.append,
+    ).to_table()
+    assert captured[0].all_counts["partitions_searched"] == probes
+    exact = ds.to_table(columns=["id"], nearest={**nearest, "use_index": False})
+    assert len(set(actual["id"].to_pylist()) & set(exact["id"].to_pylist())) / 8 >= 0.5
+    if effort == 0.5:
+        assert actual == ds.to_table(columns=["id"], nearest=nearest)
+    if effort == 1:
+        assert actual == ds.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
+    # Batch queries use the same effort on every per-query search.
+    batch_stats = []
+    batch = ds.scanner(
+        columns=["id"],
+        nearest={**nearest, "q": [centroids[0], centroids[0]], "search_effort": effort},
+        scan_stats_callback=batch_stats.append,
+    ).to_table()
+    assert batch["id"].to_pylist() == actual["id"].to_pylist() * 2
+    assert batch_stats[0].all_counts["partitions_searched"] == probes * 2
+    if metric == "l2" and index_type == "IVF_FLAT":
+        captured.clear()
+        ds.create_scalar_index("text", "INVERTED")
+        query_filter = VectorSearchQuery(**nearest, search_effort=effort)
+        filtered = ds.scanner(
+            columns=["id"],
+            filter=query_filter,
+            full_text_query=MatchQuery("match", column="text"),
+            prefilter=True,
+            scan_stats_callback=captured.append,
+        ).to_table()
+        assert sorted(filtered["id"].to_pylist()) == sorted(actual["id"].to_pylist())
+        # The shared counter also includes the inverted index's one partition.
+        assert captured[0].all_counts["partitions_searched"] == probes + 1
+    if effort == 0:
+        captured.clear()
+        filtered = ds.scanner(
+            columns=["id"],
+            nearest={**nearest, "search_effort": effort},
+            filter="id >= 240",
+            prefilter=True,
+            scan_stats_callback=captured.append,
+        ).to_table()
+        assert len(filtered) == 8
+        assert min(filtered["id"].to_pylist()) >= 240
+        assert captured[0].all_counts["partitions_searched"] > 1
+    if effort == 1:
+        captured.clear()
+        ds.scanner(
+            columns=["id"],
+            nearest={**nearest, "search_effort": effort, "maximum_nprobes": 3},
+            scan_stats_callback=captured.append,
+        ).to_table()
+        assert captured[0].all_counts["partitions_searched"] == 3
+
+
+@pytest.mark.parametrize(
+    "effort", [-0.1, 1.1, float("nan"), float("inf"), -float("inf")]
+)
+def test_vector_search_effort_invalid(indexed_dataset, effort):
+    with pytest.raises(ValueError, match="search_effort must be finite and in"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.ones(128),
+                "k": 10,
+                "search_effort": effort,
+            }
+        )
+    with pytest.raises(ValueError, match="search_effort must be finite and in"):
+        indexed_dataset.scanner(
+            filter=VectorSearchQuery(
+                "vector",
+                np.ones(128),
+                k=10,
+                search_effort=effort,
+            )
+        )
+
+
+@pytest.mark.parametrize("effort", [0, 0.25, 0.75, 1])
+def test_vector_search_effort_fixed_conflict(indexed_dataset, effort):
+    with pytest.raises(ValueError, match="cannot be combined with fixed nprobes"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.ones(128),
+                "k": 10,
+                "nprobes": 2,
+                "search_effort": effort,
+            }
+        )
 
 
 def test_vector_index_with_nprobes(indexed_dataset):
