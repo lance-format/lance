@@ -11,6 +11,7 @@ covering various data types and file format versions.
 from pathlib import Path
 
 import lance
+import pyarrow as pa
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
 
@@ -19,6 +20,90 @@ from .compat_decorator import (
     compat_test,
 )
 from .util import build_basic_types, build_large, safe_data_storage_version
+
+
+class ManagedBlobCompatibility:
+    """Methods run in released clients through the existing compat venv runner."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        field = lance.blob_field("blob").with_metadata(
+            {
+                "lance-encoding:blob-inline-size-threshold": "8",
+                "lance-encoding:blob-dedicated-size-threshold": "24",
+            }
+        )
+        table = pa.Table.from_arrays(
+            [lance.blob_array([b"p" * 16, b"d" * 32, None, b""])],
+            schema=pa.schema([field]),
+        )
+        lance.write_dataset(
+            table,
+            self.path,
+            data_storage_version="2.2",
+            max_rows_per_file=2,
+            max_rows_per_group=2,
+        )
+
+    def check_unflagged(self):
+        dataset = lance.dataset(self.path)
+        assert dataset.count_rows() == 4
+        assert [
+            row["blob"]["kind"] if row["blob"] else None
+            for row in dataset.to_table().to_pylist()
+        ] == [1, 2, None, 0]
+
+    def check_fenced(self):
+        with pytest.raises(ValueError, match="cannot be read by this version"):
+            lance.dataset(self.path)
+        # Opening for append must also honor the table fence before publishing.
+        table = pa.Table.from_arrays(
+            [lance.blob_array([b"inline"])],
+            schema=pa.schema([lance.blob_field("blob")]),
+        )
+        with pytest.raises(OSError, match="cannot be (read|written) by this version"):
+            lance.write_dataset(
+                table, self.path, mode="append", data_storage_version="2.2"
+            )
+        # The fence applies to snapshots. Historical unflagged reads remain valid;
+        # this must not be mistaken for permission to run old maintenance clients.
+        assert lance.dataset(self.path, version=1).count_rows() == 4
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("version", ["11.0.0", "13.0.0"])
+def test_managed_blob_activation_and_restore_fence(venv_factory, tmp_path, version):
+    case = ManagedBlobCompatibility(tmp_path / "blobs.lance")
+    released = venv_factory.get_venv(version)
+    released.execute_method(case, "create")
+    dataset = lance.dataset(case.path)
+    dataset.update_config({"test": "metadata-only"})
+    released.execute_method(case, "check_unflagged")
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=100, data_storage_version="2.2"
+    )
+    assert dataset.to_table(blob_handling="all_binary")["blob"].to_pylist() == [
+        b"p" * 16,
+        b"d" * 32,
+        None,
+        b"",
+    ]
+    version_before = dataset.version
+    released.execute_method(case, "check_fenced")
+    assert lance.dataset(case.path).version == version_before
+    old = lance.dataset(case.path, version=1)
+    old.restore()
+    released.execute_method(case, "check_fenced")
+    assert lance.dataset(case.path).to_table(blob_handling="all_binary")[
+        "blob"
+    ].to_pylist() == [
+        b"p" * 16,
+        b"d" * 32,
+        None,
+        b"",
+    ]
 
 
 @pytest.mark.parametrize(

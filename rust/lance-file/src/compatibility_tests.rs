@@ -8,7 +8,7 @@ use arrow_array::builder::StringDictionaryBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
-    Array, ArrayRef, Int32Array, LargeBinaryArray, ListArray, RecordBatch, StringArray,
+    Array, ArrayRef, Int32Array, LargeBinaryArray, ListArray, RecordBatch, StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
@@ -17,6 +17,7 @@ use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_encoding::decoder::{DecoderPlugins, EncodedBatchLayout, FilterExpression, decode_batch};
 use lance_encoding::encoder::{EncodedBatch, EncodingOptions, encode_batch};
+use lance_encoding::format::pb21::{compressive_encoding::Compression, page_layout::Layout};
 use lance_io::ReadBatchParams;
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
@@ -319,7 +320,7 @@ async fn assert_current_reader_roundtrip(
     fixture: &[u8],
     version: ConcreteFileVersion,
     expected: &RecordBatch,
-) {
+) -> FileReader {
     let fs = FsFixture::default();
     let mut fixture_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
     fixture_writer.write_all(fixture).await.unwrap();
@@ -374,6 +375,7 @@ async fn assert_current_reader_roundtrip(
         row_offset += actual.num_rows();
     }
     assert_eq!(row_offset, expected.num_rows());
+    reader
 }
 
 #[rstest]
@@ -521,4 +523,112 @@ async fn v1_writer_and_reader_are_wire_compatible() {
         .unwrap();
     assert_eq!(reader.num_batches(), 5);
     assert_record_batch_eq(&actual_batch, &v1_reader_expected_batch(&batch));
+}
+
+#[rstest]
+#[case::v2_1(ConcreteFileVersion::V2_1)]
+#[case::v2_2(ConcreteFileVersion::V2_2)]
+#[case::v2_3(ConcreteFileVersion::V2_3)]
+#[tokio::test]
+async fn generic_offsets_are_gated_by_file_version(
+    #[case] version: ConcreteFileVersion,
+    #[values(
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Binary,
+        DataType::LargeBinary
+    )]
+    data_type: DataType,
+    #[values(false, true)] variable_lengths: bool,
+) {
+    let values = StringArray::from_iter_values((0..4097).map(|index| {
+        let length = if variable_lengths {
+            [4, 10, 5, 8][index % 4]
+        } else {
+            16
+        };
+        format!("{index:04x}{}", "x".repeat(length - 4))
+    }));
+    let values = arrow_cast::cast(&values, &data_type).unwrap();
+    let field = Field::new("value", data_type, false).with_metadata(HashMap::from([
+        (
+            "lance-encoding:structural-encoding".into(),
+            "miniblock".into(),
+        ),
+        ("lance-encoding:compression".into(), "none".into()),
+        ("lance-encoding:dict-divisor".into(), "100000".into()),
+    ]));
+    let batch =
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![values]).unwrap();
+    let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+    let bytes = write_current_fixture(version, &batch, &schema).await;
+    let reader = assert_current_reader_roundtrip(&bytes, version, &batch).await;
+    let pages = &reader.metadata().column_infos[0].page_infos;
+    let mut generic_pages = 0;
+    for page in pages.iter() {
+        // Stable 2.2 and unstable 2.3 may encode the final single row as a constant page.
+        if page.num_rows == 1 {
+            continue;
+        }
+        let Some(Layout::MiniBlockLayout(layout)) = &page.encoding.as_structural().layout else {
+            panic!("expected mini-block layout");
+        };
+        let Some(Compression::Variable(variable)) = layout
+            .value_compression
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+        else {
+            panic!("expected variable-width encoding");
+        };
+        let offsets = variable
+            .offsets
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap();
+        if version == ConcreteFileVersion::V2_3 && page.num_rows > 1 {
+            if variable_lengths {
+                assert!(matches!(offsets, Compression::Delta(_)), "{offsets:?}");
+            } else {
+                assert!(matches!(offsets, Compression::Range(_)), "{offsets:?}");
+            }
+            generic_pages += 1;
+        } else {
+            assert!(matches!(offsets, Compression::Flat(_)), "{offsets:?}");
+        }
+    }
+    if version == ConcreteFileVersion::V2_3 {
+        assert!(generic_pages > 1);
+        // The same persisted metadata must be rejected by the stable grammar, even
+        // though v2.2 and v2.3 share protobuf definitions and u32 chunk framing.
+        let error = versions::v2_2::decode_column_metadata(&reader.metadata().column_metadatas)
+            .unwrap_err();
+        assert!(matches!(&error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not part of the Lance v2.2 grammar")
+        );
+    }
+    let indices = UInt32Array::from(vec![0, 1023, 1024, 2048, 4096]);
+    for (selection, expected) in [
+        (ReadBatchParams::Range(1020..1030), batch.slice(1020, 10)),
+        (
+            ReadBatchParams::Indices(indices.clone()),
+            arrow_select::take::take_record_batch(&batch, &indices).unwrap(),
+        ),
+    ] {
+        let actual = reader
+            .read_stream(selection, 1024, 1, FilterExpression::no_filter())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &actual).unwrap();
+        assert_record_batch_eq(&actual, &expected);
+    }
 }

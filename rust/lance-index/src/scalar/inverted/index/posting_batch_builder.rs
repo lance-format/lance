@@ -22,14 +22,15 @@ pub(super) enum BatchPositionsBuilder {
     },
 }
 
-pub(super) struct PostingListParts<'a> {
+pub(super) struct PostingListParts {
     pub(super) with_positions: bool,
     pub(super) posting_tail_codec: PostingTailCodec,
     pub(super) block_size: usize,
     pub(super) length: usize,
     pub(super) encoded_blocks: EncodedBlocks,
     pub(super) encoded_position_blocks: EncodedPositionBlocks,
-    pub(super) tail_entries: &'a [RawDocInfo],
+    pub(super) tail_doc_ids: Vec<u32>,
+    pub(super) tail_frequencies: Vec<u32>,
     pub(super) tail_position_block: Option<Vec<u8>>,
 }
 

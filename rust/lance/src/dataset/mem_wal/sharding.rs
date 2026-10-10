@@ -337,8 +337,8 @@ fn hash_bytes(bytes: &[u8], seed: i32) -> i32 {
     let mut h1 = seed;
     let remainder = bytes.len() % 4;
     let full_chunks_len = bytes.len() - remainder;
-    for chunk in bytes[..full_chunks_len].chunks_exact(4) {
-        let k1 = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    for chunk in bytes[..full_chunks_len].as_chunks::<4>().0 {
+        let k1 = i32::from_le_bytes(*chunk);
         h1 = mix_h1(h1, mix_k1(k1));
     }
     for byte in &bytes[full_chunks_len..] {

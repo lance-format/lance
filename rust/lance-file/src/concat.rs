@@ -437,6 +437,19 @@ fn validate_blob_field(
                         ));
                     }
                 }
+                BlobKind::Managed | BlobKind::ManagedWithBase => {
+                    let uris = descriptors
+                        .column_by_name("blob_uri")
+                        .ok_or_else(|| {
+                            Error::corrupt_file(path.clone(), "Managed descriptor has no blob_uri")
+                        })?
+                        .as_string::<i32>();
+                    lance_core::utils::blob::validate_managed_reference(
+                        uris.value(row),
+                        positions.value(row),
+                        sizes.value(row),
+                    )?;
+                }
                 BlobKind::Inline | BlobKind::External => {}
             }
         }

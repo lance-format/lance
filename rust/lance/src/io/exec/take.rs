@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::projection::ProjectionMapping;
 use futures::FutureExt;
 use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -40,7 +41,7 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::datatypes::Schema;
 use crate::index::prefilter::DatasetPreFilter;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
@@ -471,11 +472,17 @@ pub struct TakeExec {
     schema_to_take: Arc<Schema>,
     // The schema of the output
     output_schema: SchemaRef,
+    /// Cached from the output schema and dataset blob metadata at construction.
+    bytes_per_row: Option<f64>,
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Scanner-level byte budget for output batches.
     batch_size_bytes: Option<u64>,
+    /// Whether the input columns lead the output unchanged. A take that adds
+    /// fields to an input struct changes that column, so orderings on it do
+    /// not carry across.
+    has_unchanged_input: bool,
 }
 
 impl DisplayAs for TakeExec {
@@ -564,24 +571,55 @@ impl TakeExec {
             &output_schema,
         ));
         let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
+        let has_unchanged_input = input
+            .schema()
+            .fields()
+            .iter()
+            .zip(output_arrow.fields())
+            .all(|(input_field, output_field)| input_field == output_field);
+        let eq_properties = if has_unchanged_input {
+            Self::output_equivalences(&input, &output_arrow)?
+        } else {
+            EquivalenceProperties::new(output_arrow.clone())
+        };
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_arrow.clone())),
+                .with_eq_properties(eq_properties),
         );
+
+        let schema_to_take = projection.into_schema_ref();
+        let bytes_per_row = estimated_bytes_per_row(output_arrow.as_ref(), dataset.schema());
 
         Ok(Some(Self {
             dataset,
             output_projection: original_projection,
-            schema_to_take: projection.into_schema_ref(),
+            schema_to_take,
             input,
             output_schema: output_arrow,
+            bytes_per_row,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             batch_size_bytes,
+            has_unchanged_input,
         }))
+    }
+
+    /// The input's orderings and equivalences on `output`, whose leading
+    /// columns are the input's. Rows keep their input order.
+    fn output_equivalences(
+        input: &Arc<dyn ExecutionPlan>,
+        output: &SchemaRef,
+    ) -> Result<EquivalenceProperties> {
+        let input_schema = input.schema();
+        let indices = (0..input_schema.fields().len()).collect::<Vec<_>>();
+        let mapping = ProjectionMapping::from_indices(&indices, &input_schema)?;
+        Ok(input
+            .properties()
+            .eq_properties
+            .project(&mapping, output.clone()))
     }
 
     /// The output of a take operation will be all columns from the input schema followed
@@ -654,6 +692,12 @@ impl ExecutionPlan for TakeExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Rows keep their order, but a changed input column must not let a
+        // sort above be pushed below the take.
+        vec![self.has_unchanged_input]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -739,8 +783,12 @@ impl ExecutionPlan for TakeExec {
         &self,
         partition: Option<usize>,
     ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        // Include fetched columns as well as carried columns when costing the
+        // output of a late-materialized plan.
+        let num_rows = self.input.partition_statistics(partition)?.num_rows;
         Ok(Arc::new(Statistics {
-            num_rows: self.input.partition_statistics(partition)?.num_rows,
+            num_rows,
+            total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
     }
@@ -757,6 +805,7 @@ impl ExecutionPlan for TakeExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::datatypes::BlobHandling;
 
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray, StructArray,
@@ -835,6 +884,146 @@ mod tests {
             dataset: Arc::new(Dataset::open(test_uri).await.unwrap()),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    /// The take is where a late-materialized plan gets its width, so the reported
+    /// size has to come from the output schema, including newly fetched columns.
+    #[tokio::test]
+    async fn test_take_statistics_measure_the_output_schema() {
+        use datafusion::common::stats::Precision;
+
+        let TestFixture { dataset, .. } = test_fixture().await;
+
+        let scan_arrow_schema = ArrowSchema::new(vec![Field::new("i", DataType::Int32, false)]);
+        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
+        let config = LanceScanConfig {
+            with_row_id: true,
+            ..Default::default()
+        };
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            scan_schema,
+            config,
+        ));
+        let input_stats = input.partition_statistics(None).unwrap();
+        // 30 rows of a non-null int32 plus the nullable row id: 12.125 bytes a row.
+        assert_eq!(input_stats.num_rows, Precision::Exact(30));
+        assert_eq!(input_stats.total_byte_size, Precision::Inexact(364));
+
+        // The take passes the row count through and bills the column it adds on top
+        // of the key its input reads: four more bytes a row of float32.
+        let widened = dataset
+            .empty_projection()
+            .union_column("f", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset.clone(), input.clone(), widened)
+            .unwrap()
+            .unwrap();
+        let stats = take_exec.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, input_stats.num_rows);
+        assert_eq!(stats.total_byte_size, Precision::Inexact(484));
+        // A variable-width column is seeded from the decoder's estimate rather than
+        // withdrawing the row: 64 bytes of string and a 4-byte offset on top.
+        let seeded = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, seeded).unwrap().unwrap();
+        let stats = take_exec.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, input_stats.num_rows);
+        assert_eq!(stats.total_byte_size, Precision::Inexact(2404));
+    }
+
+    /// A take carries its input's payload columns through, so it must suppress the
+    /// estimate whatever blob mode its own projection uses: with descriptions the
+    /// projection renders a descriptor while the output still holds the payload.
+    #[rstest]
+    #[case::take_projects_descriptions(None)]
+    #[case::take_projects_binary(Some(BlobHandling::AllBinary))]
+    #[test_log::test(tokio::test)]
+    async fn test_take_statistics_suppress_a_carried_blob_payload(
+        #[case] take_blob_handling: Option<BlobHandling>,
+    ) {
+        use arrow_array::UInt64Array;
+        use datafusion::common::stats::Precision;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::blob::{BlobArrayBuilder, blob_field};
+
+        let tmp_dir = TempStrDir::default();
+        let mut blobs = BlobArrayBuilder::new(3);
+        for payload in [b"foo".as_slice(), b"bar".as_slice(), b"baz".as_slice()] {
+            blobs.push_bytes(payload).unwrap();
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blob", true),
+            Field::new("idx", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                blobs.finish().unwrap(),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &tmp_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // The input materializes the payload, and must not bill it.
+        let scan_projection = dataset
+            .empty_projection()
+            .with_blob_handling(BlobHandling::AllBinary)
+            .union_column("blob", OnMissing::Error)
+            .unwrap();
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(scan_projection.to_bare_schema()),
+            LanceScanConfig {
+                with_row_id: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            input.partition_statistics(None).unwrap().total_byte_size,
+            Precision::Absent,
+            "the scan must not bill the payload it materialized"
+        );
+
+        // The take fetches only `idx`, but carries the payload either way.
+        let mut take_projection = dataset.empty_projection();
+        if let Some(handling) = take_blob_handling {
+            take_projection = take_projection.with_blob_handling(handling);
+        }
+        let take_projection = take_projection
+            .union_column("idx", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, take_projection)
+            .unwrap()
+            .unwrap();
+
+        let stats = take_exec.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+        assert_eq!(
+            stats.total_byte_size,
+            Precision::Absent,
+            "a carried payload must suppress whatever the take projects"
+        );
     }
 
     #[tokio::test]

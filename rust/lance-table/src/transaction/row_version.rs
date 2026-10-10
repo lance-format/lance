@@ -9,14 +9,12 @@
 //! `created_at` correct across an update means tracing each new row back to the
 //! fragment and offset it came from, which is what most of this module does.
 
-use crate::format::{
-    Fragment, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-};
-use crate::rowids::segment::U64Segment;
-use crate::rowids::version::build_version_meta;
+use crate::format::{Fragment, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
+use crate::rowids::version::{SpilledRowLineage, build_version_meta};
 use crate::rowids::{RowIdSequence, read_row_ids, write_row_ids};
 use crate::transaction::Transaction;
 use lance_core::{Error, Result};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -53,17 +51,57 @@ fn resolve_created_at_version(
         .unwrap_or(UNKNOWN_CREATED_AT_VERSION)
 }
 
+/// Whether an update's new `fragment` carries row lineage its writer placed
+/// outside the manifest, which the commit keeps instead of resolving.
+///
+/// That is spilled row ids or spilled created-at versions. The commit cannot
+/// read either back, and only a writer carrying the lineage of rows it read
+/// over into the fragment produces them. Inline created-at versions next to
+/// inline row ids do not count: the commit resolves those again from the row
+/// ids, whatever the caller supplied, so a hand-built transaction cannot
+/// commit stale ones.
+///
+/// ```
+/// use lance_table::format::{Fragment, RowIdMeta};
+/// use lance_table::transaction::has_writer_placed_lineage;
+///
+/// let mut fragment = Fragment::new(0);
+/// assert!(!has_writer_placed_lineage(&fragment));
+/// fragment.row_id_meta = Some(RowIdMeta::Column);
+/// assert!(has_writer_placed_lineage(&fragment));
+/// ```
+pub fn has_writer_placed_lineage(fragment: &Fragment) -> bool {
+    matches!(fragment.row_id_meta, Some(RowIdMeta::Column))
+        || matches!(
+            fragment.created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        )
+}
+
 /// For each new fragment produced by an update, set `created_at_version_meta`
 /// (preserved from the original rows) and `last_updated_at_version_meta`.
+///
+/// A fragment with writer-placed lineage (see [`has_writer_placed_lineage`])
+/// keeps its created-at versions and only has its last-updated-at versions
+/// stamped.
+///
+/// `spilled` supplies the row ids and created-at versions of existing
+/// fragments that keep them outside the manifest; see
+/// [`SpilledRowLineage`].
 pub(super) fn resolve_update_version_metadata(
     existing_fragments: &[Fragment],
     new_fragments: &mut [Fragment],
     new_version: u64,
+    spilled: &SpilledRowLineage,
 ) -> Result<()> {
     // Collect only the row IDs we actually need to resolve, those appearing in new_fragments
     // with inline metadata. This bounds the lookup map to O(updated rows) instead of O(all dataset rows)
+    // A fragment with writer-placed lineage needs no lookup; when every new
+    // fragment has it, the set stays empty and the existing fragments are not
+    // scanned at all.
     let needed_row_ids: HashSet<u64> = new_fragments
         .iter()
+        .filter(|f| !has_writer_placed_lineage(f))
         .filter_map(|f| match &f.row_id_meta {
             Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
             _ => None,
@@ -89,9 +127,28 @@ pub(super) fn resolve_update_version_metadata(
         let mut sorted_frags: Vec<&Fragment> = existing_fragments.iter().collect();
         sorted_frags.sort_by_key(|f| f.id);
         for frag in sorted_frags {
-            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
-                && let Ok(seq) = read_row_ids(data)
-            {
+            // Finding which existing row each rewritten row came from means
+            // scanning every existing fragment's row ids, and a spilled sequence
+            // cannot be read here. Skipping such a fragment would make its rows
+            // look freshly inserted and stamp them with a new created-at version.
+            let seq = match &frag.row_id_meta {
+                Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok().map(Cow::Owned),
+                Some(RowIdMeta::Column) => Some(Cow::Borrowed(
+                    spilled
+                        .get(&frag.id)
+                        .and_then(|lineage| lineage.row_ids.as_deref())
+                        .ok_or_else(|| {
+                            Error::not_supported(format!(
+                                "fragment {} stores its row ids outside the manifest and they \
+                                 were not loaded ahead of the commit; cannot resolve which rows \
+                                 this update rewrote",
+                                frag.id
+                            ))
+                        })?,
+                )),
+                None => None,
+            };
+            if let Some(seq) = seq {
                 // Range pre-filter: skip the per-row inner loop when the fragment's
                 // bounding row-id range has no overlap with [needed_min, needed_max].
                 // row_id_range() returns None for empty sequences, which are also skipped.
@@ -118,31 +175,84 @@ pub(super) fn resolve_update_version_metadata(
     // (a protobuf decode) for every single updated row, even when many rows originate
     // from the same fragment.
     let source_frag_ids: HashSet<u64> = row_id_to_source.values().map(|(f, _)| f.id).collect();
-    let version_cache: HashMap<u64, RowDatasetVersionSequence> = existing_fragments
+    let mut version_cache: HashMap<u64, RowDatasetVersionSequence> = HashMap::new();
+    for frag in existing_fragments
         .iter()
         .filter(|f| source_frag_ids.contains(&f.id))
-        .filter_map(|frag| {
-            let seq = frag
-                .created_at_version_meta
-                .as_ref()?
-                .load_sequence()
-                .ok()?;
-            Some((frag.id, seq))
-        })
-        .collect();
+    {
+        let Some(meta) = &frag.created_at_version_meta else {
+            continue;
+        };
+        if matches!(meta, RowDatasetVersionMeta::Column) {
+            // The rewritten rows' original created-at versions live in a data
+            // file, which this path cannot read. Defaulting them would silently
+            // rewrite their lineage, so the caller has to have read them.
+            let loaded = spilled
+                .get(&frag.id)
+                .and_then(|lineage| lineage.created_at.clone())
+                .ok_or_else(|| {
+                    Error::not_supported(format!(
+                        "fragment {} stores its created-at versions outside the manifest \
+                         and they were not loaded ahead of the commit",
+                        frag.id
+                    ))
+                })?;
+            version_cache.insert(frag.id, loaded.as_ref().clone());
+        } else if let Ok(seq) = meta.load_sequence() {
+            version_cache.insert(frag.id, seq);
+        }
+    }
 
     for fragment in new_fragments.iter_mut() {
-        let row_ids = match &fragment.row_id_meta {
-            Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
-            Some(RowIdMeta::External(_)) => {
-                log::warn!(
-                    "Fragment {} has external row ID metadata; \
-                     version tracking will use defaults",
-                    fragment.id,
-                );
-                None
+        let row_ids = match (&fragment.row_id_meta, &fragment.created_at_version_meta) {
+            // Writer-placed lineage (see `has_writer_placed_lineage`): the
+            // writer read the rewritten rows and placed their created-at
+            // versions itself. The last-updated-at version is this commit's,
+            // which only the commit knows (a conflict retry moves it), so it
+            // is stamped here whatever the writer left.
+            (_, Some(RowDatasetVersionMeta::Column)) => {
+                fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
+                continue;
             }
-            None => None,
+            (Some(RowIdMeta::Column), Some(created_at)) => {
+                // Unlike a spilled sequence, an inline one can be checked
+                // against the fragment here without IO.
+                let placed_rows = created_at
+                    .load_sequence()
+                    .map_err(|error| {
+                        Error::invalid_input(format!(
+                            "fragment {} carries created-at version metadata that does not \
+                             decode: {error}",
+                            fragment.id
+                        ))
+                    })?
+                    .len();
+                let physical_rows = fragment.physical_rows.unwrap_or(0) as u64;
+                if placed_rows != physical_rows {
+                    return Err(Error::invalid_input(format!(
+                        "fragment {} carries {placed_rows} created-at versions for \
+                         {physical_rows} physical rows",
+                        fragment.id
+                    )));
+                }
+                fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
+                continue;
+            }
+            (Some(RowIdMeta::Column), None) => {
+                // Resolving the versions needs the row ids, which this
+                // commit-time path cannot read back from a data file; a writer
+                // that spills them has to place the created-at versions too.
+                return Err(Error::not_supported(format!(
+                    "fragment {} stores its row ids outside the manifest but carries no \
+                     created-at version metadata; a writer that spills row ids must place \
+                     the created-at versions with them",
+                    fragment.id
+                )));
+            }
+            // Inline created-at versions next to inline row ids are resolved
+            // again below, overwriting whatever the caller supplied.
+            (Some(RowIdMeta::Inline(data)), _) => read_row_ids(data).ok(),
+            (None, _) => None,
         };
 
         if let Some(row_ids) = row_ids {
@@ -165,8 +275,7 @@ pub(super) fn resolve_update_version_metadata(
                 .collect();
             debug_assert_eq!(created_at_versions.len(), physical_rows);
 
-            let runs = encode_version_runs(&created_at_versions);
-            let created_at_seq = RowDatasetVersionSequence { runs };
+            let created_at_seq = RowDatasetVersionSequence::from_versions(&created_at_versions);
             fragment.created_at_version_meta = Some(
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).map_err(|e| {
                     Error::internal(format!(
@@ -184,31 +293,6 @@ pub(super) fn resolve_update_version_metadata(
         }
     }
     Ok(())
-}
-
-/// Run-length encode a sequence of per-row versions into [`RowDatasetVersionRun`]s.
-fn encode_version_runs(versions: &[u64]) -> Vec<RowDatasetVersionRun> {
-    if versions.is_empty() {
-        return Vec::new();
-    }
-    let mut runs = Vec::new();
-    let mut current_version = versions[0];
-    let mut run_start = 0u64;
-    for (i, &version) in versions.iter().enumerate().skip(1) {
-        if version != current_version {
-            runs.push(RowDatasetVersionRun {
-                span: U64Segment::Range(run_start..i as u64),
-                version: current_version,
-            });
-            current_version = version;
-            run_start = i as u64;
-        }
-    }
-    runs.push(RowDatasetVersionRun {
-        span: U64Segment::Range(run_start..versions.len() as u64),
-        version: current_version,
-    });
-    runs
 }
 
 impl Transaction {
@@ -230,7 +314,8 @@ impl Transaction {
                         let sequence = read_row_ids(data)?;
                         sequence.len() as u64
                     }
-                    _ => 0,
+                    // A spilled sequence always covers every physical row.
+                    RowIdMeta::Column => physical_rows,
                 };
 
                 // only filter the fragments that match: all the rows have row id,
@@ -264,6 +349,8 @@ impl Transaction {
                         let sequence = read_row_ids(data)?;
                         sequence.len() as u64
                     }
+                    // A spilled sequence always covers every physical row.
+                    Some(RowIdMeta::Column) => physical_rows,
                     _ => 0,
                 };
 
@@ -321,10 +408,13 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::RowDatasetVersionRun;
+    use crate::rowids::segment::U64Segment;
     use crate::transaction::test_support::{
         created_at_versions, default_build_config, last_updated_at_versions,
         make_stable_row_id_manifest, update_txn,
     };
+    use rstest::rstest;
     use std::sync::Arc;
 
     #[test]
@@ -355,6 +445,261 @@ mod tests {
         } else {
             panic!("Expected inline row ID metadata");
         }
+    }
+
+    fn inline_versions(rows: u64, version: u64) -> RowDatasetVersionMeta {
+        RowDatasetVersionMeta::from_sequence(&RowDatasetVersionSequence::from_uniform_row_count(
+            rows, version,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_assign_row_ids_spilled_is_complete() {
+        // A spilled sequence covers every physical row, so the commit must not
+        // top it up with fresh ids the way it does for a partial inline one.
+        let spilled = RowIdMeta::Column;
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(spilled.clone()),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }];
+        let mut next_row_id = 100;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        assert_eq!(next_row_id, 100);
+        assert_eq!(fragments[0].row_id_meta, Some(spilled));
+    }
+
+    #[test]
+    fn test_resolve_update_versions_keeps_writer_placed_created_at() {
+        // A writer that placed a new fragment's lineage outside the manifest
+        // keeps its created-at versions; the commit only stamps
+        // last-updated-at with its own version, which the writer could not
+        // know.
+        let mut new_fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Column),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: Some(inline_versions(50, 7)),
+            created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+        }];
+
+        resolve_update_version_metadata(&[], &mut new_fragments, 9, &Default::default()).unwrap();
+        assert_eq!(
+            new_fragments[0].created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        );
+        assert_eq!(
+            new_fragments[0].last_updated_at_version_meta,
+            Some(inline_versions(50, 9))
+        );
+    }
+
+    #[test]
+    fn test_resolve_update_versions_skips_source_scan_for_spilled_new_fragments() {
+        // A new fragment whose writer spilled its created-at versions needs no
+        // lookup, so the commit does not scan the existing fragments' row ids
+        // at all: a spilled source that was not loaded ahead is no obstacle.
+        let existing = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Column),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: Some(inline_versions(50, 2)),
+            created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+        }];
+        let mut new_fragments = vec![Fragment {
+            id: 2,
+            physical_rows: Some(2),
+            row_id_meta: Some(RowIdMeta::Inline(
+                write_row_ids(&RowIdSequence::from(10..12)).into(),
+            )),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+        }];
+
+        resolve_update_version_metadata(&existing, &mut new_fragments, 9, &Default::default())
+            .unwrap();
+        assert_eq!(
+            new_fragments[0].created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        );
+        assert_eq!(
+            new_fragments[0].last_updated_at_version_meta,
+            Some(inline_versions(2, 9))
+        );
+    }
+
+    #[test]
+    fn test_resolve_update_versions_recomputes_inline_created_at() {
+        // Inline created-at versions next to inline row ids are not
+        // writer-placed: the commit resolves them from the row ids again, so a
+        // hand-built transaction cannot commit stale ones.
+        let row_ids = Some(RowIdMeta::Inline(
+            write_row_ids(&RowIdSequence::from(0..10)).into(),
+        ));
+        let existing = vec![Fragment {
+            id: 1,
+            physical_rows: Some(10),
+            row_id_meta: row_ids.clone(),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: Some(inline_versions(10, 3)),
+            created_at_version_meta: Some(inline_versions(10, 3)),
+        }];
+        let mut new_fragments = vec![Fragment {
+            id: 2,
+            physical_rows: Some(10),
+            row_id_meta: row_ids,
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: Some(inline_versions(10, 7)),
+        }];
+
+        resolve_update_version_metadata(&existing, &mut new_fragments, 9, &Default::default())
+            .unwrap();
+        assert_eq!(
+            new_fragments[0].created_at_version_meta,
+            Some(inline_versions(10, 3))
+        );
+        assert_eq!(
+            new_fragments[0].last_updated_at_version_meta,
+            Some(inline_versions(10, 9))
+        );
+    }
+
+    #[rstest]
+    #[case::covers_every_row(50)]
+    #[case::too_short(40)]
+    fn test_resolve_update_versions_checks_placed_inline_created_at(#[case] placed_rows: u64) {
+        // Inline created-at versions next to spilled row ids are writer-placed
+        // and kept as they are, so they have to cover every row.
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Column),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: Some(inline_versions(placed_rows, 3)),
+        }];
+
+        let result = resolve_update_version_metadata(&[], &mut fragments, 9, &Default::default());
+        if placed_rows == 50 {
+            result.unwrap();
+            assert_eq!(
+                fragments[0].created_at_version_meta,
+                Some(inline_versions(50, 3))
+            );
+            assert_eq!(
+                fragments[0].last_updated_at_version_meta,
+                Some(inline_versions(50, 9))
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("40 created-at versions for 50 physical rows"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_update_versions_reads_spilled_source_lineage_from_config() {
+        // The rewritten rows' sources are found by scanning existing row ids,
+        // which a spilled fragment does not expose here: the commit's caller
+        // reads them ahead of time. Without that, skipping the fragment would
+        // make its rows look freshly inserted, so it is an error instead.
+        let existing = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Column),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: Some(inline_versions(50, 2)),
+            created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+        }];
+        let new_fragment = |ids: std::ops::Range<u64>| Fragment {
+            id: 2,
+            physical_rows: Some(2),
+            row_id_meta: Some(RowIdMeta::Inline(
+                write_row_ids(&RowIdSequence::from(ids)).into(),
+            )),
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let mut new_fragments = vec![new_fragment(10..12)];
+        let error =
+            resolve_update_version_metadata(&existing, &mut new_fragments, 9, &Default::default())
+                .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+
+        // A new fragment whose own row ids are spilled cannot be resolved.
+        let mut spilled_new = vec![Fragment {
+            row_id_meta: Some(RowIdMeta::Column),
+            ..new_fragment(0..2)
+        }];
+        let error = resolve_update_version_metadata(&[], &mut spilled_new, 9, &Default::default())
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+
+        // Fragment 1 holds ids 100..150 and rows 10 and 11 were created at
+        // versions 3 and 4 respectively; that is what the rewrite must keep.
+        let mut created_at_versions = vec![2; 50];
+        created_at_versions[10] = 3;
+        created_at_versions[11] = 4;
+        let spilled = SpilledRowLineage::from([(
+            1,
+            crate::rowids::version::LoadedRowLineage {
+                row_ids: Some(Arc::new(RowIdSequence::from(100..150))),
+                created_at: Some(Arc::new(RowDatasetVersionSequence::from_versions(
+                    &created_at_versions,
+                ))),
+                last_updated_at: None,
+            },
+        )]);
+        let mut new_fragments = vec![new_fragment(110..112)];
+        resolve_update_version_metadata(&existing, &mut new_fragments, 9, &spilled).unwrap();
+        let versions = |meta: &Option<RowDatasetVersionMeta>| {
+            meta.as_ref()
+                .unwrap()
+                .load_sequence()
+                .unwrap()
+                .versions()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versions(&new_fragments[0].created_at_version_meta), [3, 4]);
+        assert_eq!(
+            versions(&new_fragments[0].last_updated_at_version_meta),
+            [9, 9]
+        );
     }
 
     #[test]
@@ -1112,28 +1457,5 @@ mod tests {
 
         // Row 12 → frag A offset 2 → version 2; row 20 → frag B offset 0 → version 8
         assert_eq!(created_at_versions(&result, 10), vec![2, 8]);
-    }
-
-    #[test]
-    fn test_encode_version_runs_empty() {
-        let runs = encode_version_runs(&[]);
-        assert!(runs.is_empty());
-    }
-
-    #[test]
-    fn test_encode_version_runs_single_run() {
-        let runs = encode_version_runs(&[3, 3, 3]);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].version, 3);
-    }
-
-    #[test]
-    fn test_encode_version_runs_alternating() {
-        let runs = encode_version_runs(&[1, 2, 1, 2]);
-        assert_eq!(runs.len(), 4);
-        assert_eq!(runs[0].version, 1);
-        assert_eq!(runs[1].version, 2);
-        assert_eq!(runs[2].version, 1);
-        assert_eq!(runs[3].version, 2);
     }
 }

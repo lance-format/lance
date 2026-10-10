@@ -273,7 +273,7 @@ public class TransactionTest {
                   .readVersion(source.version())
                   .operation(
                       Clone.builder()
-                          .shallow(false)
+                          .shallow(true)
                           .refVersion(source.version())
                           .refPath(sourcePath)
                           .build())
@@ -283,13 +283,42 @@ public class TransactionTest {
         assertInstanceOf(Clone.class, read.operation());
         Clone clone = (Clone) read.operation();
         assertEquals(
-            Clone.builder().shallow(false).refVersion(source.version()).refPath(sourcePath).build(),
+            Clone.builder().shallow(true).refVersion(source.version()).refPath(sourcePath).build(),
             clone);
-        assertFalse(clone.isShallow());
+        assertTrue(clone.isShallow());
         assertEquals(sourcePath, clone.getRefPath());
         assertEquals(source.version(), clone.getRefVersion());
         assertTrue(clone.getRefName().isEmpty());
         assertTrue(clone.getBranchName().isEmpty());
+      }
+    }
+  }
+
+  @Test
+  public void testDeepCloneCommitRejected(@TempDir Path tempDir) {
+    String sourcePath = tempDir.resolve("clone_source").toString();
+    String targetPath = tempDir.resolve("clone_target").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset sourceDataset =
+          new TestUtils.SimpleTestDataset(allocator, sourcePath);
+      sourceDataset.createEmptyDataset().close();
+      try (Dataset source = sourceDataset.write(1, 10);
+          Transaction transaction =
+              new Transaction.Builder()
+                  .readVersion(source.version())
+                  .operation(
+                      Clone.builder()
+                          .shallow(false)
+                          .refVersion(source.version())
+                          .refPath(sourcePath)
+                          .build())
+                  .build()) {
+        // Committed directly, a deep clone would reference files never copied to the target.
+        IllegalArgumentException e =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> new CommitBuilder(targetPath, allocator).execute(transaction));
+        assertTrue(e.getMessage().contains("deep Clone cannot be committed directly"));
       }
     }
   }
