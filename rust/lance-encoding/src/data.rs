@@ -102,9 +102,16 @@ pub struct NullableDataBlock {
 
 impl NullableDataBlock {
     fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        // Arrow does not allow Null arrays to carry a null bitmap: every value
+        // is null by definition, so the bitmap carries no information.
+        let is_null_type = matches!(data_type, DataType::Null);
         let nulls = self.nulls.into_buffer();
         let data = self.data.into_arrow_impl(data_type, true)?.into_builder();
-        let data = data.null_bit_buffer(Some(nulls));
+        let data = if is_null_type {
+            data
+        } else {
+            data.null_bit_buffer(Some(nulls))
+        };
         Ok(data.build()?)
     }
 

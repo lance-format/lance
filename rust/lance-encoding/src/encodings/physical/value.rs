@@ -1214,6 +1214,32 @@ mod tests {
         check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
     }
 
+    // Regression: FSL whose item type *is* Null.  The structural decoder attaches a
+    // validity bitmap for the nullable Null leaf; materialization must drop it because
+    // Arrow does not allow Null arrays to carry a null bitmap.
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_null_item_type() {
+        let items = new_null_array(&DataType::Null, 8);
+        let items_field = Arc::new(Field::new("item", DataType::Null, true));
+        let fsl = FixedSizeListArray::new(items_field, 4, items, None);
+
+        let test_cases = TestCases::default().with_structural_encodings();
+        check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
+    }
+
+    // The same array through the legacy (non-structural) array encoder: the
+    // materialization fix lives in the shared NullableDataBlock exit, so the v1
+    // path must round-trip too.
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_null_item_type_legacy_encoding() {
+        let items = new_null_array(&DataType::Null, 8);
+        let items_field = Arc::new(Field::new("item", DataType::Null, true));
+        let fsl = FixedSizeListArray::new(items_field, 4, items, None);
+
+        let test_cases = TestCases::default().with_encodings([TestEncoding::Array]);
+        check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
+    }
+
     #[test_log::test(tokio::test)]
     async fn regress_list_fsl() {
         // This regresses a case where rows are large lists that span multiple
