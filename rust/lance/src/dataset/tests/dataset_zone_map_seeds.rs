@@ -11,18 +11,21 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow::compute::concat_batches;
+use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
-use futures::stream;
+use futures::{TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
+use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::IndexType;
 use lance_index::scalar::seed::{IndexSeedWriter, SEED_META_KEY_PREFIX};
 use lance_index::scalar::zonemap::ZoneMapSeedWriter;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_io::ReadBatchParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
@@ -120,8 +123,7 @@ fn serving_file(fragment: &Fragment, field_id: i32) -> &DataFile {
         .expect("a data file serves the field")
 }
 
-/// The seed stored for `column` in the data file at `path`, if any.
-async fn seed_in_file(dataset: &Dataset, path: &str, column: &str) -> Option<Bytes> {
+async fn open_data_file(dataset: &Dataset, path: &str) -> FileReader {
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -131,7 +133,7 @@ async fn seed_in_file(dataset: &Dataset, path: &str, column: &str) -> Option<Byt
         .open_file(&path, &CachedFileSize::unknown())
         .await
         .unwrap();
-    let reader = FileReader::try_open(
+    FileReader::try_open(
         file_scheduler,
         None,
         Default::default(),
@@ -139,7 +141,12 @@ async fn seed_in_file(dataset: &Dataset, path: &str, column: &str) -> Option<Byt
         FileReaderOptions::default(),
     )
     .await
-    .unwrap();
+    .unwrap()
+}
+
+/// The seed stored for `column` in the data file at `path`, if any.
+async fn seed_in_file(dataset: &Dataset, path: &str, column: &str) -> Option<Bytes> {
+    let reader = open_data_file(dataset, path).await;
     let value = reader
         .metadata()
         .file_schema
@@ -148,6 +155,40 @@ async fn seed_in_file(dataset: &Dataset, path: &str, column: &str) -> Option<Byt
         .clone();
     let buf_index: u32 = value.split(':').next().unwrap().parse().unwrap();
     Some(reader.read_global_buffer(buf_index).await.unwrap())
+}
+
+/// The physical values of `column` stored in the data file at `path`,
+/// deleted rows included.
+async fn physical_column(dataset: &Dataset, path: &str, column: &str) -> ArrayRef {
+    let reader = open_data_file(dataset, path).await;
+    let batches: Vec<RecordBatch> = reader
+        .read_stream(
+            ReadBatchParams::RangeFull,
+            1024,
+            4,
+            FilterExpression::no_filter(),
+        )
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+    batch.column_by_name(column).unwrap().clone()
+}
+
+/// The seed a writer produces from `values`, observed in `batches` chunks.
+fn seed_from_values(column: &str, values: &ArrayRef, batches: usize) -> Bytes {
+    let mut writer =
+        ZoneMapSeedWriter::new(column, ROWS_PER_ZONE, values.data_type().clone()).unwrap();
+    let chunk = values.len().div_ceil(batches).max(1);
+    let mut offset = 0;
+    while offset < values.len() {
+        let len = chunk.min(values.len() - offset);
+        writer.observe_batch(&values.slice(offset, len)).unwrap();
+        offset += len;
+    }
+    writer.finish().unwrap().unwrap()
 }
 
 /// The seed a writer produces from the fragment's current values of `column`.
@@ -191,6 +232,19 @@ async fn replace_column(
     rewrite: impl Fn(u64) -> bool,
     value: impl Fn(i32, i32) -> Option<i32>,
 ) -> Dataset {
+    replace_column_in_batches(dataset, column, rewrite, value, 1).await
+}
+
+/// Like [`replace_column`], streaming each fragment's replacement as
+/// `batches` batches so the writer sees zone boundaries inside a batch and
+/// across batches.
+async fn replace_column_in_batches(
+    dataset: Dataset,
+    column: &str,
+    rewrite: impl Fn(u64) -> bool,
+    value: impl Fn(i32, i32) -> Option<i32>,
+    batches: usize,
+) -> Dataset {
     let column_schema = LanceSchema {
         fields: vec![dataset.schema().field(column).unwrap().clone()],
         metadata: Default::default(),
@@ -214,9 +268,14 @@ async fn replace_column(
             ))],
         )
         .unwrap();
+        let chunk = batch.num_rows().div_ceil(batches).max(1);
+        let chunks: Vec<_> = (0..batch.num_rows())
+            .step_by(chunk)
+            .map(|offset| Ok(batch.slice(offset, chunk.min(batch.num_rows() - offset))))
+            .collect();
         replacements.push(
             fragment
-                .write_columns(stream::iter([Ok(batch)]), &column_schema)
+                .write_columns(stream::iter(chunks), &column_schema)
                 .await
                 .unwrap(),
         );
@@ -367,5 +426,54 @@ async fn test_seeds_disabled_index_gets_no_seed_on_rewrite() {
     for fragment in dataset.fragments().iter() {
         let file = serving_file(fragment, val);
         assert!(seed_in_file(&dataset, &file.path, "val").await.is_none());
+    }
+}
+
+/// A fragment with deleted rows gets a partial update. The replacement
+/// column file still covers every physical row, with the deleted rows
+/// restored as nulls, and its seed describes exactly that file: zone
+/// boundaries, null counts and null positions match the physical content,
+/// not the deletion-filtered view.
+#[tokio::test]
+async fn test_partial_update_of_fragment_with_deletions_seeds_physical_rows() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_val_index(dir.as_str(), true).await;
+    dataset.delete("id % 3 = 0").await.unwrap();
+    let dataset = merge_insert_val(dataset, 13..27).await;
+
+    let val = field_id(&dataset, "val");
+    for fragment in &dataset.fragments()[1..] {
+        assert!(fragment.deletion_file.is_some());
+        let file = serving_file(fragment, val);
+        let physical = physical_column(&dataset, &file.path, "val").await;
+        assert_eq!(physical.len(), fragment.physical_rows.unwrap());
+        let stored = seed_in_file(&dataset, &file.path, "val").await.unwrap();
+        assert_eq!(stored, seed_from_values("val", &physical, 1));
+        // The deletion-filtered view would describe fewer rows.
+        assert_ne!(
+            stored,
+            seed_from_current_values(&dataset, fragment, "val").await
+        );
+    }
+}
+
+/// `write_columns` fed several batches on a fragment with deleted rows: the
+/// seed is the same as from one batch, and matches the physical file.
+#[tokio::test]
+async fn test_write_columns_in_batches_seeds_physical_rows() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_val_index(dir.as_str(), true).await;
+    dataset.delete("id % 3 = 0").await.unwrap();
+    let dataset =
+        replace_column_in_batches(dataset, "val", |id| id >= 1, replacement_value, 3).await;
+
+    let val = field_id(&dataset, "val");
+    for fragment in &dataset.fragments()[1..] {
+        let file = serving_file(fragment, val);
+        let physical = physical_column(&dataset, &file.path, "val").await;
+        assert_eq!(physical.len(), fragment.physical_rows.unwrap());
+        let stored = seed_in_file(&dataset, &file.path, "val").await.unwrap();
+        assert_eq!(stored, seed_from_values("val", &physical, 1));
+        assert_eq!(stored, seed_from_values("val", &physical, 3));
     }
 }
