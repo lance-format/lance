@@ -1083,6 +1083,126 @@ mod tests {
         assert_eq!(cache.pinned_stats().pinned_entries, 1);
     }
 
+    async fn pin_budget_cache(is_strict: bool) -> QuickCacheBackend {
+        let backend =
+            QuickCacheBackend::with_shard_policy(TEST_CAPACITY, QuickCacheShardPolicy::Single);
+        if is_strict {
+            let codec = CacheCodec::new("test.sign", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+                .with_memory_priority(3);
+            backend
+                .insert(
+                    &InternalCacheKey::from_bytes([u8::MAX; 16]),
+                    Arc::new(()),
+                    1,
+                    Some(codec),
+                )
+                .await;
+        }
+        assert_eq!(backend.priority_active.load(Ordering::Acquire), is_strict);
+        backend
+    }
+
+    #[rstest::rstest]
+    #[case::quick(false)]
+    #[case::strict(true)]
+    #[tokio::test]
+    async fn shared_pin_aliases_obey_capacity(#[case] is_strict: bool) {
+        let backend = pin_budget_cache(is_strict).await;
+        let pin = CachePin::new();
+        let _lease = CachePin::lease(&pin);
+        let entry_bytes = TEST_CAPACITY * 3 / 10;
+        let value = Arc::new(vec![0u8; entry_bytes]);
+        for id in 0..4 {
+            backend
+                .insert_pinned(
+                    &InternalCacheKey::from_bytes([id; 16]),
+                    value.clone(),
+                    entry_bytes,
+                    &pin,
+                )
+                .await;
+        }
+        assert!(
+            backend.size_bytes().await <= TEST_CAPACITY,
+            "resident bytes={}, pin stats={:?}",
+            backend.size_bytes().await,
+            backend.pinned_stats(),
+        );
+        let stats = backend.pinned_stats();
+        assert_eq!(stats.pinned_entries, 1);
+        assert_eq!(
+            stats.pinned_bytes,
+            (entry_bytes + key_footprint(&InternalCacheKey::from_bytes([0; 16]))) as u64,
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::quick(false)]
+    #[case::strict(true)]
+    #[tokio::test]
+    async fn shared_pin_backends_obey_capacity(#[case] is_strict: bool) {
+        let first = pin_budget_cache(is_strict).await;
+        let second =
+            QuickCacheBackend::with_shard_policy(10 * TEST_CAPACITY, QuickCacheShardPolicy::Single);
+        let entry_bytes = TEST_CAPACITY * 3 / 10;
+        let mut leases = Vec::with_capacity(4);
+        for id in 0..4 {
+            let pin = CachePin::new();
+            leases.push(CachePin::lease(&pin));
+            let value = Arc::new(vec![0u8; entry_bytes]);
+            let key = InternalCacheKey::from_bytes([id; 16]);
+            first
+                .insert_pinned(&key, value.clone(), entry_bytes, &pin)
+                .await;
+            second.insert_pinned(&key, value, entry_bytes, &pin).await;
+        }
+        assert!(leases.iter().all(CacheLease::is_pinned));
+        assert!(
+            first.size_bytes().await <= TEST_CAPACITY,
+            "first bytes={}, first stats={:?}, second stats={:?}",
+            first.size_bytes().await,
+            first.pinned_stats(),
+            second.pinned_stats(),
+        );
+        let first_stats = first.pinned_stats();
+        assert_eq!(first_stats.pinned_entries, 1);
+        assert_eq!(second.pinned_stats().pinned_entries, 4);
+        first.clear().await;
+        assert_eq!(first.pinned_stats().pinned_bytes, 0);
+        assert_eq!(second.pinned_stats().pinned_entries, 4);
+    }
+
+    #[rstest::rstest]
+    #[case::quick(false)]
+    #[case::strict(true)]
+    #[tokio::test]
+    async fn shared_pin_replacement_reacquires_its_reservation(#[case] is_strict: bool) {
+        let backend = pin_budget_cache(is_strict).await;
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        let entry_bytes = TEST_CAPACITY * 3 / 10;
+        let value = Arc::new(vec![0u8; entry_bytes]);
+        let pin = CachePin::new();
+        let lease = CachePin::lease(&pin);
+        for _ in 0..4 {
+            backend
+                .insert_pinned(&key, value.clone(), entry_bytes, &pin)
+                .await;
+            assert!(backend.peek_resident(&key).await);
+            assert!(lease.is_pinned());
+            assert_eq!(pin.admissions(), 1);
+            let stats = backend.pinned_stats();
+            assert_eq!((stats.pinned_entries, stats.leased_entries), (1, 1));
+            assert_eq!(
+                stats.pinned_bytes,
+                (entry_bytes + key_footprint(&key)) as u64
+            );
+        }
+        backend.clear().await;
+        assert_eq!(pin.admissions(), 0);
+        assert!(!lease.is_pinned());
+        assert_eq!(backend.pinned_stats().leased_bytes, 0);
+    }
+
     #[test]
     fn entry_weight_includes_fixed_key() {
         let key = InternalCacheKey::from_bytes([0; 16]);

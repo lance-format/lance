@@ -14,7 +14,8 @@
 //! partitions (a backend's shards), so eviction always finds unpinned weight
 //! to free and pins never push admissions over capacity. A lease that finds
 //! no room leaves its entry evictable and counts an overflow; the next lease
-//! of an unleased entry, or its next admission, tries again.
+//! of an unleased value, its next admission, or the end of another pinned
+//! admission of that value in the same budget partition tries again.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -145,20 +146,43 @@ impl PinBudget {
     }
 }
 
-/// Where a pin's entry is admitted: the budget of the backend holding it,
-/// the partition (shard) of its key and the bytes the backend charges.
-#[derive(Debug, Clone)]
-struct PinBinding {
+/// One admission's charge and eviction protection. The owning pin's state
+/// lock serializes updates; its record reads the flag without that lock.
+#[derive(Debug)]
+struct PinAdmission {
     budget: Arc<PinBudget>,
     partition: usize,
     bytes: u64,
+    pinned: Arc<AtomicBool>,
+    counted_leased: bool,
 }
 
-impl PinBinding {
-    fn same_as(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.budget, &other.budget)
-            && self.partition == other.partition
-            && self.bytes == other.bytes
+impl PinAdmission {
+    fn sync(&mut self, is_leased: bool) {
+        if !is_leased {
+            self.release();
+            return;
+        }
+        if !self.counted_leased {
+            self.budget.count_leased(self.bytes, true);
+            self.counted_leased = true;
+        }
+        if !self.pinned.load(Ordering::Relaxed) {
+            let reserved = self.budget.try_reserve(self.partition, self.bytes);
+            self.pinned.store(reserved, Ordering::Release);
+        }
+    }
+
+    fn release(&mut self) {
+        // Make the entry evictable before another admission can reuse its
+        // budget, so eviction never protects uncharged bytes.
+        if self.pinned.swap(false, Ordering::Release) {
+            self.budget.release(self.partition, self.bytes);
+        }
+        if self.counted_leased {
+            self.budget.count_leased(self.bytes, false);
+            self.counted_leased = false;
+        }
     }
 }
 
@@ -166,23 +190,20 @@ impl PinBinding {
 struct PinState {
     /// Live leases.
     holders: usize,
-    /// Live admissions of the value in its backend.
-    records: usize,
-    binding: Option<PinBinding>,
-    /// Whether the binding's budget holds the entry's bytes.
-    reserved: bool,
-    /// Whether the binding's budget counts the entry as leased.
-    counted_leased: bool,
+    /// Every live cache admission has its own reservation, including aliases
+    /// of the same value under different keys or in different backends.
+    admissions: Vec<PinAdmission>,
 }
 
 /// The pin of one cached value; see the [module docs](self). Leases and
-/// admissions share it, so every admission of the value is pinned by the
-/// same leases: a value evicted while leased (an overflow) and admitted again
-/// is pinned again at once.
+/// admissions share lease ownership, while each admission independently
+/// reserves its own cache charge. A value evicted while leased (an overflow)
+/// can be pinned again on its next admission if that budget has room.
 #[derive(Debug, Default)]
 pub struct CachePin {
     state: Mutex<PinState>,
-    /// Mirror of `state.reserved`, which eviction reads without the lock.
+    /// Whether any admission is pinned. Eviction uses the admission-specific
+    /// flag in its `PinRecord`, never this value-wide status.
     pinned: AtomicBool,
 }
 
@@ -194,7 +215,8 @@ impl CachePin {
 
     /// Take a lease: the value's entry stays in RAM, on a backend that pins,
     /// until the lease and its clones drop. The first lease of an admitted
-    /// entry reserves its bytes, or counts an overflow.
+    /// value reserves each admission's bytes independently, or counts an
+    /// overflow in that admission's budget.
     pub fn lease(pin: &Arc<Self>) -> CacheLease {
         let mut state = pin.lock();
         state.holders += 1;
@@ -207,35 +229,35 @@ impl CachePin {
     /// Record an admission of the value in `budget`, in `partition`, charged
     /// `bytes`. The entry is pinned while the returned record and a lease
     /// live, if the budget has room; a leased entry that finds none counts an
-    /// overflow and stays evictable. A pin admitted to another budget, or with
-    /// another charge, moves to this one.
+    /// overflow and stays evictable. Each call creates a separate reservation;
+    /// admitting the value again never transfers an existing admission's charge.
     pub fn record(
         pin: &Arc<Self>,
         budget: &Arc<PinBudget>,
         partition: usize,
         bytes: u64,
     ) -> PinRecord {
-        let binding = PinBinding {
+        let pinned = Arc::new(AtomicBool::new(false));
+        let mut admission = PinAdmission {
             budget: budget.clone(),
             partition,
             bytes,
+            pinned: pinned.clone(),
+            counted_leased: false,
         };
         let mut state = pin.lock();
-        if !state
-            .binding
-            .as_ref()
-            .is_some_and(|bound| bound.same_as(&binding))
-        {
-            Self::unbind(&mut state);
-            state.binding = Some(binding);
+        admission.sync(state.holders > 0);
+        state.admissions.push(admission);
+        pin.update_pinned(&state);
+        PinRecord {
+            pin: pin.clone(),
+            pinned,
         }
-        state.records += 1;
-        pin.sync(&mut state, true);
-        PinRecord { pin: pin.clone() }
     }
 
-    /// Whether a backend must keep the entry: admitted, leased, and within
-    /// its budget's cap.
+    /// Whether at least one admission is leased and within its budget's cap.
+    /// This does not imply that every admission is protected. Backends must
+    /// use [`PinRecord::is_pinned`] when deciding whether to evict an entry.
     pub fn is_pinned(&self) -> bool {
         self.pinned.load(Ordering::Acquire)
     }
@@ -251,14 +273,18 @@ impl CachePin {
     /// the value from the cache; one replaced by another admission of the
     /// same value does not.
     pub fn admissions(&self) -> usize {
-        self.lock().records
+        self.lock().admissions.len()
     }
 
-    /// Whether the entry is admitted and leased but found no room under its
-    /// budget's cap, so it stays evictable.
+    /// Whether any leased admission found no room under its budget's cap
+    /// and remains evictable. Other admissions may still be pinned.
     pub fn is_overflowed(&self) -> bool {
         let state = self.lock();
-        state.holders > 0 && state.records > 0 && state.binding.is_some() && !state.reserved
+        state.holders > 0
+            && state
+                .admissions
+                .iter()
+                .any(|admission| !admission.pinned.load(Ordering::Relaxed))
     }
 
     fn lock(&self) -> MutexGuard<'_, PinState> {
@@ -273,47 +299,50 @@ impl CachePin {
         }
     }
 
-    fn drop_record(&self) {
+    fn drop_record(&self, pinned: &Arc<AtomicBool>) {
         let mut state = self.lock();
-        state.records = state.records.saturating_sub(1);
-        if state.records == 0 {
-            self.sync(&mut state, false);
-        }
-    }
-
-    /// Release what the binding's budget holds for the entry.
-    fn unbind(state: &mut PinState) {
-        if let Some(binding) = &state.binding {
-            if state.counted_leased {
-                binding.budget.count_leased(binding.bytes, false);
-            }
-            if state.reserved {
-                binding.budget.release(binding.partition, binding.bytes);
-            }
-        }
-        state.counted_leased = false;
-        state.reserved = false;
-    }
-
-    /// Bring the budget in line with the holders and admissions: count a
-    /// leased admitted entry as leased, release it once unleased or no
-    /// longer admitted, and, when `reserve`, reserve its bytes if it is not
-    /// yet pinned.
-    fn sync(&self, state: &mut PinState, reserve: bool) {
-        let active = state.holders > 0 && state.records > 0;
-        match state.binding.clone() {
-            Some(binding) if active => {
-                if !state.counted_leased {
-                    binding.budget.count_leased(binding.bytes, true);
-                    state.counted_leased = true;
-                }
-                if reserve && !state.reserved {
-                    state.reserved = binding.budget.try_reserve(binding.partition, binding.bytes);
+        let Some(index) = state
+            .admissions
+            .iter()
+            .position(|admission| Arc::ptr_eq(&admission.pinned, pinned))
+        else {
+            debug_assert!(false, "a live pin record must have an admission");
+            return;
+        };
+        let mut removed = state.admissions.swap_remove(index);
+        let is_reserved = removed.pinned.load(Ordering::Relaxed);
+        removed.release();
+        if is_reserved && state.holders > 0 {
+            // A replacement can arrive before the old record drops. Once
+            // its charge is released, retry the value's remaining admissions
+            // in that partition without disturbing other budgets.
+            for admission in &mut state.admissions {
+                if Arc::ptr_eq(&admission.budget, &removed.budget)
+                    && admission.partition == removed.partition
+                    && !admission.pinned.load(Ordering::Relaxed)
+                {
+                    admission.sync(true);
                 }
             }
-            _ => Self::unbind(state),
         }
-        self.pinned.store(state.reserved, Ordering::Release);
+        self.update_pinned(&state);
+    }
+
+    fn sync(&self, state: &mut PinState, is_leased: bool) {
+        for admission in &mut state.admissions {
+            admission.sync(is_leased);
+        }
+        self.update_pinned(state);
+    }
+
+    fn update_pinned(&self, state: &PinState) {
+        self.pinned.store(
+            state
+                .admissions
+                .iter()
+                .any(|admission| admission.pinned.load(Ordering::Relaxed)),
+            Ordering::Release,
+        );
     }
 }
 
@@ -324,12 +353,15 @@ impl CachePin {
 #[derive(Debug)]
 pub struct PinRecord {
     pin: Arc<CachePin>,
+    pinned: Arc<AtomicBool>,
 }
 
 impl PinRecord {
-    /// Whether the backend must keep the entry; see [`CachePin::is_pinned`].
+    /// Whether this admission is leased and holds its own budget reservation.
+    /// Another admission of the same value cannot provide eviction protection
+    /// for this record.
     pub fn is_pinned(&self) -> bool {
-        self.pin.is_pinned()
+        self.pinned.load(Ordering::Acquire)
     }
 
     /// The pin of the recorded value.
@@ -340,7 +372,7 @@ impl PinRecord {
 
 impl Drop for PinRecord {
     fn drop(&mut self) {
-        self.pin.drop_record();
+        self.pin.drop_record(&self.pinned);
     }
 }
 
@@ -357,7 +389,8 @@ impl CacheLease {
         &self.pin
     }
 
-    /// Whether the leased entry is pinned; see [`CachePin::is_pinned`].
+    /// Whether any admission of the leased value is pinned; see
+    /// [`CachePin::is_pinned`].
     pub fn is_pinned(&self) -> bool {
         self.pin.is_pinned()
     }
@@ -465,24 +498,99 @@ mod tests {
         assert_eq!(budget.stats().pinned_bytes, 0);
     }
 
-    #[test]
-    fn admission_to_another_budget_moves_the_pin() {
-        let (first, second) = (
-            Arc::new(PinBudget::new(1000, 1)),
-            Arc::new(PinBudget::new(1000, 1)),
+    #[rstest::rstest]
+    #[case::same_budget_same_charge(true, 100)]
+    #[case::same_budget_different_charge(true, 200)]
+    #[case::different_budgets(false, 200)]
+    fn admissions_keep_their_own_reservations(
+        #[case] is_same_budget: bool,
+        #[case] second_bytes: u64,
+        #[values(false, true)] is_reverse_drop: bool,
+    ) {
+        let first = Arc::new(PinBudget::new(1000, 1));
+        let second = if is_same_budget {
+            first.clone()
+        } else {
+            Arc::new(PinBudget::new(1000, 1))
+        };
+        let pin = CachePin::new();
+        let lease = CachePin::lease(&pin);
+        let first_record = CachePin::record(&pin, &first, 0, 100);
+        let second_record = CachePin::record(&pin, &second, 0, second_bytes);
+        assert!(first_record.is_pinned() && second_record.is_pinned());
+        assert_eq!(pin.admissions(), 2);
+        assert_eq!(
+            first.stats().pinned_bytes,
+            100 + if is_same_budget { second_bytes } else { 0 }
         );
+        assert_eq!(
+            second.stats().pinned_bytes,
+            second_bytes + if is_same_budget { 100 } else { 0 }
+        );
+
+        // All admissions share lease ownership, but release their own charges.
+        drop(lease);
+        assert!(!first_record.is_pinned() && !second_record.is_pinned());
+        assert_eq!(first.stats().pinned_bytes, 0);
+        assert_eq!(second.stats().leased_bytes, 0);
+        let _lease = CachePin::lease(&pin);
+        assert!(first_record.is_pinned() && second_record.is_pinned());
+
+        let (removed, kept, removed_budget, kept_budget, kept_bytes) = if is_reverse_drop {
+            (second_record, first_record, &second, &first, 100)
+        } else {
+            (first_record, second_record, &first, &second, second_bytes)
+        };
+        drop(removed);
+        assert_eq!(pin.admissions(), 1);
+        assert!(kept.is_pinned() && pin.is_pinned());
+        assert_eq!(kept_budget.stats().pinned_bytes, kept_bytes);
+        assert_eq!(kept_budget.stats().leased_bytes, kept_bytes);
+        assert_eq!(kept_budget.stats().pinned_entries, 1);
+        if !is_same_budget {
+            assert_eq!(removed_budget.stats().pinned_bytes, 0);
+            assert_eq!(removed_budget.stats().leased_entries, 0);
+        }
+        drop(kept);
+        assert_eq!(pin.admissions(), 0);
+        assert!(!pin.is_pinned());
+        assert_eq!(first.stats().pinned_bytes, 0);
+        assert_eq!(second.stats().leased_entries, 0);
+    }
+
+    #[test]
+    fn admission_overflow_and_retry_stay_in_their_partition() {
+        let budget = Arc::new(PinBudget::new(1000, 2));
         let pin = CachePin::new();
         let _lease = CachePin::lease(&pin);
-        let old = CachePin::record(&pin, &first, 0, 100);
-        assert_eq!(first.stats().pinned_bytes, 100);
-        let _new = CachePin::record(&pin, &second, 0, 100);
-        assert_eq!(first.stats().pinned_bytes, 0);
-        assert_eq!(second.stats().pinned_bytes, 100);
-        assert_eq!(pin.admissions(), 2);
-        drop(old);
-        // The pin is still admitted once, so it stays pinned.
-        assert_eq!(pin.admissions(), 1);
-        assert!(pin.is_pinned());
+        let first = CachePin::record(&pin, &budget, 0, 200);
+        let overflow = CachePin::record(&pin, &budget, 0, 200);
+        let other_partition = CachePin::record(&pin, &budget, 1, 200);
+        assert!(first.is_pinned() && other_partition.is_pinned());
+        assert!(!overflow.is_pinned());
+        assert!(pin.is_pinned() && pin.is_overflowed());
+        assert_eq!(budget.stats().pinned_bytes, 400);
+        assert_eq!(budget.stats().leased_bytes, 600);
+
+        drop(other_partition);
+        assert!(first.is_pinned());
+        assert!(
+            !overflow.is_pinned(),
+            "partitions cannot borrow pin capacity"
+        );
+        drop(first);
+        assert!(overflow.is_pinned());
+        assert!(!pin.is_overflowed());
+        assert_eq!(budget.stats().pinned_entries, 1);
+        drop(overflow);
+        assert_eq!(
+            budget.stats(),
+            PinnedStats {
+                cap_bytes: 500,
+                overflow: 1,
+                ..Default::default()
+            }
+        );
     }
 
     /// Admissions count records, not the copies of an entry that share one.
@@ -490,15 +598,51 @@ mod tests {
     fn admissions_count_records() {
         let budget = Arc::new(PinBudget::new(1000, 1));
         let pin = CachePin::new();
+        let _lease = CachePin::lease(&pin);
         assert_eq!(pin.admissions(), 0);
         let record = Arc::new(CachePin::record(&pin, &budget, 0, 100));
         let copy = record.clone();
         assert_eq!(pin.admissions(), 1);
+        assert_eq!(budget.stats().pinned_bytes, 100);
         let replacement = CachePin::record(&pin, &budget, 0, 100);
         assert_eq!(pin.admissions(), 2);
+        assert_eq!(budget.stats().pinned_bytes, 200);
         drop((record, copy));
         assert_eq!(pin.admissions(), 1);
+        assert_eq!(budget.stats().pinned_bytes, 100);
         drop(replacement);
         assert_eq!(pin.admissions(), 0);
+        assert_eq!(budget.stats().pinned_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_admissions_reserve_and_release_independently() {
+        let budget = Arc::new(PinBudget::new(1000, 2));
+        let pin = CachePin::new();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let _lease = CachePin::lease(&pin);
+                    let record = CachePin::record(&pin, &budget, 0, 100);
+                    barrier.wait();
+                    assert!(budget.stats().pinned_bytes <= 250);
+                    drop(record);
+                    for _ in 0..32 {
+                        let record = CachePin::record(&pin, &budget, 0, 100);
+                        if record.is_pinned() {
+                            assert!(budget.stats().pinned_bytes >= 100);
+                        }
+                        assert!(budget.stats().pinned_bytes <= 250);
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+        assert_eq!(pin.admissions(), 0);
+        assert_eq!(pin.holders(), 0);
+        assert_eq!(budget.stats().pinned_bytes, 0);
+        assert_eq!(budget.stats().leased_entries, 0);
+        assert!(budget.stats().overflow > 0);
     }
 }
