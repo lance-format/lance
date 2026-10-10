@@ -77,7 +77,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_encoding::constants::{
     COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
 };
@@ -107,7 +107,9 @@ use crate::{pb, pbold};
 
 /// On-disk format version of the index files. The format is unstable; bump
 /// on any layout change instead of adding compatibility paths.
-pub const MINHASH_LSH_INDEX_VERSION: u32 = 0;
+///
+/// Version 1 stores physical row addresses (`_rowaddr`) instead of row ids.
+pub const MINHASH_LSH_INDEX_VERSION: u32 = 1;
 /// Version of the signature generation behavior (the token streams of the
 /// tokenizers that ship with Lance, shingle hashing, permutation family, the
 /// 16-bit compression and the band keys); bumped whenever a
@@ -226,7 +228,7 @@ static BANDS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 fn signatures_schema(num_hashes: i32) -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
         Field::new(
             SIGNATURE_COL,
             DataType::FixedSizeList(
@@ -708,11 +710,18 @@ impl QuerySignature {
 
 /// One search hit: its Jaccard distance (`1 - estimated Jaccard`) and row id,
 /// ordered by distance and then row id.
+///
+/// The row id is the stored physical row address unless the search
+/// translated it (see [`MinHashLshIndex::search_signature_as_row_ids`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MinHashHit {
     pub distance: OrderedFloat,
     pub row_id: u64,
 }
+
+/// Translates a stored physical row address into the row id a search filters
+/// and reports it by, or `None` when the address has no live row.
+pub type RowAddrToRowId = dyn Fn(u64) -> Option<u64> + Send + Sync;
 
 /// Bounded collection of the `limit` best (smallest distance) hits.
 pub struct TopHits {
@@ -780,7 +789,9 @@ impl MinHashLshTrainingRequest {
     pub fn new(params: MinHashLshIndexParams) -> Self {
         Self {
             params,
-            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            // MinHash LSH indexes store physical row addresses rather than row
+            // ids, so an FRI can repair them after a rewrite.
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         }
     }
 }

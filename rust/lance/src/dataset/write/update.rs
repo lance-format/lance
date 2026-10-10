@@ -1671,11 +1671,11 @@ mod tests {
             .unwrap();
 
         // Need to use a row-id-domain index (while we still have one)
-        let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
         dataset
             .create_index(
                 &["str"],
-                IndexType::NGram,
+                IndexType::Inverted,
                 Some("str_idx".to_string()),
                 &scalar_params,
                 true,

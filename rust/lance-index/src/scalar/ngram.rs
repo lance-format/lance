@@ -44,7 +44,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_io::object_store::ObjectStore;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_tokenizer::{
@@ -61,7 +61,30 @@ pub(crate) use ngram_regex::regex_can_use_index;
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
 pub const POSTINGS_FILENAME: &str = "ngram_postings.lance";
-const NGRAM_INDEX_VERSION: u32 = 0;
+/// NGram index format version 0: the posting lists hold row ids (`_rowid`).
+///
+/// A row id and a row address are the same value on a dataset that does not
+/// use stable row ids, so a freshly built index is still labeled this version
+/// there even though training always scans addresses -- see
+/// `build_scalar_index`'s override of the trained version. That keeps a user
+/// who never turns on stable row ids from seeing any forward-compatibility
+/// impact from the address-domain migration: old builds already understand
+/// this version.
+pub const NGRAM_ROW_ID_DOMAIN_VERSION: u32 = 0;
+/// NGram index format version 1: the posting lists hold physical row
+/// addresses (`_rowaddr`).
+pub const NGRAM_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
+/// The latest index format version
+const NGRAM_INDEX_VERSION: u32 = NGRAM_ROW_ADDR_DOMAIN_VERSION;
+
+/// The format version that records `results_are_row_addresses`.
+fn ngram_index_version(results_are_row_addresses: bool) -> u32 {
+    if results_are_row_addresses {
+        NGRAM_ROW_ADDR_DOMAIN_VERSION
+    } else {
+        NGRAM_ROW_ID_DOMAIN_VERSION
+    }
+}
 
 /// An i32-offset Binary array can hold at most i32::MAX bytes of values in total,
 /// so a spill state whose serialized posting lists exceed that must be written as
@@ -332,6 +355,11 @@ pub struct NGramIndex {
     io_parallelism: usize,
     /// The store that owns the index
     store: Arc<dyn IndexStore>,
+    /// Whether the posting lists hold physical row addresses (`true`) or row
+    /// ids directly (`false`, a segment persisted before
+    /// [`NGRAM_ROW_ADDR_DOMAIN_VERSION`]). See
+    /// [`ScalarIndex::results_are_row_addresses`].
+    results_are_row_addresses: bool,
 }
 
 impl std::fmt::Debug for NGramIndex {
@@ -354,6 +382,7 @@ impl NGramIndex {
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
         let tokens = tokens
@@ -384,6 +413,7 @@ impl NGramIndex {
             list_reader: posting_reader,
             tokenizer: NGRAM_TOKENIZER.clone(),
             store,
+            results_are_row_addresses,
         })
     }
 
@@ -417,12 +447,19 @@ impl NGramIndex {
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
         Ok(Arc::new(
-            Self::from_store(store, frag_reuse_index, index_cache).await?,
+            Self::from_store(
+                store,
+                frag_reuse_index,
+                index_cache,
+                results_are_row_addresses,
+            )
+            .await?,
         ))
     }
 
@@ -432,9 +469,11 @@ impl NGramIndex {
         store: Arc<dyn IndexStore>,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        let mut index = Self::from_store(store, None, index_cache).await?;
+        let mut index =
+            Self::from_store(store, None, index_cache, results_are_row_addresses).await?;
         index.list_reader = Arc::new(NGramPostingListReader {
             reader: index.list_reader.reader.clone(),
             frag_reuse_index: None,
@@ -451,12 +490,17 @@ impl NGramIndex {
     /// Merge several built NGram segments (and optional new data) into a single
     /// canonical segment in `dest_store`, unioning their posting lists by token
     /// without rescanning the dataset.
+    ///
+    /// `results_are_row_addresses` is the domain every source segment (and
+    /// `new_data`) shares; the caller must not mix domains, since the posting
+    /// lists are unioned as-is. The merged segment is written in that domain.
     pub async fn merge_segments(
         segment_stores: &[Arc<dyn IndexStore>],
         new_data: Option<SendableRecordBatchStream>,
         dest_store: &dyn IndexStore,
         old_data_filters: &[Option<super::OldIndexDataFilter>],
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        results_are_row_addresses: bool,
     ) -> Result<CreatedIndex> {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
@@ -466,6 +510,7 @@ impl NGramIndex {
             dest_store,
             old_data_filters,
             frag_reuse_index,
+            results_are_row_addresses,
         )
         .await
     }
@@ -477,6 +522,7 @@ impl NGramIndex {
         dest_store: &dyn IndexStore,
         old_data_filters: &[Option<super::OldIndexDataFilter>],
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        results_are_row_addresses: bool,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         // Pure consolidation has no new rows, so skip `train` (and its
@@ -496,7 +542,7 @@ impl NGramIndex {
             .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())?,
-            index_version: NGRAM_INDEX_VERSION,
+            index_version: ngram_index_version(results_are_row_addresses),
             files: vec![file],
         })
     }
@@ -668,7 +714,10 @@ impl ScalarIndex for NGramIndex {
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())?,
-            index_version: NGRAM_INDEX_VERSION,
+            // Preserve this segment's own domain: remapping a row-id-domain
+            // segment (valid without stable row ids, where a row id already
+            // is a row address) must not silently flip it to address domain.
+            index_version: ngram_index_version(self.results_are_row_addresses),
             files: vec![file],
         })
     }
@@ -688,13 +737,21 @@ impl ScalarIndex for NGramIndex {
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())?,
-            index_version: NGRAM_INDEX_VERSION,
+            // New data is always scanned as row addresses, which only matches a
+            // row-id-domain segment where the two coincide (no stable row
+            // ids); the caller rebuilds such a segment otherwise. Either way
+            // the result keeps this segment's own domain.
+            index_version: ngram_index_version(self.results_are_row_addresses),
             files: vec![file],
         })
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        self.results_are_row_addresses
+    }
+
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -1113,8 +1170,8 @@ impl NGramIndexBuilder {
                 "First field in ngram index schema must be of type Utf8/LargeUtf8".into(),
             ));
         }
-        let row_id_field = schema.field_with_name(ROW_ID)?;
-        if *row_id_field.data_type() != DataType::UInt64 {
+        let row_addr_field = schema.field_with_name(ROW_ADDR)?;
+        if *row_addr_field.data_type() != DataType::UInt64 {
             return Err(Error::invalid_input_source(
                 "Second field in ngram index schema must be of type UInt64".into(),
             ));
@@ -1214,7 +1271,7 @@ impl NGramIndexBuilder {
     ) -> Result<Vec<Vec<(u32, u64)>>> {
         let text_iter = iter_str_array(batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?);
         let row_id_col = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .expect_ok()?
             .as_primitive::<UInt64Type>();
         // Guessing 1000 tokens per row to at least avoid some of the earlier allocations
@@ -1770,8 +1827,10 @@ impl BasicTrainer for NGramIndexPlugin {
             )
             .into()));
         }
+        // NGram indexes store physical row addresses rather than row ids, so
+        // an FRI can repair them after a rewrite.
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
 
@@ -1834,11 +1893,18 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(NGramIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        let results_are_row_addresses = index_version >= NGRAM_ROW_ADDR_DOMAIN_VERSION;
+        Ok(NGramIndex::load(
+            index_store,
+            frag_reuse_index,
+            cache,
+            results_are_row_addresses,
+        )
+        .await? as Arc<dyn ScalarIndex>)
     }
     fn supports_batch_row_id_remapping(&self) -> bool {
         true
@@ -1848,11 +1914,18 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(NGramIndex::load_with_remapping(index_store, remapping, cache).await?)
+        let results_are_row_addresses = index_version >= NGRAM_ROW_ADDR_DOMAIN_VERSION;
+        Ok(NGramIndex::load_with_remapping(
+            index_store,
+            remapping,
+            cache,
+            results_are_row_addresses,
+        )
+        .await?)
     }
 }
 
@@ -1876,7 +1949,7 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{TryStreamExt, stream};
     use itertools::Itertools;
-    use lance_core::{Error, ROW_ID, Result, cache::LanceCache, utils::tempfile::TempDir};
+    use lance_core::{Error, ROW_ADDR, Result, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
@@ -2002,7 +2075,7 @@ mod tests {
             .unwrap();
 
         (
-            NGramIndex::from_store(Arc::new(test_store), None, &LanceCache::no_cache())
+            NGramIndex::from_store(Arc::new(test_store), None, &LanceCache::no_cache(), true)
                 .await
                 .unwrap(),
             merging_flushes,
@@ -2047,7 +2120,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -2171,7 +2244,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -2258,7 +2331,7 @@ mod tests {
     fn test_data_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]))
     }
 
@@ -2330,7 +2403,7 @@ mod tests {
 
         index.update(data, test_store.as_ref(), None).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         assert_eq!(index.tokens.len(), 3);
@@ -2371,7 +2444,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         let row_ids = row_ids_in_index(&index).await;
@@ -2424,7 +2497,7 @@ mod tests {
 
         index.remap(&remap, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         let addr = |offset: u64| (10u64 << 32) | offset;
@@ -2446,7 +2519,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64 + 100));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -2467,7 +2540,7 @@ mod tests {
 
         index.update(data, test_store.as_ref(), None).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         let row_ids = row_ids_in_index(&index).await;
@@ -2584,7 +2657,7 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 lance_datagen::array::rand_utf8(ByteCount::from(50), false),
             )
-            .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
+            .col(ROW_ADDR, lance_datagen::array::step::<UInt64Type>())
             .into_reader_stream(RowCount::from(128), BatchCount::from(4));
 
         let data = Box::pin(RecordBatchStreamAdapter::new(

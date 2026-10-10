@@ -35,7 +35,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_index_core::remapping::{
@@ -54,7 +54,30 @@ use std::sync::{Arc, LazyLock};
 mod sort;
 
 pub const DEFAULT_RTREE_PAGE_SIZE: u32 = 4096;
-const RTREE_INDEX_VERSION: u32 = 0;
+/// RTree index format version 0: the index stores row ids (`_rowid`).
+///
+/// A row id and a row address are the same value on a dataset that does not
+/// use stable row ids, so a freshly built index is still labeled this version
+/// there even though training always scans addresses -- see
+/// `build_scalar_index`'s override of the trained version. That keeps a user
+/// who never turns on stable row ids from seeing any forward-compatibility
+/// impact from the address-domain migration: old builds already understand
+/// this version.
+pub const RTREE_ROW_ID_DOMAIN_VERSION: u32 = 0;
+/// RTree index format version 1: the index stores physical row addresses
+/// (`_rowaddr`).
+pub const RTREE_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
+/// The latest index format version
+const RTREE_INDEX_VERSION: u32 = RTREE_ROW_ADDR_DOMAIN_VERSION;
+
+/// The format version that records `results_are_row_addresses`.
+fn rtree_index_version(results_are_row_addresses: bool) -> u32 {
+    if results_are_row_addresses {
+        RTREE_ROW_ADDR_DOMAIN_VERSION
+    } else {
+        RTREE_ROW_ID_DOMAIN_VERSION
+    }
+}
 const RTREE_PAGES_NAME: &str = "page_data.lance";
 const RTREE_NULLS_NAME: &str = "nulls.lance";
 
@@ -80,11 +103,11 @@ static BBOX_FIELD: LazyLock<Arc<ArrowField>> = LazyLock::new(|| {
     let bbox_type = RectType::new(Dimension::XY, Default::default());
     Arc::new(bbox_type.to_field("bbox", false))
 });
-static BBOX_ROWID_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
-    let rowid_field = ArrowField::new(ROW_ID, DataType::UInt64, false);
+static BBOX_ROWADDR_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
+    let rowaddr_field = ArrowField::new(ROW_ADDR, DataType::UInt64, false);
     Arc::new(ArrowSchema::new(vec![
         BBOX_FIELD.clone(),
-        rowid_field.into(),
+        rowaddr_field.into(),
     ]))
 });
 static RTREE_PAGE_SCHEMA: LazyLock<Arc<ArrowSchema>> = LazyLock::new(|| {
@@ -307,6 +330,11 @@ pub struct RTreeIndex {
     index_cache: WeakLanceCache,
     pages_reader: Arc<dyn IndexReader>,
     nulls_reader: Arc<dyn IndexReader>,
+    /// Whether this segment stores physical row addresses (`true`) or row ids
+    /// directly (`false`, a segment persisted before
+    /// [`RTREE_ROW_ADDR_DOMAIN_VERSION`]). See
+    /// [`ScalarIndex::results_are_row_addresses`].
+    results_are_row_addresses: bool,
 }
 
 impl std::fmt::Debug for RTreeIndex {
@@ -319,10 +347,21 @@ impl std::fmt::Debug for RTreeIndex {
 }
 
 impl RTreeIndex {
+    /// Load a segment written in the current format, which stores physical
+    /// row addresses.
     pub async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        Self::load_in_domain(store, frag_reuse_index, index_cache, true).await
+    }
+
+    async fn load_in_domain(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
@@ -337,6 +376,7 @@ impl RTreeIndex {
             index_cache: WeakLanceCache::from(index_cache),
             pages_reader,
             nulls_reader,
+            results_are_row_addresses,
         }))
     }
 
@@ -346,6 +386,7 @@ impl RTreeIndex {
         store: Arc<dyn IndexStore>,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
@@ -361,6 +402,7 @@ impl RTreeIndex {
             index_cache: WeakLanceCache::from(index_cache),
             pages_reader,
             nulls_reader,
+            results_are_row_addresses,
         }))
     }
 
@@ -476,14 +518,15 @@ impl RTreeIndex {
         let batches = reader_stream
             .map(|fut| {
                 fut.map_ok(|batch| {
-                    RecordBatch::try_new(BBOX_ROWID_SCHEMA.clone(), batch.columns().into()).unwrap()
+                    RecordBatch::try_new(BBOX_ROWADDR_SCHEMA.clone(), batch.columns().into())
+                        .unwrap()
                 })
             })
             .map(|fut| fut.map_err(DataFusionError::from))
             .buffered(self.store.io_parallelism())
             .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWID_SCHEMA.clone(),
+            BBOX_ROWADDR_SCHEMA.clone(),
             batches,
         )))
     }
@@ -501,7 +544,7 @@ impl RTreeIndex {
         let merged = futures::stream::select(old_input, new_input);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWID_SCHEMA.clone(),
+            BBOX_ROWADDR_SCHEMA.clone(),
             merged,
         )))
     }
@@ -523,9 +566,9 @@ fn filter_rtree_data(
     let filtered = data.map(move |batch_result| {
         let batch = batch_result?;
         let row_ids = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| Error::internal("expected UInt64Array for RTree row ids"))?;
+            .ok_or_else(|| Error::internal("expected UInt64Array for RTree row addresses"))?;
         let mask = filter.filter_row_ids(row_ids);
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
@@ -539,7 +582,7 @@ fn remap_rtree_data(
     let schema = data.schema();
     let remapped = data.map(move |batch_result| {
         let batch = batch_result?;
-        // The row ID is column 1 in BBOX_ROWID_SCHEMA.
+        // The row address is column 1 in BBOX_ROWADDR_SCHEMA.
         Ok(remapper.remap_row_ids_record_batch(batch, 1)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
@@ -552,7 +595,7 @@ fn remap_rtree_data_async(
     let schema = data.schema();
     let remapped = data.and_then(move |batch| {
         let remapper = remapper.clone();
-        // The row ID is column 1 in BBOX_ROWID_SCHEMA.
+        // The row address is column 1 in BBOX_ROWADDR_SCHEMA.
         async move { Ok(remap_record_batch_async(remapper.as_ref(), batch, 1).await?) }
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
@@ -562,6 +605,9 @@ fn remap_rtree_data_async(
 ///
 /// Each source may supply a filter for rows that are still live. The merged index recomputes its
 /// bounding box from the retained, remapped rows and preserves retained null row IDs.
+///
+/// Every source must store the same kind of row identifier (see
+/// [`ScalarIndex::results_are_row_addresses`]); the merged index keeps it.
 ///
 /// # Examples
 ///
@@ -614,6 +660,16 @@ pub async fn merge_rtree_indices(
         .unwrap_or(&source_indices[0]);
     let page_size = first_contributing.metadata.page_size;
     validate_page_size(page_size)?;
+    let results_are_row_addresses = source_indices[0].results_are_row_addresses;
+    if source_indices
+        .iter()
+        .any(|source| source.results_are_row_addresses != results_are_row_addresses)
+    {
+        return Err(Error::invalid_input(
+            "cannot merge RTree segments that disagree on whether they store row ids or row \
+             addresses -- rebuild them into one segment first",
+        ));
+    }
     let mut data_streams = Vec::with_capacity(source_indices.len());
     let mut null_map = RowAddrTreeMap::new();
 
@@ -655,7 +711,7 @@ pub async fn merge_rtree_indices(
     }
 
     let combined = Box::pin(RecordBatchStreamAdapter::new(
-        BBOX_ROWID_SCHEMA.clone(),
+        BBOX_ROWADDR_SCHEMA.clone(),
         stream::select_all(data_streams),
     ));
     let tmpdir = Arc::new(TempDir::default());
@@ -672,7 +728,10 @@ pub async fn merge_rtree_indices(
 
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
-        index_version: RTREE_INDEX_VERSION,
+        // Preserve the sources' own domain rather than the latest version this
+        // build can write: merging row-id-domain segments (valid without
+        // stable row ids) must not silently flip the result to address domain.
+        index_version: rtree_index_version(results_are_row_addresses),
         files,
     })
 }
@@ -844,13 +903,21 @@ impl ScalarIndex for RTreeIndex {
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
-            index_version: RTREE_INDEX_VERSION,
+            // New data is always scanned as row addresses, which only matches a
+            // row-id-domain segment where the two coincide (no stable row
+            // ids); the caller rebuilds such a segment otherwise. Either way
+            // the result keeps this segment's own domain.
+            index_version: rtree_index_version(self.results_are_row_addresses),
             files,
         })
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        self.results_are_row_addresses
+    }
+
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -877,7 +944,9 @@ impl RTreeTrainingRequest {
     fn new(parameters: RTreeParameters) -> Self {
         Self {
             parameters,
-            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            // RTree indexes store physical row addresses rather than row ids,
+            // so an FRI can repair them after a rewrite.
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         }
     }
 }
@@ -911,8 +980,8 @@ impl RTreeIndexPlugin {
             ));
         }
 
-        let row_id_field = schema.field_with_name(ROW_ID)?;
-        if *row_id_field.data_type() != DataType::UInt64 {
+        let row_addr_field = schema.field_with_name(ROW_ADDR)?;
+        if *row_addr_field.data_type() != DataType::UInt64 {
             return Err(Error::invalid_input_source(
                 "Second field in RTree index schema must be of type UInt64".into(),
             ));
@@ -931,7 +1000,7 @@ impl RTreeIndexPlugin {
 
                 let bbox_schema = Arc::new(ArrowSchema::new(vec![
                     bbox_array.extension_type().clone().to_field("bbox", true),
-                    ArrowField::new(ROW_ID, DataType::UInt64, false),
+                    ArrowField::new(ROW_ADDR, DataType::UInt64, false),
                 ]));
                 RecordBatch::try_new(
                     bbox_schema,
@@ -941,7 +1010,7 @@ impl RTreeIndexPlugin {
             });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWID_SCHEMA.clone(),
+            BBOX_ROWADDR_SCHEMA.clone(),
             bbox_stream,
         )))
     }
@@ -960,7 +1029,7 @@ impl RTreeIndexPlugin {
         let schema = data.schema();
 
         let mut writer = spill_store
-            .new_index_file("analyze.tmp", BBOX_ROWID_SCHEMA.clone())
+            .new_index_file("analyze.tmp", BBOX_ROWADDR_SCHEMA.clone())
             .await?;
 
         while let Some(batch) = data.try_next().await? {
@@ -1250,11 +1319,18 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(RTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        let results_are_row_addresses = index_version >= RTREE_ROW_ADDR_DOMAIN_VERSION;
+        Ok(RTreeIndex::load_in_domain(
+            index_store,
+            frag_reuse_index,
+            cache,
+            results_are_row_addresses,
+        )
+        .await? as Arc<dyn ScalarIndex>)
     }
     fn supports_batch_row_id_remapping(&self) -> bool {
         true
@@ -1264,11 +1340,18 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(RTreeIndex::load_with_remapping(index_store, remapping, cache).await?)
+        let results_are_row_addresses = index_version >= RTREE_ROW_ADDR_DOMAIN_VERSION;
+        Ok(RTreeIndex::load_with_remapping(
+            index_store,
+            remapping,
+            cache,
+            results_are_row_addresses,
+        )
+        .await?)
     }
 }
 
@@ -1321,7 +1404,7 @@ mod tests {
     ) -> SendableRecordBatchStream {
         let schema = Arc::new(Schema::new(vec![
             geo_array.data_type().to_field(VALUE_COLUMN_NAME, true),
-            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let batch =
@@ -1549,7 +1632,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
         let batch = RecordBatch::try_new(
-            BBOX_ROWID_SCHEMA.clone(),
+            BBOX_ROWADDR_SCHEMA.clone(),
             vec![
                 bounds.into_array_ref(),
                 Arc::new(UInt64Array::from(vec![0])),
@@ -1557,7 +1640,7 @@ mod tests {
         )
         .unwrap();
         let stream = Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWID_SCHEMA.clone(),
+            BBOX_ROWADDR_SCHEMA.clone(),
             stream::once(async move { Ok(batch) }),
         ));
 
@@ -1684,7 +1767,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
         let old_batch = RecordBatch::try_new(
-            BBOX_ROWID_SCHEMA.clone(),
+            BBOX_ROWADDR_SCHEMA.clone(),
             vec![
                 empty_bounds.clone().into_array_ref(),
                 Arc::new(UInt64Array::from(vec![0])),
@@ -1692,7 +1775,7 @@ mod tests {
         )
         .unwrap();
         let old_stream = Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWID_SCHEMA.clone(),
+            BBOX_ROWADDR_SCHEMA.clone(),
             stream::once(async move { Ok(old_batch) }),
         ));
         RTreeIndexPlugin::train_rtree_index(

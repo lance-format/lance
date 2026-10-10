@@ -21,7 +21,7 @@ The N-gram index stores tokenized text as trigrams with their posting lists:
 | Column         | Type   | Nullable | Description                                       |
 |----------------|--------|----------|---------------------------------------------------|
 | `tokens`       | UInt32 | true     | Hashed trigram token                              |
-| `posting_list` | Binary | false    | Compressed bitmap of row IDs containing the token |
+| `posting_list` | Binary | false    | Compressed bitmap of the physical row addresses (`fragment_id << 32 \| offset`) containing the token. A segment persisted before format version 1 (`IndexMetadata::index_version`) stores row ids here instead. |
 
 ## Accelerated Queries
 
