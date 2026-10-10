@@ -1617,6 +1617,22 @@ def test_get_fragments(tmp_path: Path):
     assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})
 
 
+def test_fragment_ids(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(10)}), tmp_path, max_rows_per_file=2)
+    dataset = lance.dataset(tmp_path)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
+    dataset.delete("a < 4")
+    assert list(dataset.fragment_ids()) == [2, 3, 4]
+
+    dataset.create_scalar_index("a", "BTREE")
+    lance.write_dataset(pa.table({"a": range(2)}), tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    (index,) = dataset.describe_indices()
+    indexed = index.segments[0].fragment_ids
+    assert list(dataset.fragment_ids() - indexed) == [5]
+
+
 def test_pickle_fragment(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
