@@ -99,7 +99,9 @@ use crate::index::vector::utils::infer_vector_dim;
 
 use super::v2::IVFIndex;
 use super::{
+    has_unowned_fragment_rows,
     ivf::load_precomputed_partitions_if_available,
+    remap_for_owned_fragments, resolve_shared_remap,
     utils::{self, get_vector_type},
 };
 
@@ -201,9 +203,23 @@ fn apply_centroid_splits(
 async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     index: &IVFIndex<S, Q>,
     partition_id: usize,
-    mapping: &RowAddrRemap,
+    mapping: Arc<RowAddrRemap>,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<(Q::Storage, S)> {
     let old_storage = index.load_partition_storage(partition_id, None).await?;
+    let filtered_mapping;
+    let mapping = if let Some(owned_fragments) = owned_fragments
+        && has_unowned_fragment_rows(old_storage.row_ids().copied(), owned_fragments)
+    {
+        filtered_mapping = remap_for_owned_fragments(
+            mapping.clone(),
+            old_storage.row_ids().copied(),
+            owned_fragments,
+        );
+        &filtered_mapping
+    } else {
+        mapping.as_ref()
+    };
     let storage = old_storage.remap(mapping)?;
     let graph = index.read_sub_index_batch(partition_id, None, None).await?;
 
@@ -597,17 +613,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// per-partition tasks are `'static`, so the map is shared through an
     /// owned translator (the same clone this method always made).
     pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
-        self.remap_with(RowAddrTranslator::sync(mapping.clone()))
+        self.remap_with(RowAddrTranslator::sync(mapping.clone()), None)
             .await
     }
 
     /// Remap through a translator whose payload may need reads, one
     /// partition's addresses at a time.
     pub async fn remap_streaming(&mut self, mapping: &RowAddrTranslator) -> Result<Vec<IndexFile>> {
-        self.remap_with(mapping.clone()).await
+        self.remap_with(mapping.clone(), None).await
     }
 
-    async fn remap_with(&mut self, mapping: RowAddrTranslator) -> Result<Vec<IndexFile>> {
+    pub async fn remap_streaming_with_ownership(
+        &mut self,
+        mapping: &RowAddrTranslator,
+        owned_fragments: Option<&RoaringBitmap>,
+    ) -> Result<Vec<IndexFile>> {
+        self.remap_with(mapping.clone(), owned_fragments).await
+    }
+
+    async fn remap_with(
+        &mut self,
+        mapping: RowAddrTranslator,
+        owned_fragments: Option<&RoaringBitmap>,
+    ) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -619,9 +647,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
+        let owned_fragments = owned_fragments.cloned().map(Arc::new);
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
             let existing_index = existing_index.clone();
             let mapping = mapping.clone();
+            let owned_fragments = owned_fragments.clone();
             async move {
                 let ivf_index = existing_index
                     .as_any()
@@ -634,12 +664,33 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 // One partition's addresses are the unit of translation; the
                 // partition itself is the working set it always was.
                 let row_ids: Vec<u64> = part.storage.row_ids().copied().collect();
-                let mapping = mapping.resolve(row_ids).await?;
+                let mapping = resolve_shared_remap(&mapping, row_ids).await?;
                 let (storage, index) = if S::name() == HNSW::name() {
-                    remap_hnsw_partition(ivf_index, part_id, &mapping).await?
+                    remap_hnsw_partition(
+                        ivf_index,
+                        part_id,
+                        mapping.clone(),
+                        owned_fragments.as_deref(),
+                    )
+                    .await?
                 } else {
-                    let storage = part.storage.remap(&mapping)?;
-                    let index = part.index.remap(&mapping, &storage)?;
+                    let filtered_mapping;
+                    let mapping = if let Some(owned_fragments) = owned_fragments.as_deref()
+                        && has_unowned_fragment_rows(
+                            part.storage.row_ids().copied(),
+                            owned_fragments,
+                        ) {
+                        filtered_mapping = remap_for_owned_fragments(
+                            mapping.clone(),
+                            part.storage.row_ids().copied(),
+                            owned_fragments,
+                        );
+                        &filtered_mapping
+                    } else {
+                        mapping.as_ref()
+                    };
+                    let storage = part.storage.remap(mapping)?;
+                    let index = part.index.remap(mapping, &storage)?;
                     (storage, index)
                 };
                 Result::Ok(Budgeted::untracked(PartitionBuildResult {
