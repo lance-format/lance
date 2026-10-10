@@ -548,6 +548,8 @@ mod evolve {
         use datafusion::prelude::{col, lit};
         use lance_index::scalar::ScalarIndexParams;
 
+        use crate::dataset::mem_wal::memtable::scanner::newest_checks;
+
         let schema = create_test_schema(4);
         let uri = format!("shared-memory://evolve-filter-{}/", Uuid::new_v4().simple());
         let mut dataset = Dataset::write(
@@ -583,12 +585,27 @@ mod evolve {
             )
             .await
             .unwrap();
+        // Filler rows, sorting below every filter, give each memtable a match
+        // budget above zero, so a selective filter is read from the indexes.
+        let filler = |first: i64| -> Vec<(i64, String)> {
+            (first..first + 64)
+                .map(|id| (id, format!("aaa{id}")))
+                .collect()
+        };
+        fn as_rows(rows: &[(i64, String)]) -> Vec<(i64, &str)> {
+            rows.iter().map(|(id, text)| (*id, text.as_str())).collect()
+        }
+        let (old_filler, new_filler) = (filler(1000), filler(2000));
         // Key 102 is rewritten under the old name, key 103 under the new one.
         writer
             .put(vec![rows_under(
                 &schema,
                 &[(101, "alpha"), (102, "beta"), (103, "gamma")],
             )])
+            .await
+            .unwrap();
+        writer
+            .put(vec![rows_under(&schema, &as_rows(&old_filler))])
             .await
             .unwrap();
         writer
@@ -603,6 +620,10 @@ mod evolve {
         let evolved: ArrowSchema = dataset.schema().into();
         writer
             .put(vec![rows_under(&evolved, &[(103, "gamma again")])])
+            .await
+            .unwrap();
+        writer
+            .put(vec![rows_under(&evolved, &as_rows(&new_filler))])
             .await
             .unwrap();
 
@@ -631,14 +652,23 @@ mod evolve {
                 .with_memtable_filter_indexes(enabled)
                 .filter_expr(filter.clone());
                 let plan = scanner.create_plan().await.unwrap();
-                let shown = datafusion::physical_plan::displayable(plan.as_ref())
-                    .indent(true)
-                    .to_string();
-                assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
-                let batch = scanner.try_into_batch().await.unwrap();
-                let mut ids = batch["id"].as_primitive::<Int64Type>().values().to_vec();
+                let batches = datafusion::physical_plan::collect(
+                    plan.clone(),
+                    datafusion::prelude::SessionContext::new().task_ctx(),
+                )
+                .await
+                .unwrap();
+                let mut ids: Vec<i64> = batches
+                    .iter()
+                    .flat_map(|batch| batch["id"].as_primitive::<Int64Type>().values().to_vec())
+                    .collect();
                 ids.sort_unstable();
                 assert_eq!(ids, expected, "{filter} with filter indexes {enabled}");
+                assert_eq!(
+                    newest_checks(&plan) > 0,
+                    enabled,
+                    "{filter}: the indexes' matches are checked only when enabled"
+                );
             }
         }
         writer.close().await.unwrap();

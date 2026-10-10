@@ -35,7 +35,7 @@ use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_p
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// An index may decline a search matching more than the visible rows divided
-/// by this; reading them all is then cheaper.
+/// by this; reading them all is then expected to be cheaper.
 const MATCH_BUDGET_DIVISOR: u64 = 16;
 
 /// Matches always worth listing, however few rows are visible.
@@ -47,6 +47,9 @@ const NEWEST_CHECK_MATCH_BUDGET_DIVISOR: u64 = 8;
 
 /// Metric counting the matches checked for being their key's newest version.
 pub const NEWEST_CHECKS_METRIC: &str = "newest_checks";
+
+/// Metric counting reads that matched too many rows and read every row instead.
+pub const FALLBACK_READS_METRIC: &str = "fallback_reads";
 
 /// Execution-plan node answering a filter from the memtable's indexes,
 /// filtered by visibility.
@@ -169,7 +172,8 @@ impl ScalarMemIndexExec {
         }
         let result = evaluate_index_filter(&self.index_expr, &self.indexes, &ctx)?;
         let exact = result.is_exact();
-        // An index may list past its budget; the fallback is then cheaper.
+        // An index may list past its budget; reading every row is then expected
+        // to be cheaper.
         let past_budget = self.broad_fallback.is_some() && result.at_most.len() > budget;
         Ok(if past_budget || result.at_most.len() == visible_rows {
             (None, exact)
@@ -193,6 +197,7 @@ impl ScalarMemIndexExec {
         let mut next = 0;
         for stored in self.batch_store.iter().take(self.readable_count) {
             let start = stored.row_offset;
+            let mut newest_checked = false;
             let end = start + stored.num_rows as u64;
             // The rows read, and their positions; `None` when they are the
             // whole batch.
@@ -212,11 +217,31 @@ impl ScalarMemIndexExec {
                     if in_batch.len() == stored.num_rows {
                         (scan_record_batch(&stored.data)?, None)
                     } else {
+                        // Drop stale versions before gathering, so their
+                        // columns are never copied.
+                        let in_batch = match (&self.newest_of, max_readable_row) {
+                            (Some(pk_indices), Some(max_readable_row)) => {
+                                newest_checks.add(in_batch.len());
+                                let survivors = self.newest_of_rows(
+                                    &stored.data,
+                                    in_batch,
+                                    start,
+                                    pk_indices,
+                                    max_readable_row,
+                                )?;
+                                newest_checked = true;
+                                if survivors.is_empty() {
+                                    continue;
+                                }
+                                survivors
+                            }
+                            _ => in_batch.to_vec(),
+                        };
                         let rows = UInt32Array::from_iter_values(
                             in_batch.iter().map(|position| (position - start) as u32),
                         );
                         let taken = take_record_batch(&stored.data, &rows)?;
-                        (scan_record_batch(&taken)?, Some(in_batch.to_vec()))
+                        (scan_record_batch(&taken)?, Some(in_batch))
                     }
                 }
                 None => (scan_record_batch(&stored.data)?, None),
@@ -234,7 +259,8 @@ impl ScalarMemIndexExec {
                 };
                 (data, positions) = retain(data, positions, start, &keep)?;
             }
-            if let (Some(pk_indices), Some(max_readable_row)) = (&self.newest_of, max_readable_row)
+            if let (false, Some(pk_indices), Some(max_readable_row)) =
+                (newest_checked, &self.newest_of, max_readable_row)
             {
                 newest_checks.add(data.num_rows());
                 let keep = self.keep_newest(
@@ -278,6 +304,34 @@ impl ScalarMemIndexExec {
         Ok(results)
     }
 
+    /// The `positions` in `stored`, a batch starting at `start`, that are their
+    /// key's newest visible version.
+    fn newest_of_rows(
+        &self,
+        stored: &RecordBatch,
+        positions: &[u64],
+        start: u64,
+        pk_indices: &[usize],
+        max_readable_row: u64,
+    ) -> DataFusionResult<Vec<u64>> {
+        let mut values = Vec::with_capacity(pk_indices.len());
+        let mut survivors = Vec::new();
+        for &position in positions {
+            let row = (position - start) as usize;
+            if self.is_newest(
+                stored,
+                row,
+                position,
+                pk_indices,
+                max_readable_row,
+                &mut values,
+            )? {
+                survivors.push(position);
+            }
+        }
+        Ok(survivors)
+    }
+
     /// Which of `data`'s rows are their key's newest visible version: one seek
     /// in the primary-key index per row. `positions` are the rows' positions,
     /// or `None` when `data` is the whole batch starting at `start`.
@@ -293,17 +347,37 @@ impl ScalarMemIndexExec {
         let mut keep = BooleanBufferBuilder::new(rows);
         let mut values = Vec::with_capacity(pk_indices.len());
         for row in 0..rows {
-            values.clear();
-            for &column in pk_indices {
-                values.push(ScalarValue::try_from_array(data.column(column), row)?);
-            }
             let position = positions.map_or(start + row as u64, |positions| positions[row]);
-            keep.append(
-                self.indexes
-                    .pk_is_newest(&values, position, max_readable_row),
-            );
+            keep.append(self.is_newest(
+                data,
+                row,
+                position,
+                pk_indices,
+                max_readable_row,
+                &mut values,
+            )?);
         }
         Ok(BooleanArray::new(keep.finish(), None))
+    }
+
+    /// Whether `data`'s row `row`, at `position`, is its key's newest visible
+    /// version: one seek in the primary-key index. `values` is scratch space.
+    fn is_newest(
+        &self,
+        data: &RecordBatch,
+        row: usize,
+        position: u64,
+        pk_indices: &[usize],
+        max_readable_row: u64,
+        values: &mut Vec<ScalarValue>,
+    ) -> DataFusionResult<bool> {
+        values.clear();
+        for &column in pk_indices {
+            values.push(ScalarValue::try_from_array(data.column(column), row)?);
+        }
+        Ok(self
+            .indexes
+            .pk_is_newest(values, position, max_readable_row))
     }
 }
 
@@ -396,6 +470,9 @@ impl ExecutionPlan for ScalarMemIndexExec {
         if positions.is_none()
             && let Some(fallback) = &self.broad_fallback
         {
+            MetricBuilder::new(&self.metrics)
+                .counter(FALLBACK_READS_METRIC, partition)
+                .add(1);
             return fallback.execute(partition, context);
         }
 

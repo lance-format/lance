@@ -1443,7 +1443,7 @@ impl MemTableScanner {
 mod tests {
     use super::*;
 
-    use crate::dataset::mem_wal::memtable::scanner::newest_checks;
+    use crate::dataset::mem_wal::memtable::scanner::{fallback_reads, newest_checks};
 
     /// A deduplicated filtered read from the filter indexes returns what
     /// reading every row returns, across overwrites, deletes, rows not yet
@@ -1664,6 +1664,7 @@ mod tests {
                 "{filter}"
             );
             assert_eq!(newest_checks(&plan) > 0, checked, "{filter}");
+            assert_eq!(fallback_reads(&plan), usize::from(!checked), "{filter}");
         }
     }
 

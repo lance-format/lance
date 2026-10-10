@@ -2404,8 +2404,6 @@ mod integration_tests {
             for filter in FILTERS {
                 for projection in [None, Some(vec!["id", "cat"])] {
                     for (limit, offset) in [(None, None), (Some(3), None), (Some(4), Some(2))] {
-                        let checks_cell = std::cell::RefCell::new(0usize);
-                        let checks = &checks_cell;
                         let read = |enabled: bool| {
                             let mut scanner = LsmScanner::new(
                                 base.clone(),
@@ -2433,7 +2431,6 @@ mod integration_tests {
                                 )
                                 .await
                                 .unwrap();
-                                *checks.borrow_mut() += newest_checks(&plan);
                                 let mut out: Vec<(i32, Option<i32>)> = Vec::new();
                                 for batch in &batches {
                                     let id = batch.column_by_name("id").unwrap();
@@ -2448,23 +2445,27 @@ mod integration_tests {
                                     }
                                 }
                                 out.sort_unstable();
-                                out
+                                (out, newest_checks(&plan))
                             }
                         };
                         let context = format!(
                             "round {round}, filter {filter}, projection {projection:?}, limit {limit:?}, offset {offset:?}"
                         );
-                        let full = read(false).await;
-                        assert_eq!(*checks.borrow(), 0, "{context}: the setting is off");
-                        let from_indexes = read(true).await;
-                        if *checks.borrow() > 0 {
+                        let (full, checks) = read(false).await;
+                        assert_eq!(checks, 0, "{context}: the setting is off");
+                        let (from_indexes, checks) = read(true).await;
+                        if checks > 0 {
                             index_reads += 1;
                         }
                         if limit.is_none() {
                             assert_eq!(from_indexes, full, "{context}");
                         } else {
-                            // An unordered limit may return any rows that match.
+                            // An unordered limit may return any rows that match,
+                            // each key once.
                             assert_eq!(from_indexes.len(), full.len(), "{context}");
+                            let mut ids: Vec<i32> = from_indexes.iter().map(|row| row.0).collect();
+                            ids.dedup();
+                            assert_eq!(ids.len(), from_indexes.len(), "{context}: a key twice");
                             let mut all =
                                 read_all(&base, &snapshot, shard_id, &in_memory, filter).await;
                             all.sort_unstable();
