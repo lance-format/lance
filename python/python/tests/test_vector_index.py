@@ -182,20 +182,25 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
 
 
 @pytest.mark.parametrize(
-    "index_type,index_options",
+    "index_type,index_options,dtype,refine_factor",
     [
-        ("IVF_FLAT", {}),
-        ("IVF_PQ", {"num_sub_vectors": 16, "num_bits": 4}),
-        ("IVF_SQ", {}),
-        ("IVF_RQ", {"num_bits": 5}),
-        ("IVF_HNSW_FLAT", {}),
-        ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}),
-        ("IVF_HNSW_SQ", {}),
+        ("IVF_FLAT", {}, np.float32, None),
+        ("IVF_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, None),
+        ("IVF_SQ", {}, np.float32, None),
+        ("IVF_RQ", {"num_bits": 5}, np.float32, None),
+        ("IVF_HNSW_FLAT", {}, np.float32, None),
+        ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, None),
+        ("IVF_HNSW_SQ", {}, np.float32, None),
+        ("IVF_FLAT", {}, np.float16, None),
+        ("IVF_FLAT", {}, np.float64, None),
+        ("IVF_FLAT", {}, np.float32, 2),
+        ("IVF_RQ", {"num_bits": 5}, np.float32, 2),
+        ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, 2),
     ],
 )
 @pytest.mark.parametrize("segments", [1, 2])
 def test_auto_probe_index_types(
-    tmp_path, monkeypatch, index_type, index_options, segments
+    tmp_path, monkeypatch, index_type, index_options, dtype, refine_factor, segments
 ):
     centroids = 4 * np.eye(16, dtype=np.float32)
     vectors = np.tile(np.repeat(centroids, 16, axis=0), (segments, 1))
@@ -205,8 +210,15 @@ def test_auto_probe_index_types(
     vectors += (
         np.random.default_rng(2254).normal(0, 0.0001, vectors.shape).astype(np.float32)
     )
-    table = vec_to_table(vectors).append_column("id", pa.array(np.arange(len(vectors))))
+    vectors = vectors.astype(dtype)
+    table = pa.table(
+        {
+            "vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 16),
+            "id": pa.array(np.arange(len(vectors))),
+        }
+    )
     dataset = lance.write_dataset(table, tmp_path / "ds.lance", max_rows_per_file=64)
+    assert dataset.schema.field("vector").type.value_type == pa.from_numpy_dtype(dtype)
     if "PQ" in index_type:
         # Keep this routing regression independent of stochastic PQ training.
         codewords = np.arange(16, dtype=np.float32) * 0.05
@@ -231,7 +243,13 @@ def test_auto_probe_index_types(
     )
     assert dataset.stats.index_stats("vector_idx")["num_segments"] == segments
     query = centroids[0] * 1.03
-    nearest = {"column": "vector", "q": query, "k": 10, "metric": "l2"}
+    nearest = {
+        "column": "vector",
+        "q": query,
+        "k": 10,
+        "metric": "l2",
+        "refine_factor": refine_factor,
+    }
     expected = set(np.argsort(np.sum((vectors - query) ** 2, axis=1))[:10].tolist())
 
     def search(nearest, **options):
@@ -263,8 +281,9 @@ def test_auto_probe_index_types(
     assert partitions > 2 * segments
 
     monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
-    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
-        search(nearest)
+    for k in (10, 10_000, 100_000):
+        with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+            search({**nearest, "k": k})
     # Explicit budgets still bypass Auto's overrides for every index type.
     assert search({**nearest, "nprobes": 2}) == (fixed_ids, fixed_partitions)
 
@@ -1696,7 +1715,7 @@ def test_create_ivf_rq_mostly_null():
     assert result.num_rows == 10
 
 
-def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
+def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch):
     rng = np.random.default_rng(42)
     query = rng.random((5, 128))
     results = indexed_multivec_dataset.scanner(
@@ -1739,6 +1758,20 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
             results["_distance"][i].as_py() * 2
             == doubled_results["_distance"][i].as_py()
         )
+
+    # Multivector routing uses Auto's configuration, including with refinement.
+    with monkeypatch.context() as overrides:
+        overrides.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+        for refine_factor in (None, 2):
+            with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+                indexed_multivec_dataset.to_table(
+                    nearest={
+                        "column": "vector",
+                        "q": query,
+                        "k": 100,
+                        "refine_factor": refine_factor,
+                    }
+                )
 
     # query with a vector that dim not match
     query = rng.random(256)

@@ -5,10 +5,11 @@ Six metric/k profiles were calibrated on the original five full corpora. All
 with a range of **95.8369%–96.3323%**. The independent returned-ID audit passes
 all 70 native policy groups and all matched baseline comparisons.
 
-These profiles are an isolated experiment at two exact k values. The runtime
-implementation in this PR still enables the calibrated profiles through k=1000.
-The experiment does not validate interpolation to other k values, quantized or
-HNSW indices, other vector types, or filtered recall. See
+The current default policy uses the k=10000 profile for k=1001..10000 and the
+k=100000 profile for k=10001..100000, across IVF index types, vector types and
+refinement factors. This report records the original experiment at two exact k
+values. It does not establish recall for intermediate k values, quantized or
+HNSW indices, other vector types, refinement, or filtered queries. See
 [LARGE_K_PROTOCOL.md](LARGE_K_PROTOCOL.md) for the frozen contract.
 
 ## Frozen parameters
@@ -43,7 +44,7 @@ Strict-ID recall uses every held-out query. Latency uses the first 512 serial qu
 
 ## Actual baseline comparison
 
-These rows compare exactly the same 32 queries in the original main binary and the experimental binary, with interleaved serial timing. Recall differs, so the ratios describe policy tradeoffs at their observed recall. They are measurements of the recorded experimental patch. The Rust implementation in this PR enables calibrated Auto through k=1000; the larger-k profiles in this report remain experimental.
+These rows compare exactly the same 32 queries in the original main binary and the experimental binary, with interleaved serial timing. Recall differs, so the ratios describe policy tradeoffs at their observed recall. They are historical measurements of the recorded experimental patch, not new latency measurements of the current PR head. The measured profiles are now used by the default policy through k=100000.
 
 Both binaries use the same r8i.8xlarge, release-with-debug profile, CPU affinity 0-15, 16 Lance/Rayon threads, one BLAS/OMP thread, query_parallelism=1, frozen IVF_FLAT indices, and prewarmed caches. Every query reports zero storage bytes read. DINO/LAION/FineWeb each contain 10M rows, Wiki-Cohere 35M, and DPR 21,015,300. Latency quantiles describe one pass, not repeated-run confidence intervals.
 

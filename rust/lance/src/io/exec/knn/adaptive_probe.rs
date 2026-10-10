@@ -13,9 +13,10 @@
 //! The caller minimum takes precedence over the learned cap, while the caller
 //! maximum and available candidate count limit the final initial budget.
 //! Explicit fixed nprobes bypasses both the heuristic and these overrides.
-//! Ordinary Float32 queries using L2, cosine, or dot with k <= 1000 use these
-//! profiles across IVF index types. The policy selects partitions from centroid
-//! distances independently of quantization or the search within each partition.
+//! Queries using L2, cosine, or dot with k <= 100000 use these profiles across IVF
+//! index types, vector types, and refinement factors. The policy selects partitions
+//! from centroid distances independently of query values, quantization, or the
+//! search within each partition.
 //! Larger k, Hamming, and explicitly bounded Auto queries retain their existing
 //! heuristic and ignore these overrides.
 //! Dot uses the magnitude of the best centroid inner product to scale its gap,
@@ -24,8 +25,6 @@
 
 use std::env;
 
-use arrow_array::{Array, cast::AsArray};
-use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use lance_index::vector::{Query, VectorIndex};
 use lance_linalg::distance::DistanceType;
@@ -43,40 +42,24 @@ pub(super) enum AutoProbePolicy {
 }
 
 impl AutoProbePolicy {
-    pub(super) fn from_env(
-        query: &Query,
-        index: &dyn VectorIndex,
-        vector_type: &DataType,
-    ) -> DataFusionResult<Self> {
-        Self::select_with_config(query, index, vector_type, AutoProbeConfig::from_env)
+    pub(super) fn from_env(query: &Query, index: &dyn VectorIndex) -> DataFusionResult<Self> {
+        Self::select_with_config(query, index, AutoProbeConfig::from_env)
     }
 
     pub(super) fn select_with_config(
         query: &Query,
         index: &dyn VectorIndex,
-        vector_type: &DataType,
         read_config: impl FnOnce(&Query, DistanceType) -> DataFusionResult<Option<AutoProbeConfig>>,
     ) -> DataFusionResult<Self> {
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(Self::Fixed);
         }
         if query.maximum_nprobes.is_some()
-            || query.key.data_type() != &DataType::Float32
-            || query.key.null_count() != 0
-            || !matches!(vector_type, DataType::FixedSizeList(item, dimension)
-                if item.data_type() == &DataType::Float32 && *dimension as usize == query.key.len())
             || !matches!(
                 index.metric_type(),
                 DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
             )
-            || query.k > 1000
-            || query.refine_factor.is_some_and(|factor| factor > 1)
-            || !query
-                .key
-                .as_primitive::<arrow_array::types::Float32Type>()
-                .values()
-                .iter()
-                .all(|x| x.is_finite())
+            || query.k > 100_000
         {
             return Ok(Self::Legacy);
         }
@@ -181,30 +164,33 @@ impl AutoProbeConfig {
             11..=100 => 2,
             101..=200 => 3,
             201..=500 => 4,
-            _ => 5,
+            501..=1000 => 5,
+            1001..=10_000 => 6,
+            _ => 7,
         };
         // Profiles depend only on metric and k; every index uses the same values.
         // Larger-k buckets are calibrated at their upper endpoints on separate
         // queries from the native evaluation (benchmarks/auto-ivf-large-k).
-        // Reusing the k=1000 profile beyond its range loses recall, so the policy
-        // gate retains legacy probing there rather than extrapolating a cap.
+        // Each bucket uses its measured upper-endpoint profile; measurements do
+        // not establish recall guarantees for every intermediate k. The policy
+        // gate retains legacy probing above the largest calibrated endpoint.
         let (default_margin, default_minimum, cap) = match metric {
             DistanceType::L2 => (
-                [0.2175, 0.265, 0.33, 0.375, 0.3725, 0.4175][bucket],
-                [5, 6, 11, 15, 22, 29][bucket],
-                [19, 24, 38, 56, 81, 93][bucket],
+                [0.2175, 0.265, 0.33, 0.375, 0.3725, 0.4175, 0.57, 0.75][bucket],
+                [5, 6, 11, 15, 22, 29, 98, 463][bucket],
+                [19, 24, 38, 56, 81, 93, 238, 704][bucket],
             ),
             DistanceType::Cosine => (
-                [0.235, 0.2875, 0.38, 0.415, 0.45, 0.47][bucket],
-                [3, 8, 7, 18, 28, 34][bucket],
-                [50, 77, 106, 156, 192, 248][bucket],
+                [0.235, 0.2875, 0.38, 0.415, 0.45, 0.47, 0.6475, 0.58][bucket],
+                [3, 8, 7, 18, 28, 34, 104, 738][bucket],
+                [50, 77, 106, 156, 192, 248, 447, 958][bucket],
             ),
             // Calibrated on unnormalized Wiki-Cohere and DPR vectors. An initial
             // cap controls overscanning without limiting later filtered search.
             DistanceType::Dot => (
-                [0.14, 0.055, 0.0625, 0.0675, 0.07, 0.0725][bucket],
-                [56, 144, 200, 211, 244, 279][bucket],
-                [112, 432, 768, 833, 971, 1092][bucket],
+                [0.14, 0.055, 0.0625, 0.0675, 0.07, 0.0725, 0.0825, 0.21][bucket],
+                [56, 144, 200, 211, 244, 279, 517, 1009][bucket],
+                [112, 432, 768, 833, 971, 1092, 1824, 2528][bucket],
             ),
             _ => return Ok(Some(Self::default())),
         };
@@ -354,6 +340,10 @@ mod tests {
     #[case::l2_top500(DistanceType::L2, 500, 0.3725, 22, 81)]
     #[case::l2_top1000_lower_boundary(DistanceType::L2, 501, 0.4175, 29, 93)]
     #[case::l2_top1000(DistanceType::L2, 1000, 0.4175, 29, 93)]
+    #[case::l2_top10000_lower_boundary(DistanceType::L2, 1001, 0.57, 98, 238)]
+    #[case::l2_top10000(DistanceType::L2, 10_000, 0.57, 98, 238)]
+    #[case::l2_top100000_lower_boundary(DistanceType::L2, 10_001, 0.75, 463, 704)]
+    #[case::l2_top100000(DistanceType::L2, 100_000, 0.75, 463, 704)]
     #[case::cosine_top1(DistanceType::Cosine, 1, 0.235, 3, 50)]
     #[case::cosine_top10_lower_boundary(DistanceType::Cosine, 2, 0.2875, 8, 77)]
     #[case::cosine_top10_upper_boundary(DistanceType::Cosine, 10, 0.2875, 8, 77)]
@@ -365,6 +355,10 @@ mod tests {
     #[case::cosine_top500(DistanceType::Cosine, 500, 0.45, 28, 192)]
     #[case::cosine_top1000_lower_boundary(DistanceType::Cosine, 501, 0.47, 34, 248)]
     #[case::cosine_top1000(DistanceType::Cosine, 1000, 0.47, 34, 248)]
+    #[case::cosine_top10000_lower_boundary(DistanceType::Cosine, 1001, 0.6475, 104, 447)]
+    #[case::cosine_top10000(DistanceType::Cosine, 10_000, 0.6475, 104, 447)]
+    #[case::cosine_top100000_lower_boundary(DistanceType::Cosine, 10_001, 0.58, 738, 958)]
+    #[case::cosine_top100000(DistanceType::Cosine, 100_000, 0.58, 738, 958)]
     #[case::dot_top1(DistanceType::Dot, 1, 0.14, 56, 112)]
     #[case::dot_top10_lower_boundary(DistanceType::Dot, 2, 0.055, 144, 432)]
     #[case::dot_top10_upper_boundary(DistanceType::Dot, 10, 0.055, 144, 432)]
@@ -376,6 +370,10 @@ mod tests {
     #[case::dot_top500(DistanceType::Dot, 500, 0.07, 244, 971)]
     #[case::dot_top1000_lower_boundary(DistanceType::Dot, 501, 0.0725, 279, 1092)]
     #[case::dot_top1000(DistanceType::Dot, 1000, 0.0725, 279, 1092)]
+    #[case::dot_top10000_lower_boundary(DistanceType::Dot, 1001, 0.0825, 517, 1824)]
+    #[case::dot_top10000(DistanceType::Dot, 10_000, 0.0825, 517, 1824)]
+    #[case::dot_top100000_lower_boundary(DistanceType::Dot, 10_001, 0.21, 1009, 2528)]
+    #[case::dot_top100000(DistanceType::Dot, 100_000, 0.21, 1009, 2528)]
     fn test_auto_probe_metric_profiles(
         #[case] metric: DistanceType,
         #[case] k: usize,

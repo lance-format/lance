@@ -3,8 +3,10 @@
 Auto's existing metric/k profiles now apply across IVF index types. The
 partition policy does not inspect the sub-index or quantization type, and
 historical IVF readers do not need prepared-search metadata to use it.
-Float32, metric, k, refinement and explicit-budget guards retain their
-existing behavior; enabled profiles still end at k=1000.
+The measured revision retained Float32 and refinement guards and enabled
+profiles through k=1000. The current default policy also supports other vector
+types, arbitrary refinement factors and profiles through k=100000; this report
+retains the original workload, source identity and measurements.
 
 This experiment uses IVF_FLAT to isolate routing effects, then measures
 the final recall of IVF_RQ 5bit with the same centroids, exact row-to-partition

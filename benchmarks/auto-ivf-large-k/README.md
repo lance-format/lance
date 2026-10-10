@@ -3,6 +3,12 @@
 This experiment extends Auto's centroid-gap probing profiles beyond k=100.
 The profiles apply to IVF partition selection across index types; IVF_FLAT
 isolates routing recall from quantization and partition-local search losses.
+The current policy selects profiles by metric and k without gating on vector
+type, query null/nonfinite values, or refinement factor. Fixed nprobes and
+explicit maximum bounds bypass the profiles; Hamming and k > 100000 retain the
+original heuristic. The k=10000 profile serves k=1001..10000, and the k=100000
+profile serves k=10001..100000. The recorded Float32/no-refinement measurements
+describe their frozen workloads, not a recall guarantee for every supported query.
 [PROTOCOL.md](PROTOCOL.md) is the evaluation contract frozen before
 calibration; [RESULTS.md](RESULTS.md) has the measurements and the decisions
 they support.
@@ -124,8 +130,9 @@ done
 uv run --frozen --no-sync python ../benchmarks/auto-ivf-large-k/audit_large.py "$LARGE_STUDY"
 ```
 
-This experiment measures the requested anchors. The defaults in this PR continue to
-use the previously validated range through k=1000.
+This experiment measures the requested anchors. The defaults now use the 10000
+profile for k=1001..10000 and the 100000 profile for k=10001..100000. The historical
+measurements do not establish recall guarantees at every intermediate k.
 
 ## One fallback threshold per metric
 
