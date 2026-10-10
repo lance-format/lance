@@ -566,6 +566,40 @@ impl Field {
             || self.is_blob_v2_descriptor()
     }
 
+    /// Represent legacy blobs in this field tree as Blob v2 logical inputs, preserving their identities.
+    ///
+    /// The new logical children have unassigned IDs; callers persisting the schema
+    /// must assign them with [`Self::set_id`]. Existing Blob v2 fields are unchanged.
+    ///
+    /// ```
+    /// # use lance_core::datatypes::Field;
+    /// # fn prepare(field: &mut Field) -> lance_core::Result<()> {
+    /// field.promote_blob_v2()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn promote_blob_v2(&mut self) -> Result<()> {
+        if !self.is_blob() {
+            for child in &mut self.children {
+                child.promote_blob_v2()?;
+            }
+            return Ok(());
+        }
+        if self.is_blob_v2() {
+            return Ok(());
+        }
+        self.logical_type = LogicalType::from("struct");
+        self.encoding = None;
+        self.children = super::BLOB_V2_LOGICAL_MINIMAL_FIELDS
+            .iter()
+            .map(|field| Self::try_from(field.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        self.metadata.remove(BLOB_META_KEY);
+        self.metadata
+            .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        Ok(())
+    }
+
     fn blob_v2_layout(&self) -> Option<BlobV2Layout> {
         if self.extension_name() != Some(BLOB_V2_EXT_NAME) {
             return None;
@@ -1070,6 +1104,27 @@ impl Field {
             .for_each(|f| f.set_id(self.id, id_seed));
     }
 
+    /// Recursively assign missing field IDs without overflowing the `i32` ID space.
+    ///
+    /// Callers that persist the result should prefer this method over [`Self::set_id`].
+    /// The `i64` seed represents the next candidate ID so `i32::MAX + 1` can be
+    /// reported as an error instead of wrapping.
+    pub fn try_set_id(&mut self, parent_id: i32, id_seed: &mut i64) -> Result<()> {
+        self.parent_id = parent_id;
+        if self.id < 0 {
+            self.id = i32::try_from(*id_seed).map_err(|_| {
+                Error::invalid_input(
+                    "No further field ID can be allocated because IDs are exhausted",
+                )
+            })?;
+            *id_seed += 1;
+        }
+        for child in &mut self.children {
+            child.try_set_id(self.id, id_seed)?;
+        }
+        Ok(())
+    }
+
     /// Recursively reset field ID for this field and all its children.
     pub(super) fn reset_id(&mut self) {
         self.id = -1;
@@ -1244,6 +1299,12 @@ impl TryFrom<&ArrowField> for Field {
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
+            // A `json` field is stored as Lance JSONB whatever the input
+            // representation, so record the stored extension.
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::JSON_EXT_NAME.to_string(),
+            );
             LogicalType::from("json")
         } else if is_blob_v2 {
             LogicalType::from("struct")
