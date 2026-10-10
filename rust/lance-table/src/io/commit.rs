@@ -1748,13 +1748,107 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct FailingManifestListStore {
+        inner: Arc<dyn OSObjectStore>,
+        first_path: Path,
+    }
+
+    impl std::fmt::Display for FailingManifestListStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingManifestListStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for FailingManifestListStore {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            data: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(path, data, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, opts).await
+        }
+
+        async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, opts).await
+        }
+
+        async fn get_ranges(
+            &self,
+            path: &Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.inner.get_ranges(path, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let first_path = self.first_path.clone();
+            self.inner
+                .list(prefix)
+                .filter(move |item| {
+                    future::ready(item.as_ref().is_ok_and(|meta| meta.location == first_path))
+                })
+                .take(1)
+                .chain(futures::stream::once(async {
+                    Err(ObjectStoreError::Generic {
+                        store: "test",
+                        source: "listing failed before the newest manifest".into(),
+                    })
+                }))
+                .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
 
     #[test]
     fn test_manifest_naming_scheme() {
@@ -2085,6 +2179,29 @@ mod tests {
         // The stale hint is ignored; listing finds version 5.
         let location = current_manifest_path(&object_store, &base).await.unwrap();
         assert_eq!(location.version, 5);
+
+        // A newer manifest can be missed if an unordered list fails after an
+        // older entry. The fallback must report the failure, not version 5.
+        object_store
+            .put(&naming_scheme.manifest_path(&base, 11), b"".as_slice())
+            .await
+            .unwrap();
+        write_version_hint(&object_store, &base, 20).await;
+        let mut failing_store = (*object_store).clone();
+        failing_store.inner = Arc::new(FailingManifestListStore {
+            inner: failing_store.inner.clone(),
+            first_path: naming_scheme.manifest_path(&base, 5),
+        });
+        let error = current_manifest_path(&failing_store, &base)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("listing failed before the newest manifest"),
+            "{error}"
+        );
     }
 
     #[test]

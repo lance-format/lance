@@ -1499,11 +1499,18 @@ impl ObjectStore {
         Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
+    /// List objects recursively. On unordered stores, a retryable failure after
+    /// the first entry is returned to the caller because resuming by lexical
+    /// offset could silently omit entries.
     pub fn list(
         &self,
         path: Option<Path>,
     ) -> Pin<Box<dyn Stream<Item = Result<ObjectMeta>> + Send>> {
-        Box::pin(ListRetryStream::new(self.inner.clone(), path, 5).map(|m| m.map_err(|e| e.into())))
+        Box::pin(
+            ListRetryStream::new(self.inner.clone(), path, 5)
+                .with_lexical_ordering(self.list_is_lexically_ordered)
+                .map(|m| m.map_err(|e| e.into())),
+        )
     }
 
     /// Read all files (start from base directory) recursively
