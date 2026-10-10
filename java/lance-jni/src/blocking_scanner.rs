@@ -7,23 +7,23 @@ use std::sync::{Arc, Mutex};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_rust};
-use arrow::array::Float32Array;
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, SchemaRef};
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    ExecutionSummaryCounts, MaterializationStyle, Scanner,
+    ExecutionSummaryCounts, FragmentSlice, MaterializationStyle, Scanner,
 };
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     DocumentGranularity,
     query::{
-        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
-        MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
-        PhraseQuery as FtsPhraseQuery,
+        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery,
+        CombinedFieldsQuery as FtsCombinedFieldsQuery, FtsQuery, MatchQuery as FtsMatchQuery,
+        MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur, PhraseQuery as FtsPhraseQuery,
     },
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
@@ -174,6 +174,33 @@ pub(crate) fn build_full_text_search_query<'a>(
 
             Ok(FtsQuery::MultiMatch(query))
         }
+        "COMBINED_FIELDS" => {
+            let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
+            let columns: Vec<String> =
+                import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                    let jstr = JString::from(elem);
+                    let value: String = env.get_string(&jstr)?.into();
+                    Ok(value)
+                })?;
+
+            let boosts: Option<Vec<f32>> =
+                env.get_optional_from_method(&java_obj, "getBoosts", |env, list_obj| {
+                    import_vec_to_rust(env, &list_obj, |env, elem| {
+                        env.get_f32_from_method(&elem, "floatValue")
+                    })
+                })?;
+            let operator = env.get_fts_operator_from_method(&java_obj)?;
+
+            // Column uniqueness and boost (>= 1) validation live in the Rust core;
+            // `?` surfaces those errors across the JNI boundary.
+            let mut query = FtsCombinedFieldsQuery::try_new(query_text, columns)?;
+            if let Some(boosts) = boosts {
+                query = query.try_with_boosts(boosts)?;
+            }
+            query = query.with_operator(operator);
+
+            Ok(FtsQuery::CombinedFields(query))
+        }
         "BOOST" => {
             let positive_obj = env
                 .call_method(
@@ -258,6 +285,7 @@ fn get_document_granularity(
 /// Scanner options passed from JNI - shared between blocking and async scanners
 pub(crate) struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
+    pub fragment_slices_obj: JObject<'a>,
     pub index_segments_obj: JObject<'a>,
     pub columns_obj: JObject<'a>,
     pub substrait_filter_obj: JObject<'a>,
@@ -285,6 +313,41 @@ pub(crate) struct ScannerOptions<'a> {
     pub disable_scoring_autoprojection: jboolean,
 }
 
+fn parse_fragment_slices(
+    env: &mut JNIEnv<'_>,
+    fragment_slices_obj: &JObject<'_>,
+) -> Result<Option<Vec<FragmentSlice>>> {
+    env.get_list_opt(fragment_slices_obj, |env, java_slice| {
+        if java_slice.is_null() {
+            return Err(Error::input_error(
+                "fragmentSlices must not contain null".to_string(),
+            ));
+        }
+        let fragment_id = env
+            .call_method(java_slice, "getFragmentId", "()I", &[])?
+            .i()?;
+        let row_offset = env
+            .call_method(java_slice, "getRowOffset", "()J", &[])?
+            .j()?;
+        let row_count = env
+            .call_method(java_slice, "getRowCount", "()J", &[])?
+            .j()?;
+        Ok(FragmentSlice {
+            fragment_id: u32::try_from(fragment_id).map_err(|_| {
+                Error::input_error(format!(
+                    "fragmentId must be non-negative, got {fragment_id}"
+                ))
+            })?,
+            row_offset: u64::try_from(row_offset).map_err(|_| {
+                Error::input_error(format!("rowOffset must be non-negative, got {row_offset}"))
+            })?,
+            row_count: u64::try_from(row_count).map_err(|_| {
+                Error::input_error(format!("rowCount must be non-negative, got {row_count}"))
+            })?,
+        })
+    })
+}
+
 /// Build a scanner with options applied - shared by blocking and async scanners
 pub(crate) fn build_scanner_with_options<'a>(
     env: &mut JNIEnv<'a>,
@@ -295,10 +358,10 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     // handle fragment_ids
     let fragment_ids_opt = env.get_ints_opt(&options.fragment_ids_obj)?;
-    if let Some(fragment_ids) = fragment_ids_opt {
+    if let Some(fragment_ids) = fragment_ids_opt.as_ref() {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
-            let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            let Some(fragment) = dataset.get_fragment(*fragment_id as usize) else {
                 return Err(Error::input_error(format!(
                     "Fragment {fragment_id} not found"
                 )));
@@ -306,6 +369,10 @@ pub(crate) fn build_scanner_with_options<'a>(
             fragments.push(fragment.metadata().clone());
         }
         scanner.with_fragments(fragments);
+    }
+
+    if let Some(slices) = parse_fragment_slices(env, &options.fragment_slices_obj)? {
+        block_on(scanner.with_fragment_slices(&slices))?;
     }
 
     env.get_optional(&options.index_segments_obj, |env, java_segments| {
@@ -381,9 +448,49 @@ pub(crate) fn build_scanner_with_options<'a>(
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Float32Array::from(key_array);
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        scanner
-            .nearest(&column, &key, k)
-            .map_err(|err| Error::input_error(err.to_string()))?;
+        let query_vector_dim = env
+            .call_method(&java_obj, "getQueryVectorDim", "()I", &[])?
+            .i()?;
+        if query_vector_dim > 0 {
+            // The core interprets a list-shaped query against a multivector column as ONE
+            // multivector query (no `query_index`), which would silently break the
+            // `setKeys` batch contract, so reject it here.
+            if let Some(field) = dataset.schema().field(&column)
+                && matches!(
+                    field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                )
+            {
+                return Err(Error::input_error(format!(
+                    "Batch vector search (setKeys) is not supported on multivector column '{}' \
+                     of type {:?}",
+                    column,
+                    field.data_type()
+                )));
+            }
+            // Batch nearest-neighbor search: the flat buffer packs multiple query
+            // vectors of `query_vector_dim` values each. Wrapping it in a FixedSizeList
+            // makes the core scanner run a shared partition scan across the batch and
+            // emit a `query_index` column tagging each result row with its query.
+            let batch_keys = FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, false)),
+                query_vector_dim,
+                Arc::new(key) as ArrayRef,
+                None,
+            )
+            .map_err(|e| {
+                Error::input_error(format!(
+                    "Failed to construct FixedSizeListArray for batch query: {e}"
+                ))
+            })?;
+            scanner
+                .nearest(&column, &batch_keys, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        } else {
+            scanner
+                .nearest(&column, &key, k)
+                .map_err(|err| Error::input_error(err.to_string()))?;
+        }
 
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
@@ -529,32 +636,33 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject<'local>,
     jdataset: JObject<'local>,
-    fragment_ids_obj: JObject<'local>,   // Optional<List<Integer>>
-    index_segments_obj: JObject<'local>, // Optional<List<UUID>>
-    columns_obj: JObject<'local>,        // Optional<List<String>>
+    fragment_ids_obj: JObject<'local>,    // Optional<List<Integer>>
+    fragment_slices_obj: JObject<'local>, // Optional<List<FragmentSlice>>
+    index_segments_obj: JObject<'local>,  // Optional<List<UUID>>
+    columns_obj: JObject<'local>,         // Optional<List<String>>
     substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
-    filter_obj: JObject<'local>,         // Optional<String>
-    batch_size_obj: JObject<'local>,     // Optional<Long>
+    filter_obj: JObject<'local>,          // Optional<String>
+    batch_size_obj: JObject<'local>,      // Optional<Long>
     batch_size_bytes_obj: JObject<'local>, // Optional<Long>
-    io_buffer_size_obj: JObject<'local>, // Optional<Long>
-    limit_obj: JObject<'local>,          // Optional<Integer>
-    offset_obj: JObject<'local>,         // Optional<Integer>
-    query_obj: JObject<'local>,          // Optional<Query>
-    fts_query_obj: JObject<'local>,      // Optional<FullTextQuery>
-    prefilter: jboolean,                 // boolean
-    with_row_id: jboolean,               // boolean
-    with_row_address: jboolean,          // boolean
-    batch_readahead: jint,               // int
+    io_buffer_size_obj: JObject<'local>,  // Optional<Long>
+    limit_obj: JObject<'local>,           // Optional<Integer>
+    offset_obj: JObject<'local>,          // Optional<Integer>
+    query_obj: JObject<'local>,           // Optional<Query>
+    fts_query_obj: JObject<'local>,       // Optional<FullTextQuery>
+    prefilter: jboolean,                  // boolean
+    with_row_id: jboolean,                // boolean
+    with_row_address: jboolean,           // boolean
+    batch_readahead: jint,                // int
     fragment_readahead_obj: JObject<'local>, // Optional<Integer>
-    scan_in_order: jboolean,             // boolean
+    scan_in_order: jboolean,              // boolean
     late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
-    column_orderings: JObject<'local>,   // Optional<List<ColumnOrdering>>
-    use_scalar_index: jboolean,          // boolean
-    fast_search: jboolean,               // boolean
+    column_orderings: JObject<'local>,    // Optional<List<ColumnOrdering>>
+    use_scalar_index: jboolean,           // boolean
+    fast_search: jboolean,                // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
-    collect_stats: jboolean,             // boolean
-    include_deleted_rows: jboolean,      // boolean
-    strict_batch_size: jboolean,         // boolean
+    collect_stats: jboolean,              // boolean
+    include_deleted_rows: jboolean,       // boolean
+    strict_batch_size: jboolean,          // boolean
     disable_scoring_autoprojection: jboolean, // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -563,6 +671,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             &mut env,
             jdataset,
             fragment_ids_obj,
+            fragment_slices_obj,
             index_segments_obj,
             columns_obj,
             substrait_filter_obj,
@@ -598,6 +707,7 @@ fn inner_create_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,
+    fragment_slices_obj: JObject<'local>,
     index_segments_obj: JObject<'local>,
     columns_obj: JObject<'local>,
     substrait_filter_obj: JObject<'local>,
@@ -632,6 +742,7 @@ fn inner_create_scanner<'local>(
 
     let options = ScannerOptions {
         fragment_ids_obj,
+        fragment_slices_obj,
         index_segments_obj,
         columns_obj,
         substrait_filter_obj,

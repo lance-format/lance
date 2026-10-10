@@ -1690,6 +1690,64 @@ impl FromStr for LanceConfigKey {
 pub struct StorageOptions(pub HashMap<String, String>);
 
 impl StorageOptions {
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn as_cloud_options<K>(&self) -> HashMap<K, String>
+    where
+        K: FromStr + AsRef<str> + Eq + std::hash::Hash,
+    {
+        let mut options: HashMap<K, (&str, &str)> = HashMap::new();
+        for (source_key, value) in &self.0 {
+            let Ok(config_key) = K::from_str(&source_key.to_ascii_lowercase()) else {
+                continue;
+            };
+            let source_key = source_key.as_str();
+            let canonical_key = config_key.as_ref();
+            // Rank spellings so conflicting aliases cannot depend on HashMap iteration order.
+            if let Some((selected_key, _)) = options.get(&config_key)
+                && (
+                    !source_key.eq_ignore_ascii_case(canonical_key),
+                    source_key != canonical_key,
+                    source_key,
+                ) >= (
+                    !selected_key.eq_ignore_ascii_case(canonical_key),
+                    *selected_key != canonical_key,
+                    *selected_key,
+                )
+            {
+                continue;
+            }
+            options.insert(config_key, (source_key, value.as_str()));
+        }
+        options
+            .into_iter()
+            .map(|(key, (_, value))| (key, value.to_string()))
+            .collect()
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn merge_env_options(
+        &mut self,
+        env_options: impl IntoIterator<
+            Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>),
+        >,
+        canonical_key: impl Fn(&str) -> Option<String>,
+    ) {
+        // Aliases must block environment defaults without rewriting the caller's keys.
+        let mut configured_keys: HashSet<String> = self
+            .0
+            .keys()
+            .filter_map(|key| canonical_key(&key.to_ascii_lowercase()))
+            .collect();
+        for (key, value) in env_options {
+            if let (Some(key), Some(value)) = (key.as_ref().to_str(), value.as_ref().to_str())
+                && let Some(config_key) = canonical_key(&key.to_ascii_lowercase())
+                && configured_keys.insert(config_key.clone())
+            {
+                self.0.insert(config_key, value.to_string());
+            }
+        }
+    }
+
     /// Create a new instance of [`StorageOptions`]
     pub fn new(options: HashMap<String, String>) -> Self {
         let mut options = options;
@@ -1935,6 +1993,57 @@ mod tests {
     use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    fn canonical_test_config_key<K: FromStr + AsRef<str>>(key: &str) -> Option<String> {
+        K::from_str(key).ok().map(|key| key.as_ref().to_string())
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[cfg_attr(feature = "aws", case::aws("region", "aws_region", canonical_test_config_key::<object_store::aws::AmazonS3ConfigKey>))]
+    #[cfg_attr(feature = "azure", case::azure("account_name", "azure_storage_account_name", canonical_test_config_key::<object_store::azure::AzureConfigKey>))]
+    #[cfg_attr(feature = "gcp", case::gcp("service_account_path", "google_service_account", canonical_test_config_key::<object_store::gcp::GoogleConfigKey>))]
+    fn test_merge_env_options(
+        #[case] alias: &str,
+        #[case] canonical: &str,
+        #[case] canonical_key: fn(&str) -> Option<String>,
+        #[values(false, true)] use_alias: bool,
+        #[values(false, true)] uppercase: bool,
+        #[values(None, Some(""), Some("explicit"))] explicit_value: Option<&str>,
+    ) {
+        let key = if use_alias { alias } else { canonical };
+        let key = if uppercase {
+            key.to_ascii_uppercase()
+        } else {
+            key.to_string()
+        };
+        let mut expected = HashMap::from([("lance_custom_option".into(), "unchanged".into())]);
+        if let Some(value) = explicit_value {
+            expected.insert(key, value.to_string());
+        }
+        let mut options = StorageOptions(expected.clone());
+        if explicit_value.is_none() {
+            expected.insert(canonical.to_string(), "environment".to_string());
+        }
+        let env_options = [
+            (canonical.to_ascii_uppercase(), "environment"),
+            (alias.to_string(), "second_environment_alias"),
+            ("lance_custom_option".to_string(), "ignored"),
+            ("unrecognized_env_option".to_string(), "ignored"),
+        ];
+
+        options.merge_env_options(
+            env_options.iter().map(|(key, value)| (key, value)),
+            canonical_key,
+        );
+        assert_eq!(options.0, expected);
+        options.merge_env_options(
+            env_options.iter().map(|(key, value)| (key, value)),
+            canonical_key,
+        );
+        assert_eq!(options.0, expected);
+    }
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {

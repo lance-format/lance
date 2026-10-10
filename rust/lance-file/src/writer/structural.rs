@@ -32,7 +32,10 @@ use tracing::instrument;
 use crate::{
     datatypes::FieldsWithMeta,
     format::{pb, pbfile},
-    writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriterOptions, PAGE_BUFFER_ALIGNMENT},
+    writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, ExpectedTypes, FileWriterOptions,
+        PAGE_BUFFER_ALIGNMENT,
+    },
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -381,6 +384,7 @@ impl StructuralFileSink {
 /// a schema is initialized. This component only executes that decision.
 pub struct EncodingPipeline {
     schema: Option<Schema>,
+    expected_types: Option<ExpectedTypes>,
     field_encoders: Vec<Box<dyn FieldEncoder>>,
     field_id_to_column_indices: Vec<(u32, u32)>,
     rows_written: u64,
@@ -393,6 +397,7 @@ impl EncodingPipeline {
     pub fn new(options: FileWriterOptions) -> Self {
         Self {
             schema: None,
+            expected_types: None,
             field_encoders: Vec::new(),
             field_id_to_column_indices: Vec::new(),
             rows_written: 0,
@@ -602,6 +607,13 @@ impl EncodingPipeline {
             batch.num_columns(),
             batch.get_array_memory_size()
         );
+        let schema = self
+            .schema
+            .as_ref()
+            .expect("the pipeline is initialized before writing");
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_batch(batch)?;
         self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
@@ -663,6 +675,9 @@ impl EncodingPipeline {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_column(column_index, &array)?;
         Self::verify_field_nullability(array.as_ref(), field)?;
         if array.is_empty() {
             return Ok(());

@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Benchmark of building PQ distance table.
+//! RaBitQ build and search benchmarks.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::UInt64Type;
 use arrow_array::types::Float32Type;
+use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::DataType;
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
-use lance_arrow::fixed_size_list_type;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use lance_arrow::{FixedSizeListArrayExt, fixed_size_list_type};
 use lance_core::ROW_ID;
 use lance_datagen::array::rand_type;
 use lance_datagen::{BatchGeneratorBuilder, RowCount};
@@ -21,12 +23,15 @@ use lance_index::vector::bq::ex_dot::{
     blocked_ex_code_bytes, ex_dot_kernel, pack_blocked_row, packed_ex_code_value,
 };
 use lance_index::vector::bq::storage::*;
-use lance_index::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
+use lance_index::vector::bq::transform::{ADD_FACTORS_COLUMN, RQTransformer, SCALE_FACTORS_COLUMN};
 use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
-use lance_linalg::distance::DistanceType;
+use lance_index::vector::transform::Transformer;
+use lance_index::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
+use lance_linalg::distance::{DistanceType, norm_squared_fsl};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use rand_distr::StandardNormal;
 
 const DIM: usize = 128;
 const TOTAL: usize = 16 * 1000;
@@ -648,9 +653,86 @@ fn heap_topk(c: &mut Criterion) {
     }
 }
 
+fn build_transform(c: &mut Criterion) {
+    let mut group = c.benchmark_group("RQ build");
+    group
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(3));
+    for threads in [8, 32] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        for (num_bits, dim) in [(1u8, 768usize), (5, 768), (9, 1536)] {
+            for rows in [64, 128, 8192] {
+                let mut rng = SmallRng::seed_from_u64(9464);
+                let mut signs = vec![0; 4 * dim.div_ceil(8)];
+                rng.fill(signs.as_mut_slice());
+                let metadata = RabitQuantizationMetadata {
+                    rotate_mat: None,
+                    rotate_mat_position: None,
+                    fast_rotation_signs: Some(signs),
+                    rotation_type: RQRotationType::Fast,
+                    code_dim: dim as u32,
+                    num_bits,
+                    packed: false,
+                    layered: false,
+                    query_estimator: RabitQueryEstimator::RawQuery,
+                };
+                let rq = RabitQuantizer::try_from(
+                    RabitQuantizer::from_metadata(&metadata, DistanceType::L2).unwrap(),
+                )
+                .unwrap();
+                let centroids = FixedSizeListArray::try_new_from_values(
+                    Float32Array::from(
+                        (0..4 * dim)
+                            .map(|_| rng.sample::<f32, _>(StandardNormal))
+                            .collect::<Vec<_>>(),
+                    ),
+                    dim as i32,
+                )
+                .unwrap();
+                let vectors = FixedSizeListArray::try_new_from_values(
+                    Float32Array::from(
+                        (0..rows * dim)
+                            .map(|_| rng.sample::<f32, _>(StandardNormal))
+                            .collect::<Vec<_>>(),
+                    ),
+                    dim as i32,
+                )
+                .unwrap();
+                let norm = Float32Array::from(norm_squared_fsl(&vectors));
+                let parts =
+                    UInt32Array::from((0..rows).map(|row| (row % 4) as u32).collect::<Vec<_>>());
+                let batch = RecordBatch::try_from_iter([
+                    ("vector", Arc::new(vectors) as ArrayRef),
+                    (CENTROID_DIST_COLUMN, Arc::new(norm) as ArrayRef),
+                    (PART_ID_COLUMN, Arc::new(parts) as ArrayRef),
+                ])
+                .unwrap();
+                let transformer =
+                    RQTransformer::new(rq, DistanceType::L2, centroids, "vector").unwrap();
+                group.throughput(Throughput::Elements(rows as u64));
+                group.bench_function(
+                    BenchmarkId::new(format!("rq{num_bits}-{dim}d-{threads}threads"), rows),
+                    |b| {
+                        b.iter(|| {
+                            pool.install(|| {
+                                black_box(transformer.transform(black_box(&batch)).unwrap())
+                            })
+                        });
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     name=benches;
     config = Criterion::default().measurement_time(Duration::from_secs(10));
-    targets = construct_dist_table, compute_distances, ex_dot_kernels, ex_code_storage_load, ex_bulk_paths, heap_topk);
+    targets = construct_dist_table, compute_distances, ex_dot_kernels, ex_code_storage_load, ex_bulk_paths, heap_topk, build_transform);
 
 criterion_main!(benches);

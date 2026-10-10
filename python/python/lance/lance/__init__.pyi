@@ -424,6 +424,9 @@ class _Dataset:
         order_by: Optional[List[Any]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_aggregate: Optional[bytes] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
+        minhash_query: Optional[Dict[str, str]] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -490,11 +493,11 @@ class _Dataset:
     ) -> pa.RecordBatchReader: ...
     def alter_columns(self, alterations: List[AlterColumn]): ...
     def merge(self, reader: pa.RecordBatchReader, left_on: str, right_on: str): ...
-    def delete(self, predicate: str): ...
+    def delete(self, predicate: str | bytes): ...
     def update(
         self,
         updates: Dict[str, str],
-        predicate: Optional[str] = None,
+        predicate: Optional[str | bytes] = None,
         conflict_retries: Optional[int] = None,
         retry_timeout: Optional[timedelta] = None,
         data_storage_version: Optional[str] = None,
@@ -503,6 +506,7 @@ class _Dataset:
     def versions(self) -> List[Version]: ...
     def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
+    def current_version(self) -> Version: ...
     def latest_version(self) -> int: ...
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
@@ -653,6 +657,24 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def find_duplicate_pairs(
+        self,
+        column: str,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
+    def find_duplicate_pairs_in_partition(
+        self,
+        column: str,
+        segment_id: str,
+        partition_id: int,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
     def hamming_clustering_for_ivf_partition(
         self,
         index_name: str,
@@ -750,6 +772,7 @@ class _Fragment:
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
+        substrait_filter: Optional[bytes] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
@@ -970,6 +993,13 @@ class PyFullTextQuery:
         boosts: Optional[List[float]] = None,
         operator: str = "OR",
     ) -> PyFullTextQuery: ...
+    @staticmethod
+    def combined_fields_query(
+        query: str,
+        columns: List[str],
+        boosts: Optional[List[float]] = None,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
     """Statistics about a scan operation."""
@@ -1008,6 +1038,11 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+    all_times: Dict[str, int]
+    """Additional debugging timings in nanoseconds. Keys are subject to change.
+
+    Nested and concurrent stages overlap; summing these values does not
+    reconstruct query wall time."""
 
 class DatasetBasePath:
     def __init__(

@@ -1007,6 +1007,54 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
 }
 
 #[tokio::test]
+async fn test_main_branch_management() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let main_branch = dataset.checkout_branch("main").await.unwrap();
+    assert_eq!(main_branch.version().version, dataset.version().version);
+    assert_eq!(main_branch.manifest.branch, None);
+
+    let main_ref = dataset.checkout_version(("main", None)).await.unwrap();
+    assert_eq!(main_ref.version().version, dataset.version().version);
+    assert_eq!(main_ref.manifest.branch, None);
+
+    let Err(create_branch_err) = dataset.create_branch("main", ("main", None), None).await else {
+        panic!("creating a branch named main should fail");
+    };
+    assert!(matches!(create_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        create_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{create_branch_err}"
+    );
+
+    assert!(!tempdir.std_path().join("tree").join("main").exists());
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+
+    let get_branch_err = dataset.branches().get("main").await.unwrap_err();
+    assert!(matches!(get_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        get_branch_err.to_string().contains("\"main\" is reserved"),
+        "{get_branch_err}"
+    );
+
+    let delete_branch_err = dataset.delete_branch("main").await.unwrap_err();
+    assert!(matches!(delete_branch_err, Error::InvalidRef { .. }));
+    assert!(
+        delete_branch_err
+            .to_string()
+            .contains("\"main\" is reserved"),
+        "{delete_branch_err}"
+    );
+}
+
+#[tokio::test]
 async fn test_cannot_delete_branch_referenced_by_tag() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
@@ -1288,6 +1336,41 @@ async fn test_branch() {
         checkout_branch1.manifest.branch.as_deref().unwrap(),
         "branch1"
     );
+
+    // Opening a branch version that main does not have (main only has version 1)
+    // must resolve the version on the branch chain.
+    let branch_version_open = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(3))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_version_open.manifest.branch.as_deref(),
+        Some("feature/nathan/branch3")
+    );
+    assert_eq!(branch_version_open.version().version, 3);
+    assert_eq!(
+        branch_version_open.count_rows(None).await.unwrap(),
+        checkout_branch3_at_version3.count_rows(None).await.unwrap()
+    );
+    // A version the branch does not have is still an error, not its latest version.
+    let err = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(99))
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::DatasetNotFound { .. }), "{err}");
+    assert!(err.to_string().contains("feature/nathan/branch3"), "{err}");
+
+    // From the branch's own directory, an older version of that branch is checked out on it.
+    let branch_dir_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_branch("branch1", Some(1))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_dir_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_dir_open.version().version, 1);
+    assert_eq!(branch_dir_open.count_rows(None).await.unwrap(), 50);
 
     // Opening at a branch-pointing tag through the builder must check out the
     // tag's branch chain, not main's chain at the tag's version number.

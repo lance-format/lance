@@ -228,6 +228,11 @@ pub struct QuantizationMetadata {
 pub trait QuantizerMetadata:
     fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
 {
+    /// Whether code bytes are laid out column-major across a whole partition.
+    fn is_transposed(&self) -> bool {
+        false
+    }
+
     // the extra metadata index in global buffer
     fn buffer_index(&self) -> Option<u32> {
         None

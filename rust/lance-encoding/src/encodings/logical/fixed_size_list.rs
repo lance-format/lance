@@ -562,7 +562,9 @@ mod tests {
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
-        testing::{TestCases, TestEncoding, check_specific_random},
+        testing::{
+            TestCases, TestEncoding, check_round_trip_encoding_of_data, check_specific_random,
+        },
     };
 
     fn make_fsl_struct_type(struct_fields: Fields, dimension: i32) -> DataType {
@@ -800,5 +802,45 @@ mod tests {
         let result = filter_nested_fsl_garbage(&fsl, &[false, true, false], 2);
         // Should return the same array unchanged
         assert_eq!(result.len(), 3);
+    }
+
+    /// A null-free nested FSL written with a forced full-zip layout goes through the
+    /// per-value path that flattens it. Both layers are nullable, as Arrow and pyarrow
+    /// build them by default, and the data carries no nulls.
+    #[rstest]
+    #[case::outer_wider(22, 3)]
+    #[case::inner_wider(3, 22)]
+    #[tokio::test]
+    async fn test_nested_fsl_full_zip_round_trip(#[case] outer_dim: i32, #[case] inner_dim: i32) {
+        let num_rows = 3;
+        let inner_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let leaf = Arc::new(arrow_array::Int32Array::from_iter_values(
+            0..num_rows * outer_dim * inner_dim,
+        ));
+        let inner = FixedSizeListArray::new(inner_field.clone(), inner_dim, leaf, None);
+        let outer = FixedSizeListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(inner_field, inner_dim),
+                true,
+            )),
+            outer_dim,
+            Arc::new(inner),
+            None,
+        );
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(outer)],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_range(0..1)
+                .with_range(1..3)
+                .with_indices(vec![0, 2]),
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_FULLZIP.to_string(),
+            )]),
+        )
+        .await;
     }
 }

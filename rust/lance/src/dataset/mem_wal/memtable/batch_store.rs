@@ -51,6 +51,8 @@ use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 
+use crate::dataset::mem_wal::MemTableDataTarget;
+
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
 pub struct StoredBatch {
@@ -221,6 +223,14 @@ pub struct BatchStore {
     /// lets a writer-global cursor (the WAL durability count) be mapped onto a
     /// particular store.
     global_offset: usize,
+
+    /// Final generation/data-file identity for batches in this store.
+    target: Option<MemTableDataTarget>,
+
+    /// The memtable generation these batches belong to. Recorded in each WAL
+    /// entry so replay keeps the writer's generation boundaries, even if the
+    /// shard is reopened with a different size limit.
+    generation: u64,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -260,6 +270,15 @@ impl BatchStore {
     /// batch sequence. Used by `freeze_memtable` for every memtable after the
     /// first; the first starts at 0.
     pub fn with_capacity_at(capacity: usize, global_offset: usize) -> Self {
+        Self::with_capacity_at_target(capacity, global_offset, None, 0)
+    }
+
+    pub(crate) fn with_capacity_at_target(
+        capacity: usize,
+        global_offset: usize,
+        target: Option<MemTableDataTarget>,
+        generation: u64,
+    ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
 
         // Allocate uninitialized storage
@@ -278,7 +297,14 @@ impl BatchStore {
             retained_bytes: AtomicUsize::new(0),
             retained_buffers: Mutex::new(HashSet::new()),
             global_offset,
+            target,
+            generation,
         }
+    }
+
+    /// The memtable generation these batches belong to.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Calculate recommended capacity from memtable size configuration.
@@ -570,6 +596,10 @@ impl BatchStore {
     #[inline]
     pub fn global_offset(&self) -> usize {
         self.global_offset
+    }
+
+    pub(crate) fn target(&self) -> Option<&MemTableDataTarget> {
+        self.target.as_ref()
     }
 
     /// The local exclusive end of this store covered by a writer-global cursor.

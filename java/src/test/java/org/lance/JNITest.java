@@ -68,6 +68,15 @@ public class JNITest {
       JniTestHelper.parseQuery(Optional.of(query));
     }
 
+    Query nprobesQuery =
+        new Query.Builder()
+            .setColumn("column")
+            .setKey(new float[] {1.0f, 2.0f, 3.0f})
+            .setNprobes(20)
+            .build();
+    assertEquals(20, nprobesQuery.getMinimumNprobes());
+    assertEquals(Optional.of(20), nprobesQuery.getMaximumNprobes());
+
     JniTestHelper.parseQuery(
         Optional.of(
             new Query.Builder()
