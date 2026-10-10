@@ -129,6 +129,7 @@ use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::io::deletion::deletion_file_path;
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::ResultExt;
@@ -3206,7 +3207,8 @@ impl MergeInsertJob {
     /// reports the streaming shape: the source is stood in for by an empty one-shot
     /// stream. The wrapping affects the plan, so use [`Self::analyze_plan_batches`]
     /// or [`Self::analyze_plan_provider`] when that matters. Those execute the merge
-    /// to collect metrics and may write data files; this method writes nothing.
+    /// to collect metrics, writing data files they delete afterwards; this method
+    /// writes nothing.
     ///
     /// # Errors
     ///
@@ -3248,9 +3250,9 @@ impl MergeInsertJob {
     /// and executes it to collect performance metrics and analysis.
     ///
     /// **Note:** This method executes the merge insert operation to collect metrics
-    /// but **does not commit the changes**. While data files may be written to storage
-    /// during execution, they will not be referenced by any dataset version and the
-    /// dataset remains unchanged. This is intended for performance analysis only.
+    /// but **does not commit the changes**. Data and deletion files written during
+    /// execution are deleted once the metrics are collected, and the dataset
+    /// remains unchanged. This is intended for performance analysis only.
     ///
     /// # Arguments
     ///
@@ -3322,7 +3324,16 @@ impl MergeInsertJob {
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
         let options = LanceExecutionOptions::default();
-        let full_analysis = analyze_plan(plan, options).await?;
+        let analysis_result = analyze_plan(plan.clone(), options).await;
+
+        // Executing the plan wrote files for a transaction that is never
+        // committed, so nothing will ever reference them. Remove them now
+        // rather than leaving them to orphan cleanup, whether or not the
+        // analysis itself succeeded.
+        if let Some(transaction) = uncommitted_transaction(plan.as_ref()) {
+            self.cleanup_uncommitted_files(&transaction).await;
+        }
+        let full_analysis = analysis_result?;
 
         // Remove the AnalyzeExec and TracedExec lines from the output
         let lines: Vec<&str> = full_analysis.lines().collect();
@@ -3335,6 +3346,99 @@ impl MergeInsertJob {
             .collect();
 
         Ok(filtered_lines.join("\n"))
+    }
+
+    /// Delete the files an executed-but-uncommitted merge wrote.
+    ///
+    /// New fragments are entirely new. An updated fragment keeps the files it
+    /// had in the read version, so only the data files and deletion file that
+    /// differ from that version are removed. Failures are logged, not
+    /// returned: the files are unreferenced either way, and orphan cleanup
+    /// still reclaims anything left behind.
+    async fn cleanup_uncommitted_files(&self, transaction: &Transaction) {
+        let Operation::Update {
+            new_fragments,
+            updated_fragments,
+            ..
+        } = &transaction.operation
+        else {
+            return;
+        };
+
+        let original_fragments: HashMap<u64, &Fragment> = self
+            .dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| (fragment.id, fragment))
+            .collect();
+
+        let mut written_fragments = new_fragments.clone();
+        let mut written_deletion_files = Vec::new();
+        for updated in updated_fragments {
+            let original = original_fragments.get(&updated.id);
+            let mut written = updated.clone();
+            written.files.retain(|file| {
+                original.is_none_or(|original| {
+                    !original
+                        .files
+                        .iter()
+                        .any(|existing| existing.path == file.path)
+                })
+            });
+            if !written.files.is_empty() {
+                written_fragments.push(written);
+            }
+            if let Some(deletion_file) = &updated.deletion_file
+                && original
+                    .is_none_or(|original| original.deletion_file.as_ref() != Some(deletion_file))
+            {
+                written_deletion_files.push(deletion_file_path(
+                    &self.dataset.base,
+                    updated.id,
+                    deletion_file,
+                ));
+            }
+        }
+
+        if !written_fragments.is_empty() {
+            let target_bases_info = resolve_target_bases(&self.dataset, &self.params)
+                .await
+                .ok()
+                .flatten();
+            cleanup_data_fragments(
+                &self.dataset.object_store,
+                &self.dataset.base,
+                target_bases_info.as_deref(),
+                &written_fragments,
+            )
+            .await;
+        }
+        // Merge insert writes deletion files with `write_deletion_file`, which
+        // always places them under the dataset root.
+        for path in written_deletion_files {
+            if let Err(e) = self.dataset.object_store.delete(&path).await {
+                log::warn!(
+                    "Failed to clean up orphaned deletion file '{}': {}",
+                    path,
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// The transaction a merge insert write node built during execution, if the
+/// node ran to completion.
+fn uncommitted_transaction(plan: &dyn ExecutionPlan) -> Option<Transaction> {
+    if let Some(full_exec) = plan.downcast_ref::<exec::FullSchemaMergeInsertExec>() {
+        full_exec.transaction()
+    } else if let Some(in_place_exec) = plan.downcast_ref::<exec::InPlaceMergeInsertExec>() {
+        in_place_exec.transaction()
+    } else if let Some(delete_exec) = plan.downcast_ref::<exec::DeleteOnlyMergeInsertExec>() {
+        delete_exec.transaction()
+    } else {
+        None
     }
 }
 
@@ -12135,6 +12239,112 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert!(analysis.contains("bytes_written"));
         assert!(analysis.contains("num_files_written"));
         assert!(analysis.contains("elapsed_compute"));
+    }
+
+    fn list_dataset_files(base_dir: &str) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(std::path::Path::new(base_dir), &mut files);
+        files.sort();
+        files
+    }
+
+    /// `analyze_plan` executes the merge without committing it, so every file
+    /// the execution wrote is unreferenced and must be removed afterwards.
+    /// Each case drives a different write node: the full-schema upsert writes a
+    /// new fragment plus deletion files, the in-place update writes a patch
+    /// file onto existing fragments, and the delete-only path writes only
+    /// deletion files.
+    #[derive(Debug, Clone, Copy)]
+    enum AnalyzedWriteNode {
+        FullSchema,
+        InPlace,
+        DeleteOnly,
+    }
+
+    #[rstest::rstest]
+    #[case::full_schema_upsert(AnalyzedWriteNode::FullSchema)]
+    #[case::in_place_update(AnalyzedWriteNode::InPlace)]
+    #[case::delete_only(AnalyzedWriteNode::DeleteOnly)]
+    #[tokio::test]
+    async fn test_analyze_plan_removes_written_files(#[case] write_node: AnalyzedWriteNode) {
+        let tempdir = TempStrDir::default();
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .col("other", array::cycle_utf8_literals(&["a", "b"]))
+            .into_reader_rows(RowCount::from(4), BatchCount::from(2));
+        let write_params = WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        };
+        let dataset = Arc::new(
+            Dataset::write(data, &tempdir, Some(write_params))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let files_before = list_dataset_files(&tempdir);
+
+        // Keys 1 and 5 hit both fragments; key 100 is new.
+        let builder =
+            || MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()]).unwrap();
+        let (job, source, expected_node) = match write_node {
+            AnalyzedWriteNode::FullSchema => (
+                builder()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap(),
+                record_batch!(
+                    ("key", UInt32, [1, 5, 100]),
+                    ("value", UInt32, [10, 50, 1000]),
+                    ("other", Utf8, ["x", "y", "z"])
+                )
+                .unwrap(),
+                "MergeInsert:",
+            ),
+            AnalyzedWriteNode::InPlace => (
+                builder()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .write_mode(MergeInsertWriteMode::RewriteColumns)
+                    .try_build()
+                    .unwrap(),
+                record_batch!(("key", UInt32, [1, 5]), ("value", UInt32, [10, 50])).unwrap(),
+                "InPlaceMergeInsert:",
+            ),
+            AnalyzedWriteNode::DeleteOnly => (
+                builder()
+                    .when_matched(WhenMatched::Delete)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .try_build()
+                    .unwrap(),
+                record_batch!(("key", UInt32, [1, 5])).unwrap(),
+                "DeleteOnlyMergeInsert:",
+            ),
+        };
+
+        let analysis = job.analyze_plan_batches(vec![source]).await.unwrap();
+        assert!(
+            analysis.trim_start().starts_with(expected_node),
+            "expected the {expected_node} write node:\n{analysis}"
+        );
+
+        assert_eq!(list_dataset_files(&tempdir), files_before);
+        let mut dataset = (*dataset).clone();
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
     }
 
     #[tokio::test]
