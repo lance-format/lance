@@ -30,6 +30,7 @@ public class Query {
   private final Optional<Integer> maximumNprobes;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
+  private final Optional<Integer> quantizedRefineFactor;
   private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
   private final int queryParallelism;
@@ -59,6 +60,10 @@ public class Query {
     this.maximumNprobes = builder.maximumNprobes;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
+    Preconditions.checkArgument(
+        !builder.quantizedRefineFactor.isPresent() || builder.quantizedRefineFactor.get() > 0,
+        "Quantized refine factor must be greater than 0");
+    this.quantizedRefineFactor = builder.quantizedRefineFactor;
     this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
     this.queryParallelism = builder.queryParallelism;
@@ -103,6 +108,10 @@ public class Query {
     return refineFactor;
   }
 
+  public Optional<Integer> getQuantizedRefineFactor() {
+    return quantizedRefineFactor;
+  }
+
   public Optional<DistanceType> getDistanceType() {
     return distanceType;
   }
@@ -138,6 +147,7 @@ public class Query {
         .add("maximumNprobes", maximumNprobes.orElse(null))
         .add("ef", ef.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
+        .add("quantizedRefineFactor", quantizedRefineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
         .add("queryParallelism", queryParallelism)
@@ -154,6 +164,7 @@ public class Query {
     private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
+    private Optional<Integer> quantizedRefineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
     private int queryParallelism = 0;
@@ -305,6 +316,20 @@ public class Query {
      */
     public Builder setRefineFactor(int refineFactor) {
       this.refineFactor = Optional.of(refineFactor);
+      return this;
+    }
+
+    /**
+     * Reranks overfetched IVF_RQ candidates with the index's most accurate stored RQ data.
+     *
+     * <p>This stage does not read original vectors. It can be combined with {@link
+     * #setRefineFactor(int)}, in which case exact refinement remains the final stage.
+     *
+     * @param quantizedRefineFactor One-bit candidate overfetch factor; must be greater than zero.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setQuantizedRefineFactor(int quantizedRefineFactor) {
+      this.quantizedRefineFactor = Optional.of(quantizedRefineFactor);
       return this;
     }
 
