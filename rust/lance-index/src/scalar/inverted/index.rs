@@ -2378,7 +2378,7 @@ impl InvertedPartition {
             let mut batch_windows = Vec::with_capacity(batch_size);
             for _ in 0..batch_size {
                 let Some(window) = windows.peek() else { break };
-                if candidates.len() >= limit && window.upper_bound < threshold {
+                if candidates.len() >= limit && window.upper_bound <= threshold {
                     break;
                 }
                 if let Some(window) = windows.next() {
@@ -2404,7 +2404,7 @@ impl InvertedPartition {
                 .v3_payload_block_batches(&block_rows, metrics)
                 .await?;
             for window in batch_windows {
-                if candidates.len() >= limit && window.upper_bound < threshold {
+                if candidates.len() >= limit && window.upper_bound <= threshold {
                     continue;
                 }
                 let window_blocks = term_plans
@@ -2465,7 +2465,7 @@ impl InvertedPartition {
                     };
                     let doc_length = docs.num_tokens(doc_id);
                     let score = self.v3_score_candidate(&acc, &term_plans, doc_length, &scorer);
-                    if candidates.len() >= limit && score < threshold {
+                    if candidates.len() >= limit && score <= threshold {
                         continue;
                     }
                     if let Some(slop) = phrase_slop
