@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use datafusion::{execution::SessionState, logical_expr::Expr};
+use datafusion::{
+    execution::SessionState,
+    logical_expr::{Expr, registry::FunctionRegistry},
+};
 
 use crate::aggregate::Aggregate;
 use datafusion_common::DFSchema;
@@ -27,6 +30,18 @@ use lance_core::{Error, Result};
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::signed_zero::NORMALIZE_SIGNED_ZERO;
+
+/// Clone the caller's state and add functions that Lance can emit internally.
+///
+/// Substrait decoding resolves functions by name, so these functions must be
+/// present even when the caller supplied a plain DataFusion session state.
+fn substrait_decode_state(state: &SessionState) -> Result<SessionState> {
+    let mut decode_state = state.clone();
+    let _ = decode_state.register_udf(Arc::clone(&NORMALIZE_SIGNED_ZERO))?;
+    Ok(decode_state)
+}
 
 /// FixedSizeList has no Substrait producer support in datafusion-substrait.
 /// Other unsupported types (Null, Float16) are encoded as UserDefined and
@@ -526,9 +541,10 @@ pub async fn parse_substrait(
         ..envelope
     };
 
+    let decode_state = substrait_decode_state(state)?;
     let mut expr_container =
         datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
-            state,
+            &decode_state,
             &extended_expr,
         )
         .await?;
@@ -617,7 +633,8 @@ pub async fn parse_aggregate_rel_with_extensions(
     extensions: &Extensions,
 ) -> Result<Aggregate> {
     let df_schema = DFSchema::try_from(input_schema.as_ref().clone())?;
-    let consumer = DefaultSubstraitConsumer::new(extensions, state);
+    let decode_state = substrait_decode_state(state)?;
+    let consumer = DefaultSubstraitConsumer::new(extensions, &decode_state);
     let group_by = parse_groupings(aggregate_rel, &df_schema, &consumer).await?;
     let aggregates = parse_measures(aggregate_rel, &df_schema, &consumer).await?;
 
