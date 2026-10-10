@@ -150,17 +150,73 @@ fn emit_rabit_prune_stats(message: &str) {
 }
 
 /// Per-scan tallies of the raw-query lower-bound gating, reported through
-/// `record_rabit_prune_stats`.
-#[derive(Default)]
-struct RabitPruneCounters {
-    candidates: usize,
-    pruned_upper_bound: usize,
-    pruned_heap: usize,
-    exact: usize,
-    exact_rejected: usize,
+/// `record_rabit_prune_stats`. Every candidate row lands in exactly one of
+/// `pruned_upper_bound`, `pruned_heap` or `exact`; `exact_rejected` counts
+/// the exactly scored rows that fell outside the query's distance range.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RabitPruneCounters {
+    pub candidates: usize,
+    pub pruned_upper_bound: usize,
+    pub pruned_heap: usize,
+    pub exact: usize,
+    pub exact_rejected: usize,
+}
+
+/// Cumulative raw-query prune counters since process start. They advance only
+/// while `LANCE_RQ_PRUNE_STATS` is enabled (reported by `enabled`), so callers
+/// compare two snapshots instead of reading absolute values.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RabitPruneStatsSnapshot {
+    pub enabled: bool,
+    /// Gated partition scans that reported counters.
+    pub calls: u64,
+    pub candidates: u64,
+    pub pruned_upper_bound: u64,
+    pub pruned_heap: u64,
+    pub exact: u64,
+    pub exact_rejected: u64,
+    /// Partition scans that could not gate on the lower bound (Fast mode,
+    /// residual estimator, or no error factors) and scored every row.
+    pub bypass_calls: u64,
+}
+
+/// Read the process-wide prune counters without resetting them.
+pub fn rabit_prune_stats_snapshot() -> RabitPruneStatsSnapshot {
+    let mut snapshot = RabitPruneStatsSnapshot {
+        enabled: rabit_prune_stats_enabled(),
+        ..Default::default()
+    };
+    if let Some(stats) = RABIT_PRUNE_STATS.get() {
+        snapshot.calls = stats.calls.load(Ordering::Relaxed);
+        snapshot.candidates = stats.candidates.load(Ordering::Relaxed);
+        snapshot.pruned_upper_bound = stats.pruned_upper_bound.load(Ordering::Relaxed);
+        snapshot.pruned_heap = stats.pruned_heap.load(Ordering::Relaxed);
+        snapshot.exact = stats.exact.load(Ordering::Relaxed);
+        snapshot.exact_rejected = stats.exact_rejected.load(Ordering::Relaxed);
+    }
+    if let Some(stats) = RABIT_PRUNE_BYPASS_STATS.get() {
+        snapshot.bypass_calls = stats.calls.load(Ordering::Relaxed);
+    }
+    snapshot
+}
+
+// Tests compare per-partition counters of two scan paths without enabling the
+// process-wide, env-gated statistics that concurrent tests would share.
+#[cfg(test)]
+thread_local! {
+    static CAPTURED_PRUNE_COUNTERS: std::cell::RefCell<Vec<RabitPruneCounters>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the per-scan counters reported on this thread, in report order.
+#[cfg(test)]
+pub(crate) fn take_captured_prune_counters() -> Vec<RabitPruneCounters> {
+    CAPTURED_PRUNE_COUNTERS.with(|captured| std::mem::take(&mut *captured.borrow_mut()))
 }
 
 fn record_rabit_prune_stats(counters: &RabitPruneCounters) {
+    #[cfg(test)]
+    CAPTURED_PRUNE_COUNTERS.with(|captured| captured.borrow_mut().push(*counters));
     if !rabit_prune_stats_enabled() {
         return;
     }
@@ -516,6 +572,21 @@ pub struct RabitQuantizationStorage {
     ex_scale_factors: Option<Float32Array>,
     high_add_factors: Option<Float32Array>,
     high_scale_factors: Option<Float32Array>,
+    // Built from the sign plane alone for the lazy full-precision scan (see
+    // `try_from_sign_plane_for_full`): the metadata still says multi-bit but
+    // no ex codes are loaded, so only the stage-1 bound scan and a survivor
+    // rerank over separately gathered `ExRows` are valid.
+    stage1_only: bool,
+}
+
+/// Which columns `from_batch_with_remapper` requires and loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaneScope {
+    /// Every column the metadata calls for.
+    All,
+    /// Only the sign plane of a layered multi-bit index; the ex planes are
+    /// supplied per query as [`ExRows`].
+    SignOnlyForFull,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -537,6 +608,7 @@ impl RabitQuantizationStorage {
         distance_type: DistanceType,
         fri: Option<Arc<dyn RowIdRemapper>>,
         prepack_ex: bool,
+        scope: PlaneScope,
     ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
@@ -623,7 +695,9 @@ impl RabitQuantizationStorage {
                 }
             }
         }
-        if metadata.layered {
+        if metadata.layered && scope == PlaneScope::SignOnlyForFull {
+            super::layered::RQLayout::try_new(metadata.num_bits)?;
+        } else if metadata.layered {
             super::layered::RQLayout::try_new(metadata.num_bits)?;
             for name in [
                 RABIT_BLOCKED_EX_CODE_LO_COLUMN,
@@ -646,7 +720,9 @@ impl RabitQuantizationStorage {
                 "RabitQ low plane requires layered metadata",
             ));
         }
-        if ex_bits != 0 {
+        if ex_bits != 0 && scope == PlaneScope::SignOnlyForFull {
+            // The ex planes are gathered per query; see `ExRows`.
+        } else if ex_bits != 0 {
             let (normalized_batch, codes, lo) =
                 load_ex_code_planes(batch, metadata.rotated_dim(), metadata.num_bits)?;
             batch = normalized_batch;
@@ -734,6 +810,7 @@ impl RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
+            stage1_only: scope == PlaneScope::SignOnlyForFull,
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
@@ -870,6 +947,18 @@ impl RabitQuantizationStorage {
         &'a self,
         parts: RabitDistCalculatorParts<'a>,
     ) -> RabitDistCalculator<'a> {
+        self.distance_calculator_from_parts_with_ex(parts, None)
+    }
+
+    /// Build the calculator for `parts`. `Some(ex)` replaces this storage's
+    /// full-precision ex codes and factors with gathered rows, which the
+    /// calculator then indexes by ex index; everything else (kernel choice,
+    /// query factors, add-factor transform) is shared with the eager path.
+    fn distance_calculator_from_parts_with_ex<'a>(
+        &'a self,
+        parts: RabitDistCalculatorParts<'a>,
+        ex: Option<ExRows<'a>>,
+    ) -> RabitDistCalculator<'a> {
         let RabitDistCalculatorParts {
             dim,
             dist_table,
@@ -901,27 +990,42 @@ impl RabitQuantizationStorage {
         } else {
             super::layered::RQPrecision::Full
         };
-        let (num_bits, ex_codes, ex_codes_lo, packed_ex_codes, ex_add, ex_scale) =
-            match rq_precision {
-                super::layered::RQPrecision::Full => (
+        let (num_bits, ex_codes, ex_codes_lo, ex_code_len, packed_ex_codes, ex_add, ex_scale) =
+            match (rq_precision, ex) {
+                (super::layered::RQPrecision::Full, Some(ex)) => (
+                    self.metadata.num_bits,
+                    Some(ex.hi),
+                    Some(ex.lo),
+                    ex.hi_row_bytes,
+                    None,
+                    Some(ex.ex_add),
+                    Some(ex.ex_scale),
+                ),
+                (super::layered::RQPrecision::Full, None) => (
                     self.metadata.num_bits,
                     ex_codes,
                     ex_codes_lo,
+                    ex_code_len,
                     packed_ex_codes,
-                    self.ex_add_factors.as_ref(),
-                    self.ex_scale_factors.as_ref(),
+                    self.ex_add_factors.as_ref().map(|f| f.values().as_ref()),
+                    self.ex_scale_factors.as_ref().map(|f| f.values().as_ref()),
                 ),
-                super::layered::RQPrecision::Sign => (1, None, None, None, None, None),
-                super::layered::RQPrecision::High => (
+                (super::layered::RQPrecision::Sign, _) => {
+                    (1, None, None, ex_code_len, None, None, None)
+                }
+                (super::layered::RQPrecision::High, _) => (
                     match self.metadata.num_bits {
                         5 => 3,
                         _ => 5,
                     },
                     ex_codes,
                     None,
+                    ex_code_len,
                     None,
-                    self.high_add_factors.as_ref(),
-                    self.high_scale_factors.as_ref(),
+                    self.high_add_factors.as_ref().map(|f| f.values().as_ref()),
+                    self.high_scale_factors
+                        .as_ref()
+                        .map(|f| f.values().as_ref()),
                 ),
             };
         let mut calculator = RabitDistCalculator::new(
@@ -940,8 +1044,8 @@ impl RabitQuantizationStorage {
             self.error_factors
                 .as_ref()
                 .map(|factors| factors.values().as_ref()),
-            ex_add.map(|factors| factors.values().as_ref()),
-            ex_scale.map(|factors| factors.values().as_ref()),
+            ex_add,
+            ex_scale,
             packed_ex_codes,
             query_factors.add,
             query_factors.error,
@@ -949,6 +1053,7 @@ impl RabitQuantizationStorage {
         );
         calculator.add_factor_scale = query_factors.add_scale;
         calculator.add_factor_offset = query_factors.add_offset;
+        calculator.stage1_only = self.stage1_only;
         if num_bits > 1
             && approx_mode != ApproxMode::Fast
             && (rq_precision == super::layered::RQPrecision::High || self.error_factors.is_none())
@@ -966,6 +1071,170 @@ impl RabitQuantizationStorage {
             }
         }
         calculator
+    }
+
+    /// Build the stage-2 calculator of a lazy full-precision scan: the same
+    /// query preparation and constructor as
+    /// [`VectorStore::dist_calculator_with_scratch`] (so query factors, the
+    /// ex-dot kernel and the add-factor transform are bit-identical to the
+    /// eager scan), scoring survivors against `ex_rows` by ex index. Pass the
+    /// same `query`, `dist_q_c`, `residual` and `options` as stage 1.
+    pub fn dist_calculator_with_ex_rows<'a>(
+        &'a self,
+        query: Arc<dyn Array>,
+        dist_q_c: f32,
+        residual: Option<QueryResidual<'a>>,
+        f32_scratch: &'a mut Vec<f32>,
+        options: DistanceCalculatorOptions,
+        ex_rows: ExRows<'a>,
+    ) -> Result<RabitDistCalculator<'a>> {
+        if !self.metadata.layered
+            || options.rq_precision != super::layered::RQPrecision::Full
+            || options.approx_mode == ApproxMode::Fast
+        {
+            return Err(Error::invalid_input(format!(
+                "gathered ex rows require a layered full-precision gated scan, got layered={} rq_precision={:?} approx_mode={:?}",
+                self.metadata.layered, options.rq_precision, options.approx_mode
+            )));
+        }
+        let layout = super::layered::RQLayout::try_new(self.metadata.num_bits)?;
+        let code_dim = self.code_dim();
+        let hi_row_bytes = blocked_ex_code_bytes(code_dim, layout.high_bits);
+        let lo_row_bytes = blocked_ex_code_bytes(code_dim, layout.low_bits);
+        let rows = ex_rows.len();
+        if ex_rows.hi_row_bytes != hi_row_bytes
+            || ex_rows.hi.len() != rows * hi_row_bytes
+            || ex_rows.lo.len() != rows * lo_row_bytes
+        {
+            return Err(Error::invalid_input(format!(
+                "gathered ex rows do not match rotated_dim={code_dim} num_bits={}: {rows} rows, high plane {} bytes at {} per row (expected {hi_row_bytes}), low plane {} bytes (expected {lo_row_bytes} per row)",
+                self.metadata.num_bits,
+                ex_rows.hi.len(),
+                ex_rows.hi_row_bytes,
+                ex_rows.lo.len(),
+            )));
+        }
+        Ok(self.dist_calculator_with_scratch_and_ex(
+            query,
+            dist_q_c,
+            residual,
+            f32_scratch,
+            options,
+            Some(ex_rows),
+        ))
+    }
+
+    /// Shared body of [`VectorStore::dist_calculator_with_scratch`] and
+    /// [`Self::dist_calculator_with_ex_rows`]: identical query preparation,
+    /// with `ex` optionally overriding the full-precision ex rows.
+    fn dist_calculator_with_scratch_and_ex<'a>(
+        &'a self,
+        qr: Arc<dyn Array>,
+        dist_q_c: f32,
+        residual: Option<QueryResidual<'a>>,
+        f32_scratch: &'a mut Vec<f32>,
+        options: DistanceCalculatorOptions,
+        ex: Option<ExRows<'a>>,
+    ) -> RabitDistCalculator<'a> {
+        let code_dim = self.code_dim();
+        if let (
+            RabitQueryEstimator::RawQuery,
+            Some(QueryResidual::RabitRawQuery {
+                rotated_centroid,
+                query: Some(raw_query),
+            }),
+        ) = (self.metadata.query_estimator, residual)
+        {
+            debug_assert_eq!(raw_query.code_dim, code_dim);
+            // Prefix levels share the rotated query; only stored code factors differ.
+            let query_factors =
+                self.raw_query_factors(dist_q_c, &raw_query.rotated_query, rotated_centroid);
+            return self.distance_calculator_from_parts_with_ex(
+                RabitDistCalculatorParts {
+                    dim: code_dim,
+                    dist_table: Cow::Borrowed(&raw_query.dist_table),
+                    ex_query: Cow::Borrowed(kernel_query(
+                        &raw_query.rotated_query,
+                        &raw_query.ex_query,
+                    )),
+                    sum_q: raw_query.sum_q,
+                    query_factors,
+                    approx_mode: options.approx_mode,
+                    rq_precision: options.rq_precision,
+                },
+                ex,
+            );
+        }
+
+        let dist_table_len = code_dim * 4;
+        let ex_bits = self.metadata.num_bits - 1;
+        // The kernels read the rotated query in place; a zero-padded copy is
+        // only needed when the rotated dim is not block-aligned.
+        let ex_query_table_len = if ex_bits == 0 || code_dim.is_multiple_of(EX_DOT_BLOCK_DIMS) {
+            0
+        } else {
+            padded_query_len(code_dim)
+        };
+        f32_scratch.resize(code_dim + dist_table_len + ex_query_table_len, 0.0);
+
+        let query_factors;
+        let sum_q = {
+            let (rotated_qr, remaining) = f32_scratch.split_at_mut(code_dim);
+            let (dist_table, ex_query) = remaining.split_at_mut(dist_table_len);
+            match residual {
+                Some(QueryResidual::Centroid(residual_centroid)) => {
+                    self.rotate_query_vector_into(
+                        code_dim,
+                        &qr,
+                        Some(residual_centroid),
+                        rotated_qr,
+                    );
+                }
+                Some(QueryResidual::RabitRawQuery { .. }) | None => {
+                    self.rotate_query_vector_into(code_dim, &qr, None, rotated_qr);
+                }
+            }
+            query_factors = match (self.metadata.query_estimator, residual) {
+                (RabitQueryEstimator::ResidualQuery, _) => RabitQueryFactors {
+                    centered_query: None,
+                    add_scale: 1.0,
+                    add_offset: 0.0,
+                    add: self.residual_query_factor(dist_q_c),
+                    error: 0.0,
+                },
+                (
+                    RabitQueryEstimator::RawQuery,
+                    Some(QueryResidual::RabitRawQuery {
+                        rotated_centroid, ..
+                    }),
+                ) => self.raw_query_factors(dist_q_c, rotated_qr, rotated_centroid),
+                (RabitQueryEstimator::RawQuery, _) => {
+                    self.raw_query_factors(dist_q_c, rotated_qr, None)
+                }
+            };
+            build_dist_table_direct_into::<Float32Type>(rotated_qr, dist_table);
+            if ex_query_table_len > 0 {
+                pad_query_into(rotated_qr, ex_query);
+            }
+            rotated_qr.iter().copied().sum()
+        };
+
+        let ex_query_start = code_dim + dist_table_len;
+        self.distance_calculator_from_parts_with_ex(
+            RabitDistCalculatorParts {
+                dim: code_dim,
+                dist_table: Cow::Borrowed(&f32_scratch[code_dim..ex_query_start]),
+                ex_query: Cow::Borrowed(kernel_query(
+                    &f32_scratch[..code_dim],
+                    &f32_scratch[ex_query_start..ex_query_start + ex_query_table_len],
+                )),
+                sum_q,
+                query_factors,
+                approx_mode: options.approx_mode,
+                rq_precision: options.rq_precision,
+            },
+            ex,
+        )
     }
 
     fn rotate_query_vector(&self, code_dim: usize, qr: &dyn Array) -> Vec<f32> {
@@ -1164,6 +1433,162 @@ struct RawQueryTopkContext<'a> {
     query_upper_bound: f32,
 }
 
+/// Full-precision ex rows gathered for the stage-2 rerank of a lazy layered
+/// scan: blocked high and low plane codes plus the full ex factors, all
+/// indexed by the survivor's ex index. Whole planes keep the sign-plane
+/// offset as the ex index; a compact gather uses the position in the gather.
+#[derive(Debug, Clone, Copy)]
+pub struct ExRows<'a> {
+    hi: &'a [u8],
+    hi_row_bytes: usize,
+    lo: &'a [u8],
+    ex_add: &'a [f32],
+    ex_scale: &'a [f32],
+}
+
+impl<'a> ExRows<'a> {
+    /// Borrow the rows of a high-plane batch (plane 1: high codes) and a
+    /// low-plane batch (plane 2: low codes and the full ex factors) with the
+    /// same row order, validating code widths as the eager loader does.
+    pub fn from_plane_batches(
+        hi: &'a RecordBatch,
+        lo: &'a RecordBatch,
+        rotated_dim: usize,
+        num_bits: u8,
+    ) -> Result<Self> {
+        let column = |batch: &'a RecordBatch, name: &str| {
+            batch.column_by_name(name).ok_or_else(|| {
+                Error::invalid_input(format!("RabitQ gathered ex rows require column {name}"))
+            })
+        };
+        let hi_codes = column(hi, RABIT_BLOCKED_EX_CODE_COLUMN)?;
+        let lo_codes = column(lo, RABIT_BLOCKED_EX_CODE_LO_COLUMN)?;
+        let factors = |name: &str| -> Result<&'a [f32]> {
+            let values = column(lo, name)?
+                .as_primitive_opt::<Float32Type>()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("RabitQ column {name} must be float32"))
+                })?
+                .values();
+            Ok(values.as_ref())
+        };
+        let ex_add = factors(EX_ADD_FACTORS_COLUMN)?;
+        let ex_scale = factors(EX_SCALE_FACTORS_COLUMN)?;
+        let rows = hi.num_rows();
+        if lo.num_rows() != rows || ex_add.len() != rows || ex_scale.len() != rows {
+            return Err(Error::invalid_input(format!(
+                "RabitQ gathered ex rows disagree in length: high plane {rows}, low plane {}, ex add factors {}, ex scale factors {}",
+                lo.num_rows(),
+                ex_add.len(),
+                ex_scale.len()
+            )));
+        }
+        let planes = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                Field::new(
+                    RABIT_BLOCKED_EX_CODE_COLUMN,
+                    hi_codes.data_type().clone(),
+                    true,
+                ),
+                Field::new(
+                    RABIT_BLOCKED_EX_CODE_LO_COLUMN,
+                    lo_codes.data_type().clone(),
+                    true,
+                ),
+            ])),
+            vec![hi_codes.clone(), lo_codes.clone()],
+        )?;
+        load_ex_code_planes(planes, rotated_dim, num_bits)?;
+        // Validated above as uint8 fixed-size lists of the layout's widths.
+        let hi_codes = hi_codes.as_fixed_size_list();
+        let lo_codes = lo_codes.as_fixed_size_list();
+        Ok(Self {
+            hi: hi_codes.values().as_primitive::<UInt8Type>().values(),
+            hi_row_bytes: hi_codes.value_length() as usize,
+            lo: lo_codes.values().as_primitive::<UInt8Type>().values(),
+            ex_add,
+            ex_scale,
+        })
+    }
+
+    /// Number of gathered rows.
+    pub fn len(&self) -> usize {
+        self.ex_add.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ex_add.is_empty()
+    }
+}
+
+/// Stage-1 output of a lazy full-precision scan over every row of the
+/// original sign plane: binary inner products in the partition's own
+/// SIMD/tail layout and the native lower bounds derived from them.
+#[derive(Debug, Default, Clone)]
+pub struct SignStage {
+    pub binary_ips: Vec<f32>,
+    pub lower_bounds: Vec<f32>,
+}
+
+/// A stage-1 survivor handed to [`RabitDistCalculator::accumulate_survivor_rows`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurvivorRow {
+    /// Row position in the [`ExRows`] the stage-2 calculator was built with.
+    pub ex_index: u32,
+    pub row_id: u64,
+    /// Stage-1 binary inner product of the row's original sign-plane offset.
+    pub binary_ip: f32,
+    /// Stage-1 lower bound of the row's original sign-plane offset.
+    pub lower_bound: f32,
+}
+
+/// Rows a stage-1 selection classified, in the categories of the eager
+/// per-row step (see [`RabitPruneCounters`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StagePruneCounts {
+    /// Accepted rows: every row without a prefilter, otherwise the rows the
+    /// prefilter selects.
+    pub candidates: usize,
+    pub pruned_upper_bound: usize,
+    pub pruned_heap: usize,
+}
+
+/// Select the stage-1 survivors of a partition in ascending offset order.
+///
+/// Row `i` survives iff it is accepted, `lower_bounds[i] < upper`, and
+/// `lower_bounds[i] < threshold`, with the upper-bound check first as in the
+/// eager per-row step. `upper` is the query's upper distance bound (none
+/// means `f32::MAX`, as in the eager scan). `threshold` must be the top of a
+/// full-score heap that already held `k` rows — never an estimate — and
+/// `None` while the heap is not full. A NaN bound or threshold compares false
+/// and keeps the row. Replaces the contents of `survivors` and `counts`.
+pub fn select_full_survivors(
+    lower_bounds: &[f32],
+    accept: Option<&[bool]>,
+    upper: Option<f32>,
+    threshold: Option<f32>,
+    survivors: &mut Vec<u32>,
+    counts: &mut StagePruneCounts,
+) {
+    debug_assert!(accept.is_none_or(|accept| accept.len() == lower_bounds.len()));
+    let upper = upper.unwrap_or(f32::MAX);
+    survivors.clear();
+    *counts = StagePruneCounts::default();
+    for (offset, &lower_bound) in lower_bounds.iter().enumerate() {
+        if accept.is_some_and(|accept| !accept[offset]) {
+            continue;
+        }
+        counts.candidates += 1;
+        if lower_bound >= upper {
+            counts.pruned_upper_bound += 1;
+        } else if threshold.is_some_and(|threshold| lower_bound >= threshold) {
+            counts.pruned_heap += 1;
+        } else {
+            survivors.push(offset as u32);
+        }
+    }
+}
+
 /// Pick the query slice the ex-dot kernels consume: the rotated query itself
 /// when the dim is block-aligned, otherwise a zero-padded copy.
 fn kernel_query<'a>(rotated_query: &'a [f32], padded: &'a [f32]) -> &'a [f32] {
@@ -1209,6 +1634,10 @@ pub struct RabitDistCalculator<'a> {
     add_factor_scale: f32,
     add_factor_offset: f32,
     approx_mode: ApproxMode,
+    // Built on a sign-plane-only storage: ex arrays, when present, are indexed
+    // by gathered ex index rather than by sign-plane offset, so the dense and
+    // filtered top-k scans must not run on it.
+    stage1_only: bool,
 
     sum_q: f32,
     sqrt_d: f32,
@@ -1380,6 +1809,7 @@ impl<'a> RabitDistCalculator<'a> {
             approx_mode,
             add_factor_scale: 1.0,
             add_factor_offset: 0.0,
+            stage1_only: false,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
         }
@@ -1840,6 +2270,10 @@ impl<'a> RabitDistCalculator<'a> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) -> Option<RawQueryTopkContext<'_>> {
+        debug_assert!(
+            !self.stage1_only,
+            "a sign-plane-only calculator scores survivors through accumulate_survivor_rows"
+        );
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
         if n == 0 {
@@ -1858,7 +2292,19 @@ impl<'a> RabitDistCalculator<'a> {
             hacc_quantized_dists,
         );
 
-        Some(RawQueryTopkContext {
+        Some(self.raw_query_ex_context(n, k, lower_bound, upper_bound))
+    }
+
+    /// The loop-invariant exact-rerank inputs shared by the eager top-k scans
+    /// and the lazy survivor rerank.
+    fn raw_query_ex_context(
+        &self,
+        n: usize,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+    ) -> RawQueryTopkContext<'_> {
+        RawQueryTopkContext {
             n,
             k,
             ex_bits: self.num_bits - 1,
@@ -1873,7 +2319,113 @@ impl<'a> RabitDistCalculator<'a> {
                 .expect("raw-query multi-bit RQ requires ex scale factors"),
             query_lower_bound: lower_bound.unwrap_or(f32::MIN),
             query_upper_bound: upper_bound.unwrap_or(f32::MAX),
-        })
+        }
+    }
+
+    /// Stage 1 of a lazy full-precision scan: the binary inner products and
+    /// native lower bounds of every row of the original sign plane, computed
+    /// exactly as the eager dense scan computes them (same SIMD/tail split and
+    /// LUT quantization, exact fallback, and Accurate high-accuracy LUT).
+    ///
+    /// Returns `Err(reason)` without touching `out` when this calculator
+    /// cannot gate on the lower bound (the eager scan then scores every row,
+    /// so the caller must take the eager path for the partition).
+    pub fn full_sign_stage_with_scratch(
+        &self,
+        out: &mut SignStage,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
+    ) -> std::result::Result<(), &'static str> {
+        if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
+            return Err(reason);
+        }
+        let Some(error_factors) = self.pruning_errors() else {
+            return Err("missing_error_factors");
+        };
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let n = self.codes.len() / code_len;
+        out.lower_bounds.clear();
+        if n == 0 {
+            out.binary_ips.clear();
+            return Ok(());
+        }
+        self.binary_distances_with_scratch(
+            n,
+            code_len,
+            &mut out.binary_ips,
+            quantized_dists,
+            quantized_dists_table,
+            hacc_quantized_dists,
+        );
+        // Same expression as `raw_query_lower_bound`, so the survivors'
+        // bounds match the eager scan's (and its prune masks) bit for bit.
+        out.lower_bounds
+            .extend(out.binary_ips.iter().enumerate().map(|(id, &binary_ip)| {
+                self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error
+            }));
+        Ok(())
+    }
+
+    /// Stage 2 of a lazy full-precision scan for one partition. `rows` are
+    /// the partition's stage-1 survivors in ascending sign-plane offset order;
+    /// each goes through the eager scan's per-row step (bound checks against
+    /// the live heap, exact rerank, range check, heap update) with its
+    /// stage-1 inner product and bound. `stage1` carries the rows stage 1
+    /// already pruned so the partition reports the same prune counters as the
+    /// eager scan; they are returned together with the stage-2 tallies.
+    ///
+    /// `on_first_full` receives the heap top once, when this partition first
+    /// fills the heap to `k` rows.
+    ///
+    /// The calculator must come from
+    /// [`RabitQuantizationStorage::dist_calculator_with_ex_rows`] with the
+    /// rows the survivors' `ex_index` refers to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_survivor_rows(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        rows: &[SurvivorRow],
+        stage1: StagePruneCounts,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        mut on_first_full: impl FnMut(f32),
+    ) -> RabitPruneCounters {
+        let mut counters = RabitPruneCounters {
+            candidates: stage1.candidates,
+            pruned_upper_bound: stage1.pruned_upper_bound,
+            pruned_heap: stage1.pruned_heap,
+            ..Default::default()
+        };
+        let n = self.codes.len() / rabit_binary_code_bytes(self.dim);
+        // The eager scans return before reporting for these, too.
+        if k == 0 || n == 0 {
+            return counters;
+        }
+        let ctx = self.raw_query_ex_context(n, k, lower_bound, upper_bound);
+        let mut max_dist = res.peek().map(|node| node.dist);
+        let mut is_full = res.len() >= k;
+        for row in rows {
+            self.accumulate_raw_query_multi_bit_row(
+                &ctx,
+                row.ex_index as usize,
+                row.row_id,
+                row.binary_ip,
+                row.lower_bound,
+                res,
+                &mut max_dist,
+                &mut counters,
+            );
+            if !is_full && res.len() >= k {
+                is_full = true;
+                if let Some(top) = res.peek() {
+                    on_first_full(top.dist.0);
+                }
+            }
+        }
+        record_rabit_prune_stats(&counters);
+        counters
     }
 
     /// Process one candidate row given its lower bound: the bound checks,
@@ -2730,99 +3282,7 @@ impl VectorStore for RabitQuantizationStorage {
         f32_scratch: &'a mut Vec<f32>,
         options: DistanceCalculatorOptions,
     ) -> Self::DistanceCalculator<'a> {
-        let code_dim = self.code_dim();
-        if let (
-            RabitQueryEstimator::RawQuery,
-            Some(QueryResidual::RabitRawQuery {
-                rotated_centroid,
-                query: Some(raw_query),
-            }),
-        ) = (self.metadata.query_estimator, residual)
-        {
-            debug_assert_eq!(raw_query.code_dim, code_dim);
-            // Prefix levels share the rotated query; only stored code factors differ.
-            let query_factors =
-                self.raw_query_factors(dist_q_c, &raw_query.rotated_query, rotated_centroid);
-            return self.distance_calculator_from_parts(RabitDistCalculatorParts {
-                dim: code_dim,
-                dist_table: Cow::Borrowed(&raw_query.dist_table),
-                ex_query: Cow::Borrowed(kernel_query(
-                    &raw_query.rotated_query,
-                    &raw_query.ex_query,
-                )),
-                sum_q: raw_query.sum_q,
-                query_factors,
-                approx_mode: options.approx_mode,
-                rq_precision: options.rq_precision,
-            });
-        }
-
-        let dist_table_len = code_dim * 4;
-        let ex_bits = self.metadata.num_bits - 1;
-        // The kernels read the rotated query in place; a zero-padded copy is
-        // only needed when the rotated dim is not block-aligned.
-        let ex_query_table_len = if ex_bits == 0 || code_dim.is_multiple_of(EX_DOT_BLOCK_DIMS) {
-            0
-        } else {
-            padded_query_len(code_dim)
-        };
-        f32_scratch.resize(code_dim + dist_table_len + ex_query_table_len, 0.0);
-
-        let query_factors;
-        let sum_q = {
-            let (rotated_qr, remaining) = f32_scratch.split_at_mut(code_dim);
-            let (dist_table, ex_query) = remaining.split_at_mut(dist_table_len);
-            match residual {
-                Some(QueryResidual::Centroid(residual_centroid)) => {
-                    self.rotate_query_vector_into(
-                        code_dim,
-                        &qr,
-                        Some(residual_centroid),
-                        rotated_qr,
-                    );
-                }
-                Some(QueryResidual::RabitRawQuery { .. }) | None => {
-                    self.rotate_query_vector_into(code_dim, &qr, None, rotated_qr);
-                }
-            }
-            query_factors = match (self.metadata.query_estimator, residual) {
-                (RabitQueryEstimator::ResidualQuery, _) => RabitQueryFactors {
-                    centered_query: None,
-                    add_scale: 1.0,
-                    add_offset: 0.0,
-                    add: self.residual_query_factor(dist_q_c),
-                    error: 0.0,
-                },
-                (
-                    RabitQueryEstimator::RawQuery,
-                    Some(QueryResidual::RabitRawQuery {
-                        rotated_centroid, ..
-                    }),
-                ) => self.raw_query_factors(dist_q_c, rotated_qr, rotated_centroid),
-                (RabitQueryEstimator::RawQuery, _) => {
-                    self.raw_query_factors(dist_q_c, rotated_qr, None)
-                }
-            };
-            build_dist_table_direct_into::<Float32Type>(rotated_qr, dist_table);
-            if ex_query_table_len > 0 {
-                pad_query_into(rotated_qr, ex_query);
-            }
-            rotated_qr.iter().copied().sum()
-        };
-
-        let ex_query_start = code_dim + dist_table_len;
-        self.distance_calculator_from_parts(RabitDistCalculatorParts {
-            dim: code_dim,
-            dist_table: Cow::Borrowed(&f32_scratch[code_dim..ex_query_start]),
-            ex_query: Cow::Borrowed(kernel_query(
-                &f32_scratch[..code_dim],
-                &f32_scratch[ex_query_start..ex_query_start + ex_query_table_len],
-            )),
-            sum_q,
-            query_factors,
-            approx_mode: options.approx_mode,
-            rq_precision: options.rq_precision,
-        })
+        self.dist_calculator_with_scratch_and_ex(qr, dist_q_c, residual, f32_scratch, options, None)
     }
 
     // TODO: implement this
@@ -3117,7 +3577,14 @@ impl QuantizerStorage for RabitQuantizationStorage {
         // The projected store is reconstructed per query. Its blocked kernels
         // consume codes directly, so rebuilding an ex FastScan transpose here
         // would cost more than scoring the requested prefix.
-        Self::from_batch_with_remapper(batch, &metadata, distance_type, remapper, false)
+        Self::from_batch_with_remapper(
+            batch,
+            &metadata,
+            distance_type,
+            remapper,
+            false,
+            PlaneScope::All,
+        )
     }
 
     type Metadata = RabitQuantizationMetadata;
@@ -3138,7 +3605,38 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
-        Self::from_batch_with_remapper(batch, metadata, distance_type, fri, true)
+        Self::from_batch_with_remapper(batch, metadata, distance_type, fri, true, PlaneScope::All)
+    }
+
+    /// Load only the sign plane (row ids, packed sign codes, binary and error
+    /// factors, bound columns) of a layered multi-bit partition. The result
+    /// supports [`RabitDistCalculator::full_sign_stage_with_scratch`] and, with
+    /// gathered rows, [`RabitQuantizationStorage::dist_calculator_with_ex_rows`];
+    /// it never scores rows through the eager top-k scans.
+    fn try_from_sign_plane_for_full(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+    ) -> Result<Self> {
+        if !metadata.layered || metadata.num_bits <= 1 {
+            return Err(Error::invalid_input(format!(
+                "sign-plane full-precision storage requires a layered multi-bit IVF_RQ index, got layered={} num_bits={}",
+                metadata.layered, metadata.num_bits
+            )));
+        }
+        if batch.column_by_name(ERROR_FACTORS_COLUMN).is_none() {
+            return Err(Error::invalid_input(format!(
+                "sign-plane full-precision storage requires the {ERROR_FACTORS_COLUMN} column for native lower-bound pruning"
+            )));
+        }
+        Self::from_batch_with_remapper(
+            batch,
+            metadata,
+            distance_type,
+            None,
+            false,
+            PlaneScope::SignOnlyForFull,
+        )
     }
 
     fn metadata(&self) -> &Self::Metadata {
@@ -3250,6 +3748,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             ex_add_factors,
             ex_scale_factors,
             row_ids: new_row_ids,
+            stage1_only: false,
         })
     }
 }

@@ -302,6 +302,19 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         Self::try_from_batch_with_remapper(batch, metadata, distance_type, remapper)
     }
 
+    /// Materialize only the sign plane of a layered partition for the lazy
+    /// full-precision scan, which bounds every row from it before reading the
+    /// ex planes of the survivors. Only layered IVF_RQ storage supports it.
+    fn try_from_sign_plane_for_full(
+        _batch: RecordBatch,
+        _metadata: &Self::Metadata,
+        _distance_type: DistanceType,
+    ) -> Result<Self> {
+        Err(Error::not_supported(
+            "sign-plane-only storage requires a layered IVF_RQ index".to_string(),
+        ))
+    }
+
     fn metadata(&self) -> &Self::Metadata;
 
     fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {

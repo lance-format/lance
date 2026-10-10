@@ -21,6 +21,9 @@ pub mod builder;
 pub(crate) mod dist_table_quant;
 pub mod ex_dot;
 pub mod layered;
+pub mod layered_stats;
+#[cfg(test)]
+mod lazy_tests;
 pub(crate) mod pairwise;
 mod plane_cache;
 pub mod prune;
