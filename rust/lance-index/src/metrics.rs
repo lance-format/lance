@@ -15,6 +15,7 @@ pub const FTS_PAYLOAD_READ_RANGES_METRIC: &str = "fts_payload_read_ranges";
 pub const FTS_REFINEMENT_BATCHES_METRIC: &str = "fts_refinement_batches";
 pub const FTS_PAYLOAD_READ_BATCHES_METRIC: &str = "fts_payload_read_batches";
 pub const FTS_POSITION_READ_BATCHES_METRIC: &str = "fts_position_read_batches";
+pub const FTS_METADATA_READ_BATCHES_METRIC: &str = "fts_metadata_read_batches";
 
 /// A trait used by the index to report metrics
 ///
@@ -87,6 +88,8 @@ pub trait MetricsCollector: Send + Sync {
 
     fn record_fts_position_read_batches(&self, _num_batches: usize) {}
 
+    fn record_fts_metadata_read_batches(&self, _num_batches: usize) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///
@@ -123,6 +126,7 @@ pub struct LocalMetricsCollector {
     pub fts_refinement_batches: AtomicUsize,
     pub fts_payload_read_batches: AtomicUsize,
     pub fts_position_read_batches: AtomicUsize,
+    pub fts_metadata_read_batches: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -130,6 +134,9 @@ impl LocalMetricsCollector {
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
+        other.record_fts_metadata_read_batches(
+            self.fts_metadata_read_batches.load(Ordering::Relaxed),
+        );
         other.record_fts_block_metadata_rows(self.fts_block_metadata_rows.load(Ordering::Relaxed));
         other.record_fts_payload_blocks_read(self.fts_payload_blocks_read.load(Ordering::Relaxed));
         other
@@ -196,6 +203,11 @@ impl MetricsCollector for LocalMetricsCollector {
 
     fn record_fts_position_read_batches(&self, num_batches: usize) {
         self.fts_position_read_batches
+            .fetch_add(num_batches, Ordering::Relaxed);
+    }
+
+    fn record_fts_metadata_read_batches(&self, num_batches: usize) {
+        self.fts_metadata_read_batches
             .fetch_add(num_batches, Ordering::Relaxed);
     }
 }

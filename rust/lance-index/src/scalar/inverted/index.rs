@@ -2310,33 +2310,40 @@ impl InvertedPartition {
         token_ids: Vec<(u32, String, u32)>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<V3TermPlan>> {
+        let metadata = self
+            .inverted_list
+            .v3_block_metadata(
+                &token_ids.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                metrics,
+            )
+            .await?;
         stream::iter(token_ids.into_iter().enumerate())
-            .map(|(term_idx, (token_id, token, position))| async move {
-                let posting_len = self.inverted_list.posting_len_for_token(token_id).await? as u32;
-                let blocks = self
-                    .inverted_list
-                    .v3_block_metadata(token_id, metrics)
-                    .await?;
-                let cached_posting = if v3_bypass_posting_list_cache_enabled() {
-                    None
-                } else {
-                    self.inverted_list
-                        .index_cache
-                        .get_with_key(&PostingListKey { token_id })
-                        .await
-                };
-                Ok(V3TermPlan {
-                    token_id,
-                    token,
-                    position,
-                    term_index: position,
-                    posting_len,
-                    term_idx,
-                    block_start: self.inverted_list.posting_list_range(token_id).start,
-                    blocks,
-                    cached_posting,
-                    refined_blocks: HashMap::new(),
-                })
+            .map(|(term_idx, (token_id, token, position))| {
+                let blocks = metadata[&token_id].clone();
+                async move {
+                    let posting_len =
+                        self.inverted_list.posting_len_for_token(token_id).await? as u32;
+                    let cached_posting = if v3_bypass_posting_list_cache_enabled() {
+                        None
+                    } else {
+                        self.inverted_list
+                            .index_cache
+                            .get_with_key(&PostingListKey { token_id })
+                            .await
+                    };
+                    Ok(V3TermPlan {
+                        token_id,
+                        token,
+                        position,
+                        term_index: position,
+                        posting_len,
+                        term_idx,
+                        block_start: self.inverted_list.posting_list_range(token_id).start,
+                        blocks,
+                        cached_posting,
+                        refined_blocks: HashMap::new(),
+                    })
+                }
             })
             .buffered(16)
             .try_collect()
@@ -3950,34 +3957,66 @@ impl PostingListReader {
 
     async fn v3_block_metadata(
         &self,
-        token_id: u32,
+        token_ids: &[u32],
         metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<Vec<V3BlockSkipMeta>>> {
-        let skip = self
-            .index_cache
-            .get_or_insert_with_key(V3BlockMetadataKey { token_id }, || async move {
-                let block_reader = self.v3_block_reader()?;
-                let block_range = self.posting_list_range(token_id);
-                let skip_batch = block_reader
-                    .read_range(
-                        block_range.clone(),
-                        Some(&[FIRST_DOC_ID_COL, LAST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
-                    )
-                    .await?;
-                let expected_rows = block_range.end.saturating_sub(block_range.start);
-                if skip_batch.num_rows() != expected_rows {
-                    return Err(Error::index(format!(
-                        "V3 skip metadata returned {} rows for block range {:?}",
-                        skip_batch.num_rows(),
-                        block_range
-                    )));
+    ) -> Result<HashMap<u32, Arc<Vec<V3BlockSkipMeta>>>> {
+        let mut metadata = HashMap::with_capacity(token_ids.len());
+        let mut missing = Vec::new();
+        for token_id in token_ids.iter().copied().unique() {
+            let key = V3BlockMetadataKey { token_id };
+            if let Some(blocks) = self.index_cache.get_with_key(&key).await {
+                metadata.insert(token_id, blocks);
+            } else {
+                let range = self.posting_list_range(token_id);
+                if range.is_empty() {
+                    metadata.insert(token_id, Arc::new(Vec::new()));
+                } else {
+                    missing.push((token_id, range));
                 }
-                metrics.record_fts_block_metadata_rows(skip_batch.num_rows());
-                Self::v3_skip_metadata_from_batch(block_range, &skip_batch)
-            })
-            .await?;
+            }
+        }
+        if missing.is_empty() {
+            return Ok(metadata);
+        }
 
-        Ok(skip)
+        // One projected read lets the file scheduler coalesce requests across
+        // query terms instead of re-reading shared pages for each term.
+        missing.sort_unstable_by_key(|(_, range)| range.start);
+        let ranges = missing
+            .iter()
+            .map(|(_, range)| range.clone())
+            .collect::<Vec<_>>();
+        let batch = self
+            .v3_block_reader()?
+            .read_ranges(
+                &ranges,
+                Some(&[FIRST_DOC_ID_COL, LAST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
+            )
+            .await?;
+        let expected_rows = ranges.iter().map(|range| range.len()).sum::<usize>();
+        if batch.num_rows() != expected_rows {
+            return Err(Error::index(format!(
+                "V3 skip metadata returned {} rows, expected {}",
+                batch.num_rows(),
+                expected_rows
+            )));
+        }
+        metrics.record_fts_block_metadata_rows(batch.num_rows());
+        metrics.record_fts_metadata_read_batches(1);
+        let mut offset = 0;
+        for (token_id, range) in missing {
+            let len = range.len();
+            let blocks = Arc::new(Self::v3_skip_metadata_from_batch(
+                range,
+                &batch.slice(offset, len),
+            )?);
+            offset += len;
+            self.index_cache
+                .insert_with_key(&V3BlockMetadataKey { token_id }, blocks.clone())
+                .await;
+            metadata.insert(token_id, blocks);
+        }
+        Ok(metadata)
     }
 
     async fn v3_payload_blocks(
