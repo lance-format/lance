@@ -244,7 +244,8 @@ sequences are single runs and cost a few bytes. A value carried over from existi
 rows -- the row ids and created-at versions that compaction or a row rewrite
 preserves -- is fixed before the commit and may be written to a data file.
 A writer spills only on a table that opts in through the `lance.row_lineage.spill`
-config key; a table that never sets it is unchanged.
+config key; a table that never sets it is unchanged. This configuration controls
+placement by the writer, not support for reading existing spilled sequences.
 
 A writer that emits any column arm MUST set the spilled row lineage feature flag
 (bit 11, value 2048) in both the reader and writer flag words. A reader without that
@@ -258,8 +259,9 @@ writer ever emitted them; the column arms replace that design, and the numbers a
 names are reserved.
 
 !!! note
-    Spilled row lineage sequences are not yet a released feature. A released build
-    treats bit 11 as an unknown feature flag and refuses the dataset.
+    Spilled row lineage is a stable table-format feature. Readers and writers that
+    do not support bit 11 MUST refuse a dataset that requires it. Supporting the
+    flag does not opt a table into spilling.
 
 <details>
 <summary>DataFragment row_id_sequence field</summary>
