@@ -183,6 +183,32 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
 
 
+def test_lsm_scanner_json_column(tmp_path):
+    """Every LsmScanner read method returns a JSON column as Arrow JSON, the
+    same as Dataset.to_table, not as Lance's stored JSONB bytes."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("doc", pa.json_(pa.utf8())),
+        ]
+    )
+    docs = pa.array(['{"a": 1}', '{"b": 2}'], pa.json_(pa.utf8()))
+    data = pa.table({"id": pa.array([1, 2], pa.int64()), "doc": docs}, schema=schema)
+    base_ds = lance.write_dataset(data, str(tmp_path / "base"), schema=schema)
+    base_ds.initialize_mem_wal()
+    snap = ShardSnapshot(str(uuid.uuid4())).with_current_generation(1)
+
+    expected = base_ds.to_table().sort_by("id")
+    assert expected.schema.field("doc").type == pa.json_(pa.utf8())
+
+    def scanner():
+        return LsmScanner.from_snapshots(base_ds, [snap])
+
+    assert scanner().to_table().sort_by("id") == expected
+    assert pa.Table.from_batches(scanner().to_batches()).sort_by("id") == expected
+    assert scanner().count_rows() == 2
+
+
 def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
