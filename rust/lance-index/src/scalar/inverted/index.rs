@@ -49,6 +49,7 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use roaring::RoaringBitmap;
+use smallvec::SmallVec;
 use std::sync::LazyLock;
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use tracing::{info, instrument};
@@ -323,16 +324,24 @@ struct V3DecodedPositionBlock {
 }
 
 #[derive(Debug, Clone)]
-struct V3TermPositions {
+struct V3TermPositions<'a> {
     position_in_query: i32,
-    positions: Vec<u32>,
+    positions: &'a [u32],
 }
 
 #[derive(Debug)]
+struct V3TermHit {
+    term_idx: usize,
+    block_row: usize,
+    doc_offset: usize,
+    freq: u32,
+}
+
+#[derive(Debug, Default)]
 struct V3DocAccumulator {
-    freqs: Vec<Option<u32>>,
-    block_rows: Vec<Option<usize>>,
-    doc_offsets: Vec<Option<usize>>,
+    // A window overlaps at most one block per term. Hits are appended in term
+    // order, preserving floating-point score accumulation without dense arrays.
+    hits: SmallVec<[V3TermHit; 2]>,
 }
 
 struct V3ScoredCandidate {
@@ -344,32 +353,27 @@ struct V3ScoredCandidate {
 }
 
 impl V3DocAccumulator {
-    fn new(num_terms: usize) -> Self {
-        Self {
-            freqs: vec![None; num_terms],
-            block_rows: vec![None; num_terms],
-            doc_offsets: vec![None; num_terms],
-        }
-    }
-
     fn add(&mut self, term_idx: usize, block_row: usize, doc_offset: usize, freq: u32) {
-        self.freqs[term_idx] = Some(freq);
-        self.block_rows[term_idx] = Some(block_row);
-        self.doc_offsets[term_idx] = Some(doc_offset);
+        debug_assert!(self.hits.last().is_none_or(|hit| hit.term_idx < term_idx));
+        self.hits.push(V3TermHit {
+            term_idx,
+            block_row,
+            doc_offset,
+            freq,
+        });
     }
 
-    fn matches_operator(&self, operator: Operator) -> bool {
+    fn matches_operator(&self, operator: Operator, num_terms: usize) -> bool {
         match operator {
-            Operator::And => self.freqs.iter().all(Option::is_some),
-            Operator::Or => self.freqs.iter().any(Option::is_some),
+            Operator::And => self.hits.len() == num_terms,
+            Operator::Or => !self.hits.is_empty(),
         }
     }
 
     fn term_freqs(&self, term_plans: &[V3TermPlan]) -> Vec<(u32, u32)> {
-        self.freqs
+        self.hits
             .iter()
-            .enumerate()
-            .filter_map(|(term_idx, freq)| freq.map(|freq| (term_plans[term_idx].term_index, freq)))
+            .map(|hit| (term_plans[hit.term_idx].term_index, hit.freq))
             .collect()
     }
 }
@@ -384,33 +388,32 @@ fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
     }
 }
 
-fn v3_phrase_positions_match(mut terms: Vec<V3TermPositions>, slop: i32) -> bool {
+fn v3_phrase_positions_match(terms: &mut [V3TermPositions<'_>], slop: i32) -> bool {
     if terms.is_empty() || terms.iter().any(|term| term.positions.is_empty()) {
         return false;
     }
-    for term in &mut terms {
-        term.positions.sort_unstable();
-        term.positions.dedup();
-    }
+    // Shared-stream codecs reconstruct nondecreasing per-document positions.
+    // Duplicate positions do not change phrase existence, so borrow the decoded
+    // slices instead of copying and normalizing them for every candidate.
     if slop == 0 {
         return v3_exact_phrase_positions_match(terms);
     }
 
     terms.sort_unstable_by_key(|term| term.position_in_query);
     let first = &terms[0];
-    for &position in &first.positions {
+    for &position in first.positions {
         let relative = position as i32 - first.position_in_query;
-        if v3_sloppy_phrase_positions_match_from(&terms, 1, relative, slop) {
+        if v3_sloppy_phrase_positions_match_from(terms, 1, relative, slop) {
             return true;
         }
     }
     false
 }
 
-fn v3_exact_phrase_positions_match(mut terms: Vec<V3TermPositions>) -> bool {
+fn v3_exact_phrase_positions_match(terms: &mut [V3TermPositions<'_>]) -> bool {
     terms.sort_unstable_by_key(|term| term.positions.len());
     let lead = &terms[0];
-    for &anchor in &lead.positions {
+    for &anchor in lead.positions {
         let Some(base) = anchor.checked_sub(lead.position_in_query as u32) else {
             continue;
         };
@@ -425,7 +428,7 @@ fn v3_exact_phrase_positions_match(mut terms: Vec<V3TermPositions>) -> bool {
 }
 
 fn v3_sloppy_phrase_positions_match_from(
-    terms: &[V3TermPositions],
+    terms: &[V3TermPositions<'_>],
     term_idx: usize,
     previous_relative: i32,
     slop: i32,
@@ -436,7 +439,7 @@ fn v3_sloppy_phrase_positions_match_from(
     let term = &terms[term_idx];
     let lower = previous_relative + term.position_in_query;
     let upper = previous_relative + slop + term.position_in_query;
-    for &position in &term.positions {
+    for &position in term.positions {
         let position = position as i32;
         if position < lower {
             continue;
@@ -2400,6 +2403,7 @@ impl InvertedPartition {
         let mut num_comparisons = 0usize;
         let mut can_refine = term_plans.len() > 1 && limit < self.docs.len();
         let mut position_batch_size = limit.clamp(16, 128);
+        let mut docs_in_window = HashMap::<u32, V3DocAccumulator>::new();
         let mut windows = windows;
         while !windows.is_empty() {
             threshold =
@@ -2460,14 +2464,9 @@ impl InvertedPartition {
                     continue;
                 }
                 scored_windows.insert(window.first_doc_id, window.last_doc_id);
-                let window_blocks = term_plans
-                    .iter()
-                    .flat_map(|term| {
-                        term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
-                    })
-                    .collect::<Vec<_>>();
-                let mut docs_in_window = HashMap::<u32, V3DocAccumulator>::new();
-                for block in &window_blocks {
+                for block in term_plans.iter().flat_map(|term| {
+                    term.overlapping_blocks(window.first_doc_id, window.last_doc_id)
+                }) {
                     let decoded = decoded_blocks.get(&block.block_row).ok_or_else(|| {
                         Error::internal(format!("missing decoded V3 block row {}", block.block_row))
                     })?;
@@ -2480,15 +2479,17 @@ impl InvertedPartition {
                     for doc_offset in start..end {
                         let doc_id = decoded.doc_ids[doc_offset];
                         let freq = decoded.freqs[doc_offset];
-                        docs_in_window
-                            .entry(doc_id)
-                            .or_insert_with(|| V3DocAccumulator::new(term_plans.len()))
-                            .add(block.term_idx, block.block_row, doc_offset, freq);
+                        docs_in_window.entry(doc_id).or_default().add(
+                            block.term_idx,
+                            block.block_row,
+                            doc_offset,
+                            freq,
+                        );
                     }
                 }
 
-                for (doc_id, acc) in docs_in_window {
-                    if !acc.matches_operator(candidate_operator) {
+                for (doc_id, acc) in docs_in_window.drain() {
+                    if !acc.matches_operator(candidate_operator, term_plans.len()) {
                         continue;
                     }
                     num_comparisons += 1;
@@ -2548,7 +2549,8 @@ impl InvertedPartition {
                             candidate_end = candidate_offset + offset;
                             break;
                         }
-                        for &row in candidate.acc.block_rows.iter().flatten() {
+                        for hit in &candidate.acc.hits {
+                            let row = hit.block_row;
                             if !decoded_positions.contains_key(&row) {
                                 rows.insert(row);
                             }
@@ -2771,12 +2773,10 @@ impl InvertedPartition {
         doc_length: u32,
         scorer: &IndexBM25Scorer,
     ) -> f32 {
-        acc.freqs
+        acc.hits
             .iter()
-            .enumerate()
-            .filter_map(|(term_idx, freq)| freq.map(|freq| (term_idx, freq)))
-            .map(|(term_idx, freq)| {
-                term_plans[term_idx].query_weight * scorer.doc_weight(freq, doc_length)
+            .map(|hit| {
+                term_plans[hit.term_idx].query_weight * scorer.doc_weight(hit.freq, doc_length)
             })
             .sum()
     }
@@ -2835,12 +2835,14 @@ impl InvertedPartition {
         decoded_positions: &HashMap<usize, V3DecodedPositionBlock>,
         slop: i32,
     ) -> Result<bool> {
-        let mut term_positions = Vec::with_capacity(term_plans.len());
-        for (term_idx, term) in term_plans.iter().enumerate() {
-            let row = acc.block_rows[term_idx]
-                .ok_or_else(|| Error::internal("phrase candidate is missing a term block row"))?;
-            let doc_offset = acc.doc_offsets[term_idx]
-                .ok_or_else(|| Error::internal("phrase candidate is missing a term doc offset"))?;
+        let mut term_positions = SmallVec::<[V3TermPositions<'_>; 2]>::new();
+        if acc.hits.len() != term_plans.len() {
+            return Err(Error::internal("phrase candidate is missing a term"));
+        }
+        for hit in &acc.hits {
+            let term = &term_plans[hit.term_idx];
+            let row = hit.block_row;
+            let doc_offset = hit.doc_offset;
             let position_block = decoded_positions.get(&row).ok_or_else(|| {
                 Error::internal(format!("missing decoded V3 positions for block row {row}"))
             })?;
@@ -2848,10 +2850,10 @@ impl InvertedPartition {
             let end = position_block.offsets[doc_offset + 1];
             term_positions.push(V3TermPositions {
                 position_in_query: term.position as i32,
-                positions: position_block.values[start..end].to_vec(),
+                positions: &position_block.values[start..end],
             });
         }
-        Ok(v3_phrase_positions_match(term_positions, slop))
+        Ok(v3_phrase_positions_match(&mut term_positions, slop))
     }
 
     #[instrument(level = "debug", skip_all)]
