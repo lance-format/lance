@@ -8527,7 +8527,8 @@ def _build_vector_search_query(
     minimum_nprobes: int, optional
         The minimum number of partitions to search.
     maximum_nprobes: int, optional
-        The maximum number of partitions to search.
+        The maximum number of partitions to search per index segment. This bounds
+        both initial and later probing without disabling Auto probing.
     refine_factor: int, optional
         The refine factor for the search.
     use_index: bool, default True

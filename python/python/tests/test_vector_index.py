@@ -78,13 +78,11 @@ def test_dot_auto_probe_overrides(tmp_path, monkeypatch, query_scale):
     monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
     with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
         dataset.to_table(columns=["id"], nearest=nearest)
-    # Fixed budgets and explicitly bounded Auto retain their existing semantics.
+    # Fixed budgets bypass Auto configuration, but an upper bound does not.
     fixed = dataset.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
     assert set(fixed["id"].to_pylist()) == expected
-    bounded = dataset.to_table(
-        columns=["id"], nearest={**nearest, "maximum_nprobes": 4}
-    )
-    assert set(bounded["id"].to_pylist()) == expected
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        dataset.to_table(columns=["id"], nearest={**nearest, "maximum_nprobes": 4})
 
 
 @pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
@@ -108,7 +106,13 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
     assert dataset.stats.index_stats("vector_idx")["num_segments"] == segments
     # Distinct centroid scores make recall meaningful even after late expansion.
     query = np.linspace(1, 0.1, 16, dtype=np.float32)
-    nearest = {"column": "vector", "q": query, "k": k, "metric": metric}
+    nearest = {
+        "column": "vector",
+        "q": query,
+        "k": k,
+        "metric": metric,
+        "query_parallelism": 2,
+    }
     if metric == "l2":
         distances = np.sum((vectors - query) ** 2, axis=1)
     elif metric == "cosine":
@@ -150,6 +154,10 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
         # Two partitions hold fewer than k rows, so late probing continues.
         assert partitions > 2 * segments
 
+    bounded, partitions = search(nearest={**nearest, "maximum_nprobes": 3})
+    assert len(bounded) == min(k, 384 * segments)
+    assert partitions == (2 if k <= 256 else 3) * segments
+
     # Filters and deletions that leave fewer than k rows in the initial budget
     # must not stop at the initial cap.
     small_k = min(k, 101)
@@ -159,26 +167,38 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
     assert len(filtered) == small_k
     assert all(i % 8 == 0 for i in filtered["id"].to_pylist())
     assert partitions > 2 * segments
+    bounded, partitions = search(
+        nearest={**nearest, "k": small_k, "maximum_nprobes": 3},
+        filter="id % 8 = 0",
+        prefilter=True,
+    )
+    assert len(bounded) == 48 * segments
+    assert all(i % 8 == 0 for i in bounded["id"].to_pylist())
+    assert partitions == 3 * segments
     dataset.delete("id % 8 != 0")
     deleted, partitions = search(nearest={**nearest, "k": small_k})
     assert len(deleted) == small_k
     assert all(i % 8 == 0 for i in deleted["id"].to_pylist())
     assert partitions > 2 * segments
 
-    # Caller minimums can exceed the learned initial cap. Explicit maximums
-    # and fixed budgets still bypass the experimental overrides entirely.
+    # Caller minimums can exceed the learned initial cap, while caller maximums
+    # bound both initial and late probing after deletions.
     minimum, partitions = search(
         nearest={**nearest, "k": small_k, "minimum_nprobes": 8}
     )
     assert len(minimum) == small_k
     assert partitions == 8 * segments
+    bounded, partitions = search(nearest={**nearest, "maximum_nprobes": 2})
+    assert len(bounded) == min(k, 32 * segments)
+    assert partitions == 2 * segments
     monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
     with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
         search(nearest=nearest)
-    for bounds in ({"nprobes": 2}, {"maximum_nprobes": 2}):
-        bounded, partitions = search(nearest={**nearest, **bounds})
-        assert 0 < len(bounded) <= min(k, 32 * segments)
-        assert partitions <= 2 * segments
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        search(nearest={**nearest, "maximum_nprobes": 2})
+    fixed, partitions = search(nearest={**nearest, "nprobes": 2})
+    assert len(fixed) == min(k, 32 * segments)
+    assert partitions == 2 * segments
 
 
 @pytest.mark.parametrize(
@@ -2920,10 +2940,17 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
 @pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
 @pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
 @pytest.mark.parametrize(
-    "effort,probes", [(0, 1), (0.25, 2), (0.5, 4), (0.75, 8), (1, 16)]
+    "effort,probes,bounded_probes",
+    [
+        (0, 1, (1, 1)),
+        (0.25, 2, (2, 2)),
+        (0.5, 4, (2, 4)),
+        (0.75, 8, (2, 6)),
+        (1, 16, (2, 8)),
+    ],
 )
 def test_vector_search_effort(
-    tmp_path, monkeypatch, metric, index_type, effort, probes
+    tmp_path, monkeypatch, metric, index_type, effort, probes, bounded_probes
 ):
     centroids = np.eye(16, dtype=np.float32)
     vectors = np.repeat(centroids, 16, axis=0)
@@ -2961,7 +2988,8 @@ def test_vector_search_effort(
     assert overridden == actual
     assert captured[0].all_counts["partitions_searched"] == probes
     exact = ds.to_table(columns=["id"], nearest={**nearest, "use_index": False})
-    assert len(set(actual["id"].to_pylist()) & set(exact["id"].to_pylist())) / 8 >= 0.5
+    exact_ids = set(exact["id"].to_pylist())
+    assert len(set(actual["id"].to_pylist()) & exact_ids) / 8 >= 0.5
     if effort == 0.5:
         assert actual == ds.to_table(columns=["id"], nearest=nearest)
         assert actual == ds.to_table(
@@ -3009,14 +3037,19 @@ def test_vector_search_effort(
         assert len(filtered) == 8
         assert min(filtered["id"].to_pylist()) >= 240
         assert captured[0].all_counts["partitions_searched"] > 1
-    if effort == 1:
+    for maximum, expected_probes in zip((2, 8), bounded_probes):
         captured.clear()
-        ds.scanner(
+        bounded = ds.scanner(
             columns=["id"],
-            nearest={**nearest, "search_effort": effort, "maximum_nprobes": 3},
+            nearest={**nearest, "search_effort": effort, "maximum_nprobes": maximum},
             scan_stats_callback=captured.append,
         ).to_table()
-        assert captured[0].all_counts["partitions_searched"] == 3
+        assert captured[0].all_counts["partitions_searched"] == expected_probes
+        assert len(set(bounded["id"].to_pylist()) & exact_ids) / 8 >= 0.5
+        if effort == 0.5:
+            assert bounded == ds.to_table(
+                columns=["id"], nearest={**nearest, "maximum_nprobes": maximum}
+            )
 
 
 @pytest.mark.parametrize(

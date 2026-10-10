@@ -17,8 +17,8 @@
 //! index types, vector types, and refinement factors. The policy selects partitions
 //! from centroid distances independently of query values, quantization, or the
 //! search within each partition.
-//! Larger k, Hamming, and explicitly bounded Auto queries retain their existing
-//! heuristic and ignore these overrides.
+//! Explicit maximum bounds limit adaptive probing without disabling it.
+//! Larger k and Hamming retain their existing heuristic and ignore these overrides.
 //! Dot uses the magnitude of the best centroid inner product to scale its gap,
 //! rather than the signed `1 - dot` distance. Corpus and query norms are preserved.
 //! No extra index statistics or file-format changes are needed.
@@ -55,12 +55,10 @@ impl AutoProbePolicy {
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(Self::Fixed);
         }
-        if query.maximum_nprobes.is_some()
-            || !matches!(
-                index.metric_type(),
-                DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
-            )
-            || query.k > 100_000
+        if !matches!(
+            index.metric_type(),
+            DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
+        ) || query.k > 100_000
         {
             return Ok(Self::Legacy);
         }
@@ -407,8 +405,7 @@ mod tests {
             query.minimum_nprobes = caller_minimum;
             query.maximum_nprobes = maximum;
             query.search_effort = effort;
-            // Equal caller bounds intentionally select fixed probing, which
-            // rejects non-default effort at the API boundary.
+            // Equal caller bounds select fixed probing, covered separately.
             if maximum == Some(caller_minimum) {
                 continue;
             }

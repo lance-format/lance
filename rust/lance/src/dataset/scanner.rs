@@ -2471,8 +2471,9 @@ impl Scanner {
 
     /// Configures the maximum number of partitions to search in the vector index.
     ///
-    /// This bounds both the initial budget and later probing to find enough
-    /// candidates. An unset maximum (the default) allows all available partitions.
+    /// This bounds both the initial budget and later probing per index segment,
+    /// without disabling Auto probing. An unset maximum (the default) allows all
+    /// available partitions.
     /// With [`Self::search_effort`] set to 1, all partitions up to this limit are
     /// included in the initial search. At lower efforts, additional partitions
     /// may be searched if the initial budget does not find enough candidates.

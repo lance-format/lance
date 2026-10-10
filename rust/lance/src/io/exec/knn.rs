@@ -3769,7 +3769,8 @@ mod tests {
     #[case::cosine("cosine", true)]
     #[case::dot("dot", true)]
     #[case::fixed_dot("fixed_dot", false)]
-    #[case::bounded_dot("bounded_dot", false)]
+    #[case::bounded_dot("bounded_dot", true)]
+    #[case::bounded_cosine("bounded_cosine", true)]
     #[case::uncalibrated_dot("uncalibrated_dot", false)]
     #[case::hamming("hamming", false)]
     #[case::float16_query("f16", true)]
@@ -3783,7 +3784,7 @@ mod tests {
     #[case::product("product", true)]
     #[case::hnsw("hnsw", true)]
     #[case::legacy("legacy", true)]
-    #[case::bounded("bounded", false)]
+    #[case::bounded("bounded", true)]
     #[case::fixed("fixed", false)]
     #[case::uncalibrated("uncalibrated", false)]
     #[case::refine("refine", true)]
@@ -3809,7 +3810,7 @@ mod tests {
             "multi" => Arc::new(Float32Array::from(vec![0.0, 1.0])),
             _ => Arc::new(Float32Array::from(vec![0.0])),
         };
-        if matches!(scenario, "bounded" | "bounded_dot") {
+        if matches!(scenario, "bounded" | "bounded_dot" | "bounded_cosine") {
             query.maximum_nprobes = Some(2);
         } else if matches!(scenario, "fixed" | "fixed_dot") {
             query.maximum_nprobes = Some(query.minimum_nprobes);
@@ -3819,7 +3820,7 @@ mod tests {
         }
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
-                "cosine" => DistanceType::Cosine,
+                "cosine" | "bounded_cosine" => DistanceType::Cosine,
                 "dot" | "fixed_dot" | "bounded_dot" | "uncalibrated_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,

@@ -4,9 +4,10 @@ This experiment extends Auto's centroid-gap probing profiles beyond k=100.
 The profiles apply to IVF partition selection across index types; IVF_FLAT
 isolates routing recall from quantization and partition-local search losses.
 The current policy selects profiles by metric and k without gating on vector
-type, query null/nonfinite values, or refinement factor. Fixed nprobes and
-explicit maximum bounds bypass the profiles; Hamming and k > 100000 retain the
-original heuristic. The k=10000 profile serves k=1001..10000, and the k=100000
+type, query null/nonfinite values, or refinement factor. Fixed probe counts bypass
+the profiles; explicit maximum bounds limit both initial and later adaptive
+probing per index segment. Hamming and k > 100000 retain the original heuristic.
+The k=10000 profile serves k=1001..10000, and the k=100000
 profile serves k=10001..100000. The recorded Float32/no-refinement measurements
 describe their frozen workloads, not a recall guarantee for every supported query.
 [PROTOCOL.md](PROTOCOL.md) is the evaluation contract frozen before
