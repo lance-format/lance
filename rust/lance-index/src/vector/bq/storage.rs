@@ -52,7 +52,9 @@ use crate::vector::bq::ex_dot::{
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
 };
 use crate::vector::bq::prune::{PRUNE_LANES, ScaledLowerBoundTerms, scaled_prune_mask_kernel};
-use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
+use crate::vector::bq::rotation::{
+    apply_fast_rotation, apply_fast_rotation_in_place, fast_rotation_signs_len,
+};
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
     SCALE_FACTORS_COLUMN,
@@ -281,6 +283,45 @@ impl RabitQuantizationMetadata {
 
     pub fn binary_code_bytes(&self) -> usize {
         rabit_binary_code_bytes(self.rotated_dim())
+    }
+
+    /// Validate that the rotation payload matches the dimension stored in this metadata.
+    pub fn validate_rotation(&self) -> Result<()> {
+        let dim = self.rotated_dim();
+        match self.rotation_type {
+            RQRotationType::Fast => {
+                let signs = self.fast_rotation_signs.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "rabitq_model fast rotation is missing fast_rotation_signs".to_string(),
+                    )
+                })?;
+                let expected_len = fast_rotation_signs_len(dim);
+                if signs.len() != expected_len {
+                    return Err(Error::invalid_input(format!(
+                        "rabitq_model fast_rotation_signs length={} does not match expected length={} for dimension={}",
+                        signs.len(),
+                        expected_len,
+                        dim
+                    )));
+                }
+            }
+            RQRotationType::Matrix => {
+                let rotate_mat = self.rotate_mat.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "rabitq_model matrix rotation is missing rotate_mat".to_string(),
+                    )
+                })?;
+                if rotate_mat.len() != dim || rotate_mat.value_length() != dim as i32 {
+                    return Err(Error::invalid_input(format!(
+                        "rabitq_model matrix rotation shape=({}, {}) does not match vector dimension={}",
+                        rotate_mat.len(),
+                        rotate_mat.value_length(),
+                        dim
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

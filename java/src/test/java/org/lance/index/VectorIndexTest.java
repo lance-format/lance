@@ -19,6 +19,8 @@ import org.lance.TestVectorDataset;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
+import org.lance.index.vector.RQModel;
+import org.lance.index.vector.RQRotationType;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
@@ -40,6 +42,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -453,7 +456,11 @@ public class VectorIndexTest {
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
       try (Dataset dataset = testVectorDataset.create()) {
         IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
-        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).build();
+        RQBuildParams rq =
+            new RQBuildParams.Builder()
+                .setNumBits((byte) 1)
+                .setRotationType(RQRotationType.MATRIX)
+                .build();
 
         VectorIndexParams vectorIndexParams =
             VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
@@ -486,7 +493,114 @@ public class VectorIndexTest {
         assertTrue(
             indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+        Map<String, Object> stats = dataset.getIndexStatistics(TestVectorDataset.indexName);
+        List<?> segments = (List<?>) stats.get("segments");
+        Map<?, ?> segment = (Map<?, ?>) segments.get(0);
+        assertEquals("matrix", ((Map<?, ?>) segment.get("sub_index")).get("rotation_type"));
       }
+    }
+  }
+
+  @Test
+  public void testIvfRqSharedModelEnablesPhysicalMerge(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("ivf_rq_shared_model"));
+        Dataset dataset = fixture.create()) {
+      List<Fragment> fragments = dataset.getFragments();
+      IvfBuildParams training =
+          new IvfBuildParams.Builder().setNumPartitions(2).setMaxIters(1).build();
+      float[] centroids =
+          VectorTrainer.trainIvfCentroids(dataset, TestVectorDataset.vectorColumnName, training);
+      IvfBuildParams ivf =
+          new IvfBuildParams.Builder()
+              .setNumPartitions(2)
+              .setMaxIters(1)
+              .setCentroids(centroids)
+              .build();
+      RQModel model = RQModel.fromBytes(RQModel.build(32, (byte) 1).toBytes());
+      RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).setModel(model).build();
+      IndexParams params =
+          IndexParams.builder()
+              .setVectorIndexParams(VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq))
+              .build();
+
+      Index first =
+          dataset.createIndex(
+              IndexOptions.builder(
+                      List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                  .withIndexName(TestVectorDataset.indexName)
+                  .withFragmentIds(List.of(fragments.get(0).getId()))
+                  .build());
+      Index second =
+          dataset.createIndex(
+              IndexOptions.builder(
+                      List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                  .withIndexName(TestVectorDataset.indexName)
+                  .withFragmentIds(List.of(fragments.get(1).getId()))
+                  .build());
+      Index merged = dataset.mergeExistingIndexSegments(List.of(first, second));
+      assertEquals(
+          Set.of(fragments.get(0).getId(), fragments.get(1).getId()),
+          new HashSet<>(merged.fragments().orElseThrow()));
+      assertEquals(
+          1,
+          dataset
+              .commitExistingIndexSegments(
+                  TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, List.of(merged))
+              .size());
+
+      float[] key = new float[32];
+      for (int i = 0; i < key.length; i++) {
+        key[i] = 32 + i;
+      }
+      Query query =
+          new Query.Builder()
+              .setColumn(TestVectorDataset.vectorColumnName)
+              .setKey(key)
+              .setK(2)
+              .setNprobes(2)
+              .build();
+      ScanOptions options =
+          new ScanOptions.Builder().nearest(query).indexSegments(List.of(merged.uuid())).build();
+      try (LanceScanner scanner = dataset.newScan(options);
+          ArrowReader reader = scanner.scanBatches()) {
+        Set<Integer> actual = new HashSet<>();
+        while (reader.loadNextBatch()) {
+          IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+          for (int row = 0; row < ids.getValueCount(); row++) {
+            actual.add(ids.get(row));
+          }
+        }
+        assertEquals(2, actual.size());
+        actual.retainAll(Set.of(1, 81));
+        assertTrue(actual.size() >= 1, "Expected Recall@2 >= 0.5, got " + actual.size() / 2.0);
+      }
+    }
+  }
+
+  @Test
+  public void testIvfRqModelDimensionMismatch(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("ivf_rq_wrong_dim"));
+        Dataset dataset = fixture.create()) {
+      IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+      RQBuildParams rq =
+          new RQBuildParams.Builder()
+              .setNumBits((byte) 1)
+              .setModel(RQModel.build(64, (byte) 1))
+              .build();
+      IndexParams params =
+          IndexParams.builder()
+              .setVectorIndexParams(VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq))
+              .build();
+      RuntimeException error =
+          assertThrows(
+              RuntimeException.class,
+              () ->
+                  dataset.createIndex(
+                      IndexOptions.builder(
+                              List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                          .build()));
+      assertTrue(causeChainContains(error, "dimension=64"), error.toString());
+      assertTrue(causeChainContains(error, "dimension=32"), error.toString());
     }
   }
 
