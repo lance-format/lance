@@ -8,11 +8,17 @@
 //! a few bytes per row: row ids and factors. With those columns read once
 //! per index, later reads fetch only the codes (and bounds) from the file:
 //! on an object store a native partition miss takes 2 requests instead of
-//! 8, and a layered one 3 instead of 13. Reads attach copies of the resident
-//! rows, so a batch holds, and is charged, what a file read returns. Cache
-//! entries hold that batch, or only the columns reads fetch from the file
+//! 8, and a layered one 3 instead of 13. Reads attach the resident rows, so
+//! a batch holds, and is charged, what a file read returns. Cache entries
+//! hold that batch, or only the columns reads fetch from the file
 //! (`EntryColumns::Codes`), and every read of such an entry attaches the
-//! resident rows again.
+//! resident rows again: a whole partition or plane gets views of the store's
+//! buffers, each of exactly its rows' bytes. Gathered rows, whole reads that
+//! become cache entries, and partitions streamed out of the index get
+//! copies. A view keeps its store column's whole allocation alive until it
+//! drops, so views live within a read and never
+//! reach a cache entry; [`resident_store_views`] counts the live ones and
+//! [`shares_resident_store`] tells whether a batch holds store memory.
 //!
 //! An index loads the store when it opens, so that no read waits for it.
 //! The store is an entry of the index cache ([`ResidentColumnsKey`]),
@@ -24,10 +30,16 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Instant;
 
-use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array, new_empty_array};
+use arrow::array::ArrayData;
+use arrow::buffer::Buffer;
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array, make_array, new_empty_array,
+};
 use arrow_schema::{Field, Schema, SchemaRef};
 use arrow_select::take::take;
 use futures::TryStreamExt;
@@ -49,7 +61,9 @@ use super::storage::{
     RABIT_EX_CODE_COLUMN,
 };
 use crate::vector::exact_buffers::{exact_array, exact_batch};
-use crate::vector::storage::{IndexFileKey, ResidentLifetime, WeakRegistry, shared_by_key};
+use crate::vector::storage::{
+    IndexFileKey, ResidentAttach, ResidentLifetime, WeakRegistry, shared_by_key,
+};
 
 /// Columns that reads always fetch from the file: the codes, which hold most
 /// of its bytes, and the estimator bounds, which only some scans read.
@@ -117,6 +131,24 @@ pub(crate) enum ResidentLoadTrigger {
     /// outside an index open, such as a test's, since every index loads its
     /// store when it opens. Counted in `resident_columns_read_loads`.
     Read,
+}
+
+/// The file rows a read attaches the resident rows of.
+#[derive(Debug, Clone)]
+pub(crate) enum ResidentRows<'a> {
+    /// Every file row of a whole partition or plane.
+    Range(Range<usize>),
+    /// The sorted, unique file rows of a sparse gather.
+    Rows(&'a UInt64Array),
+}
+
+impl ResidentRows<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Range(range) => range.len(),
+            Self::Rows(rows) => rows.len(),
+        }
+    }
 }
 
 /// One index file's store, shared by every handle of the file and by its
@@ -196,6 +228,105 @@ pub fn resident_store_is_live(file: &IndexFileKey) -> bool {
         .get(file)
         .and_then(Weak::upgrade)
         .is_some_and(|slot| slot.is_loaded())
+}
+
+/// Live views of resident store rows in the process; see
+/// [`resident_store_views`].
+static LIVE_STORE_VIEWS: AtomicU64 = AtomicU64::new(0);
+
+/// Live views of resident store rows in the process: buffers that per-read
+/// batches of whole partitions and planes share with a store
+/// ([`ResidentAttach::Share`]), one per resident column of each. A gauge,
+/// not reset by `layered_stats::snapshot_and_reset`. Each view keeps its
+/// store column's whole allocation alive, even after the store's eviction,
+/// so it returns to 0 once the reads that hold views have dropped them:
+/// a nonzero value after every query is done means a view leaked, such as
+/// into a cache entry.
+pub fn resident_store_views() -> u64 {
+    LIVE_STORE_VIEWS.load(Ordering::Relaxed)
+}
+
+/// The live views of one resident store's rows, which outlives the store
+/// while any of them does; see [`ResidentColumns::store_views`].
+#[derive(Debug, Clone, Default)]
+pub struct ResidentStoreViews(Arc<AtomicU64>);
+
+impl ResidentStoreViews {
+    /// Views of the store's rows alive now: one per resident column of each
+    /// batch that shares the store.
+    pub fn live(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Rows of a resident store column that a view shares. It holds the
+/// column's buffer, so the column's whole allocation lives until the last
+/// view of it drops, and it counts itself in [`resident_store_views`] and in
+/// its store's [`ResidentStoreViews`] while it lives.
+struct StoreRows {
+    rows: Buffer,
+    store_views: ResidentStoreViews,
+}
+
+impl StoreRows {
+    fn new(rows: Buffer, store_views: &ResidentStoreViews) -> Self {
+        LIVE_STORE_VIEWS.fetch_add(1, Ordering::Relaxed);
+        store_views.0.fetch_add(1, Ordering::Relaxed);
+        Self {
+            rows,
+            store_views: store_views.clone(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for StoreRows {
+    fn as_ref(&self) -> &[u8] {
+        self.rows.as_slice()
+    }
+}
+
+impl Drop for StoreRows {
+    fn drop(&mut self) {
+        LIVE_STORE_VIEWS.fetch_sub(1, Ordering::Relaxed);
+        self.store_views.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether any buffer of `batch` lies in the memory of a loaded resident
+/// store alive in the process: a view of the store's rows, or a slice of a
+/// store column. A cache entry must never hold such a buffer, since it
+/// would keep the store column's whole allocation alive while charged its
+/// rows alone; the loaders of cache entries check it in debug builds. It
+/// knows the stores of the process's registry, which every index open
+/// binds, and not those of storages built with a store of their own.
+pub fn shares_resident_store(batch: &RecordBatch) -> bool {
+    let slots = live_slots();
+    let stores: Vec<&ResidentColumnStore> =
+        slots.iter().filter_map(|slot| slot.store.get()).collect();
+    !stores.is_empty()
+        && batch
+            .columns()
+            .iter()
+            .any(|column| array_in_stores(&column.to_data(), &stores))
+}
+
+/// Whether a buffer of `data` (or of its children) lies in the memory of
+/// one of `stores`.
+fn array_in_stores(data: &ArrayData, stores: &[&ResidentColumnStore]) -> bool {
+    data.buffers()
+        .iter()
+        .chain(data.nulls().map(|nulls| nulls.inner().inner()))
+        .any(|buffer| stores.iter().any(|store| store.holds(buffer)))
+        || data
+            .child_data()
+            .iter()
+            .any(|child| array_in_stores(child, stores))
+}
+
+/// The allocation `buffer` lies in, as a range of addresses.
+fn allocation(buffer: &Buffer) -> Range<usize> {
+    let start = buffer.data_ptr().as_ptr() as usize;
+    start..start + buffer.capacity()
 }
 
 /// Cache key of the resident store of an IVF_RQ index file. An index keeps
@@ -403,6 +534,13 @@ impl ResidentColumns {
         self.slot.store.get().map(|store| store.bytes)
     }
 
+    /// The live views of the store's rows (see [`resident_store_views`]),
+    /// `None` until it has loaded. The count outlives the store: views keep
+    /// the store's memory, not the store.
+    pub fn store_views(&self) -> Option<ResidentStoreViews> {
+        self.slot.store.get().map(|store| store.views.clone())
+    }
+
     /// The store of `reader`'s file, loaded on first use: see
     /// [`ResidentSlot::get_or_load`]. Cache the loaded allocation without
     /// making subsequent reads depend on whether it stays in the cache.
@@ -424,6 +562,8 @@ pub(crate) struct ResidentColumnStore {
     num_rows: u64,
     /// See [`ResidentColumns::loaded_bytes`].
     bytes: u64,
+    /// See [`ResidentColumns::store_views`].
+    views: ResidentStoreViews,
 }
 
 /// Names the columns instead of printing hundreds of megabytes of values.
@@ -525,6 +665,7 @@ impl ResidentColumnStore {
             columns,
             num_rows,
             bytes,
+            views: ResidentStoreViews::default(),
         })
     }
 
@@ -538,35 +679,76 @@ impl ResidentColumnStore {
         self.num_rows
     }
 
-    /// `schema`'s columns at the ascending file rows `rows`: copies of this
-    /// store's rows of the columns it keeps (see [`ResidentColumn::copy_rows`])
-    /// and, by name, the other columns of `file_batch`, which holds them at
-    /// the same rows, read from the file or a code-only cache entry. The
-    /// batch is the one a read of every column from the file returns.
+    /// `schema`'s columns at the file rows `rows`: this store's rows of the
+    /// columns it keeps and, by name, the other columns of `file_batch`,
+    /// which holds them at the same rows, read from the file or a code-only
+    /// cache entry. The batch is the one a read of every column from the
+    /// file returns, bit for bit and byte for byte. `mode` says how a whole
+    /// partition or plane ([`ResidentRows::Range`]) takes the store's rows:
+    /// views of its buffers ([`ResidentColumn::share_rows`]) or copies;
+    /// sparse rows ([`ResidentRows::Rows`]) are always copied
+    /// ([`ResidentColumn::copy_rows`]). A batch with views must never be
+    /// cached. The mode has no default, so every caller states it.
     pub(crate) fn attach(
         &self,
         schema: SchemaRef,
         file_batch: Option<&RecordBatch>,
-        rows: &UInt64Array,
+        rows: ResidentRows<'_>,
+        mode: ResidentAttach,
     ) -> Result<RecordBatch> {
-        let started = Instant::now();
+        let num_rows = rows.len();
         if let Some(batch) = file_batch
-            && batch.num_rows() != rows.len()
+            && batch.num_rows() != num_rows
         {
             return Err(Error::internal(format!(
-                "resident columns attach to {} rows of a batch of {} rows",
-                rows.len(),
+                "resident columns attach to {num_rows} rows of a batch of {} rows",
                 batch.num_rows()
             )));
         }
-        let mut copied_bytes = 0;
+        if let ResidentRows::Range(range) = &rows
+            && (range.start > range.end || range.end as u64 > self.num_rows)
+        {
+            return Err(Error::invalid_input(format!(
+                "resident rows {range:?} are not within the {} rows of the file",
+                self.num_rows
+            )));
+        }
+        // Resolve the rows before the timer: a copy of a whole range copies
+        // the rows of a `UInt64Array` built here, as callers built it before
+        // reads could share the store, so `resident_attach_ns` times the
+        // same work in `copy` mode.
+        let whole = matches!(rows, ResidentRows::Range(_));
+        // What each resident column takes: a range to view, or rows to copy.
+        let range_rows;
+        let taken = match (rows, mode) {
+            (ResidentRows::Range(range), ResidentAttach::Share) => ResidentRows::Range(range),
+            (ResidentRows::Range(range), ResidentAttach::Copy) => {
+                range_rows = UInt64Array::from_iter_values(range.start as u64..range.end as u64);
+                ResidentRows::Rows(&range_rows)
+            }
+            (ResidentRows::Rows(rows), _) => ResidentRows::Rows(rows),
+        };
+        let started = Instant::now();
+        let mut attached_bytes = 0u64;
+        let mut copied_bytes = 0u64;
+        let mut every_column_shared = true;
         let mut columns = Vec::with_capacity(schema.fields().len());
         for field in schema.fields() {
             let column = match self.column(field.name()) {
                 Some(column) => {
-                    let copy = column.copy_rows(rows)?;
-                    copied_bytes += copy.get_buffer_memory_size() as u64;
-                    copy
+                    let (array, shared) = match &taken {
+                        ResidentRows::Range(range) => {
+                            column.share_rows(range.clone(), &self.views)?
+                        }
+                        ResidentRows::Rows(rows) => (column.copy_rows(rows)?, false),
+                    };
+                    let bytes = column.row_bytes(num_rows);
+                    attached_bytes += bytes;
+                    if !shared {
+                        copied_bytes += bytes;
+                        every_column_shared = false;
+                    }
+                    array
                 }
                 None => file_batch
                     .and_then(|batch| batch.column_by_name(field.name()))
@@ -578,14 +760,34 @@ impl ResidentColumnStore {
         let batch = RecordBatch::try_new_with_options(
             schema,
             columns,
-            &RecordBatchOptions::new().with_row_count(Some(rows.len())),
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
         )?;
         let stats = layered_stats::counters();
         stats.resident_attach_calls.incr();
-        stats.resident_attach_rows.add(rows.len() as u64);
-        stats.resident_attach_bytes.add(copied_bytes);
+        stats.resident_attach_rows.add(num_rows as u64);
+        stats.resident_attach_bytes.add(attached_bytes);
+        stats.resident_attach_copied_bytes.add(copied_bytes);
+        match (whole, every_column_shared) {
+            (true, true) => stats.resident_attach_shares.incr(),
+            (true, false) => stats.resident_attach_whole_copies.incr(),
+            (false, _) => stats.resident_attach_gathers.incr(),
+        }
         stats.resident_attach_ns.add_elapsed(started);
         Ok(batch)
+    }
+
+    /// Whether `buffer`'s bytes lie in the allocation of one of this
+    /// store's columns.
+    fn holds(&self, buffer: &Buffer) -> bool {
+        let start = buffer.as_ptr() as usize;
+        let bytes = start..start + buffer.len();
+        !bytes.is_empty()
+            && self.columns.values().any(|column| {
+                column.values.to_data().buffers().iter().any(|own| {
+                    let own = allocation(own);
+                    bytes.start < own.end && own.start < bytes.end
+                })
+            })
     }
 
     /// Heap memory the store holds: its arrays' buffers, which the
@@ -684,11 +886,71 @@ pub(crate) struct ResidentColumn {
 }
 
 impl ResidentColumn {
+    /// Bytes of `rows` rows of the column's values, which have a fixed width
+    /// (see [`resident_width`]).
+    fn row_bytes(&self, rows: usize) -> u64 {
+        let width = self
+            .values
+            .data_type()
+            .primitive_width()
+            .unwrap_or_default();
+        (rows * width) as u64
+    }
+
+    /// The file rows `range` as a view of the column's buffer: an array
+    /// whose one buffer is exactly those rows' bytes, which it shares with
+    /// the column rather than copies, so it is charged what a copy is
+    /// (an `ArrayRef::slice` would be charged the whole column). The view
+    /// keeps the column's whole allocation alive until it drops, and counts
+    /// itself in [`resident_store_views`] and in `store_views` meanwhile.
+    /// Returns whether the array is a view: a column a view cannot cover
+    /// (with a validity buffer, or more than one buffer) is copied as
+    /// [`Self::copy_rows`] copies, and so is a buffer Arrow refuses for the
+    /// column's type. An empty range is an empty array, which is no copy.
+    pub(crate) fn share_rows(
+        &self,
+        range: Range<usize>,
+        store_views: &ResidentStoreViews,
+    ) -> Result<(ArrayRef, bool)> {
+        if range.start > range.end || range.end > self.values.len() {
+            return Err(Error::invalid_input(format!(
+                "resident rows {range:?} are not within the {} rows of the file",
+                self.values.len()
+            )));
+        }
+        if range.is_empty() {
+            return Ok((new_empty_array(self.values.data_type()), true));
+        }
+        let data = self.values.to_data();
+        if let (None, [values], Some(width)) = (
+            data.nulls(),
+            data.buffers(),
+            data.data_type().primitive_width(),
+        ) {
+            // The store's buffers come from `exact_batch`, aligned for their
+            // type, so the rows' first byte keeps that alignment.
+            let rows = values
+                .slice_with_length((data.offset() + range.start) * width, range.len() * width);
+            let view = Buffer::from(bytes::Bytes::from_owner(StoreRows::new(rows, store_views)));
+            if let Ok(view) = ArrayData::builder(data.data_type().clone())
+                .len(range.len())
+                .add_buffer(view)
+                .build()
+            {
+                return Ok((make_array(view), true));
+            }
+        }
+        let rows = UInt64Array::from_iter_values(range.start as u64..range.end as u64);
+        Ok((self.copy_rows(&rows)?, false))
+    }
+
     /// A copy of the ascending file rows `rows` in a buffer of exactly their
     /// values, as a whole read of the file returns them (see
     /// `read_projected`), so that a cache entry holding it is charged the
-    /// same bytes. A slice would instead keep, and be charged, the whole
-    /// column.
+    /// same bytes, and so that it never keeps the store's memory alive: what
+    /// a sparse gather, a whole read that becomes a cache entry and every
+    /// attach under [`ResidentAttach::Copy`] take. A slice would instead
+    /// keep, and be charged, the whole column.
     pub(crate) fn copy_rows(&self, rows: &UInt64Array) -> Result<ArrayRef> {
         let offsets = rows.values();
         // The page split below relies on the order.
@@ -810,6 +1072,7 @@ mod tests {
             columns: HashMap::from([("factor".to_string(), column)]),
             num_rows: rows as u64,
             bytes: 4 * rows as u64,
+            views: ResidentStoreViews::default(),
         }
     }
 
@@ -951,6 +1214,7 @@ mod tests {
             columns: map,
             num_rows: rows as u64,
             bytes,
+            views: ResidentStoreViews::default(),
         }
     }
 
@@ -1075,48 +1339,251 @@ mod tests {
         }
     }
 
-    /// Attaching the resident columns to a batch of the other columns at
-    /// the same rows lays the columns out in the schema's order, copies the
-    /// resident rows and shares the others' buffers; a batch of other rows
-    /// or without a column the store does not keep is an error.
+    /// Serializes the tests that assert exact deltas of the attach counters
+    /// and the view gauges, which only these tests move in this crate.
+    static ATTACH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A store of [`column`], 100 rows of `factor`, live in the registry
+    /// under a key of its own, as an index open binds it.
+    fn live_column_store(test: &str, column: ResidentColumn) -> Arc<ResidentSlot> {
+        slot_with(
+            &test_file(test),
+            ResidentColumnStore {
+                columns: HashMap::from([("factor".to_string(), column)]),
+                num_rows: 100,
+                bytes: 400,
+                views: ResidentStoreViews::default(),
+            },
+        )
+    }
+
+    /// The attach counters, in a fixed order: calls, rows, bytes, shares,
+    /// whole copies, gathers and copied bytes.
+    fn attach_counters() -> [u64; 7] {
+        let counters = layered_stats::counters();
+        [
+            counters.resident_attach_calls.get(),
+            counters.resident_attach_rows.get(),
+            counters.resident_attach_bytes.get(),
+            counters.resident_attach_shares.get(),
+            counters.resident_attach_whole_copies.get(),
+            counters.resident_attach_gathers.get(),
+            counters.resident_attach_copied_bytes.get(),
+        ]
+    }
+
+    fn counter_deltas(before: [u64; 7]) -> [u64; 7] {
+        let after = attach_counters();
+        std::array::from_fn(|counter| after[counter] - before[counter])
+    }
+
+    /// A view of a range of rows shares the store column's buffer, at the
+    /// range's first row, and is charged exactly its rows' bytes; it lives,
+    /// readable, after the column drops, and the gauges count it until it
+    /// drops. An empty range is an empty array, a range past the file an
+    /// error.
     #[test]
-    fn attach_copies_resident_rows_and_takes_file_columns() {
-        let store = ResidentColumnStore {
-            columns: HashMap::from([("factor".to_string(), column())]),
-            num_rows: 100,
-            bytes: 400,
+    fn share_rows_views_the_store_without_copying() {
+        let _serial = ATTACH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let column = column();
+        let store_values = column
+            .values
+            .as_primitive::<Float32Type>()
+            .values()
+            .as_ptr();
+        let store_views = ResidentStoreViews::default();
+        let baseline = resident_store_views();
+        let mut held = Vec::new();
+        for range in [10..30, 30..60, 0..100, 99..100] {
+            let context = format!("{range:?}");
+            let (view, shared) = column.share_rows(range.clone(), &store_views).unwrap();
+            assert!(shared, "{context}");
+            let rows: Vec<u64> = (range.start as u64..range.end as u64).collect();
+            assert_eq!(values(&view), as_values(&rows), "{context}");
+            let view_values = view.as_primitive::<Float32Type>().values().as_ptr();
+            assert_eq!(
+                view_values,
+                store_values.wrapping_add(range.start),
+                "{context}"
+            );
+            assert!(view_values.is_aligned(), "{context}");
+            assert!(view.nulls().is_none(), "{context}");
+            assert_eq!(view.get_buffer_memory_size(), range.len() * 4, "{context}");
+            assert_eq!(
+                view.as_ref().deep_size_of_children(&mut Context::new()),
+                range.len() * 4,
+                "{context}"
+            );
+            held.push(view);
+            assert_eq!(store_views.live(), held.len() as u64, "{context}");
+            assert_eq!(
+                resident_store_views(),
+                baseline + held.len() as u64,
+                "{context}"
+            );
+        }
+        let (empty, _) = column.share_rows(100..100, &store_views).unwrap();
+        assert_eq!(empty.len(), 0);
+        let error = column.share_rows(90..101, &store_views).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert_eq!(store_views.live(), held.len() as u64);
+
+        drop(column);
+        let every_row: Vec<u64> = (0..100).collect();
+        assert_eq!(values(&held[2]), as_values(&every_row));
+        drop(held);
+        assert_eq!(store_views.live(), 0);
+        assert_eq!(resident_store_views(), baseline);
+    }
+
+    /// A column with a validity buffer cannot be viewed as one buffer, so
+    /// `share_rows` copies it, and the attach counts a whole copy. Arrow
+    /// keeps a validity buffer only where a value is null, so the column
+    /// has one null, past the rows read.
+    #[test]
+    fn share_rows_copies_a_column_with_nulls() {
+        let _serial = ATTACH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let factors: Vec<Option<f32>> = (0..100)
+            .map(|row| (row != 50).then_some(row as f32))
+            .collect();
+        let column = ResidentColumn {
+            values: Arc::new(Float32Array::from(factors)),
+            page_ends: vec![40, 40, 100],
         };
+        assert!(column.values.to_data().nulls().is_some());
+        let store_views = ResidentStoreViews::default();
+        let (copied, shared) = column.share_rows(10..30, &store_views).unwrap();
+        assert!(!shared);
+        let rows: Vec<u64> = (10..30).collect();
+        assert_eq!(values(&copied), as_values(&rows));
+        assert_eq!(store_views.live(), 0);
+
+        let slot = live_column_store("share-rows-nulls", column);
+        let store = slot.store.get().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "factor",
+            DataType::Float32,
+            true,
+        )]));
+        let before = attach_counters();
+        let batch = store
+            .attach(
+                schema,
+                None,
+                ResidentRows::Range(10..30),
+                ResidentAttach::Share,
+            )
+            .unwrap();
+        // One call of 20 rows of 4 bytes, a whole copy of them.
+        assert_eq!(counter_deltas(before), [1, 20, 80, 0, 1, 0, 80]);
+        assert!(!shares_resident_store(&batch));
+        assert_eq!(values(batch.column(0)), as_values(&rows));
+    }
+
+    /// Attaching the resident columns to a batch of the other columns at
+    /// the same rows lays the columns out in the schema's order, takes the
+    /// resident rows as the mode says and shares the others' buffers. Under
+    /// `share`, a whole range views the store, charged its rows alone; a
+    /// copy, under `copy` or of sparse rows, is a buffer of exactly its
+    /// rows. Either way the batch is the same, and the store's cache entry
+    /// is charged the same. A batch of other rows, a column the store does
+    /// not keep missing from it, or a range past the file is an error.
+    #[rstest::rstest]
+    fn attach_shares_or_copies_resident_rows(
+        #[values(ResidentAttach::Share, ResidentAttach::Copy)] mode: ResidentAttach,
+        #[values(false, true)] sparse: bool,
+    ) {
+        let _serial = ATTACH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = live_column_store(&format!("attach-{mode}-{sparse}"), column());
+        let store = slot.store.get().unwrap();
+        let entry_bytes = ResidentColumnsEntry::new(slot.clone()).deep_size_of();
         assert!(is_file_column(RABIT_CODE_COLUMN));
         assert!(!is_file_column("factor"));
         let schema = Arc::new(Schema::new(vec![
             Field::new(RABIT_CODE_COLUMN, DataType::UInt8, true),
             Field::new("factor", DataType::Float32, true),
         ]));
-        let rows = [5u64, 39, 40, 99];
-        let codes: ArrayRef = Arc::new(arrow_array::UInt8Array::from(vec![1u8, 2, 3, 4]));
+        let rows: Vec<u64> = if sparse {
+            vec![5, 39, 40, 99]
+        } else {
+            (5..45).collect()
+        };
+        let file_rows = UInt64Array::from(rows.clone());
+        let resident_rows = || {
+            if sparse {
+                ResidentRows::Rows(&file_rows)
+            } else {
+                ResidentRows::Range(5..45)
+            }
+        };
+        let codes: ArrayRef = Arc::new(arrow_array::UInt8Array::from_iter_values(
+            (0..rows.len()).map(|row| row as u8),
+        ));
         let file_batch = RecordBatch::try_from_iter([(RABIT_CODE_COLUMN, codes.clone())]).unwrap();
-        let calls = || layered_stats::counters().resident_attach_calls.get();
-        let before = calls();
+        let shared = mode == ResidentAttach::Share && !sparse;
+
+        let before = attach_counters();
         let batch = store
-            .attach(
-                schema.clone(),
-                Some(&file_batch),
-                &UInt64Array::from(rows.to_vec()),
-            )
+            .attach(schema.clone(), Some(&file_batch), resident_rows(), mode)
             .unwrap();
-        assert!(calls() > before);
+        let bytes = 4 * rows.len() as u64;
+        let copied = if shared { 0 } else { bytes };
+        let (shares, whole_copies, gathers) = match (sparse, shared) {
+            (true, _) => (0, 0, 1),
+            (false, true) => (1, 0, 0),
+            (false, false) => (0, 1, 0),
+        };
+        assert_eq!(
+            counter_deltas(before),
+            [
+                1,
+                rows.len() as u64,
+                bytes,
+                shares,
+                whole_copies,
+                gathers,
+                copied
+            ]
+        );
         assert_eq!(batch.schema(), schema);
         assert_eq!(values(batch.column(1)), as_values(&rows));
         assert_eq!(
             batch.column(0).to_data().buffers()[0].as_ptr(),
             codes.to_data().buffers()[0].as_ptr()
         );
-        for (batch, rows) in [(Some(&file_batch), vec![5, 39]), (None, rows.to_vec())] {
-            let error = store
-                .attach(schema.clone(), batch, &UInt64Array::from(rows))
-                .unwrap_err();
+        assert_eq!(shares_resident_store(&batch), shared);
+        assert_eq!(store.views.live(), u64::from(shared));
+        assert_eq!(batch.column(1).get_buffer_memory_size(), rows.len() * 4);
+        assert_eq!(
+            ResidentColumnsEntry::new(slot.clone()).deep_size_of(),
+            entry_bytes
+        );
+
+        // The other mode attaches the same batch, of the same bytes.
+        let other = match mode {
+            ResidentAttach::Share => ResidentAttach::Copy,
+            ResidentAttach::Copy => ResidentAttach::Share,
+        };
+        let twin = store
+            .attach(schema.clone(), Some(&file_batch), resident_rows(), other)
+            .unwrap();
+        assert_eq!(twin, batch);
+        assert_eq!(
+            twin.column(1).get_buffer_memory_size(),
+            batch.column(1).get_buffer_memory_size()
+        );
+        drop((batch, twin));
+        assert_eq!(store.views.live(), 0);
+
+        let short = file_batch.slice(0, 2);
+        for (batch, rows) in [(Some(&short), resident_rows()), (None, resident_rows())] {
+            let error = store.attach(schema.clone(), batch, rows, mode).unwrap_err();
             assert!(matches!(error, Error::Internal { .. }), "{error}");
         }
+        let error = store
+            .attach(schema, None, ResidentRows::Range(90..101), mode)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 
     /// Rows across pages are copied into one buffer of exactly their
