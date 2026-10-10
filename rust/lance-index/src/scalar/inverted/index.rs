@@ -1829,6 +1829,7 @@ impl InvertedPartition {
             num_docs,
             false,
             frag_reuse_index,
+            index_cache,
         ));
 
         Ok(Self {
@@ -7542,10 +7543,7 @@ impl DocSet {
         }
     }
 
-    /// Build a `DocSet` from already-loaded `row_id` and `num_tokens`
-    /// arrow columns. Lets callers that have one column already in hand
-    /// (e.g. `LazyDocSet` after `total_tokens_num` pre-fetched
-    /// `num_tokens`) skip re-reading that column.
+    /// Build a `DocSet` from already-loaded `row_id` and `num_tokens` columns.
     pub fn from_columns(
         row_id_col: &UInt64Array,
         num_tokens_col: &arrow_array::UInt32Array,
