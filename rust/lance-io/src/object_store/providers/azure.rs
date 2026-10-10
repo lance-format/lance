@@ -335,24 +335,36 @@ impl StorageOptions {
         Self(opts)
     }
 
-    /// Add values from the environment to storage options
+    /// Add values from the environment without overriding explicit options,
+    /// including aliases, case variants, and empty-string values.
     pub fn with_env_azure(&mut self) {
-        for (os_key, os_value) in &ENV_OPTIONS.0 {
-            if !self.0.contains_key(os_key) {
-                self.0.insert(os_key.clone(), os_value.clone());
-            }
-        }
+        self.merge_env_options(&ENV_OPTIONS.0, |key| {
+            AzureConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
     }
 
-    /// Subset of options relevant for azure storage
+    /// Return options recognized by [`AzureConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as
+    /// `azure_storage_account_name`) wins, followed by case variants of that name.
+    /// Remaining ties use the lexicographically smallest original key. Empty
+    /// values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::azure::AzureConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("account_name".into(), "alias".into()),
+    ///     ("azure_storage_account_name".into(), "canonical".into()),
+    /// ]));
+    /// assert_eq!(options.as_azure_options()[&AzureConfigKey::AccountName], "canonical");
+    /// ```
     pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let az_key = AzureConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((az_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 
     #[allow(clippy::manual_map)]
@@ -375,6 +387,36 @@ mod tests {
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
     use std::collections::HashMap;
+
+    #[rstest::rstest]
+    #[case::canonical("azure_storage_account_name", "account_name")]
+    #[case::canonical_over_case_variant("azure_storage_account_name", "AZURE_STORAGE_ACCOUNT_NAME")]
+    #[case::canonical_case_tie("AZURE_STORAGE_ACCOUNT_NAME", "Azure_Storage_Account_Name")]
+    #[case::case_variant_over_alias("AZURE_STORAGE_ACCOUNT_NAME", "account_name")]
+    #[case::lexical_alias("ACCOUNT_NAME", "account_name")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_azure_options(),
+                HashMap::from([(AzureConfigKey::AccountName, preferred_value.to_string())])
+            );
+        }
+    }
 
     #[test]
     fn test_azure_store_path() {

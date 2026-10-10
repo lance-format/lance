@@ -607,9 +607,11 @@ fn sort_to_interleave_indices(
     num_partitions: usize,
 ) -> Result<InterleaveResult> {
     let total_rows: usize = part_id_columns.iter().map(|a| a.len()).sum();
-    let mut keys: Vec<(u32, u32, u32)> = Vec::with_capacity(total_rows);
+
+    // Partition ids are bounded by `num_partitions`, so counting sort orders the
+    // rows in O(n + num_partitions) passes instead of sorting n key tuples.
+    let mut partition_counts = vec![0u64; num_partitions];
     for (batch_idx, col) in part_id_columns.iter().enumerate() {
-        let batch_idx = batch_idx as u32;
         for row_idx in 0..col.len() {
             if col.is_null(row_idx) {
                 return Err(Error::invalid_input(format!(
@@ -617,24 +619,35 @@ fn sort_to_interleave_indices(
                     batch_idx, row_idx
                 )));
             }
-            keys.push((col.value(row_idx), batch_idx, row_idx as u32));
+            let part_id = col.value(row_idx) as usize;
+            if part_id >= num_partitions {
+                return Err(Error::invalid_input(format!(
+                    "partition ID {} is out of range [0, {})",
+                    part_id, num_partitions
+                )));
+            }
+            partition_counts[part_id] += 1;
         }
     }
-    keys.sort_unstable_by_key(|k| k.0);
 
-    let mut partition_counts = vec![0u64; num_partitions];
-    let mut interleave_indices = Vec::with_capacity(total_rows);
-    for (part_id, batch_idx, row_idx) in &keys {
-        let pid = *part_id as usize;
-        if pid >= num_partitions {
-            return Err(Error::invalid_input(format!(
-                "partition ID {} is out of range [0, {})",
-                pid, num_partitions
-            )));
-        }
-        partition_counts[pid] += 1;
-        interleave_indices.push((*batch_idx as usize, *row_idx as usize));
+    // Prefix sums turn the counts into the first slot of each partition's run,
+    // then the scatter pass below consumes them as a write cursor per partition.
+    let mut cursors = Vec::with_capacity(num_partitions);
+    let mut running = 0usize;
+    for &count in partition_counts.iter() {
+        cursors.push(running);
+        running += count as usize;
     }
+
+    let mut interleave_indices = vec![(0usize, 0usize); total_rows];
+    for (batch_idx, col) in part_id_columns.iter().enumerate() {
+        for (row_idx, &part_id) in col.values().iter().enumerate() {
+            let cursor = &mut cursors[part_id as usize];
+            interleave_indices[*cursor] = (batch_idx, row_idx);
+            *cursor += 1;
+        }
+    }
+
     Ok((interleave_indices, partition_counts))
 }
 
@@ -872,6 +885,33 @@ enum OffsetPreloadSource {
     Sidecar,
 }
 
+/// Ranges of `partition_id`'s rows in the shuffle data file, one per flush
+/// group that holds any.
+///
+/// A partition is usually absent from most groups, and a zero-length range
+/// still costs the reader a range entry, so the empty ones are dropped.
+fn preloaded_partition_ranges(
+    offsets: &[u64],
+    num_batches: usize,
+    num_partitions: usize,
+    partition_id: usize,
+) -> Vec<Range<u64>> {
+    let mut ranges = Vec::with_capacity(num_batches);
+    for batch_idx in 0..num_batches {
+        let end_index = batch_idx * num_partitions + partition_id;
+        let start = if end_index == 0 {
+            0
+        } else {
+            offsets[end_index - 1]
+        };
+        let end = offsets[end_index];
+        if start < end {
+            ranges.push(start..end);
+        }
+    }
+    ranges
+}
+
 impl TwoFileShuffleReader {
     pub(super) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -1049,19 +1089,12 @@ impl TwoFileShuffleReader {
         }
 
         match &self.offsets {
-            ShuffleOffsets::Preloaded(offsets) => {
-                let mut ranges = Vec::with_capacity(self.num_batches);
-                for batch_idx in 0..self.num_batches {
-                    let end_index = batch_idx * self.num_partitions + partition_id;
-                    let start = if end_index == 0 {
-                        0
-                    } else {
-                        offsets[end_index - 1]
-                    };
-                    ranges.push(start..offsets[end_index]);
-                }
-                Ok(ranges)
-            }
+            ShuffleOffsets::Preloaded(offsets) => Ok(preloaded_partition_ranges(
+                offsets,
+                self.num_batches,
+                self.num_partitions,
+                partition_id,
+            )),
             ShuffleOffsets::OnDemand(offsets_reader) => {
                 self.read_partition_ranges(offsets_reader, partition_id)
                     .await
@@ -1154,7 +1187,11 @@ impl TwoFileShuffleReader {
                     format!("missing end offset for partition {}", partition_id),
                 )
             })?;
-            ranges.push(start..end);
+            // Same as the preloaded path: skip the groups this partition has no
+            // rows in rather than passing empty ranges to the reader.
+            if start < end {
+                ranges.push(start..end);
+            }
         }
         Ok(ranges)
     }
@@ -2937,6 +2974,66 @@ mod tests {
         assert_eq!(p0.num_rows(), 126);
         let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
         assert_eq!(p1.num_rows(), 130);
+    }
+
+    /// A partition that only appears in some flush groups used to get one
+    /// zero-length range per group it is absent from, and those reach the file
+    /// reader as real range entries.
+    #[test]
+    fn test_preloaded_partition_ranges_skip_empty_groups() {
+        // Three partitions, four flush groups. Offsets are cumulative row
+        // counts per (group, partition): partition 1 holds rows in group 1 only.
+        let offsets = vec![
+            1u64, 1, 2, // group 0: p0 one row, p1 none, p2 one row
+            2, 4, 4, // group 1: p0 none, p1 two rows, p2 none
+            5, 5, 5, // group 2: p0 one row, nothing else
+            5, 5, 6, // group 3: p2 one row
+        ];
+
+        let p1 = preloaded_partition_ranges(&offsets, 4, 3, 1);
+        assert_eq!(p1, vec![2..4], "partition 1 spans group 1 only");
+
+        let p0 = preloaded_partition_ranges(&offsets, 4, 3, 0);
+        assert_eq!(p0, vec![0..1, 4..5], "partition 0 spans groups 0 and 2");
+        assert!(
+            p0.iter()
+                .chain(p1.iter())
+                .all(|range| range.start < range.end),
+            "no zero-length range should survive: {p0:?} {p1:?}"
+        );
+    }
+
+    /// Two non-empty batches in one flush group: the bucketing has to keep each
+    /// row with its own batch, so a partition's rows come out batch by batch and
+    /// in row order within a batch. A wrong bucket offset would move values into
+    /// the neighbouring partition while leaving every partition size intact.
+    #[tokio::test]
+    async fn test_two_file_shuffler_groups_two_batches_by_partition() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+
+        let batch1 = make_batch(&[1, 0, 2], &[10, 20, 30], None);
+        let batch2 = make_batch(&[2, 1, 0], &[40, 50, 60], None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, 3);
+        let reader = shuffler
+            .shuffle(batches_to_stream(vec![batch1, batch2]))
+            .await
+            .unwrap();
+
+        let expected = [vec![20, 60], vec![10, 50], vec![30, 40]];
+        for (partition_id, expected_values) in expected.iter().enumerate() {
+            assert_eq!(reader.partition_size(partition_id).unwrap(), 2);
+            let partition = collect_partition(reader.as_ref(), partition_id)
+                .await
+                .unwrap();
+            let values: &Int32Array = partition["val"].as_primitive();
+            assert_eq!(
+                values.values(),
+                expected_values,
+                "partition {partition_id} holds the wrong rows"
+            );
+        }
     }
 
     /// Nullable `__ivf_part_id` must not be treated as partition 0 via `values()`.

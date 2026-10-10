@@ -198,7 +198,7 @@ impl<T: DeepSizeOf> DeepSizeOf for Option<T> {
     }
 }
 
-impl<K: DeepSizeOf, V: DeepSizeOf> DeepSizeOf for HashMap<K, V> {
+impl<K: DeepSizeOf, V: DeepSizeOf, S> DeepSizeOf for HashMap<K, V, S> {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         // Each bucket holds a key-value pair plus hash metadata (~1 byte control per bucket).
         // Robin hood / Swiss table capacity is always a power of 2.

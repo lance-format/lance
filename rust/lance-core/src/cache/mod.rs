@@ -70,7 +70,7 @@ pub use pin::{
     CacheLease, CachePin, PINNED_CAP_FRACTION, PinBudget, PinRecord, PinnedStats, PinnedValue,
     pinned_partition_cap,
 };
-pub use quick::{QuickCacheBackend, recommended_cache_shards};
+pub use quick::{QuickCacheBackend, QuickCacheShardPolicy, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
 
 use std::any::TypeId;
@@ -346,6 +346,11 @@ impl LanceCache {
 
     pub async fn size_bytes(&self) -> usize {
         self.state.backend.size_bytes().await
+    }
+
+    /// Weighted capacity in bytes, if the backend reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.state.backend.capacity_bytes()
     }
 
     // -- Stats / clear --------------------------------------------------------
@@ -884,6 +889,12 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         self.upgrade()?.get_rows_with_key(cache_key, rows).await
+    }
+
+    /// Weighted capacity in bytes, if the cache is alive and its backend
+    /// reports one.
+    pub fn capacity_bytes(&self) -> Option<usize> {
+        self.upgrade()?.capacity_bytes()
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>

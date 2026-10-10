@@ -533,6 +533,90 @@ pub async fn assert_plan_node_equals(
     assert_string_matches(&raw_plan_desc, raw_expected)
 }
 
+/// Fragment reuse versions over fragments no dataset has, to size a stored history
+/// without compacting that much data.
+pub fn padding_reuse_versions(count: u64) -> Vec<lance_index::frag_reuse::FragReuseVersion> {
+    use lance_index::frag_reuse::{FragDigest, FragReuseGroup, FragReuseVersion};
+    let digest = |id: u64| FragDigest {
+        id,
+        physical_rows: 4,
+        num_deleted_rows: 0,
+    };
+    (0..count)
+        .map(|i| {
+            let old_id = 1_000 + i;
+            let mut changed_row_addrs = Vec::new();
+            roaring::RoaringTreemap::from_iter((old_id << 32)..(old_id << 32) + 4)
+                .serialize_into(&mut changed_row_addrs)
+                .unwrap();
+            FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![digest(old_id)],
+                    new_frags: vec![digest(100_000 + i)],
+                }],
+            }
+        })
+        .collect()
+}
+
+/// Commits `count` padding versions as the dataset's fragment reuse history.
+pub async fn commit_padding_reuse_history(
+    dataset: &mut Dataset,
+    count: usize,
+) -> lance_table::format::IndexMetadata {
+    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+    let details = lance_index::frag_reuse::FragReuseIndexDetails {
+        versions: padding_reuse_versions(count as u64),
+    };
+    let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
+    let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            crate::dataset::transaction::Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![entry.clone()],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    entry
+}
+
+/// The most padding versions whose details still fit inline.
+pub fn inline_padding_capacity() -> usize {
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use prost::Message;
+    let versions = padding_reuse_versions(5_000);
+    let fits = |count: usize| {
+        InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
+            versions: versions[..count].to_vec(),
+        })
+        .encoded_len()
+            <= 204_800
+    };
+    let (mut low, mut high) = (0, versions.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    assert!(low < versions.len());
+    low
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -925,5 +1009,153 @@ impl CommitHandler for AmbiguousCommitHandler {
         ConditionalPutCommitHandler
             .resolve_version_location(base_path, version, object_store)
             .await
+    }
+}
+
+/// One uncommitted scalar index segment per named fragment.
+pub async fn stage_index_segments(
+    dataset: &mut Dataset,
+    column: &str,
+    index_type: lance_index::IndexType,
+    params: &lance_index::scalar::ScalarIndexParams,
+    name: &str,
+    fragment_ids: Vec<u32>,
+) -> Vec<lance_table::format::IndexMetadata> {
+    use crate::index::DatasetIndexExt;
+
+    let mut staged = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        staged.push(
+            dataset
+                .create_index_builder(&[column], index_type, params)
+                .name(name.to_string())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    staged
+}
+
+/// Geometry fixtures shared by the RTree tests.
+#[cfg(feature = "geo")]
+pub mod geo {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use geo_types::line_string;
+    use geoarrow_array::GeoArrowArray;
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_table::format::IndexMetadata;
+
+    use crate::Dataset;
+    use crate::dataset::WriteParams;
+    use crate::dataset::optimize::CompactionOptions;
+    use crate::index::DatasetIndexExt;
+    use geoarrow_array::builder::LineStringBuilder;
+    use geoarrow_schema::{Dimension, LineStringType};
+
+    pub fn line_string_type() -> LineStringType {
+        LineStringType::new(Dimension::XY, Default::default())
+    }
+
+    /// `rows` diagonal line segments starting at `first`, each one distinct.
+    pub fn line_strings(first: i32, rows: i32) -> ArrayRef {
+        let mut builder = LineStringBuilder::new(line_string_type());
+        for row in 0..rows {
+            let x = (first + row) as f64;
+            builder
+                .push_line_string(Some(&line_string![(x: x, y: x), (x: x + 1.0, y: x + 1.0)]))
+                .unwrap();
+        }
+        builder.finish().to_array_ref()
+    }
+
+    /// `id` and `geometry` batches, one per fragment.
+    pub fn batches(rows_per_fragment: i32, fragments: i32) -> (Arc<ArrowSchema>, Vec<RecordBatch>) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            line_string_type().to_field("geometry", true),
+        ]));
+        let batches = (0..fragments)
+            .map(|fragment| {
+                let first = fragment * rows_per_fragment;
+                let ids = Int32Array::from_iter_values(first..first + rows_per_fragment);
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(ids), line_strings(first, rows_per_fragment)],
+                )
+                .unwrap()
+            })
+            .collect();
+        (schema, batches)
+    }
+
+    /// Geometry fragments with a committed RTree index, so a deferred
+    /// compaction writes a reuse mapping.
+    pub async fn dataset_with_committed_rtree_index(
+        uri: &str,
+        rows_per_fragment: i32,
+        fragments: i32,
+    ) -> (Dataset, ScalarIndexParams) {
+        let (schema, batches) = batches(rows_per_fragment, fragments);
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment as usize,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), fragments as usize);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::RTree);
+        dataset
+            .create_index(
+                &["geometry"],
+                IndexType::RTree,
+                Some("committed_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        (dataset, params)
+    }
+
+    /// One uncommitted RTree segment per named fragment over `geometry`.
+    pub async fn stage_rtree_segments(
+        dataset: &mut Dataset,
+        params: &ScalarIndexParams,
+        fragment_ids: Vec<u32>,
+    ) -> Vec<IndexMetadata> {
+        super::stage_index_segments(
+            dataset,
+            "geometry",
+            IndexType::RTree,
+            params,
+            "geometry_idx",
+            fragment_ids,
+        )
+        .await
+    }
+
+    /// A compaction with deferred index remap.
+    pub fn deferred_compaction(
+        rows_per_fragment: i32,
+        fragments_per_group: i32,
+    ) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: (rows_per_fragment * fragments_per_group) as usize,
+            defer_index_remap: true,
+            ..Default::default()
+        }
     }
 }
