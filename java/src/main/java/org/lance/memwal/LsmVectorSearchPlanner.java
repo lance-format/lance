@@ -117,9 +117,9 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param nprobes number of IVF partitions to probe
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
-   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances
-   *     (refine factor 1). Useful when the base table uses an approximate index (IVF-PQ).
-   *     Auto-enabled whenever stale filtering is on (see {@code overfetchFactor}).
+   * @param refineBaseTable when true, the base-table and SSTable arms re-rank candidates with
+   *     exact distances (refine factor 1), so every arm reports exact distances. Auto-enabled
+   *     whenever stale filtering is on (see {@code overfetchFactor}).
    * @param overfetchFactor over-fetch multiple for sources with rows superseded by newer
    *     generations. Must be at least {@code 1.0}:
    *     <ul>
@@ -177,7 +177,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param nprobes number of IVF partitions to probe
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
-   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances.
+   * @param refineBaseTable when true, the base-table and SSTable arms re-rank candidates with
+   *     exact distances.
    * @return an executable plan
    */
   public ExecutionPlan planSearch(

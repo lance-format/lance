@@ -31,7 +31,7 @@ use super::data_source::LsmDataSource;
 use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
-    project_to_canonical, validate_projection_names, wants_row_id,
+    project_to_canonical, scale_distance, validate_projection_names, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
@@ -71,12 +71,14 @@ impl ProbeBounds {
 ///     SortExec: order_by=[_distance ASC], fetch=k          (per partition, parallel)
 ///       UnionExec
 ///         ProjectionExec (canonical output schema)
-///           SortExec(_distance, fetch=k)
+///           ProjectionExec (_distance rescaled, unrefined only; see `with_distance_scale`)
+///             SortExec(_distance, fetch=k)
 ///               MemTableBruteForceVectorExec or VectorIndexExec: active memtable KNN
 ///         ProjectionExec (canonical output schema)
 ///           ProjectionExec (null_columns _rowid)
 ///             PkBlockFilterExec: block-list                   (SSTable)
-///               KNNExec: SSTable gen N, fetch=ceil(k*overfetch) (fast_search)
+///               ProjectionExec (_distance rescaled, unrefined only)
+///                 KNNExec: SSTable gen N, fetch=ceil(k*overfetch) (fast_search)[.refine()?]
 ///         … one per SSTable gen …
 ///         ProjectionExec (canonical output schema)
 ///           PkBlockFilterExec: block-list                     (base)
@@ -130,6 +132,22 @@ pub struct LsmVectorSearchPlanner {
     /// generation's `IVF_HNSW_SQ` — and is ignored by an arm whose index is not
     /// a graph. `None` leaves each arm at its own default.
     ef: Option<usize>,
+    /// Refine factor for every approximate-index arm; see
+    /// [`Self::with_refine_factor`].
+    refine_factor: Option<u32>,
+    /// Multiple of the exact distance every unrefined arm reports; see
+    /// [`Self::with_distance_scale`].
+    distance_scale: f32,
+}
+
+/// Multiple of the exact distance a flushed generation's index reports. It is
+/// written as `IVF_HNSW_SQ`, which ranks cosine as L2 over normalized vectors,
+/// `2 * (1 - cos)`; the other metrics it ranks on their own scale.
+fn sstable_distance_scale(distance_type: lance_linalg::distance::DistanceType) -> f32 {
+    match distance_type {
+        lance_linalg::distance::DistanceType::Cosine => 2.0,
+        _ => 1.0,
+    }
 }
 
 impl LsmVectorSearchPlanner {
@@ -164,6 +182,8 @@ impl LsmVectorSearchPlanner {
             filter: None,
             distance_range: (None, None),
             ef: None,
+            refine_factor: None,
+            distance_scale: 1.0,
         }
     }
 
@@ -192,6 +212,34 @@ impl LsmVectorSearchPlanner {
     pub fn with_ef(mut self, ef: Option<usize>) -> Self {
         self.ef = ef;
         self
+    }
+
+    /// Set the refine factor. `Some(rf)` refines the base and SSTable arms by
+    /// `rf`, so every arm reports exact distances. `None` leaves them
+    /// unrefined; see [`Self::with_distance_scale`].
+    pub fn with_refine_factor(mut self, refine_factor: Option<u32>) -> Self {
+        self.refine_factor = refine_factor;
+        self
+    }
+
+    /// Report unrefined distances as `scale` times the exact distance, which
+    /// lines this plan up with a base search the caller merges it with: Lance
+    /// ranks cosine on SQ and PQ indexes as L2 over normalized vectors, twice
+    /// `1 - cos`. The memtable arm scales its exact distances, and the SSTable
+    /// arms convert from their own index's multiple. The distance range is
+    /// given on the same scale. Ignored when refining. Defaults to `1.0`.
+    pub fn with_distance_scale(mut self, scale: f32) -> Self {
+        self.distance_scale = scale;
+        self
+    }
+
+    /// The factor that brings an arm reporting `native` times the exact
+    /// distance to the plan's scale.
+    fn arm_scale(&self, refine_factor: Option<u32>, native: f32) -> f32 {
+        match refine_factor {
+            Some(_) => 1.0,
+            None => self.distance_scale / native,
+        }
     }
 
     /// The table's schema carrying each field's id, which is what resolves a
@@ -249,12 +297,10 @@ impl LsmVectorSearchPlanner {
     /// * `k` - Number of nearest neighbors to return
     /// * `nprobes` - Exact number of IVF partitions to search (for IVF-based indexes)
     /// * `projection` - Columns to include in output (None = all columns)
-    /// * `refine_base_table` - When true, the base-table arm re-ranks its
-    ///   candidates with exact distances (refine factor 1). Useful when the base
-    ///   table uses an approximate index (IVF-PQ) so cross-source distance
-    ///   comparison is exact. Memtable arms already use exact distances and
-    ///   never need refine. Auto-enabled whenever stale filtering is on (see
-    ///   below).
+    /// * `refine_base_table` - When true and no refine factor is set, every
+    ///   approximate-index arm re-ranks its candidates with exact distances
+    ///   (refine factor 1), so the base table's are exact too. Auto-enabled
+    ///   whenever a newer generation blocks the base table (see below).
     /// * `overfetch_factor` - Controls how aggressively sources over-fetch to
     ///   backfill the rows dropped by stale-row filtering. Values below `1.0`
     ///   are rejected; stale filtering is always enabled.
@@ -353,11 +399,16 @@ impl LsmVectorSearchPlanner {
             true, // include _distance — KNN always produces it
         )?;
 
-        // Refine the base table when explicitly requested, or whenever the base
-        // is blocked (it then over-fetches its approximate-index candidates, so
-        // distances must be re-ranked to exact before the cross-source merge).
+        // The merge ranks every arm by `_distance`, so all of them must report
+        // on one scale: exact when refining, `distance_scale` when not. A
+        // blocked base over-fetches its approximate candidates, so it refines.
         // `block_lists` is non-empty exactly when a newer generation exists.
-        let refine_base = refine_base_table || !block_lists.is_empty();
+        let has_base = sources
+            .iter()
+            .any(|source| matches!(source, LsmDataSource::BaseTable { .. }));
+        let refine_factor = self
+            .refine_factor
+            .or_else(|| (refine_base_table || (has_base && !block_lists.is_empty())).then_some(1));
 
         // Stage per-source over-fetch decisions, then build every KNN plan
         // concurrently — the builds are independent and a sequential loop was
@@ -384,8 +435,8 @@ impl LsmVectorSearchPlanner {
         // Type-erased, not merely boxed: the `Send` proof recurses through a
         // boxed future's concrete type but stops at a trait object, and an arm
         // resolves a generation's schema before it searches.
-        let built = futures::future::try_join_all(arm_inputs.iter().map(
-            |(source, is_base, _, _, fetch_k)| {
+        let built =
+            futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, _, fetch_k)| {
                 let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
                     Box::pin(self.build_knn_plan(
                         source,
@@ -393,12 +444,11 @@ impl LsmVectorSearchPlanner {
                         *fetch_k,
                         probe_bounds,
                         projection,
-                        *is_base && refine_base,
+                        refine_factor,
                     ));
                 arm
-            },
-        ))
-        .await?;
+            }))
+            .await?;
 
         let mut knn_plans = Vec::new();
         for ((_, is_base, _, blocked, _), knn) in arm_inputs.iter().zip(built) {
@@ -516,7 +566,7 @@ impl LsmVectorSearchPlanner {
         k: usize,
         probe_bounds: ProbeBounds,
         projection: Option<&[String]>,
-        refine: bool,
+        refine_factor: Option<u32>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -558,10 +608,8 @@ impl LsmVectorSearchPlanner {
                 }
                 // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
-                // Re-rank base candidates with exact distances so they're
-                // directly comparable to memtable distances in the merge.
-                if refine {
-                    scanner.refine(1);
+                if let Some(refine_factor) = refine_factor {
+                    scanner.refine(refine_factor);
                 }
                 scanner.create_plan().await
             }
@@ -635,7 +683,12 @@ impl LsmVectorSearchPlanner {
                     }
                 };
                 scanner.nearest(&vector_column, query_arr.as_ref(), k)?;
-                scanner.distance_range(self.distance_range.0, self.distance_range.1);
+                let scale =
+                    self.arm_scale(refine_factor, sstable_distance_scale(self.distance_type));
+                scanner.distance_range(
+                    self.distance_range.0.map(|lower| lower / scale),
+                    self.distance_range.1.map(|upper| upper / scale),
+                );
                 if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
                     scanner.minimum_nprobes(minimum_nprobes);
                 }
@@ -647,10 +700,14 @@ impl LsmVectorSearchPlanner {
                     scanner.ef(ef);
                 }
                 scanner.fast_search();
+                if let Some(refine_factor) = refine_factor {
+                    scanner.refine(refine_factor);
+                }
                 // Boxed for the reason the scan planner's arm gives: a
                 // generation resolves its own schema before scanning, and
                 // the inlined future is too deep for the `Send` proof.
-                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
+                let plan = scale_distance(Box::pin(scanner.create_plan()).await?, scale)?;
+                generation.reconcile_above(plan, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -717,7 +774,12 @@ impl LsmVectorSearchPlanner {
                     }
                 };
                 scanner.nearest(&vector_column, query_vector, k)?;
-                scanner.distance_range(self.distance_range.0, self.distance_range.1);
+                // This arm's distances are exact.
+                let scale = self.arm_scale(refine_factor, 1.0);
+                scanner.distance_range(
+                    self.distance_range.0.map(|lower| lower / scale),
+                    self.distance_range.1.map(|upper| upper / scale),
+                );
                 if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
                     scanner.minimum_nprobes(minimum_nprobes);
                 }
@@ -728,7 +790,7 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = self.ef {
                     scanner.ef(ef);
                 }
-                let plan = Box::pin(scanner.create_plan()).await?;
+                let plan = scale_distance(Box::pin(scanner.create_plan()).await?, scale)?;
                 match generation {
                     Some(generation) => generation.reconcile_above(plan, &above),
                     None => Ok(plan),
@@ -3381,6 +3443,157 @@ mod tests {
                 .all(|&(id, d)| !((1..=3).contains(&id) && d.abs() < 1e-3)),
             "stale read: a superseded base row was served; got {:?}",
             rows
+        );
+    }
+
+    /// The SSTable arm's `IVF_HNSW_SQ` index ranks cosine as `2 * (1 - cos)` and
+    /// the memtable arm ranks it exactly, so the plan must put both on the
+    /// requested scale or the merge interleaves them wrongly.
+    #[tokio::test]
+    async fn test_vector_search_cosine_arms_share_one_scale() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+        use lance_index::vector::ivf::IvfBuildParams;
+        use lance_index::vector::sq::builder::SQBuildParams;
+        use lance_linalg::distance::DistanceType;
+
+        // A vector of norm `norm` whose cosine distance to the query is `cos_distance`.
+        let at = |cos_distance: f32, norm: f32| {
+            let cos = 1.0 - cos_distance;
+            [norm * cos, norm * (1.0 - cos * cos).sqrt(), 0.0, 0.0]
+        };
+        let query = {
+            use arrow_array::builder::Float32Builder;
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+            builder.values().append_slice(&[1.0, 0.0, 0.0, 0.0]);
+            builder.append(true);
+            builder.finish()
+        };
+        // Exact cosine distance by id; the arms alternate so a scale mismatch
+        // between them reorders the result.
+        let expected = [(1, 0.05), (3, 0.2), (2, 0.4), (4, 0.6)];
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+
+        // SSTable: ids 1 and 2, plus far rows so SQ has a spread to train on.
+        let mut sstable_rows = vec![(1, at(0.05, 3.0)), (2, at(0.4, 2.0))];
+        sstable_rows.extend((10..20).map(|id| (id, at(1.9, 1.0 + id as f32 * 0.1))));
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 = create_dataset(&gen1_uri, vec![batch_rows(&schema, &sstable_rows)]).await;
+        let hnsw_sq = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::Cosine,
+            IvfBuildParams::new(1),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        gen1.create_index(&["vector"], IndexType::Vector, None, &hnsw_sq, true)
+            .await
+            .unwrap();
+
+        // Active memtable: ids 3 and 4.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            DistanceType::Cosine,
+            64,
+            8,
+        );
+        let batch = batch_rows(&schema, &[(3, at(0.2, 0.5)), (4, at(0.6, 1.0))]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let active = InMemoryMemTableRef {
+            batch_store,
+            index_store: Arc::new(index_store),
+            schema: schema.clone(),
+            generation: 2,
+        };
+
+        let search = |scale: f32, refine: Option<u32>, range: (Option<f32>, Option<f32>)| {
+            let snapshot = ShardSnapshot::new(shard_id)
+                .with_current_generation(2)
+                .with_sstable(1, "gen_1".to_string());
+            let collector =
+                LsmDataSourceCollector::without_base_table(base_uri.clone(), vec![snapshot])
+                    .with_in_memory_memtables(
+                        shard_id,
+                        InMemoryMemTables {
+                            active: active.clone(),
+                            frozen: vec![],
+                        },
+                    );
+            let planner = LsmVectorSearchPlanner::new(
+                collector,
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                DistanceType::Cosine,
+            )
+            .with_distance_scale(scale)
+            .with_refine_factor(refine)
+            .with_distance_range(range.0, range.1);
+            let query = query.clone();
+            async move {
+                let plan = planner
+                    .plan_search(&query, 4, 1, None, false, 1.0)
+                    .await
+                    .unwrap();
+                let batches: Vec<RecordBatch> = plan
+                    .execute(0, SessionContext::new().task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                collect_id_dist(&batches)
+            }
+        };
+        let assert_on_scale = |rows: &[(i32, f32)], scale: f32, what: &str| {
+            let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids, vec![1, 3, 2, 4], "{what}: wrong order, got {rows:?}");
+            for ((id, distance), (_, exact)) in rows.iter().zip(expected) {
+                assert!(
+                    (distance - exact * scale).abs() < 0.02 * scale,
+                    "{what}: id={id} reported {distance}, expected {}",
+                    exact * scale
+                );
+            }
+        };
+
+        assert_on_scale(&search(1.0, None, (None, None)).await, 1.0, "exact scale");
+        assert_on_scale(
+            &search(2.0, None, (None, None)).await,
+            2.0,
+            "SQ/PQ base scale",
+        );
+        // Refining reports exact distances whatever the scale.
+        assert_on_scale(&search(2.0, Some(1), (None, None)).await, 1.0, "refined");
+
+        // On the 2x scale, [0.3, 1.0) is cosine distance [0.15, 0.5): one row
+        // from each arm.
+        let ids: Vec<i32> = search(2.0, None, (Some(0.3), Some(1.0)))
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![3, 2],
+            "distance_range must apply on the scale it is given in"
         );
     }
 
