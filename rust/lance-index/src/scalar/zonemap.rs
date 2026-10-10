@@ -1852,6 +1852,34 @@ impl ZoneMapSeedWriter {
     }
 }
 
+impl ZoneMapSeedWriter {
+    /// Record the null positions of `chunk` as runs: one bitmap insert per
+    /// contiguous null region instead of one per null row, so all-null and
+    /// clustered-null data cost almost nothing to track. `base_offset` is the
+    /// fragment-local offset of the chunk's first row.
+    fn record_null_runs(&mut self, chunk: &ArrayRef, base_offset: u32) {
+        let len = chunk.len() as u32;
+        let Some(nulls) = chunk.nulls() else {
+            return;
+        };
+        // The validity buffer marks valid rows; the gaps between its set runs
+        // are the null runs.
+        let mut cursor = 0u32;
+        for (start, end) in nulls.inner().set_slices() {
+            let start = start as u32;
+            if start > cursor {
+                self.null_offsets
+                    .insert_range(base_offset + cursor..base_offset + start);
+            }
+            cursor = end as u32;
+        }
+        if cursor < len {
+            self.null_offsets
+                .insert_range(base_offset + cursor..base_offset + len);
+        }
+    }
+}
+
 impl IndexSeedWriter for ZoneMapSeedWriter {
     fn column_name(&self) -> &str {
         &self.column_name
@@ -1868,11 +1896,7 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
 
             if chunk.null_count() > 0 {
                 let base_offset = (self.next_zone_start + self.rows_in_current_zone) as u32;
-                for i in 0..chunk_len {
-                    if chunk.is_null(i) {
-                        self.null_offsets.insert(base_offset + i as u32);
-                    }
-                }
+                self.record_null_runs(&chunk, base_offset);
             }
 
             self.rows_in_current_zone += chunk_len as u64;
@@ -1919,7 +1943,9 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
         let batch = Self::seed_batch_from_zones(&self.completed_zones, &self.data_type)?;
 
         // Embed null bitmap in schema metadata so deserialize_seed can reconstruct null_rows.
-        let null_offsets = std::mem::take(&mut self.null_offsets);
+        let mut null_offsets = std::mem::take(&mut self.null_offsets);
+        // Run containers make contiguous null regions a few bytes each.
+        null_offsets.optimize();
         let bitmap_bytes = if null_offsets.is_empty() {
             Vec::default()
         } else {
@@ -4135,6 +4161,51 @@ mod tests {
             !result.is_exact(),
             "IS NULL on a legacy index should not be exact"
         );
+    }
+
+    #[test]
+    fn test_zone_map_seed_writer_null_runs_match_positions() {
+        use crate::scalar::seed::IndexSeedWriter;
+        use crate::scalar::zonemap::ZoneMapSeedWriter;
+        use arrow_array::{ArrayRef, Int32Array};
+
+        // Validity patterns: scattered, a long run, leading and trailing nulls.
+        let values: Vec<Option<i32>> = (0..1000)
+            .map(|i| {
+                if i < 7 || (200..600).contains(&i) || i % 13 == 0 || i >= 990 {
+                    None
+                } else {
+                    Some(i)
+                }
+            })
+            .collect();
+        let expected: RoaringBitmap = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_none())
+            .map(|(i, _)| i as u32)
+            .collect();
+        let array: ArrayRef = Arc::new(Int32Array::from(values));
+
+        // Observed as one array, as slices that split the runs, and with
+        // zones that split the runs: the recorded positions are identical.
+        let mut whole = ZoneMapSeedWriter::new("c", 64, DataType::Int32).unwrap();
+        whole.observe_batch(&array).unwrap();
+        let mut sliced = ZoneMapSeedWriter::new("c", 1000, DataType::Int32).unwrap();
+        for (start, len) in [(0, 3), (3, 300), (303, 500), (803, 197)] {
+            sliced.observe_batch(&array.slice(start, len)).unwrap();
+        }
+        for writer in [&mut whole, &mut sliced] {
+            let bytes = writer.finish().unwrap().unwrap();
+            let (_, bitmap) = ZoneMapSeedWriter::deserialize_seed(0, &bytes, 1000).unwrap();
+            assert_eq!(bitmap, Some(expected.clone()));
+        }
+
+        // No validity buffer means no nulls: the run scan records nothing.
+        let valid: ArrayRef = Arc::new(Int32Array::from_iter_values(0..10));
+        let mut writer = ZoneMapSeedWriter::new("c", 64, DataType::Int32).unwrap();
+        writer.record_null_runs(&valid, 0);
+        assert!(writer.null_offsets.is_empty());
     }
 
     #[tokio::test]
