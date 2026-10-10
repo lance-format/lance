@@ -9,13 +9,14 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_array::Array;
 use async_trait::async_trait;
 use futures::future::try_join_all;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::{
-    AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
+    AnyQuery, CreatedIndex, LookupMatches, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
 };
 use lance_index::{Index, IndexType};
 use lance_select::NullableRowAddrSet;
@@ -163,6 +164,20 @@ impl ScalarIndex for LogicalScalarIndex {
         )
         .await?;
         combine_search_results(results)
+    }
+
+    async fn lookup(
+        &self,
+        keys: &dyn Array,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<LookupMatches> {
+        let matches = try_join_all(
+            self.segments
+                .iter()
+                .map(|segment| segment.lookup(keys, metrics)),
+        )
+        .await?;
+        Ok(LookupMatches::concat(matches))
     }
 
     fn results_are_row_addresses(&self) -> bool {
@@ -683,6 +698,23 @@ mod tests {
         assert_eq!(
             searched_fragments.into_iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([1, 2])
+        );
+
+        // Keys resolve in whichever segment covers them; one absent.
+        let keys = arrow_array::Int32Array::from(vec![20, 43, 99, 20, 0]);
+        let matches = logical.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
+        let mut pairs = matches
+            .key_indices
+            .values()
+            .iter()
+            .copied()
+            .zip(matches.row_ids.values().iter().copied())
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        let addr = |value: u32| u64::from(RowAddress::new_from_parts(value / 16, value % 16));
+        assert_eq!(
+            pairs,
+            vec![(0, addr(20)), (1, addr(43)), (3, addr(20)), (4, addr(0))]
         );
     }
 

@@ -9,6 +9,7 @@
 //! - High cardinality (unique values) and low cardinality (100 unique values)
 //! - Equality filters
 //! - IN filters with varying size (1, 3, 5 values)
+//! - Key lookups with varying batch size (100, 1000 random keys)
 
 mod common;
 
@@ -20,6 +21,7 @@ use std::{
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use std::hint::black_box;
 
+use arrow_array::{ArrayRef, Int64Array, StringArray};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
@@ -32,6 +34,7 @@ use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
 use object_store::path::Path;
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 // Lazy static runtime - only created once
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -459,12 +462,71 @@ fn bench_in(c: &mut Criterion) {
     }
 }
 
+fn bench_lookup(c: &mut Criterion) {
+    let rt = get_runtime();
+
+    for num_keys in [100, 1_000] {
+        let mut group = c.benchmark_group(format!("bitmap_lookup_{num_keys}"));
+        group
+            .sample_size(10)
+            .measurement_time(Duration::from_secs(10));
+
+        let mut rng = SmallRng::seed_from_u64(42);
+        let keys: Vec<u64> = (0..num_keys)
+            .map(|_| rng.random_range(0..TOTAL_ROWS))
+            .collect();
+        let int_keys: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            keys.iter().map(|&key| key as i64),
+        ));
+        let string_keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+            keys.iter().map(|key| format!("string_{key:010}")),
+        ));
+
+        for use_cache in [false, true] {
+            let cache_label = if use_cache { "cached" } else { "no_cache" };
+
+            for (name, index, keys) in [
+                (
+                    "int_unique",
+                    setup_int_unique_index(rt, use_cache),
+                    &int_keys,
+                ),
+                (
+                    "string_unique",
+                    setup_string_unique_index(rt, use_cache),
+                    &string_keys,
+                ),
+            ] {
+                group.bench_function(BenchmarkId::new(name, cache_label), |b| {
+                    b.to_async(rt).iter(|| {
+                        let index = index.clone();
+                        let keys = keys.clone();
+                        async move {
+                            let matches = index
+                                .lookup(keys.as_ref(), &NoOpMetricsCollector)
+                                .await
+                                .unwrap();
+                            assert_eq!(matches.len(), num_keys);
+                            black_box(matches);
+                        }
+                    })
+                });
+            }
+        }
+
+        group.finish();
+    }
+}
+
 fn bench_bitmap(c: &mut Criterion) {
     // Run equality benchmarks
     bench_equality(c);
 
     // Run IN query benchmarks
     bench_in(c);
+
+    // Run key lookup benchmarks
+    bench_lookup(c);
 }
 
 #[cfg(target_os = "linux")]
