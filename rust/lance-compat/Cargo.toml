@@ -1,0 +1,45 @@
+[package]
+name = "lance-compat"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Compatibility fixtures for the upstream contracts Lance inherits (test-only, not published)"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+futures = { workspace = true }
+half = { workspace = true }
+lance-arrow-scalar = { workspace = true }
+lance-arrow-stats = { workspace = true }
+lance-datafusion = { workspace = true }
+lance-index = { workspace = true }
+rstest = { workspace = true }
+tokio = { workspace = true }
+
+# Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
+# Not part of the default test run: CI runs it from the `arrow-ordering-compat`
+# job when Cargo.lock changes an ordering-relevant crate or the fixtures
+# themselves change, and the clippy job lints it explicitly. Run by hand with
+# `cargo test -p lance-compat --test arrow_ordering`.
+[[test]]
+name = "arrow_ordering"
+test = false
+
+[lints]
+workspace = true
