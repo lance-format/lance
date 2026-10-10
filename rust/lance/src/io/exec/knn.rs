@@ -2383,8 +2383,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
-                        let (vector_type, _) = crate::index::vector::utils::get_vector_type(ds.schema(), &column)?;
-                        let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref(), &vector_type)?;
+                        let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref())?;
                         policy.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
 
                         // A segment's index file may still physically contain rows for
@@ -3113,6 +3112,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
@@ -3769,38 +3769,48 @@ mod tests {
     #[case::cosine("cosine", true)]
     #[case::dot("dot", true)]
     #[case::fixed_dot("fixed_dot", false)]
-    #[case::bounded_dot("bounded_dot", false)]
-    #[case::large_k_dot("large_k_dot", false)]
+    #[case::bounded_dot("bounded_dot", true)]
+    #[case::bounded_cosine("bounded_cosine", true)]
+    #[case::uncalibrated_dot("uncalibrated_dot", false)]
     #[case::hamming("hamming", false)]
-    #[case::float16_column("f16", false)]
-    #[case::float64_query("query_f64", false)]
-    #[case::null_query("null", false)]
-    #[case::nonfinite_query("nonfinite", false)]
-    #[case::multivector("multi", false)]
-    #[case::product("product", false)]
-    #[case::hnsw("hnsw", false)]
-    #[case::legacy("legacy", false)]
-    #[case::bounded("bounded", false)]
+    #[case::float16_query("f16", true)]
+    #[case::float64_query("query_f64", true)]
+    #[case::int8_query("int8", true)]
+    #[case::null_query("null", true)]
+    #[case::nan_query("nan", true)]
+    #[case::infinite_query("infinite", true)]
+    #[case::negative_infinite_query("negative_infinite", true)]
+    #[case::multivector("multi", true)]
+    #[case::product("product", true)]
+    #[case::hnsw("hnsw", true)]
+    #[case::legacy("legacy", true)]
+    #[case::bounded("bounded", true)]
     #[case::fixed("fixed", false)]
-    #[case::large_k("large_k", false)]
-    #[case::refine("refine", false)]
+    #[case::uncalibrated("uncalibrated", false)]
+    #[case::refine("refine", true)]
     fn test_auto_policy_gates_before_reading_experimental_config(
         #[case] scenario: &str,
         #[case] reads_config: bool,
+        #[values(1, 100, 101, 200, 500, 1000, 1001, 10_000, 10_001, 100_000)] k: usize,
     ) {
         let mut query = base_query();
-        query.k = if matches!(scenario, "large_k" | "large_k_dot") {
-            101
+        query.k = if matches!(scenario, "uncalibrated" | "uncalibrated_dot") {
+            100_001
         } else {
-            1
+            k
         };
         query.key = match scenario {
+            "f16" => Arc::new(arrow_array::Float16Array::from(vec![half::f16::ZERO])),
             "query_f64" => Arc::new(arrow_array::Float64Array::from(vec![0.0])),
+            "int8" => Arc::new(arrow_array::Int8Array::from(vec![0])),
             "null" => Arc::new(Float32Array::from(vec![None::<f32>])),
-            "nonfinite" => Arc::new(Float32Array::from(vec![f32::NAN])),
+            "nan" => Arc::new(Float32Array::from(vec![f32::NAN])),
+            "infinite" => Arc::new(Float32Array::from(vec![f32::INFINITY])),
+            "negative_infinite" => Arc::new(Float32Array::from(vec![f32::NEG_INFINITY])),
+            "multi" => Arc::new(Float32Array::from(vec![0.0, 1.0])),
             _ => Arc::new(Float32Array::from(vec![0.0])),
         };
-        if matches!(scenario, "bounded" | "bounded_dot") {
+        if matches!(scenario, "bounded" | "bounded_dot" | "bounded_cosine") {
             query.maximum_nprobes = Some(2);
         } else if matches!(scenario, "fixed" | "fixed_dot") {
             query.maximum_nprobes = Some(query.minimum_nprobes);
@@ -3808,20 +3818,10 @@ mod tests {
         if scenario == "refine" {
             query.refine_factor = Some(2);
         }
-        let element_type = if scenario == "f16" {
-            DataType::Float16
-        } else {
-            DataType::Float32
-        };
-        let mut vector_type =
-            DataType::FixedSizeList(Arc::new(ArrowField::new("item", element_type, true)), 1);
-        if scenario == "multi" {
-            vector_type = DataType::List(Arc::new(ArrowField::new("item", vector_type, true)));
-        }
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
-                "cosine" => DistanceType::Cosine,
-                "dot" | "fixed_dot" | "bounded_dot" | "large_k_dot" => DistanceType::Dot,
+                "cosine" | "bounded_cosine" => DistanceType::Cosine,
+                "dot" | "fixed_dot" | "bounded_dot" | "uncalibrated_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },
@@ -3837,7 +3837,7 @@ mod tests {
             row_ids: vec![vec![1], vec![2]],
         };
         let mut called = false;
-        let result = AutoProbePolicy::select_with_config(&query, &index, &vector_type, |_, _| {
+        let result = AutoProbePolicy::select_with_config(&query, &index, |_, _| {
             called = true;
             Err(DataFusionError::Execution(
                 "invalid LANCE_AUTO_PROBE_MARGIN".to_owned(),
@@ -4748,6 +4748,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::Cosine),

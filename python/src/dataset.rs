@@ -83,7 +83,7 @@ use lance_index::{
     scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
+        ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query as VectorQuery,
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
         sq::builder::SQBuildParams,
     },
@@ -125,7 +125,6 @@ pub mod io_stats;
 pub mod optimize;
 pub mod stats;
 
-const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
@@ -1553,6 +1552,7 @@ impl Dataset {
                 ef,
                 query_parallelism,
                 approx_mode,
+                search_effort,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1608,7 +1608,7 @@ impl Dataset {
                 };
 
             scanner
-                .map(|s| {
+                .and_then(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
                     if let Some(maximum_nprobes) = maximum_nprobes {
                         s = s.maximum_nprobes(maximum_nprobes);
@@ -1624,11 +1624,12 @@ impl Dataset {
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
+                    s = s.search_effort(search_effort)?;
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
                     }
-                    s
+                    Ok(s)
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
@@ -5734,6 +5735,7 @@ type VectorQueryParams = (
     Option<usize>,
     i32,
     ApproxMode,
+    f64,
 );
 
 fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
@@ -5798,28 +5800,35 @@ fn vector_query_params_from_dict(
         default_k
     };
 
-    let mut minimum_nprobes = DEFAULT_NPROBES;
-    let mut maximum_nprobes: Option<usize> = None;
+    let search_effort = dict
+        .get_item("search_effort")?
+        .filter(|value| !value.is_none())
+        .map(|value| value.extract::<f64>())
+        .transpose()?;
+    let mut probes = ProbeParams {
+        search_effort,
+        ..Default::default()
+    };
 
-    if let Some(nprobes) = dict.get_item("nprobes")?
+    if search_effort.is_none()
+        && let Some(nprobes) = dict.get_item("nprobes")?
         && !nprobes.is_none()
     {
-        let extracted: usize = nprobes.extract()?;
-        minimum_nprobes = extracted;
-        maximum_nprobes = Some(extracted);
+        probes.nprobes = Some(nprobes.extract()?);
     }
 
     if let Some(min_nprobes) = dict.get_item("minimum_nprobes")?
         && !min_nprobes.is_none()
     {
-        minimum_nprobes = min_nprobes.extract()?;
+        probes.minimum_nprobes = Some(min_nprobes.extract()?);
     }
 
     if let Some(max_nprobes) = dict.get_item("maximum_nprobes")?
         && !max_nprobes.is_none()
     {
-        maximum_nprobes = Some(max_nprobes.extract()?);
+        probes.maximum_nprobes = Some(max_nprobes.extract()?);
     }
+    let (minimum_nprobes, maximum_nprobes, search_effort) = probes.resolve();
 
     if let Some(maximum_nprobes_val) = maximum_nprobes
         && minimum_nprobes > maximum_nprobes_val
@@ -5892,6 +5901,7 @@ fn vector_query_params_from_dict(
         ef,
         query_parallelism,
         approx_mode,
+        search_effort,
     ))
 }
 
@@ -5929,6 +5939,7 @@ impl PySearchFilter {
             ef,
             query_parallelism,
             approx_mode,
+            search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -5948,7 +5959,11 @@ impl PySearchFilter {
             query_parallelism,
             dist_q_c: 0.0,
             approx_mode,
+            search_effort,
         };
+        vector_query
+            .validate_search_effort()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(Self {
             inner: QueryFilter::Vector(vector_query),

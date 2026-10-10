@@ -21,7 +21,7 @@ import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
-from lance.dataset import VectorIndexReader
+from lance.dataset import VectorIndexReader, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
@@ -78,13 +78,234 @@ def test_dot_auto_probe_overrides(tmp_path, monkeypatch, query_scale):
     monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
     with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
         dataset.to_table(columns=["id"], nearest=nearest)
-    # Fixed budgets and explicitly bounded Auto retain their existing semantics.
+    # Fixed budgets bypass Auto configuration, but an upper bound does not.
     fixed = dataset.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
     assert set(fixed["id"].to_pylist()) == expected
-    bounded = dataset.to_table(
-        columns=["id"], nearest={**nearest, "maximum_nprobes": 4}
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        dataset.to_table(columns=["id"], nearest={**nearest, "maximum_nprobes": 4})
+
+
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+@pytest.mark.parametrize("k", [100, 101, 1000])
+@pytest.mark.parametrize("segments", [1, 2])
+def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, segments):
+    rng = np.random.default_rng(2254)
+    centroids = np.eye(16, dtype=np.float32)
+    vectors = np.tile(np.repeat(centroids, 128, axis=0), (segments, 1))
+    vectors += rng.normal(0, 0.001, vectors.shape).astype(np.float32)
+    table = vec_to_table(vectors).append_column("id", pa.array(np.arange(len(vectors))))
+    dataset = lance.write_dataset(
+        table.slice(0, 2048), tmp_path / "ds.lance", max_rows_per_file=512
     )
-    assert set(bounded["id"].to_pylist()) == expected
+    dataset.create_index(
+        "vector", "IVF_FLAT", metric=metric, num_partitions=16, ivf_centroids=centroids
+    )
+    if segments == 2:
+        dataset = lance.write_dataset(table.slice(2048), dataset.uri, mode="append")
+        dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    assert dataset.stats.index_stats("vector_idx")["num_segments"] == segments
+    # Distinct centroid scores make recall meaningful even after late expansion.
+    query = np.linspace(1, 0.1, 16, dtype=np.float32)
+    nearest = {
+        "column": "vector",
+        "q": query,
+        "k": k,
+        "metric": metric,
+        "query_parallelism": 2,
+    }
+    if metric == "l2":
+        distances = np.sum((vectors - query) ** 2, axis=1)
+    elif metric == "cosine":
+        distances = -(vectors @ query) / np.linalg.norm(vectors, axis=1)
+    else:
+        distances = -(vectors @ query)
+    expected = set(np.argsort(distances)[:k].tolist())
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "0")
+    monkeypatch.setenv("LANCE_AUTO_MIN_INITIAL_NPROBES", "2")
+    monkeypatch.setenv("LANCE_AUTO_MAX_INITIAL_NPROBES", "2")
+
+    def search(**options):
+        captured = []
+        result = dataset.scanner(
+            columns=["id"], scan_stats_callback=captured.append, **options
+        ).to_table()
+        return result, captured[0].all_counts["partitions_searched"]
+
+    # Assess recall with the calibrated defaults. The deliberately tiny override
+    # below only guarantees enough results after late expansion, not full recall.
+    with monkeypatch.context() as defaults:
+        for variable in (
+            "LANCE_AUTO_PROBE_MARGIN",
+            "LANCE_AUTO_MIN_INITIAL_NPROBES",
+            "LANCE_AUTO_MAX_INITIAL_NPROBES",
+        ):
+            defaults.delenv(variable)
+        default, _ = search(nearest=nearest)
+        assert len(set(default["id"].to_pylist()) & expected) / k >= 0.95
+
+    # The initial cap applies on both sides of the k=100 profile boundary.
+    result, partitions = search(nearest=nearest)
+    assert len(result) == k
+    if k <= 256:
+        fixed, _ = search(nearest={**nearest, "nprobes": 2})
+        assert partitions == 2 * segments
+        assert set(result["id"].to_pylist()) == set(fixed["id"].to_pylist())
+    else:
+        # Two partitions hold fewer than k rows, so late probing continues.
+        assert partitions > 2 * segments
+
+    bounded, partitions = search(nearest={**nearest, "maximum_nprobes": 3})
+    assert len(bounded) == min(k, 384 * segments)
+    assert partitions == (2 if k <= 256 else 3) * segments
+
+    # Filters and deletions that leave fewer than k rows in the initial budget
+    # must not stop at the initial cap.
+    small_k = min(k, 101)
+    filtered, partitions = search(
+        nearest={**nearest, "k": small_k}, filter="id % 8 = 0", prefilter=True
+    )
+    assert len(filtered) == small_k
+    assert all(i % 8 == 0 for i in filtered["id"].to_pylist())
+    assert partitions > 2 * segments
+    bounded, partitions = search(
+        nearest={**nearest, "k": small_k, "maximum_nprobes": 3},
+        filter="id % 8 = 0",
+        prefilter=True,
+    )
+    assert len(bounded) == 48 * segments
+    assert all(i % 8 == 0 for i in bounded["id"].to_pylist())
+    assert partitions == 3 * segments
+    dataset.delete("id % 8 != 0")
+    deleted, partitions = search(nearest={**nearest, "k": small_k})
+    assert len(deleted) == small_k
+    assert all(i % 8 == 0 for i in deleted["id"].to_pylist())
+    assert partitions > 2 * segments
+
+    # Caller minimums can exceed the learned initial cap, while caller maximums
+    # bound both initial and late probing after deletions.
+    minimum, partitions = search(
+        nearest={**nearest, "k": small_k, "minimum_nprobes": 8}
+    )
+    assert len(minimum) == small_k
+    assert partitions == 8 * segments
+    bounded, partitions = search(nearest={**nearest, "maximum_nprobes": 2})
+    assert len(bounded) == min(k, 32 * segments)
+    assert partitions == 2 * segments
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        search(nearest=nearest)
+    with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+        search(nearest={**nearest, "maximum_nprobes": 2})
+    fixed, partitions = search(nearest={**nearest, "nprobes": 2})
+    assert len(fixed) == min(k, 32 * segments)
+    assert partitions == 2 * segments
+
+
+@pytest.mark.parametrize(
+    "index_type,index_options,dtype,refine_factor",
+    [
+        ("IVF_FLAT", {}, np.float32, None),
+        ("IVF_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, None),
+        ("IVF_SQ", {}, np.float32, None),
+        ("IVF_RQ", {"num_bits": 5}, np.float32, None),
+        ("IVF_HNSW_FLAT", {}, np.float32, None),
+        ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, None),
+        ("IVF_HNSW_SQ", {}, np.float32, None),
+        ("IVF_FLAT", {}, np.float16, None),
+        ("IVF_FLAT", {}, np.float64, None),
+        ("IVF_FLAT", {}, np.float32, 2),
+        ("IVF_RQ", {"num_bits": 5}, np.float32, 2),
+        ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, 2),
+    ],
+)
+@pytest.mark.parametrize("segments", [1, 2])
+def test_auto_probe_index_types(
+    tmp_path, monkeypatch, index_type, index_options, dtype, refine_factor, segments
+):
+    centroids = 4 * np.eye(16, dtype=np.float32)
+    vectors = np.tile(np.repeat(centroids, 16, axis=0), (segments, 1))
+    vectors *= np.tile(np.linspace(1, 1.1875, 16, dtype=np.float32), 16 * segments)[
+        :, None
+    ]
+    vectors += (
+        np.random.default_rng(2254).normal(0, 0.0001, vectors.shape).astype(np.float32)
+    )
+    vectors = vectors.astype(dtype)
+    table = pa.table(
+        {
+            "vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 16),
+            "id": pa.array(np.arange(len(vectors))),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path / "ds.lance", max_rows_per_file=64)
+    assert dataset.schema.field("vector").type.value_type == pa.from_numpy_dtype(dtype)
+    if "PQ" in index_type:
+        # Keep this routing regression independent of stochastic PQ training.
+        codewords = np.arange(16, dtype=np.float32) * 0.05
+        index_options = {
+            **index_options,
+            "pq_codebook": np.tile(codewords[None, :, None], (16, 1, 1)),
+        }
+    fragments = [fragment.fragment_id for fragment in dataset.get_fragments()]
+    index_segments = _build_segments(
+        dataset,
+        "vector",
+        index_type,
+        [fragments[start : start + 4] for start in range(0, len(fragments), 4)],
+        metric="l2",
+        num_partitions=16,
+        ivf_centroids=centroids,
+        max_iters=2,
+        **index_options,
+    )
+    dataset = dataset.commit_existing_index_segments(
+        "vector_idx", "vector", index_segments
+    )
+    assert dataset.stats.index_stats("vector_idx")["num_segments"] == segments
+    query = centroids[0] * 1.03
+    nearest = {
+        "column": "vector",
+        "q": query,
+        "k": 10,
+        "metric": "l2",
+        "refine_factor": refine_factor,
+    }
+    expected = set(np.argsort(np.sum((vectors - query) ** 2, axis=1))[:10].tolist())
+
+    def search(nearest, **options):
+        captured = []
+        result = dataset.scanner(
+            columns=["id"],
+            nearest=nearest,
+            scan_stats_callback=captured.append,
+            **options,
+        ).to_table()
+        return set(result["id"].to_pylist()), captured[0].all_counts[
+            "partitions_searched"
+        ]
+
+    default_ids, _ = search(nearest)
+    assert len(default_ids & expected) / 10 >= 0.5
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "0")
+    monkeypatch.setenv("LANCE_AUTO_MIN_INITIAL_NPROBES", "2")
+    monkeypatch.setenv("LANCE_AUTO_MAX_INITIAL_NPROBES", "2")
+    auto_ids, partitions = search(nearest)
+    fixed_ids, fixed_partitions = search({**nearest, "nprobes": 2})
+    assert auto_ids == fixed_ids
+    assert len(auto_ids & expected) / 10 >= 0.5
+    assert partitions == fixed_partitions == 2 * segments
+
+    filtered_ids, partitions = search(nearest, filter="id % 256 >= 224", prefilter=True)
+    assert len(filtered_ids) == 10
+    assert all(row_id % 256 >= 224 for row_id in filtered_ids)
+    assert partitions > 2 * segments
+
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+    for k in (10, 10_000, 100_000):
+        with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+            search({**nearest, "k": k})
+    # Explicit budgets still bypass Auto's overrides for every index type.
+    assert search({**nearest, "nprobes": 2}) == (fixed_ids, fixed_partitions)
 
 
 def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
@@ -1514,7 +1735,7 @@ def test_create_ivf_rq_mostly_null():
     assert result.num_rows == 10
 
 
-def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
+def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch):
     rng = np.random.default_rng(42)
     query = rng.random((5, 128))
     results = indexed_multivec_dataset.scanner(
@@ -1557,6 +1778,20 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
             results["_distance"][i].as_py() * 2
             == doubled_results["_distance"][i].as_py()
         )
+
+    # Multivector routing uses Auto's configuration, including with refinement.
+    with monkeypatch.context() as overrides:
+        overrides.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+        for refine_factor in (None, 2):
+            with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+                indexed_multivec_dataset.to_table(
+                    nearest={
+                        "column": "vector",
+                        "q": query,
+                        "k": 100,
+                        "refine_factor": refine_factor,
+                    }
+                )
 
     # query with a vector that dim not match
     query = rng.random(256)
@@ -2700,6 +2935,170 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
         prefilter=True,
     )
     assert len(res) == 10
+
+
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
+@pytest.mark.parametrize(
+    "effort,probes,bounded_probes",
+    [
+        (0, 1, (1, 1)),
+        (0.25, 2, (2, 2)),
+        (0.5, 4, (2, 4)),
+        (0.75, 8, (2, 6)),
+        (1, 16, (2, 8)),
+    ],
+)
+def test_vector_search_effort(
+    tmp_path, monkeypatch, metric, index_type, effort, probes, bounded_probes
+):
+    centroids = np.eye(16, dtype=np.float32)
+    vectors = np.repeat(centroids, 16, axis=0)
+    vectors += (
+        np.random.default_rng(2254).normal(0, 0.001, vectors.shape).astype("float32")
+    )
+    table = vec_to_table(vectors).append_column("id", pa.array(np.arange(len(vectors))))
+    table = table.append_column("text", pa.array(["match"] * len(vectors)))
+    ds = lance.write_dataset(table, tmp_path / "effort.lance", max_rows_per_file=32)
+    ds.create_index(
+        "vector",
+        index_type,
+        metric=metric,
+        num_partitions=16,
+        ivf_centroids=centroids,
+        **({"num_bits": 5} if index_type == "IVF_RQ" else {}),
+    )
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "0")
+    monkeypatch.setenv("LANCE_AUTO_MIN_INITIAL_NPROBES", "4")
+    monkeypatch.setenv("LANCE_AUTO_MAX_INITIAL_NPROBES", "4")
+    nearest = {"column": "vector", "q": centroids[0], "k": 8, "metric": metric}
+    captured = []
+    actual = ds.scanner(
+        columns=["id"],
+        nearest={**nearest, "search_effort": effort},
+        scan_stats_callback=captured.append,
+    ).to_table()
+    assert captured[0].all_counts["partitions_searched"] == probes
+    captured.clear()
+    overridden = ds.scanner(
+        columns=["id"],
+        nearest={**nearest, "search_effort": effort, "nprobes": 3},
+        scan_stats_callback=captured.append,
+    ).to_table()
+    assert overridden == actual
+    assert captured[0].all_counts["partitions_searched"] == probes
+    exact = ds.to_table(columns=["id"], nearest={**nearest, "use_index": False})
+    exact_ids = set(exact["id"].to_pylist())
+    assert len(set(actual["id"].to_pylist()) & exact_ids) / 8 >= 0.5
+    if effort == 0.5:
+        assert actual == ds.to_table(columns=["id"], nearest=nearest)
+        assert actual == ds.to_table(
+            columns=["id"], nearest={**nearest, "search_effort": None}
+        )
+    if effort == 1:
+        assert actual == ds.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
+    # Batch queries use the same effort on every per-query search.
+    batch_stats = []
+    batch = ds.scanner(
+        columns=["id"],
+        nearest={
+            **nearest,
+            "q": [centroids[0], centroids[0]],
+            "search_effort": effort,
+            "nprobes": 3,
+        },
+        scan_stats_callback=batch_stats.append,
+    ).to_table()
+    assert batch["id"].to_pylist() == actual["id"].to_pylist() * 2
+    assert batch_stats[0].all_counts["partitions_searched"] == probes * 2
+    if metric == "l2" and index_type == "IVF_FLAT":
+        captured.clear()
+        ds.create_scalar_index("text", "INVERTED")
+        query_filter = VectorSearchQuery(**nearest, search_effort=effort, nprobes=3)
+        filtered = ds.scanner(
+            columns=["id"],
+            filter=query_filter,
+            full_text_query=MatchQuery("match", column="text"),
+            prefilter=True,
+            scan_stats_callback=captured.append,
+        ).to_table()
+        assert sorted(filtered["id"].to_pylist()) == sorted(actual["id"].to_pylist())
+        # The shared counter also includes the inverted index's one partition.
+        assert captured[0].all_counts["partitions_searched"] == probes + 1
+    if effort == 0:
+        captured.clear()
+        filtered = ds.scanner(
+            columns=["id"],
+            nearest={**nearest, "search_effort": effort},
+            filter="id >= 240",
+            prefilter=True,
+            scan_stats_callback=captured.append,
+        ).to_table()
+        assert len(filtered) == 8
+        assert min(filtered["id"].to_pylist()) >= 240
+        assert captured[0].all_counts["partitions_searched"] > 1
+    for maximum, expected_probes in zip((2, 8), bounded_probes):
+        captured.clear()
+        bounded = ds.scanner(
+            columns=["id"],
+            nearest={**nearest, "search_effort": effort, "maximum_nprobes": maximum},
+            scan_stats_callback=captured.append,
+        ).to_table()
+        assert captured[0].all_counts["partitions_searched"] == expected_probes
+        assert len(set(bounded["id"].to_pylist()) & exact_ids) / 8 >= 0.5
+        if effort == 0.5:
+            assert bounded == ds.to_table(
+                columns=["id"], nearest={**nearest, "maximum_nprobes": maximum}
+            )
+
+
+@pytest.mark.parametrize(
+    "effort", [-0.1, 1.1, float("nan"), float("inf"), -float("inf")]
+)
+def test_vector_search_effort_invalid(indexed_dataset, effort):
+    with pytest.raises(ValueError, match="search_effort must be finite and in"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.ones(128),
+                "k": 10,
+                "search_effort": effort,
+            }
+        )
+    with pytest.raises(ValueError, match="search_effort must be finite and in"):
+        indexed_dataset.scanner(
+            filter=VectorSearchQuery(
+                "vector",
+                np.ones(128),
+                k=10,
+                search_effort=effort,
+            )
+        )
+
+
+@pytest.mark.parametrize("effort", [None, 0, 0.25, 0.5, 0.75, 1])
+def test_vector_search_effort_nprobes_priority(indexed_dataset, effort):
+    nearest = {
+        "column": "vector",
+        "q": np.ones(128),
+        "k": 10,
+        "nprobes": 2,
+        "search_effort": effort,
+    }
+    plan = indexed_dataset.scanner(nearest=nearest).explain_plan()
+    minimum, maximum = (2, "Some(2)") if effort is None else (1, "None")
+    assert f"minimum_nprobes={minimum}" in plan
+    assert f"maximum_nprobes={maximum}" in plan
+    if effort is not None:
+        # An ignored fixed-probe value must not contribute validation errors.
+        plan = indexed_dataset.scanner(nearest={**nearest, "nprobes": 0}).explain_plan()
+        assert "minimum_nprobes=1" in plan
+        assert "maximum_nprobes=None" in plan
+    plan = indexed_dataset.scanner(
+        nearest={**nearest, "minimum_nprobes": 3, "maximum_nprobes": 3}
+    ).explain_plan()
+    assert "minimum_nprobes=3" in plan
+    assert "maximum_nprobes=Some(3)" in plan
 
 
 def test_vector_index_with_nprobes(indexed_dataset):

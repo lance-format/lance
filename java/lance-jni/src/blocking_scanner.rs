@@ -500,6 +500,11 @@ pub(crate) fn build_scanner_with_options<'a>(
             scanner.maximum_nprobes(maximum_nprobes);
         }
 
+        let search_effort = env
+            .call_method(&java_obj, "getSearchEffort", "()D", &[])?
+            .d()?;
+        scanner.search_effort(search_effort)?;
+
         if let Some(ef) = env.get_optional_usize_from_method(&java_obj, "getEf")? {
             scanner.ef(ef);
         }

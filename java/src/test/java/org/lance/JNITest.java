@@ -26,6 +26,8 @@ import org.lance.ipc.Query;
 import org.lance.test.JniTestHelper;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Arrays;
 import java.util.Optional;
@@ -54,6 +56,8 @@ public class JNITest {
     Query defaultQuery =
         new Query.Builder().setColumn("column").setKey(new float[] {1.0f, 2.0f, 3.0f}).build();
     assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
+    assertEquals(0.5, defaultQuery.getSearchEffort());
+    assertEquals(Optional.empty(), defaultQuery.getSearchEffortOption());
 
     Query nprobesQuery =
         new Query.Builder()
@@ -78,6 +82,57 @@ public class JNITest {
                 .setQueryParallelism(-1)
                 .setApproxMode(ApproxMode.ACCURATE)
                 .build()));
+  }
+
+  @ParameterizedTest
+  @ValueSource(doubles = {0.0, 0.25, 0.5, 0.75, 1.0})
+  public void testSearchEffort(double effort) {
+    Query query =
+        new Query.Builder()
+            .setColumn("vector")
+            .setKey(new float[] {1, 2})
+            .setSearchEffort(effort)
+            .build();
+    assertEquals(effort, query.getSearchEffort());
+    assertEquals(Optional.of(effort), query.getSearchEffortOption());
+    JniTestHelper.parseQuery(Optional.of(query));
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      doubles = {-0.1, 1.1, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY})
+  public void testInvalidSearchEffort(double effort) {
+    Query query =
+        new Query.Builder()
+            .setColumn("vector")
+            .setKey(new float[] {1, 2})
+            .setSearchEffort(effort)
+            .build();
+    assertThrows(
+        IllegalArgumentException.class, () -> JniTestHelper.parseQuery(Optional.of(query)));
+  }
+
+  @ParameterizedTest
+  @ValueSource(doubles = {0.0, 0.25, 0.5, 0.75, 1.0})
+  public void testSearchEffortNprobesPriority(double effort) {
+    Query.Builder builder =
+        new Query.Builder()
+            .setColumn("vector")
+            .setKey(new float[] {1, 2})
+            .setNprobes(2)
+            .setSearchEffort(effort);
+    Query query = builder.build();
+    assertEquals(1, query.getMinimumNprobes());
+    assertEquals(Optional.empty(), query.getMaximumNprobes());
+    JniTestHelper.parseQuery(Optional.of(query));
+    query = builder.setNprobes(0).build();
+    assertEquals(1, query.getMinimumNprobes());
+    assertEquals(Optional.empty(), query.getMaximumNprobes());
+    JniTestHelper.parseQuery(Optional.of(query));
+    query = builder.setMinimumNprobes(3).setMaximumNprobes(3).build();
+    assertEquals(3, query.getMinimumNprobes());
+    assertEquals(Optional.of(3), query.getMaximumNprobes());
+    JniTestHelper.parseQuery(Optional.of(query));
   }
 
   @Test

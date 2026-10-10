@@ -28,6 +28,7 @@ public class Query {
   private final int k;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
+  private final Optional<Double> searchEffort;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
   private final Optional<DistanceType> distanceType;
@@ -47,16 +48,17 @@ public class Query {
           "Batch query buffer length must be a positive multiple of the query vector dimension");
     }
     this.queryVectorDim = builder.queryVectorDim;
+    Optional<Integer> fixedNprobes =
+        builder.searchEffort.isPresent() ? Optional.empty() : builder.nprobes;
+    this.minimumNprobes = builder.minimumNprobes.orElse(fixedNprobes.orElse(1));
+    this.maximumNprobes = builder.maximumNprobes.or(() -> fixedNprobes);
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
+    Preconditions.checkArgument(minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
-        builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
-    Preconditions.checkArgument(
-        !builder.maximumNprobes.isPresent()
-            || builder.maximumNprobes.get() >= builder.minimumNprobes,
+        !maximumNprobes.isPresent() || maximumNprobes.get() >= minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
-    this.minimumNprobes = builder.minimumNprobes;
-    this.maximumNprobes = builder.maximumNprobes;
+    this.searchEffort = builder.searchEffort;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
     this.distanceType = builder.distanceType;
@@ -93,6 +95,21 @@ public class Query {
 
   public Optional<Integer> getMaximumNprobes() {
     return maximumNprobes;
+  }
+
+  /** Returns the resolved initial IVF search effort; absent effort resolves to 0.5. */
+  public double getSearchEffort() {
+    return searchEffort.orElse(0.5);
+  }
+
+  /**
+   * Returns the configured effort, or empty when it was omitted.
+   *
+   * <p>An explicit effort, including 0.5, ignores fixed nprobes. For example, {@code new
+   * Query.Builder().setColumn("vector").setKey(vector).build() .getSearchEffortOption()} is empty.
+   */
+  public Optional<Double> getSearchEffortOption() {
+    return searchEffort;
   }
 
   public Optional<Integer> getEf() {
@@ -136,6 +153,7 @@ public class Query {
         .add("k", k)
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
+        .add("searchEffort", searchEffort.orElse(null))
         .add("ef", ef.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
@@ -150,8 +168,10 @@ public class Query {
     private float[] key;
     private int queryVectorDim = 0;
     private int k = 10;
-    private int minimumNprobes = 1;
+    private Optional<Integer> nprobes = Optional.empty();
+    private Optional<Integer> minimumNprobes = Optional.empty();
     private Optional<Integer> maximumNprobes = Optional.empty();
+    private Optional<Double> searchEffort = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
@@ -243,14 +263,14 @@ public class Query {
     /**
      * Sets the number of probes to load and search.
      *
-     * <p>This sets both the minimum and maximum number of probes to the same value.
+     * <p>Used only when search effort is absent. Explicit minimum and maximum bounds override the
+     * corresponding fixed-count bounds, regardless of setter order.
      *
      * @param nprobes The number of probes.
      * @return The Builder instance for method chaining.
      */
     public Builder setNprobes(int nprobes) {
-      this.minimumNprobes = nprobes;
-      this.maximumNprobes = Optional.of(nprobes);
+      this.nprobes = Optional.of(nprobes);
       return this;
     }
 
@@ -264,24 +284,45 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setMinimumNprobes(int minimumNprobes) {
-      this.minimumNprobes = minimumNprobes;
+      this.minimumNprobes = Optional.of(minimumNprobes);
       return this;
     }
 
     /**
      * Sets the maximum number of partitions to search.
      *
-     * <p>These partitions will only be loaded and searched if we have not found the desired number
-     * of results after searching the minimum number of partitions. Increasing this number can avoid
-     * false negatives on queries with a highly selective prefilter. This setting does not affect
-     * the recall of the query and will only affect the latency if the prefilter is highly
-     * selective.
+     * <p>This bounds both the initial budget and later probing to find enough candidates. An unset
+     * maximum allows all available partitions. With {@link #setSearchEffort(double)} set to 1, all
+     * partitions up to this limit are included in the initial search. At lower efforts, additional
+     * partitions may be searched if the initial budget does not find enough candidates.
      *
      * @param maximumNprobes The maximum number of partitions to search.
      * @return The Builder instance for method chaining.
      */
     public Builder setMaximumNprobes(int maximumNprobes) {
       this.maximumNprobes = Optional.of(maximumNprobes);
+      return this;
+    }
+
+    /**
+     * Sets the initial IVF search effort, a finite value in [0, 1].
+     *
+     * <p>Absent effort resolves to 0.5 and preserves Auto. Zero starts at the caller minimum (at
+     * least one available partition); one starts at all available partitions, subject to the caller
+     * maximum. Intermediate values interpolate geometrically. Later expansion to find enough
+     * candidates is unchanged. This is independent of approximation mode, HNSW ef and refinement,
+     * and is not a recall guarantee. Any explicit effort, including 0.5, ignores fixed nprobes
+     * regardless of setter order. Explicit minimum and maximum bounds remain effective. Effort
+     * validation occurs in the Rust core when the query is executed.
+     *
+     * <p>Example: {@code new
+     * Query.Builder().setColumn("vector").setKey(vector).setSearchEffort(0.75).build()}.
+     *
+     * @param searchEffort The initial partition search effort.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setSearchEffort(double searchEffort) {
+      this.searchEffort = Optional.of(searchEffort);
       return this;
     }
 

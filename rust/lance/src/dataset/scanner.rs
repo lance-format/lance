@@ -82,7 +82,7 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, ProbeParams, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_select::IndexExprResult;
@@ -1185,6 +1185,7 @@ pub struct Scanner {
     ordering: Option<Vec<ColumnOrdering>>,
 
     nearest: Option<Query>,
+    probe_params: ProbeParams,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -1679,6 +1680,7 @@ impl Scanner {
             offset: None,
             ordering: None,
             nearest: None,
+            probe_params: ProbeParams::default(),
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -2412,6 +2414,7 @@ impl Scanner {
             }
         };
 
+        self.probe_params = ProbeParams::default();
         self.nearest = Some(Query {
             column: column.to_string(),
             key,
@@ -2420,6 +2423,7 @@ impl Scanner {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: None,
@@ -2453,28 +2457,67 @@ impl Scanner {
 
     /// Configures how many partitions are searched in the vector index.
     ///
-    /// This sets both [`Self::minimum_nprobes`] and [`Self::maximum_nprobes`]
-    /// to the same value. With neither setter called, adaptive defaults apply.
+    /// Used only when [`Self::search_effort`] has not been set. Explicit minimum
+    /// and maximum probe bounds override the corresponding fixed-count bounds.
+    /// With none of these options set, adaptive defaults apply.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
-            q.maximum_nprobes = Some(n);
+            self.probe_params.nprobes = Some(n);
+            (q.minimum_nprobes, q.maximum_nprobes, q.search_effort) = self.probe_params.resolve();
         } else {
             log::warn!("nprobes is not set because nearest has not been called yet");
         }
         self
     }
 
+    /// Set the initial IVF search effort to a finite value in [0, 1].
+    ///
+    /// Unset effort resolves to 0.5 and preserves Auto probing. Smaller values reduce the
+    /// initial partition budget toward [`Self::minimum_nprobes`]; larger values
+    /// increase it toward all available partitions, subject to
+    /// [`Self::maximum_nprobes`]. At 0, at least one available partition is
+    /// searched. Later expansion to find enough candidates remains unchanged.
+    /// This is independent of refinement, HNSW ef and approximation mode, and
+    /// is not a recall guarantee. Setting any effort, including 0.5, ignores
+    /// [`Self::nprobes`] regardless of setter order. Explicit minimum and maximum
+    /// bounds remain effective. Call [`Self::nearest`] first.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset, vector: &Float32Array) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("vector", vector, 10)?.search_effort(0.75)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn search_effort(&mut self, effort: f64) -> Result<&mut Self> {
+        let query = self.nearest.as_mut().ok_or_else(|| {
+            Error::invalid_input("search_effort requires nearest to be called first")
+        })?;
+        let previous = self.probe_params;
+        self.probe_params.search_effort = Some(effort);
+        (
+            query.minimum_nprobes,
+            query.maximum_nprobes,
+            query.search_effort,
+        ) = self.probe_params.resolve();
+        if let Err(error) = query.validate_search_effort() {
+            self.probe_params = previous;
+            (
+                query.minimum_nprobes,
+                query.maximum_nprobes,
+                query.search_effort,
+            ) = previous.resolve();
+            return Err(error);
+        }
+        Ok(self)
+    }
+
     /// Configures how many partitions are searched in the vector index.
     #[deprecated(note = "Use nprobes instead")]
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
-        if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
-            q.maximum_nprobes = Some(n);
-        } else {
-            log::warn!("nprobes is not set because nearest has not been called yet");
-        }
-        self
+        self.nprobes(n)
     }
 
     /// Configures the minimum number of partitions to search in the vector index.
@@ -2486,7 +2529,8 @@ impl Scanner {
     /// The default value is 1.
     pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
+            self.probe_params.minimum_nprobes = Some(n);
+            (q.minimum_nprobes, q.maximum_nprobes, q.search_effort) = self.probe_params.resolve();
         } else {
             log::warn!("minimum_nprobes is not set because nearest has not been called yet");
         }
@@ -2495,18 +2539,16 @@ impl Scanner {
 
     /// Configures the maximum number of partitions to search in the vector index.
     ///
-    /// These partitions will only be searched if we have not found `k` results after
-    /// searching the minimum number of partitions.  Setting this to None (the default)
-    /// will search all partitions if needed.
-    ///
-    /// This setting only takes effect when a prefilter is in place.  In that case we
-    /// can spend more effort to try and find results when the filter is highly selective.
-    ///
-    /// If there is no prefilter, or the results are not highly selective, this value will
-    /// have no effect.
+    /// This bounds both the initial budget and later probing per index segment,
+    /// without disabling Auto probing. An unset maximum (the default) allows all
+    /// available partitions.
+    /// With [`Self::search_effort`] set to 1, all partitions up to this limit are
+    /// included in the initial search. At lower efforts, additional partitions
+    /// may be searched if the initial budget does not find enough candidates.
     pub fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.maximum_nprobes = Some(n);
+            self.probe_params.maximum_nprobes = Some(n);
+            (q.minimum_nprobes, q.maximum_nprobes, q.search_effort) = self.probe_params.resolve();
         } else {
             log::warn!("maximum_nprobes is not set because nearest has not been called yet");
         }
@@ -3305,6 +3347,12 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if let Some(query) = &self.nearest {
+            query.validate_search_effort()?;
+        }
+        if let Some(QueryFilter::Vector(query)) = &self.filter.query_filter {
+            query.validate_search_effort()?;
+        }
         if self.batch_readahead == 0 {
             return Err(Error::invalid_input_source(
                 "batch_readahead must be greater than 0, got 0".into(),
@@ -12257,6 +12305,73 @@ mod test {
             result.is_err(),
             "refine(0) must error rather than fall through to an empty batch result"
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_effort_validation_after_probe_setters() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let mut scan = test_ds.dataset.scan();
+        let error = scan.search_effort(0.75).err().unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("requires nearest"));
+        let (queries, _) = batch_knn_two_queries();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.search_effort(0.75).unwrap();
+        let error = scan.search_effort(f64::NAN).err().unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("must be finite"));
+        assert_eq!(scan.nearest.as_ref().unwrap().search_effort, 0.75);
+        scan.nprobes(2);
+        scan.validate_options().unwrap();
+        assert_eq!(scan.nearest.as_ref().unwrap().minimum_nprobes, 1);
+        assert_eq!(scan.nearest.as_ref().unwrap().maximum_nprobes, None);
+        scan.search_effort(0.5).unwrap();
+        scan.validate_options().unwrap();
+        scan.search_effort(1.0).unwrap();
+        assert_eq!(scan.nearest.as_ref().unwrap().search_effort, 1.0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_search_effort_nprobes_precedence(
+        #[values(0.0, 0.25, 0.5, 0.75, 1.0)] effort: f64,
+        #[values(false, true)] effort_first: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let (queries, _) = batch_knn_two_queries();
+        let mut scan = test_ds.dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        assert_eq!(scan.probe_params.search_effort, None);
+        assert_eq!(scan.nearest.as_ref().unwrap().search_effort, 0.5);
+        if effort_first {
+            scan.search_effort(effort).unwrap().nprobes(2);
+        } else {
+            scan.nprobes(2);
+            assert_eq!(scan.nearest.as_ref().unwrap().maximum_nprobes, Some(2));
+            scan.search_effort(effort).unwrap();
+        }
+        let mut reference = test_ds.dataset.scan();
+        reference
+            .nearest("vec", &queries, 2)
+            .unwrap()
+            .search_effort(effort)
+            .unwrap();
+        assert_eq!(
+            scan.try_into_batch().await.unwrap(),
+            reference.try_into_batch().await.unwrap()
+        );
+        assert_eq!(scan.nearest.as_ref().unwrap().minimum_nprobes, 1);
+        assert_eq!(scan.nearest.as_ref().unwrap().maximum_nprobes, None);
+        // Bounds supplied by the caller remain effective, even when equal.
+        scan.minimum_nprobes(2).maximum_nprobes(2).nprobes(9);
+        let query = scan.nearest.as_ref().unwrap();
+        assert_eq!(query.minimum_nprobes, 2);
+        assert_eq!(query.maximum_nprobes, Some(2));
+        assert_eq!(query.search_effort, effort);
     }
 
     /// Without pinned nprobes the shared-scan fast path is not equivalent to
