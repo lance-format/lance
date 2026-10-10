@@ -356,6 +356,35 @@ pub(super) async fn build_scalar_index(
     preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
+    // A JSON-wrapped BTREE index cannot yet carry the row-address-domain
+    // migration through its own metadata: `JsonIndexDetails` has no field for
+    // the target's persisted version (`JsonIndexPlugin::load_index` stands
+    // in with the target plugin's current max version instead), and the
+    // generic domain-safety checks that protect a plain BTree segment during
+    // merge/compaction (`IndexMetadata::results_are_row_addrs`, append.rs's
+    // `legacy_domain_mismatch`) key off the index's own type_url, which a
+    // JSON wrapper's details never match. A wrapped BTREE segment that
+    // genuinely stored row addresses on a stable-row-id dataset would be
+    // invisible to all of that machinery, which assumes row-id domain by
+    // construction. Reject it outright until the wrapper preserves the
+    // target's own domain through its own metadata (lance-format/lance#9721);
+    // a plain (non-wrapped) BTREE index is unaffected.
+    if params.index_type.eq_ignore_ascii_case("json")
+        && dataset.manifest.uses_stable_row_ids()
+        && params
+            .params
+            .as_deref()
+            .and_then(lance_index::scalar::json::json_wrapped_target_type)
+            .is_some_and(|target| target.eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str()))
+    {
+        return Err(Error::not_supported(
+            "a JSON-wrapped BTREE index is not yet supported on a dataset with stable row ids \
+             enabled -- create a plain BTREE index on this column instead, or disable stable \
+             row ids for this dataset"
+                .to_string(),
+        ));
+    }
+
     let inverted_params = (params.index_type.eq_ignore_ascii_case("inverted")
         || params.index_type.eq_ignore_ascii_case("fts"))
     .then(|| serde_json::from_str::<InvertedIndexParams>(params.params.as_deref().unwrap_or("{}")))
@@ -440,7 +469,7 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
-    let created_index = trainer
+    let mut created_index = trainer
         .train_index(
             training_data,
             &index_store,
@@ -449,6 +478,24 @@ pub(super) async fn build_scalar_index(
             progress,
         )
         .await?;
+
+    // BTree always trains on physical row addresses -- the plugin's
+    // TrainingCriteria has no per-dataset awareness to vary that -- but a
+    // row address and a row id are the same value on a dataset that does
+    // not use stable row ids, so the trained page data is identical either
+    // way there. Label it with the pre-migration version in that case: an
+    // old build already understands it, so a user who never turns on
+    // stable row ids sees no forward-compatibility impact from the
+    // address-domain migration (see BTREE_ROW_ID_DOMAIN_VERSION). Only a
+    // stable-row-id dataset -- where the two domains genuinely diverge --
+    // needs the address-domain version this plugin actually trained.
+    if params
+        .index_type
+        .eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str())
+        && !dataset.manifest.uses_stable_row_ids()
+    {
+        created_index.index_version = lance_index::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION;
+    }
 
     Ok(created_index)
 }

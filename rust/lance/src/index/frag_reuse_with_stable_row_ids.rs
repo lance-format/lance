@@ -722,11 +722,13 @@ mod tests {
         ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
         None
     )]
-    #[case::generic_default_btree(IndexType::Scalar, ScalarIndexParams::default(), Some("BTree"))]
+    // BTree always stores row addresses now, so it applies the fragment
+    // reuse index like ZoneMap/Bitmap and is no longer rejected here.
+    #[case::generic_default_btree(IndexType::Scalar, ScalarIndexParams::default(), None)]
     #[case::typed_btree_with_zone_map_params(
         IndexType::BTree,
         ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
-        Some("BTree")
+        None
     )]
     #[case::typed_bitmap(IndexType::Bitmap, ScalarIndexParams::default(), Some("Bitmap"))]
     #[tokio::test]

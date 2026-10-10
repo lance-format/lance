@@ -103,6 +103,7 @@ pub(in crate::index) async fn merge_segments(
             dataset,
             &effective_old_frags,
             &deleted_old_frags,
+            false,
         )
         .await?
     };

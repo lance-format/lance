@@ -530,23 +530,25 @@ pub struct UpdateCriteria {
 
 /// Filter used when merging existing scalar-index rows during update.
 ///
-/// The caller must pick a filter mode that matches the row-id semantics of the
-/// dataset:
-/// - address-style row IDs: fragment filtering is valid
-/// - stable row IDs: use exact row-id membership instead
+/// When we are doing an update we have an opportunity (not a requirement) to
+/// prune fragments from the index.  This can happen because the fragment was
+/// deleted or because it was invalidated (the indexed column was modified).
+/// Pruning these rows can lead to a smaller, more efficient index.  However,
+/// we will always subtract these fragments from the result either way so this
+/// is only an optimization opportunity and not a correctness requirement.
+///
+/// Legacy indexes that store row IDs needed to use a less efficient RowAddrTreeMap
+/// for this approach.  As these indexes fade from support we can hopefully remove
+/// this branch.
 #[derive(Debug, Clone)]
 pub enum OldIndexDataFilter {
     /// Keeps track of which fragments are still valid and which are no longer valid.
-    ///
-    /// This is valid for address-style row IDs.
     Fragments {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
-    /// Keep old rows whose row IDs are in this exact allow-list.
-    ///
-    /// This is required for stable row IDs, where row IDs are opaque and
-    /// should not be interpreted as encoded row addresses.
+    /// Keep old rows whose identifier is in this exact allow-list, used for id-domain
+    /// indexes when stable row id is enabled.
     RowIds(RowAddrTreeMap),
 }
 
@@ -651,13 +653,6 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
 
     /// Returns true if this index reports matches as physical row addresses
     /// (`fragment_id << 32 | offset`) rather than row ids
-    ///
-    /// Address-domain indices (e.g. zone map, bloom filter) are built over the
-    /// `_rowaddr` column. On a dataset with stable row ids the address and
-    /// row-id domains diverge, so these results must be translated back to row
-    /// ids (via the per-fragment row-id sequences, known only at the dataset
-    /// layer) before they are combined with row-id results or handed to the
-    /// scan. The default (row-id domain) needs no translation.
     fn results_are_row_addresses(&self) -> bool {
         false
     }

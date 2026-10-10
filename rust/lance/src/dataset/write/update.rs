@@ -1671,11 +1671,12 @@ mod tests {
             .await
             .unwrap();
 
-        let scalar_params = ScalarIndexParams::default();
+        // Need to use a row-id-domain index (while we still have one)
+        let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
         dataset
             .create_index(
                 &["str"],
-                IndexType::Scalar,
+                IndexType::Bitmap,
                 Some("str_idx".to_string()),
                 &scalar_params,
                 true,
@@ -1764,6 +1765,7 @@ mod tests {
     #[rstest]
     #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i < 100", 100)]
     #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::btree(BuiltinIndexType::BTree, IndexType::BTree, "i", "i < 100", 100)]
     #[case::fm(
         BuiltinIndexType::Fm,
         IndexType::Fm,

@@ -70,7 +70,8 @@ pub(in crate::index) async fn merge_segments(
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+            .await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;

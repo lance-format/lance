@@ -351,6 +351,20 @@ class VenvExecutor:
             env=env,
         )
 
+    def _recent_stderr(self, max_lines: int = 200) -> str:
+        """Return the tail of the runner's captured stderr, if any.
+
+        A method running in the venv cannot use plain `print()` -- stdout is
+        the binary RPC channel back to this process -- but `print(...,
+        file=sys.stderr)` is safe, and this is what surfaces it.
+        """
+        try:
+            text = self._stderr_path.read_text()
+        except (OSError, AttributeError):
+            return ""
+        lines = [line for line in text.splitlines() if line.strip()]
+        return "\n".join(lines[-max_lines:])
+
     def _last_panic(self) -> str:
         """Pull the panic message from the runner's captured stderr, if any."""
         try:
@@ -433,6 +447,14 @@ class VenvExecutor:
 
         # Ensure subprocess is running
         self._ensure_subprocess()
+        # Marks the pickled snapshot sent below as executing inside the old
+        # venv, so a test's _running_in_old_venv read there is reliable
+        # regardless of what lance.__version__ happens to report (see the
+        # flag's docstring on UpgradeDowngradeTest). Reset right after on our
+        # own `obj` reference so a later bare call on the same object (the
+        # current build's own check_read/check_write in the upgrade/downgrade
+        # round trip) does not inherit it.
+        obj._running_in_old_venv = True
         try:
             # Send request: (obj, method_name, env_overrides)
             self._send_message((obj, method_name, env_overrides or {}))
@@ -449,6 +471,9 @@ class VenvExecutor:
                     f"{response['exception_type']}: {response['exception_msg']}\n"
                     f"\nTraceback from venv:\n{response['traceback']}"
                 )
+                stderr_tail = self._recent_stderr()
+                if stderr_tail:
+                    error_msg += f"\n\nRecent stderr from venv:\n{stderr_tail}"
                 raise RuntimeError(error_msg)
 
         except (BrokenPipeError, EOFError, struct.error) as e:
@@ -463,6 +488,9 @@ class VenvExecutor:
             panic = self._last_panic()
             detail = panic or f"subprocess communication failed: {e}"
             raise RuntimeError(f"Lance {self.version} (exit={returncode}): {detail}")
+
+        finally:
+            obj._running_in_old_venv = False
 
     def cleanup(self):
         """Remove the virtual environment directory and terminate subprocess."""

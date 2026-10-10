@@ -246,6 +246,20 @@ pub struct JsonIndexParameters {
     path: String,
 }
 
+/// The target index type named by a JSON index's own serialized parameters
+/// (the `params` field of the `ScalarIndexParams` that `JsonIndex::derive_index_params`
+/// returns -- not the target's own params). `None` if `params_json` doesn't parse as
+/// [`JsonIndexParameters`].
+///
+/// Exposed so callers that only have a `ScalarIndexParams` (not a live `JsonIndex`) can
+/// still tell what a JSON index wraps, e.g. to reject an unsafe wrapped combination before
+/// training -- see `build_scalar_index`'s JSON-wrapped-BTREE guard.
+pub fn json_wrapped_target_type(params_json: &str) -> Option<String> {
+    serde_json::from_str::<JsonIndexParameters>(params_json)
+        .ok()
+        .map(|parameters| parameters.target_index_type)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum JsonIndexTargetType {
     Boolean,
@@ -1251,6 +1265,21 @@ mod tests {
     }
 
     #[test]
+    fn test_json_wrapped_target_type() {
+        assert_eq!(
+            json_wrapped_target_type(r#"{"target_index_type":"btree","path":"x"}"#),
+            Some("btree".to_string())
+        );
+        // Case is preserved here; callers that care compare case-insensitively.
+        assert_eq!(
+            json_wrapped_target_type(r#"{"target_index_type":"BTREE","path":"x"}"#),
+            Some("BTREE".to_string())
+        );
+        assert_eq!(json_wrapped_target_type("not json"), None);
+        assert_eq!(json_wrapped_target_type(r#"{"path":"x"}"#), None);
+    }
+
+    #[test]
     fn test_json_query_parser_forwards_target_details() {
         let registry = IndexPluginRegistry::with_default_plugins();
         let plugin = registry.get_plugin_by_name("json").unwrap();
@@ -1540,7 +1569,7 @@ mod tests {
         (store, tmpdir)
     }
 
-    fn json_update_batch(json_docs: &[&str], row_ids: Vec<u64>) -> RecordBatch {
+    fn json_update_batch(json_docs: &[&str], row_addrs: Vec<u64>) -> RecordBatch {
         use arrow_array::{LargeBinaryArray, UInt64Array};
 
         let jsonb = json_docs
@@ -1549,7 +1578,7 @@ mod tests {
             .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         RecordBatch::try_new(
             schema,
@@ -1557,16 +1586,16 @@ mod tests {
                 Arc::new(LargeBinaryArray::from_iter_values(
                     jsonb.iter().map(Vec::as_slice),
                 )),
-                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt64Array::from(row_addrs)),
             ],
         )
         .unwrap()
     }
 
-    fn json_update_stream(json_docs: &[&str], row_ids: Vec<u64>) -> SendableRecordBatchStream {
+    fn json_update_stream(json_docs: &[&str], row_addrs: Vec<u64>) -> SendableRecordBatchStream {
         use futures::stream;
 
-        let batch = json_update_batch(json_docs, row_ids);
+        let batch = json_update_batch(json_docs, row_addrs);
         let schema = batch.schema();
         Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1857,7 +1886,9 @@ mod tests {
     #[case::equals_exact_float(SargableQuery::Equals(ScalarValue::Float64(Some(10.5))), vec![0])]
     #[case::range_covers_all(
         SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::Float64(Some(100.0)))),
-        vec![0, 1, 2]
+        // Row 2's address is fragment 1, offset 0 (`RowAddress::new_from_parts(1, 0)`),
+        // not the row index 2: `needs_row_addrs` test data is address-domain.
+        vec![0, 1, 1u64 << 32]
     )]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
@@ -1951,13 +1982,16 @@ mod tests {
             SearchResult::exact(RowAddrTreeMap::from_iter([1u64])),
             "IsNull"
         );
+        // Row 3's address is fragment 1, offset 1 (`RowAddress::new_from_parts(1, 1)`),
+        // not the row index 3: `needs_row_addrs` test data is address-domain.
+        let row3_addr = (1u64 << 32) | 1;
         assert_eq!(
             search(SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Float64(Some(0.0))),
                 Bound::Unbounded,
             ))
             .await,
-            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 3]))
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, row3_addr]))
                 .with_nulls(RowAddrTreeMap::from_iter([1u64])),
             "> 0"
         );
@@ -1967,13 +2001,14 @@ mod tests {
                 .with_nulls(RowAddrTreeMap::from_iter([1u64])),
             "= 40.1"
         );
+        let row2_addr = 1u64 << 32;
         assert_eq!(
             search(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Float64(Some(100.0))),
             ))
             .await,
-            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 2, 3]))
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, row2_addr, row3_addr]))
                 .with_nulls(RowAddrTreeMap::from_iter([1u64])),
             "< 100 (null is neither < 100 nor >= 100)"
         );

@@ -8803,6 +8803,17 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
+            // Compaction physically rewrites fragments, and on a
+            // stable-row-id dataset the "id" BTree index now stores row
+            // addresses, which the rewrite invalidates for the affected
+            // fragment (`test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
+            // The in-place patch that would otherwise write zero files falls
+            // back to a real rewrite there to keep the index's coverage
+            // consistent, matching ZoneMap/BloomFilter/FM's existing
+            // address-domain behavior.
+            let expect_rewrite =
+                stable_row_ids && matches!(concurrent_write, ConcurrentWrite::Compaction);
+
             let commit = CommitBuilder::new(Arc::new(other.clone()))
                 .with_max_retries(0)
                 .execute(prepared.transaction)
@@ -8821,17 +8832,25 @@ mod tests {
                 let (merged, stats) = job.execute_batches(vec![source]).await.unwrap();
                 assert_eq!(stats.num_attempts, 2);
                 assert_eq!(stats.num_updated_rows, 2);
-                assert_eq!(stats.num_files_written, 0);
+                assert_eq!(stats.num_files_written, if expect_rewrite { 1 } else { 0 });
                 merged.as_ref().clone()
             };
-            assert_eq!(merged.fragments().len(), other.fragments().len());
-            for (merged_fragment, current) in
-                merged.fragments().iter().zip(other.fragments().iter())
-            {
-                assert_eq!(merged_fragment.id, current.id);
-                assert_eq!(merged_fragment.files, current.files);
-                if !stable_row_ids {
-                    assert_eq!(merged_fragment, current);
+            if expect_rewrite {
+                // The address-domain "id" index can no longer cover the
+                // fragment the rewrite touched, so the patched rows land in
+                // a brand new fragment alongside `other`'s single compacted
+                // one instead of overwriting it in place.
+                assert_eq!(merged.fragments().len(), other.fragments().len() + 1);
+            } else {
+                assert_eq!(merged.fragments().len(), other.fragments().len());
+                for (merged_fragment, current) in
+                    merged.fragments().iter().zip(other.fragments().iter())
+                {
+                    assert_eq!(merged_fragment.id, current.id);
+                    assert_eq!(merged_fragment.files, current.files);
+                    if !stable_row_ids {
+                        assert_eq!(merged_fragment, current);
+                    }
                 }
             }
             let after = merged
@@ -8842,22 +8861,45 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
-            assert_eq!(
-                before.project(&[0, 1, 2]).unwrap(),
-                after.project(&[0, 1, 2]).unwrap()
-            );
+            // `before`'s row order is always original-id order (it was
+            // captured before any rewrite). `after`'s is too, except when
+            // `expect_rewrite` relocates the patched rows (ids 0 and 4) to a
+            // new trailing fragment -- so look rows up by id rather than
+            // assuming position, which degrades to position for every other
+            // case since id and position coincide here.
+            let after_row_for_id = |id: u32| -> usize {
+                let ids = after["id"].as_primitive::<UInt32Type>();
+                (0..ids.len()).find(|&i| ids.value(i) == id).unwrap()
+            };
+            if expect_rewrite {
+                for id in 0u32..6 {
+                    assert_eq!(
+                        before.project(&[0, 1, 2]).unwrap().slice(id as usize, 1),
+                        after
+                            .project(&[0, 1, 2])
+                            .unwrap()
+                            .slice(after_row_for_id(id), 1),
+                        "row id {id} mismatched"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    before.project(&[0, 1, 2]).unwrap(),
+                    after.project(&[0, 1, 2]).unwrap()
+                );
+            }
             if stable_row_ids {
-                for row in 0..6 {
+                for id in 0u32..6 {
                     assert_eq!(
                         after[ROW_LAST_UPDATED_AT_VERSION]
                             .as_primitive::<UInt64Type>()
-                            .value(row),
-                        if [0, 4].contains(&row) {
+                            .value(after_row_for_id(id)),
+                        if [0, 4].contains(&id) {
                             merged.version().version
                         } else {
                             before[ROW_LAST_UPDATED_AT_VERSION]
                                 .as_primitive::<UInt64Type>()
-                                .value(row)
+                                .value(id as usize)
                         }
                     );
                 }
@@ -8873,9 +8915,22 @@ mod tests {
             } else {
                 vec!["id_idx"]
             };
+            // The address-domain "id" index cannot cover the new fragment a
+            // rewrite creates -- its stored addresses describe the fragment
+            // it was built against, not whatever replaced part of it (see
+            // `test_addr_domain_index_does_not_cover_rewritten_update_fragment`).
+            // Nor does it keep partial credit for the untouched remainder of
+            // the rewritten fragment: the whole fragment drops out of its
+            // coverage, leaving it empty here (only one fragment existed).
+            let empty_bitmap = RoaringBitmap::new();
             for name in expected_indices {
                 let index = indices.iter().find(|index| index.name == name).unwrap();
-                assert_eq!(index.fragment_bitmap.as_ref(), Some(&live_fragments));
+                let expected_bitmap = if expect_rewrite && name == "id_idx" {
+                    &empty_bitmap
+                } else {
+                    &live_fragments
+                };
+                assert_eq!(index.fragment_bitmap.as_ref(), Some(expected_bitmap));
             }
             merged.validate().await.unwrap();
         }

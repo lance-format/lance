@@ -736,9 +736,9 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
-    use lance_core::ROW_ID;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
+    use lance_core::{ROW_ADDR, ROW_ID};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_select::{RowAddrTreeMap, RowSetOps};
 
@@ -1037,14 +1037,14 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
-                0,
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1103,14 +1103,14 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
-                0,
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1122,7 +1122,7 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::step_custom::<Int32Type>(4096 * 100, 1),
             )
-            .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
+            .col(ROW_ADDR, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = TempDir::default();
@@ -1139,7 +1139,7 @@ mod tests {
             .load_index(
                 updated_index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
-                0,
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1191,21 +1191,24 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .col(
+                ROW_ADDR,
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
             .col(
@@ -1213,14 +1216,14 @@ mod tests {
                 array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
             )
             .col(
-                ROW_ID,
+                ROW_ADDR,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_index(&index_store, data, Some(4)).await;
@@ -1228,7 +1231,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
-                0,
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1431,7 +1434,7 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data: RecordBatch = gen_batch()
             .col(VALUE_COLUMN_NAME, array::rand_type(&data_type))
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096 * 3))
             .unwrap();
 
@@ -1471,7 +1474,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
-                0,
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1502,7 +1505,7 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096));
         assert_eq!(
             batch.as_ref().unwrap()[VALUE_COLUMN_NAME].null_count(),
@@ -1511,7 +1514,7 @@ mod tests {
         let batches = vec![batch];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
@@ -1530,7 +1533,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
-                0,
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
