@@ -2995,12 +2995,18 @@ mod tests {
             use arrow::record_batch::{RecordBatch, RecordBatchIterator};
             use lance::dataset::{Dataset, WriteMode, WriteParams};
             use lance_namespace::LanceNamespace;
+            use lance_namespace::models::CreateNamespaceRequest;
 
             let fixture = RestServerFixture::new().await;
             let namespace = Arc::new(fixture.namespace.clone()) as Arc<dyn LanceNamespace>;
 
             // Use child namespace instead of root
             let table_id = vec!["test_ns".to_string(), "test_table".to_string()];
+
+            // Writing into a namespace that does not exist is rejected, so create it first.
+            let mut create_ns_req = CreateNamespaceRequest::new();
+            create_ns_req.id = Some(vec!["test_ns".to_string()]);
+            namespace.create_namespace(create_ns_req).await.unwrap();
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("a", DataType::Int32, false),
                 ArrowField::new("b", DataType::Int32, false),
