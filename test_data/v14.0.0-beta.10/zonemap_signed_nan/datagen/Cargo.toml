@@ -1,0 +1,21 @@
+# Standalone — deliberately not part of the parent Cargo workspace. This crate
+# must compile against the ZoneMap writer that predates `negative_nan_count`
+# (any NaN forces `max = +NaN`, no sign information), so it pins the last
+# `main` commit before that column was introduced.
+[workspace]
+
+[package]
+name = "zonemap-signed-nan-datagen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+arrow-array = "58"
+arrow-schema = "58"
+half = "2"
+lance = { git = "https://github.com/lance-format/lance.git", rev = "fbec02448" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "fbec02448" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

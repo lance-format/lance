@@ -3755,7 +3755,8 @@ class LanceDataset(pa.dataset.Dataset):
           in filters.
         * ``ZONEMAP``. This inexact index breaks the column into fixed-size chunks
           called zones and stores summary statistics for each zone (min, max,
-          null_count, nan_count, fragment_id, local_row_offset). It's very small but
+          null_count, nan_count, negative_nan_count, fragment_id, local_row_offset).
+          It's very small but
           only effective if the column is at least approximately in sorted order.
         * ``INVERTED`` (alias: ``FTS``). It is used to index document columns. This
           index can conduct full-text searches. For example, a column that contains any
