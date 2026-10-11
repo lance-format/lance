@@ -32,7 +32,7 @@ use std::any::Any;
 use std::sync::LazyLock;
 
 use arrow_array::{
-    ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+    Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
@@ -69,6 +69,28 @@ pub(crate) struct ZoneMapStatistics {
     // Bound of this zone within the fragment. Persisted as three separate columns
     // (fragment_id, zone_start, zone_length) in the index file.
     bound: ZoneBound,
+}
+
+/// Sign of a NaN literal as placed by Arrow's total order: negative NaNs sort
+/// below every other value, positive NaNs above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NanSign {
+    Negative,
+    Positive,
+}
+
+fn nan_sign(value: &ScalarValue) -> Option<NanSign> {
+    let negative = match value {
+        ScalarValue::Float16(Some(f)) if f.is_nan() => f.is_sign_negative(),
+        ScalarValue::Float32(Some(f)) if f.is_nan() => f.is_sign_negative(),
+        ScalarValue::Float64(Some(f)) if f.is_nan() => f.is_sign_negative(),
+        _ => return None,
+    };
+    Some(if negative {
+        NanSign::Negative
+    } else {
+        NanSign::Positive
+    })
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -161,16 +183,6 @@ impl ZoneMapIndex {
         }
     }
 
-    /// Returns true if the zone has a non-null, non-NaN min value.
-    fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
-        !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
-    }
-
-    /// Returns true if both min and max are non-null / non-NaN.
-    fn zone_has_finite_extrema(zone: &ZoneMapStatistics) -> bool {
-        Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
-    }
-
     fn zone_has_missing_extrema(zone: &ZoneMapStatistics) -> bool {
         zone.min.is_null() || zone.max.is_null()
     }
@@ -184,12 +196,13 @@ impl ZoneMapIndex {
     /// Global `[min, max]` folded across one or more ZoneMap segments (the
     /// disjoint per-column segments of a multi-segment index), without a scan.
     ///
-    /// `None` when no zone has a finite bound, or when any zone's `max` is NaN:
-    /// `ScalarValue`'s total order ranks NaN above every finite value, so a
-    /// NaN-bearing zone hides its true finite max and no sound upper bound exists
-    /// without a scan — folding only the finite maxes would yield a *subset* that
-    /// prunes live rows. Folding raw zones (not each segment's `value_range`)
-    /// keeps this exact across segments.
+    /// `None` when no zone has a finite bound, or when any zone holds a NaN:
+    /// NaNs sit outside the finite range on either side under Arrow's total
+    /// order (and a zone with a positive NaN stores `max = +NaN`, hiding its
+    /// finite max), so no sound finite bound exists without a scan — folding
+    /// only the finite extrema would yield a *subset* that prunes live rows.
+    /// Folding raw zones (not each segment's `value_range`) keeps this exact
+    /// across segments.
     ///
     /// Otherwise the range is a superset of the segments' live values,
     /// conservative under deletion vectors: safe to prune with, not guaranteed
@@ -211,7 +224,7 @@ impl ZoneMapIndex {
                 if Self::zone_has_missing_extrema(zone) && Self::zone_has_comparable_values(zone) {
                     return None;
                 }
-                if Self::scalar_is_nan(&zone.max) {
+                if zone.nan_count > 0 || Self::scalar_is_nan(&zone.max) {
                     return None;
                 }
                 if Self::scalar_is_finite_bound(&zone.min)
@@ -236,16 +249,23 @@ impl ZoneMapIndex {
 
     /// Evaluates whether a zone could potentially contain values matching the query.
     ///
-    /// NaN query values use the explicit `nan_count`. For finite query values,
-    /// `ScalarValue` total ordering keeps finite values below a stored NaN max,
-    /// so zones with finite values plus NaNs remain conservative false positives.
+    /// A zone's rows fall into three groups described separately by its
+    /// statistics: nulls (`null_count`), NaNs (`nan_count`), and ordinary
+    /// values bounded by `[min, max]`. Arrow's total order places a negative
+    /// NaN below every ordinary value and a positive NaN above, and the
+    /// statistics do not record which signs a zone holds, so a zone with NaNs
+    /// may match either side of any range and is always kept for range
+    /// queries. Equality with an ordinary value cannot be satisfied by a NaN,
+    /// so it still uses the bounds. A `+NaN` max is a marker that the zone
+    /// holds a positive NaN (older indices wrote it for any NaN), not the
+    /// zone's largest value: NaNs with different payloads sit at different
+    /// positions in the total order. The marker hides the ordinary maximum,
+    /// which keeps the ordinary check conservative.
     fn evaluate_zone_against_query(
         &self,
         zone: &ZoneMapStatistics,
         query: &SargableQuery,
     ) -> Result<bool> {
-        use std::ops::Bound;
-
         // For nested types we only track null_count; prune only when certain.
         if self.data_type.is_nested() {
             let all_null = zone.null_count as usize == zone.bound.length;
@@ -270,198 +290,13 @@ impl ZoneMapIndex {
         }
 
         match query {
-            SargableQuery::IsNull() => {
-                // Zone contains matching values if it has any null values
-                Ok(zone.null_count > 0)
-            }
-            SargableQuery::Equals(target) => {
-                // Zone contains matching values if target falls within [min, max] range
-                // Handle null values - if target is null, check null_count
-                if target.is_null() {
-                    return Ok(zone.null_count > 0);
-                }
-
-                // Handle NaN values - if target is NaN, check nan_count
-                let is_nan = match target {
-                    ScalarValue::Float16(Some(f)) => f.is_nan(),
-                    ScalarValue::Float32(Some(f)) => f.is_nan(),
-                    ScalarValue::Float64(Some(f)) => f.is_nan(),
-                    _ => false,
-                };
-
-                if is_nan {
-                    return Ok(zone.nan_count > 0);
-                }
-
-                if Self::zone_has_missing_extrema(zone) {
-                    return Ok(Self::zone_has_comparable_values(zone));
-                }
-
-                Ok(target >= &zone.min && target <= &zone.max)
-            }
-            SargableQuery::Range(start, end) => {
-                // Zone overlaps with query range if there's any intersection between
-                // the zone's [min, max] and the query's range
-                if Self::zone_has_missing_extrema(zone) {
-                    return Ok(Self::zone_has_comparable_values(zone));
-                }
-
-                let zone_min = &zone.min;
-                let zone_max = &zone.max;
-
-                let start_check = match start {
-                    Bound::Unbounded => true,
-                    Bound::Included(s) => {
-                        // Handle NaN in range bounds - NaN is greater than all finite values
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0);
-                            }
-                            _ => {}
-                        }
-                        // Handle the case where zone_max is NaN
-                        // If zone_max is NaN, the zone contains both finite values and NaN
-                        // Since we don't know the actual max, we'll be conservative and include the zone
-                        match zone_max {
-                            ScalarValue::Float16(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float32(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => true,
-                            _ => zone_max >= s,
-                        }
-                    }
-                    Bound::Excluded(s) => {
-                        // Handle NaN in range bounds
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(false); // Nothing is greater than NaN
-                            }
-                            _ => {}
-                        }
-                        zone_max > s
-                    }
-                };
-
-                let end_check = match end {
-                    Bound::Unbounded => true,
-                    Bound::Included(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // NaN is included, so check if zone has NaN values or finite values
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0 || zone_min <= e);
-                            }
-                            _ => {}
-                        }
-                        zone_min <= e
-                    }
-                    Bound::Excluded(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // Everything is less than NaN, so include all finite values
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(true);
-                            }
-                            _ => {}
-                        }
-                        zone_min < e
-                    }
-                };
-
-                Ok(start_check && end_check)
-            }
-            SargableQuery::IsIn(values) => {
-                // Zone contains matching values if any value in the set falls within [min, max]
-                Ok(values.iter().any(|value| {
-                    if value.is_null() {
-                        zone.null_count > 0
-                    } else {
-                        match value {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    zone.nan_count > 0
-                                } else if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
-                                } else if !Self::zone_has_finite_min(zone) {
-                                    false
-                                } else {
-                                    value >= &zone.min && value <= &zone.max
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    zone.nan_count > 0
-                                } else if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
-                                } else if !Self::zone_has_finite_min(zone) {
-                                    false
-                                } else {
-                                    value >= &zone.min && value <= &zone.max
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    zone.nan_count > 0
-                                } else if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
-                                } else if !Self::zone_has_finite_min(zone) {
-                                    false
-                                } else {
-                                    value >= &zone.min && value <= &zone.max
-                                }
-                            }
-                            _ => {
-                                if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
-                                } else {
-                                    Self::zone_has_finite_extrema(zone)
-                                        && value >= &zone.min
-                                        && value <= &zone.max
-                                }
-                            }
-                        }
-                    }
-                }))
-            }
+            SargableQuery::IsNull() => Ok(zone.null_count > 0),
+            SargableQuery::Equals(target) => Ok(Self::zone_may_contain(zone, target)),
+            SargableQuery::Range(start, end) => Ok(zone.nan_count > 0
+                || Self::ordinary_values_may_match(zone, start.as_ref(), end.as_ref())),
+            SargableQuery::IsIn(values) => Ok(values
+                .iter()
+                .any(|value| Self::zone_may_contain(zone, value))),
             SargableQuery::FullTextSearch(_) => Err(Error::not_supported_source(
                 "full text search is not supported for zonemap indexes".into(),
             )),
@@ -513,6 +348,56 @@ impl ZoneMapIndex {
                 }
             }
         }
+    }
+
+    fn zone_may_contain(zone: &ZoneMapStatistics, target: &ScalarValue) -> bool {
+        if target.is_null() {
+            return zone.null_count > 0;
+        }
+        match nan_sign(target) {
+            Some(_) => zone.nan_count > 0,
+            None => Self::ordinary_values_may_match(
+                zone,
+                std::ops::Bound::Included(target),
+                std::ops::Bound::Included(target),
+            ),
+        }
+    }
+
+    /// Whether the ordinary values in `[min, max]` can fall inside the range.
+    /// A NaN bound lies outside the ordinary values on the side its sign
+    /// names. A `+NaN` max marker ranks above every ordinary lower bound in
+    /// `ScalarValue`'s total order, which is the conservative answer while the
+    /// ordinary maximum is hidden behind it.
+    fn ordinary_values_may_match(
+        zone: &ZoneMapStatistics,
+        start: std::ops::Bound<&ScalarValue>,
+        end: std::ops::Bound<&ScalarValue>,
+    ) -> bool {
+        use std::ops::Bound;
+
+        if Self::zone_has_missing_extrema(zone) {
+            return Self::zone_has_comparable_values(zone);
+        }
+        let above_start = match start {
+            Bound::Unbounded => true,
+            Bound::Included(s) | Bound::Excluded(s) => match nan_sign(s) {
+                Some(NanSign::Negative) => true,
+                Some(NanSign::Positive) => false,
+                None if matches!(start, Bound::Included(_)) => &zone.max >= s,
+                None => &zone.max > s,
+            },
+        };
+        let below_end = match end {
+            Bound::Unbounded => true,
+            Bound::Included(e) | Bound::Excluded(e) => match nan_sign(e) {
+                Some(NanSign::Positive) => true,
+                Some(NanSign::Negative) => false,
+                None if matches!(end, Bound::Included(_)) => &zone.min <= e,
+                None => &zone.min < e,
+            },
+        };
+        above_start && below_end
     }
 
     /// Additive sibling of [`Self::load`] for mappings that require
@@ -1342,14 +1227,17 @@ impl ZoneMapProcessor {
     fn max_value_from_stats(
         value: Option<&ArrayRef>,
         data_type: &DataType,
-        nan_count: u32,
+        positive_nan_count: u32,
     ) -> Result<ScalarValue> {
-        if nan_count > 0
+        if positive_nan_count > 0
             && let Some(nan) = Self::nan_scalar(data_type)
         {
-            // DataFusion's max accumulator surfaced NaN as the zone max.  Keep
-            // that stored zonemap shape while using arrow_stats so existing
-            // range/equality pruning remains conservative around NaN.
+            // The canonical `+NaN` is a marker that the zone holds a positive
+            // NaN, which sorts above every ordinary value; it is not the
+            // zone's largest NaN, since payloads order NaNs among themselves.
+            // A negative NaN sorts below every ordinary value and must not
+            // displace the ordinary maximum; it is visible only through
+            // `nan_count`.
             return Ok(nan);
         }
         Self::scalar_value_from_stat(value, data_type)
@@ -1380,6 +1268,10 @@ impl ZoneProcessor for ZoneMapProcessor {
         }
 
         let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
+        let negative_nan_count = Self::stat_count_to_u32(
+            "negative_nan_count",
+            statistics.negative_nan_count.unwrap_or(0),
+        )?;
         Ok(ZoneMapStatistics {
             min: Self::scalar_value_from_stat(
                 statistics.min.as_ref().map(|scalar| scalar.as_array()),
@@ -1388,7 +1280,7 @@ impl ZoneProcessor for ZoneMapProcessor {
             max: Self::max_value_from_stats(
                 statistics.max.as_ref().map(|scalar| scalar.as_array()),
                 &self.data_type,
-                nan_count,
+                nan_count.saturating_sub(negative_nan_count),
             )?,
             null_count,
             nan_count,
@@ -2787,9 +2679,11 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the first three zones since they contain values in the range [0, 250]
+        // Every zone holds NaNs of unknown sign, and a NaN may sit below or
+        // above any range, so a range query keeps all of them (the first three
+        // also hold values in [0, 250]).
         let mut expected = RowAddrTreeMap::new();
-        expected.insert_range(0..300);
+        expected.insert_range(0..500);
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsIn query with NaN and finite values
@@ -2857,14 +2751,17 @@ mod tests {
         expected.insert_range(0..500);
         assert_eq!(result, SearchResult::at_most(expected));
 
-        // Range with NaN as start bound (excluded)
+        // Range with NaN as start bound (excluded). Positive NaNs with a larger
+        // payload sort above this one and the counts do not record payloads, so
+        // every zone holding a positive NaN stays a candidate.
         let query = SargableQuery::Range(
             Bound::Excluded(ScalarValue::Float32(Some(f32::NAN))),
             Bound::Unbounded,
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        // Should match nothing since nothing is greater than NaN
-        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsIn query with mixed float types (Float16, Float32, Float64)
         let query = SargableQuery::IsIn(vec![
@@ -5143,5 +5040,281 @@ mod tests {
         let mut exact_nulls = RowAddrTreeMap::new();
         exact_nulls.insert(0); // only row 0 is null
         assert_eq!(result, SearchResult::exact(exact_nulls));
+    }
+
+    /// One zone's worth of Float32 values with a known NaN/null shape.
+    #[derive(Clone, Copy)]
+    enum Shape {
+        Ordinary,
+        NegativeNanWithValues,
+        PositiveNanWithValues,
+        BothSignsWithValues,
+        OnlyPositiveNan,
+        OnlyNegativeNan,
+        OnlyNull,
+        NullAndNegativeNan,
+        NullAndPositiveNan,
+    }
+
+    const SHAPES: [Shape; 9] = [
+        Shape::Ordinary,
+        Shape::NegativeNanWithValues,
+        Shape::PositiveNanWithValues,
+        Shape::BothSignsWithValues,
+        Shape::OnlyPositiveNan,
+        Shape::OnlyNegativeNan,
+        Shape::OnlyNull,
+        Shape::NullAndNegativeNan,
+        Shape::NullAndPositiveNan,
+    ];
+
+    const POS_NAN: f32 = f32::from_bits(0x7fc0_0001);
+    const POS_NAN_HIGHER: f32 = f32::from_bits(0x7fc0_0002);
+    const NEG_NAN: f32 = f32::from_bits(0xffc0_0001);
+
+    fn shape_values(shape: Shape) -> [Option<f32>; 2] {
+        match shape {
+            Shape::Ordinary => [Some(5.0), Some(8.0)],
+            Shape::NegativeNanWithValues => [Some(NEG_NAN), Some(5.0)],
+            Shape::PositiveNanWithValues => [Some(POS_NAN), Some(8.0)],
+            Shape::BothSignsWithValues => [Some(NEG_NAN), Some(POS_NAN)],
+            Shape::OnlyPositiveNan => [Some(POS_NAN), Some(POS_NAN_HIGHER)],
+            Shape::OnlyNegativeNan => [Some(NEG_NAN), Some(NEG_NAN)],
+            Shape::OnlyNull => [None, None],
+            Shape::NullAndNegativeNan => [None, Some(NEG_NAN)],
+            Shape::NullAndPositiveNan => [None, Some(POS_NAN)],
+        }
+    }
+
+    /// Every shape in order, two rows per zone.
+    async fn signed_nan_index() -> Arc<ZoneMapIndex> {
+        let values = SHAPES.iter().flat_map(|s| shape_values(*s)).collect();
+        train_and_load::<Float32Type>(vec![values]).await
+    }
+
+    fn f32_scalar(v: f32) -> ScalarValue {
+        ScalarValue::Float32(Some(v))
+    }
+
+    /// Predicates that exercise every bound kind against every NaN shape.
+    fn signed_nan_queries() -> Vec<SargableQuery> {
+        use Bound::*;
+        let mut queries = vec![
+            SargableQuery::IsNull(),
+            SargableQuery::Equals(ScalarValue::Float32(None)),
+            SargableQuery::Equals(f32_scalar(5.0)),
+            SargableQuery::Equals(f32_scalar(100.0)),
+            SargableQuery::Equals(f32_scalar(POS_NAN)),
+            SargableQuery::Equals(f32_scalar(POS_NAN_HIGHER)),
+            SargableQuery::Equals(f32_scalar(NEG_NAN)),
+            SargableQuery::IsIn(vec![f32_scalar(5.0), f32_scalar(8.0)]),
+            SargableQuery::IsIn(vec![f32_scalar(100.0), f32_scalar(NEG_NAN)]),
+        ];
+        let bounds = [
+            Unbounded,
+            Included(f32_scalar(0.0)),
+            Excluded(f32_scalar(0.0)),
+            Included(f32_scalar(100.0)),
+            Excluded(f32_scalar(100.0)),
+            Included(f32_scalar(POS_NAN)),
+            Excluded(f32_scalar(POS_NAN)),
+            Included(f32_scalar(NEG_NAN)),
+            Excluded(f32_scalar(NEG_NAN)),
+        ];
+        for start in &bounds {
+            for end in &bounds {
+                queries.push(SargableQuery::Range(start.clone(), end.clone()));
+            }
+        }
+        queries
+    }
+
+    /// Whether `value` satisfies `query` under Arrow's comparison semantics:
+    /// total order for ranges, bit equality for equals.
+    fn row_matches(value: Option<f32>, query: &SargableQuery) -> bool {
+        let Some(v) = value else {
+            return matches!(query, SargableQuery::IsNull())
+                || matches!(query, SargableQuery::Equals(t) if t.is_null());
+        };
+        let as_f32 = |s: &ScalarValue| match s {
+            ScalarValue::Float32(Some(f)) => *f,
+            _ => unreachable!(),
+        };
+        let bound_ok = |b: &Bound<ScalarValue>, upper: bool| match b {
+            Bound::Unbounded => true,
+            Bound::Included(s) => {
+                let o = v.total_cmp(&as_f32(s));
+                if upper { o.is_le() } else { o.is_ge() }
+            }
+            Bound::Excluded(s) => {
+                let o = v.total_cmp(&as_f32(s));
+                if upper { o.is_lt() } else { o.is_gt() }
+            }
+        };
+        match query {
+            SargableQuery::IsNull() => false,
+            SargableQuery::Equals(t) => !t.is_null() && v.to_bits() == as_f32(t).to_bits(),
+            SargableQuery::IsIn(values) => values
+                .iter()
+                .any(|t| !t.is_null() && v.to_bits() == as_f32(t).to_bits()),
+            SargableQuery::Range(start, end) => bound_ok(start, false) && bound_ok(end, true),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nan_zone_statistics() {
+        let index = signed_nan_index().await;
+        assert_eq!(index.zones.len(), SHAPES.len());
+        let bits = |v: &ScalarValue| match v {
+            ScalarValue::Float32(Some(f)) => Some(f.to_bits()),
+            ScalarValue::Float32(None) => None,
+            other => panic!("unexpected {other:?}"),
+        };
+        let nan = f32::NAN.to_bits();
+        // (min bits, max bits, null_count, nan_count). A positive NaN is
+        // marked by the canonical `+NaN` max; a negative NaN is below every
+        // ordinary value and leaves the ordinary max alone.
+        let expected = [
+            (Some(5.0f32.to_bits()), Some(8.0f32.to_bits()), 0, 0),
+            (Some(5.0f32.to_bits()), Some(5.0f32.to_bits()), 0, 1),
+            (Some(8.0f32.to_bits()), Some(nan), 0, 1),
+            (None, Some(nan), 0, 2),
+            (None, Some(nan), 0, 2),
+            (None, None, 0, 2),
+            (None, None, 2, 0),
+            (None, None, 1, 1),
+            (None, Some(nan), 1, 1),
+        ];
+        for (zone, (min, max, null_count, nan_count)) in index.zones.iter().zip(expected) {
+            assert_eq!(bits(&zone.min), min, "{zone:?}");
+            assert_eq!(bits(&zone.max), max, "{zone:?}");
+            assert_eq!(zone.null_count, null_count, "{zone:?}");
+            assert_eq!(zone.nan_count, nan_count, "{zone:?}");
+        }
+    }
+
+    /// No query may prune a zone that holds a matching row.
+    #[tokio::test]
+    async fn test_nan_pruning_never_drops_a_match() {
+        let index = signed_nan_index().await;
+        for (zone, shape) in index.zones.iter().zip(SHAPES) {
+            for query in signed_nan_queries() {
+                let any_match = shape_values(shape)
+                    .into_iter()
+                    .any(|v| row_matches(v, &query));
+                let kept = index.evaluate_zone_against_query(zone, &query).unwrap();
+                assert!(
+                    kept || !any_match,
+                    "zone {zone:?} pruned for {query:?} although a row matches"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nan_pruning_cases() {
+        use Bound::*;
+        let index = signed_nan_index().await;
+        let zone = |shape: Shape| {
+            let pos = SHAPES
+                .iter()
+                .position(|s| std::mem::discriminant(s) == std::mem::discriminant(&shape))
+                .unwrap();
+            &index.zones[pos]
+        };
+        let eval = |shape: Shape, q: SargableQuery| {
+            index.evaluate_zone_against_query(zone(shape), &q).unwrap()
+        };
+        let below_zero = || SargableQuery::Range(Unbounded, Excluded(f32_scalar(0.0)));
+        let above_hundred = || SargableQuery::Range(Excluded(f32_scalar(100.0)), Unbounded);
+
+        // The statistics do not say which NaN signs a zone holds, so every zone
+        // with a NaN stays a candidate for a range in either direction. Zones
+        // without NaNs are pruned by their ordinary bounds as before.
+        for shape in [
+            Shape::NegativeNanWithValues,
+            Shape::PositiveNanWithValues,
+            Shape::BothSignsWithValues,
+            Shape::OnlyPositiveNan,
+            Shape::OnlyNegativeNan,
+            Shape::NullAndNegativeNan,
+            Shape::NullAndPositiveNan,
+        ] {
+            assert!(eval(shape, below_zero()));
+            assert!(eval(shape, above_hundred()));
+            assert!(eval(
+                shape,
+                SargableQuery::Range(Unbounded, Excluded(f32_scalar(POS_NAN_HIGHER)))
+            ));
+            assert!(eval(
+                shape,
+                SargableQuery::Range(Excluded(f32_scalar(POS_NAN)), Unbounded)
+            ));
+            assert!(eval(shape, SargableQuery::Equals(f32_scalar(NEG_NAN))));
+            assert!(eval(shape, SargableQuery::Equals(f32_scalar(POS_NAN))));
+        }
+        assert!(!eval(Shape::Ordinary, below_zero()));
+        assert!(!eval(Shape::Ordinary, above_hundred()));
+        assert!(!eval(
+            Shape::Ordinary,
+            SargableQuery::Equals(f32_scalar(POS_NAN))
+        ));
+        assert!(!eval(Shape::OnlyNull, below_zero()));
+        assert!(!eval(Shape::OnlyNull, above_hundred()));
+
+        // A NaN literal as a range bound never prunes ordinary values on the
+        // side it does not touch.
+        assert!(eval(
+            Shape::Ordinary,
+            SargableQuery::Range(Included(f32_scalar(NEG_NAN)), Included(f32_scalar(6.0)))
+        ));
+        assert!(eval(
+            Shape::Ordinary,
+            SargableQuery::Range(Included(f32_scalar(6.0)), Included(f32_scalar(POS_NAN)))
+        ));
+        assert!(!eval(
+            Shape::Ordinary,
+            SargableQuery::Range(Included(f32_scalar(POS_NAN)), Unbounded)
+        ));
+        assert!(!eval(
+            Shape::Ordinary,
+            SargableQuery::Range(Unbounded, Included(f32_scalar(NEG_NAN)))
+        ));
+
+        // Equality with an ordinary value cannot be met by a NaN, so the
+        // ordinary bounds decide. A negative NaN left the ordinary max intact,
+        // which lets `= 100` prune that zone; a positive NaN hides it.
+        assert!(eval(
+            Shape::NegativeNanWithValues,
+            SargableQuery::Equals(f32_scalar(5.0))
+        ));
+        assert!(!eval(
+            Shape::NegativeNanWithValues,
+            SargableQuery::Equals(f32_scalar(100.0))
+        ));
+        assert!(eval(
+            Shape::PositiveNanWithValues,
+            SargableQuery::Equals(f32_scalar(100.0))
+        ));
+        assert!(!eval(
+            Shape::OnlyPositiveNan,
+            SargableQuery::Equals(f32_scalar(5.0))
+        ));
+        assert!(!eval(
+            Shape::OnlyNegativeNan,
+            SargableQuery::Equals(f32_scalar(5.0))
+        ));
+        assert!(!eval(
+            Shape::NullAndNegativeNan,
+            SargableQuery::IsIn(vec![f32_scalar(5.0)])
+        ));
+
+        // An all-null zone matches nothing but `IS NULL`.
+        assert!(!eval(
+            Shape::OnlyNull,
+            SargableQuery::Range(Unbounded, Unbounded)
+        ));
+        assert!(eval(Shape::OnlyNull, SargableQuery::IsNull()));
     }
 }

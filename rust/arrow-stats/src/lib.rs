@@ -3,8 +3,15 @@
 
 //! Statistics accumulator for streams of Arrow arrays.
 //!
-//! Tracks min, max, null_count, and optional nan_count across batches of arrays sharing
+//! Tracks min, max, null_count, and optional NaN counts across batches of arrays sharing
 //! the same [`DataType`]. Uses [`ArrowScalar`] for extrema tracking.
+//!
+//! # Floating-point values
+//!
+//! `min` and `max` are the extrema of the non-null, non-NaN values, compared with
+//! IEEE total ordering (so `-0.0 < 0.0`). NaNs never enter `min` or `max`; they are
+//! counted in `nan_count`, and `negative_nan_count` says how many of them carry the
+//! sign bit (which Arrow's total ordering places below every other value).
 //!
 //! # Example
 //!
@@ -26,8 +33,8 @@
 //! # Data Type Support
 //!
 //! All basic types are supported.  Every data type supports `null_count` and `buffer_memory`.
-//! The `nan_count` field is `Some` only for floating-point types (including lists of floats)
-//! and `None` for all other types.
+//! The `nan_count` and `negative_nan_count` fields are `Some` only for floating-point types
+//! (including lists of floats) and `None` for all other types.
 //!
 //! # List Types
 //!
@@ -81,6 +88,8 @@ pub struct StatisticsAccumulator {
     null_count: u64,
     /// Count of NaN values. `Some` only for floating-point types (or lists of floats).
     nan_count: Option<u64>,
+    /// Count of NaN values with the sign bit set. `Some` exactly when `nan_count` is.
+    negative_nan_count: Option<u64>,
     /// Number of null items within list entries. `Some` only for list types.
     item_nulls: Option<u64>,
     buffer_memory: u64,
@@ -94,6 +103,8 @@ pub struct Statistics {
     pub null_count: u64,
     /// Count of NaN values. `None` for non-floating-point types.
     pub nan_count: Option<u64>,
+    /// Count of NaN values with the sign bit set. `None` for non-floating-point types.
+    pub negative_nan_count: Option<u64>,
     /// Number of null items within list entries. `None` for non-list types.
     pub item_nulls: Option<u64>,
     /// Total buffer memory in bytes across all arrays seen by this accumulator.
@@ -118,8 +129,17 @@ impl StatisticsAccumulator {
             max: None,
             null_count: 0,
             nan_count,
+            negative_nan_count: nan_count,
             item_nulls,
             buffer_memory: 0,
+        }
+    }
+
+    fn add_nans(&mut self, array: &ArrayRef) {
+        if let (Some(total), Some(negative)) = (&mut self.nan_count, &mut self.negative_nan_count) {
+            let counts = count_nans(array);
+            *total += counts.total;
+            *negative += counts.negative;
         }
     }
 
@@ -171,9 +191,7 @@ impl StatisticsAccumulator {
                 )
             }
             _ => {
-                if let Some(ref mut nan_count) = self.nan_count {
-                    *nan_count += count_nans(array);
-                }
+                self.add_nans(array);
                 let (batch_min, batch_max) = find_min_max(array)?;
                 self.update_min(batch_min);
                 self.update_max(batch_max);
@@ -225,9 +243,7 @@ impl StatisticsAccumulator {
                 }
             }
             _ => {
-                if let Some(ref mut nan_count) = self.nan_count {
-                    *nan_count += count_nans(item_array);
-                }
+                self.add_nans(item_array);
                 let (batch_min, batch_max) = find_min_max(item_array)?;
                 self.update_min(batch_min);
                 self.update_max(batch_max);
@@ -267,6 +283,9 @@ impl StatisticsAccumulator {
         if let (Some(a), Some(b)) = (&mut self.nan_count, other.nan_count) {
             *a += b;
         }
+        if let (Some(a), Some(b)) = (&mut self.negative_nan_count, other.negative_nan_count) {
+            *a += b;
+        }
         self.buffer_memory += other.buffer_memory;
 
         if let (Some(a), Some(b)) = (&mut self.item_nulls, other.item_nulls) {
@@ -297,6 +316,7 @@ impl StatisticsAccumulator {
             max: self.max,
             null_count: self.null_count,
             nan_count: self.nan_count,
+            negative_nan_count: self.negative_nan_count,
             item_nulls: self.item_nulls,
             buffer_memory: self.buffer_memory,
         }
@@ -309,6 +329,7 @@ impl StatisticsAccumulator {
             max: self.max.clone(),
             null_count: self.null_count,
             nan_count: self.nan_count,
+            negative_nan_count: self.negative_nan_count,
             item_nulls: self.item_nulls,
             buffer_memory: self.buffer_memory,
         }
@@ -321,6 +342,9 @@ impl StatisticsAccumulator {
         self.null_count = 0;
         if let Some(ref mut nan_count) = self.nan_count {
             *nan_count = 0;
+        }
+        if let Some(ref mut negative_nan_count) = self.negative_nan_count {
+            *negative_nan_count = 0;
         }
         if let Some(ref mut item_nulls) = self.item_nulls {
             *item_nulls = 0;
@@ -604,6 +628,113 @@ mod tests {
         assert_eq!(format!("{}", stats.min.unwrap()), "1.0");
         assert_eq!(format!("{}", stats.max.unwrap()), "3.0");
         assert_eq!(stats.nan_count, Some(1));
+        assert_eq!(stats.negative_nan_count, Some(0));
+    }
+
+    #[test]
+    fn test_negative_nan_counted_and_excluded_from_extrema() {
+        let mut acc = StatisticsAccumulator::new(&DataType::Float64);
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![1.0, -f64::NAN, 3.0]));
+        acc.update(&array).unwrap();
+        let stats = acc.finish();
+        assert_eq!(format!("{}", stats.min.unwrap()), "1.0");
+        assert_eq!(format!("{}", stats.max.unwrap()), "3.0");
+        assert_eq!(stats.nan_count, Some(1));
+        assert_eq!(stats.negative_nan_count, Some(1));
+    }
+
+    #[test]
+    fn test_signed_nan_counts_across_batches_and_merge() {
+        let positive = f32::from_bits(0x7fc0_0001);
+        let negative = f32::from_bits(0xffc0_0002);
+        let mut acc = StatisticsAccumulator::new(&DataType::Float32);
+        let a1: ArrayRef = Arc::new(Float32Array::from(vec![Some(-f32::NAN), Some(5.0), None]));
+        let a2: ArrayRef = Arc::new(Float32Array::from(vec![positive, 8.0, negative]));
+        acc.update(&a1).unwrap();
+        acc.update(&a2).unwrap();
+        let stats = acc.statistics();
+        assert_eq!(format!("{}", stats.min.unwrap()), "5.0");
+        assert_eq!(format!("{}", stats.max.unwrap()), "8.0");
+        assert_eq!(stats.null_count, 1);
+        assert_eq!(stats.nan_count, Some(3));
+        assert_eq!(stats.negative_nan_count, Some(2));
+
+        let mut other = StatisticsAccumulator::new(&DataType::Float32);
+        let a3: ArrayRef = Arc::new(Float32Array::from(vec![negative, 1.0]));
+        other.update(&a3).unwrap();
+        acc.merge(&other).unwrap();
+        let merged = acc.statistics();
+        assert_eq!(format!("{}", merged.min.unwrap()), "1.0");
+        assert_eq!(merged.nan_count, Some(4));
+        assert_eq!(merged.negative_nan_count, Some(3));
+
+        acc.reset();
+        let reset = acc.statistics();
+        assert_eq!(reset.nan_count, Some(0));
+        assert_eq!(reset.negative_nan_count, Some(0));
+    }
+
+    #[test]
+    fn test_float16_negative_nan() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{ArrowPrimitiveType, Float16Type};
+        type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+
+        let mut acc = StatisticsAccumulator::new(&DataType::Float16);
+        let array: ArrayRef = Arc::new(Float16Array::from(vec![
+            F16::from_bits(0xfe00),
+            F16::from_f32(2.0),
+            F16::from_bits(0x7e01),
+        ]));
+        acc.update(&array).unwrap();
+        let stats = acc.finish();
+        let bits = |scalar: &ArrowScalar| {
+            scalar
+                .as_array()
+                .as_primitive::<Float16Type>()
+                .value(0)
+                .to_bits()
+        };
+        assert_eq!(
+            bits(stats.min.as_ref().unwrap()),
+            F16::from_f32(2.0).to_bits()
+        );
+        assert_eq!(
+            bits(stats.max.as_ref().unwrap()),
+            F16::from_f32(2.0).to_bits()
+        );
+        assert_eq!(stats.nan_count, Some(2));
+        assert_eq!(stats.negative_nan_count, Some(1));
+    }
+
+    #[test]
+    fn test_list_items_negative_nan() {
+        use arrow_array::types::Float32Type;
+
+        let field = Arc::new(arrow_schema::Field::new("item", DataType::Float32, true));
+        let data_type = DataType::List(field);
+        let mut acc = StatisticsAccumulator::new(&data_type);
+        let array: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+            Some(vec![Some(1.0), Some(-f32::NAN)]),
+            None,
+            Some(vec![Some(f32::NAN), Some(4.0)]),
+        ]));
+        acc.update(&array).unwrap();
+        let stats = acc.finish();
+        assert_eq!(format!("{}", stats.min.unwrap()), "1.0");
+        assert_eq!(format!("{}", stats.max.unwrap()), "4.0");
+        assert_eq!(stats.nan_count, Some(2));
+        assert_eq!(stats.negative_nan_count, Some(1));
+    }
+
+    #[test]
+    fn test_non_float_has_no_nan_counts() {
+        let mut acc = StatisticsAccumulator::new(&DataType::Int32);
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        acc.update(&array).unwrap();
+        let stats = acc.finish();
+        assert_eq!(stats.nan_count, None);
+        assert_eq!(stats.negative_nan_count, None);
     }
 
     #[test]
@@ -615,6 +746,7 @@ mod tests {
         assert!(stats.min.is_none());
         assert!(stats.max.is_none());
         assert_eq!(stats.nan_count, Some(2));
+        assert_eq!(stats.negative_nan_count, Some(0));
     }
 
     #[test]
@@ -627,6 +759,7 @@ mod tests {
         assert!(stats.max.is_none());
         assert_eq!(stats.null_count, 1);
         assert_eq!(stats.nan_count, Some(1));
+        assert_eq!(stats.negative_nan_count, Some(0));
     }
 
     #[test]
@@ -1189,6 +1322,11 @@ mod tests {
                             acc_orig.statistics().nan_count,
                             acc_rev.statistics().nan_count,
                             "nan_count changed after shuffle"
+                        );
+                        prop_assert_eq!(
+                            acc_orig.statistics().negative_nan_count,
+                            acc_rev.statistics().negative_nan_count,
+                            "negative_nan_count changed after shuffle"
                         );
                     }
                 }
