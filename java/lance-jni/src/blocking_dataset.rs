@@ -41,7 +41,7 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
-use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
+use lance::index::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
@@ -3966,6 +3966,130 @@ fn inner_get_index_statistics<'local>(
     };
     let jstats = env.new_string(stats_json)?;
     Ok(jstats)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetIndexSegmentStatistics<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jindex_uuids: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_get_index_segment_statistics(&mut env, java_dataset, jindex_name, jindex_uuids)
+    )
+}
+
+fn inner_get_index_segment_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jindex_uuids: JObject,
+) -> Result<JObject<'local>> {
+    let index_name: String = jindex_name.extract(env)?;
+    let index_uuids = import_vec_to_rust(env, &jindex_uuids, |env, index_uuid| {
+        env.with_local_frame(8, |env| {
+            let index_uuid = env.get_string_from_method(&index_uuid, "toString")?;
+            Uuid::parse_str(&index_uuid).map_err(|error| Error::input_error(error.to_string()))
+        })
+    })?;
+    let statistics = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        block_on(
+            dataset_guard
+                .inner
+                .index_segment_statistics(&index_name, &index_uuids),
+        )?
+    };
+    let results = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for statistics in statistics {
+        env.with_local_frame(8, |env| {
+            let index_uuid = env.new_string(statistics.index_uuid.to_string())?;
+            let index_type_uri = env.new_string(statistics.index_type_uri)?;
+            let statistics_json = env.new_string(serde_json::to_string(&statistics.statistics)?)?;
+            let result = env.new_object(
+                "org/lance/index/IndexSegmentStatistics",
+                "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+                &[
+                    JValue::Long(statistics.read_version as i64),
+                    JValue::Object(&index_uuid),
+                    JValue::Object(&index_type_uri),
+                    JValue::Object(&statistics_json),
+                ],
+            )?;
+            env.call_method(
+                &results,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&result)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(results)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetIndexStatisticsFromSegments<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jsegment_statistics: JObject,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_index_statistics_from_segments(
+            &mut env,
+            java_dataset,
+            jindex_name,
+            jsegment_statistics,
+        ),
+        JString::from(JObject::null())
+    )
+}
+
+fn inner_get_index_statistics_from_segments<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jsegment_statistics: JObject,
+) -> Result<JString<'local>> {
+    let index_name: String = jindex_name.extract(env)?;
+    let segment_statistics = import_vec_to_rust(env, &jsegment_statistics, |env, statistics| {
+        env.with_local_frame(8, |env| {
+            let read_version = env
+                .call_method(&statistics, "getReadVersion", "()J", &[])?
+                .j()?;
+            let read_version = u64::try_from(read_version)
+                .map_err(|error| Error::input_error(error.to_string()))?;
+            let index_uuid = env
+                .call_method(&statistics, "getIndexUuid", "()Ljava/util/UUID;", &[])?
+                .l()?;
+            let index_uuid = env.get_string_from_method(&index_uuid, "toString")?;
+            let index_type_uri = env.get_string_from_method(&statistics, "getIndexTypeUri")?;
+            let statistics_json = env.get_string_from_method(&statistics, "getStatisticsJson")?;
+            Ok(IndexSegmentStatistics {
+                read_version,
+                index_uuid: Uuid::parse_str(&index_uuid)
+                    .map_err(|error| Error::input_error(error.to_string()))?,
+                index_type_uri,
+                statistics: serde_json::from_str(&statistics_json)
+                    .map_err(|error| Error::input_error(error.to_string()))?,
+            })
+        })
+    })?;
+    let statistics_json = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        block_on(
+            dataset_guard
+                .inner
+                .index_statistics_from_segments(&index_name, segment_statistics),
+        )?
+    };
+    Ok(env.new_string(statistics_json)?)
 }
 
 #[unsafe(no_mangle)]

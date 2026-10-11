@@ -158,6 +158,19 @@ async fn test_create_index(
     assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
     assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
 
+    let segment_statistics = dataset
+        .index_segment_statistics("embeddings_idx", &[index_meta.uuid])
+        .await
+        .unwrap();
+    let assembled_statistics: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments("embeddings_idx", segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(assembled_statistics.as_object().unwrap(), actual_statistics);
+
     assert!(dataset.index_statistics("non-existent_idx").await.is_err());
     assert!(dataset.index_statistics("").await.is_err());
 

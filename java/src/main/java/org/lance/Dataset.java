@@ -25,6 +25,7 @@ import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
+import org.lance.index.IndexSegmentStatistics;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
@@ -1736,6 +1737,55 @@ public class Dataset implements Closeable {
   }
 
   private native String nativeGetIndexStatistics(String indexName);
+
+  /**
+   * Returns results in UUID request order at this dataset's read version.
+   *
+   * <p>UUIDs must be nonempty, unique, non-null, and belong to {@code indexName}. System indices
+   * are unsupported.
+   */
+  public List<IndexSegmentStatistics> getIndexSegmentStatistics(
+      String indexName, List<UUID> indexUuids) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        indexUuids != null && !indexUuids.isEmpty(), "indexUuids cannot be null or empty");
+    Preconditions.checkArgument(
+        indexUuids.stream().allMatch(indexUuid -> indexUuid != null),
+        "indexUuids cannot contain null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetIndexSegmentStatistics(indexName, indexUuids);
+    }
+  }
+
+  private native List<IndexSegmentStatistics> nativeGetIndexSegmentStatistics(
+      String indexName, List<UUID> indexUuids);
+
+  /**
+   * Requires exactly one result per segment from this dataset and read version.
+   *
+   * <p>Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
+   * Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+   */
+  public Map<String, Object> getIndexStatisticsFromSegments(
+      String indexName, List<IndexSegmentStatistics> segmentStatistics) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        segmentStatistics != null && !segmentStatistics.isEmpty(),
+        "segmentStatistics cannot be null or empty");
+    Preconditions.checkArgument(
+        segmentStatistics.stream().allMatch(statistics -> statistics != null),
+        "segmentStatistics cannot contain null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return JsonUtils.fromJson(nativeGetIndexStatisticsFromSegments(indexName, segmentStatistics));
+    }
+  }
+
+  private native String nativeGetIndexStatisticsFromSegments(
+      String indexName, List<IndexSegmentStatistics> segmentStatistics);
 
   /**
    * Describe indices on this dataset filtered by criteria.
