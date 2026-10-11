@@ -35,6 +35,14 @@ The zone map index stores zone statistics in a single file:
 | `zone_start`  | UInt64     | false    | Starting row offset within the fragment |
 | `zone_length` | UInt32     | false    | Number of rows in this zone             |
 
+`min` and `max` bound the non-null, non-NaN values of the zone, compared with Arrow's
+total ordering. NaNs never enter the bounds as values: `nan_count` counts them, and for
+float columns `max` is written as the canonical `+NaN` as a marker that the zone holds at
+least one positive NaN (a NaN with the sign bit clear, which sorts above every ordinary
+value). Negative NaNs do not change `max`; a zone whose NaNs are all negative keeps its
+ordinary maximum. Indices written before this convention wrote the `+NaN` marker for NaNs
+of either sign, which a reader must treat as "holds NaNs of unknown sign".
+
 ### Schema Metadata
 
 | Key                 | Type   | Description                               |
@@ -55,7 +63,13 @@ return exact results):
 
 | Query Type | Description               | Operation                                   | Result Type |
 |------------|---------------------------|---------------------------------------------|-------------|
-| **Equals** | `column = value`          | Includes zones where min ≤ value ≤ max      | AtMost      |
-| **Range**  | `column BETWEEN a AND b`  | Includes zones where ranges overlap         | AtMost      |
+| **Equals** | `column = value`          | Includes zones where min ≤ value ≤ max; a NaN value matches zones with nan_count > 0 | AtMost      |
+| **Range**  | `column BETWEEN a AND b`  | Includes zones where ranges overlap, and every zone with nan_count > 0 | AtMost      |
 | **IsIn**   | `column IN (v1, v2, ...)` | Includes zones that could contain any value | AtMost      |
 | **IsNull** | `column IS NULL`          | Includes zones where null_count > 0         | Exact       |
+
+Under Arrow's total ordering a negative NaN sorts below every other value and a positive
+NaN above, so a NaN row can satisfy a range predicate on either side. The statistics do
+not record the sign of a zone's NaNs, so a range query keeps every zone whose `nan_count`
+is positive and leaves the exact answer to the row filter. A NaN literal used as a bound
+only excludes ordinary values on the side its sign names.

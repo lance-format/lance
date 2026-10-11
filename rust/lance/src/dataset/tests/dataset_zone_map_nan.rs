@@ -320,10 +320,23 @@ fn seed_batch(bytes: &Bytes) -> RecordBatch {
     reader.next().unwrap().unwrap()
 }
 
+/// A NaN literal of the column's own type. A literal of another float type
+/// would make the planner cast the column, which keeps the filter away from
+/// the index.
+fn nan_literal(column: &str) -> String {
+    let data_type = match column {
+        "f16" => "Float16",
+        "f32" => "Float32",
+        "f64" => "Float64",
+        other => panic!("unexpected column {other}"),
+    };
+    format!("arrow_cast('NaN', '{data_type}')")
+}
+
 /// Filters covering every bound kind against ordinary values, nulls and
 /// both NaN signs. Negating a NaN literal sets its sign bit.
 fn predicates(column: &str) -> Vec<String> {
-    let nan = "CAST('NaN' AS DOUBLE)";
+    let nan = nan_literal(column);
     [
         format!("{column} < 0"),
         format!("{column} <= 0"),
@@ -347,6 +360,60 @@ fn predicates(column: &str) -> Vec<String> {
     ]
     .into_iter()
     .collect()
+}
+
+/// Whether the planner routes `filter` through the ZoneMap index.
+async fn uses_zone_map(dataset: &Dataset, filter: &str) -> bool {
+    let plan = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(true)
+        .await
+        .unwrap();
+    plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap")
+}
+
+/// Representative predicates, with ordinary and NaN literals, must be planned
+/// through the ZoneMap index for every column; otherwise comparing the index
+/// path with a scan would compare a scan with itself.
+async fn assert_representative_queries_use_index(dataset: &Dataset) {
+    for column in FLOAT_COLUMNS {
+        let nan = nan_literal(column);
+        for filter in [
+            format!("{column} < 0"),
+            format!("{column} > 100"),
+            format!("{column} = 5"),
+            format!("{column} IN (5, 8)"),
+            format!("{column} BETWEEN 0 AND 10"),
+            format!("{column} < {nan}"),
+            format!("{column} > -{nan}"),
+            format!("{column} = {nan}"),
+            format!("{column} = -{nan}"),
+        ] {
+            assert!(
+                uses_zone_map(dataset, &filter).await,
+                "{filter} bypassed the index"
+            );
+        }
+    }
+}
+
+/// The typed NaN literals carry the intended sign: equality with the
+/// canonical `+NaN` or `-NaN` hits exactly the rows written with that bit
+/// pattern (per fragment, zones 2, 3, 4 and 8 hold six canonical positive
+/// NaNs and zones 1, 3, 5 and 7 six canonical negative ones).
+async fn assert_nan_literals_have_expected_sign(dataset: &Dataset, fragments: usize) {
+    for column in FLOAT_COLUMNS {
+        let nan = nan_literal(column);
+        let positive = ids(dataset, &format!("{column} = {nan}"), true).await;
+        let negative = ids(dataset, &format!("{column} = -{nan}"), true).await;
+        assert_eq!(positive.len(), 6 * fragments, "{column} positive NaN rows");
+        assert_eq!(negative.len(), 6 * fragments, "{column} negative NaN rows");
+        assert!(positive.iter().all(|id| !negative.contains(id)));
+    }
 }
 
 async fn ids(dataset: &Dataset, filter: &str, use_index: bool) -> Vec<i64> {
@@ -383,8 +450,8 @@ async fn assert_index_matches_scan(dataset: &Dataset) {
     }
 }
 
-/// The `+NaN` max marks a positive NaN only: a zone whose NaNs are all
-/// negative keeps its ordinary maximum (null without ordinary values), and
+/// The `+NaN` max is a marker for a positive NaN only: a zone whose NaNs are
+/// all negative keeps its ordinary maximum (null without ordinary values), and
 /// `nan_count` is the only trace of its NaNs.
 #[tokio::test]
 async fn test_max_marks_positive_nan_only() {
@@ -466,6 +533,8 @@ fn is_nan_at(array: &arrow_array::ArrayRef, i: usize) -> bool {
 async fn test_nan_queries_match_scan() {
     let dir = TempStrDir::default();
     let mut dataset = write_dataset(&dir).await;
+    assert_representative_queries_use_index(&dataset).await;
+    assert_nan_literals_have_expected_sign(&dataset, 2).await;
     assert_index_matches_scan(&dataset).await;
 
     dataset
@@ -476,5 +545,6 @@ async fn test_nan_queries_match_scan() {
         let (batch, _) = index_file(&dataset, column).await;
         assert_eq!(batch.num_rows(), 2 * zones().len(), "{column}");
     }
+    assert_representative_queries_use_index(&dataset).await;
     assert_index_matches_scan(&dataset).await;
 }

@@ -256,9 +256,11 @@ impl ZoneMapIndex {
     /// statistics do not record which signs a zone holds, so a zone with NaNs
     /// may match either side of any range and is always kept for range
     /// queries. Equality with an ordinary value cannot be satisfied by a NaN,
-    /// so it still uses the bounds. `max` is `+NaN` when the zone holds a
-    /// positive NaN (and, in older indices, for any NaN); that only hides the
-    /// ordinary maximum, which keeps the ordinary check conservative.
+    /// so it still uses the bounds. A `+NaN` max is a marker that the zone
+    /// holds a positive NaN (older indices wrote it for any NaN), not the
+    /// zone's largest value: NaNs with different payloads sit at different
+    /// positions in the total order. The marker hides the ordinary maximum,
+    /// which keeps the ordinary check conservative.
     fn evaluate_zone_against_query(
         &self,
         zone: &ZoneMapStatistics,
@@ -364,7 +366,7 @@ impl ZoneMapIndex {
 
     /// Whether the ordinary values in `[min, max]` can fall inside the range.
     /// A NaN bound lies outside the ordinary values on the side its sign
-    /// names. A `+NaN` max ranks above every ordinary lower bound in
+    /// names. A `+NaN` max marker ranks above every ordinary lower bound in
     /// `ScalarValue`'s total order, which is the conservative answer while the
     /// ordinary maximum is hidden behind it.
     fn ordinary_values_may_match(
@@ -1230,10 +1232,12 @@ impl ZoneMapProcessor {
         if positive_nan_count > 0
             && let Some(nan) = Self::nan_scalar(data_type)
         {
-            // A positive NaN is the zone's largest value under Arrow's total
-            // order, so it is the max. A negative NaN sorts below every
-            // ordinary value and must not displace the ordinary maximum; it is
-            // visible only through `nan_count`.
+            // The canonical `+NaN` is a marker that the zone holds a positive
+            // NaN, which sorts above every ordinary value; it is not the
+            // zone's largest NaN, since payloads order NaNs among themselves.
+            // A negative NaN sorts below every ordinary value and must not
+            // displace the ordinary maximum; it is visible only through
+            // `nan_count`.
             return Ok(nan);
         }
         Self::scalar_value_from_stat(value, data_type)
@@ -1724,12 +1728,11 @@ impl ZoneMapSeedWriter {
         for i in 0..num_zones {
             let zone_start = i as u64 * rows_per_zone;
             let zone_length = zone_length_col.value(i) as usize;
-            let nan_count = nan_count_col.value(i);
             zones.push(ZoneMapStatistics {
                 min: datafusion_common::ScalarValue::try_from_array(min_col, i)?,
                 max: datafusion_common::ScalarValue::try_from_array(max_col, i)?,
                 null_count: null_count_col.value(i),
-                nan_count,
+                nan_count: nan_count_col.value(i),
                 bound: ZoneBound {
                     fragment_id,
                     start: zone_start,
@@ -5169,9 +5172,9 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         let nan = f32::NAN.to_bits();
-        // (min bits, max bits, null_count, nan_count). A positive NaN is the
-        // zone's largest value and is written as the `+NaN` max; a negative
-        // NaN is below every ordinary value and leaves the ordinary max alone.
+        // (min bits, max bits, null_count, nan_count). A positive NaN is
+        // marked by the canonical `+NaN` max; a negative NaN is below every
+        // ordinary value and leaves the ordinary max alone.
         let expected = [
             (Some(5.0f32.to_bits()), Some(8.0f32.to_bits()), 0, 0),
             (Some(5.0f32.to_bits()), Some(5.0f32.to_bits()), 0, 1),
