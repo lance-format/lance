@@ -1274,6 +1274,7 @@ impl MergeInsertJob {
         // Merge columns are matched by name, so a complete source remains a
         // full-schema merge even when the caller orders its fields differently.
         options.ignore_field_order = true;
+        options.type_comparison = self.dataset.type_comparison();
 
         // Try full schema match first.
         if check_source_schema(&lance_schema, target_schema, &options).is_ok() {
@@ -2717,6 +2718,7 @@ impl MergeInsertJob {
                 compare_nullability: NullabilityComparison::Ignore,
                 // Allow columns to be in a different order; they will be matched by name.
                 ignore_field_order: true,
+                type_comparison: self.dataset.type_comparison(),
                 ..Default::default()
             },
         )
@@ -2876,6 +2878,7 @@ impl MergeInsertJob {
                 // Keep this classification consistent with `can_use_create_plan`
                 // and `check_compatible_schema`: merge columns match by name.
                 ignore_field_order: true,
+                type_comparison: self.dataset.type_comparison(),
                 ..Default::default()
             },
         )
