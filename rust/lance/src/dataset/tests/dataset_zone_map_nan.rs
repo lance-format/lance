@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! ZoneMap pruning with NaN of either sign.
+//! ZoneMap statistics for signed NaN: `negative_nan_count` next to the legacy
+//! `+NaN` max.
 //!
-//! Arrow's total order puts a negative NaN below every value and a positive
-//! NaN above, and the zone statistics do not record which signs a zone holds,
-//! so a zone with NaNs must stay a candidate for range queries. These tests
-//! write every NaN/null shape into its own zone and require that a query with
-//! the index returns the rows a scan returns, before and after write seeds are
-//! harvested into the index.
+//! The fixture under `test_data/v14.0.0-beta.10/zonemap_signed_nan` was
+//! written by the ZoneMap writer that predates `negative_nan_count`. These
+//! tests prove that the new reader handles old indices and old seeds, that
+//! old and new zones mix inside one index, and that the new writer records
+//! the sign counts and marks only positive NaN in `max`; in every case a
+//! query with the index returns the rows a scan returns.
 
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::{
     Array, Float16Array, Float32Array, Float64Array, Int64Array, RecordBatch, RecordBatchIterator,
-    UInt32Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
@@ -35,11 +36,16 @@ use object_store::path::Path;
 use crate::Dataset;
 use crate::dataset::WriteParams;
 use crate::index::DatasetIndexExt;
+use crate::utils::test::copy_test_data_to_tmp;
 
+const FIXTURE: &str = "v14.0.0-beta.10/zonemap_signed_nan/dataset.lance";
 const ROWS_PER_ZONE: usize = 8;
 const FLOAT_COLUMNS: [&str; 3] = ["f16", "f32", "f64"];
+const SIGN_COUNT_COLUMN: &str = "negative_nan_count";
 
 /// One zone's worth of values, written identically into every float column.
+/// Mirrors the fixture's generator so a dataset written here has the same
+/// content as the fixture.
 #[derive(Clone, Copy)]
 enum V {
     Num(f64),
@@ -202,8 +208,8 @@ fn zone_map_params() -> ScalarIndexParams {
         .with_params(&serde_json::json!({"rows_per_zone": ROWS_PER_ZONE, "use_seeds": true}))
 }
 
-/// One fragment, a seeded ZoneMap index per float column, then an appended
-/// fragment whose data file carries a write seed for each column.
+/// The fixture's recipe run through the current writer: one fragment, a
+/// seeded ZoneMap index per float column, then an appended fragment.
 async fn write_dataset(uri: &str) -> Dataset {
     let rows = fragment_batch(0);
     let num_rows = rows.num_rows();
@@ -450,8 +456,102 @@ async fn assert_index_matches_scan(dataset: &Dataset) {
     }
 }
 
-/// The `+NaN` max is a marker for a positive NaN only: a zone whose NaNs are
-/// all negative keeps its ordinary maximum (null without ordinary values), and
+fn sign_counts(batch: &RecordBatch) -> Option<&UInt32Array> {
+    batch
+        .column_by_name(SIGN_COUNT_COLUMN)
+        .map(|col| col.as_any().downcast_ref::<UInt32Array>().unwrap())
+}
+
+fn fragment_ids(batch: &RecordBatch) -> &UInt64Array {
+    batch
+        .column_by_name("fragment_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+}
+
+/// New reader, old index and old seeds: the fixture loads, every query
+/// matches a scan, and the old statistics stay "unknown sign" after they are
+/// merged with zones from a new seed.
+#[tokio::test]
+async fn test_fixture_written_before_sign_counts() {
+    let dir = copy_test_data_to_tmp(FIXTURE).unwrap();
+    let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    for column in FLOAT_COLUMNS {
+        let (batch, _) = index_file(&dataset, column).await;
+        assert!(
+            sign_counts(&batch).is_none(),
+            "fixture index has {SIGN_COUNT_COLUMN}"
+        );
+        assert!(
+            seed_batch(&seed(&dataset, 1, column).await)
+                .column_by_name(SIGN_COUNT_COLUMN)
+                .is_none()
+        );
+        assert_eq!(
+            dataset
+                .statistics()
+                .column_value_range(column)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    assert_representative_queries_use_index(&dataset).await;
+    assert_nan_literals_have_expected_sign(&dataset, 2).await;
+    assert_index_matches_scan(&dataset).await;
+
+    // Harvest the old seeds of fragment 1 into the old index: every zone still
+    // comes from the old writer, so the merged index records no sign counts.
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    for column in FLOAT_COLUMNS {
+        let (batch, _) = index_file(&dataset, column).await;
+        let counts = sign_counts(&batch).unwrap();
+        assert_eq!(counts.null_count(), counts.len());
+        assert!(fragment_ids(&batch).values().contains(&1));
+    }
+    assert_index_matches_scan(&dataset).await;
+
+    // A fragment written now carries sign counts in its seed; after the merge
+    // the index mixes unknown (old) and known (new) zones.
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(fragment_batch(160))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    for column in FLOAT_COLUMNS {
+        let (batch, _) = index_file(&dataset, column).await;
+        let counts = sign_counts(&batch).unwrap();
+        let fragments = fragment_ids(&batch);
+        for i in 0..batch.num_rows() {
+            assert_eq!(counts.is_valid(i), fragments.value(i) == 2, "zone {i}");
+        }
+        assert_eq!(
+            dataset
+                .statistics()
+                .column_value_range(column)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    assert_index_matches_scan(&dataset).await;
+}
+
+/// The `+NaN` max marks a positive NaN only: a zone whose NaNs are all
+/// negative keeps its ordinary maximum (null without ordinary values), and
 /// `nan_count` is the only trace of its NaNs.
 #[tokio::test]
 async fn test_max_marks_positive_nan_only() {
@@ -527,12 +627,26 @@ fn is_nan_at(array: &arrow_array::ArrayRef, i: usize) -> bool {
     }
 }
 
-/// Every predicate returns the rows a scan returns, with the index built by a
-/// scan and again after the appended fragment's seeds are harvested into it.
+/// New reader, new index: the sign counts are exact and every query matches
+/// a scan, including after seeds are harvested.
 #[tokio::test]
-async fn test_nan_queries_match_scan() {
+async fn test_new_writer_sign_counts_and_queries() {
     let dir = TempStrDir::default();
     let mut dataset = write_dataset(&dir).await;
+
+    // Zone order follows `zones()`: negative NaNs in zones 1, 3, 5 and 7.
+    let expected_negative = [0u32, 2, 0, 1, 0, 8, 0, 4, 0, 0];
+    for column in FLOAT_COLUMNS {
+        let (batch, _) = index_file(&dataset, column).await;
+        let counts = sign_counts(&batch).unwrap();
+        assert_eq!(counts.values().as_ref(), &expected_negative, "{column}");
+        let seed = seed_batch(&seed(&dataset, 1, column).await);
+        assert_eq!(
+            sign_counts(&seed).unwrap().values().as_ref(),
+            &expected_negative,
+            "{column} seed"
+        );
+    }
     assert_representative_queries_use_index(&dataset).await;
     assert_nan_literals_have_expected_sign(&dataset, 2).await;
     assert_index_matches_scan(&dataset).await;
@@ -543,8 +657,9 @@ async fn test_nan_queries_match_scan() {
         .unwrap();
     for column in FLOAT_COLUMNS {
         let (batch, _) = index_file(&dataset, column).await;
-        assert_eq!(batch.num_rows(), 2 * zones().len(), "{column}");
+        let counts = sign_counts(&batch).unwrap();
+        assert_eq!(counts.len(), 2 * expected_negative.len());
+        assert_eq!(counts.null_count(), 0);
     }
-    assert_representative_queries_use_index(&dataset).await;
     assert_index_matches_scan(&dataset).await;
 }
