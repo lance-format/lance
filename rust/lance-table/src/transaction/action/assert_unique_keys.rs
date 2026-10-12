@@ -7,7 +7,6 @@ use super::apply::ApplyState;
 use super::proto::required;
 use super::{Footprint, Ref};
 use crate::format::key_existence::KeyExistenceFilter;
-use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};

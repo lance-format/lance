@@ -186,9 +186,7 @@ mod tests {
     use super::*;
     use crate::format::key_existence::{FilterType, KeyExistenceFilter};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
-    use crate::format::{
-        BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta, pb,
-    };
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
