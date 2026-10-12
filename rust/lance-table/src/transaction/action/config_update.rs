@@ -7,7 +7,6 @@ use super::apply::ApplyState;
 use super::footprint::UnenforcedKey;
 use super::proto::required;
 use super::{ConfigMap, Coordinate, Footprint, Ref};
-use crate::format::pb;
 use crate::format::pb_transaction;
 use crate::transaction::UpdateMap;
 use crate::transaction::update_map::apply_update_map;

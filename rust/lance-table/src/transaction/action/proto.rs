@@ -13,7 +13,6 @@
 //! must abort the commit rather than be treated as a no-op.
 
 use super::{Action, CompositeOperation, Ref, UserAction};
-use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::{Error, Result};
 
@@ -151,7 +150,7 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, RowIdMeta, pb};
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, RowIdMeta};
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{

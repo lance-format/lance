@@ -6,7 +6,6 @@
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Footprint, Ref};
-use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};

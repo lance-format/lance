@@ -5,7 +5,6 @@
 
 use super::Footprint;
 use super::apply::ApplyState;
-use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};

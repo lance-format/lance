@@ -6,7 +6,6 @@
 use super::apply::ApplyState;
 use super::proto::required;
 use super::{Coordinate, Footprint, Ref};
-use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
