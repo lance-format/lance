@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Coordinate, Footprint, Ref};
-use crate::format::{ExternalFile, Fragment, RowIdMeta, pb, pb_transaction};
+use crate::format::{Fragment, RowIdMeta, pb, pb_transaction};
 use crate::rowids::version::RowDatasetVersionMeta;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
@@ -86,22 +86,6 @@ impl AddFragment {
     }
 }
 
-fn external_file_to_wire(file: &ExternalFile) -> pb::ExternalFile {
-    pb::ExternalFile {
-        path: file.path.clone(),
-        offset: file.offset,
-        size: file.size,
-    }
-}
-
-fn external_file_from_wire(file: pb::ExternalFile) -> ExternalFile {
-    ExternalFile {
-        path: file.path,
-        offset: file.offset,
-        size: file.size,
-    }
-}
-
 impl From<&AddFragment> for pb_transaction::AddFragment {
     fn from(value: &AddFragment) -> Self {
         Self {
@@ -111,9 +95,9 @@ impl From<&AddFragment> for pb_transaction::AddFragment {
                 RowIdMeta::Inline(data) => {
                     pb_transaction::add_fragment::RowIdSequence::InlineRowIds(data.to_vec())
                 }
-                RowIdMeta::External(file) => {
-                    pb_transaction::add_fragment::RowIdSequence::ExternalRowIds(external_file_to_wire(file))
-                }
+                RowIdMeta::Column => pb_transaction::add_fragment::RowIdSequence::ColumnRowIds(
+                    pb::RowLineageColumn {},
+                ),
             }),
             last_updated_at_version_sequence: value
                 .last_updated_at_version_meta
@@ -124,9 +108,9 @@ impl From<&AddFragment> for pb_transaction::AddFragment {
                             data.to_vec(),
                         )
                     }
-                    RowDatasetVersionMeta::External(file) => {
-                        pb_transaction::add_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                            external_file_to_wire(file),
+                    RowDatasetVersionMeta::Column => {
+                        pb_transaction::add_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
+                            pb::RowLineageColumn {},
                         )
                     }
                 }),
@@ -139,9 +123,9 @@ impl From<&AddFragment> for pb_transaction::AddFragment {
                             data.to_vec(),
                         )
                     }
-                    RowDatasetVersionMeta::External(file) => {
-                        pb_transaction::add_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
-                            external_file_to_wire(file),
+                    RowDatasetVersionMeta::Column => {
+                        pb_transaction::add_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(
+                            pb::RowLineageColumn {},
                         )
                     }
                 }),
@@ -161,9 +145,7 @@ impl TryFrom<pb_transaction::AddFragment> for AddFragment {
                 pb_transaction::add_fragment::RowIdSequence::InlineRowIds(data) => {
                     RowIdMeta::Inline(data.into())
                 }
-                pb_transaction::add_fragment::RowIdSequence::ExternalRowIds(file) => {
-                    RowIdMeta::External(external_file_from_wire(file))
-                }
+                pb_transaction::add_fragment::RowIdSequence::ColumnRowIds(_) => RowIdMeta::Column,
             }),
             last_updated_at_version_meta: message.last_updated_at_version_sequence.map(
                 |sequence| {
@@ -171,9 +153,9 @@ impl TryFrom<pb_transaction::AddFragment> for AddFragment {
                     pb_transaction::add_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
                         data,
                     ) => RowDatasetVersionMeta::Inline(data.into()),
-                    pb_transaction::add_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                        file,
-                    ) => RowDatasetVersionMeta::External(external_file_from_wire(file)),
+                    pb_transaction::add_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
+                        _,
+                    ) => RowDatasetVersionMeta::Column,
                 }
                 },
             ),
@@ -182,8 +164,8 @@ impl TryFrom<pb_transaction::AddFragment> for AddFragment {
                     pb_transaction::add_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
                         RowDatasetVersionMeta::Inline(data.into())
                     }
-                    pb_transaction::add_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
-                        RowDatasetVersionMeta::External(external_file_from_wire(file))
+                    pb_transaction::add_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(_) => {
+                        RowDatasetVersionMeta::Column
                     }
                 }
             }),

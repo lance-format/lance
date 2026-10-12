@@ -975,7 +975,7 @@ mod tests {
             transaction_properties: None,
         };
 
-        let message = pb::Transaction::from(&transaction);
+        let message = pb::Transaction::try_from(&transaction).unwrap();
         // The identity lives on the envelope alone. The operation carries the
         // steps, and their descriptions are what keeps history readable.
         assert_eq!(message.uuid, uuid);
