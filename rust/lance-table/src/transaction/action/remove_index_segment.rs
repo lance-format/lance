@@ -6,7 +6,6 @@
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::{Coordinate, Footprint};
-use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};

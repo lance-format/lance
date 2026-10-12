@@ -177,9 +177,7 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{
-        BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta, pb,
-    };
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
