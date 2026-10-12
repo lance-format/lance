@@ -159,19 +159,21 @@ message AddFragment {
   uint64 physical_rows = 2;
   /*
    * Stable-row-id and row-version sequences, carried exactly as on
-   * DataFragment. Absent on datasets without stable row ids.
+   * DataFragment. Absent on datasets without stable row ids. A `column_*` arm
+   * means the sequence is a hidden column of one of the data files this
+   * fragment's AddDataFile actions add; see RowLineageColumn.
    */
   oneof row_id_sequence {
     bytes inline_row_ids = 3;
-    lance.table.ExternalFile external_row_ids = 4;
+    lance.table.RowLineageColumn column_row_ids = 4;
   }
   oneof last_updated_at_version_sequence {
     bytes inline_last_updated_at_versions = 5;
-    lance.table.ExternalFile external_last_updated_at_versions = 6;
+    lance.table.RowLineageColumn column_last_updated_at_versions = 6;
   }
   oneof created_at_version_sequence {
     bytes inline_created_at_versions = 7;
-    lance.table.ExternalFile external_created_at_versions = 8;
+    lance.table.RowLineageColumn column_created_at_versions = 8;
   }
   /*
    * false => rearrangement only (rows unchanged, e.g. compaction); CDC and
