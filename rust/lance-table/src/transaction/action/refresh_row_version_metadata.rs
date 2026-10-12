@@ -5,7 +5,6 @@
 
 use super::apply::ApplyState;
 use super::{Coordinate, Footprint};
-use crate::format::pb;
 use crate::format::pb_transaction;
 use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
 use lance_core::deepsize::DeepSizeOf;
