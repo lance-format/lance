@@ -6,7 +6,6 @@
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
 use super::proto::required;
 use super::{Footprint, Ref};
-use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;

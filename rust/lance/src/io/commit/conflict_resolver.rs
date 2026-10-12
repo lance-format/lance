@@ -2772,7 +2772,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
-                | Operation::UpdateMemWalState { .. } => Ok(()),
+                | Operation::UpdateMemWalState { .. }
+                | Operation::Unknown { .. } => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
