@@ -9,19 +9,19 @@
 //! good detector of under-rejection — a pair that should have conflicted and did
 //! not — and a poor one for the opposite mistake. A conflict detector that
 //! rejected every pair outright would score nearly as well on it as one that
-//! reasons about footprints, because the matrix never asks a question whose
-//! answer depends on the footprint.
+//! reasons about what each side touches, because the matrix never asks a
+//! question whose answer depends on it.
 //!
-//! This module asks it, at both granularities a footprint has:
+//! This module asks it, at both granularities two operations can be disjoint at:
 //!
-//! - [`Footprint::OtherFragment`] — `theirs` works on fragment 1, which `ours`
+//! - [`Placement::OtherFragment`] — `theirs` works on fragment 1, which `ours`
 //!   never touches. Visible in the fragment ids a transaction carries.
-//! - [`Footprint::OtherField`] — `theirs` works on the *same* fragment, but on
+//! - [`Placement::OtherField`] — `theirs` works on the *same* fragment, but on
 //!   column `d` while `ours` works on `c`. Visible only to something that
 //!   reasons about fields, so a resolver can distinguish the fragment case and
 //!   still miss this one.
 //!
-//! A cell where the answers differ is a pair legacy resolves by footprint. A
+//! A cell where the answers differ is a pair legacy resolves by what it touches. A
 //! cell where they agree is one it resolves by opcode alone — which may be
 //! correct, or may be conservatism worth revisiting, but either way it is now
 //! recorded rather than unasked.
@@ -38,14 +38,14 @@ use std::sync::LazyLock;
 use rstest::rstest;
 
 use super::cases::{known_bug, run};
-use super::scenarios::{Footprint, Scenario};
+use super::scenarios::{Placement, Scenario};
 use super::{Isolation, Outcome};
 use super::{invariants, oracle};
 
-/// What one ordered pair does at one footprint.
+/// What one ordered pair does at one placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cell {
-    /// The footprint does not apply to this `theirs`, so there is nothing to
+    /// The placement does not apply to this `theirs`, so there is nothing to
     /// run: staging it there would produce the same transaction as `Same`.
     NotApplicable,
     /// Excluded because what the code does today is wrong; see
@@ -73,7 +73,7 @@ impl Cell {
     }
 }
 
-/// What each fragment-scoped ordered pair does at each footprint, stated under
+/// What each fragment-scoped ordered pair does at each placement, stated under
 /// [`Isolation::Legacy`].
 ///
 /// Rows are `ours`, columns are `theirs`, keyed by [`Scenario::code`]. Each cell
@@ -82,11 +82,11 @@ impl Cell {
 /// when it touches a different fragment. `L` lands, `R` retryable, `X`
 /// incompatible, `!` excluded as a known bug, `-` not applicable.
 ///
-/// A cell reading `R/L/L` is fully footprint-sensitive. `R/R/L` distinguishes
+/// A cell reading `R/L/L` is fully placement-sensitive. `R/R/L` distinguishes
 /// fragments but not fields. `R/R/R` rejects on opcode alone.
 ///
-/// Regenerate with the `discover_footprints` test below.
-const FOOTPRINT_MATRIX: &str = "\
+/// Regenerate with the `discover_placements` test below.
+const PLACEMENT_MATRIX: &str = "\
                        | dl      df      ur      uc      ov      dr      ci      rw
 delete                 | R/-/L   R/-/L   L/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L
 delete_whole_fragment  | R/-/L   R/-/L   R/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L
@@ -98,11 +98,11 @@ create_index           | L/-/L   L/-/L   L/-/L   L/L/L   L/L/L   L/L/L   R/-/R  
 rewrite                | R/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   R/-/L   R/-/L
 ";
 
-/// The level [`FOOTPRINT_MATRIX`] was observed under.
-const FOOTPRINT_ISOLATION: Isolation = Isolation::Legacy;
+/// The level [`PLACEMENT_MATRIX`] was observed under.
+const PLACEMENT_ISOLATION: Isolation = Isolation::Legacy;
 
-/// Parsed form of [`FOOTPRINT_MATRIX`], keyed by pair then footprint.
-static FOOTPRINT_CELLS: LazyLock<HashMap<(Scenario, Scenario, Footprint), Cell>> =
+/// Parsed form of [`PLACEMENT_MATRIX`], keyed by pair then placement.
+static PLACEMENT_CELLS: LazyLock<HashMap<(Scenario, Scenario, Placement), Cell>> =
     LazyLock::new(parse);
 
 /// The operations this module covers, in matrix order.
@@ -114,8 +114,8 @@ fn scoped() -> Vec<Scenario> {
 }
 
 /// What a cell must be without running it, if anything. `None` means run it.
-fn predetermined(theirs: Scenario, footprint: Footprint, bug: bool) -> Option<Cell> {
-    if footprint == Footprint::OtherField && !theirs.is_field_scoped() {
+fn predetermined(theirs: Scenario, placement: Placement, bug: bool) -> Option<Cell> {
+    if placement == Placement::OtherField && !theirs.is_field_scoped() {
         Some(Cell::NotApplicable)
     } else if bug {
         Some(Cell::Excluded)
@@ -124,18 +124,18 @@ fn predetermined(theirs: Scenario, footprint: Footprint, bug: bool) -> Option<Ce
     }
 }
 
-fn parse() -> HashMap<(Scenario, Scenario, Footprint), Cell> {
+fn parse() -> HashMap<(Scenario, Scenario, Placement), Cell> {
     let scenario_by = |field: fn(Scenario) -> &'static str, value: &str| {
         Scenario::ALL
             .into_iter()
             .find(|s| field(*s) == value)
-            .unwrap_or_else(|| panic!("the footprint matrix names an unknown scenario {value:?}"))
+            .unwrap_or_else(|| panic!("the placement matrix names an unknown scenario {value:?}"))
     };
 
-    let mut lines = FOOTPRINT_MATRIX
+    let mut lines = PLACEMENT_MATRIX
         .lines()
         .filter(|line| !line.trim().is_empty());
-    let header = lines.next().expect("the footprint matrix has a header row");
+    let header = lines.next().expect("the placement matrix has a header row");
     let columns: Vec<Scenario> = header
         .split_once('|')
         .expect("the header row is delimited by `|`")
@@ -146,20 +146,20 @@ fn parse() -> HashMap<(Scenario, Scenario, Footprint), Cell> {
     assert_eq!(
         columns,
         scoped(),
-        "the footprint matrix columns must be the fragment-scoped scenarios, in order",
+        "the placement matrix columns must be the fragment-scoped scenarios, in order",
     );
 
     let mut cells = HashMap::new();
     for line in lines {
         let (label, rest) = line
             .split_once('|')
-            .expect("a footprint matrix row is delimited by `|`");
+            .expect("a placement matrix row is delimited by `|`");
         let ours = scenario_by(Scenario::name, label.trim());
         let entries: Vec<&str> = rest.split_whitespace().collect();
         assert_eq!(
             entries.len(),
             columns.len(),
-            "footprint matrix row {} has {} cells but there are {} columns",
+            "placement matrix row {} has {} cells but there are {} columns",
             ours.name(),
             entries.len(),
             columns.len(),
@@ -168,16 +168,16 @@ fn parse() -> HashMap<(Scenario, Scenario, Footprint), Cell> {
             let symbols: Vec<&str> = entry.split('/').collect();
             assert_eq!(
                 symbols.len(),
-                Footprint::ALL.len(),
-                "cell {entry:?} does not name all {} footprints",
-                Footprint::ALL.len(),
+                Placement::ALL.len(),
+                "cell {entry:?} does not name all {} placements",
+                Placement::ALL.len(),
             );
-            for (footprint, symbol) in Footprint::ALL.into_iter().zip(symbols) {
+            for (placement, symbol) in Placement::ALL.into_iter().zip(symbols) {
                 assert!(
                     cells
-                        .insert((ours, *theirs, footprint), Cell::from_symbol(symbol))
+                        .insert((ours, *theirs, placement), Cell::from_symbol(symbol))
                         .is_none(),
-                    "the footprint matrix has two rows for {}",
+                    "the placement matrix has two rows for {}",
                     ours.name(),
                 );
             }
@@ -186,8 +186,8 @@ fn parse() -> HashMap<(Scenario, Scenario, Footprint), Cell> {
     cells
 }
 
-/// One row of the footprint matrix: `ours` against every fragment-scoped
-/// `theirs`, at every footprint.
+/// One row of the placement matrix: `ours` against every fragment-scoped
+/// `theirs`, at every placement.
 #[rstest]
 #[case::delete(Scenario::Delete)]
 #[case::delete_whole_fragment(Scenario::DeleteWholeFragment)]
@@ -198,18 +198,18 @@ fn parse() -> HashMap<(Scenario, Scenario, Footprint), Cell> {
 #[case::create_index(Scenario::CreateIndex)]
 #[case::rewrite(Scenario::Rewrite)]
 #[tokio::test]
-async fn footprint_row(#[case] ours: Scenario) {
+async fn placement_row(#[case] ours: Scenario) {
     for theirs in scoped() {
-        for footprint in Footprint::ALL {
-            let cell = *FOOTPRINT_CELLS
-                .get(&(ours, theirs, footprint))
+        for placement in Placement::ALL {
+            let cell = *PLACEMENT_CELLS
+                .get(&(ours, theirs, placement))
                 .unwrap_or_else(|| {
                     panic!(
-                        "({}, {}) at {} is missing from the footprint matrix; re-run \
-                         `discover_footprints`",
+                        "({}, {}) at {} is missing from the placement matrix; re-run \
+                         `discover_placements`",
                         ours.name(),
                         theirs.name(),
-                        footprint.name(),
+                        placement.name(),
                     )
                 });
             let Cell::Expected(expected) = cell else {
@@ -219,9 +219,9 @@ async fn footprint_row(#[case] ours: Scenario) {
                 "({} over {} touching {})",
                 ours.name(),
                 theirs.name(),
-                footprint.name(),
+                placement.name(),
             );
-            let (outcome, landed) = run(ours, theirs, footprint).await;
+            let (outcome, landed) = run(ours, theirs, placement).await;
             assert_eq!(
                 outcome, expected,
                 "{context}: expected {expected:?} but observed {outcome:?}",
@@ -231,10 +231,10 @@ async fn footprint_row(#[case] ours: Scenario) {
                 // Boxed for the same reason as in `cases`: a second commit
                 // sequence makes the future large enough to trip clippy.
                 Box::pin(oracle::check(
-                    FOOTPRINT_ISOLATION,
+                    PLACEMENT_ISOLATION,
                     ours,
                     theirs,
-                    footprint,
+                    placement,
                     &after,
                     &context,
                 ))
@@ -244,31 +244,31 @@ async fn footprint_row(#[case] ours: Scenario) {
     }
 }
 
-/// Every pair must be covered at every footprint, and the cells that are not
+/// Every pair must be covered at every placement, and the cells that are not
 /// asserted must be ones the harness can justify not asserting.
 ///
 /// `-` has to line up with [`Scenario::is_field_scoped`] and `!` with
 /// `KNOWN_BUGS`, or the grid is quietly skipping cells. `KNOWN_BUGS` is keyed on
-/// the pair rather than the footprint, so a bug that only reproduces when the
-/// footprints overlap exempts the disjoint cells too; requiring all three to be
+/// the pair rather than the placement, so a bug that only reproduces when the
+/// placements overlap exempts the disjoint cells too; requiring all three to be
 /// excluded together keeps that visible rather than letting it pass unnoticed.
 #[test]
-fn footprint_matrix_is_total() {
+fn placement_matrix_is_total() {
     for ours in scoped() {
         for theirs in scoped() {
             let bug = known_bug(ours, theirs).is_some();
-            for footprint in Footprint::ALL {
-                let cell = *FOOTPRINT_CELLS
-                    .get(&(ours, theirs, footprint))
+            for placement in Placement::ALL {
+                let cell = *PLACEMENT_CELLS
+                    .get(&(ours, theirs, placement))
                     .unwrap_or_else(|| {
                         panic!(
-                            "({}, {}) at {} is missing from the footprint matrix",
+                            "({}, {}) at {} is missing from the placement matrix",
                             ours.name(),
                             theirs.name(),
-                            footprint.name(),
+                            placement.name(),
                         )
                     });
-                match (cell, predetermined(theirs, footprint, bug)) {
+                match (cell, predetermined(theirs, placement, bug)) {
                     (Cell::Expected(_), None) => {}
                     (actual, Some(wanted)) if actual == wanted => {}
                     (actual, _) => panic!(
@@ -276,7 +276,7 @@ fn footprint_matrix_is_total() {
                          says about it: field-scoped {}, known bug {bug}",
                         ours.name(),
                         theirs.name(),
-                        footprint.name(),
+                        placement.name(),
                         theirs.is_field_scoped(),
                     ),
                 }
@@ -285,19 +285,19 @@ fn footprint_matrix_is_total() {
     }
 }
 
-/// Print the observed outcome for every fragment-scoped pair at every footprint,
+/// Print the observed outcome for every fragment-scoped pair at every placement,
 /// as a grid.
 ///
-/// Not an assertion — this regenerates [`FOOTPRINT_MATRIX`]. Run it with:
+/// Not an assertion — this regenerates [`PLACEMENT_MATRIX`]. Run it with:
 ///
 /// ```text
-/// cargo test -p lance --lib conflict_matrix::footprint::discover_footprints -- --ignored --nocapture
+/// cargo test -p lance --lib conflict_matrix::placement::discover_placements -- --ignored --nocapture
 /// ```
 #[tokio::test]
-#[ignore = "discovery tool, not an assertion; regenerates the FOOTPRINT_MATRIX grid"]
+#[ignore = "discovery tool, not an assertion; regenerates the PLACEMENT_MATRIX grid"]
 // Stdout is the output format here, as in `cases::discover`.
 #[allow(clippy::print_stdout)]
-async fn discover_footprints() {
+async fn discover_placements() {
     let scoped = scoped();
     let width = scoped
         .iter()
@@ -305,8 +305,8 @@ async fn discover_footprints() {
         .max()
         .expect("there is at least one fragment-scoped scenario")
         + 1;
-    // One symbol per footprint plus the separators between them, and a gutter.
-    let column = Footprint::ALL.len() * 2 + 2;
+    // One symbol per placement plus the separators between them, and a gutter.
+    let column = Placement::ALL.len() * 2 + 2;
 
     let mut out = format!("{:width$}| ", "");
     for theirs in &scoped {
@@ -319,13 +319,13 @@ async fn discover_footprints() {
         for theirs in &scoped {
             let bug = known_bug(*ours, *theirs).is_some();
             let mut entry = String::new();
-            for footprint in Footprint::ALL {
+            for placement in Placement::ALL {
                 if !entry.is_empty() {
                     entry.push('/');
                 }
-                let cell = match predetermined(*theirs, footprint, bug) {
+                let cell = match predetermined(*theirs, placement, bug) {
                     Some(cell) => cell,
-                    None => Cell::Expected(run(*ours, *theirs, footprint).await.0),
+                    None => Cell::Expected(run(*ours, *theirs, placement).await.0),
                 };
                 entry.push(cell.symbol());
             }

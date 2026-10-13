@@ -44,6 +44,14 @@
 //! a regression test and the cell rejoins the matrix. See [`cases`] for the
 //! ones this suite found.
 //!
+//! # Legacy parity
+//!
+//! The matrix also stages Transaction V2 action sets, each standing in for one
+//! or more legacy operations. An action set must resolve at least as
+//! permissively as the legacy operations it replaces, so each of its cells is
+//! checked against the cells of its legacy analogues, and a cell that falls
+//! short has to be marked as a known gap. See `cases::legacy_bar`.
+//!
 //! # Why it lives here
 //!
 //! In-crate rather than under `tests/`: staging an uncommitted transaction and
@@ -53,11 +61,11 @@
 #[cfg(test)]
 mod cases;
 #[cfg(test)]
-mod footprint;
-#[cfg(test)]
 mod invariants;
 #[cfg(test)]
 mod oracle;
+#[cfg(test)]
+mod placement;
 #[cfg(test)]
 mod scenarios;
 
@@ -104,6 +112,16 @@ impl Outcome {
             Self::Retryable => 'R',
             Self::Incompatible => 'X',
             Self::Lands => 'L',
+        }
+    }
+
+    /// Higher is more permissive. A retryable conflict beats an incompatible
+    /// one because the writer can still get its change in.
+    fn permissiveness(self) -> u8 {
+        match self {
+            Self::Incompatible => 0,
+            Self::Retryable => 1,
+            Self::Lands => 2,
         }
     }
 

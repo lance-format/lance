@@ -12,7 +12,7 @@ use rstest::rstest;
 
 use super::invariants;
 use super::oracle;
-use super::scenarios::{Footprint, OVERLAY_VALUE, Scenario, Staged, fixture};
+use super::scenarios::{OVERLAY_VALUE, Placement, Scenario, Staged, fixture};
 use super::{Isolation, Outcome};
 use crate::{Dataset, Error};
 
@@ -24,6 +24,15 @@ use crate::{Dataset, Error};
 /// `L` lands, `R` retryable, `X` incompatible, and `!` excluded because what
 /// the code does today is wrong (see [`KNOWN_BUGS`]).
 ///
+/// The `action_*` rows and `v*` columns hold Transaction V2 action sets to
+/// legacy parity: each cell must be at least as permissive as the strictest
+/// cell among its legacy analogues' pairs (see [`Scenario::analogues`] and
+/// [`legacy_bar`]). A cell suffixed `*` is a known parity gap, stricter than
+/// that bar; the suffix is checked, so closing a gap means dropping it. Today
+/// every action set against a legacy operation fails closed in
+/// `check_action_txn`, so those cells are retryable and every one where legacy
+/// does better is a gap.
+///
 /// This grid is the expectation table, not a rendering of one: it is parsed at
 /// run time, so there is a single place to read and a single place to change.
 /// A row landing here also opts that pair into the invariant battery, so a cell
@@ -33,33 +42,44 @@ use crate::{Dataset, Error};
 /// change; do not hand-edit a cell to make a failing test pass. When isolation
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
-                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf
-append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L
-delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L
-delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L
-update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L
-update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L
-data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L
-data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L
-merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
-merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
-create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L
-rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L
-overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L
-restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X
-update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X
+                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+
+append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  R* R* R*
+delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  R* R* R*
+delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  R* R* R*
+update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  R* R* R*
+update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  R* R* R*
+data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  R* R* R*
+data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  R* R* R*
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  R* R* R*
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  R  R* R
+merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
+merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
+create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  R* R* R*
+rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  R* R* R*
+overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  R* R* R*
+restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  R* R  R
+update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  R* R  R
+action_append             | R* R* R* R* R* R* R* R* R  R* R  R* R* R  R  R* L  L  L
+action_update_config      | R* R* R* R* R* R* R* R* R* R  R  R* R* R  R  R  L  R  R
+action_append_and_config  | R* R* R* R* R* R* R* R* R  R  R  R* R* R  R  R  L  R  R
 ";
 
 /// The level [`MATRIX`] was observed under.
 const MATRIX_ISOLATION: Isolation = Isolation::Legacy;
 
+/// One asserted cell of [`MATRIX`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Expected {
+    outcome: Outcome,
+    /// Marked `*`: stricter than [`legacy_bar`] allows, as a known gap.
+    parity_gap: bool,
+}
+
 /// Parsed form of [`MATRIX`]. `None` marks a cell excluded as a known bug.
-static MATRIX_CELLS: LazyLock<HashMap<(Scenario, Scenario), Option<Outcome>>> =
+static MATRIX_CELLS: LazyLock<HashMap<(Scenario, Scenario), Option<Expected>>> =
     LazyLock::new(parse_matrix);
 
-fn parse_matrix() -> HashMap<(Scenario, Scenario), Option<Outcome>> {
+fn parse_matrix() -> HashMap<(Scenario, Scenario), Option<Expected>> {
     let scenario_by = |field: fn(Scenario) -> &'static str, value: &str| {
         Scenario::ALL
             .into_iter()
@@ -100,7 +120,16 @@ fn parse_matrix() -> HashMap<(Scenario, Scenario), Option<Outcome>> {
             columns.len(),
         );
         for (theirs, symbol) in columns.iter().zip(symbols) {
-            let cell = (symbol != "!").then(|| Outcome::from_symbol(symbol));
+            let cell = (symbol != "!").then(|| match symbol.strip_suffix('*') {
+                Some(outcome) => Expected {
+                    outcome: Outcome::from_symbol(outcome),
+                    parity_gap: true,
+                },
+                None => Expected {
+                    outcome: Outcome::from_symbol(symbol),
+                    parity_gap: false,
+                },
+            });
             assert!(
                 cells.insert((ours, *theirs), cell).is_none(),
                 "the matrix has two rows for {}",
@@ -112,7 +141,7 @@ fn parse_matrix() -> HashMap<(Scenario, Scenario), Option<Outcome>> {
 }
 
 /// Render a grid in [`MATRIX`]'s format, for the `discover` tool.
-fn render_matrix(symbol: impl Fn(Scenario, Scenario) -> char) -> String {
+fn render_matrix(cell: impl Fn(Scenario, Scenario) -> String) -> String {
     let width = Scenario::ALL
         .into_iter()
         .map(|s| s.name().len())
@@ -129,8 +158,7 @@ fn render_matrix(symbol: impl Fn(Scenario, Scenario) -> char) -> String {
         out.push('\n');
         out.push_str(&format!("{:width$}| ", ours.name()));
         for theirs in Scenario::ALL {
-            out.push(symbol(ours, theirs));
-            out.push_str("  ");
+            out.push_str(&format!("{:<3}", cell(ours, theirs)));
         }
     }
     out.trim_end().to_string()
@@ -161,7 +189,45 @@ pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str
 }
 
 fn expectation(ours: Scenario, theirs: Scenario) -> Option<Outcome> {
-    MATRIX_CELLS.get(&(ours, theirs)).copied().flatten()
+    MATRIX_CELLS
+        .get(&(ours, theirs))
+        .copied()
+        .flatten()
+        .map(|cell| cell.outcome)
+}
+
+/// The least permissive outcome a pair may have and still be at legacy parity:
+/// the strictest outcome among the pairs of its legacy analogues.
+///
+/// For a pair of legacy scenarios this is just its own outcome. `None` when an
+/// analogue pair is excluded as a known bug, since there is then no legacy
+/// behaviour to hold it to.
+fn legacy_bar(
+    ours: Scenario,
+    theirs: Scenario,
+    outcome: impl Fn(Scenario, Scenario) -> Option<Outcome>,
+) -> Option<Outcome> {
+    let mut bar: Option<Outcome> = None;
+    for ours in ours.analogues() {
+        for theirs in theirs.analogues() {
+            let analogue = outcome(ours, theirs)?;
+            if bar.is_none_or(|bar| analogue.permissiveness() < bar.permissiveness()) {
+                bar = Some(analogue);
+            }
+        }
+    }
+    bar
+}
+
+/// Whether `outcome` falls short of `ours` over `theirs`'s [`legacy_bar`].
+fn stricter_than_legacy(
+    ours: Scenario,
+    theirs: Scenario,
+    outcome: Outcome,
+    legacy: impl Fn(Scenario, Scenario) -> Option<Outcome>,
+) -> bool {
+    legacy_bar(ours, theirs, legacy)
+        .is_some_and(|bar| outcome.permissiveness() < bar.permissiveness())
 }
 
 /// What one cell produces: the verdict, and — when `ours` landed — the dataset
@@ -171,8 +237,8 @@ type Landing = (Outcome, Option<(Arc<Dataset>, Dataset)>);
 /// Run one ordered pair: stage `ours` against the fixture, land `theirs`
 /// underneath it, then commit `ours` so it has to rebase over `theirs`.
 ///
-/// `ours` always works on fragment 0; `footprint` says which fragment `theirs`
-/// touches, which is what the `footprint` module varies.
+/// `ours` always works on fragment 0; `placement` says which fragment `theirs`
+/// touches, which is what the `placement` module varies.
 ///
 /// Returns the observed outcome and, when it landed, the dataset `theirs`
 /// produced alongside the one `ours` produced.
@@ -184,7 +250,7 @@ type Landing = (Outcome, Option<(Arc<Dataset>, Dataset)>);
 pub(super) fn run(
     ours: Scenario,
     theirs: Scenario,
-    footprint: Footprint,
+    placement: Placement,
 ) -> BoxFuture<'static, Landing> {
     Box::pin(async move {
         let base = fixture().await;
@@ -195,7 +261,7 @@ pub(super) fn run(
             .unwrap_or_else(|e| panic!("staging {} failed: {e}", ours.name()));
 
         let concurrent = theirs
-            .stage_with(&base, footprint)
+            .stage_with(&base, placement)
             .await
             .unwrap_or_else(|e| panic!("staging {} failed: {e}", theirs.name()));
         let after_theirs = Arc::new(
@@ -235,6 +301,9 @@ pub(super) fn run(
 #[case::overwrite(Scenario::Overwrite)]
 #[case::restore(Scenario::Restore)]
 #[case::update_config(Scenario::UpdateConfig)]
+#[case::action_append(Scenario::ActionAppend)]
+#[case::action_update_config(Scenario::ActionUpdateConfig)]
+#[case::action_append_and_config(Scenario::ActionAppendAndConfig)]
 #[tokio::test]
 async fn matrix_row(#[case] ours: Scenario) {
     for theirs in Scenario::ALL {
@@ -249,7 +318,7 @@ async fn matrix_row(#[case] ours: Scenario) {
             )
         });
         let context = format!("({} over {})", ours.name(), theirs.name());
-        let (outcome, landed) = run(ours, theirs, Footprint::Same).await;
+        let (outcome, landed) = run(ours, theirs, Placement::Same).await;
         assert_eq!(
             outcome, expected,
             "{context}: expected {expected:?} but observed {outcome:?}",
@@ -262,7 +331,7 @@ async fn matrix_row(#[case] ours: Scenario) {
                 MATRIX_ISOLATION,
                 ours,
                 theirs,
-                Footprint::Same,
+                Placement::Same,
                 &after,
                 &context,
             ))
@@ -293,6 +362,9 @@ async fn matrix_row(#[case] ours: Scenario) {
 #[case::overwrite(Scenario::Overwrite)]
 #[case::restore(Scenario::Restore)]
 #[case::update_config(Scenario::UpdateConfig)]
+#[case::action_append(Scenario::ActionAppend)]
+#[case::action_update_config(Scenario::ActionUpdateConfig)]
+#[case::action_append_and_config(Scenario::ActionAppendAndConfig)]
 #[tokio::test]
 async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
     let base = fixture().await;
@@ -343,6 +415,40 @@ fn matrix_is_total() {
                     "expected"
                 },
                 if bug.is_some() { "listed" } else { "absent" },
+            );
+        }
+    }
+}
+
+/// Every cell must be at least as permissive as its [`legacy_bar`], unless it
+/// is marked `*` as a known gap, and every `*` must still be a gap.
+///
+/// Reads the grid rather than running anything: `matrix_row` already holds each
+/// cell to what the code does.
+#[test]
+fn matrix_is_at_legacy_parity() {
+    for ours in Scenario::ALL {
+        for theirs in Scenario::ALL {
+            let Some(Some(cell)) = MATRIX_CELLS.get(&(ours, theirs)).copied() else {
+                continue;
+            };
+            let stricter = stricter_than_legacy(ours, theirs, cell.outcome, expectation);
+            let bar = legacy_bar(ours, theirs, expectation);
+            assert!(
+                !stricter || cell.parity_gap,
+                "({} over {}) is {:?}, stricter than its legacy analogues' {bar:?}. Make it at \
+                 least as permissive, or mark the cell `*` as a known gap",
+                ours.name(),
+                theirs.name(),
+                cell.outcome,
+            );
+            assert!(
+                stricter || !cell.parity_gap,
+                "({} over {}) is marked `*` but {:?} is no stricter than its legacy analogues' \
+                 {bar:?}; drop the marker",
+                ours.name(),
+                theirs.name(),
+                cell.outcome,
             );
         }
     }
@@ -583,7 +689,8 @@ fn int_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<i32> {
 ///
 /// Cells that are excluded in the current matrix are re-emitted as `!` rather
 /// than as whatever they do, so regenerating never silently turns a known bug
-/// back into an expectation.
+/// back into an expectation. Cells stricter than their [`legacy_bar`] are
+/// emitted with the `*` gap marker.
 #[tokio::test]
 #[ignore = "discovery tool, not an assertion; regenerates the MATRIX grid"]
 // Stdout is the output format here: this test's job is to emit a grid to paste
@@ -593,16 +700,23 @@ async fn discover() {
     let mut observed = HashMap::new();
     for ours in Scenario::ALL {
         for theirs in Scenario::ALL {
-            let symbol = if known_bug(ours, theirs).is_some() {
-                '!'
+            let outcome = if known_bug(ours, theirs).is_some() {
+                None
             } else {
-                run(ours, theirs, Footprint::Same).await.0.symbol()
+                Some(run(ours, theirs, Placement::Same).await.0)
             };
-            observed.insert((ours, theirs), symbol);
+            observed.insert((ours, theirs), outcome);
         }
     }
+    let observed_outcome = |ours, theirs| observed[&(ours, theirs)];
     println!(
         "{}",
-        render_matrix(|ours, theirs| observed[&(ours, theirs)])
+        render_matrix(|ours, theirs| match observed_outcome(ours, theirs) {
+            None => "!".to_string(),
+            Some(outcome) if stricter_than_legacy(ours, theirs, outcome, observed_outcome) => {
+                format!("{}*", outcome.symbol())
+            }
+            Some(outcome) => outcome.symbol().to_string(),
+        })
     );
 }
