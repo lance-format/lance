@@ -309,6 +309,36 @@ fn serialized_variable_cost(
         })
 }
 
+// Compare complete layouts, including value-buffer alignment. Pricing offsets
+// alone can select Delta(Flat) just for omitting its first offset, then lose all
+// those bytes again to the second buffer's header and padding.
+fn offset_layout_costs<N: OffsetSizeTrait>(
+    offsets: &[N],
+    ranges: &[BinaryChunkRange],
+    codec: &SequenceBlockCodec,
+    legacy_encoding: &CompressiveEncoding,
+    context: MiniBlockCompressionContext,
+) -> Result<(u64, u64)> {
+    let encoding = EncodingUtils::variable(codec.expected_encoding().clone(), None);
+    let mut generic = codec.estimated_wire_bytes()
+        + (encoding.encoded_len() - codec.expected_encoding().encoded_len()) as u64;
+    let mut legacy = legacy_encoding.encoded_len() as u64;
+    for range in ranges {
+        let values = chunk_value_range(offsets, *range)?.len();
+        let count = range.end_offset_index - range.start_offset_index + 1;
+        let bytes = values
+            .checked_add(
+                count
+                    .checked_mul(N::get_byte_width())
+                    .ok_or_else(|| Error::invalid_input("Offset bytes overflow"))?,
+            )
+            .ok_or_else(|| Error::invalid_input("Variable chunk bytes overflow"))?;
+        legacy += context.chunk_header_bytes(1) + bytes.next_multiple_of(8) as u64;
+        generic += context.chunk_header_bytes(1) + values.next_multiple_of(8) as u64;
+    }
+    Ok((generic, legacy))
+}
+
 fn build_generic_chunks<N: OffsetSizeTrait>(
     data: &VariableWidthBlock,
     offsets: &[N],
@@ -454,19 +484,24 @@ impl BinaryMiniBlockEncoder {
         let bits_per_offset = data.bits_per_offset as u64;
         let legacy_encoding =
             EncodingUtils::variable(EncodingUtils::flat(bits_per_offset, None), None);
-        let (legacy_buffers, legacy_chunks) =
-            chunk_offsets(offsets, &data.data, legacy_alignment, self.minichunk_size);
-        let legacy = MiniBlockCompressed {
-            data: legacy_buffers,
-            chunks: legacy_chunks,
-            num_values: data.num_values,
+        let legacy = || {
+            let (buffers, chunks) =
+                chunk_offsets(offsets, &data.data, legacy_alignment, self.minichunk_size);
+            (
+                MiniBlockCompressed {
+                    data: buffers,
+                    chunks,
+                    num_values: data.num_values,
+                },
+                legacy_encoding.clone(),
+            )
         };
         let Some(field_params) = self
             .generic_offsets
             .as_ref()
             .filter(|_| context.allows_generic_offsets())
         else {
-            return Ok((legacy, legacy_encoding));
+            return Ok(legacy());
         };
 
         let ranges = binary_chunk_ranges(offsets, self.minichunk_size);
@@ -483,6 +518,29 @@ impl BinaryMiniBlockEncoder {
         let extra_payload_header = context
             .chunk_header_bytes(2)
             .saturating_sub(context.chunk_header_bytes(1));
+        // Bound default-policy exploration when many small chunks are likely
+        // to remain flat. Sample whole chunks across the page, not tiny prefixes
+        // of every chunk; the final selection still checks every member.
+        if field_params.compression.is_none() && member_ranges.len() > 8 {
+            let sample_ranges = (0..8)
+                .map(|i| member_ranges[i * (member_ranges.len() - 1) / 7].clone())
+                .collect::<Vec<_>>();
+            let sample = select_block_codec(
+                &offsets_block,
+                &sample_ranges,
+                field_params,
+                BlockCost::new(extra_payload_header, 8),
+                true,
+            )?;
+            let sample_chunks = (0..8)
+                .map(|i| ranges[i * (ranges.len() - 1) / 7])
+                .collect::<Vec<_>>();
+            let (generic_cost, legacy_cost) =
+                offset_layout_costs(offsets, &sample_chunks, &sample, &legacy_encoding, context)?;
+            if generic_cost >= legacy_cost {
+                return Ok(legacy());
+            }
+        }
         let codec = select_block_codec(
             &offsets_block,
             &member_ranges,
@@ -494,16 +552,19 @@ impl BinaryMiniBlockEncoder {
             codec.expected_encoding().compression.as_ref(),
             Some(Compression::Flat(_))
         ) {
-            return Ok((legacy, legacy_encoding));
+            return Ok(legacy());
         }
 
+        let (generic_cost, legacy_cost) =
+            offset_layout_costs(offsets, &ranges, &codec, &legacy_encoding, context)?;
+        if generic_cost >= legacy_cost {
+            return Ok(legacy());
+        }
         let (generic, generic_encoding) = build_generic_chunks(&data, offsets, &ranges, &codec)?;
-        if serialized_variable_cost(&generic, &generic_encoding, context)
-            < serialized_variable_cost(&legacy, &legacy_encoding, context)
-        {
+        if serialized_variable_cost(&generic, &generic_encoding, context) < legacy_cost {
             Ok((generic, generic_encoding))
         } else {
-            Ok((legacy, legacy_encoding))
+            Ok(legacy())
         }
     }
 }
