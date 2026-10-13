@@ -21,6 +21,9 @@ use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
+use lance_table::transaction::action::{
+    Action, AddDataFile, AddFragment, CompositeOperation, ConfigUpdate, FieldRef, Ref, UserStep,
+};
 use lance_table::transaction::{UpdateMap, UpdateMapEntry};
 
 use crate::Result;
@@ -59,7 +62,11 @@ impl Staged {
     /// Commit against `base`, which pins the read version. `base` being behind
     /// the latest version is what forces the rebase under test.
     pub async fn commit(self, base: &Arc<Dataset>) -> Result<Dataset> {
-        let mut builder = CommitBuilder::new(base.clone()).with_max_retries(1);
+        // The opt-in only gates committing an action set, so turning it on for
+        // every scenario changes nothing for the legacy ones.
+        let mut builder = CommitBuilder::new(base.clone())
+            .with_max_retries(1)
+            .with_experimental_composite_operations(true);
         if let Some(rows) = self.affected_rows {
             builder = builder.with_affected_rows(rows);
         }
@@ -70,6 +77,10 @@ impl Staged {
 /// The operations this suite stages, one variant per column and row of the
 /// matrix. `Update` appears twice because its two modes take different arms of
 /// `check_update_txn` and build different manifests.
+///
+/// The `Action*` variants are Transaction V2 action sets. Each one names the
+/// legacy scenarios it stands in for in [`Scenario::analogues`], which is what
+/// the parity check in `cases` holds it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Scenario {
     Append,
@@ -96,6 +107,13 @@ pub(super) enum Scenario {
     /// A schema-metadata update. `updates_schema_or_field_metadata` keys on
     /// schema or field metadata specifically, not on config entries.
     UpdateConfig,
+    /// [`Scenario::Append`]'s data files as `AddFragment` + `AddDataFile`.
+    ActionAppend,
+    /// [`Scenario::UpdateConfig`]'s schema-metadata key as a `ConfigUpdate`.
+    ActionUpdateConfig,
+    /// Both of the above in one commit, which no single legacy operation can
+    /// express.
+    ActionAppendAndConfig,
 }
 
 /// What a staged `theirs` touches, relative to what every `ours` in the matrix
@@ -105,14 +123,14 @@ pub(super) enum Scenario {
 /// is the only way to ask "do these two conflict *because* of what they touch,
 /// or merely because of what they are?". Without the axis the matrix scores a
 /// conflict detector that rejects everything just as well as one that reasons
-/// about footprints.
+/// about what each side touches.
 ///
 /// Two operations can be disjoint in two different ways, and legacy need not
 /// treat them alike: a different fragment is visible in the fragment ids a
 /// transaction carries, while a different column of the *same* fragment is only
 /// visible to something that reasons about fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum Footprint {
+pub(super) enum Placement {
     /// Fragment 0, field `c` — exactly what `ours` touches.
     Same,
     /// Fragment 0, field `d`. Same fragment, no column in common.
@@ -124,10 +142,10 @@ pub(super) enum Footprint {
     OtherFragment,
 }
 
-impl Footprint {
+impl Placement {
     pub const ALL: [Self; 3] = [Self::Same, Self::OtherField, Self::OtherFragment];
 
-    /// The fixture fragment this footprint names.
+    /// The fixture fragment this placement names.
     fn fragment(self) -> usize {
         match self {
             Self::Same | Self::OtherField => 0,
@@ -135,7 +153,7 @@ impl Footprint {
         }
     }
 
-    /// The field this footprint names. Both `c` and `d` hold a data file to
+    /// The field this placement names. Both `c` and `d` hold a data file to
     /// themselves, which is what lets a scenario swap one without orphaning
     /// another field.
     fn field(self) -> &'static str {
@@ -155,7 +173,7 @@ impl Footprint {
 }
 
 impl Scenario {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::Append,
         Self::Delete,
         Self::DeleteWholeFragment,
@@ -172,6 +190,9 @@ impl Scenario {
         Self::Overwrite,
         Self::Restore,
         Self::UpdateConfig,
+        Self::ActionAppend,
+        Self::ActionUpdateConfig,
+        Self::ActionAppendAndConfig,
     ];
 
     /// Two-letter column heading for the matrix grid in `cases`.
@@ -193,6 +214,9 @@ impl Scenario {
             Self::Overwrite => "ow",
             Self::Restore => "rs",
             Self::UpdateConfig => "cf",
+            Self::ActionAppend => "va",
+            Self::ActionUpdateConfig => "vc",
+            Self::ActionAppendAndConfig => "v+",
         }
     }
 
@@ -214,6 +238,24 @@ impl Scenario {
             Self::Overwrite => "overwrite",
             Self::Restore => "restore",
             Self::UpdateConfig => "update_config",
+            Self::ActionAppend => "action_append",
+            Self::ActionUpdateConfig => "action_update_config",
+            Self::ActionAppendAndConfig => "action_append_and_config",
+        }
+    }
+
+    /// The legacy scenarios this one stands in for: itself, for a legacy
+    /// scenario.
+    ///
+    /// An action set with several analogues is held to the strictest of them,
+    /// since a legacy writer would have needed one commit per analogue and
+    /// could land only where every one of those commits does.
+    pub fn analogues(self) -> Vec<Self> {
+        match self {
+            Self::ActionAppend => vec![Self::Append],
+            Self::ActionUpdateConfig => vec![Self::UpdateConfig],
+            Self::ActionAppendAndConfig => vec![Self::Append, Self::UpdateConfig],
+            legacy => vec![legacy],
         }
     }
 
@@ -232,7 +274,7 @@ impl Scenario {
     /// none, a projection and a merge act on the schema, and overwrite, restore
     /// and a config update replace or annotate whole-dataset state. Staging
     /// them at a different fragment would produce the same transaction, so the
-    /// footprint axis would cost runtime and prove nothing.
+    /// placement axis would cost runtime and prove nothing.
     pub fn is_fragment_scoped(self) -> bool {
         matches!(
             self,
@@ -262,24 +304,24 @@ impl Scenario {
 
     /// Stage against the fragment every `ours` in the matrix uses.
     pub async fn stage(self, dataset: &Arc<Dataset>) -> Result<Staged> {
-        self.stage_with(dataset, Footprint::Same).await
+        self.stage_with(dataset, Placement::Same).await
     }
 
-    pub async fn stage_with(self, dataset: &Arc<Dataset>, footprint: Footprint) -> Result<Staged> {
+    pub async fn stage_with(self, dataset: &Arc<Dataset>, placement: Placement) -> Result<Staged> {
         debug_assert!(
-            footprint == Footprint::Same || self.is_fragment_scoped(),
+            placement == Placement::Same || self.is_fragment_scoped(),
             "{} is dataset-scoped; staging it at {} would produce the same transaction",
             self.name(),
-            footprint.name(),
+            placement.name(),
         );
         debug_assert!(
-            footprint != Footprint::OtherField || self.is_field_scoped(),
+            placement != Placement::OtherField || self.is_field_scoped(),
             "{} is not field-scoped; staging it at {} would produce the same transaction",
             self.name(),
-            footprint.name(),
+            placement.name(),
         );
-        let fragment = footprint.fragment();
-        let field = footprint.field();
+        let fragment = placement.fragment();
+        let field = placement.field();
         match self {
             Self::Append => stage_append(dataset).await,
             Self::Delete => stage_delete(dataset, fragment).await,
@@ -299,6 +341,9 @@ impl Scenario {
             Self::Overwrite => stage_overwrite(dataset).await,
             Self::Restore => stage_restore(dataset).await,
             Self::UpdateConfig => stage_update_config(dataset).await,
+            Self::ActionAppend => stage_action_append(dataset, false).await,
+            Self::ActionUpdateConfig => stage_action_update_config(dataset).await,
+            Self::ActionAppendAndConfig => stage_action_append(dataset, true).await,
         }
     }
 }
@@ -407,16 +452,90 @@ async fn stage_update_config(dataset: &Arc<Dataset>) -> Result<Staged> {
         Operation::UpdateConfig {
             config_updates: None,
             table_metadata_updates: None,
-            schema_metadata_updates: Some(UpdateMap {
-                update_entries: vec![UpdateMapEntry {
-                    key: "conflict_matrix".into(),
-                    value: Some("update_config".into()),
-                }],
-                replace: false,
-            }),
+            schema_metadata_updates: Some(schema_metadata_update(Scenario::UpdateConfig)),
             field_metadata_updates: HashMap::new(),
         },
     )))
+}
+
+/// The one schema-metadata key every config scenario writes, so that the legacy
+/// and action forms contend for it.
+fn schema_metadata_update(writer: Scenario) -> UpdateMap {
+    UpdateMap {
+        update_entries: vec![UpdateMapEntry {
+            key: "conflict_matrix".into(),
+            value: Some(writer.name().into()),
+        }],
+        replace: false,
+    }
+}
+
+fn stage_action_set(dataset: &Dataset, actions: Vec<Action>) -> Staged {
+    Staged::new(Transaction::new_from_version(
+        dataset.manifest.version,
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "conflict_matrix",
+            actions,
+        )])),
+    ))
+}
+
+/// [`stage_append`]'s data files, re-expressed as actions. The files are the
+/// ones the legacy append wrote, so the two forms add identical data.
+///
+/// Row ids and per-row versions are left for apply to assign, as they are for
+/// a legacy append.
+async fn stage_action_append(dataset: &Arc<Dataset>, with_config: bool) -> Result<Staged> {
+    let Operation::Append { fragments } = stage_append(dataset).await?.transaction.operation else {
+        unreachable!("an uncommitted append stages Operation::Append");
+    };
+    let mut actions = Vec::new();
+    for (token, fragment) in (0u32..).zip(fragments) {
+        actions.push(Action::AddFragment(AddFragment {
+            id: Ref::Local(token),
+            physical_rows: fragment
+                .physical_rows
+                .expect("a freshly written fragment knows its row count")
+                as u64,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        }));
+        for mut file in fragment.files {
+            let field_ids = file
+                .fields
+                .iter()
+                .copied()
+                .map(FieldRef::Committed)
+                .collect();
+            file.fields = Default::default();
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(token),
+                file,
+                field_ids,
+                data_change: true,
+                base: None,
+            }));
+        }
+    }
+    if with_config {
+        actions.push(Action::ConfigUpdate(ConfigUpdate {
+            schema_metadata: Some(schema_metadata_update(Scenario::ActionAppendAndConfig)),
+            ..Default::default()
+        }));
+    }
+    Ok(stage_action_set(dataset, actions))
+}
+
+async fn stage_action_update_config(dataset: &Arc<Dataset>) -> Result<Staged> {
+    Ok(stage_action_set(
+        dataset,
+        vec![Action::ConfigUpdate(ConfigUpdate {
+            schema_metadata: Some(schema_metadata_update(Scenario::ActionUpdateConfig)),
+            ..Default::default()
+        })],
+    ))
 }
 
 /// A merge insert that matches the whole schema, which is the production
@@ -601,7 +720,7 @@ async fn stage_merge(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Res
 
 /// A BTree over `a`, covering only `fragment`.
 ///
-/// Scoped rather than whole-dataset so the index has a footprint at all: the
+/// Scoped rather than whole-dataset so the index has a placement at all: the
 /// `fragment_bitmap` it carries is what the rewrite arms of
 /// `check_create_index_txn` compare against.
 async fn stage_create_index(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
@@ -725,10 +844,10 @@ async fn write_value_file(
 /// a case costs a few milliseconds. The shape is still the smallest one that
 /// lets every axis of the suite ask its question:
 ///
-/// - **Two fragments**, so [`Footprint::OtherFragment`] can point an operation
+/// - **Two fragments**, so [`Placement::OtherFragment`] can point an operation
 ///   somewhere `ours` never touches.
-/// - **`c` and `d`, each alone in its own data file**, so [`Footprint::Same`]
-///   and [`Footprint::OtherField`] differ at file granularity, and so `project`
+/// - **`c` and `d`, each alone in its own data file**, so [`Placement::Same`]
+///   and [`Placement::OtherField`] differ at file granularity, and so `project`
 ///   and `merge` have a file they can prune whole.
 /// - **`a` and `b` sharing the file written first**, which is why no scenario
 ///   targets them: replacing that file to reach one orphans the other.
