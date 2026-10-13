@@ -7,13 +7,19 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
-use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch};
+use arrow_array::{
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch,
+    RecordBatchIterator,
+};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{ROW_ADDR, ROW_ID};
+use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::inverted::query::PhraseQuery;
 use lance_index::vector::DIST_COL;
@@ -21,6 +27,8 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
+use lance_io::object_store::ObjectStoreParams;
+use lance_io::utils::tracking_store::IOTracker;
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use rstest::rstest;
@@ -533,6 +541,290 @@ async fn test_vector_search_fragment_filter_prunes_segment_fanout() {
 }
 
 #[rstest]
+#[case::covered(vec![1], false, "i >= 5", false)]
+#[case::hybrid(vec![1, 2], false, "i >= 5", false)]
+#[case::missing(vec![2], false, "i >= 5", false)]
+#[case::fast_hybrid(vec![1, 2], true, "i >= 5", false)]
+#[case::fast_missing(vec![2], true, "i >= 5", false)]
+#[case::empty(vec![], false, "i >= 5", false)]
+#[case::duplicates(vec![1, 1], false, "i >= 5", false)]
+#[case::reordered(vec![2, 1], false, "i >= 5", false)]
+#[case::all_covered(vec![0, 1], false, "i >= 5", false)]
+#[case::all_fragments(vec![0, 1, 2], false, "i >= 5", false)]
+#[case::negation(vec![1, 2], false, "NOT (i < 5)", false)]
+#[case::conjunction(vec![1, 2], false, "i >= 5 AND i < 10", false)]
+#[case::disjunction(vec![1, 2], false, "i = 6 OR i = 10", true)]
+#[case::nulls(vec![1, 2], false, "i IS NULL", false)]
+#[case::fast_nulls(vec![1, 2], true, "i IS NULL", false)]
+#[case::no_matches(vec![1, 2], false, "i < 0", false)]
+#[tokio::test]
+async fn test_hybrid_prefilter_scope_and_io(
+    #[values(false, true)] stable_row_ids: bool,
+    #[case] selected: Vec<usize>,
+    #[case] fast_search: bool,
+    #[case] predicate: &str,
+    #[case] expect_missing_reads: bool,
+) {
+    let data_dir = TempStrDir::default();
+    let indexed = arrow_array::record_batch!((
+        "i",
+        Int32,
+        [
+            Some(0),
+            None,
+            Some(2),
+            Some(3),
+            Some(4),
+            None,
+            Some(6),
+            Some(7)
+        ]
+    ))
+    .unwrap();
+    let mut fixture = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(indexed.clone())], indexed.schema()),
+        data_dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // One scalar segment spans both fragments: pruning alone cannot enforce scope.
+    fixture
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let missing =
+        arrow_array::record_batch!(("i", Int32, [Some(8), None, Some(10), Some(11)])).unwrap();
+    fixture
+        .append(
+            RecordBatchIterator::new(vec![Ok(missing.clone())], missing.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let tracker = Arc::new(IOTracker::default());
+    let dataset = crate::dataset::builder::DatasetBuilder::from_uri(data_dir.as_str())
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(tracker.clone()),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    let fragments = dataset.fragments();
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(selected.iter().map(|id| fragments[*id].clone()).collect());
+    if fast_search {
+        scanner.fast_search();
+    }
+    scanner.filter(predicate).unwrap();
+    let filter = scanner.create_filter_plan(true, None, None).await.unwrap();
+    let source = scanner
+        .prefilter_source(
+            &filter.expr_filter_plan,
+            fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let plan = match source {
+        PreFilterSource::ScalarIndexQuery(plan) | PreFilterSource::FilteredRowIds(plan) => plan,
+        PreFilterSource::None => panic!("an exact filter must retain an empty scope"),
+    };
+    tracker.incremental_stats();
+    let batches = plan
+        .execute(0, Arc::new(datafusion::execution::TaskContext::default()))
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let stats = tracker.incremental_stats();
+    if expect_missing_reads {
+        assert!(
+            fragments[2].files.iter().any(|file| {
+                stats
+                    .requests
+                    .iter()
+                    .any(|request| request.path.as_ref().ends_with(&file.path))
+            }),
+            "prefilter must read selected missing fragment 2 during execution: {:?}",
+            stats.requests
+        );
+    }
+    for (id, fragment) in fragments.iter().enumerate() {
+        if id < 2 || fast_search || !selected.contains(&id) {
+            for file in &fragment.files {
+                assert!(
+                    !stats
+                        .requests
+                        .iter()
+                        .any(|request| request.path.as_ref().ends_with(&file.path)),
+                    "prefilter read covered or excluded data file {}: {:?}",
+                    file.path,
+                    stats.requests
+                );
+            }
+        }
+    }
+    let mut oracle = dataset.scan();
+    oracle.with_fragments(
+        selected
+            .iter()
+            .filter(|id| !fast_search || **id < 2)
+            .map(|id| fragments[*id].clone())
+            .collect(),
+    );
+    oracle.filter(predicate).unwrap();
+    oracle.use_scalar_index(false).with_row_id();
+    oracle.project::<&str>(&[]).unwrap();
+    let expected = oracle.try_into_batch().await.unwrap();
+    let expected: BTreeSet<_> = expected[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    if plan.schema() == *IndexExprResultWireFormat::ThreeVariant.schema() {
+        assert_eq!(batches.len(), 1);
+        let (result, coverage) =
+            lance_select::IndexExprResult::deserialize(&batches[0]).unwrap();
+        assert!(result.is_exact());
+        assert_eq!(
+            coverage,
+            selected
+                .iter()
+                .filter(|id| !fast_search || **id < 2)
+                .map(|id| *id as u32)
+                .collect()
+        );
+        assert_eq!(
+            result.upper,
+            lance_select::RowAddrMask::from_allowed(lance_select::RowAddrTreeMap::from_iter(
+                expected
+            ))
+        );
+    } else {
+        let actual: BTreeSet<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_hybrid_prefilter_consumers(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] fast_search: bool,
+    #[values("ann", "batch", "fts")] consumer: &str,
+) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+        .await
+        .unwrap();
+    fixture.make_scalar_index().await.unwrap();
+    fixture.append_data_with_range(400, 410).await.unwrap();
+    fixture
+        .dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    fixture.make_fts_index().await.unwrap();
+    fixture.dataset.delete("i = 252").await.unwrap();
+    let dataset = &fixture.dataset;
+    let mut oracle = dataset.scan();
+    oracle.use_scalar_index(false).with_row_id();
+    oracle.filter("i >= 250 AND i % 2 = 0").unwrap();
+    oracle.with_fragments(dataset.fragments()[1..].to_vec());
+    let expected = oracle.try_into_batch().await.unwrap();
+    let external = lance_select::RowAddrMask::from_allowed(
+        expected[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(dataset.fragments()[1..].to_vec());
+    scanner.filter("i >= 250").unwrap().prefilter(true);
+    scanner.with_row_id_prefilter(external);
+    scanner.project(&["i"]).unwrap();
+    if fast_search {
+        scanner.fast_search();
+    }
+    if consumer == "fts" {
+        scanner
+            .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+            .unwrap();
+    } else if consumer == "batch" {
+        scanner
+            .nearest("vec", &batch_knn_two_queries().0, 200)
+            .unwrap()
+            .nprobes(1);
+    } else {
+        scanner
+            .nearest("vec", &Float32Array::from(vec![0.0; 32]), 200)
+            .unwrap()
+            .nprobes(1);
+    }
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(plan.contains("PrefilterUnion:"), "{plan}");
+    assert_eq!(
+        plan.contains("projection=[], num_fragments=1"),
+        !fast_search,
+        "{plan}"
+    );
+    let actual = scanner.try_into_batch().await.unwrap();
+    let ids = |batch: &RecordBatch| {
+        batch["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    };
+    let expected: BTreeSet<_> = ids(&expected)
+        .into_iter()
+        .filter(|id| !fast_search || *id < 400)
+        .collect();
+    let actual_ids = ids(&actual);
+    assert_eq!(actual_ids, expected);
+    assert_eq!(
+        actual.num_rows(),
+        expected.len() * if consumer == "batch" { 2 } else { 1 }
+    );
+    assert_eq!(
+        actual_ids.intersection(&expected).count() as f64 / expected.len() as f64,
+        1.0
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_vector_prefilter_prunes_scalar_segments(
     #[values(false, true)] stable_row_ids: bool,
@@ -543,6 +835,29 @@ async fn test_vector_prefilter_prunes_scalar_segments(
         .unwrap();
     let vector_segments = test_ds.make_segmented_vector_index().await.unwrap();
     test_ds.make_segmented_scalar_index().await.unwrap();
+    let excluded_segment = test_ds
+        .dataset
+        .load_indices_by_name("i_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+        .unwrap();
+    let excluded_path = test_ds
+        .dataset
+        .indices_dir()
+        .join(excluded_segment.uuid.to_string());
+    let tracker = Arc::new(IOTracker::default());
+    test_ds.dataset =
+        crate::dataset::builder::DatasetBuilder::from_uri(test_ds.tmp_dir.as_str())
+            .with_store_params(ObjectStoreParams {
+                object_store_wrapper: Some(tracker.clone()),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+    tracker.incremental_stats();
     let fragments = test_ds.dataset.fragments();
     let query: Float32Array = (0..32).map(|value| value as f32).collect();
 
@@ -561,6 +876,15 @@ async fn test_vector_prefilter_prunes_scalar_segments(
     scanner.filter("NOT (i < 250)").unwrap();
 
     let analyzed = scanner.analyze_plan().await.unwrap();
+    let stats = tracker.incremental_stats();
+    assert!(
+        !stats
+            .requests
+            .iter()
+            .any(|request| request.path.as_ref().starts_with(excluded_path.as_ref())),
+        "excluded scalar segment was opened: {:?}",
+        stats.requests
+    );
     let scalar_index_node = analyzed
         .lines()
         .find(|line| line.trim_start().starts_with("ScalarIndexQuery:"))
@@ -569,12 +893,11 @@ async fn test_vector_prefilter_prunes_scalar_segments(
         scalar_index_node.contains("indices_loaded=1,"),
         "expected one scalar segment to be loaded, plan was:\n{analyzed}"
     );
-    if explicit_fragments {
-        assert!(
-            analyzed.contains("projection=[], num_fragments=1"),
-            "segment pruning must preserve the FilteredRead row-ID path, plan was:\n{analyzed}"
-        );
-    }
+    assert!(analyzed.contains("PrefilterUnion:"), "{analyzed}");
+    assert!(
+        !analyzed.contains("projection=[], num_fragments=1"),
+        "{analyzed}"
+    );
 
     let actual = scanner.try_into_batch().await.unwrap();
     let actual = actual["i"]
