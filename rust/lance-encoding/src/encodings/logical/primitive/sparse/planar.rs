@@ -304,6 +304,16 @@ pub(in crate::encodings::logical::primitive) fn encode(
             }),
             vec![],
         )
+    } else if dictionary.as_ref().is_some_and(|(indices, items)| {
+        // Indexed values initialize every index instead of the dictionary items.
+        // Keep chunked indices when that would increase materialization work.
+        matches!(items, DataBlock::VariableWidth(_))
+            && items.data_size() >= 64 * 1024
+            && items.data_size() >= indices.data_size()
+    }) {
+        let (indices, items) =
+            dictionary.ok_or_else(|| Error::internal("Missing indexed dictionary"))?;
+        super::dictionary::encode(ctx, indices, items, compression.as_ref(), row_number)?
     } else if dictionary.is_some()
         || data.as_ref().is_some_and(|data| {
             (PrimitiveStructuralEncoder::is_narrow(data)
@@ -410,6 +420,7 @@ pub(in crate::encodings::logical::primitive) fn encode(
 
 #[derive(Debug)]
 enum ValueStorage {
+    Indexed(super::dictionary::IndexedScheduler),
     Chunked(MiniBlockScheduler),
     Zipped {
         scheduler: FullZipScheduler,
@@ -532,10 +543,15 @@ impl PlanarSparseScheduler {
         }
         let buffers = &page.buffer_offsets_and_sizes[..value_buffers];
         let values = match codec {
-            pb23::value_plane::Codec::Indexed(_) => {
-                return Err(Error::not_supported(
-                    "Indexed planar values are not implemented",
-                ));
+            pb23::value_plane::Codec::Indexed(v) => {
+                ValueStorage::Indexed(super::dictionary::IndexedScheduler::try_new(
+                    buffers,
+                    page.priority,
+                    leaf_slots,
+                    v,
+                    field,
+                    decompressors,
+                )?)
             }
             pb23::value_plane::Codec::Chunked(v) => {
                 if v.levels.is_some() || v.num_items != 0 {
@@ -655,6 +671,7 @@ impl PlanarSparseScheduler {
 
     fn value_scheduler(&self) -> Option<&dyn StructuralPageScheduler> {
         match &self.values {
+            ValueStorage::Indexed(s) => Some(s),
             ValueStorage::Chunked(s) => Some(s),
             ValueStorage::Zipped { scheduler, .. } => Some(scheduler),
             _ => None,
@@ -663,6 +680,12 @@ impl PlanarSparseScheduler {
 }
 
 impl StructuralPageScheduler for PlanarSparseScheduler {
+    fn set_cache(&mut self, cache: Arc<LanceCache>) {
+        if let ValueStorage::Indexed(scheduler) = &mut self.values {
+            scheduler.set_cache(cache);
+        }
+    }
+
     fn init_layout(&self) -> Result<PageInitialization> {
         let mut ranges = self
             .value_scheduler()
@@ -752,6 +775,15 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
                 }
             }
             let values = match &mut self.values {
+                ValueStorage::Indexed(s) => Some(
+                    s.init_from_buffers(
+                        PageInitializationBuffers {
+                            buffer_slots: value_buffers,
+                        },
+                        &io,
+                    )
+                    .await?,
+                ),
                 ValueStorage::Chunked(s) => Some(
                     s.init_from_buffers(
                         PageInitializationBuffers {
@@ -789,7 +821,9 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
             };
             plan.validate(self.rows)?;
             let positions = match self.values {
-                ValueStorage::Chunked(_) => SparsePositionPlan::all(self.leaf_slots),
+                ValueStorage::Chunked(_) | ValueStorage::Indexed(_) => {
+                    SparsePositionPlan::all(self.leaf_slots)
+                }
                 _ => materialized_positions(&plan, self.rows)?,
             };
             if let ValueStorage::Zipped { num_values, .. } = self.values
@@ -823,6 +857,7 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
             .map_err(|_| Error::invalid_input("Unexpected planar sparse cache type"))?;
         if let Some(values) = &state.values {
             match &mut self.values {
+                ValueStorage::Indexed(s) => s.try_load(values)?,
                 ValueStorage::Chunked(s) => s.try_load(values)?,
                 ValueStorage::Zipped { scheduler, .. } => scheduler.try_load(values)?,
                 _ => return Err(Error::invalid_input("Unexpected cached planar value state")),

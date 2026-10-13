@@ -17,6 +17,7 @@ fn invalid_enum<T>(
     })
 }
 
+pub(super) mod dictionary;
 pub(super) mod planar;
 pub(super) mod writer;
 

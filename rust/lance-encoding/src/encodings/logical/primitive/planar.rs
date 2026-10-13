@@ -332,10 +332,13 @@ pub(super) fn validate_page(
                 ) || v.levels.as_ref().is_some_and(|l| l.bits_repetition > 0),
             )
         }
-        Values::Indexed(_) => {
-            return Err(Error::not_supported(
-                "Indexed planar values are not implemented",
-            ));
+        Values::Indexed(v) => {
+            if dense {
+                return Err(Error::invalid_input(
+                    "Indexed values require sparse structure",
+                ));
+            }
+            sparse::dictionary::validate(v, field, decompressors)?
         }
         Values::Constant(v) => {
             let dt = field.data_type();
