@@ -23,7 +23,7 @@ use crate::{
     encodings::logical::primitive::{
         CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     },
-    format::ProtobufUtils21,
+    format::EncodingUtils,
     repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level},
 };
 
@@ -43,7 +43,7 @@ pub(crate) fn encode_constant_page(
         ))
     };
 
-    let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, inline_value);
+    let description = EncodingUtils::constant_layout(&repdef.def_meaning, inline_value);
 
     let has_repdef = repdef.repetition_levels.is_some() || repdef.definition_levels.is_some();
 

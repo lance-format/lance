@@ -198,6 +198,17 @@ impl FieldEncodingStrategy for BenchFieldEncodingStrategy {
         column_index: &mut ColumnIndexSequence,
         context: &FieldEncodingContext<'_>,
     ) -> Result<Box<dyn FieldEncoder>> {
+        if matches!(self.encoding, BenchEncoding::StructuralSparse)
+            && field.is_blob()
+            && matches!(
+                field.data_type(),
+                arrow_schema::DataType::Binary | arrow_schema::DataType::LargeBinary
+            )
+        {
+            return Err(Error::invalid_input(
+                "Lance 2.3 requires Blob v2 descriptor structs",
+            ));
+        }
         if let Some(encoder) =
             try_create_binary_blob(&self.primitive, field, column_index, context)?
         {
@@ -290,11 +301,7 @@ pub fn encoding_strategy(encoding: BenchEncoding) -> Box<dyn FieldEncodingStrate
             PrimitivePageEncoding::constant(),
             PrimitivePageEncoding::dense_u32(compression),
         ],
-        BenchEncoding::StructuralSparse => vec![
-            PrimitivePageEncoding::sparse(compression.clone()),
-            PrimitivePageEncoding::constant(),
-            PrimitivePageEncoding::dense_u32(compression),
-        ],
+        BenchEncoding::StructuralSparse => vec![PrimitivePageEncoding::planar(compression)],
         BenchEncoding::Array => unreachable!(),
     };
     Box::new(BenchFieldEncodingStrategy {

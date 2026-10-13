@@ -27,9 +27,9 @@ use crate::encodings::logical::primitive::miniblock::{
     MiniBlockCompressor,
 };
 use crate::encodings::physical::checked_fixed_values;
-use crate::format::pb21::CompressiveEncoding;
-use crate::format::pb21::compressive_encoding::Compression;
-use crate::format::{ProtobufUtils21, pb21};
+use crate::format::metadata::CompressiveEncoding;
+use crate::format::metadata::compressive_encoding::Compression;
+use crate::format::{EncodingUtils, metadata};
 
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
@@ -395,7 +395,7 @@ fn build_generic_chunks<N: OffsetSizeTrait>(
             chunks,
             num_values: data.num_values,
         },
-        ProtobufUtils21::variable(offsets_encoding, None),
+        EncodingUtils::variable(offsets_encoding, None),
     ))
 }
 
@@ -453,7 +453,7 @@ impl BinaryMiniBlockEncoder {
         validate_variable_offsets(offsets, data.num_values, data.data.len())?;
         let bits_per_offset = data.bits_per_offset as u64;
         let legacy_encoding =
-            ProtobufUtils21::variable(ProtobufUtils21::flat(bits_per_offset, None), None);
+            EncodingUtils::variable(EncodingUtils::flat(bits_per_offset, None), None);
         let (legacy_buffers, legacy_chunks) =
             chunk_offsets(offsets, &data.data, legacy_alignment, self.minichunk_size);
         let legacy = MiniBlockCompressed {
@@ -556,7 +556,7 @@ impl BinaryMiniBlockDecompressor {
         })
     }
 
-    pub fn from_variable(variable: &pb21::Variable) -> Result<Self> {
+    pub fn from_variable(variable: &metadata::Variable) -> Result<Self> {
         if variable.values.is_some() {
             return Err(Error::invalid_input(
                 "Binary mini-block Variable encoding cannot contain a values codec",
@@ -960,10 +960,7 @@ impl BlockCompressor for VariableEncoder {
         .map(|payload| {
             (
                 Some(payload),
-                ProtobufUtils21::variable(
-                    ProtobufUtils21::flat(bits_per_offset as u64, None),
-                    None,
-                ),
+                EncodingUtils::variable(EncodingUtils::flat(bits_per_offset as u64, None), None),
             )
         })
     }
@@ -975,8 +972,8 @@ impl PerValueCompressor for VariableEncoder {
             panic!("BinaryPerValueCompressor can only work with Variable Width DataBlock.");
         };
 
-        let encoding = ProtobufUtils21::variable(
-            ProtobufUtils21::flat(variable.bits_per_offset as u64, None),
+        let encoding = EncodingUtils::variable(
+            EncodingUtils::flat(variable.bits_per_offset as u64, None),
             None,
         );
         Ok((PerValueDataBlock::Variable(variable), encoding))
@@ -1171,8 +1168,8 @@ mod tests {
         encodings::logical::primitive::miniblock::{
             MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
         },
-        format::pb21::compressive_encoding::Compression,
-        format::{ProtobufUtils21, pb21, pb21::CompressiveEncoding},
+        format::metadata::compressive_encoding::Compression,
+        format::{EncodingUtils, metadata, metadata::CompressiveEncoding},
         testing::check_specific_random,
     };
     use rstest::rstest;
@@ -1429,8 +1426,8 @@ mod tests {
             Some(Compression::Flat(_))
         ));
 
-        let variable = pb21::Variable {
-            offsets: Some(Box::new(ProtobufUtils21::range(32, 0, 3))),
+        let variable = metadata::Variable {
+            offsets: Some(Box::new(EncodingUtils::range(32, 0, 3))),
             values: None,
         };
         let decoder = BinaryMiniBlockDecompressor::from_variable(&variable).unwrap();

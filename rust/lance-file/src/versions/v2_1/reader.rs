@@ -178,7 +178,12 @@ pub fn decode_column(
         .map(|(page_index, page)| {
             let page_layout = structural::decode_page_layout(column_index, page_index, page)?;
             validate_page_layout(&page_layout)?;
-            structural::build_page_info(column_index, page_index, page, page_layout)
+            structural::build_page_info(
+                column_index,
+                page_index,
+                page,
+                lance_encoding::decoder::PageEncoding::try_from(page_layout)?,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     structural::build_column_info(column_index, metadata, page_infos)

@@ -12,7 +12,7 @@
 
 use crate::{
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
-    format::pb21::CompressiveEncoding,
+    format::metadata::CompressiveEncoding,
 };
 
 use lance_core::Result;

@@ -31,8 +31,8 @@ use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
-use crate::format::pb21::CompressiveEncoding;
-use crate::format::{ProtobufUtils21, pb21};
+use crate::format::metadata::CompressiveEncoding;
+use crate::format::{EncodingUtils, metadata};
 use crate::statistics::{GetStat, Stat};
 use bytemuck::Pod;
 
@@ -83,7 +83,7 @@ impl InlineBitpacking {
         }
     }
 
-    pub fn from_description(description: &pb21::InlineBitpacking) -> Self {
+    pub fn from_description(description: &metadata::InlineBitpacking) -> Self {
         Self {
             uncompressed_bit_width: description.uncompressed_bits_per_value,
         }
@@ -209,7 +209,7 @@ impl InlineBitpacking {
         };
         (
             compressed,
-            ProtobufUtils21::inline_bitpacking(
+            EncodingUtils::inline_bitpacking(
                 bits_per_value,
                 // TODO: Could potentially compress the data here
                 None,
@@ -364,7 +364,7 @@ impl BlockCompressor for InlineBitpacking {
             })?;
         Ok((
             Some(payload),
-            ProtobufUtils21::inline_bitpacking(self.uncompressed_bit_width, None),
+            EncodingUtils::inline_bitpacking(self.uncompressed_bit_width, None),
         ))
     }
 }
@@ -630,9 +630,9 @@ impl BlockCompressor for OutOfLineBitpacking {
         };
         Ok((
             Some(compressed),
-            ProtobufUtils21::out_of_line_bitpacking(
+            EncodingUtils::out_of_line_bitpacking(
                 self.uncompressed_bit_width,
-                ProtobufUtils21::flat(self.compressed_bit_width, None),
+                EncodingUtils::flat(self.compressed_bit_width, None),
             ),
         ))
     }

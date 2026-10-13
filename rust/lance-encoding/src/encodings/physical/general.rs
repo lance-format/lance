@@ -16,7 +16,7 @@ use crate::{
         },
         physical::block::{CompressionConfig, GeneralBufferCompressor},
     },
-    format::{ProtobufUtils21, pb21::CompressiveEncoding},
+    format::{EncodingUtils, metadata::CompressiveEncoding},
 };
 use lance_core::Error;
 
@@ -44,7 +44,7 @@ impl BlockCompressor for GeneralBlockCompressor {
         compressor.compress(&payload, &mut compressed)?;
         Ok((
             Some(LanceBuffer::from(compressed)),
-            ProtobufUtils21::wrapped(self.compression, child_encoding)?,
+            EncodingUtils::wrapped(self.compression, child_encoding)?,
         ))
     }
 }
@@ -182,7 +182,7 @@ impl MiniBlockCompressor for GeneralMiniBlockCompressor {
         };
 
         // Return compressed encoding
-        let encoding = ProtobufUtils21::wrapped(self.compression, inner_encoding)?;
+        let encoding = EncodingUtils::wrapped(self.compression, inner_encoding)?;
         Ok((compressed_result, encoding))
     }
 }
@@ -236,8 +236,8 @@ mod tests {
     use crate::encodings::physical::block::CompressionScheme;
     use crate::encodings::physical::rle::RleEncoder;
     use crate::encodings::physical::value::ValueEncoder;
-    use crate::format::pb21;
-    use crate::format::pb21::compressive_encoding::Compression;
+    use crate::format::metadata;
+    use crate::format::metadata::compressive_encoding::Compression;
     use arrow_array::{Float64Array, Int32Array};
 
     fn miniblock_context() -> MiniBlockCompressionContext {
@@ -569,7 +569,7 @@ mod tests {
                 assert!(cm.values.is_some());
                 assert_eq!(
                     cm.compression.as_ref().unwrap().scheme(),
-                    pb21::CompressionScheme::CompressionAlgorithmZstd
+                    metadata::CompressionScheme::CompressionAlgorithmZstd
                 );
                 assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
 
@@ -672,7 +672,7 @@ mod tests {
                 // Check compression is LZ4
                 assert_eq!(
                     cm.compression.as_ref().unwrap().scheme(),
-                    pb21::CompressionScheme::CompressionAlgorithmLz4
+                    metadata::CompressionScheme::CompressionAlgorithmLz4
                 );
             }
             Some(Compression::Rle(_)) => {
@@ -731,7 +731,7 @@ mod tests {
                 // Check compression is LZ4
                 assert_eq!(
                     cm.compression.as_ref().unwrap().scheme(),
-                    pb21::CompressionScheme::CompressionAlgorithmLz4
+                    metadata::CompressionScheme::CompressionAlgorithmLz4
                 );
             }
             Some(Compression::Rle(_)) => {

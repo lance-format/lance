@@ -17,7 +17,7 @@ use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_encoding::decoder::{DecoderPlugins, EncodedBatchLayout, FilterExpression, decode_batch};
 use lance_encoding::encoder::{EncodedBatch, EncodingOptions, encode_batch};
-use lance_encoding::format::pb21::{compressive_encoding::Compression, page_layout::Layout};
+use lance_encoding::format::metadata::{compressive_encoding::Compression, page_layout::Layout};
 use lance_io::ReadBatchParams;
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
@@ -452,7 +452,10 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
 
 #[tokio::test]
 async fn v2_3_output_is_deterministic_within_the_current_revision() {
-    let batch = compatibility_fixture_batch();
+    // Blob v1 remains covered by the stable fixtures; 2.3 uses Blob v2 descriptors.
+    let batch = compatibility_fixture_batch()
+        .project(&[0, 1, 2, 3])
+        .unwrap();
     let mut schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
     schema.set_dictionary(&batch).unwrap();
 
@@ -570,7 +573,12 @@ async fn generic_offsets_are_gated_by_file_version(
         if page.num_rows == 1 {
             continue;
         }
-        let Some(Layout::MiniBlockLayout(layout)) = &page.encoding.as_structural().layout else {
+        let normalized = match &page.encoding {
+            lance_encoding::decoder::PageEncoding::Structural(l) => l.clone(),
+            lance_encoding::decoder::PageEncoding::Planar(l) => l.dense_execution_layout().unwrap(),
+            _ => panic!("expected structural page"),
+        };
+        let Some(Layout::MiniBlockLayout(layout)) = &normalized.layout else {
             panic!("expected mini-block layout");
         };
         let Some(Compression::Variable(variable)) = layout
@@ -603,15 +611,11 @@ async fn generic_offsets_are_gated_by_file_version(
     if version == ConcreteFileVersion::V2_3 {
         assert!(generic_pages > 1);
         // The same persisted metadata must be rejected by the stable grammar, even
-        // though v2.2 and v2.3 share protobuf definitions and u32 chunk framing.
+        // though both versions use u32 chunk framing.
         let error = versions::v2_2::decode_column_metadata(&reader.metadata().column_metadatas)
             .unwrap_err();
         assert!(matches!(&error, lance_core::Error::InvalidInput { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("not part of the Lance v2.2 grammar")
-        );
+        assert!(error.to_string().contains("lance.encodings21.PageLayout"));
     }
     let indices = UInt32Array::from(vec![0, 1023, 1024, 2048, 4096]);
     for (selection, expected) in [
@@ -631,4 +635,93 @@ async fn generic_offsets_are_gated_by_file_version(
         let actual = arrow_select::concat::concat_batches(&batch.schema(), &actual).unwrap();
         assert_record_batch_eq(&actual, &expected);
     }
+}
+
+#[tokio::test]
+async fn planar_planes_roundtrip_across_pages_and_reject_stable_envelopes() {
+    use lance_encoding::{decoder::PageEncoding, format::pb23};
+    let rows = 2048;
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(Int32Array::from_iter_values(0..rows)),
+        Arc::new(Int32Array::from_iter(
+            (0..rows).map(|i| (i % 7 == 0).then_some(i)),
+        )),
+        Arc::new(StringArray::from_iter((0..rows).map(|i| {
+            (i % 17 == 0).then(|| format!("{i}{}", "x".repeat(1024)))
+        }))),
+        Arc::new(Int32Array::from_iter(
+            (0..rows).map(|i| (i % 11 == 0).then_some(42)),
+        )),
+        Arc::new(Int32Array::from(vec![None; rows as usize])),
+    ];
+    let fields = arrays
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let field = Field::new(format!("c{i}"), a.data_type().clone(), true);
+            if i == 1 {
+                field.with_metadata(HashMap::from([(
+                    "lance-encoding:structural-encoding".to_owned(),
+                    "sparse".to_owned(),
+                )]))
+            } else {
+                field
+            }
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays).unwrap();
+    let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+    let bytes = write_current_fixture(ConcreteFileVersion::V2_3, &batch, &schema).await;
+    let reader = assert_current_reader_roundtrip(&bytes, ConcreteFileVersion::V2_3, &batch).await;
+    for (i, column) in reader.metadata().column_infos.iter().enumerate() {
+        for page in column.page_infos.iter() {
+            let PageEncoding::Planar(layout) = &page.encoding else {
+                panic!("expected planar page")
+            };
+            assert_eq!(layout.sparse().is_some(), i != 0);
+            assert!(matches!(
+                (i, layout.values.as_ref().unwrap().codec.as_ref().unwrap()),
+                (0 | 1, pb23::value_plane::Codec::Chunked(_))
+                    | (2, pb23::value_plane::Codec::Zipped(_))
+                    | (3, pb23::value_plane::Codec::Constant(_))
+                    | (4, pb23::value_plane::Codec::None(_))
+            ));
+        }
+    }
+    let indices = UInt32Array::from(vec![0, 1, 1023, 1024, 2047]);
+    let expected = arrow_select::take::take_record_batch(&batch, &indices).unwrap();
+    let batches = reader
+        .read_stream(
+            ReadBatchParams::Indices(indices),
+            2,
+            2,
+            FilterExpression::no_filter(),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+    assert_record_batch_eq(&actual, &expected);
+    for decode in [
+        versions::v2_1::decode_column_metadata,
+        versions::v2_2::decode_column_metadata,
+    ] {
+        let error = decode(&reader.metadata().column_metadatas).unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("lance.encodings21.PageLayout"));
+    }
+}
+
+#[tokio::test]
+async fn planar_writer_rejects_blob_v1() {
+    let batch = compatibility_fixture_batch();
+    let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+    let fs = FsFixture::default();
+    let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+    let result = versions::v2_3::create_writer(object_writer, schema, FileWriterOptions::default());
+    let error = result.err().expect("Blob v1 must be rejected");
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("Blob v1"));
 }

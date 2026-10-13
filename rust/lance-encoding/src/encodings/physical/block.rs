@@ -29,8 +29,8 @@ use std::str::FromStr;
 use crate::compression::{BlockCompressor, BlockDecompressor, require_block_payload};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
-    ProtobufUtils21,
-    pb21::{self, CompressiveEncoding},
+    EncodingUtils,
+    metadata::{self, CompressiveEncoding},
 };
 use crate::{
     buffer::LanceBuffer,
@@ -79,7 +79,7 @@ pub enum CompressionScheme {
     Lz4,
 }
 
-impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
+impl TryFrom<CompressionScheme> for metadata::CompressionScheme {
     type Error = Error;
 
     fn try_from(scheme: CompressionScheme) -> Result<Self> {
@@ -94,13 +94,13 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
     }
 }
 
-impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
+impl TryFrom<metadata::CompressionScheme> for CompressionScheme {
     type Error = Error;
 
-    fn try_from(scheme: pb21::CompressionScheme) -> Result<Self> {
+    fn try_from(scheme: metadata::CompressionScheme) -> Result<Self> {
         match scheme {
-            pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
-            pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
+            metadata::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
+            metadata::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
             _ => Err(Error::invalid_input(format!(
                 "Unsupported compression scheme: {:?}",
                 scheme
@@ -640,7 +640,7 @@ impl CompressedBufferEncoder {
         })
     }
 
-    pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
+    pub fn from_scheme(scheme: metadata::CompressionScheme) -> Result<Self> {
         let scheme = CompressionScheme::try_from(scheme)?;
         let block_compression = CompressionConfig {
             scheme,
@@ -729,12 +729,9 @@ impl PerValueCompressor for CompressedBufferEncoder {
 
         // TODO: Support setting the level
         // TODO: Support underlying compression of data (e.g. defer to binary encoding for offset bitpacking)
-        let encoding = ProtobufUtils21::wrapped(
+        let encoding = EncodingUtils::wrapped(
             self.compressor.config(),
-            ProtobufUtils21::variable(
-                ProtobufUtils21::flat(data.bits_per_offset as u64, None),
-                None,
-            ),
+            EncodingUtils::variable(EncodingUtils::flat(data.bits_per_offset as u64, None), None),
         )?;
 
         Ok((compressed, encoding))
@@ -774,7 +771,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         let (encoded, inner_encoding) = match data {
             DataBlock::FixedWidth(fixed_width) => (
                 fixed_width.data,
-                ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+                EncodingUtils::flat(fixed_width.bits_per_value, None),
             ),
             DataBlock::VariableWidth(variable_width) => {
                 // Wrap VariableEncoder to handle the encoding
@@ -802,7 +799,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         self.compressor.compress(&encoded, &mut compressed)?;
         Ok((
             Some(LanceBuffer::from(compressed)),
-            ProtobufUtils21::wrapped(self.block_compression, inner_encoding)?,
+            EncodingUtils::wrapped(self.block_compression, inner_encoding)?,
         ))
     }
 }

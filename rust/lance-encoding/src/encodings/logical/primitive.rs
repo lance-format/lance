@@ -20,8 +20,8 @@ use crate::{
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
     format::{
-        ProtobufUtils21,
-        pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
+        EncodingUtils,
+        metadata::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
 use arrow_array::{
@@ -98,8 +98,8 @@ mod chunk_index;
 pub mod constant;
 pub mod dict;
 pub mod fullzip;
-mod layout;
 pub mod miniblock;
+mod planar;
 pub(crate) mod sparse;
 
 use chunk_index::{ItemCounts, MiniBlockChunkIndex, PrefixSums, RowMapping, parse_nested_rep};
@@ -212,6 +212,10 @@ impl PageInitializationBuffers {
 /// A trait for figuring out how to schedule the data within
 /// a single page.
 trait StructuralPageScheduler: std::fmt::Debug + Send {
+    /// Attach the reader's file-scoped cache for independently cached value data.
+    /// Legacy schedulers keep their existing initialization-only cache behavior.
+    fn set_cache(&mut self, _cache: Arc<LanceCache>) {}
+
     /// Whether this page requires initialized metadata before scheduling.
     fn needs_initialization(&self) -> bool {
         true
@@ -258,14 +262,6 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>>;
-}
-
-/// Metadata describing the decoded size of a mini-block
-#[derive(Debug)]
-struct ChunkMeta {
-    num_values: u64,
-    chunk_size_bytes: u64,
-    offset_bytes: u64,
 }
 
 /// A mini-block chunk that has been decoded and decompressed
@@ -2212,7 +2208,7 @@ impl MiniBlockScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
-        layout: &pb21::MiniBlockLayout,
+        layout: &metadata::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let rep_decompressor = layout
@@ -2236,7 +2232,7 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
@@ -3089,7 +3085,7 @@ impl FullZipScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         rows_in_page: u64,
-        layout: &pb21::FullZipLayout,
+        layout: &metadata::FullZipLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let (data_buf_position, data_buf_size) = buffer_offsets_and_sizes[0];
@@ -3110,13 +3106,13 @@ impl FullZipScheduler {
         });
 
         let value_decompressor = match layout.details {
-            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => {
+            Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => {
                 let decompressor = decompressors.create_fixed_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
                 PerValueDecompressor::Fixed(decompressor.into())
             }
-            Some(pb21::full_zip_layout::Details::BitsPerOffset(_)) => {
+            Some(metadata::full_zip_layout::Details::BitsPerOffset(_)) => {
                 let decompressor = decompressors.create_variable_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
@@ -3133,15 +3129,15 @@ impl FullZipScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
         let max_visible_def = max_visible_level(&def_meaning);
 
         let bits_per_offset = match layout.details {
-            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => 32,
-            Some(pb21::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
+            Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => 32,
+            Some(metadata::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
                 bits_per_offset as u8
             }
             None => panic!("Full-zip layout must have a `details` field"),
@@ -4508,7 +4504,7 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
-        use pb21::page_layout::Layout;
+        use metadata::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
             Layout::MiniBlockLayout(mini_block) => Box::new(MiniBlockScheduler::try_new(
                 &page_info.buffer_offsets_and_sizes,
@@ -4517,16 +4513,6 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
-            Layout::SparseLayout(sparse_layout) => {
-                Box::new(sparse::SparseStructuralScheduler::try_new(
-                    &page_info.buffer_offsets_and_sizes,
-                    page_info.priority,
-                    page_info.num_rows,
-                    target_field.data_type(),
-                    sparse_layout,
-                    decompressors,
-                )?)
-            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -4542,7 +4528,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = constant_layout
                     .layers
                     .iter()
-                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
@@ -4591,7 +4577,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = blob
                     .layers
                     .iter()
-                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
@@ -4620,6 +4606,30 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<PageInfoAndScheduler> {
+        if let PageEncoding::Planar(layout) = &page_info.encoding {
+            let scheduler = if layout.sparse().is_some() {
+                Box::new(sparse::planar::PlanarSparseScheduler::try_new(
+                    page_info,
+                    layout,
+                    target_field,
+                    decompressors,
+                )?) as Box<dyn StructuralPageScheduler>
+            } else {
+                planar::validate_page(page_info, layout, target_field, decompressors)?;
+                Self::page_layout_to_scheduler(
+                    page_info,
+                    &layout.dense_execution_layout()?,
+                    decompressors,
+                    cache_repetition_index,
+                    target_field,
+                )?
+            };
+            return Ok(PageInfoAndScheduler {
+                page_index,
+                row_range,
+                scheduler,
+            });
+        }
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
             page_info,
@@ -4959,6 +4969,9 @@ impl StructuralPrimitiveFieldScheduler {
         // Serve cache hits in place; the rest are misses we must read.
         let mut misses = Vec::with_capacity(positions.len());
         for page_idx in positions {
+            self.page_schedulers[page_idx]
+                .scheduler
+                .set_cache(cache.clone());
             let page = &self.page_schedulers[page_idx];
             if !page.scheduler.needs_initialization() {
                 continue;
@@ -5470,6 +5483,21 @@ pub struct PrimitivePageEncoding {
 }
 
 impl PrimitivePageEncoding {
+    /// Encode 2.3 pages as independent structural and value planes.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_encoding::{compression::CompressionStrategy, encoder::structural::PrimitivePageEncoding};
+    /// # fn configure(compression: Arc<dyn CompressionStrategy>) {
+    /// let encoding = PrimitivePageEncoding::planar(compression);
+    /// # }
+    /// ```
+    pub fn planar(compression: Arc<dyn CompressionStrategy>) -> Self {
+        Self {
+            behavior: Arc::new(planar::PlanarPrimitiveEncoding { compression }),
+        }
+    }
+
     /// Reject an explicit request for sparse structural encoding.
     pub fn reject_sparse() -> Self {
         Self {
@@ -5481,13 +5509,6 @@ impl PrimitivePageEncoding {
     pub fn constant() -> Self {
         Self {
             behavior: Arc::new(ConstantPrimitiveEncoding),
-        }
-    }
-
-    /// Plan and encode sparse structural pages when applicable.
-    pub fn sparse(compression: Arc<dyn CompressionStrategy>) -> Self {
-        Self {
-            behavior: Arc::new(SparsePrimitiveEncoding { compression }),
         }
     }
 
@@ -5511,11 +5532,6 @@ struct RejectSparsePrimitiveEncoding;
 
 #[derive(Debug)]
 struct ConstantPrimitiveEncoding;
-
-#[derive(Debug)]
-struct SparsePrimitiveEncoding {
-    compression: Arc<dyn CompressionStrategy>,
-}
 
 #[derive(Debug)]
 struct DenseU16PrimitiveEncoding {
@@ -5569,7 +5585,7 @@ enum PrimitivePageStructure {
     },
     Sparse {
         plan: sparse::SparseStructuralPlan,
-        prepared_values: Option<sparse::writer::PreparedSparseValues>,
+        constant: Option<Vec<u8>>,
     },
 }
 
@@ -5586,7 +5602,6 @@ struct PrimitivePageData {
 }
 
 struct PrimitivePlanContext<'a> {
-    column_idx: u32,
     field: &'a Field,
     encoding_metadata: &'a HashMap<String, String>,
 }
@@ -6067,7 +6082,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
     ) -> Result<EncodedPage> {
         let description =
-            ProtobufUtils21::constant_layout(&[DefinitionInterpretation::NullableItem], None);
+            EncodingUtils::constant_layout(&[DefinitionInterpretation::NullableItem], None);
         Ok(EncodedPage {
             column_idx,
             data: vec![],
@@ -6080,7 +6095,7 @@ impl PrimitiveStructuralEncoder {
     fn encode_complex_all_null_vals(
         data: &Arc<[u16]>,
         compression_strategy: &dyn CompressionStrategy,
-    ) -> Result<(LanceBuffer, pb21::CompressiveEncoding)> {
+    ) -> Result<(LanceBuffer, metadata::CompressiveEncoding)> {
         let buffer = LanceBuffer::reinterpret_slice(data.clone());
         let mut fixed_width_block = FixedWidthDataBlock {
             data: buffer,
@@ -6121,7 +6136,7 @@ impl PrimitiveStructuralEncoder {
                 LanceBuffer::empty()
             };
 
-            let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, None);
+            let description = EncodingUtils::constant_layout(&repdef.def_meaning, None);
             return Ok(EncodedPage {
                 column_idx,
                 data: vec![rep_bytes, def_bytes],
@@ -6151,7 +6166,7 @@ impl PrimitiveStructuralEncoder {
             (LanceBuffer::empty(), None, 0)
         };
 
-        let description = ProtobufUtils21::compressed_all_null_constant_layout(
+        let description = EncodingUtils::compressed_all_null_constant_layout(
             &repdef.def_meaning,
             rep_encoding,
             def_encoding,
@@ -6412,7 +6427,11 @@ impl PrimitiveStructuralEncoder {
 
         let num_items = data.num_values();
 
-        let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
+        let compressor = if dictionary_data.is_some() {
+            compression_strategy.create_dictionary_index_compressor(field, &data)?
+        } else {
+            compression_strategy.create_miniblock_compressor(field, &data)?
+        };
         let common_chunk_buffers =
             u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
         let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
@@ -6487,7 +6506,7 @@ impl PrimitiveStructuralEncoder {
                 data.push(rep_index);
             }
 
-            let description = ProtobufUtils21::miniblock_layout(
+            let description = EncodingUtils::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -6506,7 +6525,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
             })
         } else {
-            let description = ProtobufUtils21::miniblock_layout(
+            let description = EncodingUtils::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -6797,7 +6816,7 @@ impl PrimitiveStructuralEncoder {
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
         let description = match &compressed_data {
-            PerValueDataBlock::Fixed(fixed) => ProtobufUtils21::fixed_full_zip_layout(
+            PerValueDataBlock::Fixed(fixed) => EncodingUtils::fixed_full_zip_layout(
                 bits_rep,
                 bits_def,
                 fixed.bits_per_value as u32,
@@ -6806,7 +6825,7 @@ impl PrimitiveStructuralEncoder {
                 num_items as u32,
                 num_visible_items as u32,
             ),
-            PerValueDataBlock::Variable(variable) => ProtobufUtils21::variable_full_zip_layout(
+            PerValueDataBlock::Variable(variable) => EncodingUtils::variable_full_zip_layout(
                 bits_rep,
                 bits_def,
                 variable.bits_per_offset as u32,
@@ -7587,7 +7606,6 @@ impl PrimitiveStructuralEncoder {
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
         let normalized = RepDefBuilder::normalize(repdefs);
         let plan_ctx = PrimitivePlanContext {
-            column_idx: self.column_index,
             field: &self.field,
             encoding_metadata: &self.encoding_metadata,
         };
@@ -7799,131 +7817,6 @@ impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
     }
 }
 
-impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
-    fn try_plan_pages(
-        &self,
-        ctx: &PrimitivePlanContext<'_>,
-        arrays: &[ArrayRef],
-        normalized: &NormalizedStructuralPlan,
-        row_number: u64,
-        num_rows: u64,
-        num_values: u64,
-    ) -> Result<Option<Vec<PrimitivePageData>>> {
-        let requested_encoding = ctx.encoding_metadata.get(STRUCTURAL_ENCODING_META_KEY);
-        let requests_sparse = requested_encoding
-            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
-        if requests_sparse {
-            let plan = sparse::writer::plan(normalized, num_values)?;
-            if sparse::writer::uses_constant_layout(&plan, ctx.field) {
-                return Ok(None);
-            }
-            return Ok(Some(vec![PrimitivePageData {
-                arrays: arrays.to_vec(),
-                structure: PrimitivePageStructure::Sparse {
-                    plan,
-                    prepared_values: None,
-                },
-                row_number,
-                num_rows,
-            }]));
-        }
-
-        let (_, miniblock_repdef_budget) = normalized.serialize_with_miniblock_repdef_budget(
-            miniblock::max_repdef_levels_per_chunk,
-            num_rows,
-            num_values,
-        )?;
-        let automatic_sparse = layout::select_automatic_sparse(
-            requested_encoding.map(String::as_str),
-            &miniblock_repdef_budget,
-            || {
-                let data = DataBlock::from_arrays(arrays, num_values);
-                if !sparse::writer::supports_value_block(&data) {
-                    return Ok(None);
-                }
-                let prepared_values = match sparse::writer::prepare_values(
-                    ctx.field,
-                    self.compression.as_ref(),
-                    data,
-                ) {
-                    Ok(prepared_values) => prepared_values,
-                    Err(error) => {
-                        debug!(
-                            "Keeping column {} on its dense structural path because sparse value preparation is unavailable: {}",
-                            ctx.column_idx, error
-                        );
-                        return Ok(None);
-                    }
-                };
-                let plan = sparse::writer::plan(normalized, num_values)?;
-                if sparse::writer::uses_constant_layout(&plan, ctx.field) {
-                    return Ok(None);
-                }
-                Ok(Some((plan, prepared_values)))
-            },
-        )?;
-        Ok(automatic_sparse.map(|(plan, prepared_values)| {
-            vec![PrimitivePageData {
-                arrays: arrays.to_vec(),
-                structure: PrimitivePageStructure::Sparse {
-                    plan,
-                    prepared_values: Some(prepared_values),
-                },
-                row_number,
-                num_rows,
-            }]
-        }))
-    }
-
-    fn try_encode_page(
-        &self,
-        ctx: &PrimitiveEncodeContext,
-        page: PrimitivePageData,
-    ) -> Result<PrimitiveEncodeAttempt> {
-        if !matches!(&page.structure, PrimitivePageStructure::Sparse { .. }) {
-            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
-        }
-        let PrimitivePageData {
-            arrays,
-            structure:
-                PrimitivePageStructure::Sparse {
-                    plan,
-                    prepared_values,
-                },
-            row_number,
-            num_rows,
-        } = page
-        else {
-            unreachable!()
-        };
-        let num_values = arrays.iter().map(|array| array.len() as u64).sum();
-        log::debug!(
-            "Encoding column {} with {} visible items ({} rows) using sparse layout",
-            ctx.column_idx,
-            num_values,
-            num_rows
-        );
-        Ok(PrimitiveEncodeAttempt::Encoded(
-            sparse::writer::encode_page(
-                ctx.column_idx,
-                &ctx.field,
-                self.compression.as_ref(),
-                prepared_values.map_or_else(
-                    || {
-                        sparse::writer::SparseValueInput::Unprepared(DataBlock::from_arrays(
-                            &arrays, num_values,
-                        ))
-                    },
-                    sparse::writer::SparseValueInput::Prepared,
-                ),
-                plan,
-                row_number,
-                num_rows,
-            )?,
-        ))
-    }
-}
-
 impl PrimitivePageEncodingBehavior for ConstantPrimitiveEncoding {
     fn try_encode_page(
         &self,
@@ -8054,9 +7947,9 @@ mod tests {
     };
     use crate::encodings::physical::rle::{RleDecompressor, RleEncoder, RleRuns, RunLengthWidth};
     use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
-    use crate::format::ProtobufUtils21;
-    use crate::format::pb21;
-    use crate::format::pb21::compressive_encoding::Compression;
+    use crate::format::EncodingUtils;
+    use crate::format::metadata;
+    use crate::format::metadata::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
     use crate::testing::TestEncoding;
     use crate::testing::{SimulatedScheduler, TestCases, check_round_trip_encoding_of_data};
@@ -9995,10 +9888,10 @@ mod tests {
             .map(|page_index| PageInfo {
                 num_rows: ROWS_PER_PAGE,
                 priority: page_index * ROWS_PER_PAGE,
-                encoding: PageEncoding::Structural(pb21::PageLayout {
-                    layout: Some(pb21::page_layout::Layout::ConstantLayout(
-                        pb21::ConstantLayout {
-                            layers: vec![pb21::RepDefLayer::RepdefNullableItem as i32],
+                encoding: PageEncoding::Structural(metadata::PageLayout {
+                    layout: Some(metadata::page_layout::Layout::ConstantLayout(
+                        metadata::ConstantLayout {
+                            layers: vec![metadata::RepDefLayer::RepdefNullableItem as i32],
                             ..Default::default()
                         },
                     )),
@@ -10830,7 +10723,7 @@ mod tests {
                 // Navigate to the dictionary encoding in the page layout
                 if let Some(PageEncoding::Structural(page_layout)) =
                     &col.final_pages.first().map(|p| &p.description)
-                    && let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) =
+                    && let Some(metadata::page_layout::Layout::MiniBlockLayout(mini_block)) =
                         &page_layout.layout
                     && let Some(dictionary_encoding) = &mini_block.dictionary
                 {
@@ -10840,9 +10733,9 @@ mod tests {
                             let compression = general.compression.as_ref().unwrap();
                             assert!(
                                 compression.scheme()
-                                    == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                    == metadata::CompressionScheme::CompressionAlgorithmLz4
                                     || compression.scheme()
-                                        == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                        == metadata::CompressionScheme::CompressionAlgorithmZstd,
                                 "Expected LZ4 or Zstd compression for large dictionary"
                             );
                         }
@@ -10856,11 +10749,12 @@ mod tests {
 
     fn dictionary_encoding_from_page(
         page: &crate::encoder::EncodedPage,
-    ) -> &crate::format::pb21::CompressiveEncoding {
+    ) -> &crate::format::metadata::CompressiveEncoding {
         let PageEncoding::Structural(layout) = &page.description else {
             panic!("Expected structural page encoding");
         };
-        let pb21::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap()
+        let metadata::page_layout::Layout::MiniBlockLayout(layout) =
+            layout.layout.as_ref().unwrap()
         else {
             panic!("Expected mini-block layout");
         };
@@ -10935,7 +10829,7 @@ mod tests {
         let compression = general.compression.as_ref().unwrap();
         assert_eq!(
             compression.scheme(),
-            pb21::CompressionScheme::CompressionAlgorithmLz4
+            metadata::CompressionScheme::CompressionAlgorithmLz4
         );
     }
 
@@ -10949,7 +10843,7 @@ mod tests {
         let compression = general.compression.as_ref().unwrap();
         assert_eq!(
             compression.scheme(),
-            pb21::CompressionScheme::CompressionAlgorithmLz4
+            metadata::CompressionScheme::CompressionAlgorithmLz4
         );
     }
 
@@ -10968,7 +10862,7 @@ mod tests {
         let compression = general.compression.as_ref().unwrap();
         assert_eq!(
             compression.scheme(),
-            pb21::CompressionScheme::CompressionAlgorithmZstd
+            metadata::CompressionScheme::CompressionAlgorithmZstd
         );
     }
 
@@ -11121,14 +11015,14 @@ mod tests {
         let unique_values = 2_000;
 
         let dictionary_encoding =
-            ProtobufUtils21::out_of_line_bitpacking(64, ProtobufUtils21::flat(11, None));
-        let layout = pb21::MiniBlockLayout {
+            EncodingUtils::out_of_line_bitpacking(64, EncodingUtils::flat(11, None));
+        let layout = metadata::MiniBlockLayout {
             rep_compression: None,
             def_compression: None,
-            value_compression: Some(ProtobufUtils21::flat(64, None)),
+            value_compression: Some(EncodingUtils::flat(64, None)),
             dictionary: Some(dictionary_encoding),
             num_dictionary_items: unique_values,
-            layers: vec![pb21::RepDefLayer::RepdefAllValidItem as i32],
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
             num_buffers: 1,
             repetition_index_depth: 0,
             num_items: rows,
@@ -11487,21 +11381,24 @@ mod tests {
         })))
     }
 
-    fn miniblock_layout(page: &crate::encoder::EncodedPage) -> &pb21::MiniBlockLayout {
-        let PageEncoding::Structural(layout) = &page.description else {
-            panic!("expected structural page encoding");
+    fn miniblock_layout(page: &crate::encoder::EncodedPage) -> metadata::MiniBlockLayout {
+        let layout = match &page.description {
+            PageEncoding::Structural(l) => l.clone(),
+            PageEncoding::Planar(l) => l.dense_execution_layout().unwrap(),
+            _ => panic!("expected structural page encoding"),
         };
-        let Some(pb21::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref()
+        let Some(metadata::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref()
         else {
             panic!("expected mini-block page layout");
         };
-        layout
+        layout.clone()
     }
 
     fn variable_offset_compression(
         page: &crate::encoder::EncodedPage,
-    ) -> &pb21::compressive_encoding::Compression {
-        let value_encoding = miniblock_layout(page).value_compression.as_ref().unwrap();
+    ) -> metadata::compressive_encoding::Compression {
+        let metadata = miniblock_layout(page);
+        let value_encoding = metadata.value_compression.as_ref().unwrap();
         let Compression::Variable(variable) = value_encoding.compression.as_ref().unwrap() else {
             panic!("expected Variable value compression");
         };
@@ -11510,6 +11407,7 @@ mod tests {
             .as_deref()
             .and_then(|offsets| offsets.compression.as_ref())
             .unwrap()
+            .clone()
     }
 
     fn variable_value_wire_bytes(page: &crate::encoder::EncodedPage) -> usize {
@@ -11575,7 +11473,7 @@ mod tests {
             &buffer_offsets_and_sizes,
             0,
             page.num_rows,
-            miniblock_layout(page),
+            &miniblock_layout(page),
             &decompression,
         )
         .unwrap();
@@ -11597,7 +11495,7 @@ mod tests {
             &buffer_offsets_and_sizes,
             0,
             page.num_rows,
-            miniblock_layout(page),
+            &miniblock_layout(page),
             &decompression,
         )
         .unwrap();
@@ -11664,7 +11562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
 
         let val = vec![0xABu8; 33];
         let arr: ArrayRef = Arc::new(
@@ -11694,7 +11592,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constant_layout_out_of_line_utf8_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
 
         let arr: ArrayRef = Arc::new(arrow_array::StringArray::from_iter_values(
             std::iter::repeat_n("hello", 512),
@@ -11719,7 +11617,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constant_layout_nullable_item_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
 
         let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![
             Some(7),
@@ -11748,7 +11646,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constant_layout_list_repdef_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
         use arrow_array::builder::{Int32Builder, ListBuilder};
 
         let mut builder = ListBuilder::new(Int32Builder::new());
@@ -11793,7 +11691,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
         use arrow_array::builder::{FixedSizeListBuilder, Int32Builder};
 
         let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 3);
@@ -11829,7 +11727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_constant_layout_not_written_before_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
 
         let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7; 1024]));
         let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -11851,7 +11749,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_null_constant_layout_still_works_v2_2() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
 
         let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None, None, None]));
         let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -11952,7 +11850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complex_all_null_compression_gated_by_version() {
-        use crate::format::pb21::page_layout::Layout;
+        use crate::format::metadata::page_layout::Layout;
         use arrow_array::ListArray;
 
         let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
@@ -12048,7 +11946,7 @@ mod tests {
         let rep_frame = encoded_u16_frame(&levels, RunLengthWidth::U8);
         let rep_decompressor = RleDecompressor::new(16);
         let def_frame = LanceBuffer::reinterpret_slice(Arc::from(levels.clone()));
-        let def_decompressor = ValueDecompressor::from_flat(&pb21::Flat {
+        let def_decompressor = ValueDecompressor::from_flat(&metadata::Flat {
             bits_per_value: 16,
             data: None,
         });
@@ -12563,10 +12461,10 @@ mod tests {
 
     #[test]
     fn complex_all_null_level_codec_validates_rle_metadata() {
-        let encoding = pb21::CompressiveEncoding {
-            compression: Some(Compression::Rle(Box::new(pb21::Rle {
+        let encoding = metadata::CompressiveEncoding {
+            compression: Some(Compression::Rle(Box::new(metadata::Rle {
                 values: None,
-                run_lengths: Some(Box::new(ProtobufUtils21::flat(8, None))),
+                run_lengths: Some(Box::new(EncodingUtils::flat(8, None))),
             }))),
         };
 

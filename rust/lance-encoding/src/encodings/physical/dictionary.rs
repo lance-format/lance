@@ -10,7 +10,7 @@ use crate::{
     compression::{BlockCompressor, BlockDecompressor},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     encodings::physical::{checked_fixed_values, try_vec_with_capacity},
-    format::{ProtobufUtils21, pb21::CompressiveEncoding},
+    format::{EncodingUtils, metadata::CompressiveEncoding},
 };
 use lance_core::{Error, Result};
 
@@ -100,7 +100,7 @@ impl BlockCompressor for BlockDictionaryEncoder {
             .compress(DataBlock::FixedWidth(indices_block))?;
         let (items_payload, items_encoding) =
             self.items.compress(DataBlock::FixedWidth(items_block))?;
-        let encoding = ProtobufUtils21::dictionary(
+        let encoding = EncodingUtils::dictionary(
             indices_encoding,
             items_encoding,
             self.dictionary_items.len() as u32,
@@ -373,7 +373,7 @@ mod tests {
         range::{RangeDecompressor, RangeEncoder},
         value::{ValueDecompressor, ValueEncoder},
     };
-    use crate::format::pb21::Flat;
+    use crate::format::metadata::Flat;
 
     use super::*;
 
@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(u64::from_le_bytes(payload[8..16].try_into().unwrap()), 16);
         assert!(matches!(
             encoding.compression,
-            Some(crate::format::pb21::compressive_encoding::Compression::Dictionary(_))
+            Some(crate::format::metadata::compressive_encoding::Compression::Dictionary(_))
         ));
 
         let decoder =

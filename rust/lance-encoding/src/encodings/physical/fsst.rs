@@ -26,8 +26,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor},
     },
     format::{
-        ProtobufUtils21,
-        pb21::{self, CompressiveEncoding},
+        EncodingUtils,
+        metadata::{self, CompressiveEncoding},
     },
 };
 
@@ -163,7 +163,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
 
         Ok((
             binary_miniblock_compressed,
-            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
+            EncodingUtils::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -189,7 +189,7 @@ impl PerValueCompressor for FsstPerValueEncoder {
 
         Ok((
             binary_compressed,
-            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
+            EncodingUtils::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -304,7 +304,7 @@ pub struct FsstMiniBlockDecompressor {
 
 impl FsstMiniBlockDecompressor {
     pub fn new(
-        description: &pb21::Fsst,
+        description: &metadata::Fsst,
         inner_decompressor: Box<dyn MiniBlockDecompressor>,
     ) -> Self {
         Self {

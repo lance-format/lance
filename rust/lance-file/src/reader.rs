@@ -539,11 +539,9 @@ fn indexed_projection_column_count(field: &Field) -> Option<usize> {
 pub(crate) fn normalized_column_num_rows(info: &ColumnInfo) -> Result<u64> {
     info.page_infos.iter().try_fold(0_u64, |rows, page| {
         let page_rows = match &page.encoding {
-            PageEncoding::Structural(layout) => match &layout.layout {
-                Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => {
-                    sparse.row_count_and_scale(page.num_rows)?.0
-                }
-                _ => page.num_rows,
+            PageEncoding::Planar(layout) => match layout.sparse() {
+                Some(sparse) => sparse.row_count_and_scale(page.num_rows)?.0,
+                None => page.num_rows,
             },
             _ => page.num_rows,
         };
@@ -2310,6 +2308,11 @@ pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
                                 format!("Unsupported(decode_err={})", err)
                             }
                         }
+                    } else if encoding_any.type_url == "/lance.encodings23.PlanarLayout" {
+                        match encoding_any.to_msg::<lance_encoding::format::pb23::PlanarLayout>() {
+                            Ok(encoding) => format!("{encoding:#?}"),
+                            Err(err) => format!("Unsupported(decode_err={err})"),
+                        }
                     } else {
                         format!("Unrecognized(type_url={})", encoding_any.type_url)
                     }
@@ -2441,7 +2444,7 @@ mod tests {
             PageEncoding, ReadBatchTask, decode_batch,
         },
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
-        format::pb21,
+        format::metadata,
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
@@ -2548,6 +2551,10 @@ mod tests {
                     STRUCTURAL_ENCODING_SPARSE.to_string(),
                 ),
                 ("lance-encoding:compression".to_string(), "none".to_string()),
+                (
+                    "lance-encoding:dict-divisor".to_string(),
+                    "100000".to_string(),
+                ),
             ]);
             let values = Arc::new(StringArray::from_iter_values((0..2048).map(|i| {
                 let len = if kind == "binary_range" {
@@ -2557,7 +2564,8 @@ mod tests {
                 };
                 char::from(b'a' + (i % 26) as u8).to_string().repeat(len)
             })));
-            let item = Arc::new(Field::new("item", DataType::Utf8, true));
+            let item =
+                Arc::new(Field::new("item", DataType::Utf8, true).with_metadata(metadata.clone()));
             let lists = ListArray::try_new(
                 item.clone(),
                 OffsetBuffer::new(ScalarBuffer::from((0..=2048).collect::<Vec<i32>>())),
@@ -2599,19 +2607,22 @@ mod tests {
         .unwrap();
         assert_eq!(file_reader.metadata().column_infos.len(), 2);
         if matches!(kind, "rle" | "dictionary") {
-            let PageEncoding::Structural(layout) =
+            let PageEncoding::Planar(layout) =
                 &file_reader.metadata().column_infos[1].page_infos[0].encoding
             else {
                 panic!("expected structural page")
             };
-            let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
+            let Some(sparse) = layout.sparse() else {
                 panic!("expected sparse page")
             };
             let counts = sparse
-                .structural_layers
+                .layers
                 .iter()
                 .find_map(|layer| {
-                    if let Some(pb21::sparse_structural_layer::Layer::List(list)) = &layer.layer {
+                    if let Some(
+                        lance_encoding::format::pb23::sparse_structural_layer::Layer::List(list),
+                    ) = &layer.layer
+                    {
                         list.counts.as_ref()
                     } else {
                         None
@@ -2621,25 +2632,29 @@ mod tests {
             assert!(
                 matches!(
                     (kind, &counts.compression),
-                    ("rle", Some(pb21::compressive_encoding::Compression::Rle(_)))
-                        | (
-                            "dictionary",
-                            Some(pb21::compressive_encoding::Compression::Dictionary(_))
-                        )
+                    (
+                        "rle",
+                        Some(metadata::compressive_encoding::Compression::Rle(_))
+                    ) | (
+                        "dictionary",
+                        Some(metadata::compressive_encoding::Compression::Dictionary(_))
+                    )
                 ),
                 "unexpected count codec: {counts:?}"
             );
         }
         if kind.starts_with("binary_") {
             for column in &file_reader.metadata().column_infos {
-                let PageEncoding::Structural(layout) = &column.page_infos[0].encoding else {
+                let PageEncoding::Planar(layout) = &column.page_infos[0].encoding else {
                     panic!("expected structural page")
                 };
-                let Some(pb21::page_layout::Layout::SparseLayout(sparse)) = &layout.layout else {
-                    panic!("expected sparse page")
+                let Some(lance_encoding::format::pb23::value_plane::Codec::Chunked(values)) =
+                    layout.values.as_ref().and_then(|v| v.codec.as_ref())
+                else {
+                    panic!("expected chunked values")
                 };
-                let Some(pb21::compressive_encoding::Compression::Variable(variable)) =
-                    &sparse.value_compression.as_ref().unwrap().compression
+                let Some(metadata::compressive_encoding::Compression::Variable(variable)) =
+                    &values.compression.as_ref().unwrap().compression
                 else {
                     panic!("expected variable values")
                 };
@@ -2647,12 +2662,12 @@ mod tests {
                 if kind == "binary_range" {
                     assert!(matches!(
                         offsets,
-                        Some(pb21::compressive_encoding::Compression::Range(_))
+                        Some(metadata::compressive_encoding::Compression::Range(_))
                     ));
                 } else {
                     assert!(matches!(
                         offsets,
-                        Some(pb21::compressive_encoding::Compression::Delta(_))
+                        Some(metadata::compressive_encoding::Compression::Delta(_))
                     ));
                 }
             }
@@ -2666,11 +2681,8 @@ mod tests {
                 .all(|page| {
                     matches!(
                         &page.encoding,
-                        PageEncoding::Structural(layout)
-                            if matches!(
-                                layout.layout,
-                                Some(pb21::page_layout::Layout::SparseLayout(_))
-                            )
+                        PageEncoding::Planar(layout)
+                            if layout.structure.is_some() && layout.values.is_some()
                     )
                 })
         );

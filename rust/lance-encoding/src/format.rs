@@ -19,7 +19,7 @@ pub mod pb {
 /// Protobuf definitions for encodings21
 ///
 /// These are the messages used for describing encoding in the 2.1 format
-/// and any newer formats.
+/// and the stable 2.2 format.
 pub mod pb21 {
     #![allow(clippy::all)]
     #![allow(non_upper_case_globals)]
@@ -37,6 +37,10 @@ pub mod pb23 {
     #![allow(clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/lance.encodings23.rs"));
 }
+
+pub mod metadata;
+pub mod planar;
+mod stable;
 
 use pb::{
     ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Block, Dictionary, FixedSizeBinary,
@@ -310,433 +314,375 @@ impl ProtobufUtils {
     }
 }
 
-macro_rules! impl_common_protobuf_utils {
-    ($module:ident, $struct_name:ident) => {
-        pub struct $struct_name {}
+/// Constructors for compression trees and structural execution descriptions.
+pub struct EncodingUtils {}
 
-        impl $struct_name {
-            pub fn flat(
-                bits_per_value: u64,
-                values_compression: Option<crate::format::$module::BufferCompression>,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::Flat(
-                            crate::format::$module::Flat {
-                                bits_per_value,
-                                data: values_compression,
-                            },
-                        ),
-                    ),
-                }
-            }
-
-            pub fn constant(
-                value: Option<bytes::Bytes>,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::Constant(
-                            crate::format::$module::Constant { value },
-                        ),
-                    ),
-                }
-            }
-
-            pub fn fsl(
-                items_per_value: u64,
-                has_validity: bool,
-                values: crate::format::$module::CompressiveEncoding,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::FixedSizeList(
-                            Box::new(crate::format::$module::FixedSizeList {
-                                items_per_value,
-                                has_validity,
-                                values: Some(Box::new(values)),
-                            }),
-                        ),
-                    ),
-                }
-            }
-
-            pub fn variable(
-                offsets_desc: crate::format::$module::CompressiveEncoding,
-                values_compression: Option<crate::format::$module::BufferCompression>,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::Variable(
-                            Box::new(crate::format::$module::Variable {
-                                offsets: Some(Box::new(offsets_desc)),
-                                values: values_compression,
-                            }),
-                        ),
-                    ),
-                }
-            }
-
-            pub fn inline_bitpacking(
-                uncompressed_bits_per_value: u64,
-                values_compression: Option<crate::format::$module::BufferCompression>,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::InlineBitpacking(
-                            crate::format::$module::InlineBitpacking {
-                                uncompressed_bits_per_value,
-                                values: values_compression,
-                            },
-                        ),
-                    ),
-                }
-            }
-
-            pub fn out_of_line_bitpacking(
-                uncompressed_bits_per_value: u64,
-                values: crate::format::$module::CompressiveEncoding,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::OutOfLineBitpacking(
-                            Box::new(crate::format::$module::OutOfLineBitpacking {
-                                uncompressed_bits_per_value,
-                                values: Some(Box::new(values)),
-                            }),
-                        ),
-                    ),
-                }
-            }
-
-            pub fn buffer_compression(
-                compression: CompressionConfig,
-            ) -> Result<crate::format::$module::BufferCompression> {
-                Ok(crate::format::$module::BufferCompression {
-                    scheme: crate::format::$module::CompressionScheme::try_from(
-                        compression.scheme,
-                    )? as i32,
-                    level: compression.level,
-                })
-            }
-
-            pub fn wrapped(
-                compression: CompressionConfig,
-                values: crate::format::$module::CompressiveEncoding,
-            ) -> Result<crate::format::$module::CompressiveEncoding> {
-                Ok(crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::General(
-                            Box::new(crate::format::$module::General {
-                                compression: Some(Self::buffer_compression(compression)?),
-                                values: Some(Box::new(values)),
-                            }),
-                        ),
-                    ),
-                })
-            }
-
-            pub fn rle(
-                values: crate::format::$module::CompressiveEncoding,
-                run_lengths: crate::format::$module::CompressiveEncoding,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::Rle(Box::new(
-                            crate::format::$module::Rle {
-                                values: Some(Box::new(values)),
-                                run_lengths: Some(Box::new(run_lengths)),
-                            },
-                        )),
-                    ),
-                }
-            }
-
-            pub fn byte_stream_split(
-                values: crate::format::$module::CompressiveEncoding,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::ByteStreamSplit(
-                            Box::new(crate::format::$module::ByteStreamSplit {
-                                values: Some(Box::new(values)),
-                            }),
-                        ),
-                    ),
-                }
-            }
-
-            pub fn fsst(
-                data: crate::format::$module::CompressiveEncoding,
-                symbol_table: Vec<u8>,
-            ) -> crate::format::$module::CompressiveEncoding {
-                crate::format::$module::CompressiveEncoding {
-                    compression: Some(
-                        crate::format::$module::compressive_encoding::Compression::Fsst(
-                            Box::new(crate::format::$module::Fsst {
-                                symbol_table: symbol_table.into(),
-                                values: Some(Box::new(data)),
-                            }),
-                        ),
-                    ),
-                }
-            }
-
-            fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
-                match def {
-                    DefinitionInterpretation::AllValidItem => {
-                        crate::format::$module::RepDefLayer::RepdefAllValidItem as i32
-                    }
-                    DefinitionInterpretation::AllValidList => {
-                        crate::format::$module::RepDefLayer::RepdefAllValidList as i32
-                    }
-                    DefinitionInterpretation::NullableItem => {
-                        crate::format::$module::RepDefLayer::RepdefNullableItem as i32
-                    }
-                    DefinitionInterpretation::NullableList => {
-                        crate::format::$module::RepDefLayer::RepdefNullableList as i32
-                    }
-                    DefinitionInterpretation::EmptyableList => {
-                        crate::format::$module::RepDefLayer::RepdefEmptyableList as i32
-                    }
-                    DefinitionInterpretation::NullableAndEmptyableList => {
-                        crate::format::$module::RepDefLayer::RepdefNullAndEmptyList as i32
-                    }
-                }
-            }
-
-            pub fn repdef_layer_to_def_interp(
-                layer: i32,
-            ) -> DefinitionInterpretation {
-                let layer = crate::format::$module::RepDefLayer::try_from(layer).unwrap();
-                match layer {
-                    crate::format::$module::RepDefLayer::RepdefAllValidItem => {
-                        DefinitionInterpretation::AllValidItem
-                    }
-                    crate::format::$module::RepDefLayer::RepdefAllValidList => {
-                        DefinitionInterpretation::AllValidList
-                    }
-                    crate::format::$module::RepDefLayer::RepdefNullableItem => {
-                        DefinitionInterpretation::NullableItem
-                    }
-                    crate::format::$module::RepDefLayer::RepdefNullableList => {
-                        DefinitionInterpretation::NullableList
-                    }
-                    crate::format::$module::RepDefLayer::RepdefEmptyableList => {
-                        DefinitionInterpretation::EmptyableList
-                    }
-                    crate::format::$module::RepDefLayer::RepdefNullAndEmptyList => {
-                        DefinitionInterpretation::NullableAndEmptyableList
-                    }
-                    crate::format::$module::RepDefLayer::RepdefUnspecified => {
-                        panic!("Unspecified repdef layer")
-                    }
-                }
-            }
-
-            #[allow(clippy::too_many_arguments)]
-            pub fn miniblock_layout(
-                rep_encoding: Option<crate::format::$module::CompressiveEncoding>,
-                def_encoding: Option<crate::format::$module::CompressiveEncoding>,
-                value_encoding: crate::format::$module::CompressiveEncoding,
-                repetition_index_depth: u32,
-                num_buffers: u64,
-                dictionary_encoding: Option<(
-                    crate::format::$module::CompressiveEncoding,
-                    u64,
-                )>,
-                def_meaning: &[DefinitionInterpretation],
-                num_items: u64,
-                has_large_chunk: bool,
-    ) -> crate::format::$module::PageLayout {
-                assert!(!def_meaning.is_empty());
-                let (dictionary, num_dictionary_items) = dictionary_encoding
-                    .map(|(d, i)| (Some(d), i))
-                    .unwrap_or((None, 0));
-                crate::format::$module::PageLayout {
-                    layout: Some(
-                        crate::format::$module::page_layout::Layout::MiniBlockLayout(
-                            crate::format::$module::MiniBlockLayout {
-                                def_compression: def_encoding,
-                                rep_compression: rep_encoding,
-                                value_compression: Some(value_encoding),
-                                repetition_index_depth,
-                                num_buffers,
-                                dictionary,
-                                num_dictionary_items,
-                                layers: def_meaning
-                                    .iter()
-                                    .map(|&def| Self::def_inter_to_repdef_layer(def))
-                                    .collect(),
-                                num_items,
-                                has_large_chunk,
+impl EncodingUtils {
+    pub fn flat(
+        bits_per_value: u64,
+        values_compression: Option<metadata::BufferCompression>,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Flat(
+                metadata::Flat {
+                    bits_per_value,
+                    data: values_compression,
                 },
-                        ),
-                    ),
-                }
-            }
-
-            fn full_zip_layout(
-                bits_rep: u8,
-                bits_def: u8,
-                details: crate::format::$module::full_zip_layout::Details,
-                value_encoding: crate::format::$module::CompressiveEncoding,
-                def_meaning: &[DefinitionInterpretation],
-                num_items: u32,
-                num_visible_items: u32,
-            ) -> crate::format::$module::PageLayout {
-                crate::format::$module::PageLayout {
-                    layout: Some(
-                        crate::format::$module::page_layout::Layout::FullZipLayout(
-                            crate::format::$module::FullZipLayout {
-                                bits_rep: bits_rep as u32,
-                                bits_def: bits_def as u32,
-                                details: Some(details),
-                                value_compression: Some(value_encoding),
-                                num_items,
-                                num_visible_items,
-                                layers: def_meaning
-                                    .iter()
-                                    .map(|&def| Self::def_inter_to_repdef_layer(def))
-                                    .collect(),
-                            },
-                        ),
-                    ),
-                }
-            }
-
-            pub fn fixed_full_zip_layout(
-                bits_rep: u8,
-                bits_def: u8,
-                bits_per_value: u32,
-                value_encoding: crate::format::$module::CompressiveEncoding,
-                def_meaning: &[DefinitionInterpretation],
-                num_items: u32,
-                num_visible_items: u32,
-            ) -> crate::format::$module::PageLayout {
-                Self::full_zip_layout(
-                    bits_rep,
-                    bits_def,
-                    crate::format::$module::full_zip_layout::Details::BitsPerValue(
-                        bits_per_value,
-                    ),
-                    value_encoding,
-                    def_meaning,
-                    num_items,
-                    num_visible_items,
-                )
-            }
-
-            pub fn variable_full_zip_layout(
-                bits_rep: u8,
-                bits_def: u8,
-                bits_per_offset: u32,
-                value_encoding: crate::format::$module::CompressiveEncoding,
-                def_meaning: &[DefinitionInterpretation],
-                num_items: u32,
-                num_visible_items: u32,
-            ) -> crate::format::$module::PageLayout {
-                Self::full_zip_layout(
-                    bits_rep,
-                    bits_def,
-                    crate::format::$module::full_zip_layout::Details::BitsPerOffset(
-                        bits_per_offset,
-                    ),
-                    value_encoding,
-                    def_meaning,
-                    num_items,
-                    num_visible_items,
-                )
-            }
-
-            pub fn blob_layout(
-                inner_layout: crate::format::$module::PageLayout,
-                def_meaning: &[DefinitionInterpretation],
-            ) -> crate::format::$module::PageLayout {
-                crate::format::$module::PageLayout {
-                    layout: Some(
-                        crate::format::$module::page_layout::Layout::BlobLayout(Box::new(
-                            crate::format::$module::BlobLayout {
-                                inner_layout: Some(Box::new(inner_layout)),
-                                layers: def_meaning
-                                    .iter()
-                                    .map(|&def| Self::def_inter_to_repdef_layer(def))
-                                    .collect(),
-                            },
-                        )),
-                    ),
-                }
-            }
-
-
+            )),
         }
-    };
-}
+    }
 
-impl_common_protobuf_utils!(pb21, ProtobufUtils21);
+    pub fn constant(value: Option<bytes::Bytes>) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Constant(
+                metadata::Constant { value },
+            )),
+        }
+    }
 
-impl ProtobufUtils21 {
-    pub fn range(
+    pub fn fsl(
+        items_per_value: u64,
+        has_validity: bool,
+        values: metadata::CompressiveEncoding,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::FixedSizeList(
+                Box::new(metadata::FixedSizeList {
+                    items_per_value,
+                    has_validity,
+                    values: Some(Box::new(values)),
+                }),
+            )),
+        }
+    }
+
+    pub fn variable(
+        offsets_desc: metadata::CompressiveEncoding,
+        values_compression: Option<metadata::BufferCompression>,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Variable(
+                Box::new(metadata::Variable {
+                    offsets: Some(Box::new(offsets_desc)),
+                    values: values_compression,
+                }),
+            )),
+        }
+    }
+
+    pub fn inline_bitpacking(
         uncompressed_bits_per_value: u64,
-        start: u64,
-        step: u64,
-    ) -> crate::format::pb21::CompressiveEncoding {
-        crate::format::pb21::CompressiveEncoding {
+        values_compression: Option<metadata::BufferCompression>,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
             compression: Some(
-                crate::format::pb21::compressive_encoding::Compression::Range(
-                    crate::format::pb21::Range {
+                metadata::compressive_encoding::Compression::InlineBitpacking(
+                    metadata::InlineBitpacking {
                         uncompressed_bits_per_value,
-                        start,
-                        step,
+                        values: values_compression,
                     },
                 ),
             ),
         }
     }
 
-    pub fn delta(
+    pub fn out_of_line_bitpacking(
         uncompressed_bits_per_value: u64,
-        base: u64,
-        deltas: crate::format::pb21::CompressiveEncoding,
-    ) -> crate::format::pb21::CompressiveEncoding {
-        crate::format::pb21::CompressiveEncoding {
+        values: metadata::CompressiveEncoding,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
             compression: Some(
-                crate::format::pb21::compressive_encoding::Compression::Delta(Box::new(
-                    crate::format::pb21::Delta {
+                metadata::compressive_encoding::Compression::OutOfLineBitpacking(Box::new(
+                    metadata::OutOfLineBitpacking {
                         uncompressed_bits_per_value,
-                        base,
-                        deltas: Some(Box::new(deltas)),
+                        values: Some(Box::new(values)),
                     },
                 )),
             ),
         }
     }
 
-    pub fn dictionary(
-        indices: crate::format::pb21::CompressiveEncoding,
-        items: crate::format::pb21::CompressiveEncoding,
-        num_dictionary_items: u32,
-    ) -> crate::format::pb21::CompressiveEncoding {
-        crate::format::pb21::CompressiveEncoding {
+    pub fn buffer_compression(
+        compression: CompressionConfig,
+    ) -> Result<metadata::BufferCompression> {
+        Ok(metadata::BufferCompression {
+            scheme: metadata::CompressionScheme::try_from(compression.scheme)? as i32,
+            level: compression.level,
+        })
+    }
+
+    pub fn wrapped(
+        compression: CompressionConfig,
+        values: metadata::CompressiveEncoding,
+    ) -> Result<metadata::CompressiveEncoding> {
+        Ok(metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::General(
+                Box::new(metadata::General {
+                    compression: Some(Self::buffer_compression(compression)?),
+                    values: Some(Box::new(values)),
+                }),
+            )),
+        })
+    }
+
+    pub fn rle(
+        values: metadata::CompressiveEncoding,
+        run_lengths: metadata::CompressiveEncoding,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Rle(Box::new(
+                metadata::Rle {
+                    values: Some(Box::new(values)),
+                    run_lengths: Some(Box::new(run_lengths)),
+                },
+            ))),
+        }
+    }
+
+    pub fn byte_stream_split(
+        values: metadata::CompressiveEncoding,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
             compression: Some(
-                crate::format::pb21::compressive_encoding::Compression::Dictionary(Box::new(
-                    crate::format::pb21::Dictionary {
-                        indices: Some(Box::new(indices)),
-                        items: Some(Box::new(items)),
-                        num_dictionary_items,
+                metadata::compressive_encoding::Compression::ByteStreamSplit(Box::new(
+                    metadata::ByteStreamSplit {
+                        values: Some(Box::new(values)),
                     },
                 )),
             ),
+        }
+    }
+
+    pub fn fsst(
+        data: metadata::CompressiveEncoding,
+        symbol_table: Vec<u8>,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Fsst(Box::new(
+                metadata::Fsst {
+                    symbol_table: symbol_table.into(),
+                    values: Some(Box::new(data)),
+                },
+            ))),
+        }
+    }
+
+    fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
+        match def {
+            DefinitionInterpretation::AllValidItem => {
+                metadata::RepDefLayer::RepdefAllValidItem as i32
+            }
+            DefinitionInterpretation::AllValidList => {
+                metadata::RepDefLayer::RepdefAllValidList as i32
+            }
+            DefinitionInterpretation::NullableItem => {
+                metadata::RepDefLayer::RepdefNullableItem as i32
+            }
+            DefinitionInterpretation::NullableList => {
+                metadata::RepDefLayer::RepdefNullableList as i32
+            }
+            DefinitionInterpretation::EmptyableList => {
+                metadata::RepDefLayer::RepdefEmptyableList as i32
+            }
+            DefinitionInterpretation::NullableAndEmptyableList => {
+                metadata::RepDefLayer::RepdefNullAndEmptyList as i32
+            }
+        }
+    }
+
+    pub fn repdef_layer_to_def_interp(layer: i32) -> DefinitionInterpretation {
+        let layer = metadata::RepDefLayer::try_from(layer).unwrap();
+        match layer {
+            metadata::RepDefLayer::RepdefAllValidItem => DefinitionInterpretation::AllValidItem,
+            metadata::RepDefLayer::RepdefAllValidList => DefinitionInterpretation::AllValidList,
+            metadata::RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
+            metadata::RepDefLayer::RepdefNullableList => DefinitionInterpretation::NullableList,
+            metadata::RepDefLayer::RepdefEmptyableList => DefinitionInterpretation::EmptyableList,
+            metadata::RepDefLayer::RepdefNullAndEmptyList => {
+                DefinitionInterpretation::NullableAndEmptyableList
+            }
+            metadata::RepDefLayer::RepdefUnspecified => {
+                panic!("Unspecified repdef layer")
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn miniblock_layout(
+        rep_encoding: Option<metadata::CompressiveEncoding>,
+        def_encoding: Option<metadata::CompressiveEncoding>,
+        value_encoding: metadata::CompressiveEncoding,
+        repetition_index_depth: u32,
+        num_buffers: u64,
+        dictionary_encoding: Option<(metadata::CompressiveEncoding, u64)>,
+        def_meaning: &[DefinitionInterpretation],
+        num_items: u64,
+        has_large_chunk: bool,
+    ) -> metadata::PageLayout {
+        assert!(!def_meaning.is_empty());
+        let (dictionary, num_dictionary_items) = dictionary_encoding
+            .map(|(d, i)| (Some(d), i))
+            .unwrap_or((None, 0));
+        metadata::PageLayout {
+            layout: Some(metadata::page_layout::Layout::MiniBlockLayout(
+                metadata::MiniBlockLayout {
+                    def_compression: def_encoding,
+                    rep_compression: rep_encoding,
+                    value_compression: Some(value_encoding),
+                    repetition_index_depth,
+                    num_buffers,
+                    dictionary,
+                    num_dictionary_items,
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                    num_items,
+                    has_large_chunk,
+                },
+            )),
+        }
+    }
+
+    fn full_zip_layout(
+        bits_rep: u8,
+        bits_def: u8,
+        details: metadata::full_zip_layout::Details,
+        value_encoding: metadata::CompressiveEncoding,
+        def_meaning: &[DefinitionInterpretation],
+        num_items: u32,
+        num_visible_items: u32,
+    ) -> metadata::PageLayout {
+        metadata::PageLayout {
+            layout: Some(metadata::page_layout::Layout::FullZipLayout(
+                metadata::FullZipLayout {
+                    bits_rep: bits_rep as u32,
+                    bits_def: bits_def as u32,
+                    details: Some(details),
+                    value_compression: Some(value_encoding),
+                    num_items,
+                    num_visible_items,
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                },
+            )),
+        }
+    }
+
+    pub fn fixed_full_zip_layout(
+        bits_rep: u8,
+        bits_def: u8,
+        bits_per_value: u32,
+        value_encoding: metadata::CompressiveEncoding,
+        def_meaning: &[DefinitionInterpretation],
+        num_items: u32,
+        num_visible_items: u32,
+    ) -> metadata::PageLayout {
+        Self::full_zip_layout(
+            bits_rep,
+            bits_def,
+            metadata::full_zip_layout::Details::BitsPerValue(bits_per_value),
+            value_encoding,
+            def_meaning,
+            num_items,
+            num_visible_items,
+        )
+    }
+
+    pub fn variable_full_zip_layout(
+        bits_rep: u8,
+        bits_def: u8,
+        bits_per_offset: u32,
+        value_encoding: metadata::CompressiveEncoding,
+        def_meaning: &[DefinitionInterpretation],
+        num_items: u32,
+        num_visible_items: u32,
+    ) -> metadata::PageLayout {
+        Self::full_zip_layout(
+            bits_rep,
+            bits_def,
+            metadata::full_zip_layout::Details::BitsPerOffset(bits_per_offset),
+            value_encoding,
+            def_meaning,
+            num_items,
+            num_visible_items,
+        )
+    }
+
+    pub fn blob_layout(
+        inner_layout: metadata::PageLayout,
+        def_meaning: &[DefinitionInterpretation],
+    ) -> metadata::PageLayout {
+        metadata::PageLayout {
+            layout: Some(metadata::page_layout::Layout::BlobLayout(Box::new(
+                metadata::BlobLayout {
+                    inner_layout: Some(Box::new(inner_layout)),
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                },
+            ))),
+        }
+    }
+
+    pub fn range(
+        uncompressed_bits_per_value: u64,
+        start: u64,
+        step: u64,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Range(
+                metadata::Range {
+                    uncompressed_bits_per_value,
+                    start,
+                    step,
+                },
+            )),
+        }
+    }
+
+    pub fn delta(
+        uncompressed_bits_per_value: u64,
+        base: u64,
+        deltas: metadata::CompressiveEncoding,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Delta(
+                Box::new(metadata::Delta {
+                    uncompressed_bits_per_value,
+                    base,
+                    deltas: Some(Box::new(deltas)),
+                }),
+            )),
+        }
+    }
+
+    pub fn dictionary(
+        indices: metadata::CompressiveEncoding,
+        items: metadata::CompressiveEncoding,
+        num_dictionary_items: u32,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Dictionary(
+                Box::new(metadata::Dictionary {
+                    indices: Some(Box::new(indices)),
+                    items: Some(Box::new(items)),
+                    num_dictionary_items,
+                }),
+            )),
         }
     }
 
     pub fn constant_layout(
         def_meaning: &[DefinitionInterpretation],
         inline_value: Option<Vec<u8>>,
-    ) -> crate::format::pb21::PageLayout {
-        crate::format::pb21::PageLayout {
-            layout: Some(crate::format::pb21::page_layout::Layout::ConstantLayout(
-                crate::format::pb21::ConstantLayout {
+    ) -> metadata::PageLayout {
+        metadata::PageLayout {
+            layout: Some(metadata::page_layout::Layout::ConstantLayout(
+                metadata::ConstantLayout {
                     inline_value: inline_value.map(bytes::Bytes::from),
                     rep_compression: None,
                     def_compression: None,
@@ -753,14 +699,14 @@ impl ProtobufUtils21 {
 
     pub fn compressed_all_null_constant_layout(
         def_meaning: &[DefinitionInterpretation],
-        rep_compression: Option<crate::format::pb21::CompressiveEncoding>,
-        def_compression: Option<crate::format::pb21::CompressiveEncoding>,
+        rep_compression: Option<metadata::CompressiveEncoding>,
+        def_compression: Option<metadata::CompressiveEncoding>,
         num_rep_values: u64,
         num_def_values: u64,
-    ) -> crate::format::pb21::PageLayout {
-        crate::format::pb21::PageLayout {
-            layout: Some(crate::format::pb21::page_layout::Layout::ConstantLayout(
-                crate::format::pb21::ConstantLayout {
+    ) -> metadata::PageLayout {
+        metadata::PageLayout {
+            layout: Some(metadata::page_layout::Layout::ConstantLayout(
+                metadata::ConstantLayout {
                     inline_value: None,
                     rep_compression,
                     def_compression,
@@ -776,41 +722,39 @@ impl ProtobufUtils21 {
     }
 
     pub fn packed_struct(
-        values: crate::format::pb21::CompressiveEncoding,
+        values: metadata::CompressiveEncoding,
         bits_per_values: Vec<u64>,
-    ) -> crate::format::pb21::CompressiveEncoding {
-        crate::format::pb21::CompressiveEncoding {
-            compression: Some(
-                crate::format::pb21::compressive_encoding::Compression::PackedStruct(Box::new(
-                    crate::format::pb21::PackedStruct {
-                        bits_per_value: bits_per_values,
-                        values: Some(Box::new(values)),
-                    },
-                )),
-            ),
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::PackedStruct(
+                Box::new(metadata::PackedStruct {
+                    bits_per_value: bits_per_values,
+                    values: Some(Box::new(values)),
+                }),
+            )),
         }
     }
 
     pub fn packed_struct_variable(
-        fields: Vec<crate::format::pb21::variable_packed_struct::FieldEncoding>,
-    ) -> crate::format::pb21::CompressiveEncoding {
-        crate::format::pb21::CompressiveEncoding {
+        fields: Vec<metadata::variable_packed_struct::FieldEncoding>,
+    ) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
             compression: Some(
-                crate::format::pb21::compressive_encoding::Compression::VariablePackedStruct(
-                    crate::format::pb21::VariablePackedStruct { fields },
+                metadata::compressive_encoding::Compression::VariablePackedStruct(
+                    metadata::VariablePackedStruct { fields },
                 ),
             ),
         }
     }
 
     pub fn packed_struct_field_fixed(
-        value_encoding: crate::format::pb21::CompressiveEncoding,
+        value_encoding: metadata::CompressiveEncoding,
         bits_per_value: u64,
-    ) -> crate::format::pb21::variable_packed_struct::FieldEncoding {
-        crate::format::pb21::variable_packed_struct::FieldEncoding {
+    ) -> metadata::variable_packed_struct::FieldEncoding {
+        metadata::variable_packed_struct::FieldEncoding {
             value: Some(value_encoding),
             layout: Some(
-                crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerValue(
+                metadata::variable_packed_struct::field_encoding::Layout::BitsPerValue(
                     bits_per_value,
                 ),
             ),
@@ -818,13 +762,13 @@ impl ProtobufUtils21 {
     }
 
     pub fn packed_struct_field_variable(
-        value_encoding: crate::format::pb21::CompressiveEncoding,
+        value_encoding: metadata::CompressiveEncoding,
         bits_per_length: u64,
-    ) -> crate::format::pb21::variable_packed_struct::FieldEncoding {
-        crate::format::pb21::variable_packed_struct::FieldEncoding {
+    ) -> metadata::variable_packed_struct::FieldEncoding {
+        metadata::variable_packed_struct::FieldEncoding {
             value: Some(value_encoding),
             layout: Some(
-                crate::format::pb21::variable_packed_struct::field_encoding::Layout::BitsPerLength(
+                metadata::variable_packed_struct::field_encoding::Layout::BitsPerLength(
                     bits_per_length,
                 ),
             ),

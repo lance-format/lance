@@ -26,7 +26,7 @@ use crate::{
     writer::PAGE_BUFFER_ALIGNMENT,
 };
 
-fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> Result<M> {
+pub fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> Result<M> {
     match &encoding.location {
         Some(pbfile::encoding::Location::Indirect(_)) => Err(Error::invalid_input_source(
             "Indirect file encodings are not supported".into(),
@@ -75,7 +75,7 @@ pub fn build_page_info(
     column_index: u32,
     page_index: usize,
     page: &pbfile::column_metadata::Page,
-    page_layout: pb21::PageLayout,
+    page_layout: impl Into<PageEncoding>,
 ) -> Result<PageInfo> {
     if page.buffer_offsets.len() != page.buffer_sizes.len() {
         return Err(Error::invalid_input_source(
@@ -109,7 +109,7 @@ pub fn build_page_info(
     );
     Ok(PageInfo {
         buffer_offsets_and_sizes,
-        encoding: PageEncoding::Structural(page_layout),
+        encoding: page_layout.into(),
         num_rows: page.length,
         priority: page.priority,
     })

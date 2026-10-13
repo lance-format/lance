@@ -255,8 +255,8 @@ use crate::encodings::logical::list::StructuralListScheduler;
 use crate::encodings::logical::map::StructuralMapScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
+use crate::format::metadata;
 use crate::format::pb::{self, column_encoding};
-use crate::format::pb21;
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
@@ -414,23 +414,39 @@ fn inline_scheduling_threshold() -> u64 {
     })
 }
 
-/// Top-level encoding message for a page. Wraps both the v2.0
-/// [`pb::ArrayEncoding`] grammar and the structural [`pb21::PageLayout`] grammar.
+/// A page encoding and the metadata used to execute it.
 ///
-/// A file should only use one or the other and never both.
-/// 2.0 decoders can always assume this is pb::ArrayEncoding
-/// and 2.1+ decoders can always assume this is pb::PageLayout
+/// A file uses the metadata grammar associated with its version: array encodings
+/// in 2.0, structural page layouts in 2.1/2.2, and planar page layouts in 2.3.
 #[derive(Debug, Clone)]
 pub enum PageEncoding {
+    /// The frozen 2.0 array grammar.
     Legacy(pb::ArrayEncoding),
-    Structural(pb21::PageLayout),
+    /// Execution metadata decoded from or destined for the stable 2.1/2.2 grammar.
+    Structural(metadata::PageLayout),
+    /// The unstable 2.3 independent structure and value planes.
+    Planar(crate::format::pb23::PlanarLayout),
+}
+
+impl From<metadata::PageLayout> for PageEncoding {
+    fn from(layout: metadata::PageLayout) -> Self {
+        Self::Structural(layout)
+    }
+}
+
+impl TryFrom<crate::format::pb21::PageLayout> for PageEncoding {
+    type Error = Error;
+    fn try_from(layout: crate::format::pb21::PageLayout) -> Result<Self> {
+        Ok(Self::Structural(layout.try_into()?))
+    }
 }
 
 impl DeepSizeOf for PageEncoding {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         match self {
             Self::Legacy(encoding) => encoding.encoded_len() * 4,
-            Self::Structural(encoding) => encoding.encoded_len() * 4,
+            Self::Structural(encoding) => encoding.estimated_size(),
+            Self::Planar(encoding) => encoding.encoded_len() * 4,
         }
     }
 }
@@ -439,19 +455,19 @@ impl PageEncoding {
     pub fn as_legacy(&self) -> &pb::ArrayEncoding {
         match self {
             Self::Legacy(enc) => enc,
-            Self::Structural(_) => panic!("Expected a legacy encoding"),
+            Self::Structural(_) | Self::Planar(_) => panic!("Expected a legacy encoding"),
         }
     }
 
-    pub fn as_structural(&self) -> &pb21::PageLayout {
+    pub fn as_structural(&self) -> &metadata::PageLayout {
         match self {
             Self::Structural(enc) => enc,
-            Self::Legacy(_) => panic!("Expected a structural encoding"),
+            Self::Legacy(_) | Self::Planar(_) => panic!("Expected a structural encoding"),
         }
     }
 
     pub fn is_structural(&self) -> bool {
-        matches!(self, Self::Structural(_))
+        matches!(self, Self::Structural(_) | Self::Planar(_))
     }
 }
 
@@ -919,8 +935,8 @@ impl CoreFieldDecoderStrategy {
                     if column_info.page_infos.iter().any(|page| {
                         matches!(
                             page.encoding,
-                            PageEncoding::Structural(pb21::PageLayout {
-                                layout: Some(pb21::page_layout::Layout::BlobLayout(_))
+                            PageEncoding::Structural(metadata::PageLayout {
+                                layout: Some(metadata::page_layout::Layout::BlobLayout(_))
                             })
                         )
                     }) {

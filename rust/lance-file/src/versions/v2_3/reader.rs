@@ -5,7 +5,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::{
-    decoder::ColumnInfo, encodings::physical::binary::BinaryMiniBlockDecompressor, format::pb21,
+    decoder::ColumnInfo,
+    encodings::physical::binary::BinaryMiniBlockDecompressor,
+    format::{metadata, pb23},
 };
 
 use crate::{
@@ -36,7 +38,8 @@ enum EncodingPosition {
 impl EncodingPosition {
     fn child(self) -> Self {
         match self {
-            Self::OptionalPayloadBlock | Self::BufferBackedBlock => Self::BufferBackedBlock,
+            Self::OptionalPayloadBlock => Self::OptionalPayloadBlock,
+            Self::BufferBackedBlock => Self::BufferBackedBlock,
             Self::MiniBlock => Self::MiniBlock,
             Self::PerValue => Self::PerValue,
         }
@@ -53,10 +56,10 @@ impl EncodingPosition {
 }
 
 fn validate_compressive_encoding(
-    encoding: &pb21::CompressiveEncoding,
+    encoding: &metadata::CompressiveEncoding,
     position: EncodingPosition,
 ) -> Result<()> {
-    use pb21::compressive_encoding::Compression;
+    use metadata::compressive_encoding::Compression;
 
     match encoding.compression.as_ref() {
         Some(Compression::Flat(_))
@@ -147,7 +150,7 @@ fn validate_compressive_encoding(
 }
 
 fn validate_sparse_sequence(
-    positions: Option<&pb21::CompressiveEncoding>,
+    positions: Option<&metadata::CompressiveEncoding>,
     count: u64,
 ) -> Result<()> {
     lance_encoding::compression::validate_fixed_width_block_sequence(
@@ -157,21 +160,26 @@ fn validate_sparse_sequence(
     )
 }
 
-fn validate_sparse_validity(validity: Option<&pb21::SparseValiditySet>) -> Result<()> {
-    if let Some(validity) = validity {
-        validate_sparse_sequence(validity.positions.as_ref(), validity.num_positions)?;
+fn validate_sparse_validity(validity: Option<&pb23::SparseValiditySet>) -> Result<()> {
+    let validity = required(validity, "sparse validity")?;
+    match pb23::sparse_validity_set::Meaning::try_from(validity.meaning) {
+        Ok(
+            pb23::sparse_validity_set::Meaning::SparseValidityNullPositions
+            | pb23::sparse_validity_set::Meaning::SparseValidityValidPositions,
+        ) => {}
+        _ => {
+            return Err(Error::invalid_input(
+                "Planar sparse validity has an invalid meaning",
+            ));
+        }
     }
-    Ok(())
+    validate_sparse_sequence(validity.positions.as_ref(), validity.num_positions)
 }
 
-fn validate_sparse_layout(layout: &pb21::SparseLayout) -> Result<()> {
-    use pb21::sparse_structural_layer::Layer;
+fn validate_sparse_structure(layout: &pb23::SparseStructure) -> Result<()> {
+    use pb23::sparse_structural_layer::Layer;
 
-    validate_compressive_encoding(
-        required(layout.value_compression.as_ref(), "sparse values")?,
-        EncodingPosition::MiniBlock,
-    )?;
-    for layer in &layout.structural_layers {
+    for layer in &layout.layers {
         match layer.layer.as_ref() {
             Some(Layer::Validity(validity)) => validate_sparse_validity(Some(validity))?,
             Some(Layer::List(list)) => {
@@ -193,8 +201,8 @@ fn validate_sparse_layout(layout: &pb21::SparseLayout) -> Result<()> {
     Ok(())
 }
 
-fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
-    use pb21::page_layout::Layout;
+fn validate_page_layout(layout: &metadata::PageLayout) -> Result<()> {
+    use metadata::page_layout::Layout;
 
     match layout.layout.as_ref() {
         Some(Layout::MiniBlockLayout(miniblock)) => {
@@ -231,18 +239,50 @@ fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
             }
             Ok(())
         }
-        Some(Layout::SparseLayout(sparse)) => validate_sparse_layout(sparse),
-        Some(Layout::BlobLayout(blob)) => {
-            let inner = blob.inner_layout.as_deref().ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Lance v2.3 blob page layout is missing its inner layout".into(),
-                )
-            })?;
-            validate_page_layout(inner)
-        }
+        Some(Layout::BlobLayout(_)) => Err(Error::invalid_input(
+            "Blob v1 pages are not part of the Lance 2.3 grammar",
+        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.3 page is missing its page layout".into(),
         )),
+    }
+}
+
+fn validate_planar_layout(layout: &pb23::PlanarLayout) -> Result<()> {
+    if let Some(structure) = layout.sparse() {
+        validate_sparse_structure(structure)?;
+        use pb23::value_plane::Codec;
+        match layout.values.as_ref().and_then(|v| v.codec.as_ref()) {
+            Some(Codec::Chunked(v)) => {
+                validate_compressive_encoding(
+                    required(v.compression.as_ref(), "chunked values")?,
+                    EncodingPosition::MiniBlock,
+                )?;
+                if let Some(dictionary) = &v.dictionary {
+                    validate_compressive_encoding(dictionary, EncodingPosition::BufferBackedBlock)?;
+                }
+                Ok(())
+            }
+            Some(Codec::Zipped(v)) => validate_compressive_encoding(
+                required(v.compression.as_ref(), "zipped values")?,
+                EncodingPosition::PerValue,
+            ),
+            Some(Codec::Indexed(v)) => {
+                validate_compressive_encoding(
+                    required(v.indices.as_ref(), "dictionary indices")?,
+                    EncodingPosition::OptionalPayloadBlock,
+                )?;
+                let items = required(v.items.as_ref(), "dictionary items")?;
+                validate_compressive_encoding(
+                    required(items.compression.as_ref(), "dictionary item values")?,
+                    EncodingPosition::PerValue,
+                )
+            }
+            Some(Codec::Constant(_)) | Some(Codec::None(_)) => Ok(()),
+            None => Err(Error::invalid_input("Planar page is missing values")),
+        }
+    } else {
+        validate_page_layout(&layout.dense_execution_layout()?)
     }
 }
 
@@ -255,9 +295,18 @@ pub fn decode_column(
         .iter()
         .enumerate()
         .map(|(page_index, page)| {
-            let page_layout = structural::decode_page_layout(column_index, page_index, page)?;
-            validate_page_layout(&page_layout)?;
-            structural::build_page_info(column_index, page_index, page, page_layout)
+            let layout: pb23::PlanarLayout = structural::fetch_encoding(
+                page.encoding
+                    .as_ref()
+                    .ok_or_else(|| Error::invalid_input("Planar page is missing its encoding"))?,
+            )?;
+            validate_planar_layout(&layout)?;
+            structural::build_page_info(
+                column_index,
+                page_index,
+                page,
+                lance_encoding::decoder::PageEncoding::Planar(layout),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     structural::build_column_info(column_index, metadata, page_infos)
@@ -348,7 +397,7 @@ pub fn finish_metadata_index(index: FileMetadataIndex) -> Result<FileMetadataInd
 #[cfg(test)]
 mod grammar_tests {
     use super::*;
-    use pb21::{
+    use metadata::{
         CompressiveEncoding, Dictionary, FixedSizeList, Flat, FullZipLayout, MiniBlockLayout,
         PageLayout, Rle, compressive_encoding::Compression, page_layout::Layout,
     };
@@ -390,14 +439,14 @@ mod grammar_tests {
     #[test]
     fn accepts_range_and_delta() {
         let range = CompressiveEncoding {
-            compression: Some(Compression::Range(pb21::Range {
+            compression: Some(Compression::Range(metadata::Range {
                 uncompressed_bits_per_value: 32,
                 start: 0,
                 step: 1,
             })),
         };
         let delta = CompressiveEncoding {
-            compression: Some(Compression::Delta(Box::new(pb21::Delta {
+            compression: Some(Compression::Delta(Box::new(metadata::Delta {
                 uncompressed_bits_per_value: 32,
                 base: 0,
                 deltas: Some(Box::new(range.clone())),
@@ -411,14 +460,14 @@ mod grammar_tests {
     #[test]
     fn rejects_metadata_only_codecs_in_buffer_backed_block_positions() {
         let range = CompressiveEncoding {
-            compression: Some(Compression::Range(pb21::Range {
+            compression: Some(Compression::Range(metadata::Range {
                 uncompressed_bits_per_value: 32,
                 start: 0,
                 step: 1,
             })),
         };
         let delta = CompressiveEncoding {
-            compression: Some(Compression::Delta(Box::new(pb21::Delta {
+            compression: Some(Compression::Delta(Box::new(metadata::Delta {
                 uncompressed_bits_per_value: 32,
                 base: 0,
                 deltas: Some(Box::new(range.clone())),
@@ -451,14 +500,14 @@ mod grammar_tests {
     #[test]
     fn rejects_range_and_delta_outside_block_positions() {
         let range = CompressiveEncoding {
-            compression: Some(Compression::Range(pb21::Range {
+            compression: Some(Compression::Range(metadata::Range {
                 uncompressed_bits_per_value: 32,
                 start: 0,
                 step: 1,
             })),
         };
         let delta = CompressiveEncoding {
-            compression: Some(Compression::Delta(Box::new(pb21::Delta {
+            compression: Some(Compression::Delta(Box::new(metadata::Delta {
                 uncompressed_bits_per_value: 32,
                 base: 0,
                 deltas: Some(Box::new(range.clone())),

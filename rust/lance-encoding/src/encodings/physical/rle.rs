@@ -68,8 +68,8 @@ use crate::encodings::logical::primitive::miniblock::{
     MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::encodings::physical::block::{CompressionConfig, GeneralBufferCompressor};
-use crate::format::ProtobufUtils21;
-use crate::format::pb21::CompressiveEncoding;
+use crate::format::EncodingUtils;
+use crate::format::metadata::CompressiveEncoding;
 
 use lance_core::{Error, Result};
 
@@ -731,7 +731,7 @@ impl RleEncoder {
         bits_per_value: u64,
     ) -> RleChildCandidate {
         RleChildCandidate {
-            encoding: ProtobufUtils21::flat(bits_per_value, None),
+            encoding: EncodingUtils::flat(bits_per_value, None),
             data: buffers[buffer_index].clone(),
             chunk_sizes: chunks
                 .iter()
@@ -799,7 +799,7 @@ impl RleEncoder {
         }
 
         let encoding =
-            ProtobufUtils21::wrapped(compression, ProtobufUtils21::flat(bits_per_value, None))?;
+            EncodingUtils::wrapped(compression, EncodingUtils::flat(bits_per_value, None))?;
         Ok(Some(
             RleChildCandidate {
                 encoding,
@@ -899,9 +899,9 @@ impl RleEncoder {
 
         Ok(Some(
             RleChildCandidate {
-                encoding: ProtobufUtils21::out_of_line_bitpacking(
+                encoding: EncodingUtils::out_of_line_bitpacking(
                     bits_per_value,
-                    ProtobufUtils21::flat(packed_bits, None),
+                    EncodingUtils::flat(packed_bits, None),
                 ),
                 data: LanceBuffer::from(packed),
                 chunk_sizes: packed_sizes,
@@ -1065,9 +1065,9 @@ impl MiniBlockCompressor for RleEncoder {
                         chunks,
                         num_values,
                     };
-                    let encoding = ProtobufUtils21::rle(
-                        ProtobufUtils21::flat(bits_per_value, None),
-                        ProtobufUtils21::flat(self.run_length_width.bits_per_value(), None),
+                    let encoding = EncodingUtils::rle(
+                        EncodingUtils::flat(bits_per_value, None),
+                        EncodingUtils::flat(self.run_length_width.bits_per_value(), None),
                     );
                     return Ok((compressed, encoding));
                 }
@@ -1105,7 +1105,7 @@ impl MiniBlockCompressor for RleEncoder {
                     num_values,
                 };
 
-                let encoding = ProtobufUtils21::rle(values.encoding, run_lengths.encoding);
+                let encoding = EncodingUtils::rle(values.encoding, run_lengths.encoding);
 
                 Ok((compressed, encoding))
             }
@@ -1135,9 +1135,9 @@ impl BlockCompressor for RleEncoder {
                 combined.extend_from_slice(&all_buffers[1]);
                 Ok((
                     Some(LanceBuffer::from(combined)),
-                    ProtobufUtils21::rle(
-                        ProtobufUtils21::flat(bits_per_value, None),
-                        ProtobufUtils21::flat(self.run_length_width.bits_per_value(), None),
+                    EncodingUtils::rle(
+                        EncodingUtils::flat(bits_per_value, None),
+                        EncodingUtils::flat(self.run_length_width.bits_per_value(), None),
                     ),
                 ))
             }
@@ -1990,7 +1990,7 @@ impl BlockCompressor for BlockRleEncoder {
         let (lengths_payload, lengths_encoding) = self
             .run_lengths
             .compress(DataBlock::FixedWidth(run_lengths))?;
-        let encoding = ProtobufUtils21::rle(values_encoding, lengths_encoding);
+        let encoding = EncodingUtils::rle(values_encoding, lengths_encoding);
         if values_payload.is_none() && lengths_payload.is_none() {
             return Ok((None, encoding));
         }
@@ -2581,9 +2581,9 @@ mod tests {
         compressed_frame.extend_from_slice(&compressed_values);
         compressed_frame.extend_from_slice(lengths.as_ref());
 
-        let encoding = ProtobufUtils21::rle(
-            ProtobufUtils21::wrapped(compression, ProtobufUtils21::flat(16, None)).unwrap(),
-            ProtobufUtils21::flat(8, None),
+        let encoding = EncodingUtils::rle(
+            EncodingUtils::wrapped(compression, EncodingUtils::flat(16, None)).unwrap(),
+            EncodingUtils::flat(8, None),
         );
         let decompressor = create_rle_decompressor(
             expect_rle(&encoding),
@@ -2698,12 +2698,12 @@ mod tests {
         assert_eq!(compressed.data[1].as_ref(), &1000u16.to_le_bytes());
 
         let rle = match encoding.compression.as_ref().unwrap() {
-            crate::format::pb21::compressive_encoding::Compression::Rle(rle) => rle,
+            crate::format::metadata::compressive_encoding::Compression::Rle(rle) => rle,
             other => panic!("expected RLE encoding, got {other:?}"),
         };
         let run_lengths = rle.run_lengths.as_ref().unwrap();
         let flat = match run_lengths.compression.as_ref().unwrap() {
-            crate::format::pb21::compressive_encoding::Compression::Flat(flat) => flat,
+            crate::format::metadata::compressive_encoding::Compression::Flat(flat) => flat,
             other => panic!("expected flat run lengths, got {other:?}"),
         };
         assert_eq!(flat.bits_per_value, 16);
@@ -2737,7 +2737,7 @@ mod tests {
         let rle = expect_rle(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::General(_)
+            crate::format::metadata::compressive_encoding::Compression::General(_)
         ));
         assert!(matches!(
             rle.run_lengths
@@ -2746,7 +2746,7 @@ mod tests {
                 .compression
                 .as_ref()
                 .unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::Flat(_)
+            crate::format::metadata::compressive_encoding::Compression::Flat(_)
         ));
 
         let decompressor = DefaultDecompressionStrategy::default()
@@ -2774,7 +2774,7 @@ mod tests {
         let rle = expect_rle(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::Flat(_)
+            crate::format::metadata::compressive_encoding::Compression::Flat(_)
         ));
         assert!(matches!(
             rle.run_lengths
@@ -2783,7 +2783,7 @@ mod tests {
                 .compression
                 .as_ref()
                 .unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::General(_)
+            crate::format::metadata::compressive_encoding::Compression::General(_)
         ));
 
         let decompressor = DefaultDecompressionStrategy::default()
@@ -2819,9 +2819,9 @@ mod tests {
                 .unwrap()
                 .0
                 .unwrap();
-        let encoding = ProtobufUtils21::rle(
-            ProtobufUtils21::flat(32, None),
-            ProtobufUtils21::out_of_line_bitpacking(8, ProtobufUtils21::flat(3, None)),
+        let encoding = EncodingUtils::rle(
+            EncodingUtils::flat(32, None),
+            EncodingUtils::out_of_line_bitpacking(8, EncodingUtils::flat(3, None)),
         );
 
         let decompressor = DefaultDecompressionStrategy::default()
@@ -2839,9 +2839,9 @@ mod tests {
     #[test]
     #[cfg(feature = "bitpacking")]
     fn test_rle_rejects_two_count_dependent_child_encodings() {
-        let encoding = ProtobufUtils21::rle(
-            ProtobufUtils21::out_of_line_bitpacking(32, ProtobufUtils21::flat(3, None)),
-            ProtobufUtils21::out_of_line_bitpacking(8, ProtobufUtils21::flat(3, None)),
+        let encoding = EncodingUtils::rle(
+            EncodingUtils::out_of_line_bitpacking(32, EncodingUtils::flat(3, None)),
+            EncodingUtils::out_of_line_bitpacking(8, EncodingUtils::flat(3, None)),
         );
 
         let err = DefaultDecompressionStrategy::default()
@@ -2870,9 +2870,9 @@ mod tests {
         values
     }
 
-    fn expect_rle(encoding: &CompressiveEncoding) -> &crate::format::pb21::Rle {
+    fn expect_rle(encoding: &CompressiveEncoding) -> &crate::format::metadata::Rle {
         match encoding.compression.as_ref().unwrap() {
-            crate::format::pb21::compressive_encoding::Compression::Rle(rle) => rle,
+            crate::format::metadata::compressive_encoding::Compression::Rle(rle) => rle,
             other => panic!("expected RLE encoding, got {other:?}"),
         }
     }
@@ -2908,7 +2908,7 @@ mod tests {
         let rle = expect_rle(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::General(_)
+            crate::format::metadata::compressive_encoding::Compression::General(_)
         ));
         assert!(matches!(
             rle.run_lengths
@@ -2917,7 +2917,7 @@ mod tests {
                 .compression
                 .as_ref()
                 .unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::General(_)
+            crate::format::metadata::compressive_encoding::Compression::General(_)
         ));
 
         let decoded = decompress_i32_chunks(&compressed, &encoding);
@@ -2938,7 +2938,7 @@ mod tests {
         let rle = expect_rle(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::OutOfLineBitpacking(_)
+            crate::format::metadata::compressive_encoding::Compression::OutOfLineBitpacking(_)
         ));
         assert!(matches!(
             rle.run_lengths
@@ -2947,7 +2947,7 @@ mod tests {
                 .compression
                 .as_ref()
                 .unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::Flat(_)
+            crate::format::metadata::compressive_encoding::Compression::Flat(_)
         ));
 
         let decoded = decompress_i32_chunks(&compressed, &encoding);
@@ -2968,7 +2968,7 @@ mod tests {
         let rle = expect_rle(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::Flat(_)
+            crate::format::metadata::compressive_encoding::Compression::Flat(_)
         ));
         assert!(matches!(
             rle.run_lengths
@@ -2977,7 +2977,7 @@ mod tests {
                 .compression
                 .as_ref()
                 .unwrap(),
-            crate::format::pb21::compressive_encoding::Compression::OutOfLineBitpacking(_)
+            crate::format::metadata::compressive_encoding::Compression::OutOfLineBitpacking(_)
         ));
 
         let decoded = decompress_i32_chunks(&compressed, &encoding);

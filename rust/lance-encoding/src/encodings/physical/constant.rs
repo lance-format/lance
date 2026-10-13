@@ -10,7 +10,7 @@ use crate::{
     },
     data::{AllNullDataBlock, ConstantDataBlock, DataBlock, FixedWidthDataBlock},
     encodings::physical::{checked_fixed_values, try_vec_with_capacity},
-    format::{ProtobufUtils21, pb21::CompressiveEncoding},
+    format::{EncodingUtils, metadata::CompressiveEncoding},
 };
 
 use lance_core::{Error, Result};
@@ -40,7 +40,7 @@ impl ConstantEncoder {
             )));
         }
         if num_values == 0 {
-            return Ok(ProtobufUtils21::constant(None));
+            return Ok(EncodingUtils::constant(None));
         }
         let scalar = if self.bits_per_value == 32 {
             let value = u32::try_from(self.value).map_err(|_| {
@@ -50,7 +50,7 @@ impl ConstantEncoder {
         } else {
             bytes::Bytes::copy_from_slice(&self.value.to_le_bytes())
         };
-        Ok(ProtobufUtils21::constant(Some(scalar)))
+        Ok(EncodingUtils::constant(Some(scalar)))
     }
 }
 
