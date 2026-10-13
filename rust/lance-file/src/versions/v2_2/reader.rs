@@ -105,9 +105,6 @@ fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result
             }
             Ok(())
         }
-        Some(Compression::Range(_) | Compression::Delta(_)) => Err(Error::invalid_input_source(
-            "Range and delta compression are not part of the Lance v2.2 grammar".into(),
-        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.2 compressive encoding is missing its compression variant".into(),
         )),
@@ -160,9 +157,6 @@ fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
             })?;
             validate_page_layout(inner)
         }
-        Some(Layout::SparseLayout(_)) => Err(Error::invalid_input_source(
-            "Sparse page layout is not part of the Lance v2.2 grammar".into(),
-        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.2 page is missing its page layout".into(),
         )),
@@ -180,12 +174,7 @@ pub fn decode_column(
         .map(|(page_index, page)| {
             let page_layout = structural::decode_page_layout(column_index, page_index, page)?;
             validate_page_layout(&page_layout)?;
-            structural::build_page_info(
-                column_index,
-                page_index,
-                page,
-                lance_encoding::decoder::PageEncoding::try_from(page_layout)?,
-            )
+            structural::build_page_info(column_index, page_index, page, page_layout)
         })
         .collect::<Result<Vec<_>>>()?;
     structural::build_column_info(column_index, metadata, page_infos)
@@ -320,31 +309,18 @@ mod grammar_tests {
         );
     }
 
-    #[test]
-    fn rejects_range_and_delta() {
-        let range = CompressiveEncoding {
-            compression: Some(Compression::Range(pb21::Range {
-                uncompressed_bits_per_value: 64,
-                start: 0,
-                step: 1,
-            })),
-        };
-        let delta = CompressiveEncoding {
-            compression: Some(Compression::Delta(Box::new(pb21::Delta {
-                uncompressed_bits_per_value: 64,
-                base: 0,
-                deltas: Some(Box::new(range.clone())),
-            }))),
-        };
-
-        for encoding in [&range, &delta] {
-            let error = validate_compressive_encoding(encoding).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("not part of the Lance v2.2 grammar")
-            );
-        }
+    #[rstest::rstest]
+    #[case::unknown_14(&[0x72, 0x00])]
+    #[case::unknown_15(&[0x7a, 0x00])]
+    fn rejects_unknown_compression(#[case] bytes: &[u8]) {
+        use prost::Message;
+        let encoding = CompressiveEncoding::decode(bytes).unwrap();
+        let error = validate_compressive_encoding(&encoding).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing its compression variant")
+        );
     }
     #[rstest::rstest]
     #[case::constant(Compression::Constant(pb21::Constant {

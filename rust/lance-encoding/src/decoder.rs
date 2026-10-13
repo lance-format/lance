@@ -434,10 +434,9 @@ impl From<metadata::PageLayout> for PageEncoding {
     }
 }
 
-impl TryFrom<crate::format::pb21::PageLayout> for PageEncoding {
-    type Error = Error;
-    fn try_from(layout: crate::format::pb21::PageLayout) -> Result<Self> {
-        Ok(Self::Structural(layout.try_into()?))
+impl From<crate::format::pb21::PageLayout> for PageEncoding {
+    fn from(layout: crate::format::pb21::PageLayout) -> Self {
+        Self::Structural(layout.into())
     }
 }
 

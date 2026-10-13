@@ -56,6 +56,7 @@ scheduling so that compression libraries can focus on compression. This keeps ou
 without sacrificing our ability to perform random access.
 
 Lance 2.1 and 2.2 describe structural encodings with `lance.encodings21.PageLayout`.
+Their protobuf schema contains only stable layouts and codecs; sparse planes, Range, and Delta belong to 2.3.
 Lance 2.3 uses the independent planes described in [Planar Page Layout](#planar-page-layout).
 
 ```protobuf

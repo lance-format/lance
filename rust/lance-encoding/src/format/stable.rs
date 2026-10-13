@@ -9,15 +9,14 @@ use lance_core::{Error, Result};
 
 macro_rules! message {
     ($old:path, $new:path, direct: [$($direct:ident),*], optional: [$($optional:ident),*], boxed: [$($boxed:ident),*], repeated: [$($repeated:ident),*]) => {
-        impl TryFrom<$old> for $new {
-            type Error = Error;
-            fn try_from(value: $old) -> Result<Self> {
-                Ok(Self {
+        impl From<$old> for $new {
+            fn from(value: $old) -> Self {
+                Self {
                     $($direct: value.$direct,)*
-                    $($optional: value.$optional.map(TryInto::try_into).transpose()?,)*
-                    $($boxed: value.$boxed.map(|v| (*v).try_into().map(Box::new)).transpose()?,)*
-                    $($repeated: value.$repeated.into_iter().map(TryInto::try_into).collect::<Result<_>>()?,)*
-                })
+                    $($optional: value.$optional.map(Into::into),)*
+                    $($boxed: value.$boxed.map(|v| Box::new((*v).into())),)*
+                    $($repeated: value.$repeated.into_iter().map(Into::into).collect(),)*
+                }
             }
         }
         impl TryFrom<$new> for $old {
@@ -36,11 +35,10 @@ macro_rules! message {
 
 macro_rules! scalar_variants {
     ($old:path, $new:path, [$($variant:ident),*]) => {
-        impl TryFrom<$old> for $new {
-            type Error = Error;
-            fn try_from(value: $old) -> Result<Self> {
+        impl From<$old> for $new {
+            fn from(value: $old) -> Self {
                 use $old as Old;
-                Ok(match value { $(Old::$variant(v) => Self::$variant(v),)* })
+                match value { $(Old::$variant(v) => Self::$variant(v),)* }
             }
         }
         impl TryFrom<$new> for $old {
@@ -54,15 +52,11 @@ macro_rules! scalar_variants {
 }
 
 macro_rules! variants {
-    ($old:path, $new:path, [$($variant:ident),*] $(, unsupported: [$($unsupported:ident),*])? $(, unsupported_old: [$($unsupported_old:ident),*])?) => {
-        impl TryFrom<$old> for $new {
-            type Error = Error;
-            fn try_from(value: $old) -> Result<Self> {
+    ($old:path, $new:path, [$($variant:ident),*] $(, unsupported: [$($unsupported:ident),*])?) => {
+        impl From<$old> for $new {
+            fn from(value: $old) -> Self {
                 use $old as Old;
-                match value {
-                    $(Old::$variant(v) => Ok(Self::$variant(v.try_into()?)),)*
-                    $($(Old::$unsupported_old(_) => Err(Error::invalid_input(concat!(stringify!($unsupported_old), " is not part of the stable encoding grammar"))),)*)?
-                }
+                match value { $(Old::$variant(v) => Self::$variant(v.into()),)* }
             }
         }
         impl TryFrom<$new> for $old {
@@ -81,10 +75,9 @@ macro_rules! variants {
 // Recursive protobuf variants carry boxes; convert their contents explicitly.
 macro_rules! boxed {
     ($old:path, $new:path) => {
-        impl TryFrom<Box<$old>> for Box<$new> {
-            type Error = Error;
-            fn try_from(value: Box<$old>) -> Result<Self> {
-                (*value).try_into().map(Box::new)
+        impl From<Box<$old>> for Box<$new> {
+            fn from(value: Box<$old>) -> Self {
+                Box::new((*value).into())
             }
         }
         impl TryFrom<Box<$new>> for Box<$old> {
@@ -278,12 +271,12 @@ variants!(
     metadata::compressive_encoding::Compression,
     [Flat, Variable, Constant, OutOfLineBitpacking, InlineBitpacking, Fsst, Dictionary,
      Rle, ByteStreamSplit, General, FixedSizeList, PackedStruct, VariablePackedStruct],
-    unsupported: [Range, Delta], unsupported_old: [Range, Delta]
+    unsupported: [Range, Delta]
 );
 variants!(
     pb21::page_layout::Layout,
     metadata::page_layout::Layout,
-    [MiniBlockLayout, FullZipLayout, ConstantLayout, BlobLayout], unsupported_old: [SparseLayout]
+    [MiniBlockLayout, FullZipLayout, ConstantLayout, BlobLayout]
 );
 scalar_variants!(
     pb21::full_zip_layout::Details,
