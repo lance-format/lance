@@ -63,7 +63,8 @@ use crate::{
             range::RangeDecompressor,
             rle::{
                 BlockRleDecompressor, BlockRleRunCount, RleChildDecompressor, RleDecompressor,
-                RleEncoder, RunLengthWidth, rle_encoded_size, select_run_length_width,
+                RleEncoder, RunLengthWidth, rle_encoded_size, select_miniblock_run_length_width,
+                select_run_length_width,
             },
             value::{ValueDecompressor, ValueEncoder},
         },
@@ -254,8 +255,14 @@ fn try_child_rle_for_mini_block(
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let raw_bytes = rle_is_applicable(data, params)?;
-    let (run_length_width, estimated_bytes) =
-        estimate_rle_width_and_size_from_data(data, Some(*MAX_MINIBLOCK_VALUES)).ok()?;
+    // Plain u8 runs retain full blocks. Composite RLE uses smaller blocks to
+    // bound child materialization during random reads; estimate both in one pass.
+    let (run_length_width, estimated_bytes, max_values) = select_miniblock_run_length_width(
+        data,
+        *MAX_MINIBLOCK_VALUES,
+        (*MAX_MINIBLOCK_VALUES).min(2048),
+    )
+    .ok()?;
     let child_compression = rle_child_compression_config(params);
     let encoder = || {
         RleEncoder::with_child_encoding(
@@ -264,6 +271,7 @@ fn try_child_rle_for_mini_block(
             child_compression,
             true,
         )
+        .with_max_miniblock_values(max_values as usize)
     };
 
     #[cfg(feature = "bitpacking")]
@@ -275,7 +283,7 @@ fn try_child_rle_for_mini_block(
         && (estimated_bytes >= raw_bytes
             || bitpack_bytes.is_some_and(|bytes| bytes < estimated_bytes));
     let selected_bytes = if should_measure_children {
-        encoder().selected_payload_size(data).ok()?
+        encoder().estimated_payload_size(data).ok()?
     } else {
         estimated_bytes
     };

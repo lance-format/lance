@@ -202,6 +202,87 @@ pub(crate) fn select_run_length_width(
     select_run_length_width_from_entries(&entries, bits_per_value)
 }
 
+/// Estimate both miniblock limits in one value scan, preserving the policy that
+/// plain u8 runs use full blocks and composite runs use the smaller limit.
+pub(crate) fn select_miniblock_run_length_width(
+    data: &FixedWidthDataBlock,
+    full_limit: u64,
+    composite_limit: u64,
+) -> Result<(RunLengthWidth, u128, u64)> {
+    fn collect<T: Copy + PartialEq>(
+        values: &[T],
+        full_limit: u64,
+        composite_limit: u64,
+    ) -> ([u64; 3], [u64; 3]) {
+        let mut full = [0; 3];
+        let mut composite = [0; 3];
+        let mut add_run = |length| {
+            let mut entries = [0; 3];
+            accumulate_run_length_entries(length, Some(full_limit), &mut entries);
+            for (total, count) in full.iter_mut().zip(entries) {
+                *total += count;
+            }
+            if length <= composite_limit {
+                for (total, count) in composite.iter_mut().zip(entries) {
+                    *total += count;
+                }
+            } else {
+                accumulate_run_length_entries(length, Some(composite_limit), &mut composite);
+            }
+        };
+        if let Some((&first, rest)) = values.split_first() {
+            let mut previous = first;
+            let mut length = 1;
+            for &value in rest {
+                if value == previous {
+                    length += 1;
+                } else {
+                    add_run(length);
+                    previous = value;
+                    length = 1;
+                }
+            }
+            add_run(length);
+        }
+        (full, composite)
+    }
+    use super::checked_fixed_values;
+    let (full, composite) = match data.bits_per_value {
+        8 => collect(
+            &checked_fixed_values::<u8>(data, "RLE values")?,
+            full_limit,
+            composite_limit,
+        ),
+        16 => collect(
+            &checked_fixed_values::<u16>(data, "RLE values")?,
+            full_limit,
+            composite_limit,
+        ),
+        32 => collect(
+            &checked_fixed_values::<u32>(data, "RLE values")?,
+            full_limit,
+            composite_limit,
+        ),
+        64 => collect(
+            &checked_fixed_values::<u64>(data, "RLE values")?,
+            full_limit,
+            composite_limit,
+        ),
+        bits => {
+            return Err(Error::invalid_input(format!(
+                "Unsupported RLE value width: {bits}"
+            )));
+        }
+    };
+    let (width, bytes) = select_run_length_width_from_entries(&full, data.bits_per_value)?;
+    if width == RunLengthWidth::U8 || full_limit == composite_limit {
+        Ok((width, bytes, full_limit))
+    } else {
+        let (width, bytes) = select_run_length_width_from_entries(&composite, data.bits_per_value)?;
+        Ok((width, bytes, composite_limit))
+    }
+}
+
 pub(crate) fn rle_encoded_size(
     data: &LanceBuffer,
     num_values: u64,
@@ -329,6 +410,7 @@ pub(crate) fn accumulate_run_length_entries(
 #[derive(Debug)]
 pub struct RleEncoder {
     run_length_width: RunLengthWidth,
+    max_miniblock_values: usize,
     values_compression: Option<CompressionConfig>,
     run_lengths_compression: Option<CompressionConfig>,
     use_child_bitpacking: bool,
@@ -353,6 +435,7 @@ impl RleEncoder {
     pub fn new() -> Self {
         Self {
             run_length_width: RunLengthWidth::U8,
+            max_miniblock_values: *MAX_MINIBLOCK_VALUES as usize,
             values_compression: None,
             run_lengths_compression: None,
             use_child_bitpacking: false,
@@ -362,6 +445,7 @@ impl RleEncoder {
     pub(crate) fn with_run_length_width(run_length_width: RunLengthWidth) -> Self {
         Self {
             run_length_width,
+            max_miniblock_values: *MAX_MINIBLOCK_VALUES as usize,
             values_compression: None,
             run_lengths_compression: None,
             use_child_bitpacking: false,
@@ -376,10 +460,16 @@ impl RleEncoder {
     ) -> Self {
         Self {
             run_length_width,
+            max_miniblock_values: *MAX_MINIBLOCK_VALUES as usize,
             values_compression,
             run_lengths_compression,
             use_child_bitpacking,
         }
+    }
+
+    pub(crate) fn with_max_miniblock_values(mut self, max_values: usize) -> Self {
+        self.max_miniblock_values = self.max_miniblock_values.min(max_values);
+        self
     }
 
     fn encode_data(
@@ -581,7 +671,7 @@ impl RleEncoder {
     {
         let type_size = std::mem::size_of::<T>();
         let chunk_start = offset * type_size;
-        let max_by_count = *MAX_MINIBLOCK_VALUES as usize;
+        let max_by_count = self.max_miniblock_values;
         let max_values = values_remaining.min(max_by_count);
         let chunk_end = chunk_start + max_values * type_size;
 
@@ -622,7 +712,7 @@ impl RleEncoder {
     where
         T: bytemuck::Pod + PartialEq + Copy,
     {
-        let max_prefix = values.len().min(*MAX_MINIBLOCK_VALUES as usize);
+        let max_prefix = values.len().min(self.max_miniblock_values);
         let mut prefix = 1usize << max_prefix.ilog2();
         while prefix > 1 {
             if self.encoded_size(&values[..prefix]) <= MAX_MINIBLOCK_BYTES as usize {
@@ -1010,7 +1100,32 @@ impl RleEncoder {
         (values[value_idx].clone(), run_lengths[length_idx].clone())
     }
 
-    pub(crate) fn selected_payload_size(&self, data: &FixedWidthDataBlock) -> Result<u128> {
+    /// Estimate child compression from bounded, distributed mini-block samples.
+    /// Codec selection must not encode an entire page just to reject it.
+    pub(crate) fn estimated_payload_size(&self, data: &FixedWidthDataBlock) -> Result<u128> {
+        const SAMPLE_BLOCKS: u64 = 4;
+        let block_values = *MAX_MINIBLOCK_VALUES;
+        if data.num_values <= block_values * SAMPLE_BLOCKS {
+            return self.selected_payload_size(data);
+        }
+        let width = (data.bits_per_value / 8) as usize;
+        let mut bytes = 0;
+        for index in 0..SAMPLE_BLOCKS {
+            let start = index * (data.num_values - block_values) / (SAMPLE_BLOCKS - 1);
+            let sample = FixedWidthDataBlock {
+                data: data
+                    .data
+                    .slice_with_length(start as usize * width, block_values as usize * width),
+                bits_per_value: data.bits_per_value,
+                num_values: block_values,
+                block_info: BlockInfo::new(),
+            };
+            bytes += self.selected_payload_size(&sample)?;
+        }
+        Ok((bytes * data.num_values as u128).div_ceil((block_values * SAMPLE_BLOCKS) as u128))
+    }
+
+    fn selected_payload_size(&self, data: &FixedWidthDataBlock) -> Result<u128> {
         let (all_buffers, chunks) =
             self.encode_data(&data.data, data.num_values, data.bits_per_value)?;
         if all_buffers.is_empty() {
@@ -1595,21 +1710,27 @@ impl RleDecompressor {
                 )
             })?;
             let remaining = expected_value_count - decoded.len();
+            if length > remaining && !clamp_overflow {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE decoding overflowed expected value count: produced at least {}, expected {}",
+                        decoded.len() + length,
+                        expected_value_count
+                    )
+                    .into(),
+                ));
+            }
+            let count = length.min(remaining);
+            let initialized = decoded.len() + count;
+            // Slice fill vectorizes repeated primitive values, unlike Vec::resize's
+            // per-element length bookkeeping on this measured decode hot path.
+            decoded.spare_capacity_mut()[..count].fill(std::mem::MaybeUninit::new(*value));
+            // SAFETY: capacity was reserved for expected_value_count above, count
+            // is bounded by the remaining capacity, and every new element was filled.
+            unsafe { decoded.set_len(initialized) };
             if length > remaining {
-                if !clamp_overflow {
-                    return Err(Error::invalid_input_source(
-                        format!(
-                            "RLE decoding overflowed expected value count: produced at least {}, expected {}",
-                            decoded.len() + length,
-                            expected_value_count
-                        )
-                        .into(),
-                    ));
-                }
-                decoded.resize(expected_value_count, *value);
                 break;
             }
-            decoded.resize(decoded.len() + length, *value);
         }
 
         if decoded.len() != expected_value_count {
