@@ -677,7 +677,7 @@ mod tests {
                     size: 0,
                 },
                 BlobKind::External,
-                Path::from_filesystem_path(&external_file).unwrap(),
+                Path::from_absolute_path(&external_file).unwrap(),
                 1,
                 4,
                 Some(external_uri.as_str()),
