@@ -40,8 +40,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchOptions,
-        SearchResult, UpdateCriteria,
+        AnyQuery, CreatedIndex, IndexStore, LookupMatches, RowIdRemapper, ScalarIndex,
+        SearchOptions, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -140,6 +140,14 @@ impl ScalarIndex for JsonIndex {
         self.target_index
             .search_with_options(query.target_query.as_ref(), options, metrics)
             .await
+    }
+
+    async fn lookup(
+        &self,
+        keys: &dyn Array,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<LookupMatches> {
+        self.target_index.lookup(keys, metrics).await
     }
 
     fn can_remap(&self) -> bool {

@@ -31,8 +31,9 @@ pub use lance_index_core::remapping::{
 };
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
+    LANCE_SCALAR_INDEX, LookupMatches, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+    ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering,
+    UpdateCriteria,
 };
 
 pub mod bitmap;

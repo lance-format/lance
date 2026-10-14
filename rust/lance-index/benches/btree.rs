@@ -10,6 +10,7 @@
 //! - Equality filters
 //! - Range filters with varying selectivity (few/many/most rows match)
 //! - IN filters with varying size (10, 20, 30 values)
+//! - Key lookups with varying batch size (1000, 8192 keys), sorted or random
 //! - Range filters over pages whose row ids span many fragments
 
 mod common;
@@ -23,6 +24,7 @@ use std::{
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use std::hint::black_box;
 
+use arrow_array::{ArrayRef, Int64Array, StringArray};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
@@ -36,6 +38,7 @@ use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
 use object_store::path::Path;
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 /// Selectivity level for range queries
 #[derive(Clone, Copy, Debug)]
@@ -732,6 +735,78 @@ fn bench_in(c: &mut Criterion) {
     }
 }
 
+/// Keys for a lookup benchmark: a contiguous run around the middle of the
+/// range (touches few pages) or values drawn uniformly at random (touches
+/// pages across the whole index).
+fn lookup_keys(num_keys: usize, random: bool) -> Vec<u64> {
+    if random {
+        let mut rng = SmallRng::seed_from_u64(42);
+        (0..num_keys)
+            .map(|_| rng.random_range(0..TOTAL_ROWS))
+            .collect()
+    } else {
+        let start = TOTAL_ROWS / 2 - num_keys as u64 / 2;
+        (start..start + num_keys as u64).collect()
+    }
+}
+
+fn bench_lookup(c: &mut Criterion) {
+    let rt = get_runtime();
+
+    for num_keys in [1_000, 8_192] {
+        let mut group = c.benchmark_group(format!("btree_lookup_{num_keys}"));
+        group
+            .sample_size(10)
+            .measurement_time(Duration::from_secs(10));
+
+        for random in [false, true] {
+            let order = if random { "random" } else { "sorted" };
+            let keys = lookup_keys(num_keys, random);
+            let int_keys: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                keys.iter().map(|&key| key as i64),
+            ));
+            let string_keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+                keys.iter().map(|key| format!("string_{key:010}")),
+            ));
+
+            for use_cache in [false, true] {
+                let cache_label = if use_cache { "cached" } else { "no_cache" };
+
+                for (name, index, keys) in [
+                    (
+                        "int_unique",
+                        setup_int_unique_index(rt, use_cache),
+                        &int_keys,
+                    ),
+                    (
+                        "string_unique",
+                        setup_string_unique_index(rt, use_cache),
+                        &string_keys,
+                    ),
+                ] {
+                    let id = BenchmarkId::new(format!("{name}_{order}"), cache_label);
+                    group.bench_function(id, |b| {
+                        b.to_async(rt).iter(|| {
+                            let index = index.clone();
+                            let keys = keys.clone();
+                            async move {
+                                let matches = index
+                                    .lookup(keys.as_ref(), &NoOpMetricsCollector)
+                                    .await
+                                    .unwrap();
+                                assert_eq!(matches.len(), num_keys);
+                                black_box(matches);
+                            }
+                        })
+                    });
+                }
+            }
+        }
+
+        group.finish();
+    }
+}
+
 /// Range queries over an index whose pages each span all `NUM_FRAGMENTS`
 /// fragments: the result has to be assembled from `pages x fragments`
 /// (page, fragment) pieces, which is where per-page result construction
@@ -795,6 +870,9 @@ fn bench_btree(c: &mut Criterion) {
 
     // Run IN query benchmarks
     bench_in(c);
+
+    // Run key lookup benchmarks
+    bench_lookup(c);
 
     // Run range benchmarks with different selectivities
     bench_range(c, Selectivity::Few);
