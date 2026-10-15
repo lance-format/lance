@@ -19,6 +19,7 @@
 //! own module.
 
 use super::{CompositeOperation, Ref};
+use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
 use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
@@ -199,7 +200,7 @@ impl<'a> ApplyState<'a> {
         if reset {
             indices.clear();
         }
-        prune_rebound_fields_from_indices(&mut indices, &rebound_fields);
+        prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema);
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
         Transaction::normalize_fragments(&mut fragments)?;
@@ -485,22 +486,6 @@ impl<'a> ApplyState<'a> {
             .extend(fields);
     }
 
-    /// As [`Self::rebind_fields`], for a change that invalidates the field
-    /// across every fragment at once.
-    pub(super) fn rebind_field_everywhere(&mut self, field: i32) {
-        let fragment_ids = self
-            .fragments
-            .iter()
-            .map(|fragment| fragment.id)
-            .collect::<Vec<_>>();
-        for fragment_id in fragment_ids {
-            self.rebound_fields
-                .entry(fragment_id)
-                .or_default()
-                .insert(field);
-        }
-    }
-
     /// Stamp row ids and version metadata onto the fragments this operation
     /// minted, matching what an Append does for its new fragments.
     fn assign_row_ids_to_new_fragments(
@@ -605,9 +590,16 @@ impl<'a> ApplyState<'a> {
 /// when it was built. Rebinding the field's data in a fragment invalidates the
 /// index for that fragment only, so the fragment leaves the bitmap rather than
 /// the whole index being discarded.
+///
+/// Rebinding a field also invalidates an index on any field it contains or is
+/// nested in: a packed struct is stored under the parent's id while an index may
+/// be keyed on a child. Ancestry is read from `read_schema`, the schema the
+/// actions were prepared against, because a field this operation drops or moves
+/// has already left the schema being built.
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
     rebound: &HashMap<u64, HashSet<i32>>,
+    read_schema: &Schema,
 ) {
     if rebound.is_empty() {
         return;
@@ -617,7 +609,9 @@ fn prune_rebound_fields_from_indices(
             continue;
         };
         for (fragment_id, fields) in rebound {
-            if index.fields.iter().any(|field| fields.contains(field))
+            if fields
+                .iter()
+                .any(|field| field_affects_index(*field, &index.fields, read_schema))
                 && let Ok(fragment_id) = u32::try_from(*fragment_id)
             {
                 bitmap.remove(fragment_id);

@@ -14,15 +14,16 @@ use lance_core::{Error, Result};
 /// Alter facets of an existing field in place, preserving its id.
 ///
 /// Each facet is independently optional -- present means "change this", absent
-/// means "leave it alone" -- so a widening cast and a nullability relaxation on
-/// the same field commute. A cast additionally needs a
-/// [`TombstoneFieldData`](super::TombstoneFieldData) plus a fresh
-/// [`AddDataFile`](super::AddDataFile) to rewrite the data.
+/// means "leave it alone".
+///
+/// `logical_type` is on the wire but rejected when applied: a cast is a
+/// [`DropField`](super::DropField), an [`AddField`](super::AddField) under the
+/// same name, and the data.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AlterField {
     pub field: Ref,
     pub name: Option<String>,
-    /// The new type. The cast.
+    /// The new type. Rejected at apply; see the type's docs.
     ///
     /// A [`LogicalType`], Lance's own string encoding of an Arrow type and
     /// what [`Field::logical_type`](lance_core::datatypes::Field::logical_type)
@@ -35,6 +36,20 @@ pub struct AlterField {
 
 impl AlterField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        if let Some(logical_type) = &self.logical_type {
+            // A cast that rewrites values must not keep the field's id: the
+            // id is durable identity, and once ids are non-reusable it may
+            // not name a different type in a later version. Only a promotion
+            // that leaves stored values valid could keep it, and none is
+            // supported yet. A cast is spelled as a DropField, an AddField
+            // with the same name and the new type, and the data. See the
+            // lineage issue (`derived_from`) for the explicit form.
+            return Err(Error::not_supported(format!(
+                "AlterField cannot change field {:?}'s type to {logical_type} in place; \
+                 use DropField, then AddField with the new type, then AddDataFile for its data",
+                self.field
+            )));
+        }
         let field_id = state.resolve_field(self.field)?;
         let missing = || {
             Error::invalid_input(format!(
@@ -58,28 +73,27 @@ impl AlterField {
         if let Some(nullable) = self.nullable {
             field.nullable = nullable;
         }
-        if let Some(logical_type) = &self.logical_type {
-            field.logical_type = logical_type.clone();
-            // The cast leaves any index on the field describing the old type.
-            // The data rewrite itself is separate actions; this only records
-            // that every fragment's view of the field changed.
-            state.rebind_field_everywhere(field_id);
-        }
         Ok(())
     }
 
-    /// Renaming or relaxing a field leaves the values alone, and the
-    /// rewrite a cast needs is separate actions that answer for themselves.
+    /// Renaming or changing nullability leaves the values alone.
     pub(super) fn is_data_change(&self) -> bool {
         false
     }
 
     /// The field's definition, and the name a rename takes -- a name is a
-    /// coordinate whether a field is added under it or moved to it. The data
-    /// rewrite a cast needs is separate actions, which record their own
-    /// coordinates.
+    /// coordinate whether a field is added under it or moved to it.
+    ///
+    /// Tightening to non-nullable is only valid against the values it read,
+    /// and applying it does not look at any. Values written since, or rows
+    /// added that leave the field unset, may hold nulls. Landing first, the
+    /// tightening is caught by the writer's requirement on the definition.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write_field_definition(self.field);
+        if self.nullable == Some(false) {
+            footprint.require_no_values_written(self.field);
+            footprint.require_no_rows_added();
+        }
         if let Some(name) = &self.name {
             footprint.write(Coordinate::FieldName(name.clone()));
         }

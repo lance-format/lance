@@ -16,7 +16,7 @@
 //! Which coordinates an action writes is decided by that action, in its own
 //! module. This module holds the coordinate space and the comparison.
 
-use super::{CompositeOperation, Ref};
+use super::{Action, CompositeOperation, Ref};
 use crate::transaction::UpdateMap;
 use std::collections::{HashMap, HashSet};
 
@@ -35,6 +35,13 @@ pub enum Coordinate {
     FieldData { fragment: u64, field: i32 },
     /// A field's definition in the schema.
     FieldDefinition(i32),
+    /// The schema new rows are written in. Every set that adds rows requires
+    /// it, because a writer prepares rows against the schema it read: a row
+    /// minted later carries no value for a non-nullable column added in
+    /// between. A set that adds such a column writes it. No concurrent writer
+    /// can name the added field, so the field's own coordinates cannot say
+    /// this.
+    NewRowSchema,
     /// A field's name. Names only have to be unique among siblings, but a
     /// footprint has no schema to place a field among its siblings, so a name
     /// coordinates table-wide: two writers adding a `c` under different structs
@@ -84,6 +91,7 @@ impl Coordinate {
             Self::FragmentExistence(id) | Self::FragmentDeletions(id) => Some(*id),
             Self::FieldData { fragment, .. } => Some(*fragment),
             Self::FieldDefinition(_)
+            | Self::NewRowSchema
             | Self::FieldName(_)
             | Self::BaseName(_)
             | Self::BaseLocation(_)
@@ -165,6 +173,27 @@ fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     }
 }
 
+/// Something that must not have happened in a set that landed after this one
+/// read.
+///
+/// A [`Mode::Requires`] claim is checked against what the other set wrote, but
+/// never the reverse: what the committed set required held when it committed.
+/// That leaves a gap for a set that is valid only against the rows or values it
+/// read, such as a stricter nullability, whose validity a later write can
+/// revoke without touching any coordinate the first set names. The committed
+/// set is queried for the fact itself.
+///
+/// Preconditions are one-way by design. The set that landed first was valid
+/// when it landed, and a precondition says nothing about the order the other
+/// way around; that order is covered by the claims the later set makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Precondition {
+    /// No values were written for this field, in any fragment.
+    NoValuesWritten(i32),
+    /// No fragment was added.
+    NoRowsAdded,
+}
+
 /// Everything an action set writes, in one set.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Footprint {
@@ -196,6 +225,17 @@ pub struct Footprint {
     /// lands first. And not a write, because it must not collide with a
     /// concurrent write to some other coordinate in the same fragment.
     required_fragments: HashSet<u64>,
+    /// Facts about the table this set is valid only against. See
+    /// [`Precondition`].
+    preconditions: Vec<Precondition>,
+    /// Committed fields this set writes values for, in any fragment, including
+    /// one it mints. Unlike [`Coordinate::FieldData`] this is not a claim: two
+    /// sets writing one field's values into different fragments commute, but a
+    /// set that needs the field to hold no new values cannot commit after
+    /// either.
+    values_written: HashSet<i32>,
+    /// Whether this set adds a fragment.
+    rows_added: bool,
     /// Whether this set rewrites the table wholesale. Such a set collides with
     /// every concurrent set, including one that records no claim at all -- an
     /// append's rows would vanish or survive the reset depending on which
@@ -212,12 +252,10 @@ impl Footprint {
     /// That is where the one asymmetry lives: a requirement of this set is
     /// tested against what `committed` wrote, never the reverse, because
     /// `committed` serialized first and nothing arriving later can break what
-    /// it required. The distinction is not academic. Data written for a field
-    /// requires the field's definition; a cast of that field writes it.
-    /// Checking both directions would also reject the cast that arrives
-    /// *after* the data -- an order [`AlterField`](super::AlterField) already
-    /// handles, by rebinding the field in every fragment the manifest has by
-    /// then.
+    /// it required. A set whose validity depends on what it read rather than on
+    /// a coordinate -- a tightened nullability, a replaced field -- adds
+    /// [`Precondition`]s, which are tested against the facts `committed`
+    /// recorded, and are likewise one-way.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
@@ -225,7 +263,7 @@ impl Footprint {
         if self.exclusive || committed.exclusive {
             return true;
         }
-        if self.claims_conflict_with(committed) {
+        if self.claims_conflict_with(committed) || self.preconditions_violated_by(committed) {
             return true;
         }
         self.anchors_removed_by(committed) || committed.anchors_removed_by(self)
@@ -265,6 +303,15 @@ impl Footprint {
             .chain(theirs_inside_our_regions)
             .chain(same_region)
             .any(|(ours, theirs)| pair_conflicts(ours, theirs))
+    }
+
+    fn preconditions_violated_by(&self, committed: &Self) -> bool {
+        self.preconditions
+            .iter()
+            .any(|precondition| match precondition {
+                Precondition::NoValuesWritten(field) => committed.values_written.contains(field),
+                Precondition::NoRowsAdded => committed.rows_added,
+            })
     }
 
     /// Whether `other` removes a fragment this set needs to still be there.
@@ -307,13 +354,14 @@ impl Footprint {
     ///
     /// Every committed field's definition is required. Values are written in
     /// the type the schema names, so a concurrent
-    /// [`AlterField`](super::AlterField) casting it would leave the manifest
-    /// describing these values as something they are not, and a concurrent
-    /// [`DropField`](super::DropField) would leave a file carrying data for a
-    /// field the manifest no longer has. Both write the definition, so both are
-    /// caught when they land first. Landing second, a cast rebinds the field in
-    /// every fragment the manifest has by then and a drop tombstones it out of
-    /// every fragment's files, so neither order needs a symmetric check.
+    /// [`AlterField`](super::AlterField) changing its definition could leave the
+    /// manifest describing these values as something they are not, and a
+    /// concurrent [`DropField`](super::DropField) would leave a file carrying
+    /// data for a field the manifest no longer has. Both write the definition,
+    /// so both are caught when they land first. Landing second, a drop tombstones the field
+    /// out of every fragment's files, so it needs no symmetric check. A
+    /// replacement does, because it rewrites the values it read; see
+    /// [`Footprint`]'s `From<&CompositeOperation>`.
     ///
     /// This requires the whole definition, not the type alone, so it also
     /// rejects a concurrent rename or nullability change that would not have
@@ -327,6 +375,7 @@ impl Footprint {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
             self.require(Coordinate::FieldDefinition(field));
+            self.values_written.insert(field);
         }
         let Some(fragment) = fragment.committed() else {
             return;
@@ -335,6 +384,36 @@ impl Footprint {
         for field in fields {
             self.write(Coordinate::FieldData { fragment, field });
         }
+    }
+
+    /// Record that this set adds a fragment, whose rows were prepared against
+    /// the schema this set read. See [`Coordinate::NewRowSchema`].
+    pub(super) fn add_rows(&mut self) {
+        self.rows_added = true;
+        self.require(Coordinate::NewRowSchema);
+    }
+
+    /// Record that this set adds a column that rows must carry a value for.
+    /// Rows a stale writer adds afterwards would not, and rows already added
+    /// are not covered by the data this set wrote.
+    pub(super) fn add_required_column(&mut self) {
+        self.write(Coordinate::NewRowSchema);
+        self.preconditions.push(Precondition::NoRowsAdded);
+    }
+
+    /// Record that this set only holds if `field` has had no values written
+    /// since it read it, such as a stricter nullability the apply does not
+    /// check the values against.
+    pub(super) fn require_no_values_written(&mut self, field: Ref) {
+        if let Some(field) = committed_field(field) {
+            self.preconditions
+                .push(Precondition::NoValuesWritten(field));
+        }
+    }
+
+    /// Record that this set only holds if no rows were added since it read.
+    pub(super) fn require_no_rows_added(&mut self) {
+        self.preconditions.push(Precondition::NoRowsAdded);
     }
 
     /// A field's entry in the schema.
@@ -410,6 +489,23 @@ impl From<&CompositeOperation> for Footprint {
         let mut footprint = Self::default();
         for action in composite_operation.iter_actions() {
             action.footprint(&mut footprint);
+        }
+
+        // Dropping a field and adding one by the same name is how a cast is
+        // spelled, now that [`AlterField`](super::AlterField) cannot retype in
+        // place: the new field's data is rewritten from the dropped field's
+        // values as they were read. A footprint has no schema to match the
+        // names, so any drop alongside any add is treated as a replacement. The
+        // cost is a spurious conflict for an unrelated drop and add in one set.
+        let adds_field = composite_operation
+            .iter_actions()
+            .any(|action| matches!(action, Action::AddField(_)));
+        if adds_field {
+            for action in composite_operation.iter_actions() {
+                if let Action::DropField(drop) = action {
+                    footprint.require_no_values_written(drop.field);
+                }
+            }
         }
         footprint
     }
@@ -657,7 +753,7 @@ mod tests {
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
         false,
     )]
-    // A cast and data for an unrelated field never interact, in either order.
+    // A retype and data for an unrelated field never interact, in either order.
     #[case::casting_a_field_a_concurrent_append_does_not_write(
         vec![cast_field(1)],
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
@@ -751,12 +847,11 @@ mod tests {
     ///
     /// Anything that depends on a field -- data written for it, a child added
     /// under it -- requires that field's definition, and a requirement is only
-    /// checked against what committed *after* the set was planned. A cast or a
-    /// drop that arrives second is the unsafe order: the data was encoded
-    /// against a definition the manifest no longer carries. Arriving first they
-    /// are not, because applying a cast rebinds the field in every fragment the
-    /// manifest has by then, and applying a drop tombstones the field out of
-    /// every fragment's files -- including one a concurrent set just added.
+    /// checked against what committed *after* the set was planned. A drop that
+    /// arrives second is safe, because applying it tombstones the field out of
+    /// every fragment's files, including one a concurrent set just added. A
+    /// set that is valid only against the values it read -- a replacement, a
+    /// tightening -- is not: it carries a precondition instead.
     #[rstest]
     #[case::an_append_landing_after_a_cast(
         append(1),
