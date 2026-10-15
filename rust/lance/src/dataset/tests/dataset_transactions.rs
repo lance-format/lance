@@ -2409,7 +2409,7 @@ mod composite {
     use std::sync::Arc;
 
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
-    use crate::index::load_all_indices;
+    use crate::index::{DatasetIndexExt, load_all_indices};
     use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema};
