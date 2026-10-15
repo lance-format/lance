@@ -152,6 +152,7 @@ datafusion-substrait = { version = "54.0.0", default-features = false }
 dirs = "6.0.0"
 either = "1.0"
 env_logger = "0.11.7"
+faer = { version = "0.24.4", default-features = false, features = ["linalg", "rayon", "std"] }
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=14.0.0-beta.16", path = "./rust/compression/fsst" }
 futures = "0.3"

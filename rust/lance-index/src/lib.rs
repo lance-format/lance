@@ -28,7 +28,7 @@ pub mod vector;
 pub use crate::traits::*;
 
 // Re-export core traits from lance-index-core
-pub use lance_index_core::{Index, IndexParams, IndexType};
+pub use lance_index_core::{Index, IndexParams, IndexType, VECTOR_PRE_TRANSFORM_INDEX_VERSION};
 
 pub const INDEX_FILE_NAME: &str = "index.idx";
 /// The name of the auxiliary index file.
@@ -105,7 +105,11 @@ mod tests {
 
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
-        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+        const { assert!(VECTOR_PRE_TRANSFORM_INDEX_VERSION > IVF_RQ_INDEX_VERSION) };
+        assert_eq!(
+            IndexType::max_vector_version(),
+            VECTOR_PRE_TRANSFORM_INDEX_VERSION
+        );
     }
 
     #[test]

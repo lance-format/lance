@@ -47,6 +47,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::{Shuffler, create_ivf_shuffler};
+use lance_index::vector::pca::PcaParams;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
     VectorIndex,
@@ -261,10 +262,22 @@ impl IndexFileVersion {
     }
 }
 
+/// Vector pre-transform applied before IVF and quantization.
+///
+/// New transforms are additional variants. Callers that only understand PCA
+/// use [`VectorIndexParams::pca_params`].
+#[derive(Debug, Clone)]
+pub enum PreTransformParams {
+    Pca(PcaParams),
+}
+
 /// The parameters to build vector index.
 #[derive(Debug, Clone)]
 pub struct VectorIndexParams {
     pub stages: Vec<StageParams>,
+
+    /// Optional vector pre-transform applied before all index stages.
+    pub pre_transform: Option<PreTransformParams>,
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
@@ -297,6 +310,7 @@ impl VectorIndexParams {
         let stages = vec![StageParams::Ivf(ivf_params)];
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -308,6 +322,7 @@ impl VectorIndexParams {
         let stages = vec![StageParams::Ivf(ivf)];
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -343,6 +358,7 @@ impl VectorIndexParams {
 
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -370,6 +386,7 @@ impl VectorIndexParams {
         let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
         Self {
             stages,
+            pre_transform: None,
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -386,6 +403,7 @@ impl VectorIndexParams {
         let stages = vec![StageParams::Ivf(ivf), StageParams::PQ(pq)];
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -401,6 +419,7 @@ impl VectorIndexParams {
         let stages = vec![StageParams::Ivf(ivf), StageParams::SQ(sq)];
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -416,6 +435,7 @@ impl VectorIndexParams {
         let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -431,6 +451,7 @@ impl VectorIndexParams {
         let stages = vec![StageParams::Ivf(ivf), StageParams::Hnsw(hnsw)];
         Self {
             stages,
+            pre_transform: None,
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -453,6 +474,7 @@ impl VectorIndexParams {
         ];
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
@@ -475,10 +497,41 @@ impl VectorIndexParams {
         ];
         Self {
             stages,
+            pre_transform: None,
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+        }
+    }
+
+    /// Configures PCA as the vector pre-transform for this index.
+    ///
+    /// This is an experimental format feature. The parameters and stored model
+    /// may change incompatibly, in which case the index must be rebuilt. The
+    /// source data is not rewritten.
+    ///
+    /// PCA changes the vectors' logical index dimension before IVF and
+    /// quantization. It is supported for full new local IVF_RQ builds with L2
+    /// distance.
+    pub fn with_pca(mut self, params: PcaParams) -> Self {
+        self.pre_transform = Some(PreTransformParams::Pca(params));
+        self
+    }
+
+    /// Returns the configured PCA pre-transform parameters, if present.
+    pub fn pca_params(&self) -> Option<&PcaParams> {
+        match self.pre_transform.as_ref() {
+            Some(PreTransformParams::Pca(params)) => Some(params),
+            None => None,
+        }
+    }
+
+    /// Returns the manifest compatibility version required by these parameters.
+    pub fn compatibility_version(&self) -> u32 {
+        match (self.pre_transform.is_some(), self.index_type()) {
+            (true, IndexType::IvfRq) => lance_index::VECTOR_PRE_TRANSFORM_INDEX_VERSION,
+            (_, index_type) => index_type.version() as u32,
         }
     }
 

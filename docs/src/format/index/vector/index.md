@@ -53,6 +53,26 @@ The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
+## PCA Pre-transform
+
+!!! warning "Experimental"
+
+    PCA as a vector pre-transform is an experimental format feature. Its
+    details message and stored model may change incompatibly without a
+    separate vote; after such a change the index must be rebuilt, and the
+    data itself is never rewritten. The feature is removed if its
+    stabilization vote does not pass. Indexes that do not use a pre-transform
+    are unaffected.
+
+An `IVF_RQ` index may store one PCA pre-transform in `VectorIndexDetails.pre_transform`.
+When the field is absent, vectors are indexed in their original dimension.
+When it is present, vectors are projected by the stored `PcaModel` before IVF and
+quantization, and query vectors are projected the same way before search.
+An index that uses the pre-transform records index metadata version 3 so older
+readers skip it. The IVF_RQ quantization format itself is unchanged.
+The source dataset is not rewritten; dropping the feature only requires
+rebuilding the index.
+
 ## Storage Layout (V3)
 
 Each vector index is stored as 2 regular Lance files - index file and auxiliary file.

@@ -230,6 +230,47 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+
+  /* EXPERIMENTAL: optional vector pre-transform. Present means vectors are
+   * transformed by the referenced trained model before indexing; absent means
+   * vectors are indexed in their original dimension. An index applies at most
+   * one. See PcaParameters. Datasets that do not set this field are unaffected.
+   */
+  oneof pre_transform {
+    PcaParameters pca = 10;
+  }
+}
+
+/*
+ * EXPERIMENTAL: PCA vector pre-transform is an experimental format feature.
+ * This message and the stored model may change incompatibly without a
+ * separate vote, in which case the index must be rebuilt (the data is never
+ * rewritten), and the feature is removed if its stabilization vote does not
+ * pass. Datasets that do not use the pre-transform are not affected either
+ * way.
+ */
+message PcaParameters {
+  // Number of dimensions produced by PCA. A present PCA configuration must
+  // have a non-zero dimension.
+  uint32 dimension = 1;
+  // Whether a deterministic orthogonal rotation follows PCA.
+  bool random_rotation = 2;
+  // Whether retained components are scaled by regularized variance.
+  bool whitening = 3;
+  // Whitening regularizer.
+  float epsilon = 4;
+  // Target number of valid rows used for training.
+  uint32 sample_size = 5;
+  // Maximum estimated peak bytes permitted for training.
+  uint64 max_training_memory_bytes = 6;
+  // Seed used by dataset-aware sampling.
+  uint64 sampling_seed = 7;
+  // Seed used to construct the deterministic random rotation.
+  uint64 rotation_seed = 8;
+  // BLAKE3 fingerprint of the exact trained model applied by the index.
+  // This must contain exactly 32 raw bytes and is required whenever this
+  // message is present.
+  bytes model_fingerprint = 9;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
@@ -380,4 +421,23 @@ message MinHashLshIndexDetails {
    * format version.
    */
   uint32 signature_version = 5;
+}
+
+/*
+ * EXPERIMENTAL: PCA vector pre-transform is an experimental format feature.
+ * This message and the stored model may change incompatibly without a
+ * separate vote, in which case the index must be rebuilt (the data is never
+ * rewritten), and the feature is removed if its stabilization vote does not
+ * pass. Datasets that do not use the pre-transform are not affected either
+ * way.
+ */
+message PcaModel {
+  // Model format version. The initial and currently supported version is 1.
+  uint32 model_version = 1;
+
+  // Row-major FLOAT32 matrix with shape [output_dimension, input_dimension].
+  Tensor transform_matrix = 2;
+
+  // FLOAT32 input-space mean with shape [input_dimension].
+  Tensor mean = 3;
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
 
 pub use builder::IvfBuildParams;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, MetricType};
 use tracing::instrument;
 
@@ -58,6 +58,35 @@ pub fn new_ivf_transformer_with_quantizer(
     quantizer: Quantizer,
     range: Option<Range<u32>>,
 ) -> Result<IvfTransformer> {
+    new_ivf_transformer_with_pre_transform(
+        centroids,
+        metric_type,
+        vector_column,
+        quantizer,
+        range,
+        None,
+    )
+}
+
+/// Creates an IVF transform chain with an optional vector pre-transform.
+///
+/// `pre_transform` rewrites the vector column after invalid vectors are
+/// removed and before partition assignment, so `centroids` must live in its
+/// output space. Pre-transforms are supported only for RQ quantization;
+/// passing one with another quantizer returns [`Error::NotSupported`].
+pub fn new_ivf_transformer_with_pre_transform(
+    centroids: FixedSizeListArray,
+    metric_type: MetricType,
+    vector_column: &str,
+    quantizer: Quantizer,
+    range: Option<Range<u32>>,
+    pre_transform: Option<Arc<dyn Transformer>>,
+) -> Result<IvfTransformer> {
+    if pre_transform.is_some() && !matches!(&quantizer, Quantizer::Rabit(_)) {
+        return Err(Error::not_supported(
+            "vector pre-transforms are only supported for RQ quantization",
+        ));
+    }
     match quantizer {
         Quantizer::Flat(_) | Quantizer::FlatBin(_) => Ok(IvfTransformer::new_flat(
             centroids,
@@ -79,9 +108,14 @@ pub fn new_ivf_transformer_with_quantizer(
             sq,
             range,
         )),
-        Quantizer::Rabit(rq) => {
-            IvfTransformer::with_rq(centroids, metric_type, vector_column, rq, range)
-        }
+        Quantizer::Rabit(rq) => IvfTransformer::with_rq(
+            centroids,
+            metric_type,
+            vector_column,
+            rq,
+            range,
+            pre_transform,
+        ),
     }
 }
 
@@ -284,6 +318,7 @@ impl IvfTransformer {
         vector_column: &str,
         rq: RabitQuantizer,
         range: Option<Range<u32>>,
+        pre_transform: Option<Arc<dyn Transformer>>,
     ) -> Result<Self> {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
@@ -297,6 +332,9 @@ impl IvfTransformer {
             distance_type
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
+        if let Some(pre_transform) = pre_transform {
+            transforms.push(pre_transform);
+        }
 
         let partition_transform = Arc::new(
             PartitionTransformer::new(centroids.clone(), distance_type, vector_column)
@@ -368,9 +406,6 @@ impl Transformer for IvfTransformer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Float32Array;
-    use lance_arrow::FixedSizeListArrayExt;
-
     /// `new_flat` normalizes the vectors for cosine and assigns partitions with
     /// L2, like its sibling constructors, so the metric it stores has to be the
     /// converted one too. Otherwise the transformer's own `find_partitions` and
@@ -398,6 +433,146 @@ mod tests {
             cosine_dists.values(),
             l2_dists.values(),
             "the cosine flat transformer should report the L2 distances it assigns with"
+        );
+    }
+
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt64Type;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, UInt64Array};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::ROW_ID;
+
+    use crate::vector::bq::storage::RABIT_CODE_COLUMN;
+    use crate::vector::flat::index::FlatQuantizer;
+    use crate::vector::pca::{PcaModel, PcaParams};
+    use crate::vector::transform::PcaTransformer;
+
+    fn train_pca() -> Arc<PcaModel> {
+        let training = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 1.0, -1.0, -1.0, 2.0, 2.0, -2.0, -2.0]),
+            2,
+        )
+        .unwrap();
+        Arc::new(
+            PcaModel::train(&training, &PcaParams::new(1)).expect("PCA training should succeed"),
+        )
+    }
+
+    #[test]
+    fn test_rq_pca_runs_after_keep_finite_and_before_partition() {
+        let pca_model = train_pca();
+        let source_centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 1.0, -1.0, -1.0]),
+            2,
+        )
+        .unwrap();
+        let centroids = pca_model.transform(&source_centroids).unwrap();
+        let rq = RabitQuantizer::new::<arrow_array::types::Float32Type>(1, 1);
+        let transformer = new_ivf_transformer_with_pre_transform(
+            centroids,
+            MetricType::L2,
+            "vector",
+            Quantizer::Rabit(rq),
+            None,
+            Some(Arc::new(PcaTransformer::new(pca_model, "vector"))),
+        )
+        .unwrap();
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.9, 1.1, f32::NAN, 0.0]),
+            2,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from(vec![10, 20])) as ArrayRef,
+            ),
+            ("vector", Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap();
+
+        let output = transformer.transform(&batch).unwrap();
+        assert_eq!(output.num_rows(), 1);
+        assert_eq!(output[ROW_ID].as_primitive::<UInt64Type>().value(0), 10);
+        assert!(output.column_by_name(PART_ID_COLUMN).is_some());
+        assert!(output.column_by_name(RABIT_CODE_COLUMN).is_some());
+        assert!(output.column_by_name("vector").is_none());
+    }
+
+    #[test]
+    fn test_rq_none_pca_preserves_transform_behavior() {
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![-1.0, 1.0]), 1)
+                .unwrap();
+        let rq = RabitQuantizer::new::<arrow_array::types::Float32Type>(1, 1);
+        let actual_transformer = IvfTransformer::with_rq(
+            centroids.clone(),
+            MetricType::L2,
+            "vector",
+            rq.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let expected_transformer = IvfTransformer::new(
+            centroids.clone(),
+            MetricType::L2,
+            vec![
+                Arc::new(super::super::transform::Flatten::new("vector")),
+                Arc::new(KeepFiniteVectors::new("vector")),
+                Arc::new(
+                    PartitionTransformer::new(centroids.clone(), MetricType::L2, "vector")
+                        .with_distance(true),
+                ),
+                Arc::new(ResidualTransform::new(
+                    centroids.clone(),
+                    PART_ID_COLUMN,
+                    "vector",
+                )),
+                Arc::new(
+                    RQTransformer::new(rq, MetricType::L2, centroids, "vector")
+                        .expect("RQ transformer construction should succeed"),
+                ),
+            ],
+        );
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![-0.75, 0.75]), 1)
+                .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (ROW_ID, Arc::new(UInt64Array::from(vec![1, 2])) as ArrayRef),
+            ("vector", Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap();
+
+        let actual = actual_transformer.transform(&batch).unwrap();
+        let expected = expected_transformer.transform(&batch).unwrap();
+        assert_eq!(actual.schema(), expected.schema());
+        assert_eq!(actual.num_columns(), expected.num_columns());
+        for (actual, expected) in actual.columns().iter().zip(expected.columns()) {
+            assert_eq!(actual.to_data(), expected.to_data());
+        }
+    }
+
+    #[test]
+    fn test_pca_rejected_for_non_rq_quantizer() {
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0]), 1).unwrap();
+        let error = new_ivf_transformer_with_pre_transform(
+            centroids,
+            MetricType::L2,
+            "vector",
+            Quantizer::Flat(FlatQuantizer::new(1, MetricType::L2)),
+            None,
+            Some(Arc::new(PcaTransformer::new(train_pca(), "vector"))),
+        )
+        .expect_err("pre-transforms should be rejected for non-RQ quantizers");
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("only supported for RQ quantization")
         );
     }
 }
