@@ -678,6 +678,36 @@ impl Footprint {
         }
     }
 
+    /// Record that this set writes some of the cells of each of `fields` in
+    /// `fragment`, leaving the rest as they were.
+    ///
+    /// As [`Self::write_field_data`], the definition of every committed field
+    /// is required and the values count as written whichever fragment they go
+    /// in, so a minted fragment still depends on the schema it was prepared
+    /// against. Only a committed fragment has cells a concurrent writer can
+    /// name.
+    pub(super) fn write_partial_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = Ref>,
+    ) {
+        let committed_fragment = fragment.committed();
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.require(Coordinate::FieldDefinition(field));
+            self.values_written.insert(field);
+            if let Some(fragment) = committed_fragment {
+                self.write_part(Coordinate::FieldData { fragment, field });
+            }
+        }
+    }
+
+    /// Record that this set writes part of `fragment`'s deletions, so it
+    /// commutes with another such set but not with one that replaces them. See
+    /// [`Mode::WritesPart`].
+    pub(super) fn write_part_of_deletions(&mut self, fragment: u64) {
+        self.write_part(Coordinate::FragmentDeletions(fragment));
+    }
+
     /// Record that this set adds a fragment, whose rows were prepared against
     /// the schema this set read. See [`Coordinate::NewRowSchema`].
     pub(super) fn add_rows(&mut self) {

@@ -31,7 +31,7 @@ use crate::format::{
     BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
 };
 use crate::rowids::read_row_ids;
-use crate::rowids::version::build_version_meta;
+use crate::rowids::version::{SpilledRowLineage, build_version_meta};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
@@ -468,6 +468,12 @@ impl<'a> ApplyState<'a> {
         };
         self.touched_index_names.insert(name.to_string());
         Ok(&mut self.indices[position])
+    }
+
+    /// Row lineage the caller read ahead of time for fragments whose lineage
+    /// lives in a data file, which applying cannot read itself.
+    pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
+        &self.build_config.spilled_row_lineage
     }
 
     pub(super) fn schema(&self) -> &Schema {

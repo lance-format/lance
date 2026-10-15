@@ -4550,4 +4550,66 @@ mod composite {
         )
         .await;
     }
+
+    /// A stale append that carries an overlay for a column a concurrent set
+    /// dropped would leave values for a field the schema no longer has.
+    #[tokio::test]
+    async fn test_an_overlay_on_a_minted_fragment_conflicts_with_a_dropped_field() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let read_version = dataset.version().version;
+        let stale_append = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(&dataset, 0),
+                field_ids: vec![Ref::Committed(1)],
+                data_change: true,
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Local(0),
+                overlays: vec![DataOverlayFile {
+                    data_file: existing_data_file(&dataset, 1),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
+                    committed_version: 0,
+                }],
+                data_change: true,
+            }),
+        ];
+
+        let dropped = commit(
+            dataset.clone(),
+            vec![Action::DropField(DropField {
+                field: Ref::Committed(0),
+            })],
+        )
+        .await;
+
+        commit_expecting_conflict(&dropped, read_version, stale_append).await;
+    }
 }
