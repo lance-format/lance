@@ -648,13 +648,16 @@ mod tests {
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
         new_mem_wal_index_meta,
     };
-    use crate::transaction::action::test_support::{added_field, apply, backed_manifest};
+    use crate::transaction::action::test_support::{
+        added_field, apply, apply_with_indices, backed_manifest,
+    };
     use crate::transaction::action::{
         Action, AddDataFile, AddField, AddFragment, CompositeOperation, TombstoneFieldData,
         UserAction,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{DataReplacementGroup, Operation};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -835,5 +838,64 @@ mod tests {
             error.to_string().contains("cannot create one"),
             "unexpected error: {error}"
         );
+    }
+
+    /// An index is keyed to one field and the data is stored under another: a
+    /// packed struct is stored under the parent's id while an index may be
+    /// built on a child, and the reverse for an unpacked struct. Either way the
+    /// rewrite changes what the index recorded, so the exact ids differing is
+    /// not a reason to keep the fragment covered.
+    #[rstest]
+    #[case::packed_parent_rewritten_under_a_child_index(0, 1)]
+    #[case::child_rewritten_under_a_parent_index(1, 0)]
+    fn test_rewriting_a_field_prunes_indices_on_its_ancestor_or_descendant(
+        #[case] rewritten: i32,
+        #[case] indexed: i32,
+    ) {
+        let arrow = ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "x",
+                DataType::Int32,
+                false,
+            )])),
+            false,
+        )]);
+        let mut manifest = backed_manifest();
+        manifest.schema = lance_core::datatypes::Schema::try_from(&arrow).unwrap();
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.files[0].fields = vec![rewritten].into();
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(0),
+                    field_ids: vec![Ref::Committed(rewritten as u64)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(0),
+                    file: DataFile::new(
+                        "data/0-new.lance",
+                        vec![rewritten],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    ),
+                    field_ids: vec![Ref::Committed(rewritten as u64)],
+                    data_change: true,
+                }),
+            ],
+            vec![IndexMetadata {
+                fields: vec![indexed],
+                ..sample_index_metadata("idx")
+            }],
+        )
+        .unwrap();
+
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
     }
 }

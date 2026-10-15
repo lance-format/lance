@@ -467,6 +467,30 @@ mod tests {
         })
     }
 
+    fn add_non_nullable_field(local: u32, name: &str) -> Action {
+        Action::AddField(AddField {
+            local,
+            parent: None,
+            def: Field::try_from(ArrowField::new(name, DataType::Int32, false)).unwrap(),
+        })
+    }
+
+    fn set_nullability(field: i32, nullable: bool) -> Action {
+        Action::AlterField(AlterField {
+            field: Ref::Committed(field as u64),
+            name: None,
+            logical_type: None,
+            nullable: Some(nullable),
+        })
+    }
+
+    fn append(field: i32) -> Vec<Action> {
+        vec![
+            add_fragment(Ref::Local(0)),
+            add_data_file(Ref::Local(0), &[field]),
+        ]
+    }
+
     /// The add-column shape: mint a field, then back it in a committed fragment.
     fn add_column(name: &str, fragment: u64) -> Vec<Action> {
         vec![
@@ -735,23 +759,94 @@ mod tests {
     /// every fragment's files -- including one a concurrent set just added.
     #[rstest]
     #[case::an_append_landing_after_a_cast(
-        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        append(1),
         vec![cast_field(1)],
         true,
-    )]
-    #[case::a_cast_landing_after_an_append(
-        vec![cast_field(1)],
-        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
-        false,
     )]
     #[case::a_rewrite_landing_after_a_cast(
         vec![add_data_file(Ref::Committed(7), &[1])],
         vec![cast_field(1)],
         true,
     )]
-    #[case::a_cast_landing_after_a_rewrite(
-        vec![cast_field(1)],
+    // A cast is a drop, an add under the same name, and the data. The footprint
+    // has no schema to match the name, so any drop paired with an add counts as
+    // a replacement, and the replacement's data would miss a value a concurrent
+    // writer put in the dropped field.
+    #[case::a_replacement_landing_after_an_append(
+        vec![drop_field(1), add_field(0, "a", None)],
+        append(1),
+        true,
+    )]
+    #[case::a_replacement_landing_after_a_rewrite(
+        vec![drop_field(1), add_field(0, "a", None)],
         vec![add_data_file(Ref::Committed(7), &[1])],
+        true,
+    )]
+    #[case::a_replacement_landing_after_an_append_to_another_field(
+        vec![drop_field(1), add_field(0, "a", None)],
+        append(2),
+        false,
+    )]
+    // The reverse order is already caught: the append requires the definition
+    // the replacement drops.
+    #[case::an_append_landing_after_a_replacement(
+        append(1),
+        vec![drop_field(1), add_field(0, "a", None)],
+        true,
+    )]
+    // New rows must carry a value for every non-nullable field, so a stale
+    // append cannot land after one is added, and an add cannot land after rows
+    // the add's data never covered. A nullable add needs neither.
+    #[case::an_append_landing_after_a_non_nullable_add(
+        append(1),
+        vec![add_non_nullable_field(0, "c")],
+        true,
+    )]
+    #[case::a_non_nullable_add_landing_after_an_append(
+        vec![add_non_nullable_field(0, "c")],
+        append(1),
+        true,
+    )]
+    #[case::an_append_landing_after_a_nullable_add(
+        append(1),
+        vec![add_field(0, "c", None)],
+        false,
+    )]
+    #[case::a_nullable_add_landing_after_an_append(
+        vec![add_field(0, "c", None)],
+        append(1),
+        false,
+    )]
+    // Tightening is valid against the version it read; values written since
+    // may hold nulls the apply never sees.
+    #[case::a_tightening_landing_after_an_append_to_the_field(
+        vec![set_nullability(1, false)],
+        append(1),
+        true,
+    )]
+    #[case::a_tightening_landing_after_a_rewrite_of_the_field(
+        vec![set_nullability(1, false)],
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        true,
+    )]
+    #[case::a_tightening_landing_after_an_append_omitting_the_field(
+        vec![set_nullability(1, false)],
+        append(2),
+        true,
+    )]
+    #[case::a_tightening_landing_after_a_rewrite_of_another_field(
+        vec![set_nullability(1, false)],
+        vec![add_data_file(Ref::Committed(7), &[2])],
+        false,
+    )]
+    #[case::an_append_landing_after_a_tightening(
+        append(1),
+        vec![set_nullability(1, false)],
+        true,
+    )]
+    #[case::a_relaxation_landing_after_an_append(
+        vec![set_nullability(1, true)],
+        append(1),
         false,
     )]
     #[case::an_append_landing_after_a_drop(

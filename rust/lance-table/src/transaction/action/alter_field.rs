@@ -142,8 +142,8 @@ mod tests {
     }
 
     #[test]
-    fn test_alter_field_retype_prunes_covering_indices() {
-        let (next, indices) = apply_with_indices(
+    fn test_alter_field_rejects_a_retype() {
+        let error = apply(
             &backed_manifest(),
             vec![Action::AlterField(AlterField {
                 field: Ref::Committed(0),
@@ -151,15 +151,17 @@ mod tests {
                 logical_type: Some("int64".into()),
                 nullable: None,
             })],
-            vec![sample_index_metadata("idx")],
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(
-            next.schema.field_by_id(0).unwrap().logical_type.to_string(),
-            "int64"
+        assert!(
+            matches!(error, Error::NotSupported { .. }),
+            "unexpected error: {error}"
         );
-        assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
+        assert!(
+            error.to_string().contains("DropField"),
+            "the error should point at drop + add: {error}"
+        );
     }
 
     #[test]
