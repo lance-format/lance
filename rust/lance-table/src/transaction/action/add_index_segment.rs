@@ -69,10 +69,10 @@ pub struct AddIndexSegment {
     /// The dataset version whose data this segment reflects, or `None` for the
     /// version the operation reads -- what a freshly built segment reflects.
     ///
-    /// A segment merged from older ones reflects only as much as its oldest
-    /// input, so this is not always the read version and is not derivable from
-    /// it. The overlay version gate reads it: an overlay committed at or before
-    /// it counts as already folded into the index.
+    /// When present it must equal the version the operation reads: a segment
+    /// built from an older snapshot is rejected, because nothing would catch a
+    /// rewrite between that snapshot and the read. The overlay version gate
+    /// reads the field, which is why it stays on the wire.
     pub dataset_version: Option<u64>,
     pub data_change: bool,
 }
@@ -159,8 +159,19 @@ impl AddIndexSegment {
         Ok((lowered, covering))
     }
 
-    /// The version this segment reflects, defaulting to the one the operation
-    /// reads.
+    /// The version this segment reflects: the one the operation reads, whether
+    /// stated or left out.
+    ///
+    /// A footprint only compares against commits after the read, so nothing
+    /// would catch a rewrite landing between an older build and the read, and
+    /// the format cannot detect an in-place column rewrite from metadata alone.
+    /// Letting the segment name an older version would publish its coverage of
+    /// data that has since changed.
+    ///
+    /// TODO: a segment built elsewhere, from an older snapshot, could be
+    /// accepted by pruning its coverage at commit time with
+    /// `prune_stale_segment_coverage`, replaying the fragment reuse index. No
+    /// format change is needed for that, which is why the field stays on the wire.
     fn reflected_version(&self, read_version: u64) -> Result<u64> {
         let Some(version) = self.dataset_version else {
             return Ok(read_version);
@@ -170,6 +181,14 @@ impl AddIndexSegment {
                 "AddIndexSegment for index '{}' reflects dataset version {version}, which is \
                  newer than the version {read_version} this operation reads; a segment cannot \
                  reflect data it could not have seen",
+                self.name
+            )));
+        }
+        if version < read_version {
+            return Err(Error::invalid_input(format!(
+                "AddIndexSegment for index '{}' reflects dataset version {version}, but this \
+                 operation reads version {read_version}; compose the transaction against the \
+                 segment's build snapshot so that nothing rewritten since is indexed as it was",
                 self.name
             )));
         }
@@ -507,10 +526,13 @@ mod tests {
         assert!(error.to_string().contains("could not have seen"), "{error}");
     }
 
+    /// The footprint only compares against commits after the read, so nothing
+    /// would catch a rewrite between the build and the read; a segment has to
+    /// have been built from the snapshot the operation reads.
     #[test]
-    fn test_a_merged_segment_keeps_the_older_version_it_reflects() {
+    fn test_a_segment_built_before_the_version_read_is_rejected() {
         let manifest = backed_manifest();
-        let (_, indices) = apply_with_indices(
+        let error = apply_with_indices(
             &manifest,
             vec![Action::AddIndexSegment(AddIndexSegment {
                 dataset_version: Some(manifest.version - 1),
@@ -518,9 +540,29 @@ mod tests {
             })],
             Vec::new(),
         )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("build snapshot"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_segment_stating_the_version_read_commits() {
+        let manifest = backed_manifest();
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                dataset_version: Some(manifest.version),
+                ..segment("by_a", vec![Ref::Committed(0)])
+            })],
+            Vec::new(),
+        )
         .unwrap();
 
-        assert_eq!(indices[0].dataset_version, manifest.version - 1);
+        assert_eq!(indices[0].dataset_version, manifest.version);
     }
 
     #[test]
@@ -598,11 +640,15 @@ mod tests {
 
     #[test]
     fn test_a_second_segment_extends_the_same_index() {
+        let manifest = two_fragment_manifest();
         let existing = sample_index_metadata("by_a");
-        let added = segment("by_a", vec![Ref::Committed(0)]);
+        let added = AddIndexSegment {
+            covered_fragments: Some(vec![Ref::Committed(1)]),
+            ..segment("by_a", vec![Ref::Committed(0)])
+        };
 
         let (_, indices) = apply_with_indices(
-            &backed_manifest(),
+            &manifest,
             vec![Action::AddIndexSegment(added.clone())],
             vec![existing.clone()],
         )
@@ -614,6 +660,119 @@ mod tests {
         let uuids = indices.iter().map(|index| index.uuid).collect::<Vec<_>>();
         assert!(uuids.contains(&existing.uuid));
         assert!(uuids.contains(&added.uuid));
+    }
+
+    fn two_fragment_manifest() -> crate::format::Manifest {
+        let mut manifest = backed_manifest();
+        let mut second = manifest.fragments[0].clone();
+        second.id = 1;
+        second.files[0].path = "data/1.lance".into();
+        manifest.fragments = Arc::new(vec![manifest.fragments[0].clone(), second]);
+        manifest
+    }
+
+    fn type_url(url: &str) -> Option<Arc<prost_types::Any>> {
+        Some(Arc::new(prost_types::Any {
+            type_url: url.into(),
+            value: Vec::new(),
+        }))
+    }
+
+    /// The query path unions a logical index's segments, so they have to agree
+    /// on what the index is and not describe a fragment twice.
+    #[rstest]
+    #[case::different_keyed_field(
+        |added: &mut AddIndexSegment| added.fields = vec![Ref::Committed(1)],
+        Some("fields")
+    )]
+    #[case::different_carried_field(
+        |added: &mut AddIndexSegment| added.covering_fields = vec![Ref::Committed(1)],
+        Some("fields")
+    )]
+    #[case::different_index_type(
+        |added: &mut AddIndexSegment| added.index_details = type_url("other.Type"),
+        Some("type")
+    )]
+    #[case::overlapping_coverage(
+        |added: &mut AddIndexSegment| added.covered_fragments = Some(vec![Ref::Committed(0)]),
+        Some("fragment 0")
+    )]
+    #[case::compatible_and_disjoint(
+        |_: &mut AddIndexSegment| {},
+        None
+    )]
+    fn test_a_segment_must_be_compatible_with_the_rest_of_its_index(
+        #[case] change: fn(&mut AddIndexSegment),
+        #[case] rejected_for: Option<&str>,
+    ) {
+        let mut manifest = two_fragment_manifest();
+        manifest.schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("a", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new("b", arrow_schema::DataType::Int32, false),
+            ]))
+            .unwrap();
+        let existing = IndexMetadata {
+            index_details: type_url("btree.Details"),
+            ..sample_index_metadata("shared")
+        };
+        let mut added = AddIndexSegment {
+            index_details: type_url("btree.Details"),
+            covered_fragments: Some(vec![Ref::Committed(1)]),
+            ..segment("shared", vec![Ref::Committed(0)])
+        };
+        change(&mut added);
+
+        let result = apply_with_indices(
+            &manifest,
+            vec![Action::AddIndexSegment(added)],
+            vec![existing],
+        );
+
+        match rejected_for {
+            None => {
+                result.unwrap();
+            }
+            Some(reason) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                let message = error.to_string();
+                assert!(message.contains("shared"), "{message}");
+                assert!(message.contains(reason), "{message}");
+            }
+        }
+    }
+
+    /// `Local(0)` is a different field in each operation that mints one, so the
+    /// check has to compare what the tokens resolved to.
+    #[test]
+    fn test_local_tokens_from_separate_operations_are_different_fields() {
+        let mint_and_index = |fragment: u64| {
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("c"),
+                }),
+                Action::AddIndexSegment(AddIndexSegment {
+                    covered_fragments: Some(vec![Ref::Committed(fragment)]),
+                    ..segment("shared", vec![Ref::Local(0)])
+                }),
+            ]
+        };
+        let manifest = two_fragment_manifest();
+        let (next, indices) = apply_with_indices(&manifest, mint_and_index(0), Vec::new()).unwrap();
+
+        let mut second = mint_and_index(1);
+        second[0] = Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: added_field("d"),
+        });
+        let error = apply_with_indices(&next, second, indices).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("fields"), "{error}");
     }
 
     #[test]
