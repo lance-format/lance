@@ -381,3 +381,22 @@ message MinHashLshIndexDetails {
    */
   uint32 signature_version = 5;
 }
+
+/*
+ * EXPERIMENTAL: PCA vector pre-transform is an experimental format feature.
+ * This message and the stored model may change incompatibly without a
+ * separate vote, in which case the index must be rebuilt (the data is never
+ * rewritten), and the feature is removed if its stabilization vote does not
+ * pass. Datasets that do not use the pre-transform are not affected either
+ * way.
+ */
+message PcaModel {
+  // Model format version. The initial and currently supported version is 1.
+  uint32 model_version = 1;
+
+  // Row-major FLOAT32 matrix with shape [output_dimension, input_dimension].
+  Tensor transform_matrix = 2;
+
+  // FLOAT32 input-space mean with shape [input_dimension].
+  Tensor mean = 3;
+}

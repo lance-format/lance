@@ -28,6 +28,7 @@ datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion.workspace = true
 dirs.workspace = true
+faer.workspace = true
 fst.workspace = true
 futures.workspace = true
 geoarrow-array = { workspace = true, optional = true }
@@ -66,6 +67,7 @@ roaring.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+blake3.workspace = true
 # `union` drops the inline/heap tag word, which keeps the per-token FTS
 # posting-list builder small.
 smallvec = { version = "1.15", features = ["union"] }
