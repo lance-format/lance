@@ -74,8 +74,15 @@ impl AddField {
     /// would otherwise both land. Attaching it under a committed parent does
     /// not rewrite the parent's definition, but it does need the parent to
     /// still be there.
+    ///
+    /// A non-nullable field is also a promise about rows: each must carry a
+    /// value for it. Its data only covers the fragments the writer saw, so
+    /// rows added by a concurrent writer, in either order, would break it.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write(Coordinate::FieldName(self.def.name.clone()));
+        if !self.def.nullable {
+            footprint.add_required_column();
+        }
         if let Some(parent) = self.parent {
             footprint.require_field_definition(parent);
         }

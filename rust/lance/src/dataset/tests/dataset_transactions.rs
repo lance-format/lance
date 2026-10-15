@@ -3269,7 +3269,6 @@ mod composite {
     async fn test_non_nullable_add_conflicts_with_a_stale_append_in_either_order() {
         let original = test_dataset(false).await;
         let read_version = original.version().version;
-
         let with_b = commit(
             original.clone(),
             add_non_nullable_b_over_existing_data(&original),
@@ -3277,6 +3276,7 @@ mod composite {
         .await;
         commit_expecting_conflict(&with_b, read_version, append_with_field_zero(&original)).await;
 
+        let original = test_dataset(false).await;
         let appended = commit(original.clone(), append_with_field_zero(&original)).await;
         commit_expecting_conflict(
             &appended,
@@ -3286,30 +3286,39 @@ mod composite {
         .await;
     }
 
-    /// The tightening was valid against the version it read, but nulls written
-    /// since are never revalidated by applying it.
-    #[tokio::test]
-    async fn test_tightening_conflicts_with_a_concurrent_append() {
-        let original = test_dataset(false).await;
-        let relax = AlterField {
-            field: Ref::Committed(0),
-            name: None,
-            logical_type: None,
-            nullable: Some(true),
-        };
-        let nullable = commit(original, vec![Action::AlterField(relax)]).await;
-        let read_version = nullable.version().version;
-        let tighten = vec![Action::AlterField(AlterField {
+    async fn nullable_test_dataset() -> Dataset {
+        commit(
+            test_dataset(false).await,
+            vec![Action::AlterField(AlterField {
+                field: Ref::Committed(0),
+                name: None,
+                logical_type: None,
+                nullable: Some(true),
+            })],
+        )
+        .await
+    }
+
+    fn tighten_field_zero() -> Vec<Action> {
+        vec![Action::AlterField(AlterField {
             field: Ref::Committed(0),
             name: None,
             logical_type: None,
             nullable: Some(false),
-        })];
+        })]
+    }
 
+    /// The tightening was valid against the version it read, but nulls written
+    /// since are never revalidated by applying it.
+    #[tokio::test]
+    async fn test_tightening_conflicts_with_a_concurrent_append_in_either_order() {
+        let nullable = nullable_test_dataset().await;
+        let read_version = nullable.version().version;
         let appended = commit(nullable.clone(), append_with_field_zero(&nullable)).await;
-        commit_expecting_conflict(&appended, read_version, tighten.clone()).await;
+        commit_expecting_conflict(&appended, read_version, tighten_field_zero()).await;
 
-        let tightened = commit(nullable.clone(), tighten).await;
+        let nullable = nullable_test_dataset().await;
+        let tightened = commit(nullable.clone(), tighten_field_zero()).await;
         commit_expecting_conflict(&tightened, read_version, append_with_field_zero(&nullable))
             .await;
     }
@@ -3357,7 +3366,7 @@ mod composite {
         })])
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("detached"), "{error}");
+        assert!(error.to_string().contains("Detached"), "{error}");
 
         detached(vec![Action::AlterField(AlterField {
             field: Ref::Committed(0),
