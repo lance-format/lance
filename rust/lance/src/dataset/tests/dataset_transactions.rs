@@ -2409,10 +2409,14 @@ mod composite {
     use std::sync::Arc;
 
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::{Dataset, Error, Result};
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema};
+    use futures::stream;
     use lance_core::datatypes::Field as LanceField;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
     use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
     use lance_table::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
@@ -2425,7 +2429,7 @@ mod composite {
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     /// A two-fragment dataset, so its two data files can stand in for the files an
@@ -3206,6 +3210,237 @@ mod composite {
         assert!(
             error.to_string().contains("preempted"),
             "unexpected error: {error}"
+        );
+    }
+
+    fn append_with_field_zero(dataset: &Dataset) -> Vec<Action> {
+        vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+        ]
+    }
+
+    /// Commit `actions` against `dataset`'s version, expecting to lose a race.
+    async fn commit_expecting_conflict(dataset: &Dataset, read_version: u64, actions: Vec<Action>) {
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, actions))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    fn add_non_nullable_b_over_existing_data(dataset: &Dataset) -> Vec<Action> {
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: LanceField::try_from(Field::new("b", DataType::Int32, false)).unwrap(),
+        })];
+        for (index, fragment) in dataset.fragments().iter().enumerate() {
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(dataset, index),
+                field_ids: vec![Ref::Local(0)],
+                data_change: true,
+            }));
+        }
+        actions
+    }
+
+    /// A stale append mints rows that carry no value for a column added while it
+    /// was being prepared, and the column is not nullable.
+    #[tokio::test]
+    async fn test_non_nullable_add_conflicts_with_a_stale_append_in_either_order() {
+        let original = test_dataset(false).await;
+        let read_version = original.version().version;
+
+        let with_b = commit(
+            original.clone(),
+            add_non_nullable_b_over_existing_data(&original),
+        )
+        .await;
+        commit_expecting_conflict(&with_b, read_version, append_with_field_zero(&original)).await;
+
+        let appended = commit(original.clone(), append_with_field_zero(&original)).await;
+        commit_expecting_conflict(
+            &appended,
+            read_version,
+            add_non_nullable_b_over_existing_data(&original),
+        )
+        .await;
+    }
+
+    /// The tightening was valid against the version it read, but nulls written
+    /// since are never revalidated by applying it.
+    #[tokio::test]
+    async fn test_tightening_conflicts_with_a_concurrent_append() {
+        let original = test_dataset(false).await;
+        let relax = AlterField {
+            field: Ref::Committed(0),
+            name: None,
+            logical_type: None,
+            nullable: Some(true),
+        };
+        let nullable = commit(original, vec![Action::AlterField(relax)]).await;
+        let read_version = nullable.version().version;
+        let tighten = vec![Action::AlterField(AlterField {
+            field: Ref::Committed(0),
+            name: None,
+            logical_type: None,
+            nullable: Some(false),
+        })];
+
+        let appended = commit(nullable.clone(), append_with_field_zero(&nullable)).await;
+        commit_expecting_conflict(&appended, read_version, tighten.clone()).await;
+
+        let tightened = commit(nullable.clone(), tighten).await;
+        commit_expecting_conflict(&tightened, read_version, append_with_field_zero(&nullable))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_alter_field_rejects_a_retype() {
+        let dataset = test_dataset(false).await;
+
+        let error = try_commit(
+            dataset,
+            vec![Action::AlterField(AlterField {
+                field: Ref::Committed(0),
+                name: None,
+                logical_type: Some("int64".into()),
+                nullable: None,
+            })],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+    }
+
+    /// Detached commits allocate field ids from their own parent's watermark, so
+    /// two of them, or one and the main line, can mint the same id for
+    /// different fields.
+    #[tokio::test]
+    async fn test_detached_composite_add_field_is_rejected_once_field_ids_are_non_reusable() {
+        let mut original = test_dataset(false).await;
+        original.migrate_manifest_paths_v2().await.unwrap();
+        original.migrate_to_non_reusable_field_ids().await.unwrap();
+        let read_version = original.version().version;
+        let original = Arc::new(original);
+        let detached = |actions| {
+            CommitBuilder::new(original.clone())
+                .with_experimental_composite_operations(true)
+                .with_detached(true)
+                .execute(composite_txn(read_version, actions))
+        };
+
+        let error = detached(vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: int32_field("detached"),
+        })])
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("detached"), "{error}");
+
+        detached(vec![Action::AlterField(AlterField {
+            field: Ref::Committed(0),
+            name: Some("renamed".into()),
+            logical_type: None,
+            nullable: None,
+        })])
+        .await
+        .unwrap();
+    }
+
+    fn packed_batch(values: Vec<i32>) -> RecordBatch {
+        let child = Arc::new(Field::new("x", DataType::Int32, false));
+        let field =
+            Field::new("s", DataType::Struct(vec![child.clone()].into()), false).with_metadata(
+                HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+            );
+        let array = StructArray::from(vec![(
+            child,
+            Arc::new(Int32Array::from(values)) as arrow_array::ArrayRef,
+        )]);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap()
+    }
+
+    /// A packed struct is stored under the parent's field id, so rewriting it
+    /// changes what an index on a child recorded.
+    #[tokio::test]
+    async fn test_packed_parent_rewrite_removes_the_fragment_from_a_child_index() {
+        let mut original = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![packed_batch(vec![1, 2, 3, 4])])
+            .await
+            .unwrap();
+        original
+            .create_index(
+                &["s.x"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let fragment = original.get_fragments().remove(0);
+        let (fragment_id, file) = fragment
+            .write_columns(
+                stream::iter(vec![Ok(packed_batch(vec![9, 10]))]),
+                original.schema(),
+            )
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        let fields: Vec<Ref> = file
+            .fields
+            .iter()
+            .map(|id| Ref::Committed(*id as u64))
+            .collect();
+
+        let updated = commit(
+            original,
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(fragment_id),
+                    field_ids: fields.clone(),
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(fragment_id),
+                    file,
+                    field_ids: fields,
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            updated.count_rows(Some("s.x = 9".into())).await.unwrap(),
+            1,
+            "the indexed predicate missed the new value"
         );
     }
 }

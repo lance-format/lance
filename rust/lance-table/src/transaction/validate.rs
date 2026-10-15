@@ -1118,6 +1118,10 @@ mod tests {
     use super::*;
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DataStorageFormat};
+    use crate::transaction::action::{
+        Action, AddField, AlterField, CompositeOperation, DropField, Ref, SetDeletionFile,
+        UserAction,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use roaring::RoaringBitmap;
@@ -2100,6 +2104,57 @@ mod tests {
                 .contains("Detached commits cannot change schema"),
             "{err}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::add_field(
+        Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: LanceCoreField::try_from(ArrowField::new("detached", DataType::Int32, true))
+                .unwrap(),
+        }),
+        false
+    )]
+    #[case::rename(
+        Action::AlterField(AlterField {
+            field: Ref::Committed(0),
+            name: Some("renamed".into()),
+            logical_type: None,
+            nullable: None,
+        }),
+        true
+    )]
+    #[case::drop_field(Action::DropField(DropField { field: Ref::Committed(0) }), true)]
+    #[case::data_only(
+        Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: None,
+            data_change: true,
+        }),
+        true
+    )]
+    #[test]
+    fn detached_composite_may_not_allocate_field_ids_once_non_reusable(
+        #[case] action: Action,
+        #[case] allowed: bool,
+    ) {
+        let manifest = activated_manifest();
+        let operation =
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step",
+                vec![action],
+            )]));
+
+        let result = validate_detached_non_reusable_field_ids(&manifest, &operation);
+
+        if allowed {
+            result.unwrap();
+        } else {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("AddField"), "{err}");
+            assert!(err.to_string().contains("detached"), "{err}");
+        }
     }
 
     #[rstest::rstest]
