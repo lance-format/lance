@@ -38,7 +38,7 @@ use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 /// The field id written into a data file's field list once the file no longer
@@ -201,6 +201,10 @@ pub(super) struct ApplyState<'a> {
     /// reserved range is always the top `count` ids of the resulting watermark.
     reserved_row_ids: u64,
 
+    /// Names of the logical indices this operation added a segment to or
+    /// adjusted, whose segment sets are validated once the operation has run.
+    touched_index_names: BTreeSet<String>,
+
     /// Fields whose backing data changed, per fragment. An index covering such
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
@@ -253,6 +257,7 @@ impl<'a> ApplyState<'a> {
             new_fragments: HashSet::new(),
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
+            touched_index_names: BTreeSet::new(),
             rebound_fields: HashMap::new(),
             tombstoned_fields: HashMap::new(),
         }
@@ -284,6 +289,7 @@ impl<'a> ApplyState<'a> {
             schema,
             mut fragments,
             mut indices,
+            touched_index_names,
             new_bases,
             rebound_fields,
             fragment_high_water,
@@ -295,6 +301,7 @@ impl<'a> ApplyState<'a> {
 
         prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema)?;
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        validate_index_segment_sets(&indices, &touched_index_names)?;
 
         Transaction::normalize_fragments(&mut fragments)?;
         check_required_fields_are_stored(current_manifest, &schema, &fragments)?;
@@ -386,6 +393,7 @@ impl<'a> ApplyState<'a> {
                 segment.uuid
             )));
         }
+        self.touched_index_names.insert(segment.name.clone());
         self.indices.push(segment);
         Ok(())
     }
@@ -430,6 +438,7 @@ impl<'a> ApplyState<'a> {
                 "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
             )));
         };
+        self.touched_index_names.insert(name.to_string());
         Ok(&mut self.indices[position])
     }
 
@@ -1116,6 +1125,74 @@ fn display_mark(mark: Option<u64>) -> String {
         || "unset (no id handed out)".to_string(),
         |mark| mark.to_string(),
     )
+}
+
+/// Check that the segments left under each touched index name still form one
+/// logical index.
+///
+/// The query path unions a logical index's segments, so they must agree on
+/// what the index is: the same keyed and carried fields, resolved to ids (a
+/// `Local` token means a different field in each operation that mints one), and
+/// the same index type. And they must not describe a fragment twice, which
+/// would double-count its rows. The check runs on the final set rather than the
+/// actions, so a segment added by an earlier commit is compared too. This is the
+/// same rule `build_index_metadata_from_segments` holds a staged build to.
+///
+/// Only names this operation touched are checked, so an operation is not blamed
+/// for an inconsistency it did not introduce.
+fn validate_index_segment_sets(
+    indices: &[IndexMetadata],
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    for name in touched {
+        let mut segments = indices.iter().filter(|index| &index.name == name);
+        let Some(first) = segments.next() else {
+            continue;
+        };
+        let type_url = |index: &IndexMetadata| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.clone())
+        };
+        let mut covered = first.fragment_bitmap.clone().unwrap_or_default();
+        for segment in segments {
+            if segment.fields != first.fields || segment.covering_fields != first.covering_fields {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} over fields {:?} (carried {:?}) beside segment {} \
+                     over fields {:?} (carried {:?}); the segments of one index must agree",
+                    segment.uuid,
+                    segment.fields,
+                    segment.covering_fields,
+                    first.uuid,
+                    first.fields,
+                    first.covering_fields
+                )));
+            }
+            if type_url(segment) != type_url(first) {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} of type {:?} beside segment {} of type {:?}; \
+                     the segments of one index must be the same type",
+                    segment.uuid,
+                    type_url(segment),
+                    first.uuid,
+                    type_url(first)
+                )));
+            }
+            let Some(bitmap) = &segment.fragment_bitmap else {
+                continue;
+            };
+            if let Some(fragment) = (&covered & bitmap).min() {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} covering fragment {fragment}, which another \
+                     segment of the index already covers; its rows would be counted twice",
+                    segment.uuid
+                )));
+            }
+            covered |= bitmap;
+        }
+    }
+    Ok(())
 }
 
 fn unbound_token_err(space: &str, token: u32) -> Error {
