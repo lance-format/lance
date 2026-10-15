@@ -5,12 +5,14 @@
 
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{Coordinate, Footprint, Ref};
+use super::{Footprint, Ref};
 use crate::format::overlay::DataOverlayFile;
 use crate::format::pb;
 use crate::format::pb_transaction;
+use crate::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
+use roaring::RoaringBitmap;
 
 /// Append overlay files to one fragment, supplying new values for a subset of
 /// its `(row offset, field)` cells without rewriting its base data files.
@@ -30,8 +32,17 @@ pub struct AddOverlays {
 
 impl AddOverlays {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        if !self.data_change {
+            return Err(Error::invalid_input(
+                "AddOverlays cannot set data_change = false: an overlay supplies values that \
+                 differ from the ones it covers, so there is no restatement to describe, and \
+                 the flag would only hide the change from consumers that skip non-data commits",
+            ));
+        }
         let fragment_id = state.resolve_fragment(self.fragment)?;
         let committed_version = state.new_version();
+        let refreshes_lineage = state.uses_stable_row_ids() && self.fragment.committed().is_some();
+        let spilled = state.spilled_row_lineage();
         let fragment = state.fragment_mut(fragment_id, "AddOverlays")?;
         fragment
             .overlays
@@ -39,18 +50,56 @@ impl AddOverlays {
                 overlay.committed_version = committed_version;
                 overlay
             }));
-        Ok(())
+
+        // The overlaid cells changed at this version, which incremental
+        // consumers find through the rows' last-updated versions. A fragment
+        // this operation minted takes its lineage from the `AddFragment` that
+        // minted it.
+        //
+        // Skipped for a fragment with no last-updated sequence: the refresh
+        // would fill the uncovered rows with a version they never had, as the
+        // legacy path avoids.
+        if !refreshes_lineage || fragment.last_updated_at_version_meta.is_none() {
+            return Ok(());
+        }
+        let mut covered = RoaringBitmap::new();
+        for overlay in &self.overlays {
+            for position in 0..overlay.data_file.fields.len() {
+                covered |= overlay.coverage_for_field(position)?.as_ref();
+            }
+        }
+        let physical_rows = fragment.physical_rows;
+        if let (Some(max_offset), Some(physical_rows)) = (covered.max(), physical_rows)
+            && max_offset as usize >= physical_rows
+        {
+            return Err(Error::invalid_input(format!(
+                "AddOverlays covers row offset {max_offset} of fragment {fragment_id}, which has \
+                 {physical_rows} rows"
+            )));
+        }
+        let offsets = covered
+            .iter()
+            .map(|offset| offset as usize)
+            .collect::<Vec<_>>();
+        refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+            fragment,
+            &offsets,
+            committed_version,
+            // Never read: a fragment with no sequence was skipped above.
+            1,
+            spilled,
+        )
     }
 
-    /// An overlay supplies new cell values, so by default it changes what a
-    /// reader sees. The writer can still mark a restatement of existing values
-    /// as no change.
+    /// An overlay supplies new cell values, so it changes what a reader sees.
+    /// `data_change = false` is rejected at apply; see there.
     pub(super) fn is_data_change(&self) -> bool {
         self.data_change
     }
 
-    /// A partial write of each overlaid field's data in the fragment, and a
-    /// requirement on each of those fields' definitions.
+    /// A partial write of each overlaid field's data in the fragment, a
+    /// requirement on each of those fields' definitions, and a partial write of
+    /// the fragment's deletions.
     ///
     /// Partial, because two concurrent overlays over the same cells both land
     /// and the newer `committed_version` decides which value wins. A full
@@ -63,23 +112,31 @@ impl AddOverlays {
     ///
     /// The definition is required for the same reason a data file requires it:
     /// the overlay's values are encoded in the type the schema names, and a
-    /// concurrent cast or drop landing first would leave them described as
-    /// something they are not, or over a field the manifest no longer has.
+    /// concurrent drop landing first would leave them over a field the manifest
+    /// no longer has. A fragment this operation mints still requires it, since
+    /// the overlay may supply a field the fragment's base files do not.
     ///
-    /// A fragment this operation mints records nothing; no concurrent writer
-    /// can name a cell inside it.
+    /// The deletions are written, in part, because a concurrent row-moving
+    /// update deletes rows from the fragment and re-creates them in another
+    /// from the base the overlay never touched, losing the overlay's values for
+    /// them. Not a requirement: the update landing second is the lossy order,
+    /// and the footprint cannot tell a move from a plain delete. So an overlay
+    /// also conflicts with a plain delete of the fragment, which is stricter
+    /// than legacy; the row-level comparison of moved rows against overlay
+    /// coverage comes with the conflict-parity follow-ups.
+    ///
+    /// A fragment this operation mints has no cells or deletions a concurrent
+    /// writer can name.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        let Some(fragment) = self.fragment.committed() else {
-            return;
-        };
-        for field in self
+        let fields = self
             .overlays
             .iter()
             .flat_map(|overlay| overlay.data_file.fields.iter().copied())
             .filter(|field| *field >= 0)
-        {
-            footprint.write_part(Coordinate::FieldData { fragment, field });
-            footprint.require(Coordinate::FieldDefinition(field));
+            .map(|field| Ref::Committed(field as u64));
+        footprint.write_partial_field_data(self.fragment, fields);
+        if let Some(fragment) = self.fragment.committed() {
+            footprint.write_part_of_deletions(fragment);
         }
     }
 }
