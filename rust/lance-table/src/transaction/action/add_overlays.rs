@@ -122,7 +122,7 @@ mod tests {
     use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
     use crate::transaction::action::{
         Action, AddFragment, AddIndexSegment, AlterField, DropField, RemoveFragment,
-        TombstoneFieldData,
+        SetDeletionFile, TombstoneFieldData,
     };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
@@ -355,6 +355,168 @@ mod tests {
         assert!(other_overlay.conflicts_with(&materialize));
         assert!(!materialize.conflicts_with(&other_column));
         assert!(!other_column.conflicts_with(&materialize));
+    }
+
+    /// Overlaid cells have changed since the version a consumer last read, so
+    /// the rows' last-updated versions have to say so, leaving every row the
+    /// overlay does not cover at the version it already had.
+    #[test]
+    fn test_overlaid_rows_are_restamped_with_the_version_the_commit_produces() {
+        use crate::format::RowIdMeta;
+        use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
+        use crate::rowids::{RowIdSequence, write_row_ids};
+        use crate::transaction::test_support::make_stable_row_id_manifest;
+
+        let mut fragment = backed_manifest().fragments[0].clone();
+        fragment.physical_rows = Some(3);
+        let ids = RowIdSequence::from([0u64, 1, 2].as_slice());
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&ids).into()));
+        refresh_row_latest_update_meta_for_full_frag_rewrite_cols(&mut fragment, 1).unwrap();
+        let manifest = make_stable_row_id_manifest(vec![fragment]);
+        let expected = manifest.version + 1;
+
+        let out = apply(
+            &manifest,
+            vec![add(Ref::Committed(0), vec![overlay("new.lance", &[0])])],
+        )
+        .unwrap();
+
+        let versions = out.fragments[0]
+            .last_updated_at_version_meta
+            .as_ref()
+            .unwrap()
+            .load_sequence()
+            .unwrap();
+        assert_eq!(
+            versions.versions().collect::<Vec<_>>(),
+            vec![expected, 1, 1]
+        );
+    }
+
+    /// An overlay always supplies values that differ from what was there, so
+    /// there is no restatement for `data_change = false` to describe; it would
+    /// only hide the change from consumers that skip non-data commits.
+    #[test]
+    fn test_an_overlay_cannot_be_marked_as_no_data_change() {
+        let error = apply(
+            &backed_manifest(),
+            vec![Action::AddOverlays(AddOverlays {
+                fragment: Ref::Committed(0),
+                overlays: vec![overlay("a.lance", &[0])],
+                data_change: false,
+            })],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("data_change"), "{error}");
+    }
+
+    /// The overlay's values are encoded in the type the schema names, whether or
+    /// not the fragment it lands in is one this operation minted: a stale append
+    /// carrying an overlay for a field a concurrent set dropped would leave
+    /// values for a field the schema no longer has.
+    #[rstest::rstest]
+    #[case::cast(Action::AlterField(AlterField {
+        field: Ref::Committed(0),
+        name: None,
+        logical_type: Some("int64".into()),
+        nullable: None,
+    }))]
+    #[case::drop(Action::DropField(DropField { field: Ref::Committed(0) }))]
+    fn test_an_overlay_on_a_minted_fragment_needs_its_field_defined_as_it_was(
+        #[case] schema_change: Action,
+    ) {
+        let overlaid = footprint(vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
+        ]);
+        let schema_change = footprint(vec![schema_change]);
+
+        assert!(overlaid.conflicts_with(&schema_change));
+        assert!(!schema_change.conflicts_with(&overlaid));
+    }
+
+    /// A concurrent row-moving update deletes rows from the fragment and
+    /// re-creates them in a new one built from the pre-overlay base, so the
+    /// overlay's values for them would be lost. The footprint cannot tell a
+    /// move from a plain delete, so any deletion-file change on the fragment
+    /// collides, in both orders -- not a requirement, because the update
+    /// landing second is the lossy order. Two overlays still commute.
+    #[test]
+    fn test_an_overlay_conflicts_with_a_deletion_of_the_same_fragment() {
+        let delete = |fragment: u64| {
+            footprint(vec![Action::SetDeletionFile(SetDeletionFile {
+                fragment,
+                deletion_file: None,
+                data_change: true,
+            })])
+        };
+        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
+
+        assert!(overlaid.conflicts_with(&delete(0)));
+        assert!(delete(0).conflicts_with(&overlaid));
+        assert!(!overlaid.conflicts_with(&delete(1)));
+        assert!(!delete(1).conflicts_with(&overlaid));
+    }
+
+    #[test]
+    fn test_an_overlay_on_a_minted_fragment_does_not_conflict_with_a_deletion() {
+        let overlaid = footprint(vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
+        ]);
+        let delete = footprint(vec![Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: None,
+            data_change: true,
+        })]);
+
+        assert!(!overlaid.conflicts_with(&delete));
+        assert!(!delete.conflicts_with(&overlaid));
+    }
+
+    /// An overlay writes values for its field, on any fragment, so a set that
+    /// is valid only while the field holds no new values cannot land after it.
+    #[rstest::rstest]
+    #[case::committed_fragment(Ref::Committed(0))]
+    #[case::minted_fragment(Ref::Local(0))]
+    fn test_a_tightening_cannot_land_after_an_overlay_of_its_field(#[case] fragment: Ref) {
+        let mut actions = Vec::new();
+        if fragment.committed().is_none() {
+            actions.push(Action::AddFragment(AddFragment {
+                id: fragment,
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }));
+        }
+        actions.push(add(fragment, vec![overlay("a.lance", &[0])]));
+        let overlaid = footprint(actions);
+        let tighten = footprint(vec![Action::AlterField(AlterField {
+            field: Ref::Committed(0),
+            name: None,
+            logical_type: None,
+            nullable: Some(false),
+        })]);
+
+        assert!(tighten.conflicts_with(&overlaid));
     }
 
     #[test]
