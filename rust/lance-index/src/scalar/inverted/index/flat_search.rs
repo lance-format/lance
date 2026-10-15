@@ -188,12 +188,15 @@ pub(super) fn phrase_matches_positions(
         };
         let mut next_candidates = Vec::new();
         for &position in positions {
-            let position = u64::from(position);
             if candidates.iter().any(|candidate| {
-                let least = u64::from(*candidate) + u64::from(query_delta);
-                least <= position && position <= least + u64::from(slop)
+                super::super::query::phrase_position_follows(
+                    *candidate,
+                    position,
+                    query_delta,
+                    slop,
+                )
             }) {
-                next_candidates.push(position as u32);
+                next_candidates.push(position);
             }
         }
         if next_candidates.is_empty() {

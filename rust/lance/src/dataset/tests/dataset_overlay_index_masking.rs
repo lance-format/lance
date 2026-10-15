@@ -1471,6 +1471,38 @@ async fn test_fts_overlay_flat_path_takes_only_stale_rows(
         flat_path_uses_targeted_take,
         "overlay-stale FTS rows must be re-evaluated through a targeted take"
     );
+    let baseline = scan.try_into_batch().await.unwrap();
+    scan.with_highlight();
+    let highlighted = scan.try_into_batch().await.unwrap();
+    assert_eq!(highlighted.num_rows(), baseline.num_rows());
+    assert_eq!(
+        highlighted.column_by_name("id"),
+        baseline.column_by_name("id")
+    );
+    assert_eq!(
+        highlighted.column_by_name("_score"),
+        baseline.column_by_name("_score")
+    );
+    let mut ids = ids_from_batches(std::slice::from_ref(&highlighted));
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+    for row in 0..highlighted.num_rows() {
+        let values = highlighted["_highlights"].as_list::<i32>().value(row);
+        let matches = values.as_struct()["matches"].as_list::<i32>().value(0);
+        assert_eq!(
+            matches.as_struct()["start"]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            0
+        );
+        assert_eq!(
+            matches.as_struct()["end"]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            6
+        );
+        assert!(values.as_struct().column_by_name("text").is_none());
+    }
 }
 
 #[tokio::test]

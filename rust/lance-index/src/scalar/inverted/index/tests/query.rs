@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::scalar::inverted::InvertedIndexPlugin;
+use crate::scalar::inverted::query::fuzzy::FuzzyAutomaton;
 use crate::scalar::registry::ScalarIndexPlugin;
 use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_io::object_store::WrappingObjectStore;

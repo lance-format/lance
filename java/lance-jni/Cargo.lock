@@ -4138,6 +4138,7 @@ dependencies = [
  "half",
  "hashbrown 0.16.1",
  "hex",
+ "icu_segmenter",
  "itertools 0.14.0",
  "jieba-rs",
  "lance-arrow",

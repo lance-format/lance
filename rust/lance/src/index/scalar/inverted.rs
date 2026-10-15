@@ -22,6 +22,7 @@ use lance_core::{
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::index_files_to_table;
+use lance_index::scalar::inverted::highlight::HighlightValue;
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
 };
@@ -80,6 +81,33 @@ pub(crate) struct FtsDocument {
 }
 
 impl ResolvedFtsField {
+    /// Retain original value coordinates instead of flattening them into index text.
+    pub(crate) fn highlight_values(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+        doc_index: &[u32],
+    ) -> Result<Vec<HighlightValue>> {
+        let column = batch.column_by_name(&self.root_column).ok_or_else(|| {
+            Error::internal(format!(
+                "highlight source '{}' is missing",
+                self.root_column
+            ))
+        })?;
+        let mut values = Vec::new();
+        collect_highlight_values(
+            &self.traversal,
+            column.as_ref(),
+            row,
+            &mut Vec::new(),
+            &mut values,
+        )?;
+        if self.document_granularity.is_list_element() {
+            values.retain(|value| value.value_index == doc_index);
+        }
+        Ok(values)
+    }
+
     pub fn has_lists(&self) -> bool {
         self.list_depth > 0
     }
@@ -134,6 +162,55 @@ impl ResolvedFtsField {
         }
         Ok(documents)
     }
+}
+
+fn collect_highlight_values(
+    traversal: &FtsTraversal,
+    array: &dyn Array,
+    row: usize,
+    coordinate: &mut Vec<u32>,
+    output: &mut Vec<HighlightValue>,
+) -> Result<()> {
+    if array.is_null(row) {
+        return Ok(());
+    }
+    match traversal {
+        FtsTraversal::Text => {
+            if let Some(text) = string_value(array, row)? {
+                output.push(HighlightValue {
+                    value_index: coordinate.clone(),
+                    text: text.to_owned(),
+                });
+            }
+        }
+        FtsTraversal::Struct { child_index, child } => collect_highlight_values(
+            child,
+            array.as_struct().column(*child_index).as_ref(),
+            row,
+            coordinate,
+            output,
+        )?,
+        FtsTraversal::List { child } => {
+            let values = match array.data_type() {
+                DataType::List(_) => array.as_list::<i32>().value(row),
+                DataType::LargeList(_) => array.as_list::<i64>().value(row),
+                other => {
+                    return Err(Error::internal(format!(
+                        "highlight traversal expected list, got {other}"
+                    )));
+                }
+            };
+            for index in 0..values.len() {
+                coordinate.push(
+                    u32::try_from(index)
+                        .map_err(|_| Error::invalid_input("highlight list ordinal exceeds u32"))?,
+                );
+                collect_highlight_values(child, values.as_ref(), index, coordinate, output)?;
+                coordinate.pop();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn string_value(array: &dyn Array, index: usize) -> Result<Option<&str>> {
@@ -1165,6 +1242,19 @@ pub async fn load_segment_params(
 ) -> Result<InvertedIndexParams> {
     let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
     InvertedIndex::load_params(&store).await
+}
+
+/// Resolve the logical source analyzer from shared query metadata, without opening postings.
+pub(crate) async fn resolve_fts_analyzer(
+    dataset: &Dataset,
+    column: &str,
+    granularity: DocumentGranularity,
+) -> Result<Option<Box<dyn lance_index::scalar::inverted::document_tokenizer::LanceTokenizer>>> {
+    let Some(segments) = load_segments(dataset, column, granularity).await? else {
+        return Ok(None);
+    };
+    let details = load_segment_details(dataset, column, &segments).await?;
+    Ok(Some(InvertedIndexParams::try_from(&details)?.build()?))
 }
 
 #[cfg(test)]

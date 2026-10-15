@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
+mod highlight;
+
+use lance_index::scalar::inverted::highlight::HIGHLIGHTS_COL;
 
 use datafusion::config::ConfigOptions;
 use lance_select::result::IndexExprResultWireFormat;
@@ -1149,6 +1152,7 @@ pub struct Scanner {
 
     /// Optional full text search query
     full_text_query: Option<FullTextSearchQuery>,
+    highlight: bool,
 
     /// MinHash similarity search. The scan source is the index lookup and the
     /// output gains a `_distance` column.
@@ -1672,6 +1676,7 @@ impl Scanner {
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
             full_text_query: None,
+            highlight: false,
             minhash_query: None,
             batch_size: None,
             batch_size_bytes: None,
@@ -2076,6 +2081,29 @@ impl Scanner {
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
         self.full_text_query = Some(query);
         Ok(self)
+    }
+
+    /// Append all logical text matches as `_highlights`, using UTF-8 byte ranges
+    /// in complete source values. Query fields and analyzers are resolved automatically.
+    ///
+    /// Preserves scores, order, pagination, and the read snapshot. Candidate expansion
+    /// budgets do not restrict highlighting. JSON documents and aggregation are unsupported.
+    /// Select source columns in the same query when displaying the highlighted text.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// use lance_index::scalar::FullTextSearchQuery;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let results = dataset.scan()
+    ///     .full_text_search(FullTextSearchQuery::new("rust".into()))?
+    ///     .with_highlight()
+    ///     .try_into_batch().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_highlight(&mut self) -> &mut Self {
+        self.highlight = true;
+        self
     }
 
     /// Return the rows of `query.column` most similar to `query.text` under
@@ -2915,6 +2943,17 @@ impl Scanner {
         // Select the columns from the output schema based on the user's projection (or the list
         // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
+        if self.highlight {
+            if output_expr.iter().any(|(_, name)| name == HIGHLIGHTS_COL) {
+                return Err(Error::invalid_input(
+                    "projection conflicts with reserved _highlights column",
+                ));
+            }
+            output_expr.push((
+                expressions::col(HIGHLIGHTS_COL, current_schema)?,
+                HIGHLIGHTS_COL.to_owned(),
+            ));
+        }
 
         if self.full_text_query.is_some()
             && current_schema.field_with_name(DOC_INDEX_COL).is_ok()
@@ -3383,6 +3422,18 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if self.highlight {
+            if self.full_text_query.is_none() || self.aggregate.is_some() {
+                return Err(Error::invalid_input(
+                    "highlight requires full-text search without aggregation",
+                ));
+            }
+            if self.dataset.schema().field(HIGHLIGHTS_COL).is_some() {
+                return Err(Error::invalid_input(
+                    "source schema conflicts with reserved _highlights column",
+                ));
+            }
+        }
         if let Some(query) = &self.nearest {
             query.validate_search_effort()?;
         }
@@ -3918,6 +3969,11 @@ impl Scanner {
 
         // Take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
+        if self.highlight
+            && let Some(query) = &full_text_query
+        {
+            plan = self.highlight_plan(plan, query).await?;
+        }
 
         // Add system columns, if requested
         if self.projection_plan.must_add_row_offset {

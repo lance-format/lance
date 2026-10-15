@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub(super) mod fuzzy;
+
 use crate::scalar::inverted::DocumentGranularity;
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
@@ -1041,7 +1043,7 @@ impl FtsQueryNode for BooleanQuery {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Tokens {
     tokens: Vec<String>,
     positions: Vec<u32>,
@@ -1281,6 +1283,12 @@ pub fn fill_fts_query_column(
             Ok(FtsQuery::Boolean(BooleanQuery { must, should, must_not }))
         }
     }
+}
+
+/// Ordered, per-gap phrase matching, independent of the retrieval implementation.
+pub(super) fn phrase_position_follows(previous: u32, current: u32, delta: u32, slop: u32) -> bool {
+    let least = u64::from(previous) + u64::from(delta);
+    least <= u64::from(current) && u64::from(current) <= least + u64::from(slop)
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ mod compound;
 mod cross_column;
 mod documents;
 mod encoding;
+pub mod highlight;
 mod impact;
 mod index;
 mod iter;
@@ -45,6 +46,7 @@ use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
+use query::fuzzy::FuzzyAutomaton;
 pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
 pub use tokenizer::*;
 

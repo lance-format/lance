@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::partition::FuzzyAutomaton;
+use super::super::query::fuzzy::FuzzyAutomaton;
 use super::*;
 
 const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";

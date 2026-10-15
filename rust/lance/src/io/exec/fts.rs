@@ -2264,7 +2264,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
 }
 
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
-fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
+pub(crate) fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
     Box::new(TextTokenizer::new(
         TextAnalyzer::builder(SimpleTokenizer::default()).build(),
     ))
