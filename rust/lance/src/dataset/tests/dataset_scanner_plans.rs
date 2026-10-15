@@ -1579,7 +1579,8 @@ FilterExec: _distance@... IS NOT NULL
             SortExec: TopK(fetch=8), expr=...
               ANNSubIndex: name=..., k=8, deltas=1, metric=L2
                 ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+                PrefilterUnion: scalar_fragments=3, evaluated_fragments=3
+                  ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1634,7 +1635,8 @@ FilterExec: _distance@... IS NOT NULL
             SortExec: TopK(fetch=11), expr=...
               ANNSubIndex: name=..., k=11, deltas=1, metric=L2
                 ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+                PrefilterUnion: scalar_fragments=3, evaluated_fragments=3
+                  ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     dataset.make_scalar_index().await?;
     assert_plan_equals(
@@ -1875,8 +1877,9 @@ CoalesceBatchesExec: target_batch_size=8192
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
 MatchQuery: column=s, query=[hello]
-  LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+  PrefilterUnion: scalar_fragments=4, evaluated_fragments=5
+    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+    LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1989,12 +1992,12 @@ MatchCorpus
     CoalescePartitionsExec
       UnionExec
         MatchQuery: column=s, query=[hello]
-          LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+          PrefilterUnion: scalar_fragments=4, evaluated_fragments=5
             ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+            LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
         FlatMatchQuery: column=s, query=hello
           LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
-          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-            ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"#
     };
     assert_plan_equals(
         &dataset.dataset,
