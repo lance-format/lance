@@ -80,6 +80,7 @@ impl AddFragment {
     /// operations handed the same range would otherwise each add a fragment at
     /// the same id and the second commit would silently win.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        footprint.add_rows();
         if let Some(id) = self.id.committed() {
             footprint.write(Coordinate::FragmentExistence(id));
         }

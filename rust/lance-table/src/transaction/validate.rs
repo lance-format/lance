@@ -9,6 +9,7 @@
 
 use crate::format::{Fragment, Manifest};
 use crate::io::deletion::relative_deletion_file_path;
+use crate::transaction::action::Action;
 use crate::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
@@ -621,6 +622,19 @@ pub fn validate_detached_non_reusable_field_ids(
         | Operation::Restore { .. } => Err(Error::invalid_input(
             "Detached commits cannot change schema after non-reusable field IDs are activated",
         )),
+        // Only AddField allocates an id. A detached manifest advances its own
+        // watermark, which cannot keep ids unique against the main line.
+        // TODO: reserve field ids on main, as ReserveFragmentIds does for
+        // fragments, so a detached AddField can be supported.
+        Operation::CompositeOperation(composite)
+            if composite
+                .iter_actions()
+                .any(|action| matches!(action, Action::AddField(_))) =>
+        {
+            Err(Error::invalid_input(
+                "Detached commits cannot AddField after non-reusable field IDs are activated",
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -1119,8 +1133,7 @@ mod tests {
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DataStorageFormat};
     use crate::transaction::action::{
-        Action, AddField, AlterField, CompositeOperation, DropField, Ref, SetDeletionFile,
-        UserAction,
+        AddField, AlterField, CompositeOperation, DropField, Ref, SetDeletionFile, UserAction,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
@@ -2153,7 +2166,7 @@ mod tests {
         } else {
             let err = result.unwrap_err();
             assert!(err.to_string().contains("AddField"), "{err}");
-            assert!(err.to_string().contains("detached"), "{err}");
+            assert!(err.to_string().contains("Detached"), "{err}");
         }
     }
 
