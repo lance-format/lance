@@ -3,6 +3,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance_core::{
@@ -275,9 +276,10 @@ fn children_share_parent_length(field: &Field) -> bool {
     field.logical_type.is_struct()
 }
 
-fn validate_field_length<F: Fn(usize) -> Result<u64>>(
+fn validate_field_length<F: Fn(usize, u64) -> Result<u64>>(
     field: &Field,
     comparable: bool,
+    row_scale: u64,
     column_indices: &[u32],
     cursor: &mut usize,
     column_len: &F,
@@ -292,13 +294,31 @@ fn validate_field_length<F: Fn(usize) -> Result<u64>>(
             ))
         })?;
         *cursor += 1;
-        field_rows = Some(column_len(column as usize)?);
+        field_rows = Some(column_len(column as usize, row_scale)?);
     }
     if recurse {
+        let child_row_scale = match field.data_type() {
+            DataType::FixedSizeList(_, dimension) => row_scale
+                .checked_mul(dimension as u64)
+                .filter(|scale| *scale > 0)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fixed-size-list row scale is invalid for field '{}'",
+                        field.name
+                    ))
+                })?,
+            _ => row_scale,
+        };
         let enforce_children = comparable && children_share_parent_length(field);
         for child in &field.children {
-            let child_rows =
-                validate_field_length(child, enforce_children, column_indices, cursor, column_len)?;
+            let child_rows = validate_field_length(
+                child,
+                enforce_children,
+                child_row_scale,
+                column_indices,
+                cursor,
+                column_len,
+            )?;
             let expected = *field_rows.get_or_insert(child_rows);
             if enforce_children && child_rows != expected {
                 return Err(Error::invalid_input(format!(
@@ -318,7 +338,7 @@ fn validate_field_length<F: Fn(usize) -> Result<u64>>(
 
 /// Determine the normalized logical read length for a structural projection.
 pub fn prepared_read_length(prepared: &PreparedProjection) -> Result<u64> {
-    let column_len = |column: usize| {
+    let column_len = |column: usize, row_scale: u64| {
         let info = prepared.column_infos.get(column).ok_or_else(|| {
             Error::invalid_input(format!(
                 "projection references column index {} but only {} columns are available",
@@ -326,7 +346,7 @@ pub fn prepared_read_length(prepared: &PreparedProjection) -> Result<u64> {
                 prepared.column_infos.len()
             ))
         })?;
-        normalized_column_num_rows(info)
+        normalized_column_num_rows(info, row_scale)
     };
     projection_length(
         &prepared.decoder_projection.schema,
@@ -335,7 +355,7 @@ pub fn prepared_read_length(prepared: &PreparedProjection) -> Result<u64> {
     )
 }
 
-fn projection_length<F: Fn(usize) -> Result<u64>>(
+fn projection_length<F: Fn(usize, u64) -> Result<u64>>(
     schema: &Schema,
     column_indices: &[u32],
     column_len: &F,
@@ -343,7 +363,7 @@ fn projection_length<F: Fn(usize) -> Result<u64>>(
     let mut cursor = 0;
     let mut field_lengths = Vec::with_capacity(schema.fields.len());
     for field in &schema.fields {
-        let rows = validate_field_length(field, true, column_indices, &mut cursor, column_len)?;
+        let rows = validate_field_length(field, true, 1, column_indices, &mut cursor, column_len)?;
         field_lengths.push((field.name.as_str(), rows));
     }
     if cursor != column_indices.len() {
@@ -437,9 +457,12 @@ pub fn test_projection_length(
     column_indices: &[u32],
     column_lengths: &[u64],
 ) -> Result<u64> {
-    projection_length(schema, column_indices, &|column| {
-        column_lengths.get(column).copied().ok_or_else(|| {
-            Error::invalid_input(format!("missing synthetic length for column {column}"))
-        })
+    projection_length(schema, column_indices, &|column, row_scale| {
+        column_lengths
+            .get(column)
+            .map(|rows| rows / row_scale)
+            .ok_or_else(|| {
+                Error::invalid_input(format!("missing synthetic length for column {column}"))
+            })
     })
 }

@@ -536,14 +536,15 @@ fn indexed_projection_column_count(field: &Field) -> Option<usize> {
 // error (naming each column's length) when they differ. Ordinary files always
 // pass; only files written with `FileWriter::write_column` whose columns ended up
 // unequal can fail, and those must be read separately.
-pub(crate) fn normalized_column_num_rows(info: &ColumnInfo) -> Result<u64> {
+pub(crate) fn normalized_column_num_rows(info: &ColumnInfo, dense_row_scale: u64) -> Result<u64> {
     info.page_infos.iter().try_fold(0_u64, |rows, page| {
+        // Sparse pages carry their row scale in the layout. Dense pages use the schema's scale.
         let page_rows = match &page.encoding {
             PageEncoding::Structural(layout) => match &layout.layout {
                 Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => {
                     sparse.row_count_and_scale(page.num_rows)?.0
                 }
-                _ => page.num_rows,
+                _ => page.num_rows / dense_row_scale,
             },
             _ => page.num_rows,
         };

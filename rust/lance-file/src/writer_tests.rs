@@ -551,6 +551,59 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::v2_3_dense(ConcreteFileVersion::V2_3, false)]
+    #[case::v2_3_sparse(ConcreteFileVersion::V2_3, true)]
+    #[tokio::test]
+    async fn test_read_fixed_size_list_struct_with_scalar(
+        #[case] version: ConcreteFileVersion,
+        #[case] sparse: bool,
+    ) {
+        use lance_encoding::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE};
+
+        let metadata = if sparse {
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_SPARSE.to_string(),
+            )])
+        } else {
+            HashMap::new()
+        };
+        let values = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        )]));
+        let points = FixedSizeListArray::new(
+            Arc::new(Field::new("item", values.data_type().clone(), true)),
+            2,
+            values,
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("points", points.data_type().clone(), true).with_metadata(metadata),
+            ])),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(points) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let fs = FsFixture::default();
+
+        crate::testing::write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
+        let batches = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        assert_eq!(batches, vec![batch]);
+    }
+
     /// `write_column` rejects invalid inputs at the API boundary with
     /// descriptive errors: a writer without an explicit schema, an
     /// out-of-bounds field index, and a null written into a non-nullable field.
