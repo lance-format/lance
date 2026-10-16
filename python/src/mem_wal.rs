@@ -25,6 +25,7 @@ use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnaps
 use lance::dataset::mem_wal::{
     LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids, evaluate_sharding_spec,
 };
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
@@ -36,6 +37,7 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
+use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::LanceSchema as PyLanceSchema;
 
@@ -684,6 +686,25 @@ impl PyLsmScanner {
             })
             .collect::<PyResult<_>>()?;
         PyList::new(py, py_batches)
+    }
+
+    /// Execute the scan and return a PyArrow RecordBatchReader that yields
+    /// batches as the scan produces them, instead of collecting them first.
+    pub fn to_reader(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let scanner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
+        let stream = rt()
+            .block_on(Some(py), scanner.try_into_stream())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
     }
 
     /// Return the row count without loading all data.
