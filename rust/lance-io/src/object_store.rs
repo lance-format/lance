@@ -553,7 +553,11 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
-        .unwrap()
+        .map_err(|err| {
+            Error::invalid_input(format!(
+                "Invalid table location: '{str_path}' could not be resolved to an absolute path: {err}"
+            ))
+        })?
         .as_path()
         .to_path_buf();
     // path_abs::PathAbs::new(".") returns an empty string.
@@ -2477,8 +2481,14 @@ mod tests {
         )
         .unwrap();
 
+        // The working directory is process state, and this one is about to be
+        // removed with the temp dir, so put it back as soon as the call that
+        // needs it returns.
+        let original_dir = std::env::current_dir().unwrap();
         set_current_dir(StdPath::new(tmp_path.as_ref())).expect("Error changing current dir");
-        let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
+        let opened = ObjectStore::from_uri("./bar/foo.lance").await;
+        set_current_dir(&original_dir).expect("Error restoring current dir");
+        let (store, path) = opened.unwrap();
 
         let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
             .await
