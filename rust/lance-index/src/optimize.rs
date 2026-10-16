@@ -48,6 +48,24 @@ pub struct OptimizeOptions {
 
     /// Progress callback for index building during optimization.
     pub progress: Arc<dyn IndexBuildProgress>,
+
+    /// Upper bound on the rows one build task covers. Default: unbounded.
+    ///
+    /// Unindexed fragments are packed into tasks of at most this many rows,
+    /// and of at most `max_rows_per_segment`, since a task's output is never
+    /// split (nor is a fragment); with neither set each index is one task.
+    ///
+    /// Setting either bound splits the build of every index that can merge
+    /// segments, in `optimize_indices` as in the distributed plan; the
+    /// `lance::index::optimize` module documents how that differs.
+    pub max_rows_per_task: Option<u64>,
+
+    /// Upper bound on the rows one committed segment holds. Default: unbounded.
+    ///
+    /// Existing segments and new tasks are packed into output segments of at
+    /// most this many rows; `None` merges everything into one segment. See
+    /// `max_rows_per_task` for what setting it changes.
+    pub max_rows_per_segment: Option<u64>,
 }
 
 impl Default for OptimizeOptions {
@@ -58,6 +76,8 @@ impl Default for OptimizeOptions {
             retrain: false,
             transaction_properties: None,
             progress: noop_progress(),
+            max_rows_per_task: None,
+            max_rows_per_segment: None,
         }
     }
 }
@@ -111,6 +131,18 @@ impl OptimizeOptions {
     /// Set progress callback for index building during optimization.
     pub fn progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
+        self
+    }
+
+    /// Bound the rows one build task covers.
+    pub fn max_rows_per_task(mut self, rows: Option<u64>) -> Self {
+        self.max_rows_per_task = rows;
+        self
+    }
+
+    /// Bound the rows one committed segment holds.
+    pub fn max_rows_per_segment(mut self, rows: Option<u64>) -> Self {
+        self.max_rows_per_segment = rows;
         self
     }
 }

@@ -1166,6 +1166,36 @@ pub(crate) async fn build_vector_index(
         frag_reuse_index,
         progress,
         None,
+        false,
+    )
+    .await
+}
+
+/// Train a vector index's IVF model and quantizer from the whole table and
+/// write a segment that carries that model and no rows.
+///
+/// A distributed rebuild hands this segment to every build task as the model
+/// to encode against; the segment itself is never committed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_vector_model_segment(
+    dataset: &Dataset,
+    column: &str,
+    name: &str,
+    uuid: Uuid,
+    params: &VectorIndexParams,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<Vec<IndexFile>> {
+    build_vector_index_impl(
+        dataset,
+        column,
+        name,
+        uuid,
+        params,
+        frag_reuse_index,
+        progress,
+        None,
+        true,
     )
     .await
 }
@@ -1191,6 +1221,7 @@ pub(crate) async fn build_filtered_vector_index(
         frag_reuse_index,
         progress,
         Some(fragment_ids),
+        false,
     )
     .await
 }
@@ -1205,6 +1236,7 @@ async fn build_vector_index_impl(
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
+    train_only: bool,
 ) -> Result<Vec<IndexFile>> {
     let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
         prepare_vector_segment_build(
@@ -1243,6 +1275,7 @@ async fn build_vector_index_impl(
                     frag_reuse_index,
                 )?
                 .with_optional_fragment_filter(fragment_ids)
+                .with_train_only(train_only)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
@@ -1261,6 +1294,7 @@ async fn build_vector_index_impl(
                     frag_reuse_index,
                 )?
                 .with_optional_fragment_filter(fragment_ids)
+                .with_train_only(train_only)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
@@ -1285,6 +1319,12 @@ async fn build_vector_index_impl(
                     if fragment_ids.is_some() {
                         return Err(Error::index(
                             "Build Vector Index: filtered IVF_PQ builds do not support legacy format"
+                                .to_string(),
+                        ));
+                    }
+                    if train_only {
+                        return Err(Error::index(
+                            "Build Vector Index: model-only IVF_PQ builds do not support legacy format"
                                 .to_string(),
                         ));
                     }
@@ -1317,6 +1357,7 @@ async fn build_vector_index_impl(
                     let summary = builder
                         .with_transpose(!params.skip_transpose)
                         .with_optional_fragment_filter(fragment_ids)
+                        .with_train_only(train_only)
                         .with_progress(progress.clone())
                         .build()
                         .await?;
@@ -1344,6 +1385,7 @@ async fn build_vector_index_impl(
                 frag_reuse_index,
             )?
             .with_optional_fragment_filter(fragment_ids)
+            .with_train_only(train_only)
             .with_progress(progress.clone())
             .build()
             .await?;
@@ -1372,6 +1414,7 @@ async fn build_vector_index_impl(
             let summary = builder
                 .with_transpose(!params.skip_transpose)
                 .with_optional_fragment_filter(fragment_ids)
+                .with_train_only(train_only)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
@@ -1398,6 +1441,7 @@ async fn build_vector_index_impl(
                         frag_reuse_index,
                     )?
                     .with_optional_fragment_filter(fragment_ids)
+                    .with_train_only(train_only)
                     .with_progress(progress.clone())
                     .build()
                     .await?;
@@ -1416,6 +1460,7 @@ async fn build_vector_index_impl(
                         frag_reuse_index,
                     )?
                     .with_optional_fragment_filter(fragment_ids)
+                    .with_train_only(train_only)
                     .with_progress(progress.clone())
                     .build()
                     .await?;
@@ -1448,6 +1493,7 @@ async fn build_vector_index_impl(
                 frag_reuse_index,
             )?
             .with_optional_fragment_filter(fragment_ids)
+            .with_train_only(train_only)
             .with_progress(progress.clone())
             .build()
             .await?;
@@ -1478,6 +1524,7 @@ async fn build_vector_index_impl(
                 frag_reuse_index,
             )?
             .with_optional_fragment_filter(fragment_ids)
+            .with_train_only(train_only)
             .with_progress(progress.clone())
             .build()
             .await?;
