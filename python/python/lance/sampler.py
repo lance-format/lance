@@ -63,15 +63,27 @@ def _efficient_sample(
     batch_size : int
         The batch size to use when loading the data.
     max_takes : int
-        The maximum number of takes to perform. This is used to limit the number of
-        random reads. Large enough value can give a good random sample without
-        having to issue too many random reads.
+        The target number of strata to sample from. A large enough value can give
+        a good random sample. Reads within each output batch are coalesced into
+        takes of at most 8192 rows.
 
     Returns
     -------
     Generator of a RecordBatch.
     """
-    buf: list[pa.RecordBatch] = []
+    indices: list[int] = []
+
+    def load_batch() -> pa.RecordBatch:
+        buf: list[pa.RecordBatch] = []
+        for start in range(0, len(indices), 8192):
+            buf.extend(
+                dataset.take(
+                    indices[start : start + 8192], columns=columns
+                ).to_batches()
+            )
+        indices.clear()
+        return pa.Table.from_batches(buf).combine_chunks().to_batches()[0]
+
     total_records = len(dataset)
     assert total_records > n
     chunk_size = total_records // max_takes
@@ -96,24 +108,13 @@ def _efficient_sample(
         else:
             offset = i
 
-        buf.extend(
-            dataset.take(
-                list(range(offset, offset + local_sample_size)),
-                columns=columns,
-            ).to_batches()
-        )
+        indices.extend(range(offset, offset + local_sample_size))
         if idx % 50 == 0:
             LOGGER.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
-        if sum(len(b) for b in buf) >= batch_size:
-            tbl = pa.Table.from_batches(buf)
-            buf.clear()
-            tbl = tbl.combine_chunks()
-            yield tbl.to_batches()[0]
-            del tbl
-    if buf:
-        tbl = pa.Table.from_batches(buf).combine_chunks()
-        yield tbl.to_batches()[0]
-        del tbl
+        if len(indices) >= batch_size:
+            yield load_batch()
+    if indices:
+        yield load_batch()
 
 
 def _filtered_efficient_sample(
@@ -189,10 +190,11 @@ def maybe_sample(
     batch_size : int, optional
         The batch size to use when loading the data, by default 10240.
     max_takes : int, optional
-        The maximum number of takes to perform, by default 2048.
-        This is employed to minimize the number of random reads necessary for sampling.
-        A sufficiently large value can provide an effective random sample without
-        the need for excessive random reads.
+        The target number of sampling strata, by default 2048. A sufficiently
+        large value can provide an effective random sample. For unfiltered
+        stratified sampling, reads within each output batch are coalesced into
+        takes of at most 8192 rows;
+        this parameter does not impose a hard limit on the number of take calls.
     filt : str, optional
         The filter to apply to the dataset, by default None.  If a filter is provided,
         then we will first load all row ids in memory and then batch through the ids

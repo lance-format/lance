@@ -276,3 +276,204 @@ def test_sample_dataset(tmp_path: Path, nrows: int):
     assert isinstance(large_scan[0], pa.RecordBatch)
     assert large_scan[0].schema == pa.schema([pa.field("vec", fsl.type)])
     assert large_scan[0].num_rows == min(nrows, 128)
+
+
+def _copy_numpy_state():
+    state = np.random.get_state()
+    return state[0], state[1].copy(), *state[2:]
+
+
+def _assert_numpy_state(actual, expected):
+    assert actual[0] == expected[0]
+    np.testing.assert_array_equal(actual[1], expected[1])
+    assert actual[2:] == expected[2:]
+
+
+def _legacy_stratified_batches(rows, n, batch_size, max_takes):
+    """Reference the old per-stratum offsets and output flush points."""
+    chunk_size, per_chunk = rows // max_takes, n // max_takes
+    sampled, pending, batches, states = 0, [], [], []
+    for start in range(0, rows, chunk_size):
+        if sampled >= n:
+            break
+        sampled += per_chunk
+        size = min(per_chunk, min(chunk_size, rows - start))
+        offset = start
+        if size < min(chunk_size, rows - start):
+            offset += np.random.randint(0, min(chunk_size, rows - start) - size)
+        pending.extend(range(offset, offset + size))
+        if len(pending) >= batch_size:
+            batches.append(pending)
+            pending = []
+            states.append(_copy_numpy_state())
+    if pending:
+        batches.append(pending)
+        states.append(_copy_numpy_state())
+    return batches, states
+
+
+@pytest.fixture
+def preserve_numpy_state():
+    state = np.random.get_state()
+    yield
+    np.random.set_state(state)
+
+
+@pytest.fixture
+def write_multifragment_dataset(tmp_path):
+    def write(table, name, max_rows_per_file=25):
+        dataset = lance.write_dataset(
+            table, tmp_path / name, max_rows_per_file=max_rows_per_file
+        )
+        assert len(dataset.get_fragments()) > 1
+        return dataset
+
+    return write
+
+
+def _patch_small_torch_sampler(monkeypatch, max_takes):
+    import lance.torch.data as torch_data
+
+    def sample(dataset, n, columns, batch_size=128, filt=None):
+        return maybe_sample(
+            dataset, n, columns, batch_size=batch_size, max_takes=max_takes, filt=filt
+        )
+
+    monkeypatch.setattr(torch_data, "maybe_sample", sample)
+
+
+@pytest.mark.parametrize("stop_early", [False, True], ids=["full", "early-stop"])
+@pytest.mark.parametrize(
+    "rows,n,expected_rows",
+    [(101, 17, 18), (97, 18, 17)],
+    ids=["overshoot", "undershoot"],
+)
+def test_maybe_sample_preserves_strata_and_rng(
+    rows,
+    n,
+    expected_rows,
+    stop_early,
+    write_multifragment_dataset,
+    preserve_numpy_state,
+):
+    dataset = write_multifragment_dataset(
+        pa.table({"id": np.arange(rows, dtype=np.int64)}), "sample.lance"
+    )
+    batch_size, max_takes, seed = 1, 8, 2718
+    np.random.seed(seed)
+    expected, expected_states = _legacy_stratified_batches(
+        rows, n, batch_size, max_takes
+    )
+    np.random.seed(seed)
+    sampler = iter(
+        maybe_sample(dataset, n, ["id"], batch_size=batch_size, max_takes=max_takes)
+    )
+    actual, states = [], []
+    for batch in sampler:
+        actual.append(batch["id"].to_pylist())
+        states.append(_copy_numpy_state())
+        if stop_early:
+            break
+    if stop_early:
+        sampler.close()
+    count = 1 if stop_early else len(expected)
+    assert actual == expected[:count]
+    assert list(map(len, actual)) == list(map(len, expected[:count]))
+    assert len(expected) == 9 and sum(map(len, expected)) == expected_rows
+    for actual_state, expected_state in zip(states, expected_states[:count]):
+        _assert_numpy_state(actual_state, expected_state)
+
+
+class _RecordingDataset:
+    def __init__(self, dataset):
+        self.dataset, self.take_sizes = dataset, []
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def take(self, indices, columns=None):
+        self.take_sizes.append(len(indices))
+        return self.dataset.take(indices, columns=columns)
+
+
+def test_maybe_sample_coalesces_takes_at_8192_rows(
+    write_multifragment_dataset, preserve_numpy_state
+):
+    rows, n = 16385, 8193
+    dataset = _RecordingDataset(
+        write_multifragment_dataset(
+            pa.table({"id": range(rows)}), "take_boundary.lance", max_rows_per_file=8192
+        )
+    )
+    np.random.seed(31415)
+    expected, states = _legacy_stratified_batches(rows, n, n, 1)
+    np.random.seed(31415)
+    actual = list(maybe_sample(dataset, n, {"row_id": "id"}, batch_size=n, max_takes=1))
+    assert actual[0]["row_id"].to_pylist() == expected[0]
+    assert actual[0].schema == pa.schema([pa.field("row_id", pa.int64())])
+    assert [batch.num_rows for batch in actual] == [n]
+    assert dataset.take_sizes == [8192, 1]
+    _assert_numpy_state(np.random.get_state(), states[-1])
+
+
+def test_torch_dataset_preserves_prefetch_rows_and_rng(
+    write_multifragment_dataset, preserve_numpy_state, monkeypatch
+):
+    pytest.importorskip("torch")
+    from lance.torch.data import LanceDataset as TorchDataset
+
+    rows, n, batch_size, max_takes = 101, 17, 5, 8
+    dataset = write_multifragment_dataset(
+        pa.table({"id": np.arange(rows, dtype=np.int64)}), "torch_sample.lance"
+    )
+    _patch_small_torch_sampler(monkeypatch, max_takes)
+    np.random.seed(1618)
+    expected, source_states = _legacy_stratified_batches(rows, n, batch_size, max_takes)
+    np.random.seed(1618)
+    batches, states = [], []
+    for batch in TorchDataset(
+        dataset,
+        batch_size=batch_size,
+        columns=["id"],
+        samples=n,
+        auto_detect_rank=False,
+    ):
+        batches.append(batch.tolist())
+        states.append(_copy_numpy_state())
+    assert batches == expected and list(map(len, batches)) == [6, 6, 6]
+    prefetched_states = [source_states[1], source_states[2], source_states[2]]
+    for actual, reference in zip(states, prefetched_states):
+        _assert_numpy_state(actual, reference)
+
+
+def test_sample_init_skips_nonfinite_rows_without_draining_prefetch(
+    monkeypatch, preserve_numpy_state, write_multifragment_dataset
+):
+    pytest.importorskip("torch")
+    from lance.torch.data import LanceDataset as TorchDataset
+    from lance.vector import _sample_init_centroids
+
+    rows, n, batch_size, max_takes, k = 101, 17, 5, 8, 5
+    ids = np.arange(rows, dtype=np.float32)
+    vectors = np.column_stack((ids, ids + 1000))
+    vectors[:30] = np.nan
+    dataset = write_multifragment_dataset(
+        pa.table({"vec": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 2)}),
+        "nonfinite_sample.lance",
+    )
+    _patch_small_torch_sampler(monkeypatch, max_takes)
+    np.random.seed(5772)
+    expected, states = _legacy_stratified_batches(rows, n, batch_size, max_takes)
+    valid_ids = [row for batch in expected[:2] for row in batch if row >= 30][:k]
+    np.random.seed(5772)
+    torch_dataset = TorchDataset(
+        dataset,
+        batch_size=batch_size,
+        columns=["vec"],
+        samples=n,
+        auto_detect_rank=False,
+    )
+    centroids = _sample_init_centroids(torch_dataset, k, filter_nan=True)
+    np.testing.assert_allclose(centroids.numpy(), vectors[valid_ids])
+    assert np.isfinite(centroids.numpy()).all()
+    _assert_numpy_state(np.random.get_state(), states[2])
