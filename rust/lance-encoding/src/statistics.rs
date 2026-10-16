@@ -581,16 +581,31 @@ impl ComputeStat for StructDataBlock {
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
 
+        // The packed row width is the sum of the children's widths. A child that
+        // carries no `MaxLength` (an all-null or a dictionary-encoded column, for
+        // example) has no width to contribute, which makes the sum unknown rather
+        // than zero, so the statistic is left out instead of panicking on the
+        // missing child. Such a struct cannot be packed anyway and the encoder
+        // rejects it with a typed error.
         let max_len = self
             .children
             .iter()
-            .map(|child| child.expect_single_stat::<UInt64Type>(Stat::MaxLength))
-            .sum::<u64>();
-        let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
+            .map(|child| {
+                let stat = child.get_stat(Stat::MaxLength)?;
+                let stat = stat.as_primitive_opt::<UInt64Type>()?;
+                if stat.len() == 1 {
+                    Some(stat.value(0))
+                } else {
+                    None
+                }
+            })
+            .sum::<Option<u64>>();
 
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
-        info.insert(Stat::MaxLength, max_len_array);
+        if let Some(max_len) = max_len {
+            info.insert(Stat::MaxLength, Arc::new(UInt64Array::from(vec![max_len])));
+        }
     }
 }
 
@@ -617,6 +632,46 @@ mod tests {
         types::{Int32Type, UInt64Type},
     };
     use arrow_select::concat::concat;
+
+    /// A packed struct whose child is all-null (or dictionary-encoded) has no
+    /// `MaxLength` to contribute, so the struct's width is unknown. Computing the
+    /// struct's statistics used to panic on that child; the column has to reach the
+    /// encoder's typed rejection instead.
+    #[test]
+    fn test_struct_stat_without_child_max_length() {
+        use crate::compression::try_fixed_packed_struct_miniblock;
+        use arrow_array::{StructArray, new_null_array};
+        use arrow_schema::Fields;
+
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let array = Arc::new(StructArray::new(
+            fields,
+            vec![
+                new_null_array(&DataType::Int32, 3),
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+
+        let block = DataBlock::from_arrays(&[array], 3);
+        assert!(matches!(block, DataBlock::Struct(_)));
+        assert!(block.get_stat(Stat::DataSize).is_some());
+        assert!(
+            block.get_stat(Stat::MaxLength).is_none(),
+            "an all-null child contributes no width, so the sum is unknown"
+        );
+
+        let err = try_fixed_packed_struct_miniblock(&block)
+            .expect_err("a packed struct with an all-null child must be rejected");
+        assert!(
+            err.to_string().contains("fixed-width children"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_data_size_stat() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
