@@ -137,6 +137,10 @@ pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataTyp
     Ok(())
 }
 
+/// Field IDs of a new table must be below this (2^30), leaving room for about a
+/// billion fields added later.
+pub const NEW_TABLE_FIELD_ID_LIMIT: i32 = 1 << 30;
+
 impl Schema {
     /// The unenforced primary key fields in the schema, ordered by position.
     ///
@@ -740,6 +744,35 @@ impl Schema {
             field.try_set_id(-1, &mut current_id)?;
         }
         Ok(())
+    }
+
+    /// Assign field IDs for a new table: keep the IDs the fields carry and give
+    /// each field without one an ID above the largest.
+    ///
+    /// Fails when two fields share an ID, or when an ID is not below
+    /// [`NEW_TABLE_FIELD_ID_LIMIT`], so the table has room for fields added later.
+    pub fn try_assign_new_table_field_ids(&mut self) -> Result<()> {
+        self.try_keep_field_ids()?;
+        if let Some(max_id) = self.max_field_id()
+            && max_id >= NEW_TABLE_FIELD_ID_LIMIT
+        {
+            return Err(Error::invalid_input(format!(
+                "field ID {max_id} is too large for a new table: field IDs must be below \
+                 {NEW_TABLE_FIELD_ID_LIMIT} to leave room for fields added later"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Keep the IDs the fields carry and give each field without one an ID
+    /// above the largest. Unlike [`Self::try_assign_new_table_field_ids`] there
+    /// is no upper limit, for IDs an existing table already uses, which may be
+    /// past [`NEW_TABLE_FIELD_ID_LIMIT`].
+    ///
+    /// Fails when two fields share an ID.
+    pub fn try_keep_field_ids(&mut self) -> Result<()> {
+        self.try_set_field_id(None)?;
+        self.validate()
     }
 
     /// Replace every field ID with a fresh checked allocation.
@@ -2600,6 +2633,56 @@ mod tests {
                 ("right_only".to_string(), "right".to_string()),
             ])
         );
+    }
+
+    fn with_field_id(field: ArrowField, id: i32) -> ArrowField {
+        field.with_metadata(HashMap::from([(
+            LANCE_FIELD_ID_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    #[test]
+    fn test_new_table_keeps_supplied_field_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            with_field_id(ArrowField::new("a", DataType::Int32, false), 0),
+            with_field_id(
+                ArrowField::new(
+                    "s",
+                    DataType::Struct(ArrowFields::from(vec![
+                        with_field_id(ArrowField::new("x", DataType::Utf8, true), 7),
+                        ArrowField::new("y", DataType::Utf8, true),
+                    ])),
+                    true,
+                ),
+                3,
+            ),
+            ArrowField::new("b", DataType::Int64, true),
+        ]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.try_assign_new_table_field_ids().unwrap();
+
+        let ids: Vec<(&str, i32)> = schema
+            .fields_pre_order()
+            .map(|field| (field.name.as_str(), field.id))
+            .collect();
+        assert_eq!(ids, vec![("a", 0), ("s", 3), ("x", 7), ("y", 8), ("b", 9)]);
+    }
+
+    #[rstest::rstest]
+    #[case::at_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT])]
+    #[case::filled_up_to_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT - 1, -1])]
+    #[case::largest_possible(vec![i32::MAX])]
+    #[case::shared(vec![1, 1])]
+    fn test_new_table_rejects_unusable_field_ids(#[case] ids: Vec<i32>) {
+        let fields: Vec<ArrowField> = (0..ids.len())
+            .map(|i| ArrowField::new(format!("f{i}"), DataType::Int32, true))
+            .collect();
+        let mut schema = Schema::try_from(&ArrowSchema::new(fields)).unwrap();
+        for (field, id) in schema.fields.iter_mut().zip(ids) {
+            field.id = id;
+        }
+        assert!(schema.try_assign_new_table_field_ids().is_err());
     }
 
     #[test]

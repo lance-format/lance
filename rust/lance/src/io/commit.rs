@@ -435,14 +435,11 @@ async fn do_commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
     session: Arc<Session>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
-    if !keep_field_ids {
-        canonicalize_non_reusable_field_ids(None, &mut transaction.operation, None)?;
-    } else if let Operation::Overwrite { schema, .. } = &transaction.operation {
-        // Canonicalization would have checked the schema it renumbered.
-        schema.validate()?;
+    if let Operation::Overwrite { schema, .. } = &mut transaction.operation {
+        crate::dataset::write::assign_new_table_field_ids(schema, inherited_field_ids)?;
         schema.verify_primary_key()?;
     }
     let transaction = &transaction;
@@ -788,7 +785,7 @@ pub(crate) async fn commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
     session: Arc<Session>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
@@ -801,7 +798,7 @@ pub(crate) async fn commit_new_dataset(
         manifest_naming_scheme,
         metadata_cache,
         session,
-        keep_field_ids,
+        inherited_field_ids,
     )
     .await
 }
