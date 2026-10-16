@@ -7,6 +7,9 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[path = "stop_word_filter/greek.rs"]
+mod greek;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -26,7 +29,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stopwords::FINNISH,
         stopwords::FRENCH,
         stopwords::GERMAN,
-        stop_words::get("el"),
+        greek::GREEK,
         stopwords::HUNGARIAN,
         stopwords::ITALIAN,
         stopwords::NORWEGIAN,
@@ -43,6 +46,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
+    .filter(|word| !greek::UNION_EXCLUSIONS.contains(word))
 }
 
 #[derive(Clone)]
@@ -64,7 +68,7 @@ impl StopWordFilter {
             Language::Finnish => stopwords::FINNISH,
             Language::French => stopwords::FRENCH,
             Language::German => stopwords::GERMAN,
-            Language::Greek => stop_words::get("el"),
+            Language::Greek => greek::GREEK,
             Language::Hungarian => stopwords::HUNGARIAN,
             Language::Italian => stopwords::ITALIAN,
             Language::Norwegian => stopwords::NORWEGIAN,
