@@ -1327,7 +1327,10 @@ async fn check_round_trip_encoding_inner(
     let scheduler = Arc::new(SimulatedScheduler::new(encoded_data)) as Arc<dyn EncodingsIo>;
 
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
-    let concat_data = if test_cases.skip_validation {
+    // The caller can supply the expected array; in that case skip deriving it,
+    // because building it here may itself fail (e.g. `concat` on dictionaries
+    // that Arrow's lossy merge cannot combine).
+    let concat_data = if test_cases.skip_validation || expected_override.is_some() {
         None
     } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
         // TODO(tsaucer) When arrow upgrades to 56, remove this if statement

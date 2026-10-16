@@ -7399,6 +7399,22 @@ impl PrimitiveStructuralEncoder {
         }
 
         if let DataBlock::Dictionary(dict) = data_block {
+            // Merging the buffered chunks can widen dictionary indices beyond
+            // the declared key type (see `concat_dict_arrays`).  The physical
+            // index width must match the schema, so reject the mismatch instead
+            // of persisting a file the reader would later reject as corrupt.
+            if let DataType::Dictionary(key_type, _) = field.data_type() {
+                let declared_key_bits = key_type.byte_width() as u64 * 8;
+                if dict.indices.bits_per_value != declared_key_bits {
+                    return Err(Error::invalid_input(format!(
+                        "Field '{}' is declared as {} but the merged dictionary needs {} bits per index and the declared key type addresses only {} bits; widen the dictionary key type to hold the merged values",
+                        field.name,
+                        field.data_type(),
+                        dict.indices.bits_per_value,
+                        declared_key_bits,
+                    )));
+                }
+            }
             log::debug!(
                 "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
                 column_idx,
@@ -8070,10 +8086,14 @@ mod tests {
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
     use crate::testing::TestEncoding;
-    use crate::testing::{SimulatedScheduler, TestCases, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        SimulatedScheduler, TestCases, check_round_trip_encoding_of_data,
+        check_round_trip_encoding_of_data_with_expected,
+    };
     use arrow_array::{
         Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array,
-        PrimitiveArray, StringArray, UInt8Array, make_array, new_null_array, types::Int32Type,
+        PrimitiveArray, StringArray, UInt8Array, UInt16Array, make_array, new_null_array,
+        types::{Int8Type, Int32Type},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
@@ -11979,6 +11999,141 @@ mod tests {
             .with_indices(vec![split_at as u64]);
 
         check_round_trip_encoding_of_data(dictionaries, &test_cases, HashMap::new()).await;
+    }
+
+    fn int8_dictionary_with_all_values() -> ArrayRef {
+        let values: Vec<u16> = (0..127u16).collect();
+        let keys: Vec<i8> = (0..127)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+            .collect();
+        Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(UInt16Array::from(values)),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_dictionary_merge_keeps_declared_key_type_round_trip() {
+        // Regression for a write that succeeded but produced a file the reader
+        // rejected: two Dictionary(Int8, UInt16) chunks, each holding all 127
+        // values an Int8 key can address.  Arrow's lossy concat merge
+        // over-counted the union (hash collisions in its interner) and widened
+        // the indices to 32 bits, contradicting the declared key type.
+        let a = int8_dictionary_with_all_values();
+        let b = int8_dictionary_with_all_values();
+        // Build the expected array directly: `concat` hits the same Arrow
+        // interner overflow, so the test harness cannot derive it.
+        let values: Vec<u16> = (0..127u16).collect();
+        let permutation: Vec<i8> = (0..127)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+            .collect();
+        let mut keys = permutation.clone();
+        keys.extend_from_slice(&permutation);
+        let expected: ArrayRef = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(UInt16Array::from(values)),
+            )
+            .unwrap(),
+        );
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralU32)
+            .with_page_sizes(vec![4096]);
+        check_round_trip_encoding_of_data_with_expected(
+            vec![a, b],
+            Some(expected),
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    fn disjoint_int8_dictionary(offset: u16) -> ArrayRef {
+        let values: Vec<u16> = (0..100u16).map(|value| value + offset).collect();
+        let keys: Vec<i8> = (0..100).map(|i| i as i8).collect();
+        Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(UInt16Array::from(values)),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_dictionary_merge_overflow_is_rejected_at_write() {
+        // Two chunks with disjoint dictionaries whose exact union (200 values)
+        // cannot be addressed by Int8 indices.  The writer must reject the
+        // mismatch instead of persisting indices wider than the declared key.
+        use crate::encoder::{
+            ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+        };
+        use crate::repdef::RepDefBuilder;
+        use crate::testing::{create_test_field_encoder, test_encoding_strategy};
+
+        let a = disjoint_int8_dictionary(0);
+        let b = disjoint_int8_dictionary(1000);
+        let field = ArrowField::new("d", a.data_type().clone(), false);
+        let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+        let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU32);
+        let mut column_index_seq = ColumnIndexSequence::default();
+        let encoding_options = EncodingOptions {
+            cache_bytes_per_column: 1024 * 1024,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+        };
+        let mut encoder = create_test_field_encoder(
+            encoding_strategy.as_ref(),
+            &lance_field,
+            &mut column_index_seq,
+            &encoding_options,
+        )
+        .unwrap();
+
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+        let mut error = None;
+        for (index, array) in [a, b].into_iter().enumerate() {
+            let row_number = (index * 100) as u64;
+            match encoder.maybe_encode(
+                array,
+                &mut external_buffers,
+                RepDefBuilder::default(),
+                row_number,
+                100,
+            ) {
+                Ok(tasks) => {
+                    for task in tasks {
+                        if let Err(err) = task.await {
+                            error = Some(err);
+                            break;
+                        }
+                    }
+                }
+                Err(err) => error = Some(err),
+            }
+            if error.is_some() {
+                break;
+            }
+        }
+        if error.is_none() {
+            for task in encoder.flush(&mut external_buffers).unwrap() {
+                if let Err(err) = task.await {
+                    error = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let error = error.expect("oversized dictionary merge must be rejected");
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("widen the dictionary key type"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
