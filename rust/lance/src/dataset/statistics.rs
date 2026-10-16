@@ -84,7 +84,11 @@ pub(super) async fn collect_current_data_stats(
             let file_fragment = FileFragment::new(dataset.clone(), fragment);
             let schema = schema.clone();
             let scan_scheduler = scan_scheduler.clone();
-            async move { file_fragment.storage_stats(&schema, scan_scheduler).await }
+            async move {
+                file_fragment
+                    .storage_stats_with(&schema, scan_scheduler)
+                    .await
+            }
         })
         .buffer_unordered(dataset.object_store.io_parallelism())
         .try_for_each(|fragment_stats| {

@@ -1094,8 +1094,32 @@ impl FileFragment {
         Ok(frag)
     }
 
+    /// Returns on-disk bytes for each field in this fragment.
+    ///
+    /// Field ids that appear in more than one data file are summed. The pairs
+    /// are sorted by field id.
+    pub async fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
+        let scan_scheduler = ScanScheduler::new(
+            self.dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(self.dataset.object_store.as_ref()),
+        );
+        let pairs = self
+            .storage_stats_with(self.dataset.schema(), scan_scheduler)
+            .await?;
+        let mut totals = HashMap::<u32, u64>::new();
+        for (field_id, bytes) in pairs {
+            *totals.entry(field_id).or_default() += bytes;
+        }
+        let mut totals: Vec<(u32, u64)> = totals.into_iter().collect();
+        totals.sort_unstable_by_key(|(field_id, _)| *field_id);
+        Ok(totals)
+    }
+
     /// Returns storage stats as `(field_id, bytes_on_disk)` pairs for this fragment.
-    pub(crate) async fn storage_stats(
+    ///
+    /// The same field id can appear more than once when it is stored in more
+    /// than one data file.
+    pub(crate) async fn storage_stats_with(
         &self,
         dataset_schema: &Schema,
         scan_scheduler: Arc<ScanScheduler>,
