@@ -7,6 +7,9 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[path = "stop_word_filter/latin.rs"]
+mod latin;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -17,12 +20,8 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stop_words::get("ar"),
         stopwords::DANISH,
         stopwords::DUTCH,
-        // Use the fuller `stop-words` crate English list (~198 words) rather
-        // than the local Tantivy-style list (~33 words), which omits extremely
-        // common pronouns/function words (you, my, your, we, she, what, ...).
-        // Those omissions let the highest-frequency English tokens through the
-        // ICU stop-word path and build pathologically large posting lists.
-        stop_words::get("en"),
+        // Keep the full list's pronoun coverage while preserving meaningful terms.
+        latin::ENGLISH,
         stopwords::FINNISH,
         stopwords::FRENCH,
         stopwords::GERMAN,
@@ -31,18 +30,19 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stopwords::ITALIAN,
         stopwords::NORWEGIAN,
         stopwords::PORTUGUESE,
-        stop_words::get("ro"),
+        latin::ROMANIAN,
         stopwords::RUSSIAN,
         stopwords::SPANISH,
         stopwords::SWEDISH,
         stop_words::get("ta"),
-        stop_words::get("tr"),
+        latin::TURKISH,
         stop_words::get("zh"),
         stop_words::get("ja"),
         stop_words::get("ko"),
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
+    .filter(|word| !latin::UNION_EXCLUSIONS.contains(word))
 }
 
 #[derive(Clone)]
@@ -56,11 +56,8 @@ impl StopWordFilter {
             Language::Arabic => stop_words::get("ar"),
             Language::Danish => stopwords::DANISH,
             Language::Dutch => stopwords::DUTCH,
-            // Use the fuller `stop-words` crate English list (~198 words); the
-            // local Tantivy-style list (~33 words) omits common pronouns/function
-            // words (you, my, your, we, ...) that would otherwise leak through
-            // stop-word removal and build pathologically large posting lists.
-            Language::English => stop_words::get("en"),
+            // Retain common pronouns without dropping content and negation.
+            Language::English => latin::ENGLISH,
             Language::Finnish => stopwords::FINNISH,
             Language::French => stopwords::FRENCH,
             Language::German => stopwords::GERMAN,
@@ -69,12 +66,12 @@ impl StopWordFilter {
             Language::Italian => stopwords::ITALIAN,
             Language::Norwegian => stopwords::NORWEGIAN,
             Language::Portuguese => stopwords::PORTUGUESE,
-            Language::Romanian => stop_words::get("ro"),
+            Language::Romanian => latin::ROMANIAN,
             Language::Russian => stopwords::RUSSIAN,
             Language::Spanish => stopwords::SPANISH,
             Language::Swedish => stopwords::SWEDISH,
             Language::Tamil => stop_words::get("ta"),
-            Language::Turkish => stop_words::get("tr"),
+            Language::Turkish => latin::TURKISH,
         };
         Some(Self::remove(words.iter().map(|word| (*word).to_owned())))
     }
