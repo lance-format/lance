@@ -14529,7 +14529,9 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count().await,
-                5 + dataset.versions().await.unwrap().len()
+                // the index, its partitions and the segment ownership mask, plus
+                // the index metadata of every version
+                6 + dataset.versions().await.unwrap().len()
             );
             assert_eq!(results.len(), 1);
             let batch = &results[0];
