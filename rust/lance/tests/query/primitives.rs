@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::*;
 use arrow_array::{
     ArrayRef, BinaryArray, BinaryViewArray, Float16Array, Float32Array, Float64Array, Int32Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator, StringArray,
     StringViewArray,
 };
 use arrow_schema::DataType;
@@ -233,6 +233,7 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
             Some(f16::MIN),
             Some(f16::MAX),
             None,
+            Some(-f16::NAN),
         ])),
         DataType::Float32 => Arc::new(Float32Array::from(vec![
             Some(0.0_f32),
@@ -245,6 +246,7 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
             Some(f32::MIN),
             Some(f32::MAX),
             None,
+            Some(-f32::NAN),
         ])),
         DataType::Float64 => Arc::new(Float64Array::from(vec![
             Some(0.0_f64),
@@ -257,11 +259,12 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
             Some(f64::MIN),
             Some(f64::MAX),
             None,
+            Some(-f64::NAN),
         ])),
         _ => unreachable!(),
     };
 
-    let id_array = Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>()));
+    let id_array = Arc::new(Int32Array::from((0..11).collect::<Vec<i32>>()));
 
     let batch =
         RecordBatch::try_from_iter(vec![("id", id_array as ArrayRef), ("value", value_array)])
@@ -294,17 +297,17 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
             // instead of treating the two encodings as one number the way
             // IEEE 754 and SQL do. That makes it useless as the reference, so
             // assert the rows. Ids are 0: +0.0, 1: -0.0, 2: +inf, 3: -inf,
-            // 4: NaN, 5: 1.0, 6: -1.0, 7: MIN, 8: MAX, 9: NULL.
+            // 4: +NaN, 5: 1.0, 6: -1.0, 7: MIN, 8: MAX, 9: NULL,
+            // 10: -NaN. NaN's sign is not part of its value, so both NaNs must
+            // compare on the positive side of every finite bound.
             for zero in ["0.0", "-0.0"] {
                 assert_filter_ids(&ds, &format!("value < {zero}"), &[3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value <= {zero}"), &[0, 1, 3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value = {zero}"), &[0, 1]).await;
-                assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8]).await;
-                // NaN is row 4. Arrow sorts it above every other value, so it
-                // survives `>` and `>=`, which IEEE would reject. That gap is
-                // not specific to zero and this rewrite leaves it alone.
-                assert_filter_ids(&ds, &format!("value > {zero}"), &[2, 4, 5, 8]).await;
-                assert_filter_ids(&ds, &format!("value >= {zero}"), &[0, 1, 2, 4, 5, 8]).await;
+                assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8, 10])
+                    .await;
+                assert_filter_ids(&ds, &format!("value > {zero}"), &[2, 4, 5, 8, 10]).await;
+                assert_filter_ids(&ds, &format!("value >= {zero}"), &[0, 1, 2, 4, 5, 8, 10]).await;
                 // A literal on the left. DataFusion's canonicalizer swaps it back
                 // before the rewrite runs, so this pins the answer rather than the
                 // mirroring branch, which `a_literal_on_the_left_mirrors_the_operator`
@@ -317,7 +320,24 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                 assert_filter_ids(
                     &ds,
                     &format!("value NOT BETWEEN {zero} AND {zero}"),
-                    &[2, 3, 4, 5, 6, 7, 8],
+                    &[2, 3, 4, 5, 6, 7, 8, 10],
+                )
+                .await;
+                // A two-sided bound excludes both NaNs without its own
+                // negative-NaN ranges, which is what keeps it one index range.
+                assert_filter_ids(&ds, &format!("value BETWEEN -1.0 AND {zero}"), &[0, 1, 6]).await;
+                // An infinite lower bound is still the one that excludes -NaN.
+                assert_filter_ids(
+                    &ds,
+                    &format!("value BETWEEN CAST('-inf' AS DOUBLE) AND {zero}"),
+                    &[0, 1, 3, 6, 7],
+                )
+                .await;
+                assert_filter_ids(&ds, &format!("value > {zero} AND value <= 1.0"), &[5]).await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("NOT (value >= -1.0 AND value <= {zero})"),
+                    &[2, 3, 4, 5, 7, 8, 10],
                 )
                 .await;
                 // An IN list gains the encoding it does not spell out.
@@ -325,19 +345,96 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                 assert_filter_ids(
                     &ds,
                     &format!("value NOT IN ({zero}, 1.0)"),
-                    &[2, 3, 4, 6, 7, 8],
+                    &[2, 3, 4, 6, 7, 8, 10],
                 )
                 .await;
                 // Composed with NULL logic, where this index layer has broken before.
                 assert_filter_ids(
                     &ds,
                     &format!("value != {zero} OR value IS NULL"),
-                    &[2, 3, 4, 5, 6, 7, 8, 9],
+                    &[2, 3, 4, 5, 6, 7, 8, 9, 10],
                 )
                 .await;
             }
         })
         .await
+}
+
+/// Neither zero's nor NaN's sign is part of its value, including when both
+/// sides of a comparison are columns or the value is an `array_has` needle.
+#[tokio::test]
+async fn test_float_sign_is_ignored_in_column_comparisons_and_array_has() {
+    let nan = f64::NAN;
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
+        ),
+        (
+            "a",
+            Arc::new(Float64Array::from(vec![
+                Some(-nan),
+                Some(nan),
+                Some(-0.0),
+                Some(0.0),
+                Some(1.0),
+                Some(-1.0),
+                Some(1.0),
+                None,
+                Some(0.0),
+                Some(-nan),
+            ])) as ArrayRef,
+        ),
+        (
+            "b",
+            Arc::new(Float64Array::from(vec![
+                Some(nan),
+                Some(-nan),
+                Some(0.0),
+                Some(-0.0),
+                Some(1.0),
+                Some(1.0),
+                Some(-1.0),
+                Some(0.0),
+                None,
+                Some(0.0),
+            ])) as ArrayRef,
+        ),
+        (
+            "l",
+            Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+                Some(vec![Some(-nan)]),
+                Some(vec![Some(nan)]),
+                Some(vec![Some(-0.0)]),
+                Some(vec![Some(0.0)]),
+                Some(vec![Some(1.0)]),
+                Some(vec![None, Some(-0.0)]),
+                Some(vec![None]),
+                Some(vec![]),
+                None,
+                Some(vec![Some(1.0)]),
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+
+    DatasetTestCases::from_data(batch)
+        .with_index_types("l", [Some(IndexType::LabelList)])
+        .run(|ds: Dataset, _original: RecordBatch| async move {
+            assert_filter_ids(&ds, "a = b", &[0, 1, 2, 3, 4]).await;
+            assert_filter_ids(&ds, "a != b", &[5, 6, 9]).await;
+            assert_filter_ids(&ds, "a < b", &[5]).await;
+            assert_filter_ids(&ds, "a <= b", &[0, 1, 2, 3, 4, 5]).await;
+            assert_filter_ids(&ds, "a > b", &[6, 9]).await;
+            assert_filter_ids(&ds, "a >= b", &[0, 1, 2, 3, 4, 6, 9]).await;
+            for zero in ["0.0", "-0.0"] {
+                assert_filter_ids(&ds, &format!("array_has(l, {zero})"), &[2, 3, 5]).await;
+            }
+            for nan in ["CAST('NaN' AS DOUBLE)", "-CAST('NaN' AS DOUBLE)"] {
+                assert_filter_ids(&ds, &format!("array_has(l, {nan})"), &[0, 1]).await;
+            }
+        })
+        .await;
 }
 
 /// A rewritten zero predicate still has to reach a scalar index. Without this,
@@ -374,7 +471,14 @@ async fn test_float_zero_predicate_uses_scalar_index() {
     .await
     .unwrap();
 
-    for predicate in ["value = 0.0", "value < 0.0", "value != 0.0"] {
+    for predicate in [
+        "value = 0.0",
+        "value < 0.0",
+        "value > 0.0",
+        "value != 0.0",
+        "value BETWEEN -1.0 AND 0.0",
+        "value > 0.0 AND value < 1.0",
+    ] {
         let plan = ds
             .scan()
             .filter(predicate)
@@ -387,11 +491,15 @@ async fn test_float_zero_predicate_uses_scalar_index() {
             "`{predicate}` should use the scalar index, got plan:\n{plan}"
         );
         // The rewrite's output survives a second `optimize_expr`, which the scan
-        // path does run, so the predicate must not appear twice.
+        // path does run, so each required range must appear exactly once. `>` has
+        // two disjoint ranges: ordinary values above zero and negative NaNs below
+        // negative infinity. A two-sided bound needs neither NaN range, so it
+        // stays one range.
+        let expected_searches = if predicate == "value > 0.0" { 2 } else { 1 };
         assert_eq!(
             plan.matches("value_idx").count(),
-            1,
-            "`{predicate}` should search the index once, got plan:\n{plan}"
+            expected_searches,
+            "`{predicate}` should search each required range once, got plan:\n{plan}"
         );
     }
 
