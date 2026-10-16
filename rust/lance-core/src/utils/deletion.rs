@@ -5,6 +5,7 @@ use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use crate::deepsize::{Context, DeepSizeOf};
 use arrow_array::BooleanArray;
+use arrow_buffer::BooleanBufferBuilder;
 use roaring::RoaringBitmap;
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
@@ -102,6 +103,66 @@ impl DeletionVector {
         }
     }
 
+    /// Build a mask of the rows in a batch that survive deletion.
+    ///
+    /// `ranges` are the fragment row offsets the batch covers, in the order the batch
+    /// returns them, and must sum to `num_rows`.  Bit `i` of the result is set when the
+    /// batch's `i`th row is still live.
+    ///
+    /// Returns `None` when the batch contains no deleted row, letting the caller pass it
+    /// along untouched.
+    ///
+    /// Unlike [`Self::build_predicate`] this looks deleted rows up by offset instead of
+    /// asking about every row in turn, so the cost follows the deletions a batch actually
+    /// covers rather than the number of rows it holds.  A [`HashSet`] cannot be queried by
+    /// range, so for that representation the two loops are compared by length and the
+    /// shorter one is walked.
+    pub fn build_keep_mask(&self, ranges: &[Range<u32>], num_rows: u32) -> Option<BooleanArray> {
+        debug_assert_eq!(
+            ranges.iter().map(|r| r.end - r.start).sum::<u32>(),
+            num_rows,
+            "ranges must cover exactly num_rows rows"
+        );
+
+        let mut mask = KeepMaskBuilder::new(num_rows);
+        match self {
+            Self::NoDeletions => {}
+            Self::Bitmap(bitmap) => {
+                let mut base = 0;
+                for range in ranges {
+                    for deleted in bitmap.range(range.clone()) {
+                        mask.delete(base + deleted - range.start);
+                    }
+                    base += range.end - range.start;
+                }
+            }
+            // Walking the set costs one step per entry for every range, while probing
+            // costs one lookup per row.  A set never grows past `BITMAP_THRESDHOLD`, so
+            // on a batch-sized read the first is usually the shorter walk.
+            Self::Set(set) if set.len().saturating_mul(ranges.len()) <= num_rows as usize => {
+                let mut base = 0;
+                for range in ranges {
+                    for deleted in set.iter().copied().filter(|offset| range.contains(offset)) {
+                        mask.delete(base + deleted - range.start);
+                    }
+                    base += range.end - range.start;
+                }
+            }
+            Self::Set(set) => {
+                let mut position = 0;
+                for range in ranges {
+                    for offset in range.clone() {
+                        if set.contains(&offset) {
+                            mask.delete(position);
+                        }
+                        position += 1;
+                    }
+                }
+            }
+        }
+        mask.finish()
+    }
+
     // Note: deletion vectors are based on 32-bit offsets.  However, this function works
     // even when given 64-bit row addresses.  That is because `id as u32` returns the lower
     // 32 bits (the row offset) and the upper 32 bits are ignored.
@@ -120,6 +181,39 @@ impl DeletionVector {
             Self::NoDeletions => None,
         }
         .map(BooleanArray::from)
+    }
+}
+
+/// Collects deleted positions into a keep mask, allocating only once one shows up.
+///
+/// Most batches of a scan contain no deleted row at all, and those cost nothing here.
+struct KeepMaskBuilder {
+    num_rows: u32,
+    builder: Option<BooleanBufferBuilder>,
+}
+
+impl KeepMaskBuilder {
+    fn new(num_rows: u32) -> Self {
+        Self {
+            num_rows,
+            builder: None,
+        }
+    }
+
+    fn delete(&mut self, position: u32) {
+        let num_rows = self.num_rows as usize;
+        self.builder
+            .get_or_insert_with(|| {
+                let mut builder = BooleanBufferBuilder::new(num_rows);
+                builder.append_n(num_rows, true);
+                builder
+            })
+            .set_bit(position as usize, false);
+    }
+
+    fn finish(self) -> Option<BooleanArray> {
+        self.builder
+            .map(|mut builder| BooleanArray::new(builder.finish(), None))
     }
 }
 
@@ -419,6 +513,96 @@ mod test {
             pred.iter().map(|v| v.unwrap()).collect::<Vec<_>>(),
             [false, true, false, true, false]
         );
+    }
+
+    /// A missing mask means every row survived, so spell that out as a full mask.
+    fn keep_mask_values(dv: &DeletionVector, ranges: &[Range<u32>], num_rows: u32) -> Vec<bool> {
+        match dv.build_keep_mask(ranges, num_rows) {
+            Some(mask) => mask.iter().map(|v| v.unwrap()).collect(),
+            None => vec![true; num_rows as usize],
+        }
+    }
+
+    #[rstest]
+    #[case::set(set_dv([1, 3]))]
+    #[case::bitmap(bitmap_dv([1, 3]))]
+    fn test_build_keep_mask(#[case] dv: DeletionVector) {
+        assert_eq!(
+            keep_mask_values(&dv, &[0..5], 5),
+            [true, false, true, false, true]
+        );
+    }
+
+    #[rstest]
+    #[case::set(set_dv([1, 6, 9]))]
+    #[case::bitmap(bitmap_dv([1, 6, 9]))]
+    fn test_build_keep_mask_maps_offsets_to_batch_positions(#[case] dv: DeletionVector) {
+        // Offsets 0..3 land at positions 0..3 and offsets 6..10 at positions 3..7, so the
+        // deleted offsets 1, 6 and 9 must show up at positions 1, 3 and 6.
+        assert_eq!(
+            keep_mask_values(&dv, &[0..3, 6..10], 7),
+            [true, false, true, false, true, true, false]
+        );
+    }
+
+    #[rstest]
+    #[case::no_deletions(DeletionVector::NoDeletions)]
+    #[case::set(set_dv([100, 200]))]
+    #[case::bitmap(bitmap_dv([100, 200]))]
+    fn test_build_keep_mask_skips_batches_without_deletions(#[case] dv: DeletionVector) {
+        assert!(dv.build_keep_mask(&[0..10], 10).is_none());
+    }
+
+    /// The row addresses `build_predicate` would be handed for a batch covering `ranges`.
+    fn batch_row_addrs(ranges: &[Range<u32>]) -> Vec<u64> {
+        ranges
+            .iter()
+            .flat_map(|range| range.clone())
+            .map(u64::from)
+            .collect()
+    }
+
+    #[rstest]
+    // Few enough deleted rows that walking the set is the shorter loop.
+    #[case::set_walked(set_dv([2, 5, 11]), vec![0..8, 10..14], 12)]
+    // More deleted rows than the batch holds, so the per-row probe is used instead.
+    #[case::set_probed(set_dv([0, 1, 2, 3, 4, 5, 6, 7]), vec![2..5], 3)]
+    #[case::bitmap(bitmap_dv([2, 5, 11]), vec![0..8, 10..14], 12)]
+    fn test_build_keep_mask_matches_build_predicate(
+        #[case] dv: DeletionVector,
+        #[case] ranges: Vec<Range<u32>>,
+        #[case] num_rows: u32,
+    ) {
+        let row_addrs = batch_row_addrs(&ranges);
+        let expected = dv
+            .build_predicate(row_addrs.iter())
+            .map(|mask| mask.iter().map(|v| v.unwrap()).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![true; num_rows as usize]);
+        assert_eq!(keep_mask_values(&dv, &ranges, num_rows), expected);
+    }
+
+    /// Bitmap lookups always go through `range()`, including short runs, runs that
+    /// start mid-fragment, and a batch that mixes several of those in one call.
+    #[rstest]
+    #[case::short_run(vec![0..3])]
+    #[case::long_run(vec![0..64])]
+    #[case::offset_run(vec![32..80])]
+    #[case::mixed_runs(vec![0..3, 10..26, 100..104])]
+    fn test_build_keep_mask_range_lookup(#[case] ranges: Vec<Range<u32>>) {
+        let num_rows = ranges.iter().map(|range| range.end - range.start).sum();
+        // Spread across the fragment and onto run edges, so every case drops a row.
+        let dv = bitmap_dv([0, 3, 11, 25, 40, 41, 42, 79, 100, 103]);
+
+        let row_addrs = batch_row_addrs(&ranges);
+        let expected = dv
+            .build_predicate(row_addrs.iter())
+            .map(|mask| mask.iter().map(|v| v.unwrap()).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![true; num_rows as usize]);
+        assert!(
+            expected.contains(&false),
+            "case would pass without resolving any deletion"
+        );
+        assert_eq!(keep_mask_values(&dv, &ranges, num_rows), expected);
     }
 
     #[rstest]

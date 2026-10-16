@@ -487,22 +487,37 @@ fn apply_row_id_and_deletes_with_system_columns(
     debug_assert!(batch.num_columns() > 0 || config.has_system_cols() || has_deletions);
 
     // If row id sequence is None, then row id IS row address.
-    let should_fetch_row_addr = config.with_row_addr
-        || (config.with_row_id && config.row_id_sequence.is_none())
-        || has_deletions;
+    //
+    // Deletions are resolved from row offsets, so they no longer make row addresses
+    // worth materializing on their own.
+    let should_fetch_row_addr =
+        config.with_row_addr || (config.with_row_id && config.row_id_sequence.is_none());
 
     let num_rows = batch.num_rows() as u32;
 
+    // Row addresses and the deletion mask are both derived from where this batch's rows
+    // sit in the fragment, so resolve that once and hand it to both.
+    let batch_selection = if should_fetch_row_addr || has_deletions {
+        Some(
+            config
+                .params
+                .slice(batch_offset as usize, num_rows as usize)?,
+        )
+    } else {
+        None
+    };
+
+    // Only the mask needs the runs up front; row addresses can stream them.
+    let offset_ranges = match batch_selection.as_ref().filter(|_| has_deletions) {
+        Some(selection) => Some(selection.iter_offset_ranges()?.collect::<Vec<_>>()),
+        None => None,
+    };
+
     let row_addrs =
-        if should_fetch_row_addr {
+        if let Some(selection) = batch_selection.as_ref().filter(|_| should_fetch_row_addr) {
             let _rowaddrs = tracing::span!(tracing::Level::DEBUG, "fetch_row_addrs").entered();
             let mut row_addrs = Vec::with_capacity(num_rows as usize);
-            for offset_range in config
-                .params
-                .slice(batch_offset as usize, num_rows as usize)
-                .unwrap()
-                .iter_offset_ranges()?
-            {
+            for offset_range in selection.iter_offset_ranges()? {
                 row_addrs.extend(offset_range.map(|row_offset| {
                     u64::from(RowAddress::new_from_parts(fragment_id, row_offset))
                 }));
@@ -545,10 +560,12 @@ fn apply_row_id_and_deletes_with_system_columns(
 
     let span = tracing::span!(tracing::Level::DEBUG, "apply_deletions");
     let _enter = span.enter();
-    let deletion_mask = deletion_vector.and_then(|v| {
-        let row_addrs: &[u64] = row_addrs.as_ref().unwrap().values();
-        v.build_predicate(row_addrs.iter())
-    });
+    let deletion_mask =
+        deletion_vector
+            .zip(offset_ranges.as_ref())
+            .and_then(|(deletion_vector, offset_ranges)| {
+                deletion_vector.build_keep_mask(offset_ranges, num_rows)
+            });
 
     let mut system_columns: Vec<(Field, ArrayRef)> = Vec::with_capacity(4);
     if config.with_row_id {
@@ -1488,6 +1505,52 @@ mod tests {
             0..100,
         )
         .await;
+    }
+
+    /// A filtered scan reads a fragment as a set of ranges, which is the shape where a
+    /// batch's position and its fragment row offset drift apart.
+    #[tokio::test]
+    async fn test_deletes_with_range_selection() {
+        // 100 rows over 10 batches, selected as two ranges of a 110 row fragment.
+        let data = batch_task_stream(
+            lance_datagen::gen_batch()
+                .col("x", lance_datagen::array::rand::<Int32Type>())
+                .into_reader_stream(RowCount::from(10), BatchCount::from(10))
+                .0,
+        );
+
+        // Offset 55 is deleted but never selected, so it must not shift anything.
+        let deletion_vector = Arc::new(DeletionVector::Bitmap(RoaringBitmap::from_iter([
+            0, 49, 55, 60, 109,
+        ])));
+
+        let config = RowIdAndDeletesConfig {
+            params: ReadBatchParams::Ranges(Arc::from(vec![0..50_u64, 60..110])),
+            with_row_id: true,
+            with_row_addr: false,
+            with_row_last_updated_at_version: false,
+            with_row_created_at_version: false,
+            deletion_vector: Some(deletion_vector),
+            row_id_sequence: None,
+            last_updated_at_sequence: None,
+            created_at_sequence: None,
+            make_deletions_null: false,
+            total_num_rows: 110,
+        };
+
+        let stream = super::wrap_with_row_id_and_delete(data, 0, config);
+        let batches = stream.buffered(1).try_collect::<Vec<_>>().await.unwrap();
+
+        let actual = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
+            .collect::<Vec<u64>>();
+        let expected = (0..50)
+            .chain(60..110)
+            .filter(|offset| ![0, 49, 60, 109].contains(offset))
+            .map(|offset| RowAddress::new_from_parts(0, offset).into())
+            .collect::<Vec<u64>>();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
