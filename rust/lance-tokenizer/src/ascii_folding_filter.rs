@@ -69,7 +69,9 @@ impl<T: TokenStream> TokenStream for AsciiFoldingFilterTokenStream<'_, T> {
 fn to_ascii(text: &str, output: &mut String) {
     output.clear();
     output.reserve(text.len());
-    for ch in text.chars() {
+    // NFKC first so compatibility forms with no ASCII equivalent (e.g. half-width
+    // katakana) still normalize to their canonical form.
+    for ch in text.nfkc() {
         if ch.is_ascii() {
             output.push(ch);
             continue;
@@ -156,5 +158,11 @@ mod tests {
     fn test_ascii_folding_cjk_unchanged() {
         let tokens = collect_tokens("こんにちは世界");
         assert_eq!(tokens[0].text, "こんにちは世界");
+    }
+
+    #[test]
+    fn test_ascii_folding_halfwidth_katakana() {
+        let tokens = collect_tokens("ﾕｰｻﾞｰ");
+        assert_eq!(tokens[0].text, "ユーザー");
     }
 }

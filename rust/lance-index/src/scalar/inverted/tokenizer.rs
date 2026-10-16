@@ -1504,6 +1504,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_code_tokenizer_splits_cjk_and_non_ascii_digits() {
+        let mut tokenizer = InvertedIndexParams::code()
+            .split_identifiers(true)
+            .build()
+            .unwrap();
+        let mut stream =
+            tokenizer.token_stream_for_doc("getユーザー ユーザーget 用户Name ｕｔｆ８ ﾕｰｻﾞｰ");
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| tokens.push(token.text.clone()));
+        assert_eq!(
+            tokens,
+            vec![
+                "getユーザー",
+                "get",
+                "ユーザー",
+                "ユーザーget",
+                "ユーザー",
+                "get",
+                "用户name",
+                "用户",
+                "name",
+                "utf8",
+                "utf",
+                "8",
+                "ユーザー",
+            ]
+        );
+    }
+
+    #[test]
     fn test_inverted_details_round_trip_code_params() {
         let params = InvertedIndexParams::code()
             .with_position(true)

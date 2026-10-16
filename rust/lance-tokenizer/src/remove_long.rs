@@ -52,7 +52,7 @@ pub struct RemoveLongFilterStream<T> {
 
 impl<T> RemoveLongFilterStream<T> {
     fn predicate(&self, token: &Token) -> bool {
-        token.text.len() < self.token_length_limit
+        token.text.chars().count() < self.token_length_limit
     }
 }
 
@@ -72,5 +72,29 @@ impl<T: TokenStream> TokenStream for RemoveLongFilterStream<T> {
 
     fn token_mut(&mut self) -> &mut Token {
         self.tail.token_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{RemoveLongFilter, SimpleTokenizer, TextAnalyzer};
+
+    fn collect_texts(text: &str, limit: usize) -> Vec<String> {
+        let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(limit))
+            .build();
+        let mut stream = analyzer.token_stream(text);
+        let mut texts = Vec::new();
+        stream.process(&mut |token| texts.push(token.text.clone()));
+        texts
+    }
+
+    #[test]
+    fn test_remove_long_counts_chars_not_bytes() {
+        // 5 chars but 15 UTF-8 bytes.
+        assert_eq!(
+            collect_texts("ユーザー名 abcdefghij", 6),
+            vec!["ユーザー名"]
+        );
     }
 }

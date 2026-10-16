@@ -142,10 +142,15 @@ fn split_segment(
 fn is_boundary(chars: &[CharInfo], idx: usize, split_on_numerics: bool) -> bool {
     let prev = chars[idx - 1].ch;
     let cur = chars[idx].ch;
-    if split_on_numerics && prev.is_ascii_digit() != cur.is_ascii_digit() {
+    if split_on_numerics && prev.is_numeric() != cur.is_numeric() {
         return true;
     }
     if prev.is_lowercase() && cur.is_uppercase() {
+        return true;
+    }
+    // Caseless letters (e.g. kana, kanji, hanzi) next to cased letters, in either order.
+    let is_cased = |c: char| c.is_lowercase() || c.is_uppercase();
+    if prev.is_alphabetic() && cur.is_alphabetic() && is_cased(prev) != is_cased(cur) {
         return true;
     }
     if prev.is_uppercase()
@@ -292,6 +297,42 @@ mod tests {
                 ("Name", 2, 1),
                 ("next", 3, 1),
             ]
+        );
+    }
+
+    #[test]
+    fn test_word_delimiter_cjk_latin_boundaries() {
+        let tokens = collect_tokens("getユーザー ユーザーget 用户Name");
+        let texts = tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![
+                "getユーザー",
+                "get",
+                "ユーザー",
+                "ユーザーget",
+                "ユーザー",
+                "get",
+                "用户Name",
+                "用户",
+                "Name",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_word_delimiter_non_ascii_digits() {
+        let tokens = collect_tokens("ｕｔｆ８ var٣Name");
+        let texts = tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec!["ｕｔｆ８", "ｕｔｆ", "８", "var٣Name", "var", "٣", "Name"]
         );
     }
 }
