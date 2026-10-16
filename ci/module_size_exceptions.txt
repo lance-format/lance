@@ -4,7 +4,6 @@
 # Do not add new entries: split the module instead.
 rust/lance-encoding/src/encodings/logical/primitive.rs
 rust/lance-index/src/scalar/inverted/wand.rs
-rust/lance-namespace-impls/src/dir.rs
 rust/lance/src/dataset/mem_wal/write.rs
 rust/lance/src/dataset/optimize.rs
 rust/lance/src/dataset/scanner.rs

@@ -7,7 +7,7 @@ Tests for DirectoryNamespace implementation.
 This module tests the DirectoryNamespace class which provides a directory-based
 namespace implementation for organizing Lance tables and nested namespaces.
 
-These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir.rs
+These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir/tests/
 
 Additionally, tests are parameterized to run with both the native DirectoryNamespace
 and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
