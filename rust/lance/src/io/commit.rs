@@ -892,9 +892,20 @@ pub(crate) fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     }
 
     // First, see which, if any fields have duplicate ids, within any fragment.
+    // Data file field lists are interned `Arc<[i32]>`s shared across fragments, so
+    // fragments whose files carry the same lists were already checked.
     let mut fields_with_duplicate_ids = HashSet::new();
     let mut seen_fields = HashSet::new();
+    let mut checked_field_lists: HashSet<Vec<usize>> = HashSet::new();
     for fragment in manifest.fragments.iter() {
+        let field_lists: Vec<usize> = fragment
+            .files
+            .iter()
+            .map(|file| file.fields.as_ptr() as usize)
+            .collect();
+        if !checked_field_lists.insert(field_lists) {
+            continue;
+        }
         for file in fragment.files.iter() {
             for field_id in file.fields.iter() {
                 if *field_id >= 0 && !seen_fields.insert(*field_id) {
@@ -3943,6 +3954,70 @@ mod tests {
         let err = check_storage_version(&mut manifest).unwrap_err();
 
         assert!(err.to_string().contains("Non-leaf field"), "{err}");
+    }
+
+    #[test]
+    fn test_fix_schema_checks_distinct_field_lists_after_shared_ones() {
+        // Fragments sharing interned field lists are scanned once; a later
+        // fragment with a distinct duplicate-id list must still be remapped.
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let mut field1 =
+            Field::try_from(ArrowField::new("b", arrow_schema::DataType::Int64, false)).unwrap();
+        field1.set_id(-1, &mut 1);
+        let schema = Schema {
+            fields: vec![field0.clone(), field1.clone()],
+            metadata: Default::default(),
+        };
+
+        let shared_a = DataFile::new_legacy_from_fields("a.lance", vec![0], None);
+        let shared_b = DataFile::new_legacy_from_fields("b.lance", vec![1], None);
+        let make_fragment = |id: u64, files: Vec<DataFile>| Fragment {
+            id,
+            files,
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let fragments = vec![
+            make_fragment(0, vec![shared_a.clone(), shared_b.clone()]),
+            make_fragment(1, vec![shared_a.clone(), shared_b]),
+            make_fragment(
+                2,
+                vec![
+                    shared_a,
+                    DataFile::new_legacy_from_fields("dup.lance", vec![0, 1], None),
+                ],
+            ),
+        ];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        fix_schema(&mut manifest).unwrap();
+
+        // Field 0 is duplicated only in fragment 2 -> remapped to max_field_id + 1 = 2.
+        field0.id = 2;
+        let expected_schema = Schema {
+            fields: vec![field0, field1],
+            metadata: Default::default(),
+        };
+        assert_eq!(manifest.schema, expected_schema);
+        // Shared lists in fragments 0/1 are remapped too; fragment 2's first
+        // file only held the old id and is dropped as no longer in use.
+        assert_eq!(manifest.fragments[0].files[0].fields.as_ref(), &[2]);
+        assert_eq!(manifest.fragments[0].files[1].fields.as_ref(), &[1]);
+        let frag2 = &manifest.fragments[2];
+        assert_eq!(frag2.files.len(), 1);
+        assert_eq!(frag2.files[0].path, "dup.lance");
+        assert_eq!(frag2.files[0].fields.as_ref(), &[2, 1]);
     }
 
     #[test]
