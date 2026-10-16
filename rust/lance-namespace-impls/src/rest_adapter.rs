@@ -87,7 +87,7 @@ impl RestAdapter {
                 "/v1/table/:id/version/delete",
                 post(batch_delete_table_versions),
             )
-            .route("/v1/table/:id/stats", get(get_table_stats))
+            .route("/v1/table/:id/stats", post(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
             .route("/v1/table/:id/declare", post(declare_table))
@@ -96,7 +96,7 @@ impl RestAdapter {
             .route("/v1/table/:id/update", post(update_table))
             .route("/v1/table/:id/delete", post(delete_from_table))
             .route("/v1/table/:id/query", post(query_table))
-            .route("/v1/table/:id/count_rows", get(count_table_rows))
+            .route("/v1/table/:id/count_rows", post(count_table_rows))
             // Index operations
             .route("/v1/table/:id/create_index", post(create_table_index))
             .route(
@@ -106,7 +106,7 @@ impl RestAdapter {
             .route("/v1/table/:id/index/list", post(list_table_indices))
             .route(
                 "/v1/table/:id/index/:index_name/stats",
-                get(describe_table_index_stats),
+                post(describe_table_index_stats),
             )
             .route(
                 "/v1/table/:id/index/:index_name/drop",
@@ -137,7 +137,7 @@ impl RestAdapter {
                 post(update_table_schema_metadata),
             )
             // Tag operations
-            .route("/v1/table/:id/tags/list", get(list_table_tags))
+            .route("/v1/table/:id/tags/list", post(list_table_tags))
             .route("/v1/table/:id/tags/version", post(get_table_tag_version))
             .route("/v1/table/:id/tags/create", post(create_table_tag))
             .route("/v1/table/:id/tags/delete", post(delete_table_tag))
@@ -804,17 +804,13 @@ async fn count_table_rows(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CountTableRowsRequest>,
 ) -> Response {
-    let request = CountTableRowsRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        version: None,
-        predicate: None,
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.count_table_rows(request).await {
-        Ok(count) => (StatusCode::OK, Json(serde_json::json!({ "count": count }))).into_response(),
+        Ok(count) => (StatusCode::OK, Json(count)).into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -949,12 +945,10 @@ async fn get_table_stats(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<GetTableStatsRequest>,
 ) -> Response {
-    let request = GetTableStatsRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
 
     match backend.get_table_stats(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -1046,14 +1040,11 @@ async fn describe_table_index_stats(
     headers: HeaderMap,
     Path(params): Path<IndexPathParams>,
     Query(query): Query<DelimiterQuery>,
+    Json(mut request): Json<DescribeTableIndexStatsRequest>,
 ) -> Response {
-    let request = DescribeTableIndexStatsRequest {
-        id: Some(parse_id(&params.id, query.delimiter.as_deref())),
-        version: None,
-        index_name: Some(params.index_name),
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    request.id = Some(parse_id(&params.id, query.delimiter.as_deref()));
+    request.index_name = Some(params.index_name);
+    request.identity = extract_identity(&headers);
 
     match backend.describe_table_index_stats(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -3201,7 +3192,7 @@ mod tests {
                 .unwrap();
 
             let request = InsertIntoTableRequest {
-                id: Some(table_id),
+                id: Some(table_id.clone()),
                 mode: Some("append".to_string()),
                 ..Default::default()
             };
@@ -3213,6 +3204,28 @@ mod tests {
 
             assert_eq!(response.num_inserted_rows, Some(3));
             assert_eq!(response.version, Some(2));
+
+            // The table now holds ids 1, 2, 3, 1, 2, 3.
+            let count = fixture
+                .namespace
+                .count_table_rows(CountTableRowsRequest {
+                    id: Some(table_id.clone()),
+                    predicate: Some("id > 1".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 4);
+
+            let stats = fixture
+                .namespace
+                .get_table_stats(GetTableStatsRequest {
+                    id: Some(table_id),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(stats.num_rows, 6);
         }
 
         // ============================================================================
@@ -3788,6 +3801,14 @@ mod tests {
                 .create("exp-tag", ("exp", Some(overlap_version)))
                 .await
                 .unwrap();
+            let tags = namespace
+                .list_table_tags(ListTableTagsRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(tags.tags["exp-tag"].branch.as_deref(), Some("exp"));
             let tag_open = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
                 .await
                 .unwrap()
@@ -4006,6 +4027,20 @@ mod tests {
                 vec!["id"],
                 "Index column should be 'id'"
             );
+
+            let stats = fixture
+                .namespace
+                .describe_table_index_stats(DescribeTableIndexStatsRequest {
+                    id: Some(vec![
+                        "index_test_ns".to_string(),
+                        "index_test_table".to_string(),
+                    ]),
+                    index_name: Some("id_idx".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(stats.num_indexed_rows, Some(3));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

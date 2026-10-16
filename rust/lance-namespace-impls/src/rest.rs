@@ -954,7 +954,8 @@ impl LanceNamespace for RestNamespace {
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/count_rows", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.get_json(&path, &query, "count_table_rows", &id).await
+        self.post_json(&path, &query, &request, "count_table_rows", &id)
+            .await
     }
 
     async fn create_table(
@@ -1543,7 +1544,8 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
-        self.get_json(&path, &query, "list_table_tags", &id).await
+        self.post_json(&path, &query, &request, "list_table_tags", &id)
+            .await
     }
 
     async fn get_table_tag_version(
