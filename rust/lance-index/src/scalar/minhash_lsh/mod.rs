@@ -97,13 +97,14 @@ use crate::scalar::registry::{
     VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    MetricsCollector, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchResult, UpdateCriteria,
+    AnyQuery, BatchRowIdRemapper, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader,
+    IndexStore, IndexWriter, MetricsCollector, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+    ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::vector::graph::OrderedFloat;
 use crate::{Index, IndexType};
 use crate::{pb, pbold};
+use lance_index_core::remapping::remap_row_ids_async;
 
 /// On-disk format version of the index files. The format is unstable; bump
 /// on any layout change instead of adding compatibility paths.
@@ -196,6 +197,27 @@ const MAX_NUM_BANDS: u32 = 256;
 /// them all small enough that no parameter combination can overflow or
 /// allocate unboundedly before validation runs.
 const MAX_NUM_HASHES: u32 = 4096;
+
+/// Brings stored row ids of a segment into the current address space of
+/// the deferred compactions it was opened with, in order, `None` for a row
+/// those compactions deleted (or excluded from this segment). A segment is
+/// opened with at most one of the two forms: the legacy synchronous
+/// remapper (v0 histories) or the batch remapper (tagged histories); with
+/// neither, every row id is its own.
+async fn translate_stored_row_ids(
+    row_ids: &[u64],
+    frag_reuse_index: Option<&dyn RowIdRemapper>,
+    batch_remapper: Option<&dyn BatchRowIdRemapper>,
+) -> Result<Vec<Option<u64>>> {
+    match (frag_reuse_index, batch_remapper) {
+        (Some(remapper), _) => Ok(row_ids
+            .iter()
+            .map(|&row_id| remapper.remap_row_id(row_id))
+            .collect()),
+        (None, Some(remapper)) => remap_row_ids_async(remapper, row_ids).await,
+        (None, None) => Ok(row_ids.iter().map(|&row_id| Some(row_id)).collect()),
+    }
+}
 
 /// Rows of `row_bytes` each that fit one IO batch.
 fn rows_per_batch(row_bytes: usize) -> usize {
@@ -879,6 +901,24 @@ impl ScalarIndexPlugin for MinHashLshIndexPlugin {
         Ok(
             MinHashLshIndex::load(index_store, index_details, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
+        )
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(
+            MinHashLshIndex::load_with_remapping(index_store, index_details, remapping, cache)
+                .await? as Arc<dyn ScalarIndex>,
         )
     }
 

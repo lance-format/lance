@@ -992,3 +992,113 @@ async fn test_oversized_merge_groups_stream_and_match_gather() {
         .unwrap();
     assert_eq!(bands(streamed, &rows).await, sorted_in_memory);
 }
+
+/// Batch remapper of a tagged history: fragment 0's rows moved to fragment
+/// 7 at the same offset, except every offset `1 mod 50`, which was deleted.
+#[derive(Debug)]
+struct MovedToFragment7;
+
+#[async_trait::async_trait]
+impl BatchRowIdRemapper for MovedToFragment7 {
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        Ok(row_ids
+            .iter()
+            .map(|&row_id| {
+                let address = lance_core::utils::address::RowAddress::from(row_id);
+                assert_eq!(address.fragment_id(), 0, "stored addresses only");
+                let offset = address.row_offset();
+                (offset % 50 != 1).then(|| fragment_7(offset))
+            })
+            .collect())
+    }
+}
+
+fn fragment_7(offset: u32) -> u64 {
+    u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+        7, offset,
+    ))
+}
+
+/// Load the index in `store` through `remapper`, holding `candidate_batch`
+/// candidates per level so a small corpus reaches the dense level walk
+/// (a level of more than `candidate_batch` plus a tenth of the segment).
+async fn load_remapped(
+    store: &Arc<LanceIndexStore>,
+    details: &prost_types::Any,
+    cache: &LanceCache,
+    remapper: Arc<dyn BatchRowIdRemapper>,
+    candidate_batch: usize,
+) -> Arc<MinHashLshIndex> {
+    let mut index =
+        MinHashLshIndex::load_with_remapping(store.clone(), details, Some(remapper), cache)
+            .await
+            .unwrap();
+    let bounds = Arc::get_mut(&mut index).unwrap();
+    bounds.candidate_batch = candidate_batch;
+    bounds.window_pages = 128;
+    index
+}
+
+#[tokio::test]
+async fn test_batch_remapper_translates_before_the_mask_on_every_read_path() {
+    // The dense corpus of test_overflowing_lower_level_is_continued: the
+    // near duplicate's copies come from the walked buckets, the text's
+    // level from the dense walk, resident chunks from the prewarmed cache.
+    let (bases, _) = near_duplicate_corpus(1, 60);
+    let mut words: Vec<&str> = bases[0].split(' ').collect();
+    words[59] = "zzz";
+    let near = words.join(" ");
+    let mut texts = vec![bases[0].as_str(); 200];
+    texts.extend(std::iter::repeat_n(near.as_str(), 200));
+    let (_tmpdir, store) = test_store();
+    let builder = default_builder().with_page_rows(8).unwrap();
+    let details = builder.params().details_any().unwrap();
+    builder
+        .train(text_stream(&rows_from(&texts), 64), store.as_ref())
+        .await
+        .unwrap();
+    let remapper: Arc<dyn BatchRowIdRemapper> = Arc::new(MovedToFragment7);
+    let cold_cache = LanceCache::no_cache();
+    let cold = load_remapped(&store, &details, &cold_cache, remapper.clone(), 32).await;
+    let warm_cache = LanceCache::with_capacity(64 << 20);
+    let warm = load_remapped(&store, &details, &warm_cache, remapper.clone(), 32).await;
+    warm.prewarm().await.unwrap();
+    let unbounded =
+        MinHashLshIndex::load_with_remapping(store.clone(), &details, Some(remapper), &cold_cache)
+            .await
+            .unwrap();
+    let live = |offsets: std::ops::Range<u32>| offsets.filter(|offset| offset % 50 != 1);
+
+    // Every path answers in destination addresses without the deleted rows:
+    // the near duplicate's copies, then the lowest surviving rows of the text.
+    let expected: Vec<u64> = live(200..400).chain(live(0..56)).map(fragment_7).collect();
+    assert_eq!(expected.len(), 250);
+    assert_eq!(ids(&search(&cold, &near, 250).await), expected);
+    let metrics = LocalMetricsCollector::default();
+    let first = search_with(&warm, &near, 250, &RowAddrMask::all_rows(), &metrics).await;
+    assert_eq!(ids(&first), expected);
+    assert!(
+        metrics.index_cache_hits() > 0,
+        "the prewarmed chunks are hit"
+    );
+    // Every chunk and page is resident, so the one part read is the dense
+    // walk's scan of the signature table.
+    assert_eq!(metrics.parts_loaded.load(Relaxed), 1);
+    assert_eq!(
+        search_with(&warm, &near, 250, &RowAddrMask::all_rows(), &metrics).await,
+        first
+    );
+    assert_eq!(ids(&search(&unbounded, &near, 250).await), expected);
+
+    // The mask selects destination addresses: half of the near duplicate's
+    // copies, then a slice of the text's level reached by the dense walk.
+    // Applied to the stored addresses it would select nothing.
+    for (allowed, expected) in [(200..300u32, 200..300u32), (100..150, 100..150)] {
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(allowed.map(fragment_7)));
+        let expected: Vec<u64> = live(expected).map(fragment_7).collect();
+        for index in [&cold, &warm, &unbounded] {
+            let hits = search_with(index, &near, 250, &mask, &NoOpMetricsCollector).await;
+            assert_eq!(ids(&hits), expected);
+        }
+    }
+}
