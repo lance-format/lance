@@ -7,6 +7,10 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[cfg(test)]
+#[path = "stop_word_filter/russian_tests.rs"]
+mod russian_tests;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
