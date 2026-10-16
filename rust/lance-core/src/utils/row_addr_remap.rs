@@ -50,6 +50,7 @@ use crate::deepsize::{Context, DeepSizeOf};
 use crate::utils::address::RowAddress;
 use crate::{Error, Result};
 use roaring::{RoaringBitmap, RoaringTreemap};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::size_of;
@@ -608,6 +609,12 @@ impl CompactRemapStep {
         let frag = (addr >> 32) as u32;
         // Not in any rewrite group -> unaffected by this remap.
         let old_frag = self.frags.get(&frag)?;
+        self.get_in(old_frag, addr)
+    }
+
+    // Always inlined, so `get` compiles as it did before the split.
+    #[inline(always)]
+    fn get_in(&self, old_frag: &OldFragmentRemap, addr: u64) -> Option<Option<u64>> {
         let offset = addr as u32;
         if old_frag
             .physical_rows
@@ -699,28 +706,102 @@ impl DeepSizeOf for RemapStep {
     }
 }
 
+/// Chains with at least this many steps also index their steps by fragment.
+const MIN_STEPS_TO_INDEX: usize = 32;
+
+/// An indexed lookup walks step by step when the next step naming the row's
+/// fragment is at most this many steps ahead: a short walk costs less than
+/// asking the index.
+const WALK_WITHIN_STEPS: usize = 3;
+
+/// A walk goes back to the index after this many steps in a row do not name the
+/// row's fragment.
+const WALK_UNTIL_IDLE_STEPS: usize = 8;
+
+/// Rows a batch remap over an indexed chain tracks at a time.
+const REMAP_BATCH_ROWS: usize = 1 << 16;
+
+/// For each fragment id, the steps that name it, in step order.
+///
+/// A step answers only for addresses in the fragments it names, so asking just
+/// these steps gives the same answer as asking every step in turn.
+#[derive(Clone)]
+struct FragmentSteps(IntMap<u32, Vec<u32>>);
+
+impl FragmentSteps {
+    fn new(steps: &[RemapStep]) -> Self {
+        let mut by_fragment = IntMap::<u32, Vec<u32>>::default();
+        // Most fragments are named by one step.
+        let mut add = |frag_id: u32, step: u32| {
+            by_fragment
+                .entry(frag_id)
+                .or_insert_with(|| Vec::with_capacity(1))
+                .push(step);
+        };
+        for (step, remap) in (0u32..).zip(steps) {
+            match remap {
+                RemapStep::Compact(compact) => {
+                    for &frag_id in compact.frags.keys() {
+                        add(frag_id, step);
+                    }
+                }
+                RemapStep::Direct(direct) => {
+                    let frag_ids = direct
+                        .keys()
+                        .map(|addr| (addr >> 32) as u32)
+                        .collect::<HashSet<_>>();
+                    for frag_id in frag_ids {
+                        add(frag_id, step);
+                    }
+                }
+            }
+        }
+        Self(by_fragment)
+    }
+}
+
+impl std::fmt::Debug for FragmentSteps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FragmentSteps({} fragments)", self.0.len())
+    }
+}
+
+impl DeepSizeOf for FragmentSteps {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.0.deep_size_of_children(context)
+    }
+}
+
 /// Compact remap backed by per-group rewritten row bitmaps + new-fragment layouts.
 ///
 /// Multiple remaps are retained as ordered private steps so a version chain
 /// does not require another public [`RowAddrRemap`] variant.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CompactRowAddrRemap {
     steps: Vec<RemapStep>,
+    /// `None` keeps short chains on the step-by-step path.
+    fragment_steps: Option<FragmentSteps>,
 }
+
+impl PartialEq for CompactRowAddrRemap {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps == other.steps
+    }
+}
+
+impl Eq for CompactRowAddrRemap {}
 
 impl CompactRowAddrRemap {
     fn new(groups: impl IntoIterator<Item = GroupInput>) -> Result<Self> {
-        Ok(Self {
-            steps: vec![RemapStep::Compact(CompactRemapStep::new(groups)?)],
-        })
+        Ok(Self::from_steps(vec![RemapStep::Compact(
+            CompactRemapStep::new(groups)?,
+        )]))
     }
 
     fn new_with_layout(groups: impl IntoIterator<Item = GroupInputWithLayout>) -> Result<Self> {
-        Ok(Self {
-            steps: vec![RemapStep::Compact(CompactRemapStep::new_with_layout(
-                groups,
-            )?)],
-        })
+        Ok(Self::from_steps(vec![RemapStep::Compact(
+            CompactRemapStep::new_with_layout(groups)?,
+        )]))
     }
 
     fn chained(remaps: Vec<RowAddrRemap>) -> Self {
@@ -731,11 +812,29 @@ impl CompactRowAddrRemap {
                 RowAddrRemap::Direct(direct) => steps.push(RemapStep::Direct(direct)),
             }
         }
-        Self { steps }
+        Self::from_steps(steps)
+    }
+
+    fn from_steps(steps: Vec<RemapStep>) -> Self {
+        let fragment_steps = (steps.len() >= MIN_STEPS_TO_INDEX
+            && u32::try_from(steps.len()).is_ok())
+        .then(|| FragmentSteps::new(&steps));
+        Self {
+            steps,
+            fragment_steps,
+        }
     }
 
     #[inline]
     pub fn get(&self, addr: u64) -> Option<Option<u64>> {
+        match &self.fragment_steps {
+            Some(fragment_steps) => self.get_by_fragment(fragment_steps, addr),
+            None => self.get_by_step(addr),
+        }
+    }
+
+    #[inline]
+    fn get_by_step(&self, addr: u64) -> Option<Option<u64>> {
         let mut current = addr;
         let mut was_affected = false;
         for step in &self.steps {
@@ -751,7 +850,74 @@ impl CompactRowAddrRemap {
         was_affected.then_some(Some(current))
     }
 
+    /// [`Self::get_by_step`], skipping the steps that do not name the fragment
+    /// the row is in.
+    // Out of line, so `get` stays small where it is inlined.
+    #[inline(never)]
+    fn get_by_fragment(&self, fragment_steps: &FragmentSteps, addr: u64) -> Option<Option<u64>> {
+        let mut current = addr;
+        let mut next_step = 0;
+        let mut was_affected = false;
+        while let Some(steps) = fragment_steps.0.get(&((current >> 32) as u32)) {
+            let first = steps.partition_point(|&step| (step as usize) < next_step);
+            let Some(&step) = steps.get(first) else {
+                break;
+            };
+            let step = step as usize;
+            if step - next_step <= WALK_WITHIN_STEPS {
+                let mut idle = 0;
+                for remap in &self.steps[next_step..] {
+                    next_step += 1;
+                    // `None` if the step does not name the row's fragment.
+                    let named = match remap {
+                        RemapStep::Compact(compact) => compact
+                            .frags
+                            .get(&((current >> 32) as u32))
+                            .map(|old_frag| compact.get_in(old_frag, current)),
+                        RemapStep::Direct(direct) => {
+                            direct.get(&current).map(|&answer| Some(answer))
+                        }
+                    };
+                    match named {
+                        None => {
+                            idle += 1;
+                            if idle == WALK_UNTIL_IDLE_STEPS {
+                                break;
+                            }
+                        }
+                        Some(answer) => {
+                            idle = 0;
+                            match answer {
+                                None => {}
+                                Some(None) => return Some(None),
+                                Some(Some(mapped)) => {
+                                    current = mapped;
+                                    was_affected = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            next_step = step + 1;
+            match self.steps[step].get(current) {
+                None => {}
+                Some(None) => return Some(None),
+                Some(Some(mapped)) => {
+                    current = mapped;
+                    was_affected = true;
+                }
+            }
+        }
+        was_affected.then_some(Some(current))
+    }
+
     fn remap_in_place(&self, row_addrs: &mut [Option<u64>]) {
+        if self.fragment_steps.is_some() {
+            self.remap_in_place_by_fragment(row_addrs);
+            return;
+        }
         for step in &self.steps {
             for row_addr in row_addrs.iter_mut() {
                 if let Some(addr) = *row_addr
@@ -760,6 +926,52 @@ impl CompactRowAddrRemap {
                     *row_addr = mapped;
                 }
             }
+        }
+    }
+
+    /// The step-major walk, with each step visiting only the rows in the
+    /// fragments it names. Rows go [`REMAP_BATCH_ROWS`] at a time, and no list
+    /// keeps more than about four times the rows it holds, so the scratch memory
+    /// is bounded by the rows of a pass, whatever the number of steps.
+    #[inline(never)]
+    fn remap_in_place_by_fragment(&self, row_addrs: &mut [Option<u64>]) {
+        let mut rows_by_fragment = IntMap::<u32, Vec<u32>>::default();
+        let mut moved = Vec::new();
+        for batch in row_addrs.chunks_mut(REMAP_BATCH_ROWS) {
+            add_rows(&mut rows_by_fragment, batch, 0..batch.len() as u32);
+            for step in &self.steps {
+                match step {
+                    RemapStep::Compact(compact)
+                        if compact.frags.len() <= rows_by_fragment.len() =>
+                    {
+                        for (&frag_id, old_frag) in &compact.frags {
+                            if let Entry::Occupied(mut rows) = rows_by_fragment.entry(frag_id) {
+                                apply_step(rows.get_mut(), batch, &mut moved, |addr| {
+                                    compact.get_in(old_frag, addr)
+                                });
+                                if rows.get().is_empty() {
+                                    rows.remove();
+                                }
+                            }
+                        }
+                    }
+                    RemapStep::Compact(compact) => rows_by_fragment.retain(|frag_id, rows| {
+                        if let Some(old_frag) = compact.frags.get(frag_id) {
+                            apply_step(rows, batch, &mut moved, |addr| {
+                                compact.get_in(old_frag, addr)
+                            });
+                        }
+                        !rows.is_empty()
+                    }),
+                    RemapStep::Direct(direct) => rows_by_fragment.retain(|_, rows| {
+                        apply_step(rows, batch, &mut moved, |addr| direct.get(&addr).copied());
+                        !rows.is_empty()
+                    }),
+                }
+                // Rows join their new fragments after the step, so no step applies twice.
+                add_rows(&mut rows_by_fragment, batch, moved.drain(..));
+            }
+            rows_by_fragment.clear();
         }
     }
 
@@ -786,16 +998,75 @@ impl CompactRowAddrRemap {
     }
 }
 
+/// Hash once per run of rows in the same fragment.
+fn add_rows(
+    rows_by_fragment: &mut IntMap<u32, Vec<u32>>,
+    row_addrs: &[Option<u64>],
+    positions: impl Iterator<Item = u32>,
+) {
+    let mut rows = positions
+        .filter_map(|position| Some((position, (row_addrs[position as usize]? >> 32) as u32)))
+        .peekable();
+    while let Some((position, frag_id)) = rows.next() {
+        let list = rows_by_fragment.entry(frag_id).or_default();
+        list.push(position);
+        while let Some((position, _)) = rows.next_if(|&(_, next)| next == frag_id) {
+            list.push(position);
+        }
+    }
+}
+
+fn apply_step(
+    positions: &mut Vec<u32>,
+    row_addrs: &mut [Option<u64>],
+    moved: &mut Vec<u32>,
+    get: impl Fn(u64) -> Option<Option<u64>>,
+) {
+    positions.retain(|&position| {
+        let row_addr = &mut row_addrs[position as usize];
+        let Some(addr) = *row_addr else {
+            return false;
+        };
+        match get(addr) {
+            None => true,
+            Some(mapped) => {
+                *row_addr = mapped;
+                if mapped.is_some() {
+                    moved.push(position);
+                }
+                false
+            }
+        }
+    });
+    // Release excess capacity so mostly emptied lists do not accumulate per step.
+    if positions.len() < positions.capacity() / 4 {
+        shrink(positions);
+    }
+}
+
+/// Out of line: inlined, it slowed the batch loops.
+#[cold]
+#[inline(never)]
+fn shrink(positions: &mut Vec<u32>) {
+    // Copy instead of shrink_to_fit: in-place shrinking caused glibc RSS growth
+    // by leaving block remainders unusable for later lists.
+    *positions = positions.to_vec();
+}
+
 impl DeepSizeOf for CompactRowAddrRemap {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.steps.deep_size_of_children(context)
+            + self.fragment_steps.deep_size_of_children(context)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::ProptestConfig;
+    use proptest::test_runner::TestCaseResult;
     use proptest::{prop_assert, prop_assert_eq};
+    use std::ops::Range;
 
     fn addr(frag: u32, offset: u32) -> u64 {
         u64::from(RowAddress::new_from_parts(frag, offset))
@@ -1227,6 +1498,455 @@ mod tests {
             forward.fully_deleted_fragments(),
             reverse.fully_deleted_fragments()
         );
+    }
+
+    fn rewrite(old: &[(u32, u32)], deleted: &[u64], new_id: u32) -> RowAddrRemap {
+        let rewritten = old
+            .iter()
+            .flat_map(|&(frag, rows)| (0..rows).map(move |offset| addr(frag, offset)))
+            .filter(|old_addr| !deleted.contains(old_addr))
+            .collect::<RoaringTreemap>();
+        let rows = rewritten.len() as u32;
+        RowAddrRemap::compact_with_layout([GroupInputWithLayout {
+            rewritten_old_row_addrs: rewritten,
+            old_frags: old.to_vec(),
+            new_frags: if rows == 0 {
+                vec![]
+            } else {
+                vec![(new_id, rows)]
+            },
+        }])
+        .unwrap()
+    }
+
+    fn compact_chain(remap: &RowAddrRemap) -> &CompactRowAddrRemap {
+        let RowAddrRemap::Compact(chain) = remap else {
+            panic!("expected a chain");
+        };
+        chain
+    }
+
+    #[test]
+    fn test_indexed_chain_matches_step_by_step() {
+        let steps = vec![
+            // Fragment 5 has 4 rows here and 8 rows when named again below, so
+            // (5, 6) is out of range for this step and moves at the later one.
+            rewrite(&[(5, 4)], &[], 20),
+            rewrite(&[(30, 3)], &[], 30),
+            rewrite(&[(30, 3)], &[], 31),
+            rewrite(&[(40, 4)], &[addr(40, 2)], 41),
+            rewrite(&[(41, 3)], &[addr(41, 0)], 42),
+            rewrite(&[(50, 2), (55, 1)], &[], 51),
+            rewrite(&[(51, 3)], &[], 52),
+            rewrite(&[(52, 3)], &[addr(52, 2)], 53),
+            RowAddrRemap::direct(HashMap::from([
+                (addr(60, 0), Some(addr(61, 5))),
+                (addr(60, 1), None),
+            ])),
+            rewrite(&[(5, 8)], &[addr(5, 7)], 21),
+            rewrite(&[(61, 6)], &[addr(61, 0)], 62),
+            rewrite(&[(53, 2)], &[], 54),
+            // Steps writing into one of their own sources: rows from the other
+            // source land inside its old range, and the step must not move them
+            // again.
+            rewrite(&[(71, 2), (70, 2)], &[], 70),
+            rewrite(&[(81, 2), (80, 2)], &[], 80),
+        ];
+        let expected = [
+            (addr(5, 2), Some(Some(addr(20, 2)))),
+            (addr(5, 6), Some(Some(addr(21, 6)))),
+            (addr(5, 7), Some(None)),
+            (addr(5, 8), None),
+            (addr(30, 1), Some(Some(addr(31, 1)))),
+            (addr(40, 0), Some(None)),
+            (addr(40, 1), Some(Some(addr(42, 0)))),
+            (addr(40, 2), Some(None)),
+            (addr(50, 1), Some(Some(addr(54, 1)))),
+            (addr(55, 0), Some(None)),
+            (addr(51, 2), Some(None)),
+            (addr(60, 0), Some(Some(addr(62, 4)))),
+            (addr(60, 1), Some(None)),
+            (addr(60, 2), None),
+            (addr(70, 0), Some(Some(addr(70, 2)))),
+            (addr(71, 1), Some(Some(addr(70, 1)))),
+            (addr(80, 1), Some(Some(addr(80, 3)))),
+            (addr(81, 0), Some(Some(addr(80, 0)))),
+            (addr(999, 0), None),
+        ];
+
+        // Unrelated steps before and after, to cross the threshold.
+        let pad = |k: u32| rewrite(&[(1_000 + k, 1)], &[], 2_000 + k);
+        let half = MIN_STEPS_TO_INDEX as u32 / 2;
+        let padded = (0..half)
+            .map(pad)
+            .chain(steps.iter().cloned())
+            .chain((half..2 * half).map(pad))
+            .collect::<Vec<_>>();
+
+        let short = RowAddrRemap::chained(steps);
+        let long = RowAddrRemap::chained(padded);
+        assert!(compact_chain(&short).fragment_steps.is_none());
+        assert!(compact_chain(&long).fragment_steps.is_some());
+        for chain in [&short, &long] {
+            for &(old_addr, answer) in &expected {
+                assert_eq!(chain.get(old_addr), answer, "address {old_addr:#x}");
+            }
+            let mut batch = expected
+                .iter()
+                .map(|&(old_addr, _)| Some(old_addr))
+                .chain([None])
+                .collect::<Vec<_>>();
+            chain.remap_in_place(&mut batch);
+            let remapped = expected
+                .iter()
+                .map(|&(old_addr, answer)| answer.unwrap_or(Some(old_addr)))
+                .chain([None])
+                .collect::<Vec<_>>();
+            assert_eq!(batch, remapped);
+        }
+    }
+
+    #[test]
+    fn test_batch_remap_spanning_several_passes_matches_step_by_step() {
+        let mut rows = 4u32;
+        let steps = (0..MIN_STEPS_TO_INDEX as u32 + 8)
+            .map(|k| {
+                let deleted = if k % 10 == 9 {
+                    vec![addr(k, 0)]
+                } else {
+                    vec![]
+                };
+                let step = rewrite(&[(k, rows)], &deleted, k + 1);
+                rows -= deleted.len() as u32;
+                step
+            })
+            .collect::<Vec<_>>();
+        let chain = RowAddrRemap::chained(steps.clone());
+        assert!(compact_chain(&chain).fragment_steps.is_some());
+
+        let mut batch = (0..2 * REMAP_BATCH_ROWS + 5)
+            .map(|i| (i % 1_000 != 999).then(|| addr((i % 7) as u32 * 5, (i % 5) as u32)))
+            .collect::<Vec<_>>();
+        let step_by_step = |old_addr: u64| {
+            steps
+                .iter()
+                .try_fold(old_addr, |current, step| match step.get(current) {
+                    None => Some(current),
+                    Some(mapped) => mapped,
+                })
+        };
+        let answers = batch
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|old_addr| (old_addr, step_by_step(old_addr)))
+            .collect::<HashMap<_, _>>();
+        for (&old_addr, &answer) in &answers {
+            assert_eq!(
+                chain.get(old_addr).unwrap_or(Some(old_addr)),
+                answer,
+                "address {old_addr:#x}"
+            );
+        }
+        let expected = batch
+            .iter()
+            .map(|row_addr| row_addr.and_then(|old_addr| answers[&old_addr]))
+            .collect::<Vec<_>>();
+        chain.remap_in_place(&mut batch);
+        assert_eq!(batch, expected);
+    }
+
+    #[test]
+    fn test_fragment_index_size_is_its_map_and_lists() {
+        let RowAddrRemap::Compact(indexed) =
+            RowAddrRemap::chained((0..MIN_STEPS_TO_INDEX as u32 + 4).map(|k| {
+                rewrite(
+                    &[(2 * k, 64), (2 * k + 1, 64)],
+                    &[addr(2 * k, 3)],
+                    1_000 + k,
+                )
+            }))
+        else {
+            panic!("expected a chain");
+        };
+        let index = indexed.fragment_steps.as_ref().unwrap();
+        let index_bytes = index.0.capacity() * (size_of::<u32>() + size_of::<Vec<u32>>() + 1)
+            + index
+                .0
+                .values()
+                .map(|steps| steps.capacity() * size_of::<u32>())
+                .sum::<usize>();
+        let indexed_bytes = indexed.deep_size_of();
+        let unindexed = CompactRowAddrRemap {
+            steps: indexed.steps.clone(),
+            fragment_steps: None,
+        };
+        assert_eq!(indexed, unindexed);
+
+        // The same steps, not clones, whose vectors would have other capacities.
+        let unindexed = CompactRowAddrRemap {
+            steps: indexed.steps,
+            fragment_steps: None,
+        };
+        assert_eq!(indexed_bytes, unindexed.deep_size_of() + index_bytes);
+    }
+
+    /// splitmix64, so a failing history can be rebuilt from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) % n
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    type GeneratedStep = (RowAddrRemap, HashMap<u64, Option<u64>>);
+
+    /// Histories include deletions, multiple rewrite groups, reused fragment ids,
+    /// and direct steps. Materialized maps provide an independent oracle.
+    fn random_history(seed: u64, num_steps: usize) -> (Vec<GeneratedStep>, Vec<(u32, u32)>) {
+        let mut rng = Rng(seed);
+        let mut live = (0..6u32)
+            .map(|id| {
+                let rows = 1 + rng.below(10) as u32;
+                (id, rows, vec![true; rows as usize])
+            })
+            .collect::<Vec<_>>();
+        let mut seen = live
+            .iter()
+            .map(|(id, rows, _)| (*id, *rows))
+            .collect::<Vec<_>>();
+        let mut retired = Vec::new();
+        let mut next_id = 100u32;
+        let mut steps = Vec::new();
+        for _ in 0..num_steps {
+            for (_, _, alive) in live.iter_mut() {
+                for row in alive.iter_mut() {
+                    *row &= !rng.chance(10);
+                }
+            }
+            let mut groups = Vec::new();
+            let mut map = HashMap::new();
+            let mut created = Vec::new();
+            let mut written = Vec::new();
+            for _ in 0..1 + rng.below(2) {
+                if live.is_empty() {
+                    break;
+                }
+                let sources = (0..1 + rng.below(3).min(live.len() as u64 - 1))
+                    .map(|_| live.swap_remove(rng.below(live.len() as u64) as usize))
+                    .collect::<Vec<_>>();
+                let read_order = sources
+                    .iter()
+                    .flat_map(|(id, rows, alive)| {
+                        (0..*rows)
+                            .filter(move |offset| alive[*offset as usize])
+                            .map(move |offset| addr(*id, offset))
+                    })
+                    .collect::<Vec<_>>();
+                let mut new_frags: Vec<(u32, u32)> = Vec::new();
+                let mut remaining = read_order.len() as u32;
+                while remaining > 0 {
+                    let rows = if remaining > 1 && rng.chance(30) {
+                        1 + rng.below(u64::from(remaining - 1)) as u32
+                    } else {
+                        remaining
+                    };
+                    let own = sources
+                        .iter()
+                        .map(|(id, _, _)| *id)
+                        .filter(|id| !created.contains(id))
+                        .collect::<Vec<_>>();
+                    let old = retired
+                        .iter()
+                        .copied()
+                        .filter(|id| !created.contains(id))
+                        .collect::<Vec<_>>();
+                    let id = match rng.below(100) {
+                        0..20 if !own.is_empty() => own[rng.below(own.len() as u64) as usize],
+                        20..35 if !old.is_empty() => old[rng.below(old.len() as u64) as usize],
+                        _ => {
+                            next_id += 1;
+                            next_id
+                        }
+                    };
+                    created.push(id);
+                    new_frags.push((id, rows));
+                    remaining -= rows;
+                }
+                let new_addrs = new_frags
+                    .iter()
+                    .flat_map(|&(id, rows)| (0..rows).map(move |offset| addr(id, offset)));
+                for (old_addr, new_addr) in read_order.iter().zip(new_addrs) {
+                    map.insert(*old_addr, Some(new_addr));
+                }
+                for (id, rows, _) in &sources {
+                    for offset in 0..*rows {
+                        map.entry(addr(*id, offset)).or_insert(None);
+                    }
+                }
+                groups.push(GroupInputWithLayout {
+                    rewritten_old_row_addrs: read_order.iter().copied().collect(),
+                    old_frags: sources.iter().map(|(id, rows, _)| (*id, *rows)).collect(),
+                    new_frags: new_frags.clone(),
+                });
+                retired.extend(sources.iter().map(|(id, _, _)| *id));
+                written.extend(new_frags);
+            }
+            retired.retain(|id| !created.contains(id));
+            for (id, rows) in written {
+                live.push((id, rows, vec![true; rows as usize]));
+                seen.push((id, rows));
+            }
+            let remap = if rng.chance(10) {
+                RowAddrRemap::direct(map.clone())
+            } else {
+                RowAddrRemap::compact_with_layout(groups).unwrap()
+            };
+            steps.push((remap, map));
+        }
+        (steps, seen)
+    }
+
+    // History lengths split three ways, so each property test stays short; together
+    // they cover chains on both sides of the indexing threshold.
+    const SHORT_CHAINS: Range<usize> = 0..MIN_STEPS_TO_INDEX;
+    const INDEXED_CHAINS: Range<usize> = MIN_STEPS_TO_INDEX..MIN_STEPS_TO_INDEX + 20;
+    const LONG_INDEXED_CHAINS: Range<usize> = MIN_STEPS_TO_INDEX + 20..2 * MIN_STEPS_TO_INDEX + 8;
+
+    /// The share of the default case budget for histories of `num_steps` steps,
+    /// in proportion to the range's width. `PROPTEST_CASES`, when set, applies to
+    /// each test in full.
+    fn cases_for(num_steps: Range<usize>) -> ProptestConfig {
+        let cases = ProptestConfig::default().cases as usize * num_steps.len();
+        ProptestConfig::with_cases(cases.div_ceil(LONG_INDEXED_CHAINS.end) as u32)
+    }
+
+    fn check_chain_matches_materialized_steps(
+        seed: u64,
+        num_steps: usize,
+        splits: Vec<usize>,
+    ) -> TestCaseResult {
+        let (steps, seen) = random_history(seed, num_steps);
+        let reference = |old_addr: u64| {
+            let mut current = old_addr;
+            let mut was_affected = false;
+            for (_, map) in &steps {
+                match map.get(&current) {
+                    None => {}
+                    Some(None) => return Some(None),
+                    Some(Some(mapped)) => {
+                        current = *mapped;
+                        was_affected = true;
+                    }
+                }
+            }
+            was_affected.then_some(Some(current))
+        };
+
+        let flat = RowAddrRemap::chained(steps.iter().map(|(remap, _)| remap.clone()));
+        let mut bounds = splits
+            .into_iter()
+            .filter(|&at| at < steps.len())
+            .collect::<Vec<_>>();
+        bounds.extend([0, steps.len()]);
+        bounds.sort_unstable();
+        let nested = RowAddrRemap::chained(bounds.windows(2).map(|piece| {
+            RowAddrRemap::chained(
+                steps[piece[0]..piece[1]]
+                    .iter()
+                    .map(|(remap, _)| remap.clone()),
+            )
+        }));
+        if let RowAddrRemap::Compact(chain) = &flat {
+            prop_assert_eq!(
+                chain.fragment_steps.is_some(),
+                chain.steps.len() >= MIN_STEPS_TO_INDEX
+            );
+        }
+
+        let mut queries = seen
+            .iter()
+            .flat_map(|&(id, rows)| (0..rows + 2).map(move |offset| addr(id, offset)))
+            .collect::<Vec<_>>();
+        queries.extend([addr(99, 0), addr(0xFFFF_FFF0, 3)]);
+        let expected = queries.iter().map(|&a| reference(a)).collect::<Vec<_>>();
+        for remap in [&flat, &nested] {
+            for (&old_addr, answer) in queries.iter().zip(&expected) {
+                prop_assert_eq!(
+                    remap.get(old_addr),
+                    *answer,
+                    "address {:#x}, seed {}",
+                    old_addr,
+                    seed
+                );
+            }
+            for reversed in [false, true] {
+                let mut batch = Vec::new();
+                let mut remapped = Vec::new();
+                for (i, (&old_addr, answer)) in queries.iter().zip(&expected).enumerate() {
+                    if i % 7 == 0 {
+                        batch.push(None);
+                        remapped.push(None);
+                    }
+                    batch.push(Some(old_addr));
+                    remapped.push(answer.unwrap_or(Some(old_addr)));
+                }
+                if reversed {
+                    batch.reverse();
+                    remapped.reverse();
+                }
+                remap.remap_in_place(&mut batch);
+                prop_assert_eq!(&batch, &remapped, "seed {}", seed);
+            }
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(cases_for(SHORT_CHAINS))]
+        #[test]
+        fn test_short_chain_matches_materialized_steps(
+            seed in proptest::num::u64::ANY,
+            num_steps in SHORT_CHAINS,
+            splits in proptest::collection::vec(0..LONG_INDEXED_CHAINS.end, 0..3),
+        ) {
+            check_chain_matches_materialized_steps(seed, num_steps, splits)?;
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(cases_for(INDEXED_CHAINS))]
+        #[test]
+        fn test_indexed_chain_matches_materialized_steps(
+            seed in proptest::num::u64::ANY,
+            num_steps in INDEXED_CHAINS,
+            splits in proptest::collection::vec(0..LONG_INDEXED_CHAINS.end, 0..3),
+        ) {
+            check_chain_matches_materialized_steps(seed, num_steps, splits)?;
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(cases_for(LONG_INDEXED_CHAINS))]
+        #[test]
+        fn test_long_indexed_chain_matches_materialized_steps(
+            seed in proptest::num::u64::ANY,
+            num_steps in LONG_INDEXED_CHAINS,
+            splits in proptest::collection::vec(0..LONG_INDEXED_CHAINS.end, 0..3),
+        ) {
+            check_chain_matches_materialized_steps(seed, num_steps, splits)?;
+        }
     }
 
     proptest::proptest! {
