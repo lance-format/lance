@@ -2453,7 +2453,10 @@ mod tests {
     use lance_core::{ArrowResult, datatypes::Schema};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::{
-        constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE},
+        constants::{
+            STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+            STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
+        },
         decoder::{
             DecodeBatchScheduler, DecoderPlugins, EncodedBatchLayout, FilterExpression,
             PageEncoding, ReadBatchTask, decode_batch,
@@ -2481,6 +2484,74 @@ mod tests {
             u16::from_le_bytes([bytes[version_start], bytes[version_start + 1]]),
             u16::from_le_bytes([bytes[version_start + 2], bytes[version_start + 3]]),
         )
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fsl_struct_with_list_first_returns_not_supported(
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        // The struct retains its first child's repdef, so a list must come before
+        // the primitive sibling to reach fixed-size-list decimation with repetition levels.
+        let struct_fields = Fields::from(vec![
+            Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]);
+        let data_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+            2,
+        );
+        let data = gen_batch()
+            .col(
+                "items",
+                array::rand_type(&data_type).with_metadata(HashMap::from([(
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    structural_encoding.to_string(),
+                )])),
+            )
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let fs = FsFixture::default();
+        write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let err = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                8,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "expected NotSupported, got: {err}"
+        );
+        assert!(err.to_string().contains("fixed-size-list dimension 2"));
+        assert!(err.to_string().contains("repetition levels"));
     }
 
     #[rstest::rstest]

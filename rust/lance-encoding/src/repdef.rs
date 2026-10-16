@@ -1920,6 +1920,9 @@ impl RepDefUnraveler {
     /// layer has a single definition level per slot (all `dimension` items in a
     /// slot share it) so we keep every `dimension`-th level and drop the rest.
     ///
+    /// Dense repetition levels at this layer are not supported and return
+    /// [`Error::NotSupported`].
+    ///
     /// `dimension` must be non-zero.  A zero dimension can only come from a
     /// malformed schema (writers reject it, see
     /// [`lance_core::datatypes::validate_fixed_size_list_dimensions`]) and is
@@ -1934,18 +1937,9 @@ impl RepDefUnraveler {
             return sparse.decimate(dimension);
         }
         if self.rep_levels.is_some() {
-            // If we need to support this then I think we need to walk through the rep def levels to find
-            // the spots at which we keep.  E.g. if we have:
-            //  rep: 1 0 0 1 0 1 0 0 0 1 0 0
-            //  def: 1 1 1 0 1 0 1 1 0 1 1 0
-            //  dimension: 2
-            //
-            // The output should be:
-            //  rep: 1 0 0 1 0 0 0
-            //  def: 1 1 1 0 1 1 0
-            //
-            // Maybe there's some special logic for empty/null lists?  I'll save the headache for future me.
-            todo!("Not yet supported FSL<...List<...>>");
+            return Err(Error::not_supported(format!(
+                "Decoding fixed-size-list dimension {dimension} with repetition levels is not supported by the dense structural decoder"
+            )));
         }
         let Some(def_levels) = self.def_levels.as_mut() else {
             return Ok(());
@@ -3144,6 +3138,30 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[rstest::rstest]
+    #[case::repetition_only(None)]
+    #[case::repetition_and_definition(Some(vec![0, 0, 1, 1]))]
+    fn test_repdef_fsl_with_repetition_is_not_supported(#[case] def_levels: Option<Vec<u16>>) {
+        let mut unraveler = RepDefUnraveler::new(
+            Some(vec![1, 0, 1, 0]),
+            def_levels,
+            vec![
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::AllValidList,
+            ]
+            .into(),
+            4,
+        );
+
+        let err = unraveler.decimate(2).unwrap_err();
+        assert!(matches!(err, lance_core::Error::NotSupported { .. }));
+        assert!(
+            err.to_string().contains("fixed-size-list dimension 2"),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("repetition levels"));
     }
 
     #[test]
