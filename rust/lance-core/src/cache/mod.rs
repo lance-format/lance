@@ -348,6 +348,18 @@ impl LanceCache {
         self.state.backend.capacity_bytes()
     }
 
+    /// Largest admissible RAM entry, if reported by the backend. An admitted
+    /// entry remains subject to ordinary cache eviction.
+    ///
+    /// ```
+    /// use lance_core::cache::LanceCache;
+    /// let cache = LanceCache::with_capacity(1024);
+    /// assert_eq!(cache.max_entry_bytes(), Some(1024));
+    /// ```
+    pub fn max_entry_bytes(&self) -> Option<u64> {
+        self.state.backend.max_entry_bytes()
+    }
+
     // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {

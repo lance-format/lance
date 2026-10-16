@@ -2535,6 +2535,14 @@ fn build_frag_reuse_mapping(
 impl QuantizerStorage for RabitQuantizationStorage {
     type Metadata = RabitQuantizationMetadata;
 
+    fn try_from_sign_plane_for_full(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+    ) -> Result<Self> {
+        Self::try_from_sign_plane_for_full(batch, metadata, distance_type)
+    }
+
     fn try_from_batch(
         batch: RecordBatch,
         metadata: &Self::Metadata,

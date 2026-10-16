@@ -330,6 +330,10 @@ impl CacheBackend for QuickCacheBackend {
         Some(self.capacity)
     }
 
+    fn max_entry_bytes(&self) -> Option<u64> {
+        Some((self.capacity / self.cache.num_shards()) as u64)
+    }
+
     fn approx_num_entries(&self) -> usize {
         self.cache.len()
             + self
@@ -598,6 +602,13 @@ mod tests {
             QuickCacheBackend::with_capacity(1 << 20).capacity_bytes(),
             Some(1 << 20)
         );
+        for capacity in [0, 1 << 20, 16 << 30] {
+            let backend = QuickCacheBackend::with_capacity(capacity);
+            assert_eq!(
+                backend.max_entry_bytes(),
+                Some((capacity / backend.cache.num_shards()) as u64)
+            );
+        }
     }
 
     fn keys_in_shard(

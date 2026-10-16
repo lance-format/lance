@@ -21,8 +21,13 @@ pub mod builder;
 pub(crate) mod dist_table_quant;
 pub mod ex_dot;
 pub(crate) mod pairwise;
+pub mod partition_codes;
+mod plane_cache;
+pub mod planes;
 pub mod prune;
+pub(crate) mod resident;
 pub mod rotation;
+pub mod scan_stats;
 pub mod storage;
 pub mod transform;
 

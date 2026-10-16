@@ -50,7 +50,10 @@ use lance_index::prefilter::NoFilter;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
+use lance_index::vector::bq::partition_codes::PartitionCodesKey;
+use lance_index::vector::bq::planes::EntryColumns;
 use lance_index::vector::bq::rabit_ex_bits;
+use lance_index::vector::bq::scan_stats;
 use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
@@ -62,8 +65,11 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext,
-    VectorStore,
+    IndexFileKey, OriginLatencyClass, QueryResidual, QueryScratch, QueryScratchCapacity,
+    QueryScratchPool, RabitRawQueryContext, ResidentAttach, ResidentColumns,
+    ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
+    origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
+    resident_store_fits, shares_resident_store,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -646,6 +652,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<ResolvedRemapping>,
+        context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>>;
 }
 
@@ -822,6 +829,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
         frag_reuse_index: Option<ResolvedRemapping>,
+        context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>> {
         Box::pin(async move {
             match self.sub_index_type {
@@ -832,6 +840,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         file_metadata_cache,
                         index_cache,
                         frag_reuse_index,
+                        context,
                     )
                     .await
                 }
@@ -842,6 +851,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         file_metadata_cache,
                         index_cache,
                         frag_reuse_index,
+                        context,
                     )
                     .await
                 }
@@ -918,6 +928,13 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub storage: Q::Storage,
     partition_rows: OnceLock<Arc<RowAddrTreeMap>>,
     partition_rows_accounted: AtomicBool,
+    /// Whether [`IVFIndex::cache_partition_rows`] may cache the entry whole.
+    /// An entry built for one read, from a code-only entry or of a native
+    /// partition's planes, sets it false: its resident columns may be views
+    /// of the resident store, charged their rows' bytes (which the store's
+    /// cache entry already charges) yet keeping the whole store column
+    /// alive, so such an entry must never be cached.
+    cache_whole_partition: bool,
     /// Memoized size of the immutable parts (this struct, the sub-index and the
     /// quantized storage): every query that prepares this partition needs its
     /// size to budget scoring chunks, and the walk over the storage's arrays
@@ -938,6 +955,7 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             storage,
             partition_rows: OnceLock::new(),
             partition_rows_accounted: AtomicBool::new(false),
+            cache_whole_partition: true,
             immutable_bytes: OnceLock::new(),
             coverage_bytes: OnceLock::new(),
         }
@@ -954,6 +972,15 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
                 + self.storage.deep_size_of_children(&mut context)
         });
         immutable + self.coverage_bytes.get().copied().unwrap_or_default()
+    }
+
+    /// Whether the entry's storage holds memory of a resident store, which
+    /// no cached entry may (see [`shares_resident_store`]); the loaders of
+    /// partition entries check it in debug builds.
+    fn shares_resident_store(&self) -> bool {
+        self.storage
+            .to_batches()
+            .is_ok_and(|mut batches| batches.any(|batch| shares_resident_store(&batch)))
     }
 
     fn partition_rows(&self) -> Arc<RowAddrTreeMap> {
@@ -1034,6 +1061,62 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     }
 }
 
+/// What the session opening an IVF index declares about it, passed to
+/// [`IVFIndex::try_new`] and to the reconstruction from a cached
+/// [`IvfIndexState`]. The default declares nothing and charges no cache.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IvfOpenContext {
+    /// The origin latency class the session declares for the IVF_RQ indexes
+    /// it opens (`Session::index_origin_latency`), `None` when it declares
+    /// none; see [`IVFIndex::origin_latency_at_open`].
+    pub(crate) origin_latency_hint: Option<OriginLatencyClass>,
+    /// Whether the session keeps the small columns of the IVF_RQ indexes it
+    /// opens resident (`Session::index_resident_columns`), `auto` unless it
+    /// sets one; `LANCE_RQ_RESIDENT_COLUMNS` set to `on` or `off` overrides
+    /// it. See [`IVFIndex::resident_columns_at_open`].
+    pub(crate) resident_columns: ResidentColumnsSetting,
+    /// The index's namespace of the index cache without a fragment reuse
+    /// segment, where an IVF_RQ index with resident small columns charges
+    /// their store (see [`ResidentColumns::in_index_cache`]), so
+    /// that a new fragment reuse index keeps the store. `None` keeps the
+    /// store charged nowhere, shared with the file's other live indexes.
+    pub(crate) file_cache: Option<LanceCache>,
+    /// A strong reference acquired before opening the index can evict the
+    /// cached store. Dropped if the index does not use resident columns.
+    pub(crate) resident_columns_handle: Option<ResidentColumns>,
+}
+
+/// The key of the auxiliary (storage) file of index `uuid` in `index_dir`
+/// on `object_store`, which IVF_RQ runtime handles, the resident store and
+/// the lazy scan's far gather pools, are shared by.
+pub(crate) fn aux_file_key(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    uuid: &Uuid,
+) -> IndexFileKey {
+    let uuid = uuid.to_string();
+    let aux_path = index_dir
+        .clone()
+        .join(uuid.as_str())
+        .join(INDEX_AUXILIARY_FILE_NAME);
+    IndexFileKey::new(&uuid, &object_store.store_prefix, aux_path.as_ref())
+}
+
+/// Warn, once per process, that `LANCE_RQ_RESIDENT_COLUMNS=on` keeps a
+/// resident store that the index cache charges `charge` bytes for, more than
+/// its largest admissible entry, `max_entry_bytes`. Index handles keep this
+/// allocation alive independently of cache capacity.
+fn warn_resident_store_oversize(charge: u64, max_entry_bytes: Option<u64>) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "LANCE_RQ_RESIDENT_COLUMNS=on keeps a resident store the index cache charges \
+             {charge} bytes for, exceeding its {max_entry_bytes:?} byte entry limit; \
+             live index handles retain this memory outside the cache"
+        );
+    });
+}
+
 /// IVF Index.
 #[derive(Debug)]
 pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
@@ -1071,7 +1154,9 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     prepared_partitions: Arc<PreparedPartitionTracker>,
-
+    /// Latency class of reads from the index's files, resolved when the
+    /// index opens; the storage carries the same class.
+    origin_latency: OriginLatencyClass,
     _marker: PhantomData<(S, Q)>,
 }
 
@@ -1112,7 +1197,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition: &Arc<PartitionEntry<S, Q>>,
     ) -> Result<Arc<RowAddrTreeMap>> {
         let rows = partition.partition_rows();
-        if !partition.partition_rows_accounted.load(Ordering::Acquire) {
+        if partition.cache_whole_partition
+            && !partition.partition_rows_accounted.load(Ordering::Acquire)
+        {
+            debug_assert!(
+                !partition.shares_resident_store(),
+                "partition {partition_id} would be cached with memory of a resident store"
+            );
             let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
             if index_cache
                 .insert_with_key(&cache_key, partition.clone())
@@ -1519,6 +1610,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Create a new IVF index.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
         index_dir: Path,
@@ -1527,12 +1619,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
         file_sizes: HashMap<String, u64>,
+        context: IvfOpenContext,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
+        let origin_latency =
+            Self::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
+        let uuid_str = uuid.to_string();
+        let aux_path = index_dir
+            .clone()
+            .join(uuid_str.as_str())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let index_file = aux_file_key(&object_store, &index_dir, &uuid);
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
-        let uuid_str = uuid.to_string();
         let uri = index_dir
             .clone()
             .join(uuid_str.as_str())
@@ -1581,15 +1681,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .map(|&size| CachedFileSize::new(size))
             .unwrap_or_else(CachedFileSize::unknown);
         let storage_reader = FileReader::try_open(
-            scheduler
-                .open_file(
-                    &index_dir
-                        .clone()
-                        .join(uuid_str.as_str())
-                        .join(INDEX_AUXILIARY_FILE_NAME),
-                    &aux_cached_size,
-                )
-                .await?,
+            scheduler.open_file(&aux_path, &aux_cached_size).await?,
             None,
             Arc::<DecoderPlugins>::default(),
             file_metadata_cache,
@@ -1612,6 +1704,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?
             }
         };
+        let resident_columns = Self::resident_columns_at_open(
+            &storage,
+            context.file_cache.as_ref(),
+            context.resident_columns,
+        )?;
+        let resident_store =
+            Self::resident_store_at_open(resident_columns, &index_file, context).await?;
+        let storage = storage
+            .with_origin_latency(origin_latency)
+            .with_resident_columns(resident_store)
+            .with_resident_columns_enabled(resident_columns)
+            .with_entry_columns(Self::entry_columns_at_open()?);
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
@@ -1619,10 +1723,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .with_key_prefix(uri.as_ref())
             .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
             .await;
-        let aux_path = index_dir
-            .clone()
-            .join(uuid_str.as_str())
-            .join(INDEX_AUXILIARY_FILE_NAME);
         file_metadata_cache
             .with_key_prefix(aux_path.as_ref())
             .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
@@ -1635,8 +1735,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
         // The scheduler is freshly created above and, at this point, has served
         // only the open-time reads (file footers, IVF centroids, quantization
-        // metadata) -- partition reads happen later, during queries.  So its
-        // cumulative stats are exactly the one-time index-open I/O.
+        // metadata) -- partition reads happen
+        // later, during queries.  So its cumulative stats are exactly the
+        // one-time index-open I/O.
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
@@ -1658,11 +1759,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
+            origin_latency,
             _marker: PhantomData,
         })
     }
 
-    /// Reconstruct an IVFIndex from pre-parsed state without any I/O.
+    /// Reconstruct an IVFIndex from pre-parsed state without any I/O, over
+    /// a storage already bound to its resident store.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_cached_state(
         uri: String,
@@ -1676,7 +1779,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
+        origin_latency: OriginLatencyClass,
     ) -> Result<Self> {
+        let storage = storage.with_origin_latency(origin_latency);
         let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
@@ -1702,8 +1807,213 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
             prepared_partitions: Arc::default(),
+            origin_latency,
             _marker: PhantomData,
         })
+    }
+
+    /// The origin latency class of an index opened on `object_store` by a
+    /// session that declares `hint`. Only IVF_RQ indexes read (and validate)
+    /// `LANCE_RQ_ORIGIN_LATENCY` and take the hint, the setting first (see
+    /// [`OriginLatencyClass::resolve_with_hint`]); any other index takes the
+    /// class of its store, since no reader policy of theirs depends on it.
+    fn origin_latency_at_open(
+        object_store: &ObjectStore,
+        hint: Option<OriginLatencyClass>,
+    ) -> Result<OriginLatencyClass> {
+        if Q::quantization_type() != QuantizationType::Rabit {
+            return Ok(OriginLatencyClass::of_store(object_store));
+        }
+        Ok(OriginLatencyClass::resolve_with_hint(
+            origin_latency_setting()?,
+            hint,
+            object_store,
+        ))
+    }
+
+    /// Latency class of reads from the index's files, resolved when the index
+    /// opened; see [`OriginLatencyClass`].
+    pub fn origin_latency(&self) -> OriginLatencyClass {
+        self.origin_latency
+    }
+
+    /// Replace the origin latency class so tests can exercise both classes
+    /// over one store in one process.
+    #[cfg(test)]
+    pub(crate) fn with_origin_latency_for_test(
+        mut self,
+        origin_latency: OriginLatencyClass,
+    ) -> Result<Self> {
+        self.origin_latency = origin_latency;
+        self.storage = self.storage.with_origin_latency(origin_latency);
+        Ok(self)
+    }
+
+    /// Whether an index keeps the small columns of `storage`'s file
+    /// resident in `file_cache`, whatever its origin latency class: when the
+    /// setting admits the store (see [`ResidentColumnsSetting::admits`]).
+    /// The setting is `LANCE_RQ_RESIDENT_COLUMNS` when it is `on` or `off`,
+    /// and otherwise `session`, the opening session's
+    /// ([`ResidentColumnsSetting::resolve_with_session`]). `off` keeps none
+    /// and sizes nothing. `auto` keeps one when its charged bytes fit the
+    /// cache entry limit; without a cache, only `on` keeps one, shared and
+    /// uncharged. A store that does not fit counts
+    /// `resident_columns_oversize`. Only IVF_RQ
+    /// indexes read (and validate) `LANCE_RQ_RESIDENT_COLUMNS` and
+    /// `LANCE_RQ_RESIDENT_LIFETIME`: the resident columns are told apart
+    /// from the RaBitQ code columns, so other storages keep none.
+    fn resident_columns_at_open(
+        storage: &IvfQuantizationStorage<Q>,
+        file_cache: Option<&LanceCache>,
+        session: ResidentColumnsSetting,
+    ) -> Result<bool> {
+        if !storage.supports_rabit_planes() {
+            return Ok(false);
+        }
+        resident_lifetime_setting()?;
+        let setting =
+            ResidentColumnsSetting::resolve_with_session(resident_columns_setting()?, session);
+        if setting == ResidentColumnsSetting::Off {
+            return Ok(false);
+        }
+        let store = storage.resident_store_size()?;
+        let Some(cache) = file_cache else {
+            return Ok(setting == ResidentColumnsSetting::On && store.bytes > 0);
+        };
+        let max_entry_bytes = cache.max_entry_bytes();
+        if store.bytes > 0 && !resident_store_fits(store.charge, max_entry_bytes) {
+            scan_stats::counters().resident_columns_oversize.incr();
+            if setting == ResidentColumnsSetting::On {
+                warn_resident_store_oversize(store.charge, max_entry_bytes);
+            }
+        }
+        Ok(setting.admits(store, max_entry_bytes))
+    }
+
+    /// The resident store handle of an index opening on index file `file`:
+    /// when the index keeps its small columns `resident`, the store every
+    /// live index of the file shares and offered to the ordinary file cache.
+    /// The opener's strong reference bridges eviction during index opening.
+    /// Otherwise use an independent store that loads only if residency is
+    /// enabled later.
+    async fn resident_store_at_open(
+        resident: bool,
+        file: &IndexFileKey,
+        context: IvfOpenContext,
+    ) -> Result<ResidentColumns> {
+        if !resident {
+            return Ok(ResidentColumns::default());
+        }
+        Ok(match &context.file_cache {
+            Some(cache) => {
+                ResidentColumns::in_index_cache(
+                    cache,
+                    file,
+                    context.resident_columns_handle,
+                    resident_lifetime_setting()?,
+                )
+                .await
+            }
+            None => ResidentColumns::shared(file),
+        })
+    }
+
+    /// Whether reads keep the index's small columns resident and fetch only
+    /// its code columns from the file, resolved when the index
+    /// opened; see `LANCE_RQ_RESIDENT_COLUMNS`.
+    pub fn resident_columns_enabled(&self) -> bool {
+        self.storage.resident_columns_enabled()
+    }
+
+    /// Bytes the index's resident columns take, whether or not it keeps
+    /// them; see [`lance_index::vector::storage::resident_columns_bytes`].
+    /// Zero for a storage layout that does not support resident columns.
+    pub fn resident_columns_bytes(&self) -> u64 {
+        self.storage.resident_columns_bytes()
+    }
+
+    /// The size of the index's resident store, whether or not it keeps
+    /// one, and what an index cache charges for it once loaded, which the
+    /// open compared with the cache's entry limit; see
+    /// [`ResidentColumnsSetting::admits`]. Zero for unsupported storage layouts.
+    pub fn resident_store_size(&self) -> Result<ResidentStoreSize> {
+        self.storage.resident_store_size()
+    }
+
+    /// Replace whether reads keep the small columns resident, so tests can
+    /// open both in one process. Enabling loads the store through the
+    /// index's handle unless it is loaded, as an open that keeps the columns
+    /// resident does: a store of the index's own when the open kept none.
+    /// Disabling also gives the index a store handle of its own, so that it
+    /// never shares the store the open bound.
+    #[cfg(test)]
+    pub(crate) async fn with_resident_columns_for_test(mut self, enabled: bool) -> Result<Self> {
+        if !enabled {
+            self.storage = self
+                .storage
+                .with_resident_columns(ResidentColumns::default());
+        }
+        self.storage = self.storage.with_resident_columns_enabled(enabled);
+        self.storage.load_resident_store(None).await?;
+        Ok(self)
+    }
+
+    /// The entry columns an opening index asks its storage for: an IVF_RQ
+    /// index reads (and validates) `LANCE_RQ_ENTRY_COLUMNS`, and its storage
+    /// resolves them against residency (see
+    /// [`IvfQuantizationStorage::entry_columns`]); any other index keeps
+    /// full entries.
+    fn entry_columns_at_open() -> Result<EntryColumns> {
+        if Q::quantization_type() != QuantizationType::Rabit {
+            return Ok(EntryColumns::All);
+        }
+        entry_columns_setting()
+    }
+
+    /// How reads attach the resident rows to the whole partitions and
+    /// planes they never cache; see
+    /// [`IvfQuantizationStorage::resident_attach`].
+    pub fn resident_attach(&self) -> ResidentAttach {
+        self.storage.resident_attach()
+    }
+
+    /// Replace how reads attach the resident rows, so tests can run both
+    /// modes in one process.
+    #[cfg(test)]
+    pub(crate) fn with_resident_attach_for_test(mut self, resident_attach: ResidentAttach) -> Self {
+        self.storage = self.storage.with_resident_attach(resident_attach);
+        self
+    }
+
+    /// What the index's cache entries hold, resolved when it opened; see
+    /// `LANCE_RQ_ENTRY_COLUMNS`. [`EntryColumns::Codes`] only for an index
+    /// whose small columns are resident: its sign and ex plane entries,
+    /// or a native flat index's partition entries, which
+    /// are then [`PartitionCodes`](lance_index::vector::bq::partition_codes::PartitionCodes).
+    /// A native index with a graph caches whole partitions.
+    pub fn entry_columns(&self) -> EntryColumns {
+        if self.caches_partition_codes() {
+            self.storage.entry_columns()
+        } else {
+            EntryColumns::All
+        }
+    }
+
+    /// Whether the index caches its partitions as code-only entries: a
+    /// native IVF_RQ index with a flat sub-index, which holds nothing but
+    /// the storage, and code-only entries (see [`Self::entry_columns`]).
+    fn caches_partition_codes(&self) -> bool {
+        Q::quantization_type() == QuantizationType::Rabit
+            && S::name() == <FlatIndex as IvfSubIndex>::name()
+            && self.storage.entry_columns() == EntryColumns::Codes
+    }
+
+    /// Replace the entry columns the index asks for, so tests can open both
+    /// in one process; the storage still resolves them against residency.
+    #[cfg(test)]
+    pub(crate) fn with_entry_columns_for_test(mut self, entry_columns: EntryColumns) -> Self {
+        self.storage = self.storage.with_entry_columns(entry_columns);
+        self
     }
 
     /// Prepared-partition accounting for this index instance; see
@@ -1720,6 +2030,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        self.load_partition_attached(partition_id, write_cache, self.resident_attach(), metrics)
+            .await
+    }
+
+    /// [`Self::load_partition`], with the resident rows of a code-only
+    /// partition attached as `attach` says; see
+    /// [`IvfQuantizationStorage::partition_from_codes`].
+    async fn load_partition_attached(
+        &self,
+        partition_id: usize,
+        write_cache: bool,
+        attach: ResidentAttach,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionLoad);
         if partition_id >= self.ivf.num_partitions() {
             return Err(Error::index(format!(
@@ -1727,6 +2051,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 partition_id,
                 self.ivf.num_partitions()
             )));
+        }
+
+        if self.caches_partition_codes() {
+            return self
+                .load_code_only_partition(partition_id, write_cache, attach, metrics)
+                .await;
         }
 
         let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
@@ -1737,8 +2067,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .get_or_insert_with_key_hit(cache_key, || async {
                     info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
                     metrics.record_part_load();
-                    self.load_partition_entry(partition_id, metrics.io_stats())
-                        .await
+                    let entry = self
+                        .load_partition_entry(partition_id, metrics.io_stats())
+                        .await?;
+                    debug_assert!(
+                        !entry.shares_resident_store(),
+                        "partition {partition_id} would be cached with memory of a resident store"
+                    );
+                    Ok(entry)
                 })
                 .await;
             match &result {
@@ -1762,6 +2098,43 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
     }
 
+    /// A native flat partition read through its code-only entry, which is
+    /// cached (admitted when `write_cache`) while the partition entry built
+    /// from it, with the resident rows attached as `attach` says, is built
+    /// again on every read and never cached; see
+    /// [`IvfQuantizationStorage::load_partition_cached`].
+    async fn load_code_only_partition(
+        &self,
+        partition_id: usize,
+        write_cache: bool,
+        attach: ResidentAttach,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        let io_stats = metrics.io_stats();
+        let (storage, hit) = self
+            .storage
+            .load_partition_cached(
+                partition_id,
+                &self.index_cache,
+                write_cache,
+                attach,
+                io_stats.clone(),
+            )
+            .await?;
+        if hit {
+            metrics.record_index_cache_hit();
+        } else {
+            metrics.record_index_cache_miss();
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
+            metrics.record_part_load();
+        }
+        // A flat sub-index holds no rows, so building it reads nothing.
+        let index = self.load_sub_index(partition_id, io_stats).await?;
+        let mut entry = PartitionEntry::new(index, storage);
+        entry.cache_whole_partition = false;
+        Ok(Arc::new(entry))
+    }
+
     async fn load_partition_entry(
         &self,
         partition_id: usize,
@@ -1777,6 +2150,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let idx = S::load(batch)?;
         let storage = self.load_partition_storage(partition_id, io_stats).await?;
         Ok(PartitionEntry::new(idx, storage))
+    }
+
+    async fn load_sub_index(&self, partition_id: usize, io_stats: Option<IoStats>) -> Result<S> {
+        let batch = self
+            .read_sub_index_batch(partition_id, self.read_projection.as_ref(), io_stats)
+            .await?;
+        S::load(batch)
     }
 
     /// Read the serialized sub-index of a partition, with its metadata attached.
@@ -1885,6 +2265,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Q::Metadata: 'static,
         Q::Storage: 'static,
     {
+        if self.caches_partition_codes() {
+            return self.prewarm_partition_codes_window(partitions).await;
+        }
         let index_schema = Arc::new(match &self.read_projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
@@ -1957,8 +2340,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                             let key = IVFPartitionKey::<S, Q>::new(follower_id);
                             self.index_cache
                                 .get_or_insert_with_key(key, || async move {
-                                    self.materialize_prewarm_partition(follower_id, batches)
-                                        .await
+                                    let entry = self
+                                        .materialize_prewarm_partition(follower_id, batches)
+                                        .await?;
+                                    debug_assert!(
+                                        !entry.shares_resident_store(),
+                                        "prewarmed partition {follower_id} holds memory of a resident store"
+                                    );
+                                    Ok(entry)
                                 })
                                 .await
                                 .map(|_| ())
@@ -1975,8 +2364,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     if let Some(error) = first_error {
                         return Err(error);
                     }
-                    self.materialize_prewarm_partition(partition_id, leader_batches)
-                        .await
+                    let entry = self
+                        .materialize_prewarm_partition(partition_id, leader_batches)
+                        .await?;
+                    debug_assert!(
+                        !entry.shares_resident_store(),
+                        "prewarmed partition {partition_id} holds memory of a resident store"
+                    );
+                    Ok(entry)
                 })
                 .await?;
             partition_id = if was_cached {
@@ -1988,6 +2383,112 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 run_end
             };
         }
+        Ok(())
+    }
+
+    /// [`Self::prewarm_partition_window`] of an index that caches its
+    /// partitions as code-only entries: one read of the window's code
+    /// columns, cut into the entries of its partitions. The flat sub-index
+    /// holds nothing to warm, and the index loaded the resident store when
+    /// it opened.
+    async fn prewarm_partition_codes_window(&self, partitions: Range<usize>) -> Result<()> {
+        let projection = self.storage.partition_codes_projection()?;
+        let schema: arrow_schema::SchemaRef = Arc::new(projection.schema.as_ref().into());
+        let mut partition_id = partitions.start;
+        while partition_id < partitions.end {
+            let cached = |partition| async move {
+                let key = PartitionCodesKey { partition };
+                self.index_cache.get_with_key(&key).await.is_some()
+            };
+            if cached(partition_id).await {
+                partition_id += 1;
+                continue;
+            }
+            // Stop at a cached hole, as the whole-partition prewarm does.
+            let mut run_end = partition_id + 1;
+            while run_end < partitions.end && !cached(run_end).await {
+                run_end += 1;
+            }
+            let run = partition_id..run_end;
+            let batches = read_partition_window_batches(
+                self.storage.reader(),
+                Some(&projection),
+                &schema,
+                self.storage.ivf(),
+                run.clone(),
+                None,
+            )
+            .await?;
+            if batches.len() != run.len() {
+                return Err(Error::internal(format!(
+                    "IVF prewarm run {run:?} produced {} partitions of codes",
+                    batches.len()
+                )));
+            }
+            for (partition, batches) in run.zip(batches) {
+                let codes = self.storage.partition_codes_from_batches(batches)?;
+                debug_assert!(
+                    !shares_resident_store(&codes.0),
+                    "prewarmed codes of partition {partition} hold memory of a resident store"
+                );
+                self.index_cache
+                    .get_or_insert_with_key(
+                        PartitionCodesKey { partition },
+                        || async move { Ok(codes) },
+                    )
+                    .await?;
+            }
+            partition_id = run_end;
+        }
+        Ok(())
+    }
+
+    /// [`Index::prewarm`] of an index that is not native: its partitions,
+    /// in byte windows ([`IVF_PREWARM_WINDOW_SIZE_ENV`]) read with bounded
+    /// parallelism.
+    async fn prewarm_partitions(&self) -> Result<()> {
+        let cpu_parallelism = get_num_compute_intensive_cpus();
+        let target_bytes = prewarm_window_size_bytes()?;
+        let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
+        let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
+        let windows = plan_partition_windows(
+            PrewarmFileLayout {
+                ivf: &self.ivf,
+                encoded_bytes: self.reader.metadata().num_data_bytes,
+                num_rows: self.reader.num_rows(),
+            },
+            PrewarmFileLayout {
+                ivf: self.storage.ivf(),
+                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
+                num_rows: self.storage.reader().num_rows(),
+            },
+            target_bytes,
+            max_partitions,
+        )?;
+        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
+        info!(
+            uuid = %self.uuid,
+            windows = windows.len(),
+            planned_bytes,
+            window_bytes = target_bytes,
+            parallelism,
+            io_parallelism = self.io_parallelism,
+            "prewarming IVF partitions in byte windows"
+        );
+        let started = std::time::Instant::now();
+        stream::iter(windows)
+            .map(Ok)
+            .try_for_each_concurrent(Some(parallelism), |window| async move {
+                self.prewarm_partition_window(window.partitions).await
+            })
+            .await?;
+        let elapsed = started.elapsed();
+        info!(
+            uuid = %self.uuid,
+            elapsed_ms = elapsed.as_millis() as u64,
+            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
+            "prewarmed IVF partitions"
+        );
         Ok(())
     }
 
@@ -2044,48 +2545,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let cpu_parallelism = get_num_compute_intensive_cpus();
-        let target_bytes = prewarm_window_size_bytes()?;
-        let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
-        let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
-        let windows = plan_partition_windows(
-            PrewarmFileLayout {
-                ivf: &self.ivf,
-                encoded_bytes: self.reader.metadata().num_data_bytes,
-                num_rows: self.reader.num_rows(),
-            },
-            PrewarmFileLayout {
-                ivf: self.storage.ivf(),
-                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
-                num_rows: self.storage.reader().num_rows(),
-            },
-            target_bytes,
-            max_partitions,
-        )?;
-        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
-        info!(
-            uuid = %self.uuid,
-            windows = windows.len(),
-            planned_bytes,
-            window_bytes = target_bytes,
-            parallelism,
-            io_parallelism = self.io_parallelism,
-            "prewarming IVF partitions in byte windows"
-        );
-        let started = std::time::Instant::now();
-        stream::iter(windows)
-            .map(Ok)
-            .try_for_each_concurrent(Some(parallelism), |window| async move {
-                self.prewarm_partition_window(window.partitions).await
-            })
-            .await?;
-        let elapsed = started.elapsed();
-        info!(
-            uuid = %self.uuid,
-            elapsed_ms = elapsed.as_millis() as u64,
-            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
-            "prewarmed IVF partitions"
-        );
+        self.storage.load_resident_store(None).await?;
+        self.prewarm_partitions().await?;
         Ok(())
     }
 
@@ -2867,7 +3328,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         with_vector: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<SendableRecordBatchStream> {
-        let partition = self.load_partition(partition_id, false, metrics).await?;
+        // The stream leaves the index: its caller may hold the batches after
+        // the index, and its lease on the resident store, are gone, where a
+        // view of the store would keep a whole store column alive, uncharged.
+        let partition = self
+            .load_partition_attached(partition_id, false, ResidentAttach::Copy, metrics)
+            .await?;
         let store = &partition.storage;
         let schema = if with_vector {
             store.schema().clone()
@@ -2981,8 +3447,11 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
     frag_reuse_index: Option<ResolvedRemapping>,
+    context: IvfOpenContext,
 ) -> Result<Arc<dyn VectorIndex>> {
     let io_parallelism = object_store.io_parallelism();
+    let origin_latency =
+        IVFIndex::<S, Q>::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
 
     let index_path = Path::parse(&state.index_file_path)
         .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
@@ -2992,6 +3461,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     parts.pop();
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+    let index_file = IndexFileKey::new(&state.uuid, &object_store.store_prefix, aux_path.as_ref());
 
     // Readers carry a scheduler bound to an object store, so they cannot be
     // shared across dataset opens. Reuse only portable file metadata and bind
@@ -3029,6 +3499,20 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         }
         Some(ResolvedRemapping::V1Identity) | None => make_storage(None),
     };
+    // Bind the store as an open does: the state holds none, so a state read
+    // back from a persistent tier binds to the one the index cache holds or
+    // the file's live indexes share, and any state pins nothing.
+    let resident = IVFIndex::<S, Q>::resident_columns_at_open(
+        &storage,
+        context.file_cache.as_ref(),
+        context.resident_columns,
+    )?;
+    let resident_columns =
+        IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
+    let storage = storage
+        .with_resident_columns(resident_columns)
+        .with_resident_columns_enabled(resident)
+        .with_entry_columns(IVFIndex::<S, Q>::entry_columns_at_open()?);
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
@@ -3045,6 +3529,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         index_cache,
         io_parallelism,
         rq_search_cache,
+        origin_latency,
     )?;
     Ok(Arc::new(index))
 }
@@ -9862,4 +10347,6 @@ mod tests {
         let recall = row_ids.intersection(&ground_truth).count() as f32 / 20.0;
         assert_ge!(recall, 0.5);
     }
+
+    mod native_storage_tests;
 }
