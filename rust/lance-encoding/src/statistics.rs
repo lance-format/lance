@@ -123,7 +123,12 @@ impl ComputeStat for FixedSizeListBlock {
         // There is a potential opportunity here to do better.  For example, if we have a FSL of
         // 4 32-bit integers then we should probably treat them as a single 128-bit integer or maybe
         // even 4 columns of 32-bit integers.  This might yield better compression.
-        self.child.compute_stat();
+        //
+        // The child's stats are already computed: `from_arrays` runs `compute_stat`
+        // on every block it builds, including this FSL's child. Re-running the
+        // child here computed every fixed-width statistic twice (every vector
+        // column) and panicked for a variable-width child, whose `compute_stat`
+        // rejects a second call.
     }
 }
 
@@ -617,6 +622,40 @@ mod tests {
         types::{Int32Type, UInt64Type},
     };
     use arrow_select::concat::concat;
+
+    /// `from_arrays` already computes the child's stats; the FSL wrapper's
+    /// `compute_stat` used to re-run the child's, which panicked for
+    /// variable-width children (they assert single computation) and doubled
+    /// every fixed-width statistic for all vector columns.
+    #[test]
+    fn test_fsl_of_variable_width_compute_stat_once() {
+        use arrow_array::FixedSizeListArray;
+
+        let values = Arc::new(StringArray::from(vec![
+            Some("aa"),
+            Some("bb"),
+            Some("cc"),
+            Some("dd"),
+        ]));
+        let array = Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            2,
+            values,
+            None,
+        )) as ArrayRef;
+        let block = DataBlock::from_arrays(&[array], 2);
+        assert!(matches!(block, DataBlock::FixedSizeList(_)));
+        // The child's MaxLength must be populated exactly once.
+        let child_max_length = match &block {
+            DataBlock::FixedSizeList(fsl) => fsl.child.get_stat(Stat::MaxLength),
+            _ => None,
+        };
+        assert!(
+            child_max_length.is_some(),
+            "child stats computed once by from_arrays"
+        );
+    }
+
     #[test]
     fn test_data_size_stat() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
