@@ -1866,4 +1866,38 @@ mod tests {
             "content word 英语 was dropped: {tokens:?}"
         );
     }
+
+    // The ICU path applies every language's stop words to all text, so the
+    // Chinese list must not remove content words from Japanese or Chinese
+    // text (#9890).
+    #[rstest]
+    #[case::ja("取得したデータを全部表示", &["取得", "全部", "表示"], &["を"])]
+    #[case::ja_ijou("以上の場合は処理を開始する", &["以上", "場合", "処理"], &["の", "は", "を"])]
+    #[case::zh("从数据库获取所有用户信息并返回结果", &["所有", "结果"], &["从", "并"])]
+    fn test_icu_stop_words_keep_cjk_content_words(
+        #[case] text: &str,
+        #[case] kept: &[&str],
+        #[case] removed: &[&str],
+    ) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer("icu".to_string())
+            .remove_stop_words(true)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search(text);
+        let tokens: Vec<String> =
+            std::iter::from_fn(|| stream.next().map(|t| t.text.clone())).collect();
+        for word in kept {
+            assert!(
+                tokens.iter().any(|t| t == word),
+                "{word} was dropped: {tokens:?}"
+            );
+        }
+        for word in removed {
+            assert!(
+                !tokens.iter().any(|t| t == word),
+                "{word} was kept: {tokens:?}"
+            );
+        }
+    }
 }
