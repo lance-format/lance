@@ -100,6 +100,10 @@ use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
+pub mod rabit_scan;
+
+use rabit_scan::{RabitCacheLayout, RabitScan, RabitScanContext, RabitScanFactory};
+
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
 /// Serializable state of an IVF index, sufficient to reconstruct the index
@@ -1066,6 +1070,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
 /// [`IvfIndexState`]. The default declares nothing and charges no cache.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IvfOpenContext {
+    /// Session policy only; deliberately absent from cached index state.
+    pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
     /// The origin latency class the session declares for the IVF_RQ indexes
     /// it opens (`Session::index_origin_latency`), `None` when it declares
     /// none; see [`IVFIndex::origin_latency_at_open`].
@@ -1160,6 +1166,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     prepared_partitions: Arc<PreparedPartitionTracker>,
+    rabit_scan: Option<Arc<dyn RabitScan>>,
     /// Latency class of reads from the index's files, resolved when the
     /// index opens; the storage carries the same class.
     origin_latency: OriginLatencyClass,
@@ -1323,7 +1330,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     ) -> Result<PreparedPartitionSearch<S, Q>> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
         let (part_entry, ()) =
-            tokio::try_join!(self.load_partition(partition_id, true, metrics), async {
+            tokio::try_join!(self.load_query_partition(partition_id, metrics), async {
                 let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
                 pre_filter.wait_for_ready().await
             },)?;
@@ -1352,7 +1359,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        let part_entry = self.load_query_partition(partition_id, metrics).await?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
                 .await?;
@@ -1715,6 +1722,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             context.file_cache.as_ref(),
             context.resident_columns,
         )?;
+        let rabit_scan = if storage.supports_rabit_planes() {
+            context
+                .rabit_scan_factory
+                .as_ref()
+                .map(|factory| factory.create(&index_file, origin_latency))
+                .transpose()?
+        } else {
+            None
+        };
         let resident_store =
             Self::resident_store_at_open(resident_columns, &index_file, context).await?;
         let storage = storage
@@ -1769,6 +1785,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
+            rabit_scan,
             origin_latency,
             _marker: PhantomData,
         })
@@ -1817,6 +1834,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
             prepared_partitions: Arc::default(),
+            rabit_scan: None,
             origin_latency,
             _marker: PhantomData,
         })
@@ -2003,7 +2021,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// are then [`PartitionCodes`](lance_index::vector::bq::partition_codes::PartitionCodes).
     /// A native index with a graph caches whole partitions.
     pub fn entry_columns(&self) -> EntryColumns {
-        if self.caches_partition_codes() {
+        if self.uses_rabit_plane_cache() || self.caches_partition_codes() {
             self.storage.entry_columns()
         } else {
             EntryColumns::All
@@ -2146,6 +2164,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(Arc::new(entry))
     }
 
+    async fn load_query_partition(
+        &self,
+        partition_id: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        if !self.uses_rabit_plane_cache() {
+            return self.load_partition(partition_id, true, metrics).await;
+        }
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition id {partition_id} is out of range of {} partitions",
+                self.ivf.num_partitions()
+            )));
+        }
+        let mut entry = self
+            .load_plane_partition_entry(partition_id, metrics.io_stats())
+            .await?;
+        entry.cache_whole_partition = false;
+        Ok(Arc::new(entry))
+    }
+
+    /// A strategy's native plane cache must also serve prewarm and eager
+    /// fallback; otherwise the scan would bypass already-warmed partitions.
+    fn uses_rabit_plane_cache(&self) -> bool {
+        self.rabit_scan
+            .as_ref()
+            .is_some_and(|scan| scan.cache_layout() == RabitCacheLayout::Planes)
+    }
+
     async fn load_partition_entry(
         &self,
         partition_id: usize,
@@ -2161,6 +2208,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let idx = S::load(batch)?;
         let storage = self.load_partition_storage(partition_id, io_stats).await?;
         Ok(PartitionEntry::new(idx, storage))
+    }
+
+    async fn load_plane_partition_entry(
+        &self,
+        partition_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<PartitionEntry<S, Q>> {
+        let index = self.load_sub_index(partition_id, io_stats.clone()).await?;
+        let storage = self
+            .storage
+            .load_rabit_partition_planes(partition_id, &self.index_cache, io_stats)
+            .await?;
+        Ok(PartitionEntry::new(index, storage))
     }
 
     async fn load_sub_index(&self, partition_id: usize, io_stats: Option<IoStats>) -> Result<S> {
@@ -2564,7 +2624,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             "IVF_RQ index {} prewarms with a resident store its open did not load",
             self.uuid
         );
-        self.prewarm_partitions().await?;
+        if self.uses_rabit_plane_cache() {
+            self.storage.prewarm_planes(&self.index_cache).await?;
+        } else {
+            self.prewarm_partitions().await?;
+        }
         Ok(())
     }
 
@@ -2701,7 +2765,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let (part_entry, pre_filter) = {
             // Match split preparation without counting CPU queueing or search.
             let _prepare_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
-            let part_entry = self.load_partition(partition_id, true, metrics).await?;
+            let part_entry = self.load_query_partition(partition_id, metrics).await?;
             {
                 let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
                 pre_filter.wait_for_ready().await?;
@@ -2844,6 +2908,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
+            if let Some(strategy) = &self.rabit_scan {
+                let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
+                if let Ok(index) = erased.downcast::<IVFIndex<FlatIndex, RabitQuantizer>>() {
+                    let context = Arc::new(RabitScanContext::new(
+                        index,
+                        raw_query_context.clone(),
+                        query.clone(),
+                        partitions.clone(),
+                        q_c_dists.clone(),
+                        start_idx..end_idx,
+                        pre_filter.clone(),
+                        metrics.clone(),
+                    ));
+                    if let Some(batch) = strategy.search(context).await? {
+                        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                            VECTOR_RESULT_SCHEMA.clone(),
+                            stream::once(async move { Ok(batch) }),
+                        )));
+                    }
+                }
+            }
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
             {
                 let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
@@ -3244,7 +3329,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 let metrics = load_metrics.clone();
                 async move {
                     let part_entry = index
-                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .load_query_partition(part_id as usize, metrics.as_ref())
                         .await?;
                     Result::Ok((part_id as usize, part_entry, probing_queries))
                 }
@@ -3526,6 +3611,15 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         context.resident_columns,
     )?;
     let io_stats = context.io_stats.clone();
+    let rabit_scan = if storage.supports_rabit_planes() {
+        context
+            .rabit_scan_factory
+            .as_ref()
+            .map(|factory| factory.create(&index_file, origin_latency))
+            .transpose()?
+    } else {
+        None
+    };
     let resident_columns =
         IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
     let storage = storage
@@ -3540,7 +3634,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
         .map_err(|e| Error::index(format!("Invalid UUID in IvfIndexState: {e}")))?;
-    let index = IVFIndex::<S, Q>::from_cached_state(
+    let mut index = IVFIndex::<S, Q>::from_cached_state(
         to_local_path(&index_path),
         index_path.to_string(),
         parsed_uuid,
@@ -3554,6 +3648,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         rq_search_cache,
         origin_latency,
     )?;
+    index.rabit_scan = rabit_scan;
     Ok(Arc::new(index))
 }
 
@@ -10372,6 +10467,7 @@ mod tests {
     }
 
     mod native_resident_tests;
+    mod native_scan_tests;
     mod native_share_tests;
     mod native_storage_tests;
 }

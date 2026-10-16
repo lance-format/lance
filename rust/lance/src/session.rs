@@ -13,6 +13,8 @@ use lance_io::spill::{LocalSpillStore, SpillStore};
 
 pub use lance_index::vector::storage::{OriginLatencyClass, ResidentColumnsSetting};
 
+use crate::index::vector::ivf::v2::rabit_scan::RabitScanFactory;
+
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
 use crate::session::index_caches::GlobalIndexCache;
@@ -85,6 +87,9 @@ pub struct Session {
     /// Whether the IVF_RQ indexes this session opens keep their small columns
     /// resident; see [`Self::with_index_resident_columns`].
     index_resident_columns: ResidentColumnsSetting,
+
+    /// Optional runtime strategy, rebound for each opened index.
+    pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
 }
 
 impl DeepSizeOf for Session {
@@ -117,6 +122,7 @@ impl std::fmt::Debug for Session {
             )
             .field("index_origin_latency", &self.index_origin_latency)
             .field("index_resident_columns", &self.index_resident_columns)
+            .field("has_rabit_scan_factory", &self.rabit_scan_factory.is_some())
             .finish()
     }
 }
@@ -153,6 +159,7 @@ impl Session {
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
+            rabit_scan_factory: None,
         }
     }
 
@@ -176,6 +183,7 @@ impl Session {
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
+            rabit_scan_factory: None,
         }
     }
 
@@ -256,6 +264,23 @@ impl Session {
         self.index_resident_columns
     }
 
+    /// Install a runtime scan strategy for native RaBitQ indices
+    /// with current plane storage, including reconstruction from cached metadata.
+    /// Without a factory, queries use Lance's built-in full scan.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance::session::Session;
+    /// use lance::index::vector::ivf::v2::rabit_scan::RabitScanFactory;
+    /// fn configured(factory: Arc<dyn RabitScanFactory>) -> Session {
+    ///     Session::default().with_rabit_scan_factory(factory)
+    /// }
+    /// ```
+    pub fn with_rabit_scan_factory(mut self, factory: Arc<dyn RabitScanFactory>) -> Self {
+        self.rabit_scan_factory = Some(factory);
+        self
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
@@ -317,6 +342,7 @@ impl Session {
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
+            rabit_scan_factory: None,
         }
     }
 

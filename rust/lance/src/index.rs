@@ -4227,6 +4227,7 @@ impl Dataset {
         // or reconstruction below runs, and where a reconstruction adds the
         // I/O of a resident store load.
         let open_context = IvfOpenContext {
+            rabit_scan_factory: self.session.rabit_scan_factory.clone(),
             origin_latency_hint: self.session.index_origin_latency(),
             resident_columns: self.session.index_resident_columns(),
             file_cache: Some(file_cache),
