@@ -3,22 +3,29 @@
 
 use crate::bitmap::{PyBitmap, bitmap_from_iterable, is_int, value_from_py};
 use crate::dataset::DatasetBasePath;
+use crate::error::PythonErrorExt;
 use crate::schema::LanceSchema;
 use crate::utils::{PyLance, class_name, export_vec, extract_vec};
-use arrow::pyarrow::PyArrowType;
+use arrow::pyarrow::{FromPyArrow, PyArrowType};
+use arrow_array::{ArrayRef, make_array};
+use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::datatypes::{Field, Schema};
+use lance_table::format::key_existence::{
+    BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS, BLOOM_FILTER_DEFAULT_PROBABILITY, FilterType,
+    KeyExistenceFilter,
+};
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -393,7 +400,127 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayGroup> {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Read-only view of the keys a merge-insert recorded as inserted.
+///
+/// Exact sets answer `might_contain` precisely. Bloom filters never report a
+/// recorded key as absent, but they can report an absent key as present.
+#[pyclass(
+    name = "InsertedRowsFilter",
+    module = "lance",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyInsertedRowsFilter {
+    inner: KeyExistenceFilter,
+}
+
+#[pymethods]
+impl PyInsertedRowsFilter {
+    /// Field ids of the join key, in key order.
+    #[getter]
+    fn field_ids(&self) -> Vec<i32> {
+        self.inner.field_ids.clone()
+    }
+
+    /// ``exact`` or ``bloom``.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match &self.inner.filter {
+            FilterType::ExactSet(_) => "exact",
+            FilterType::Bloom { .. } => "bloom",
+        }
+    }
+
+    /// Exact sets store sorted little-endian key hashes. Bloom filters store
+    /// the serialized bitset.
+    #[getter]
+    fn payload(&self) -> Vec<u8> {
+        match &self.inner.filter {
+            FilterType::ExactSet(hashes) => {
+                let mut hashes: Vec<u64> = hashes.iter().copied().collect();
+                hashes.sort_unstable();
+                let mut bytes = Vec::with_capacity(hashes.len() * 8);
+                for hash in hashes {
+                    bytes.extend_from_slice(&hash.to_le_bytes());
+                }
+                bytes
+            }
+            FilterType::Bloom { bitmap, .. } => bitmap.clone(),
+        }
+    }
+
+    /// Whether each row might have been inserted.
+    ///
+    /// `values` is a pyarrow Array (one key column), RecordBatch, or Table
+    /// whose columns are in `field_ids` order. A null in any key column is
+    /// reported as absent.
+    fn might_contain(&self, values: &Bound<'_, PyAny>) -> PyResult<Vec<bool>> {
+        let columns = key_columns_from_pyarrow(values)?;
+        self.inner.might_contain_columns(&columns).infer_error()
+    }
+}
+
+fn key_columns_from_pyarrow(values: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
+    if values.hasattr("num_columns")? && values.hasattr("column")? {
+        let num_columns: usize = values.getattr("num_columns")?.extract()?;
+        let mut columns = Vec::with_capacity(num_columns);
+        for index in 0..num_columns {
+            let column = values.call_method1("column", (index,))?;
+            let array = if column.hasattr("combine_chunks")? {
+                column.call_method0("combine_chunks")?
+            } else {
+                column
+            };
+            columns.push(array_from_pyarrow(&array)?);
+        }
+        return Ok(columns);
+    }
+    Ok(vec![array_from_pyarrow(values)?])
+}
+
+fn array_from_pyarrow(values: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
+    let data = ArrayData::from_pyarrow_bound(values)?;
+    Ok(make_array(data))
+}
+
+fn extract_inserted_rows_filter(ob: &Bound<'_, PyAny>) -> PyResult<KeyExistenceFilter> {
+    if let Ok(filter) = ob.cast::<PyInsertedRowsFilter>() {
+        return Ok(filter.borrow().inner.clone());
+    }
+
+    let field_ids: Vec<i32> = ob.getattr("field_ids")?.extract()?;
+    let kind: String = ob.getattr("kind")?.extract()?;
+    let payload: Vec<u8> = ob.getattr("payload")?.extract()?;
+    let filter = match kind.as_str() {
+        "exact" => {
+            if !payload.len().is_multiple_of(8) {
+                return Err(PyValueError::new_err(format!(
+                    "exact inserted_rows_filter payload length must be a multiple of 8, got {}",
+                    payload.len()
+                )));
+            }
+            let mut hashes = HashSet::with_capacity(payload.len() / 8);
+            for chunk in payload.as_chunks::<8>().0 {
+                hashes.insert(u64::from_le_bytes(*chunk));
+            }
+            FilterType::ExactSet(hashes)
+        }
+        "bloom" => FilterType::Bloom {
+            num_bits: (payload.len() as u32).saturating_mul(8),
+            bitmap: payload,
+            number_of_items: BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS,
+            probability: BLOOM_FILTER_DEFAULT_PROBABILITY,
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "inserted_rows_filter kind must be 'exact' or 'bloom', got {other}"
+            )));
+        }
+    };
+    Ok(KeyExistenceFilter { field_ids, filter })
+}
+
 pub struct PyUpdateMode(pub UpdateMode);
 
 impl FromPyObject<'_, '_> for PyUpdateMode {
@@ -502,6 +629,13 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .transpose()?
                     .map(UpdatedFragmentOffsets);
 
+                let inserted_rows_filter = ob
+                    .getattr("inserted_rows_filter")
+                    .ok()
+                    .filter(|value| !value.is_none())
+                    .map(|value| extract_inserted_rows_filter(&value))
+                    .transpose()?;
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
@@ -510,7 +644,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap,
                     update_mode,
-                    inserted_rows_filter: None,
+                    inserted_rows_filter,
                     updated_fragment_offsets,
                 };
                 Ok(Self(op))
@@ -706,6 +840,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 updated_fragment_offsets,
+                inserted_rows_filter,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -738,6 +873,17 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                                 })
                                 .collect::<HashMap<u64, Vec<u8>>>()
                         });
+                let inserted_rows_filter = match inserted_rows_filter {
+                    Some(filter) => Py::new(
+                        py,
+                        PyInsertedRowsFilter {
+                            inner: filter.clone(),
+                        },
+                    )?
+                    .into_bound(py)
+                    .into_any(),
+                    None => py.None().into_bound(py),
+                };
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -749,6 +895,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     updated_fragment_offsets,
+                    inserted_rows_filter,
                 ))
             }
             Operation::DataReplacement { replacements } => {

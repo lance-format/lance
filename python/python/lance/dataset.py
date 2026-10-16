@@ -62,6 +62,7 @@ from .lance import (
     Compaction,
     CompactionMetrics,
     DatasetBasePath,
+    InsertedRowsFilter,
     IOStats,
     LanceSchema,
     PySearchFilter,
@@ -6466,6 +6467,10 @@ class LanceOperation:
             each serialized in the portable RoaringBitmap format. Set on
             ``rewrite_columns`` updates over stable row ids so the commit
             refreshes row-level version metadata for the matched rows only.
+        inserted_rows_filter: InsertedRowsFilter, optional
+            Keys inserted by a merge-insert, used for concurrent conflict
+            detection. ``might_contain`` is exact for an exact set and may
+            have false positives for a bloom filter.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6479,6 +6484,7 @@ class LanceOperation:
         )
         update_mode: str = ""
         updated_fragment_offsets: Optional[Dict[int, bytes]] = None
+        inserted_rows_filter: Optional[InsertedRowsFilter] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)

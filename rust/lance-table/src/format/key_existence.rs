@@ -15,8 +15,8 @@ use std::hash::{Hash, Hasher};
 use crate::format::pb;
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
+    RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::DataType;
 use lance_core::Result;
@@ -209,6 +209,74 @@ impl KeyExistenceFilter {
                 Ok((has, has))
             }
         }
+    }
+
+    /// Whether `key` might have been recorded in this filter.
+    ///
+    /// Exact sets answer precisely. Bloom filters never return a false negative,
+    /// but they can return a false positive.
+    pub fn might_contain(&self, key: &KeyValue) -> Result<bool> {
+        match &self.filter {
+            FilterType::ExactSet(hashes) => Ok(hashes.contains(&key.hash_value())),
+            FilterType::Bloom { bitmap, .. } => {
+                let sbbf = Sbbf::new(bitmap).map_err(|err| {
+                    lance_core::Error::invalid_input(format!(
+                        "inserted_rows_filter bloom bitmap is invalid: {err}"
+                    ))
+                })?;
+                Ok(sbbf.check(&key.to_bytes()[..]))
+            }
+        }
+    }
+
+    /// Check one key per row. `columns` are in `field_ids` order.
+    ///
+    /// A null in any key column is reported as absent.
+    pub fn might_contain_columns(&self, columns: &[ArrayRef]) -> Result<Vec<bool>> {
+        if columns.is_empty() {
+            return Err(lance_core::Error::invalid_input(
+                "might_contain requires at least one key column".to_string(),
+            ));
+        }
+        if columns.len() != self.field_ids.len() {
+            return Err(lance_core::Error::invalid_input(format!(
+                "might_contain expected {} key column(s) for field ids {:?}, got {}",
+                self.field_ids.len(),
+                self.field_ids,
+                columns.len()
+            )));
+        }
+        let num_rows = columns[0].len();
+        if columns.iter().any(|column| column.len() != num_rows) {
+            return Err(lance_core::Error::invalid_input(
+                "might_contain columns must have the same number of rows".to_string(),
+            ));
+        }
+
+        let mut present = Vec::with_capacity(num_rows);
+        for row_idx in 0..num_rows {
+            if columns.iter().any(|column| column.is_null(row_idx)) {
+                present.push(false);
+                continue;
+            }
+            let mut parts = Vec::with_capacity(columns.len());
+            for column in columns {
+                let Some(part) = extract_key_value(column.as_ref(), row_idx) else {
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "might_contain: unsupported key type {} at row {row_idx}",
+                        column.data_type()
+                    )));
+                };
+                parts.push(part);
+            }
+            let key = if parts.len() == 1 {
+                parts.swap_remove(0)
+            } else {
+                KeyValue::Composite(parts)
+            };
+            present.push(self.might_contain(&key)?);
+        }
+        Ok(present)
     }
 }
 
@@ -714,5 +782,28 @@ mod tests {
             key1.is_none(),
             "struct row with a null child should not produce a key",
         );
+    }
+
+    #[test]
+    fn test_might_contain_exact_set_and_bloom() {
+        let present = KeyValue::Int64(4);
+        let absent = KeyValue::Int64(99);
+        let exact = KeyExistenceFilter {
+            field_ids: vec![0],
+            filter: FilterType::ExactSet(HashSet::from([present.hash_value()])),
+        };
+        assert!(exact.might_contain(&present).unwrap());
+        assert!(!exact.might_contain(&absent).unwrap());
+
+        let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(4), None, Some(99)]));
+        assert_eq!(
+            exact.might_contain_columns(&[column]).unwrap(),
+            vec![true, false, false]
+        );
+
+        let mut builder = KeyExistenceFilterBuilder::new(vec![0]);
+        builder.insert(present.clone()).unwrap();
+        let bloom = KeyExistenceFilter::from_bloom_filter(&builder);
+        assert!(bloom.might_contain(&present).unwrap());
     }
 }

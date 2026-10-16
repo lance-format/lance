@@ -3269,6 +3269,48 @@ def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):
     assert result.to_pydict() == {"id": [1, 2, 3, 4], "value": [10, 200, 300, 400]}
 
 
+def test_merge_insert_inserted_rows_filter(tmp_path):
+    base_dir = tmp_path / "merge_insert_inserted_rows_filter"
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema), base_dir
+    )
+    dataset.merge_insert("id").when_not_matched_insert_all().execute(
+        pa.table({"id": [2, 4], "value": [21, 40]}, schema=schema)
+    )
+
+    txn = dataset.read_transaction(dataset.version)
+    inserted = txn.operation.inserted_rows_filter
+    assert inserted is not None
+    assert inserted.kind == "bloom"
+    assert len(inserted.field_ids) == 1
+    assert inserted.payload
+    assert inserted.might_contain(pa.array([4], type=pa.int32())) == [True]
+    assert inserted.might_contain(pa.table({"id": [4, None]})) == [True, False]
+
+    recommitted = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.Update(inserted_rows_filter=inserted),
+        read_version=dataset.version,
+    )
+    round_trip = recommitted.read_transaction(recommitted.version)
+    restored = round_trip.operation.inserted_rows_filter
+    assert restored is not None
+    assert restored.kind == "bloom"
+    assert restored.field_ids == inserted.field_ids
+    assert restored.might_contain(pa.array([4], type=pa.int32())) == [True]
+
+
 def test_merge_insert_raises_without_pk_and_on_omitted(tmp_path):
     base_dir = tmp_path / "merge_insert_no_pk"
 
