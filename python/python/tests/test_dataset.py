@@ -5794,6 +5794,23 @@ EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
 EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
 
 
+def test_column_value_range(tmp_path: Path):
+    table = pa.table({"x": list(range(100)), "y": ["a"] * 100})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP", name="x_zonemap")
+
+    value_range = dataset.stats.column_value_range("x")
+    assert value_range == (0, 99)
+    assert dataset.stats.column_value_range("y") is None
+
+    dataset.insert(pa.table({"x": [1000], "y": ["b"]}))
+    # The new fragment is not covered by the index built before the insert.
+    assert dataset.stats.column_value_range("x") is None
+
+    with pytest.raises(ValueError, match="not found"):
+        dataset.stats.column_value_range("missing")
+
+
 def test_stats(tmp_path: Path):
     table = pa.table({"x": [1, 2, 3, 4], "y": ["foo", "bar", "baz", "qux"]})
     dataset = lance.write_dataset(table, tmp_path)
