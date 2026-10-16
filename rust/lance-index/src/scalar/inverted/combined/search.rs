@@ -2,11 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! The indexed `combined_fields` entry point: load every term's postings across
-//! the target columns, merge them into the shared row-id space, and score every
-//! candidate.
+//! the target columns, merge them into the shared row-id space, and rank them
+//! with MAXSCORE.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
 use lance_core::Result;
@@ -15,7 +14,8 @@ use lance_core::utils::tokio::spawn_cpu;
 use super::super::documents::AddressKeyedDocuments;
 use super::super::query::{FtsSearchParams, Operator, Tokens};
 use super::super::scorer::CombinedFieldsBM25Scorer;
-use super::cursor::{CombinedTermPostings, LoadedSource, build_term_postings};
+use super::cursor::{LoadedSource, MaterializedTerm, build_materialized_term};
+use super::maxscore::combined_maxscore;
 use super::{CombinedFieldColumn, unique_terms};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
@@ -26,23 +26,24 @@ use crate::vector::graph::OrderedFloat;
 /// `classify_wand_exactness_certificate`.
 ///
 /// [`ScoredDoc`](super::super::builder::ScoredDoc) compares on score alone, which
-/// is not enough for a bounded heap: among equal scores it evicts whichever row
-/// the heap happens to hold at the bottom, so rows that belong in the top-k are
-/// dropped and no later sort can bring them back. A fully covered plan returns
-/// this search's output directly, with no `SortExec` above it, so the order and
-/// the membership both have to be settled here.
+/// is not enough for the bounded heap [`combined_maxscore`] collects into: among
+/// equal scores it evicts whichever row the heap happens to hold at the bottom, so
+/// rows that belong in the top-k are dropped and no later sort can bring them
+/// back. A fully covered plan returns this search's output directly, with no
+/// `SortExec` above it, so the order and the membership both have to be settled
+/// here.
 ///
 /// `row_id` is stored reversed so that the derived lexicographic ordering ranks a
 /// higher row id lower. The heap's smallest element is then the lowest score with
 /// the highest row id, which is exactly the candidate a full heap should evict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct RankedDoc {
-    score: OrderedFloat,
-    row_id: Reverse<u64>,
+pub(super) struct RankedDoc {
+    pub(super) score: OrderedFloat,
+    pub(super) row_id: Reverse<u64>,
 }
 
 impl RankedDoc {
-    fn new(row_id: u64, score: f32) -> Self {
+    pub(super) fn new(row_id: u64, score: f32) -> Self {
         Self {
             score: OrderedFloat(score),
             row_id: Reverse(row_id),
@@ -53,8 +54,9 @@ impl RankedDoc {
 /// Exact cross-field BM25F search over the target columns.
 ///
 /// Loads each query term's postings across every column and partition, then
-/// scores the union of those postings and keeps a bounded top-k. Every candidate
-/// is scored; there is no pruning, so the result is exact by construction.
+/// ranks them with `combined_maxscore`, which skips candidates that cannot reach
+/// the running k-th score. The top-k equals that of an exhaustive scan.
+///
 /// Results come back ordered by `score DESC, row_id ASC`, which is a total order,
 /// so the same data always yields the same top-k even when scores tie.
 ///
@@ -111,7 +113,7 @@ pub async fn combined_fields_search(
         }
     }
     // Everything past the loads is uninterruptible CPU work: building and sorting
-    // a per-term `HashMap`, then the whole scoring loop with no await. Offload it
+    // a per-term `HashMap`, then the whole MAXSCORE loop with no await. Offload it
     // so a large query cannot hold a DataFusion
     // worker past a stream drop or task cancellation, matching how the
     // single-column `InvertedIndex::bm25_search` dispatches its per-partition
@@ -119,53 +121,25 @@ pub async fn combined_fields_search(
     // scoring loop. The `'static` closure clones the borrowed `scorer` (a handful
     // of per-term statistics) and moves everything else in.
     let scorer = Arc::new(scorer.clone());
-    let top = spawn_cpu(move || {
+    let (top, _stats) = spawn_cpu(move || {
         let dl_prime = |row_id: u64| -> f32 {
             length_sources
                 .iter()
                 .map(|(weight, docs)| weight * docs.doc_length_at(row_id) as f32)
                 .sum()
         };
-        let terms: Vec<CombinedTermPostings> = terms
+        let mut cursors: Vec<MaterializedTerm> = terms
             .iter()
             .zip(loaded)
-            .map(|(term, sources)| build_term_postings(term, sources, &mask, scorer.as_ref()))
+            .map(|(term, sources)| build_materialized_term(term, sources, &mask, &scorer))
             .collect();
-
-        // Score every candidate: the union of the terms' postings for `Or`, and the
-        // same union filtered to the documents holding every term for `And`. A row
-        // absent from a term contributes no `tf'`, so it is skipped rather than
-        // scored as zero.
-        //
-        // Ties are settled by [`RankedDoc`], not left to the heap: it orders on
-        // `(score, row_id)` as a whole, so both which rows survive the k-th score and
-        // the order they come back in are fixed by the data alone.
-        let candidates: BTreeSet<u64> = terms
-            .iter()
-            .flat_map(|term| term.postings.iter().map(|(row_id, _)| *row_id))
-            .collect();
-        let mut top: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
-        for row_id in candidates {
-            let dl = dl_prime(row_id);
-            let mut score = 0.0f32;
-            let mut missing_term = false;
-            for term in &terms {
-                let tf = term.tf_prime(row_id);
-                if tf <= 0.0 {
-                    missing_term = true;
-                    continue;
-                }
-                score += term.idf * scorer.doc_weight(tf, dl);
-            }
-            if require_all_terms && missing_term {
-                continue;
-            }
-            top.push(Reverse(RankedDoc::new(row_id, score)));
-            if top.len() > limit {
-                top.pop();
-            }
-        }
-        Result::Ok(top)
+        Result::Ok(combined_maxscore(
+            &mut cursors,
+            dl_prime,
+            limit,
+            require_all_terms,
+            &scorer,
+        ))
     })
     .await?;
 

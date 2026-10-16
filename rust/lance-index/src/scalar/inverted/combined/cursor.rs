@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Per-term cross-column postings for `combined_fields`: one term's postings
-//! merged across every target column into the shared row-id space, and the
-//! loaded posting sources they are built from.
+//! Per-term cross-column cursors for `combined_fields` and the posting sources
+//! they are built from.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +12,7 @@ use lance_select::RowAddrMask;
 use super::super::documents::AddressKeyedDocuments;
 use super::super::index::{PostingList, live_posting_rows};
 use super::super::scorer::CombinedFieldsBM25Scorer;
+use super::maxscore::term_upper_bound;
 
 /// One query term's postings, merged across every target column/partition into
 /// the shared row-id space.
@@ -35,6 +35,67 @@ impl CombinedTermPostings {
     }
 }
 
+/// One query term as seen by
+/// [`combined_maxscore`](super::maxscore::combined_maxscore): fully read
+/// [`CombinedTermPostings`] plus a cursor. Essential terms are walked with
+/// [`head`](Self::head) and [`consume`](Self::consume); non-essential ones are
+/// read with [`probe`](Self::probe).
+pub(super) struct MaterializedTerm {
+    pub(super) postings: CombinedTermPostings,
+    cursor: usize,
+}
+
+impl MaterializedTerm {
+    pub(super) fn new(postings: CombinedTermPostings) -> Self {
+        Self {
+            postings,
+            cursor: 0,
+        }
+    }
+
+    /// See [`term_upper_bound`].
+    #[inline]
+    pub(super) fn upper_bound(&self) -> f32 {
+        term_upper_bound(self.postings.idf)
+    }
+
+    /// The blended IDF `idf'(t)`.
+    #[inline]
+    pub(super) fn idf(&self) -> f32 {
+        self.postings.idf
+    }
+
+    /// The smallest unconsumed row id, or `None` when exhausted.
+    #[inline]
+    pub(super) fn head(&self) -> Option<u64> {
+        self.postings.postings.get(self.cursor).map(|(id, _)| *id)
+    }
+
+    /// `tf'` at [`head`](Self::head).
+    #[inline]
+    pub(super) fn head_tf(&self) -> f32 {
+        self.postings
+            .postings
+            .get(self.cursor)
+            .map(|(_, tf)| *tf)
+            .unwrap_or(0.0)
+    }
+
+    /// Advance past `row_id`, which must be `head()`.
+    #[inline]
+    pub(super) fn consume(&mut self, row_id: u64) {
+        if self.head() == Some(row_id) {
+            self.cursor += 1;
+        }
+    }
+
+    /// `tf'` at `target`, or 0 when absent.
+    #[inline]
+    pub(super) fn probe(&mut self, target: u64) -> f32 {
+        self.postings.tf_prime(target)
+    }
+}
+
 /// A `(column, index, partition)` posting source loaded for one term.
 pub(super) struct LoadedSource {
     pub(super) weight: f32,
@@ -45,12 +106,12 @@ pub(super) struct LoadedSource {
 
 /// Merge every source's postings for `term` into the shared row-id space,
 /// accumulating `tf'` in the canonical order.
-pub(super) fn build_term_postings(
+pub(super) fn build_materialized_term(
     term: &str,
     sources: Vec<LoadedSource>,
     mask: &Arc<RowAddrMask>,
     scorer: &CombinedFieldsBM25Scorer,
-) -> CombinedTermPostings {
+) -> MaterializedTerm {
     let mut acc: HashMap<u64, f32> = HashMap::new();
     for source in &sources {
         for (row_id, freq) in live_posting_rows(&source.posting, &source.docs, source.is_legacy) {
@@ -63,18 +124,20 @@ pub(super) fn build_term_postings(
     let idf = scorer.query_weight(term);
     let mut postings: Vec<(u64, f32)> = acc.into_iter().collect();
     postings.sort_unstable_by_key(|(row_id, _)| *row_id);
-    CombinedTermPostings { idf, postings }
+    MaterializedTerm::new(CombinedTermPostings { idf, postings })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::maxscore::combined_maxscore;
     use super::super::testing::{compressed_list, modern_identity_docs};
     use super::*;
     use lance_core::utils::address::RowAddress;
     use lance_select::RowAddrTreeMap;
+    use std::cmp::Reverse;
 
     #[tokio::test]
-    async fn test_build_term_postings_merges_legacy_and_compressed() {
+    async fn test_build_materialized_term_merges_legacy_and_compressed() {
         // A legacy (Plain, row-id-keyed, list-multiplicity)
         // source and a compressed source merge into one ordered `tf'` stream,
         // masked rows dropped and contributions summed in column order.
@@ -110,15 +173,18 @@ mod tests {
             },
         ];
         let mask = Arc::new(RowAddrMask::all_rows().also_block(RowAddrTreeMap::from_iter([42u64])));
-        let term = build_term_postings("t", sources, &mask, &scorer);
+        let term = build_materialized_term("t", sources, &mask, &scorer);
 
         // row 10: 2*1 = 2; row 20: 2*2 + 2*3 + 1*5 = 15; row 30: 2*1 = 2.
         // Row 42 is masked out entirely.
-        assert_eq!(term.postings, vec![(10, 2.0), (20, 15.0), (30, 2.0)]);
+        assert_eq!(
+            term.postings.postings,
+            vec![(10, 2.0), (20, 15.0), (30, 2.0)]
+        );
     }
 
     #[tokio::test]
-    async fn test_build_term_postings_skips_tombstoned_addresses() {
+    async fn test_build_materialized_term_skips_tombstoned_addresses() {
         // A remapped partition keeps a deleted document's DocId slot so the
         // posting lists stay aligned and answers `TOMBSTONE_ROW` for its address.
         // Nothing else stops that address: a default mask is an empty block list,
@@ -135,7 +201,7 @@ mod tests {
         assert_eq!(docs.doc_length_at(RowAddress::TOMBSTONE_ROW), 0);
         let sources = vec![LoadedSource {
             weight: 2.0,
-            docs,
+            docs: docs.clone(),
             is_legacy: false,
             posting: PostingList::Compressed(compressed_list(&[
                 (10, 1),
@@ -143,12 +209,26 @@ mod tests {
                 (30, 3),
             ])),
         }];
-        let term = build_term_postings("t", sources, &Arc::new(RowAddrMask::default()), &scorer);
+        let term =
+            build_materialized_term("t", sources, &Arc::new(RowAddrMask::default()), &scorer);
         assert_eq!(
-            term.postings,
+            term.postings.postings,
             vec![(10, 2.0), (30, 6.0)],
             "the tombstoned address must never be accumulated, and the live rows \
              must keep their exact contributions"
         );
+
+        // The live rows are the whole top-k, scored as if the dead slot's posting
+        // did not exist.
+        let mut cursors = vec![term];
+        let dl_prime = |row_id: u64| -> f32 { 2.0 * docs.doc_length_at(row_id) as f32 };
+        let (top, _) = combined_maxscore(&mut cursors, dl_prime, 10, false, &scorer);
+        let hits: Vec<(u64, u32)> = top
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(doc)| (doc.row_id.0, doc.score.0.to_bits()))
+            .collect();
+        let expected = |tf: f32| (scorer.query_weight("t") * scorer.doc_weight(tf, 8.0)).to_bits();
+        assert_eq!(hits, vec![(10, expected(2.0)), (30, expected(6.0))]);
     }
 }
