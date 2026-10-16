@@ -3018,6 +3018,19 @@ impl Dataset {
             .map(PyLance)
     }
 
+    /// Per-zone statistics for a ZoneMap index, as one Arrow record batch.
+    #[pyo3(signature = (index_name))]
+    fn zone_statistics<'py>(
+        &self,
+        py: Python<'py>,
+        index_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batch = rt()
+            .block_on(None, self.ds.statistics().zone_statistics(&index_name))?
+            .infer_error()?;
+        batch.to_pyarrow(py)
+    }
+
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
         let core_fragments = self_.ds.get_fragments();
 

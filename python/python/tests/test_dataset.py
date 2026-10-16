@@ -5794,6 +5794,33 @@ EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
 EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
 
 
+def test_zone_statistics(tmp_path: Path):
+    table = pa.table({"x": list(range(100)), "y": ["a"] * 100})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP", name="x_zonemap")
+    dataset.create_scalar_index("y", index_type="BTREE", name="y_btree")
+
+    zones = dataset.stats.zone_statistics("x_zonemap")
+    assert zones.column_names == [
+        "min",
+        "max",
+        "null_count",
+        "nan_count",
+        "fragment_id",
+        "zone_start",
+        "zone_length",
+    ]
+    assert zones.schema.metadata[b"rows_per_zone"]
+    assert pc.min(zones["min"]).as_py() == 0
+    assert pc.max(zones["max"]).as_py() == 99
+    assert pc.sum(zones["zone_length"]).as_py() == 100
+
+    with pytest.raises(ValueError, match="not found"):
+        dataset.stats.zone_statistics("missing")
+    with pytest.raises(ValueError, match="not a ZoneMap"):
+        dataset.stats.zone_statistics("y_btree")
+
+
 def test_stats(tmp_path: Path):
     table = pa.table({"x": [1, 2, 3, 4], "y": ["foo", "bar", "baz", "qux"]})
     dataset = lance.write_dataset(table, tmp_path)

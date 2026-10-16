@@ -5,6 +5,8 @@
 
 use std::{collections::HashMap, future::Future, sync::Arc};
 
+use arrow_array::RecordBatch;
+use arrow_select::concat::concat_batches;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
@@ -208,6 +210,66 @@ impl<'a> DatasetStatistics<'a> {
             return Ok(None);
         };
         Ok(ZoneMapIndex::value_range_over(zonemaps))
+    }
+
+    /// Per-zone statistics for the ZoneMap index named `index_name`.
+    ///
+    /// Segments of a multi-segment index are concatenated. The batch columns
+    /// are `min`, `max`, `null_count`, `nan_count`, `fragment_id`,
+    /// `zone_start`, and `zone_length`.
+    pub async fn zone_statistics(&self, index_name: &str) -> Result<RecordBatch> {
+        let dataset = self.dataset;
+        let indices = dataset.load_indices().await?;
+        let segments: Vec<_> = indices
+            .iter()
+            .filter(|idx| idx.name == index_name)
+            .filter(|idx| {
+                idx.index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+            })
+            .collect();
+        if segments.is_empty() {
+            if indices.iter().any(|idx| idx.name == index_name) {
+                return Err(Error::invalid_input(format!(
+                    "zone_statistics: index '{index_name}' is not a ZoneMap index"
+                )));
+            }
+            return Err(Error::invalid_input(format!(
+                "zone_statistics: index '{index_name}' not found"
+            )));
+        }
+
+        let mut batches = Vec::with_capacity(segments.len());
+        for idx in &segments {
+            let Some(field_id) = idx.keyed_field() else {
+                return Err(Error::invalid_input(format!(
+                    "zone_statistics: index '{index_name}' segment {} has no keyed field",
+                    idx.uuid
+                )));
+            };
+            let field_path = dataset.schema().field_path(field_id)?;
+            let opened = dataset
+                .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                .await?;
+            let Some(zonemap) = opened.as_any().downcast_ref::<ZoneMapIndex>() else {
+                return Err(Error::invalid_input(format!(
+                    "zone_statistics: index '{index_name}' segment {} is not a ZoneMapIndex",
+                    idx.uuid
+                )));
+            };
+            batches.push(zonemap.zones_as_batch()?);
+        }
+
+        if batches.len() == 1 {
+            return Ok(batches.remove(0));
+        }
+        let schema = batches[0].schema();
+        concat_batches(&schema, &batches).map_err(|err| {
+            Error::invalid_input(format!(
+                "zone_statistics: failed to combine segments of '{index_name}': {err}"
+            ))
+        })
     }
 }
 

@@ -8114,6 +8114,29 @@ class LanceStats:
         """
         return self._ds.data_stats()
 
+    def zone_statistics(self, index_name: str) -> pa.Table:
+        """
+        Per-zone statistics for a ZoneMap index.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the ZoneMap index.
+
+        Returns
+        -------
+        pyarrow.Table
+            One row per zone. Columns are ``min``, ``max``, ``null_count``,
+            ``nan_count``, ``fragment_id``, ``zone_start``, and
+            ``zone_length``. Schema metadata includes ``rows_per_zone``.
+
+        Raises
+        ------
+        ValueError
+            If ``index_name`` does not exist or is not a ZoneMap index.
+        """
+        return pa.Table.from_batches([self._ds.zone_statistics(index_name)])
+
 
 def write_dataset(
     data_obj: ReaderLike,

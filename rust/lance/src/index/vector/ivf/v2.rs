@@ -7221,8 +7221,23 @@ mod tests {
     }
 
     fn level0_edges(graph: &RecordBatch) -> HashSet<(u32, u32)> {
-        let metadata: HnswMetadata =
-            serde_json::from_str(&graph.schema_ref().metadata()[HNSW_METADATA_KEY]).unwrap();
+        // Compaction stores `""` for a partition whose graph has no rows, for
+        // example when every row assigned to it was deleted. That is not JSON.
+        let metadata_json = graph
+            .schema_ref()
+            .metadata()
+            .get(HNSW_METADATA_KEY)
+            .map(String::as_str)
+            .unwrap_or("");
+        if metadata_json.is_empty() {
+            assert_eq!(
+                graph.num_rows(),
+                0,
+                "HNSW graph has rows but no {HNSW_METADATA_KEY} metadata"
+            );
+            return HashSet::new();
+        }
+        let metadata: HnswMetadata = serde_json::from_str(metadata_json).unwrap();
         let neighbors = graph[HNSW_NEIGHBORS_COL].as_list::<i32>();
         (0..metadata.level_offsets[1])
             .flat_map(|node| {

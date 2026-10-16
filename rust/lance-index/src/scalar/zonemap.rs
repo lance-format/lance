@@ -34,7 +34,7 @@ use std::sync::LazyLock;
 use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -146,10 +146,80 @@ impl DeepSizeOf for ZoneMapIndex {
     }
 }
 
+fn zone_scalar_column(
+    data_type: &DataType,
+    values: impl IntoIterator<Item = ScalarValue>,
+) -> lance_core::Result<ArrayRef> {
+    let values: Vec<ScalarValue> = values.into_iter().collect();
+    if values.is_empty() {
+        return Ok(new_empty_array(data_type));
+    }
+    ScalarValue::iter_to_array(values).map_err(|err| {
+        lance_core::Error::invalid_input(format!("failed to build zone statistic column: {err}"))
+    })
+}
+
 impl ZoneMapIndex {
     /// Returns the rows-per-zone parameter for this index.
     pub fn rows_per_zone(&self) -> u64 {
         self.rows_per_zone
+    }
+
+    /// Per-zone statistics as a record batch.
+    ///
+    /// Columns match the on-disk zone map: `min`, `max`, `null_count`,
+    /// `nan_count`, `fragment_id`, `zone_start`, and `zone_length`. Schema
+    /// metadata carries `rows_per_zone`.
+    pub fn zones_as_batch(&self) -> lance_core::Result<RecordBatch> {
+        let min_array = zone_scalar_column(
+            &self.data_type,
+            self.zones.iter().map(|zone| zone.min.clone()),
+        )?;
+        let max_array = zone_scalar_column(
+            &self.data_type,
+            self.zones.iter().map(|zone| zone.max.clone()),
+        )?;
+        let null_count =
+            UInt32Array::from_iter_values(self.zones.iter().map(|zone| zone.null_count));
+        let nan_count = UInt32Array::from_iter_values(self.zones.iter().map(|zone| zone.nan_count));
+        let fragment_id =
+            UInt64Array::from_iter_values(self.zones.iter().map(|zone| zone.bound.fragment_id));
+        let zone_start =
+            UInt64Array::from_iter_values(self.zones.iter().map(|zone| zone.bound.start));
+        let zone_length =
+            UInt64Array::from_iter_values(self.zones.iter().map(|zone| zone.bound.length as u64));
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("rows_per_zone".to_string(), self.rows_per_zone.to_string());
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("min", min_array.data_type().clone(), true),
+                Field::new("max", max_array.data_type().clone(), true),
+                Field::new("null_count", DataType::UInt32, false),
+                Field::new("nan_count", DataType::UInt32, false),
+                Field::new("fragment_id", DataType::UInt64, false),
+                Field::new("zone_start", DataType::UInt64, false),
+                Field::new("zone_length", DataType::UInt64, false),
+            ])
+            .with_metadata(metadata),
+        );
+        RecordBatch::try_new(
+            schema,
+            vec![
+                min_array,
+                max_array,
+                Arc::new(null_count),
+                Arc::new(nan_count),
+                Arc::new(fragment_id),
+                Arc::new(zone_start),
+                Arc::new(zone_length),
+            ],
+        )
+        .map_err(|err| {
+            lance_core::Error::invalid_input(format!(
+                "failed to build zone statistics batch: {err}"
+            ))
+        })
     }
 
     fn scalar_is_nan(value: &ScalarValue) -> bool {
