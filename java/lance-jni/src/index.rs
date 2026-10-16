@@ -211,6 +211,8 @@ fn determine_index_type<'local>(
             Some("BLOOM_FILTER")
         } else if lower.contains("rtree") {
             Some("RTREE")
+        } else if lower.contains("minhashlsh") {
+            Some("MINHASH_LSH")
         } else if lower.contains("ivfhnsw") {
             if lower.contains("sq") {
                 Some("IVF_HNSW_SQ")
