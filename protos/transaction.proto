@@ -33,6 +33,11 @@ message Transaction {
 
   /* Optional properties for the transaction
    * __lance_commit_message is a reserved key
+   * __lance_idempotency_keys is a reserved key holding the transaction's
+   * idempotency keys as a JSON array of strings; see the Idempotency Keys
+   * section of the transaction specification. EXPERIMENTAL: the key, its
+   * encoding and its conflict rule may change incompatibly without a
+   * separate vote
    */
   map<string, string> transaction_properties = 4;
 
