@@ -253,7 +253,7 @@ pub struct JsonIndexParameters {
 ///
 /// Exposed so callers that only have a `ScalarIndexParams` (not a live `JsonIndex`) can
 /// still tell what a JSON index wraps, e.g. to reject an unsafe wrapped combination before
-/// training -- see `build_scalar_index`'s JSON-wrapped-BTREE guard.
+/// training -- see `build_scalar_index`'s JSON-wrapped-address-domain guard.
 pub fn json_wrapped_target_type(params_json: &str) -> Option<String> {
     serde_json::from_str::<JsonIndexParameters>(params_json)
         .ok()

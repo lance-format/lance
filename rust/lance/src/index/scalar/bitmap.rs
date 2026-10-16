@@ -13,6 +13,18 @@ use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
+fn ensure_bitmap_details(segment: &IndexMetadata) -> Result<()> {
+    if let Some(details) = segment.index_details.as_ref()
+        && !details.type_url.ends_with("BitmapIndexDetails")
+    {
+        return Err(Error::invalid_input(format!(
+            "Segment '{}' is not a Bitmap segment (details type_url = '{}')",
+            segment.uuid, details.type_url
+        )));
+    }
+    Ok(())
+}
+
 /// Open the given bitmap `segments` and k-way merge their postings, together
 /// with `new_data`, into a single bitmap index written to `new_store`.
 pub(in crate::index) async fn open_and_merge_segments(
@@ -60,6 +72,30 @@ pub(in crate::index) async fn merge_segments(
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
 
+    for segment in &segments {
+        ensure_bitmap_details(segment)?;
+    }
+
+    // A pre-migration segment stores row ids directly, which on a
+    // stable-row-id dataset are a different domain than the row addresses a
+    // modern segment stores; merging the two into one segment would silently
+    // combine incompatible values in the postings column. This path never
+    // rescans the dataset to repair that, so refuse rather than corrupt --
+    // the caller should fully rebuild the legacy segment first (e.g. via
+    // `create_index(..., replace: true)`).
+    if dataset.manifest.uses_stable_row_ids() {
+        for segment in &segments {
+            if !segment.results_are_row_addrs() {
+                return Err(Error::invalid_input(format!(
+                    "Bitmap merge_segments: segment {} predates row-address-domain support and \
+                     cannot be merged on a dataset with stable row IDs; rebuild it first (e.g. \
+                     with create_index(..., replace: true))",
+                    segment.uuid,
+                )));
+            }
+        }
+    }
+
     let field_id = *segments[0].fields.first().ok_or_else(|| {
         Error::invalid_input(format!(
             "CreateIndex: segment {} is missing field ids",
@@ -70,7 +106,7 @@ pub(in crate::index) async fn merge_segments(
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
             .await?;
 
     let new_uuid = Uuid::new_v4();

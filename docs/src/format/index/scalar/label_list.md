@@ -13,14 +13,14 @@ They provide efficient set-based queries on multi-value columns using an underly
 
 The label list index uses a bitmap index internally and stores its data in:
 
-1. `bitmap_page_lookup.lance` - Bitmap index mapping unique labels to row IDs
+1. `bitmap_page_lookup.lance` - Bitmap index mapping unique labels to row addresses (or row ids, pre-format-version-2)
 
 ### File Schema
 
 | Column    | Type       | Nullable | Description                                                            |
 |-----------|------------|----------|------------------------------------------------------------------------|
 | `keys`    | {DataType} | true     | The unique label value from the indexed column                         |
-| `bitmaps` | Binary     | true     | Serialized RowAddrTreeMap containing row addr where this label appears |
+| `bitmaps` | Binary     | true     | Serialized RowAddrTreeMap of physical row addresses (`fragment_id << 32 \| offset`) where this label appears. A segment persisted before format version 2 (`IndexMetadata::index_version`) stores row ids here instead. |
 
 ## Accelerated Queries
 
