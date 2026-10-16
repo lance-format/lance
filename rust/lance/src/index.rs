@@ -7219,6 +7219,24 @@ mod tests {
             let num_rows = dataset.count_all_rows().await.unwrap();
             assert_eq!(indexed_rows, expected_indexed_rows);
             assert_eq!(unindexed_rows, num_rows - expected_indexed_rows);
+            for metadata in dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|metadata| metadata.name == "text_idx")
+            {
+                let index = dataset
+                    .open_scalar_index("text", &metadata.uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let live_index = Arc::downgrade(&index);
+                drop(index);
+                assert!(
+                    live_index.upgrade().is_none(),
+                    "optimization retained a live FTS index in the session cache"
+                );
+            }
         }
 
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -7359,6 +7377,7 @@ mod tests {
             compact_files(&mut dataset, CompactionOptions::default(), None)
                 .await
                 .unwrap();
+            assert_indexed_rows(&dataset, num_rows).await;
             for &word in uppercase_words.iter() {
                 let query_result = dataset
                     .scan()

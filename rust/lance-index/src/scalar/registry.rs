@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
 use arrow_schema::{DataType, Field};
@@ -255,6 +255,36 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Provide cached state that owns no open readers or row-ID remappers.
+    ///
+    /// The cache keeps only a weak reference to the live index when this returns
+    /// `Some`. The plugin must reconstruct a request's live index from the state
+    /// in its open path. `None` preserves the default live-index cache.
+    ///
+    /// See [`single_flight_store_bound_open_with_snapshot`] for an example.
+    fn cache_snapshot(&self, _index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Ok(None)
+    }
+
+    /// Reconstruct cached state with the current store and batch row-ID remapper.
+    ///
+    /// The caller scopes the state to an immutable index and fragment-reuse
+    /// namespace. Implementations may share decoded and prewarmed data, but must
+    /// replace request-owned readers and remappers. Returning `None` falls back
+    /// to [`load_index_with_remapping`](Self::load_index_with_remapping).
+    /// Plugins providing a [`cache_snapshot`](Self::cache_snapshot) for batch
+    /// remapping should override this to preserve that state across requests.
+    ///
+    /// See [`single_flight_store_bound_open_with_snapshot`] for an example.
+    fn rebind_with_remapping(
+        &self,
+        _index: &dyn ScalarIndex,
+        _index_store: Arc<dyn IndexStore>,
+        _remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Ok(None)
+    }
+
     /// Open an index through the cache, awaiting `load` only on a miss.
     ///
     /// The default read-through / write-back over
@@ -420,11 +450,53 @@ where
     Rebind: FnOnce(Arc<dyn ScalarIndex>) -> RebindFuture + Send,
     RebindFuture: Future<Output = Result<Option<Arc<dyn ScalarIndex>>>> + Send,
 {
+    single_flight_store_bound_open_with_snapshot(index_store, cache, load, rebind, |_| Ok(None))
+        .await
+}
+
+/// Retain a reader-free snapshot and only a weak reference to the live index
+/// when the plugin supports it. Other indices keep their existing live cache.
+///
+/// If the state cannot be rebound, a new load supplies the request's readers.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance_core::{cache::LanceCache, Result};
+/// # use lance_index::scalar::{IndexStore, ScalarIndex};
+/// # use lance_index::scalar::registry::{ScalarIndexLoad, ScalarIndexPlugin,
+/// #     single_flight_store_bound_open_with_snapshot};
+/// # use lance_index_core::remapping::BatchRowIdRemapper;
+/// # async fn open(plugin: &dyn ScalarIndexPlugin, store: Arc<dyn IndexStore>,
+/// #     cache: &LanceCache, load: ScalarIndexLoad<'_>,
+/// #     remapping: Arc<dyn BatchRowIdRemapper>) -> Result<Arc<dyn ScalarIndex>> {
+/// let rebind_store = store.clone();
+/// single_flight_store_bound_open_with_snapshot(
+///     store, cache, load,
+///     |index| async move {
+///         plugin.rebind_with_remapping(index.as_ref(), rebind_store, Some(remapping))
+///     },
+///     |index| plugin.cache_snapshot(index),
+/// ).await
+/// # }
+/// ```
+pub async fn single_flight_store_bound_open_with_snapshot<Rebind, RebindFuture, Snapshot>(
+    index_store: Arc<dyn IndexStore>,
+    cache: &LanceCache,
+    load: ScalarIndexLoad<'_>,
+    rebind: Rebind,
+    snapshot: Snapshot,
+) -> Result<Arc<dyn ScalarIndex>>
+where
+    Rebind: FnOnce(Arc<dyn ScalarIndex>) -> RebindFuture + Send,
+    RebindFuture: Future<Output = Result<Option<Arc<dyn ScalarIndex>>>> + Send,
+    Snapshot: Fn(&dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> + Send + Sync,
+{
     let pending_load = Arc::new(Mutex::new(Some(load)));
     let cache_load = pending_load.clone();
     let loaded_index = Arc::new(OnceLock::new());
     let cache_loaded_index = loaded_index.clone();
     let cache_index_store = index_store.clone();
+    let cache_snapshot = &snapshot;
     let entry = cache
         .get_or_insert_unsized_with_key(ScalarIndexCacheKey, move || async move {
             let load = take_scalar_index_load(&cache_load)?.ok_or_else(|| {
@@ -434,9 +506,11 @@ where
             })?;
             let index = load.await?;
             cache_loaded_index.get_or_init(|| index.clone());
-            Ok(Arc::new(StoreBoundScalarIndexCacheEntry::new(
+            let snapshot = cache_snapshot(index.as_ref())?;
+            Ok(Arc::new(StoreBoundScalarIndexCacheEntry::with_snapshot(
                 cache_index_store,
                 index,
+                snapshot,
             )))
         })
         .await?;
@@ -449,8 +523,10 @@ where
     }
 
     let binding = entry.binding.load_full();
-    if index_store.is_same_storage_binding(binding.index_store.as_ref()) {
-        return Ok(binding.index.clone());
+    if index_store.is_same_storage_binding(binding.index_store.as_ref())
+        && let Some(index) = binding.live_index()
+    {
+        return Ok(index);
     }
 
     // Reader-free state can be rebound independently for each request. Do not
@@ -458,17 +534,20 @@ where
     // if the source binding is still current, so a delayed caller cannot roll
     // the cache back after another request has replaced it.
     if let Some(index) = rebind(binding.index.clone()).await? {
+        let snapshot = snapshot(index.as_ref())?;
         let previous = entry.binding.compare_and_swap(
             &binding,
-            Arc::new(StoreBoundScalarIndexBinding {
-                index_store: index_store.clone(),
-                index: index.clone(),
-            }),
+            Arc::new(StoreBoundScalarIndexBinding::new(
+                index_store.clone(),
+                index.clone(),
+                snapshot,
+            )),
         );
         if !Arc::ptr_eq(&previous, &binding)
             && index_store.is_same_storage_binding(previous.index_store.as_ref())
+            && let Some(index) = previous.live_index()
         {
-            return Ok(previous.index.clone());
+            return Ok(index);
         }
         return Ok(index);
     }
@@ -484,7 +563,14 @@ where
         lance_core::Error::internal("store-bound scalar index load has no retained result")
     })?;
     let index = load.await?;
-    entry.replace(index_store, index.clone());
+    let snapshot = snapshot(index.as_ref())?;
+    entry
+        .binding
+        .store(Arc::new(StoreBoundScalarIndexBinding::new(
+            index_store,
+            index.clone(),
+            snapshot,
+        )));
     Ok(index)
 }
 
@@ -499,14 +585,47 @@ fn take_scalar_index_load<'a>(
         .map(|mut pending_load| pending_load.take())
 }
 
-/// A live scalar index together with the store binding used to open it.
-#[derive(DeepSizeOf)]
+/// Cached scalar state together with the store binding used to open it.
 struct StoreBoundScalarIndexBinding {
     index_store: Arc<dyn IndexStore>,
     index: Arc<dyn ScalarIndex>,
+    // With a snapshot, active requests may share a live reader, but the cache
+    // must not extend that reader's lifetime. None preserves live-only plugins.
+    live_index: Option<Weak<dyn ScalarIndex>>,
 }
 
-/// A stable cache slot for one live, store-bound scalar index.
+impl DeepSizeOf for StoreBoundScalarIndexBinding {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.index_store.deep_size_of_children(context) + self.index.deep_size_of_children(context)
+    }
+}
+
+impl StoreBoundScalarIndexBinding {
+    fn new(
+        index_store: Arc<dyn IndexStore>,
+        index: Arc<dyn ScalarIndex>,
+        snapshot: Option<Arc<dyn ScalarIndex>>,
+    ) -> Self {
+        let (index, live_index) = match snapshot {
+            Some(snapshot) => (snapshot, Some(Arc::downgrade(&index))),
+            None => (index, None),
+        };
+        Self {
+            index_store,
+            index,
+            live_index,
+        }
+    }
+
+    fn live_index(&self) -> Option<Arc<dyn ScalarIndex>> {
+        match &self.live_index {
+            Some(index) => index.upgrade(),
+            None => Some(self.index.clone()),
+        }
+    }
+}
+
+/// A stable cache slot for a scalar index's state and current storage binding.
 pub struct StoreBoundScalarIndexCacheEntry {
     binding: ArcSwap<StoreBoundScalarIndexBinding>,
     replacement_guard: tokio::sync::Mutex<()>,
@@ -520,33 +639,45 @@ impl DeepSizeOf for StoreBoundScalarIndexCacheEntry {
 
 impl StoreBoundScalarIndexCacheEntry {
     fn new(index_store: Arc<dyn IndexStore>, index: Arc<dyn ScalarIndex>) -> Self {
+        Self::with_snapshot(index_store, index, None)
+    }
+
+    pub(crate) fn with_snapshot(
+        index_store: Arc<dyn IndexStore>,
+        index: Arc<dyn ScalarIndex>,
+        snapshot: Option<Arc<dyn ScalarIndex>>,
+    ) -> Self {
         Self {
-            binding: ArcSwap::from_pointee(StoreBoundScalarIndexBinding { index_store, index }),
+            binding: ArcSwap::from_pointee(StoreBoundScalarIndexBinding::new(
+                index_store,
+                index,
+                snapshot,
+            )),
             replacement_guard: tokio::sync::Mutex::new(()),
         }
     }
 
-    fn index_for_store(&self, index_store: &Arc<dyn IndexStore>) -> Option<Arc<dyn ScalarIndex>> {
+    pub(crate) fn index_for_store(
+        &self,
+        index_store: &Arc<dyn IndexStore>,
+    ) -> Option<Arc<dyn ScalarIndex>> {
         let binding = self.binding.load();
         index_store
             .is_same_storage_binding(binding.index_store.as_ref())
-            .then(|| binding.index.clone())
+            .then(|| binding.live_index())
+            .flatten()
     }
 
-    fn replace(&self, index_store: Arc<dyn IndexStore>, index: Arc<dyn ScalarIndex>) {
-        self.binding.store(Arc::new(StoreBoundScalarIndexBinding {
-            index_store,
-            index,
-        }));
-    }
-
-    /// Return a shared handle to the cached scalar index.
+    /// Return the live index, or its reader-free snapshot after the request ends.
     pub fn index(&self) -> Arc<dyn ScalarIndex> {
-        self.binding.load().index.clone()
+        let binding = self.binding.load();
+        binding
+            .live_index()
+            .unwrap_or_else(|| binding.index.clone())
     }
 }
 
-/// In-memory cache key for a live, store-bound scalar index.
+/// In-memory cache key for a scalar index's storage-bound state.
 ///
 /// Used by the default [`ScalarIndexPlugin::get_from_cache`] /
 /// [`ScalarIndexPlugin::put_in_cache`] implementations. The cache is already

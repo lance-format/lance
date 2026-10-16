@@ -619,6 +619,93 @@ async fn text_indices_translate_through_the_shared_remapper(#[case] index_type: 
     }
 }
 
+#[rstest::rstest]
+#[case::lazy(false)]
+#[case::prewarmed(true)]
+#[tokio::test]
+async fn translated_fts_preserves_cached_state_after_request_end(#[case] prewarm: bool) {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col("text", lance_datagen::array::fill_utf8("hit".to_string()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &lance_index::scalar::InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let metadata = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    if prewarm {
+        dataset.prewarm_index("text_idx").await.unwrap();
+    } else {
+        dataset
+            .open_scalar_index("text", &metadata.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+    }
+    let before = crate::index::scalar::cached_scalar_index_container(&dataset, &metadata.uuid)
+        .await
+        .unwrap();
+    let before = before
+        .as_any()
+        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+        .unwrap();
+    for _ in 0..2 {
+        let metrics = lance_index::metrics::LocalMetricsCollector::default();
+        let index = dataset
+            .open_scalar_index("text", &metadata.uuid, &metrics)
+            .await
+            .unwrap();
+        let after = index
+            .as_any()
+            .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+            .unwrap();
+        assert_eq!(
+            (
+                metrics
+                    .index_loads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before.shares_prewarm_state(after),
+            ),
+            (0, true),
+            "translated FTS must preserve cached state after its request ends"
+        );
+        let live = Arc::downgrade(&index);
+        drop(index);
+        assert!(live.upgrade().is_none());
+        let mut scan = dataset.scan();
+        scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+            .unwrap();
+        let result = scan.try_into_batch().await.unwrap();
+        let mut values = result["i"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (0..8).collect::<Vec<_>>());
+    }
+}
+
 #[tokio::test]
 async fn label_list_translates_values_and_null_rows() {
     let labels = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Int64Type, _, _>(

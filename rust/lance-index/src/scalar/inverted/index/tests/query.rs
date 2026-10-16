@@ -31,6 +31,115 @@ impl WrappingObjectStore for RequestWrapper {
     }
 }
 
+#[derive(Debug, Default)]
+struct OffsetBatchRemapper {
+    calls: AtomicU32,
+}
+
+#[async_trait]
+impl BatchRowIdRemapper for OffsetBatchRemapper {
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(row_ids.iter().map(|row_id| Some(row_id + 1000)).collect())
+    }
+}
+
+#[tokio::test]
+async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_resources() {
+    let object_store = ObjectStore::memory();
+    let metadata_cache = Arc::new(LanceCache::with_capacity(1 << 20));
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(object_store.clone()),
+        "index".into(),
+        metadata_cache.clone(),
+    ));
+    write_single_partition_index(
+        store.clone(),
+        InvertedIndexParams::default(),
+        TokenSetFormat::default(),
+        "hit",
+        100,
+    )
+    .await
+    .unwrap();
+    let plugin = InvertedIndexPlugin;
+    let remapper = Arc::new(OffsetBatchRemapper::default());
+    let remapper_weak = Arc::downgrade(&remapper);
+    let cache = LanceCache::with_capacity(1 << 20);
+    let index = InvertedIndex::load_with_remapping(store, Some(remapper.clone()), &cache)
+        .await
+        .unwrap();
+    index.prewarm().await.unwrap();
+    let snapshot = plugin.cache_snapshot(index.as_ref()).unwrap().unwrap();
+    let reader = Arc::downgrade(
+        index.partitions[0]
+            .inverted_list
+            .reader
+            .get()
+            .await
+            .unwrap(),
+    );
+    drop(index);
+    drop(remapper);
+    assert!(reader.upgrade().is_none());
+    assert!(remapper_weak.upgrade().is_none());
+
+    let wrapper = RequestWrapper::default();
+    let revoked = Arc::new(AtomicBool::new(true));
+    let policy_revoked = revoked.clone();
+    wrapper.policy.lock().unwrap().set_before_policy(
+        "credentials",
+        Arc::new(move |_, _| {
+            if policy_revoked.load(Ordering::Relaxed) {
+                Err(Error::io("request credentials revoked"))
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    let mut wrapped = object_store;
+    wrapped.apply_wrapper(&wrapper);
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(wrapped),
+        "index".into(),
+        metadata_cache,
+    ));
+    let remapper = Arc::new(OffsetBatchRemapper::default());
+    let remapper_weak = Arc::downgrade(&remapper);
+    let index = plugin
+        .rebind_with_remapping(snapshot.as_ref(), store, Some(remapper.clone()))
+        .unwrap()
+        .unwrap();
+    let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+    assert!(
+        inverted.shares_prewarm_state(snapshot.as_any().downcast_ref::<InvertedIndex>().unwrap())
+    );
+    let partition = &inverted.partitions[0];
+    let posting_error = partition.inverted_list.reader.get().await.err().unwrap();
+    let document_error = partition.docs.load_build_docset().await.err().unwrap();
+    for error in [posting_error, document_error] {
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(error.to_string().contains("request credentials revoked"));
+    }
+    revoked.store(false, Ordering::Relaxed);
+    let documents = partition.docs.load_build_docset().await.unwrap();
+    assert_eq!(documents.row_id(0), 1100);
+    assert_eq!(remapper.calls.load(Ordering::Relaxed), 1);
+    let reader = Arc::downgrade(partition.inverted_list.reader.get().await.unwrap());
+    let rebound_snapshot = plugin.cache_snapshot(index.as_ref()).unwrap().unwrap();
+    drop(index);
+    drop(remapper);
+    assert!(reader.upgrade().is_none());
+    assert!(remapper_weak.upgrade().is_none());
+    assert!(
+        rebound_snapshot
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .unwrap()
+            .shares_prewarm_state(snapshot.as_any().downcast_ref::<InvertedIndex>().unwrap())
+    );
+}
+
 #[tokio::test]
 async fn test_request_wrappers_preserve_prewarmed_index_state() {
     let object_store = ObjectStore::memory();

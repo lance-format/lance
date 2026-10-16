@@ -2,6 +2,138 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::inverted::InvertedIndexPlugin;
+use crate::scalar::registry::ScalarIndexPlugin;
+use lance_core::cache::MokaCacheBackend;
+
+#[rstest::rstest]
+#[case::quick(Arc::new(QuickCacheBackend::with_capacity(1 << 20)))]
+#[case::moka(Arc::new(MokaCacheBackend::with_capacity(1 << 20)))]
+#[tokio::test]
+async fn cached_fts_versions_release_posting_readers(
+    #[case] backend: Arc<dyn lance_core::cache::CacheBackend>,
+) {
+    let tmpdir = TempObjDir::default();
+    let metadata_cache = Arc::new(LanceCache::with_capacity(1 << 20));
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        metadata_cache.clone(),
+    ));
+    for (partition_id, row_id) in [(0, 100), (1, 200)] {
+        let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+        builder.tokens.get_or_add("test");
+        let mut posting = PostingListBuilder::new(false);
+        posting.add(0, PositionRecorder::Count(1));
+        builder.posting_lists.push(posting);
+        builder.docs.append(row_id, 1);
+        builder.write(store.as_ref()).await.unwrap();
+    }
+    write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+
+    let cache = LanceCache::with_backend(backend);
+    let plugin = InvertedIndexPlugin;
+    // Different namespaces model the UUIDs produced by repeated optimization.
+    for version in 0..3 {
+        let version_cache = cache.with_key_prefix(&version.to_string());
+        let load_store = store.clone();
+        let load_cache = version_cache.clone();
+        let index = plugin
+            .get_or_insert_in_cache(
+                store.clone(),
+                None,
+                &version_cache,
+                Box::pin(async move {
+                    Ok(InvertedIndex::load(load_store, None, &load_cache).await?
+                        as Arc<dyn ScalarIndex>)
+                }),
+            )
+            .await
+            .unwrap();
+        let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        let mut readers = Vec::with_capacity(2);
+        for partition in &inverted.partitions {
+            readers.push(Arc::downgrade(
+                partition.inverted_list.reader.get().await.unwrap(),
+            ));
+        }
+        inverted.prewarm().await.unwrap();
+        drop(index);
+        assert!(
+            readers.iter().all(|reader| reader.upgrade().is_none()),
+            "cached FTS version {version} retained a posting reader after its request ended"
+        );
+
+        // Exercise both the same binding and a new request's binding. Neither
+        // may publish its live readers into the long-lived cache entry.
+        for request_store in [
+            store.clone(),
+            Arc::new(LanceIndexStore::new(
+                ObjectStore::local().into(),
+                tmpdir.clone(),
+                metadata_cache.clone(),
+            )),
+        ] {
+            let index = plugin
+                .get_or_insert_in_cache(
+                    request_store.clone(),
+                    None,
+                    &version_cache,
+                    Box::pin(async { panic!("warm FTS state must not reload") }),
+                )
+                .await
+                .unwrap();
+            let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+            readers.clear();
+            for partition in &inverted.partitions {
+                readers.push(Arc::downgrade(
+                    partition.inverted_list.reader.get().await.unwrap(),
+                ));
+            }
+            let (mut row_ids, scores) = inverted
+                .bm25_search(
+                    Arc::new(Tokens::new(vec!["test".to_owned()], DocType::Text)),
+                    Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+                    Operator::Or,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            row_ids.sort_unstable();
+            assert_eq!(row_ids, vec![100, 200]);
+            assert!(scores.iter().all(|score| *score > 0.0));
+            plugin
+                .put_in_cache(request_store.clone(), &version_cache, index.clone())
+                .await
+                .unwrap();
+            drop(index);
+            assert!(readers.iter().all(|reader| reader.upgrade().is_none()));
+            let index = plugin
+                .get_from_cache(request_store, None, &version_cache)
+                .await
+                .unwrap()
+                .expect("reader-free state must survive after its live handle is dropped");
+            let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+            let reader = Arc::downgrade(
+                inverted.partitions[0]
+                    .inverted_list
+                    .reader
+                    .get()
+                    .await
+                    .unwrap(),
+            );
+            drop(index);
+            assert!(reader.upgrade().is_none());
+        }
+    }
+    assert!(
+        cache.size().await >= 3,
+        "the version states must remain cached"
+    );
+    assert!(cache.size_bytes().await <= 1 << 20);
+}
 
 #[tokio::test]
 async fn test_posting_cache_conflict_across_partitions() {
