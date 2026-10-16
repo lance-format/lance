@@ -804,6 +804,13 @@ pub struct FragReadConfig {
     pub with_row_id: bool,
     // Add the row address column
     pub with_row_address: bool,
+    /// Retain deleted rows in physical reads instead of filtering them out.
+    ///
+    /// Deleted rows have null `_rowid` and `_rowaddr` values when those columns
+    /// are enabled. Payload and row-version columns are unchanged.
+    /// [`FileFragment::open`] requires `with_row_id` or `with_row_address` when
+    /// this is true. Defaults to false.
+    pub make_deletions_null: bool,
     // Add the last updated at version column
     pub with_row_last_updated_at_version: bool,
     // Add the created at version column
@@ -838,6 +845,31 @@ impl FragReadConfig {
 
     pub fn with_row_address(mut self, value: bool) -> Self {
         self.with_row_address = value;
+        self
+    }
+
+    /// Configure deletion markers instead of filtering deleted rows.
+    ///
+    /// See [`Self::make_deletions_null`]. Use [`FragmentReader::read_all`],
+    /// [`FragmentReader::take_range`] or [`FragmentReader::read_ranges`] for
+    /// physical row selections; [`FragmentReader::read_range`] still interprets
+    /// its range in non-deleted row positions.
+    ///
+    /// ```
+    /// # use lance::{Result, dataset::fragment::{FileFragment, FragReadConfig}};
+    /// # async fn example(fragment: &FileFragment) -> Result<()> {
+    /// let config = FragReadConfig::default()
+    ///     .with_row_address(true)
+    ///     .with_make_deletions_null(true);
+    /// let reader = fragment.open(fragment.schema(), config).await?;
+    /// // Read physical offsets, with null addresses marking deleted rows.
+    /// let batches = reader.take_range(0..1, 1).await?;
+    /// # let _ = batches;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_make_deletions_null(mut self, value: bool) -> Self {
+        self.make_deletions_null = value;
         self
     }
 
@@ -1163,6 +1195,14 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
+        if read_config.make_deletions_null
+            && !read_config.with_row_id
+            && !read_config.with_row_address
+        {
+            return Err(Error::invalid_input(
+                "make_deletions_null requires with_row_id or with_row_address".to_string(),
+            ));
+        }
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
@@ -1267,6 +1307,9 @@ impl FileFragment {
         }
         if read_config.with_row_created_at_version {
             reader.with_row_created_at_version(created_at_sequence);
+        }
+        if read_config.make_deletions_null {
+            reader.with_make_deletions_null();
         }
 
         Ok(reader)
@@ -6438,6 +6481,167 @@ mod tests {
                 .windows(2)
                 .all(|pair| Arc::ptr_eq(&pair[0].schema(), &pair[1].schema()))
         );
+    }
+
+    #[rstest]
+    #[case::row_id(true, false, false, LanceFileVersion::V2_1)]
+    #[case::row_address(false, true, true, LanceFileVersion::V2_1)]
+    #[case::both(true, true, true, LanceFileVersion::V2_1)]
+    #[case::stable(true, true, false, LanceFileVersion::Stable)]
+    #[tokio::test]
+    async fn test_frag_read_config_make_deletions_null(
+        #[case] with_row_id: bool,
+        #[case] with_row_address: bool,
+        #[case] enable_stable_row_ids: bool,
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            (
+                "value",
+                Int32,
+                [
+                    Some(0),
+                    None,
+                    Some(20),
+                    None,
+                    Some(40),
+                    None,
+                    Some(60),
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(data_storage_version),
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("i IN (0, 1, 4, 5)").await.unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+
+        for (fragment_index, fragment) in fragments.iter().enumerate() {
+            for invalid_config in [
+                FragReadConfig {
+                    make_deletions_null: true,
+                    ..Default::default()
+                },
+                FragReadConfig::default()
+                    .with_make_deletions_null(true)
+                    .with_row_created_at_version(true),
+            ] {
+                let error = fragment
+                    .open(dataset.schema(), invalid_config)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("make_deletions_null requires with_row_id or with_row_address")
+                );
+            }
+
+            let config = FragReadConfig::default()
+                .with_row_id(with_row_id)
+                .with_row_address(with_row_address);
+            assert!(!config.make_deletions_null);
+            let reader = fragment
+                .open(
+                    dataset.schema(),
+                    config.clone().with_make_deletions_null(true),
+                )
+                .await
+                .unwrap();
+            let reads = [
+                (reader.read_all(2).await.unwrap(), vec![0, 1, 2, 3]),
+                (reader.take_range(0..2, 2).await.unwrap(), vec![0, 1]),
+                (reader.take_range(1..3, 2).await.unwrap(), vec![1, 2]),
+                (
+                    reader
+                        .read_ranges(Arc::from([0..1, 2..4]), 2)
+                        .await
+                        .unwrap(),
+                    vec![0, 2, 3],
+                ),
+            ];
+            for (stream, offsets) in reads {
+                let batches = stream.buffered(2).try_collect::<Vec<_>>().await.unwrap();
+                let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+                let expected_indices = UInt32Array::from(
+                    offsets
+                        .iter()
+                        .map(|offset| fragment_index as u32 * 4 + offset)
+                        .collect::<Vec<_>>(),
+                );
+                let expected =
+                    arrow_select::take::take_record_batch(&batch, &expected_indices).unwrap();
+                assert_eq!(actual.num_rows(), offsets.len());
+                for column in ["i", "value"] {
+                    assert_eq!(actual[column].as_ref(), expected[column].as_ref());
+                }
+                assert_eq!(actual.column_by_name(ROW_ID).is_some(), with_row_id);
+                assert_eq!(actual.column_by_name(ROW_ADDR).is_some(), with_row_address);
+                for (column, enabled) in [(ROW_ID, with_row_id), (ROW_ADDR, with_row_address)] {
+                    if !enabled {
+                        continue;
+                    }
+                    let expected_markers = UInt64Array::from(
+                        offsets
+                            .iter()
+                            .map(|&offset| {
+                                (offset >= 2).then(|| {
+                                    if column == ROW_ID && enable_stable_row_ids {
+                                        fragment_index as u64 * 4 + u64::from(offset)
+                                    } else {
+                                        u64::from(RowAddress::new_from_parts(
+                                            fragment.id() as u32,
+                                            offset,
+                                        ))
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    assert_eq!(actual[column].as_ref(), &expected_markers);
+                }
+            }
+
+            for filtered_config in [
+                config,
+                FragReadConfig::default(),
+                FragReadConfig::default()
+                    .with_make_deletions_null(true)
+                    .with_make_deletions_null(false),
+            ] {
+                let filtered = fragment
+                    .open(dataset.schema(), filtered_config)
+                    .await
+                    .unwrap()
+                    .read_range_as_batch(0..4)
+                    .await
+                    .unwrap();
+                assert_eq!(filtered.num_rows(), 2);
+                let expected = batch.slice(fragment_index * 4 + 2, 2);
+                for column in ["i", "value"] {
+                    assert_eq!(filtered[column].as_ref(), expected[column].as_ref());
+                }
+                for column in [ROW_ID, ROW_ADDR] {
+                    if let Some(markers) = filtered.column_by_name(column) {
+                        assert_eq!(markers.null_count(), 0);
+                    }
+                }
+            }
+        }
     }
 
     #[rstest]
