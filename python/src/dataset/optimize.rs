@@ -15,8 +15,9 @@
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        RewriteResult, commit_compaction, compact_files, plan_compaction,
+        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionScope,
+        CompactionTask, CompactionTaskKind, RewriteResult, commit_compaction, compact_files,
+        plan_compaction,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
@@ -92,6 +93,21 @@ fn parse_compaction_options(
                     opts.data_storage_version = Some(version.parse().infer_error()?);
                 }
             }
+            "max_data_files_per_fragment" => {
+                opts.max_data_files_per_fragment = value.extract()?;
+            }
+            "column_groups" => {
+                opts.column_groups = value
+                    .extract::<Option<Vec<Vec<String>>>>()?
+                    .unwrap_or_default();
+            }
+            "scope" => {
+                let scope: Option<String> = value.extract()?;
+                if let Some(scope) = scope {
+                    opts.scope = CompactionScope::try_from(scope.as_str())
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                }
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
@@ -129,8 +145,9 @@ pub struct PyCompactionMetrics {
     /// int : The number of files that have been removed, including deletion files.
     #[pyo3(get)]
     pub files_removed: usize,
-    /// int : The number of files that have been added, which is always equal to the
-    /// number of fragments.
+    /// int : The number of data files that have been added. A rewrite adds one
+    /// per new fragment (one per group with ``column_groups``), a column repack
+    /// one per new file.
     #[pyo3(get)]
     pub files_added: usize,
 }
@@ -263,8 +280,10 @@ impl PyCompactionTask {
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
         Ok(format!(
-            "CompactionTask(read_version={}, fragments=[{}])",
-            self.0.read_version, fragment_reprs
+            "CompactionTask(read_version={}, kind={}, fragments=[{}])",
+            self.0.read_version,
+            self.kind(),
+            fragment_reprs
         ))
     }
 
@@ -272,6 +291,16 @@ impl PyCompactionTask {
     #[getter]
     pub fn read_version(&self) -> u64 {
         self.0.read_version
+    }
+
+    /// str : ``"rewrite_fragments"`` for a task that rewrites its fragments,
+    /// ``"repack_columns"`` for one that repacks its fragment's columns.
+    #[getter]
+    pub fn kind(&self) -> &'static str {
+        match self.0.task.kind {
+            CompactionTaskKind::RewriteFragments => "rewrite_fragments",
+            CompactionTaskKind::RepackColumns { .. } => "repack_columns",
+        }
     }
 
     /// List[lance.fragment.FragmentMetadata] : The fragments that will be compacted.

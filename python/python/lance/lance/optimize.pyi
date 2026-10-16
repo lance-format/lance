@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from lance import LanceDataset
 from lance.fragment import FragmentMetadata
@@ -32,6 +32,7 @@ class RewriteResult:
 
 class CompactionTask:
     read_version: int
+    kind: Literal["rewrite_fragments", "repack_columns"]
     fragments: List["FragmentMetadata"]
 
     def execute(self, dataset: "LanceDataset") -> RewriteResult: ...

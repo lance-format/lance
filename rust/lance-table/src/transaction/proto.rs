@@ -373,12 +373,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                 }
             }
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement {
+                    replacements,
+                    data_change,
+                },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
                     .map(DataReplacementGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
+                data_change: data_change.unwrap_or(true),
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
                 pb::transaction::UpdateMemWalState { compacted_sstables },
@@ -673,14 +677,18 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema_metadata: Default::default(),
                 field_metadata: Default::default(),
             }),
-            Operation::DataReplacement { replacements } => {
-                pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
-                    replacements: replacements
-                        .iter()
-                        .map(pb::transaction::DataReplacementGroup::from)
-                        .collect(),
-                })
-            }
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            } => pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
+                replacements: replacements
+                    .iter()
+                    .map(pb::transaction::DataReplacementGroup::from)
+                    .collect(),
+                // Written only when false, so a transaction file from a data
+                // changing replacement stays byte-identical to an older writer's.
+                data_change: (!data_change).then_some(false),
+            }),
             Operation::DataOverlay { groups } => {
                 pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
                     groups: groups
@@ -890,5 +898,45 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    /// `data_change` survives the round trip, and a transaction written
+    /// before the field existed reads back as a data change.
+    #[rstest::rstest]
+    #[case::moved(false)]
+    #[case::changed(true)]
+    fn test_data_replacement_data_change_roundtrips(#[case] data_change: bool) {
+        let transaction = Transaction::new(
+            1,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("new.lance", vec![3], None),
+                )],
+                data_change,
+            },
+            None,
+        );
+        let mut message = pb::Transaction::try_from(&transaction).unwrap();
+        let decoded = Transaction::try_from(message.clone()).unwrap();
+        assert!(matches!(
+            decoded.operation,
+            Operation::DataReplacement { data_change: d, .. } if d == data_change
+        ));
+
+        if let Some(pb::transaction::Operation::DataReplacement(replacement)) =
+            message.operation.as_mut()
+        {
+            assert_eq!(replacement.data_change, (!data_change).then_some(false));
+            replacement.data_change = None;
+        }
+        let legacy = Transaction::try_from(message).unwrap();
+        assert!(matches!(
+            legacy.operation,
+            Operation::DataReplacement {
+                data_change: true,
+                ..
+            }
+        ));
     }
 }

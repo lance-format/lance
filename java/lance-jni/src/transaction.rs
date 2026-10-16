@@ -1127,13 +1127,19 @@ fn convert_to_java_operation_inner<'local>(
             )?;
             Ok(java_operation)
         }
-        Operation::DataReplacement { replacements } => {
+        Operation::DataReplacement {
+            replacements,
+            data_change,
+        } => {
             let java_replacements = export_vec(env, &replacements)?;
 
             Ok(env.new_object(
                 "org/lance/operation/DataReplacement",
-                "(Ljava/util/List;)V",
-                &[JValue::Object(&java_replacements)],
+                "(Ljava/util/List;Z)V",
+                &[
+                    JValue::Object(&java_replacements),
+                    JValue::Bool(data_change as u8),
+                ],
             )?)
         }
         Operation::DataOverlay { groups } => {
@@ -2069,7 +2075,13 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "replacements", |env, replacement| {
                     replacement.extract_object(env)
                 })?;
-            Operation::DataReplacement { replacements }
+            let data_change = env
+                .call_method(java_operation, "dataChange", "()Z", &[])?
+                .z()?;
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            }
         }
         "DataOverlay" => {
             let groups = import_vec_from_method(env, java_operation, "getGroups", |env, group| {

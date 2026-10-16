@@ -4369,6 +4369,7 @@ mod test {
             dataset.version().version,
             Operation::DataReplacement {
                 replacements: vec![replacement],
+                data_change: true,
             },
             None,
         );

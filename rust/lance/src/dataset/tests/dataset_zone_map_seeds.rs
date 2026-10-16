@@ -37,6 +37,7 @@ use lance_table::format::{DataFile, Fragment};
 
 use crate::Dataset;
 use crate::blob::{BlobArrayBuilder, blob_field};
+use crate::dataset::optimize::{CompactionOptions, CompactionScope, compact_files};
 use crate::dataset::schema_evolution::{ColumnAlteration, NewColumnTransform};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
@@ -76,6 +77,7 @@ async fn test_zone_map_seed_harvest_after_repeated_column_replacement(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -269,6 +271,7 @@ async fn test_zone_map_seed_harvest_after_column_name_swap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -644,7 +647,10 @@ async fn replace_column_in_batches(
     let read_version = dataset.manifest.version;
     Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset)),
-        Operation::DataReplacement { replacements },
+        Operation::DataReplacement {
+            replacements,
+            data_change: true,
+        },
         Some(read_version),
         None,
         None,
@@ -920,6 +926,28 @@ async fn test_merge_insert_inserted_fragments_get_seeds() {
     let reader = Box::new(RecordBatchIterator::new([Ok(source)], schema()));
     let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
     let dataset = dataset.as_ref().clone();
+    assert_new_files_seed_physical_rows(&dataset, &before, "val").await;
+}
+
+/// A column repack moving `val` into a file of its own writes that file's
+/// seed from the moved values, deleted rows included.
+#[tokio::test]
+async fn test_column_repack_seeds_moved_column() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_with_val_index(dir.as_str(), true).await;
+    dataset.delete("id % 3 = 0").await.unwrap();
+    let before = data_file_paths(&dataset);
+    let fragment_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    let options = CompactionOptions {
+        column_groups: vec![vec!["val".into()]],
+        scope: CompactionScope::RepackColumns,
+        ..Default::default()
+    };
+    compact_files(&mut dataset, options, None).await.unwrap();
+    assert_eq!(
+        dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+        fragment_ids
+    );
     assert_new_files_seed_physical_rows(&dataset, &before, "val").await;
 }
 

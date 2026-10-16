@@ -1071,7 +1071,7 @@ pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Ve
         ..Default::default()
     };
     let task = CompactionTask {
-        task: TaskData { fragments },
+        task: TaskData::rewrite_fragments(fragments),
         read_version: dataset.manifest.version,
         options: options.clone(),
     };

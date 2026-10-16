@@ -11,8 +11,9 @@ use jni::{
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
-        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        IndexRemapperOptions, RewriteResult, TaskData, commit_compaction, plan_compaction,
+        CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionScope,
+        CompactionTask, CompactionTaskKind, IndexRemapperOptions, RepackedFiles, RewriteResult,
+        TaskData, commit_compaction, plan_compaction,
     },
 };
 
@@ -23,12 +24,13 @@ use crate::{
         FromJObjectWithEnv, IntoJava, export_vec, import_vec_from_method, import_vec_to_rust,
     },
     utils::{
-        build_compaction_options, to_java_boolean_obj, to_java_float_obj, to_java_list,
-        to_java_long_obj, to_java_optional,
+        apply_repack_options, build_compaction_options, to_java_boolean_obj, to_java_float_obj,
+        to_java_list, to_java_long_obj, to_java_optional,
     },
 };
 
 use crate::error::Result;
+use crate::ffi::JNIEnvExt;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction<'local>(
@@ -50,6 +52,9 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
+    max_data_files_per_fragment: JObject,     // Optional<Long>
+    column_groups: JObject,                   // List<List<String>>
+    scope: JObject,                           // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -70,7 +75,10 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             max_source_rows,
             max_source_bytes,
             excluded_fragment_ids,
-            data_storage_version
+            data_storage_version,
+            max_data_files_per_fragment,
+            column_groups,
+            scope
         ),
         JObject::null()
     )
@@ -95,13 +103,16 @@ fn inner_plan_compaction<'local>(
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
+    max_data_files_per_fragment: JObject,     // Optional<Long>
+    column_groups: JObject,                   // List<List<String>>
+    scope: JObject,                           // Optional<String>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
         dataset.inner.manifest.config.clone()
     };
-    let compaction_options = build_compaction_options(
+    let mut compaction_options = build_compaction_options(
         env,
         &target_rows_per_fragment,
         &max_rows_per_group,
@@ -119,6 +130,13 @@ fn inner_plan_compaction<'local>(
         &excluded_fragment_ids,
         &data_storage_version,
         &config,
+    )?;
+    apply_repack_options(
+        env,
+        &mut compaction_options,
+        &max_data_files_per_fragment,
+        &column_groups,
+        &scope,
     )?;
 
     let plan = {
@@ -258,6 +276,9 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
+    max_data_files_per_fragment: JObject,     // Optional<Long>
+    column_groups: JObject,                   // List<List<String>>
+    scope: JObject,                           // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -280,7 +301,10 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             max_source_rows,
             max_source_bytes,
             excluded_fragment_ids,
-            data_storage_version
+            data_storage_version,
+            max_data_files_per_fragment,
+            column_groups,
+            scope
         ),
         JObject::null()
     )
@@ -307,6 +331,9 @@ fn inner_execute_task<'local>(
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
     data_storage_version: JObject,            // Optional<String>
+    max_data_files_per_fragment: JObject,     // Optional<Long>
+    column_groups: JObject,                   // List<List<String>>
+    scope: JObject,                           // Optional<String>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
     let config = {
@@ -314,7 +341,7 @@ fn inner_execute_task<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
         dataset.inner.manifest.config.clone()
     };
-    let compaction_options = build_compaction_options(
+    let mut compaction_options = build_compaction_options(
         env,
         &target_rows_per_fragment,
         &max_rows_per_group,
@@ -333,6 +360,13 @@ fn inner_execute_task<'local>(
         &data_storage_version,
         &config,
     )?;
+    apply_repack_options(
+        env,
+        &mut compaction_options,
+        &max_data_files_per_fragment,
+        &column_groups,
+        &scope,
+    )?;
     let compaction_task = CompactionTask {
         task: task_data,
         read_version: read_version as u64,
@@ -347,26 +381,48 @@ fn inner_execute_task<'local>(
 }
 
 const TASK_DATA_CLASS: &str = "org/lance/compaction/TaskData";
-const TASK_DATA_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;)V";
+const TASK_DATA_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;Ljava/util/List;)V";
 const COMPACTION_METRICS_CLASS: &str = "org/lance/compaction/CompactionMetrics";
 const COMPACTION_METRICS_CONSTRUCTOR_SIG: &str = "(JJJJ)V";
 const COMPACTION_PLAN_CLASS: &str = "org/lance/compaction/CompactionPlan";
 const COMPACTION_PLAN_CONSTRUCTOR_SIG: &str =
     "(Ljava/util/List;JLorg/lance/compaction/CompactionOptions;)V";
 const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
-const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
+const REWRITE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[BLjava/lang/Long;Ljava/util/List;)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let fragments = export_vec(env, &self.fragments)?;
+        let repack_files = match &self.kind {
+            CompactionTaskKind::RewriteFragments => JObject::null(),
+            CompactionTaskKind::RepackColumns { files } => {
+                let mut lists = Vec::with_capacity(files.len());
+                for file in files {
+                    let ids = file
+                        .iter()
+                        .map(|id| {
+                            Ok(env.new_object(
+                                "java/lang/Integer",
+                                "(I)V",
+                                &[JValueGen::Int(*id)],
+                            )?)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    lists.push(to_java_list(env, &ids)?);
+                }
+                to_java_list(env, &lists)?
+            }
+        };
         Ok(env.new_object(
             TASK_DATA_CLASS,
             TASK_DATA_CONSTRUCTOR_SIG,
-            &[JValueGen::Object(&fragments)],
+            &[
+                JValueGen::Object(&fragments),
+                JValueGen::Object(&repack_files),
+            ],
         )?)
     }
 }
@@ -445,6 +501,25 @@ impl IntoJava for &CompactionOptions {
             None => JObject::null(),
         };
         let data_storage_version_opt = to_java_optional(env, data_storage_version)?;
+        let max_data_files_per_fragment =
+            to_java_long_obj(env, self.max_data_files_per_fragment.map(|v| v as i64))?;
+        let max_data_files_per_fragment_opt = to_java_optional(env, max_data_files_per_fragment)?;
+        let mut column_groups = Vec::with_capacity(self.column_groups.len());
+        for group in &self.column_groups {
+            let names = group
+                .iter()
+                .map(|name| Ok(JObject::from(env.new_string(name)?)))
+                .collect::<Result<Vec<_>>>()?;
+            column_groups.push(to_java_list(env, &names)?);
+        }
+        let column_groups = to_java_list(env, &column_groups)?;
+        let scope = match self.scope {
+            CompactionScope::All => "all",
+            CompactionScope::RewriteFragments => "rewrite_fragments",
+            CompactionScope::RepackColumns => "repack_columns",
+        };
+        let scope: JObject = env.new_string(scope)?.into();
+        let scope_opt = to_java_optional(env, scope)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -465,6 +540,9 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&max_source_bytes_opt),
                 JValueGen::Object(&excluded_fragment_ids),
                 JValueGen::Object(&data_storage_version_opt),
+                JValueGen::Object(&max_data_files_per_fragment_opt),
+                JValueGen::Object(&column_groups),
+                JValueGen::Object(&scope_opt),
             ],
         )?)
     }
@@ -496,6 +574,13 @@ impl IntoJava for &RewriteResult {
         } else {
             JObject::null()
         };
+        let (repacked_fragment_id, repacked_files) = match &self.repacked_files {
+            Some(repacked) => (
+                to_java_long_obj(env, Some(repacked.fragment_id as i64))?,
+                export_vec(env, &repacked.files)?,
+            ),
+            None => (JObject::null(), JObject::null()),
+        };
         Ok(env.new_object(
             REWRITE_RESULT_CLASS,
             REWRITE_RESULT_CONSTRUCTOR_SIG,
@@ -505,6 +590,8 @@ impl IntoJava for &RewriteResult {
                 JValueGen::Object(&original_fragments),
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&row_addrs),
+                JValueGen::Object(&repacked_fragment_id),
+                JValueGen::Object(&repacked_files),
             ],
         )?)
     }
@@ -534,8 +621,19 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         let task_data = import_vec_from_method(env, self, "getFragments", |env, fragment| {
             fragment.extract_object(env)
         })?;
+        let repack_files = env
+            .call_method(self, "getRepackFiles", "()Ljava/util/List;", &[])?
+            .l()?;
+        let kind = if repack_files.is_null() {
+            CompactionTaskKind::RewriteFragments
+        } else {
+            let files =
+                import_vec_to_rust(env, &repack_files, |env, file| env.get_integers(&file))?;
+            CompactionTaskKind::RepackColumns { files }
+        };
         Ok(TaskData {
             fragments: task_data,
+            kind,
         })
     }
 }
@@ -569,12 +667,27 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
         } else {
             Some(env.convert_byte_array(row_addrs_obj)?)
         };
+        let repacked_fragment_id = env
+            .call_method(self, "getRepackedFragmentId", "()Ljava/lang/Long;", &[])?
+            .l()?;
+        let repacked_files = if repacked_fragment_id.is_null() {
+            None
+        } else {
+            let fragment_id = env
+                .call_method(&repacked_fragment_id, "longValue", "()J", &[])?
+                .j()? as u64;
+            let files = import_vec_from_method(env, self, "getRepackedFiles", |env, file| {
+                file.extract_object(env)
+            })?;
+            Some(RepackedFiles { fragment_id, files })
+        };
         Ok(RewriteResult {
             metrics,
             new_fragments,
             read_version,
             original_fragments,
             row_addrs,
+            repacked_files,
         })
     }
 }

@@ -6162,4 +6162,70 @@ mod tests {
             );
         }
     }
+
+    /// A `column_groups` compaction writes an indexed column's seed into that
+    /// column's group file, which need not be the fragment's first file; the
+    /// harvest has to find it there.
+    #[tokio::test]
+    async fn test_harvest_seeds_from_column_group_file() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(Int32Array::from_iter_values(0..20)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["a"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        // {b} is unclaimed and becomes the first file; {a} is the second.
+        let options = CompactionOptions {
+            column_groups: vec![vec!["a".into()]],
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        let fragments: Vec<Fragment> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect();
+        let a_id = dataset.schema().field("a").unwrap().id;
+        assert!(
+            !fragments[0].files[0].fields.contains(&a_id),
+            "the indexed column is not in the first file: {:?}",
+            fragments[0].files
+        );
+        let index = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.fields == [a_id])
+            .unwrap()
+            .clone();
+        let seeds = try_harvest_seeds(&dataset, &fragments, &index)
+            .await
+            .unwrap();
+        assert!(seeds.is_some(), "the seed in the group file is found");
+    }
 }

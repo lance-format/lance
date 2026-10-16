@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
-use lance::dataset::optimize::{CompactionMode, CompactionOptions};
+use lance::dataset::optimize::{CompactionMode, CompactionOptions, CompactionScope};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -284,6 +284,34 @@ pub fn build_compaction_options(
     }
 
     Ok(compaction_options)
+}
+
+/// Apply the column repack options a Java `CompactionOptions` carries. An empty
+/// `column_groups` keeps the table config's groups.
+pub fn apply_repack_options(
+    env: &mut JNIEnv,
+    options: &mut CompactionOptions,
+    max_data_files_per_fragment: &JObject, // Optional<Long>
+    column_groups: &JObject,               // List<List<String>>
+    scope: &JObject,                       // Optional<String>
+) -> Result<()> {
+    if let Some(max) = env.get_long_opt(max_data_files_per_fragment)? {
+        options.max_data_files_per_fragment = Some(usize::try_from(max).map_err(|_| {
+            Error::input_error(format!(
+                "max_data_files_per_fragment must be positive, got {max}"
+            ))
+        })?);
+    }
+    let groups = crate::traits::import_vec_to_rust(env, column_groups, |env, group| {
+        env.get_strings(&group)
+    })?;
+    if !groups.is_empty() {
+        options.column_groups = groups;
+    }
+    if let Some(scope) = env.get_string_opt(scope)? {
+        options.scope = CompactionScope::try_from(scope.as_str())?;
+    }
+    Ok(())
 }
 
 // Convert from Java Optional<Query> to Rust Option<Query>

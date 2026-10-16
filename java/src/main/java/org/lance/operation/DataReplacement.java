@@ -21,21 +21,22 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Replace data in a column in the dataset with new data. This is used for null column population
- * where we replace an entirely null column with a new column that has data.
+ * Replace the data files backing some fields of existing fragments with new files, without moving
+ * rows. Each group names a fragment and one new data file for it. At commit, a file holding exactly
+ * the new file's fields is swapped for it; otherwise the new file's fields are tombstoned where
+ * they live and the new file is appended. A fragment can take several groups, one per new file.
+ * Used for null column population, and by compaction to repack columns into fewer files.
  *
- * <p>This operation will only allow replacing files that contain the same schema e.g. if the
- * original files contain columns A, B, C and the new files contain only columns A, B then the
- * operation is not allowed.
- *
- * <p>Corollary to the above: the operation will also not allow replacing files unless the affected
- * columns all have the same datafile layout across the fragments being replaced.
+ * <p>{@code dataChange == false} declares that the new files hold the same values as the files they
+ * replace: indices keep their coverage, overlays keep shadowing, and no row is reported as updated.
  */
 public class DataReplacement implements Operation {
   private final List<DataReplacementGroup> replacements;
+  private final boolean dataChange;
 
-  private DataReplacement(List<DataReplacementGroup> replacements) {
+  private DataReplacement(List<DataReplacementGroup> replacements, boolean dataChange) {
     this.replacements = replacements;
+    this.dataChange = dataChange;
   }
 
   /**
@@ -47,6 +48,15 @@ public class DataReplacement implements Operation {
     return replacements;
   }
 
+  /**
+   * Whether the new files change any value.
+   *
+   * @return false if the values were only moved to new files
+   */
+  public boolean dataChange() {
+    return dataChange;
+  }
+
   @Override
   public String name() {
     return "DataReplacement";
@@ -54,7 +64,10 @@ public class DataReplacement implements Operation {
 
   @Override
   public String toString() {
-    return MoreObjects.toStringHelper(this).add("replacements", replacements).toString();
+    return MoreObjects.toStringHelper(this)
+        .add("replacements", replacements)
+        .add("dataChange", dataChange)
+        .toString();
   }
 
   @Override
@@ -62,7 +75,12 @@ public class DataReplacement implements Operation {
     if (this == o) return true;
     if (o == null || getClass() != o.getClass()) return false;
     DataReplacement that = (DataReplacement) o;
-    return Objects.equals(replacements, that.replacements);
+    return dataChange == that.dataChange && Objects.equals(replacements, that.replacements);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(replacements, dataChange);
   }
 
   /**
@@ -77,6 +95,7 @@ public class DataReplacement implements Operation {
   /** Builder for DataReplacement. */
   public static class Builder {
     private List<DataReplacementGroup> replacements;
+    private boolean dataChange = true;
 
     public Builder() {}
 
@@ -92,12 +111,24 @@ public class DataReplacement implements Operation {
     }
 
     /**
+     * Set whether the new files change any value. Defaults to true; pass false only when the new
+     * files hold the same values as the files they replace.
+     *
+     * @param dataChange whether the new files change any value
+     * @return this builder
+     */
+    public Builder dataChange(boolean dataChange) {
+      this.dataChange = dataChange;
+      return this;
+    }
+
+    /**
      * Build a new DataReplacement.
      *
      * @return a new DataReplacement
      */
     public DataReplacement build() {
-      return new DataReplacement(replacements);
+      return new DataReplacement(replacements, dataChange);
     }
   }
 
