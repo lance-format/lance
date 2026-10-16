@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Migration Guide — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/migration/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="../read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a href="../read_and_write/">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+    <a href="../object_store/">Object Store Configuration</a>
+    <a href="../observability/">Observability</a>
+    <a href="../distributed_write/">Distributed Write</a>
+    <a href="../distributed_indexing/">Distributed Indexing</a>
+    <a class="active" href="./">Migration Guide</a>
+    <a href="../performance/">Performance Guide</a>
+    <a href="../tokenizer/">Tokenizer</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Migration Guide</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="migration-guides">Migration Guides<a class="headerlink" href="#migration-guides" title="Permanent link">&para;</a></h1>
+<p>Lance aims to avoid breaking changes when possible.  Currently, we are refining the Rust public API so that we can move
+it out of experimental status and make stronger commitments to backwards compatibility.  The python API is considered
+stable and breaking changes should generally be communicated (via warnings) for 1-2 months prior to being finalized to
+give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
+migrate.</p>
+<h2 id="900">9.0.0<a class="headerlink" href="#900" title="Permanent link">&para;</a></h2>
+<ul>
+<li>
+<p>Unless overridden, newly created FTS indexes use format v2. The code analyzer
+  and <code>block_size=256</code> require format v3, so readers must support v3 before an
+  index using either option is created. <code>document_granularity="list_element"</code>
+  also requires v3 reader capability, independently of the posting format.</p>
+</li>
+<li>
+<p>To keep new indexes readable by nodes that support at most format v1 or v2,
+  set <code>format_version</code> in the index creation parameters, or set
+  <code>LANCE_FTS_FORMAT_VERSION</code> for a rollout-wide override. Formats v1 and v2
+  require the text analyzer and <code>block_size=128</code>.</p>
+</li>
+<li>
+<p>Operations that maintain an existing FTS index, including append, incremental
+  indexing, optimize, and mem-wal maintained-index flush, preserve its format
+  version.</p>
+</li>
+</ul>
+<h2 id="720">7.2.0<a class="headerlink" href="#720" title="Permanent link">&para;</a></h2>
+<ul>
+<li>
+<p>The <code>IndexSegmentBuilder</code> API has been removed from Rust, Python, and Java.
+  This API was deprecated by the distributed indexing flow based on
+  <code>create_index_uncommitted</code>, <code>merge_existing_index_segments</code>, and
+  <code>commit_existing_index_segments</code>, but remained in the codebase as a parallel
+  way to plan and publish staged index segments.</p>
+</li>
+<li>
+<p>Callers should now publish staged segment outputs directly with
+  <code>commit_existing_index_segments(...)</code>. If multiple staged outputs should be
+  combined into a larger physical segment first, callers should explicitly group
+  those outputs and call <code>merge_existing_index_segments(...)</code> for each group
+  before committing the final segment list.</p>
+</li>
+<li>
+<p>The old builder's <code>target_segment_bytes</code> automatic size-based grouping has no
+  direct replacement. Distributed index drivers that used it should choose
+  segment groups themselves, then pass each group to
+  <code>merge_existing_index_segments(...)</code>.</p>
+</li>
+</ul>
+<h2 id="500">5.0.0<a class="headerlink" href="#500" title="Permanent link">&para;</a></h2>
+<ul>
+<li>
+<p>The default data storage version changed from 2.0 to 2.1. This affects the <code>column_indices</code>
+  field in the <code>DataFile</code> protobuf message. In 2.0, every field (including non-leaf fields like
+  struct containers and list containers) was assigned a sequential column index. In 2.1, non-leaf
+  fields (unpacked structs, list containers) are assigned <code>-1</code> instead since their validity
+  information is now folded into repetition/definition levels. Only leaf fields and packed structs
+  are assigned column indices.</p>
+<p>For example, given the schema:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>x: i32, y: [f32], z: { a: i32 }
+</span></code></pre></div>
+<p>The fields (in depth-first order) are:</p>
+<table>
+<thead>
+<tr>
+<th>Field ID</th>
+<th>Field</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td><code>x</code> (i32)</td>
+</tr>
+<tr>
+<td>1</td>
+<td><code>y</code> (list)</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>y.item</code> (f32)</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>z</code> (struct)</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>z.a</code> (i32)</td>
+</tr>
+</tbody>
+</table>
+<p>In <strong>2.0</strong>, <code>column_indices</code> = <code>[0, 1, 2, 3, 4]</code> — every field gets a column.</p>
+<p>In <strong>2.1</strong>, <code>column_indices</code> = <code>[0, -1, 1, -1, 2]</code> — non-leaf fields (<code>y</code> and <code>z</code>) get <code>-1</code>.</p>
+</li>
+<li>
+<p>This change only affects advanced users who construct <code>DataFile</code> messages directly, for example
+  when building operations by hand for <code>Dataset.commit</code>. Normal read and write paths are
+  unaffected.</p>
+</li>
+<li>
+<p>To opt back to 2.0 format, set <code>data_storage_version="2.0"</code> when creating a dataset.</p>
+</li>
+</ul>
+<h2 id="100">1.0.0<a class="headerlink" href="#100" title="Permanent link">&para;</a></h2>
+<ul>
+<li>The <code>SearchResult</code> returned by scalar indices must now output information about null values.
+  Instead of containing a <code>RowIdTreeMap</code>, it now contains a <code>NullableRowIdSet</code>. Expressions that
+  resolve to null values must be included in search results in the null set. This ensures that
+  <code>NOT</code> can be applied to index search results correctly.</li>
+</ul>
+<h2 id="039">0.39<a class="headerlink" href="#039" title="Permanent link">&para;</a></h2>
+<ul>
+<li>
+<p>The <code>lance</code> crate no longer re-exports utilities from <code>lance-arrow</code> such as <code>RecordBatchExt</code> or <code>SchemaExt</code>.  In the
+short term, if you are relying on these utilities,  you can add a dependency on the <code>lance-arrow</code> crate.  However, we
+do not expect <code>lance-arrow</code> to ever be stable, and you may want to consider forking these utilities.</p>
+</li>
+<li>
+<p>Previously, we exported <code>Error</code> and <code>Result</code> as both <code>lance::Error</code> and <code>lance::error::Error</code>.  We have now reduced
+this to just <code>lance::Error</code>.  We have also removed some internal error utilities (such as <code>OptionExt</code>) from the public
+API and do not plan on reintroducing these.</p>
+</li>
+<li>
+<p>The Python and Rust <code>dataset::diff_meta</code> API has been removed in favor of <code>dataset::delta</code>, 
+which returns a <code>DatasetDelta</code> that offers both metadata diff through <code>list_transactions</code> and data diff 
+through <code>get_inserted_rows</code> and <code>get_updated_rows</code>.</p>
+</li>
+<li>
+<p>Some other minor utilities which had previously been public are now private.  It is unlikely anyone was utilizing'
+these.  Please open an issue if you were relying on any of these.</p>
+</li>
+<li>
+<p>The <code>lance-namespace</code> Rust crate now splits into <code>lance-namespace</code> that contains the main <code>LanceNamespace</code> trait 
+and data models, and <code>lance-namespace-impls</code> that has different implementations of the namespace. 
+The <code>DirectoryNamespace</code> and <code>RestNamespace</code> interfaces have been refactored to be more user friendly.
+The <code>DirectoryNamespace</code> also now uses Lance ObjectStore for IO instead of directly depending on Apache OpenDAL.</p>
+</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../distributed_indexing/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Distributed Indexing</div>
+        </a>
+        <a class="next" href="../performance/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Performance Guide</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#900">9.0.0</a>
+      <a class="ld-toc__h2" href="#720">7.2.0</a>
+      <a class="ld-toc__h2" href="#500">5.0.0</a>
+      <a class="ld-toc__h2" href="#100">1.0.0</a>
+      <a class="ld-toc__h2" href="#039">0.39</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,142 @@
+/* Lance Design System — tokens (Swiss editorial: white, ink, brand purple #625EFF).
+   Merged from the design project's ds/tokens set; dark theme mirrors the same
+   structure with paper rules on ink. */
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Roboto+Mono:wght@400;500;600&display=swap");
+
+:root {
+  color-scheme: light;
+
+  /* ---- Typography ---- */
+  --font-display: "Space Grotesk", "Segoe UI", sans-serif;
+  --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --font-mono: "Roboto Mono", "SF Mono", monospace;
+  --text-base: 16px;
+  --leading-body: 1.6;
+  --tracking-display: -0.045em;
+  --tracking-caps: 0.14em;
+
+  /* ---- Ink scale (dark values — code surfaces & tooltips only) ---- */
+  --ink-950: #0E0C14;
+  --ink-900: #14111D;
+  --ink-850: #1A1626;
+  --ink-800: #221D30;
+  --ink-700: #2C2640;
+  --ink-600: #3A3352;
+
+  /* ---- Foreground scale (on white) ---- */
+  --fg-1: #0E0C14;
+  --fg-2: #4A4459;
+  --fg-3: #8A8499;
+  --fg-inverse: #ffffff;
+
+  /* ---- Brand purple ramp (official #625EFF) ---- */
+  --beam-300: #B3B1FF;
+  --beam-400: #625EFF;
+  --beam-500: #625EFF;
+  --beam-600: #4B47E0;
+  --beam-700: #3936B4;
+  --beam-glow: rgba(98, 94, 255, 0.25);
+  --beam-dim: rgba(98, 94, 255, 0.09);
+
+  /* ---- Semantic status ---- */
+  --ok-500: #0E8F63;
+  --warn-500: #B26205;
+  --danger-500: #D92D20;
+
+  /* ---- Lines: ink rules carry the structure ---- */
+  --line-1: #14111D;
+  --line-2: rgba(20, 17, 29, 0.16);
+
+  /* ---- Surfaces ---- */
+  --surface-page: #FFFFFF;
+  --surface-card: #FFFFFF;
+  --surface-overlay: #F5F4F8;
+  --surface-header: rgba(255, 255, 255, 0.88);
+  --surface-code: #F5F4F8; /* light code surface */
+  --surface-inline-code: rgba(20, 17, 29, 0.05);
+
+  --text-body: var(--fg-1);
+  --text-secondary: var(--fg-2);
+  --text-muted: var(--fg-3);
+
+  /* ---- Syntax highlighting (Pygments), light theme ---- */
+  --code-fg: #2A2635;
+  --code-kw: #7C3AED;     /* keywords, builtins */
+  --code-str: #0B62C4;    /* strings */
+  --code-com: #6E6A80;    /* comments */
+  --code-num: #9A6700;    /* numbers */
+  --code-fn: #0F766E;     /* functions, decorators */
+  --code-name: #2A2635;   /* class/module names, headings */
+  --code-tag: #BE123C;    /* HTML tags, attributes */
+  --code-punct: #57534E;  /* operators, punctuation, output */
+  --code-prompt: #8A8499; /* REPL prompts */
+  --code-hll: rgba(98, 94, 255, 0.12); /* highlighted line */
+
+  /* ---- Layout ---- */
+  --container-max: 1200px;
+  --radius-box: 6px;   /* content boxes: code, admonitions, tabs */
+  --radius-chip: 4px;  /* inline code chips */
+
+  /* ---- Motion — fast, precise, no bounce ---- */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 120ms;
+}
+
+/* ---- Dark theme: same structure, paper rules on ink ---- */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --fg-1: #F2F0FA;
+  --fg-2: #B7B1C6;
+  --fg-3: #837D96;
+  --fg-inverse: #0E0C14;
+
+  /* text accents need a lighter purple to stay readable on ink */
+  --beam-600: #8E8BFF;
+  --beam-700: #A9A6FF;
+
+  --ok-500: #34C08E;
+  --warn-500: #E8A13C;
+  --danger-500: #FF6B5E;
+
+  --line-1: rgba(237, 235, 245, 0.7);
+  --line-2: rgba(237, 235, 245, 0.15);
+
+  --surface-page: #0E0C14;
+  --surface-card: #14111D;
+  --surface-overlay: #1A1626;
+  --surface-header: rgba(14, 12, 20, 0.85);
+  --surface-code: #14111D;
+  --surface-inline-code: rgba(237, 235, 245, 0.08);
+
+  /* ---- Syntax highlighting (Pygments), dark theme (on ink) ---- */
+  --code-fg: #EDEBF5;
+  --code-kw: #B8A8FF;
+  --code-str: #7CC0FF;
+  --code-com: #6F6A85;
+  --code-num: #F2CE6B;
+  --code-fn: #8FE8CE;
+  --code-name: #EDEBF5;
+  --code-tag: #FF95A8;
+  --code-punct: #B7B1C6;
+  --code-prompt: #6F6A85;
+  --code-hll: rgba(98, 94, 255, 0.22);
+}
+
+/* ---- Minimal base ---- */
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--surface-page);
+  color: var(--text-body);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* No `color` here: forcing ink text breaks selection inside dark code blocks. */
+::selection { background: rgba(98, 94, 255, 0.3); }
+
+code, kbd, pre { font-family: var(--font-mono); }
