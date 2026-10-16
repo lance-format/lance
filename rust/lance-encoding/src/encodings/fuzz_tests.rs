@@ -133,7 +133,6 @@ fn encoding_config_strategy() -> impl Strategy<Value = EncodingTestConfig> {
             "Skip unsupported combinations",
             |(_, structure, width, _)| {
                 // FSL with Variable width types is not supported
-                // This combination causes compute_stat to be called twice
                 !matches!(
                     (structure, width),
                     (DataStructure::FixedSizeList(_), DataWidth::Variable(_))
