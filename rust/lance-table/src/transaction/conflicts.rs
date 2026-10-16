@@ -940,7 +940,10 @@ impl Operation {
                 ) {
                     return true;
                 }
-                if schema_metadata_updates.is_some() && other_schema_metadata.is_some() {
+                if Self::update_maps_conflict(
+                    schema_metadata_updates.as_ref(),
+                    other_schema_metadata.as_ref(),
+                ) {
                     return true;
                 }
                 if !field_metadata_updates.is_empty() && !other_field_metadata.is_empty() {
@@ -1008,6 +1011,34 @@ mod tests {
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
         }
+    }
+
+    fn schema_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace,
+            }),
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    /// Schema metadata must use the same per-key conflict rules as table
+    /// metadata: disjoint-key merge-mode updates compose safely, while any
+    /// replace or key overlap conflicts. It previously used a blanket
+    /// any-vs-any check that rejected safe disjoint-key merges.
+    #[test]
+    fn test_schema_metadata_conflict_is_per_key() {
+        let left = schema_metadata_update(vec![("key", Some("1"))], false);
+        let same_key = schema_metadata_update(vec![("key", Some("2"))], false);
+        let different_key = schema_metadata_update(vec![("other", Some("2"))], false);
+        let replace = schema_metadata_update(vec![("other", Some("2"))], true);
+
+        assert!(left.modifies_same_metadata(&same_key));
+        assert!(!left.modifies_same_metadata(&different_key));
+        assert!(left.modifies_same_metadata(&replace));
     }
 
     #[test]
