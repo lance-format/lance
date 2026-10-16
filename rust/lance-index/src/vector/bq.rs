@@ -284,3 +284,6 @@ mod tests {
         assert_eq!(rabit_ex_code_bytes(129, 3).unwrap(), 49);
     }
 }
+
+#[cfg(test)]
+mod scan_tests;
