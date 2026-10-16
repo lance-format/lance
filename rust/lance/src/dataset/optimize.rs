@@ -1000,6 +1000,40 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
+        if log::log_enabled!(log::Level::Debug) {
+            // Bound both dimensions of the candidate bin previews.
+            const MAX_PREVIEW_BINS: usize = 100;
+            const MAX_PREVIEW_ITEMS: usize = 100;
+            log::debug!(
+                "Compaction candidate_bins: count={}, omitted_bins={}, index_fragmaps={:?}",
+                candidate_bins.len(),
+                candidate_bins.len().saturating_sub(MAX_PREVIEW_BINS),
+                index_fragmaps,
+            );
+            for (bin_index, bin) in candidate_bins.iter().take(MAX_PREVIEW_BINS).enumerate() {
+                let fragment_ids: Vec<_> = bin
+                    .fragments
+                    .iter()
+                    .take(MAX_PREVIEW_ITEMS)
+                    .map(|fragment| fragment.id)
+                    .collect();
+                log::debug!(
+                    "Compaction candidate_bins[{}]: pos_range={:?}, fragment_count={}, \
+                     fragment_ids_preview={:?}, candidacy_preview={:?}, row_counts_preview={:?}, \
+                     index_count={}, indices_preview={:?}, preview_item_limit={}",
+                    bin_index,
+                    bin.pos_range,
+                    bin.fragments.len(),
+                    fragment_ids,
+                    &bin.candidacy[..bin.candidacy.len().min(MAX_PREVIEW_ITEMS)],
+                    &bin.row_counts[..bin.row_counts.len().min(MAX_PREVIEW_ITEMS)],
+                    bin.indices.len(),
+                    &bin.indices[..bin.indices.len().min(MAX_PREVIEW_ITEMS)],
+                    MAX_PREVIEW_ITEMS,
+                );
+            }
+        }
+
         let all_tasks: Vec<(TaskData, usize)> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
