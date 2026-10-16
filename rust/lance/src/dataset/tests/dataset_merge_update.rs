@@ -32,9 +32,11 @@ use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::{Array, LargeBinaryArray, MapArray, StructArray};
 use arrow_array::{
-    ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray, UInt64Array,
+    ArrayRef, Float32Array, Int32Array, LargeListArray, ListArray, RecordBatchIterator,
+    StringArray, UInt64Array,
     types::{Int32Type, UInt64Type},
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
@@ -591,6 +593,109 @@ async fn test_insert_nested_subschemas() {
     )
     .unwrap();
     assert_eq!(result, expected);
+}
+
+/// An append that leaves out a child of a struct nested in a list is filled
+/// with nulls on read, whichever list type carries the struct. Narrowing the
+/// projection to the children a file has used to stop at `List`, so for
+/// `LargeList` the read asked the older file for a column it never wrote.
+#[rstest]
+#[case::list(false)]
+#[case::large_list(true)]
+#[tokio::test]
+async fn test_insert_subschema_nested_in_a_list(
+    #[case] is_large: bool,
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+    version: LanceFileVersion,
+) {
+    let field_a = Arc::new(ArrowField::new("a", DataType::Int32, true));
+    let field_b = Arc::new(ArrowField::new("b", DataType::Int32, true));
+    let list_of = |fields: Vec<Arc<ArrowField>>| {
+        let item = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(fields.into()),
+            true,
+        ));
+        if is_large {
+            DataType::LargeList(item)
+        } else {
+            DataType::List(item)
+        }
+    };
+    let batch_of = |fields: Vec<Arc<ArrowField>>, values: Vec<ArrayRef>| {
+        let structs = StructArray::new(fields.clone().into(), values, None);
+        // One struct per list, so each row holds a single element.
+        let lengths = std::iter::repeat_n(1, structs.len());
+        let item = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(fields.clone().into()),
+            true,
+        ));
+        let list: ArrayRef = if is_large {
+            Arc::new(LargeListArray::new(
+                item,
+                OffsetBuffer::<i64>::from_lengths(lengths),
+                Arc::new(structs),
+                None,
+            ))
+        } else {
+            Arc::new(ListArray::new(
+                item,
+                OffsetBuffer::<i32>::from_lengths(lengths),
+                Arc::new(structs),
+                None,
+            ))
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "l",
+            list_of(fields),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![list]).unwrap()
+    };
+
+    let full = batch_of(
+        vec![field_a.clone(), field_b.clone()],
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+    );
+    let test_uri = TempStrDir::default();
+    let write_params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(full.clone())], full.schema());
+    Dataset::write(reader, &test_uri, Some(write_params.clone()))
+        .await
+        .unwrap();
+
+    let just_a = batch_of(
+        vec![field_a.clone()],
+        vec![Arc::new(Int32Array::from(vec![3]))],
+    );
+    let reader = RecordBatchIterator::new(vec![Ok(just_a.clone())], just_a.schema());
+    let dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..write_params
+        }),
+    )
+    .await
+    .unwrap();
+
+    let data = dataset.scan().try_into_batch().await.unwrap();
+    let expected = batch_of(
+        vec![field_a, field_b],
+        vec![
+            Arc::new(Int32Array::from(vec![1, 3])),
+            Arc::new(Int32Array::from(vec![Some(2), None])),
+        ],
+    );
+    assert_eq!(data, expected);
 }
 
 #[tokio::test]

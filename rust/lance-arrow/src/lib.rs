@@ -26,7 +26,7 @@ use arrow_array::{
 use arrow_array::{
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, new_null_array,
 };
-use arrow_buffer::MutableBuffer;
+use arrow_buffer::{BooleanBufferBuilder, MutableBuffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
 use arrow_select::{interleave::interleave, take::take};
@@ -669,7 +669,7 @@ impl RecordBatchExt for RecordBatch {
         }
         let left_struct_array: StructArray = self.clone().into();
         let right_struct_array: StructArray = other.clone().into();
-        self.try_new_from_struct_array(merge(&left_struct_array, &right_struct_array))
+        self.try_new_from_struct_array(merge(&left_struct_array, &right_struct_array)?)
     }
 
     fn merge_with_schema(&self, other: &RecordBatch, schema: &Schema) -> Result<RecordBatch> {
@@ -917,30 +917,63 @@ fn lists_have_same_offsets_helper<T: OffsetSizeTrait>(left: &dyn Array, right: &
     left_list.offsets().inner() == right_list.offsets().inner()
 }
 
+/// The values of `list`, with the items of every entry that is null in `list`
+/// but valid in `other` made null. Those entries become valid when the two
+/// lists are merged, and their items here were never meant to be read. Merging
+/// the items then pushes these nulls into their children.
+fn hide_items_revealed_by<T: OffsetSizeTrait>(
+    list: &GenericListArray<T>,
+    other: Option<&NullBuffer>,
+) -> ArrayRef {
+    let Some(nulls) = list.nulls() else {
+        return list.values().clone();
+    };
+    let revealed = match other {
+        Some(other) => other.inner() & &!nulls.inner(),
+        None => !nulls.inner(),
+    };
+    if revealed.count_set_bits() == 0 {
+        return list.values().clone();
+    }
+    let offsets = list.value_offsets();
+    let mut items_validity = BooleanBufferBuilder::new(list.values().len());
+    items_validity.append_n(list.values().len(), true);
+    for row in revealed.set_indices() {
+        for item in offsets[row].as_usize()..offsets[row + 1].as_usize() {
+            items_validity.set_bit(item, false);
+        }
+    }
+    adjust_child_validity(
+        list.values(),
+        Some(&NullBuffer::new(items_validity.finish())),
+    )
+}
+
 fn merge_list_structs_helper<T: OffsetSizeTrait>(
     left: &dyn Array,
     right: &dyn Array,
     items_field_name: impl Into<String>,
     items_nullable: bool,
-) -> Arc<dyn Array> {
+) -> Result<ArrayRef> {
     let left_list: &GenericListArray<T> = left.as_list();
     let right_list: &GenericListArray<T> = right.as_list();
-    let left_struct = left_list.values();
-    let right_struct = right_list.values();
-    let left_struct_arr = left_struct.as_struct();
-    let right_struct_arr = right_struct.as_struct();
-    let merged_items = Arc::new(merge(left_struct_arr, right_struct_arr));
+    // The lists share offsets, and an entry is valid if either side has it, as
+    // for struct rows. Each side's items under its own null entries are hidden
+    // first, so the other side's validity cannot expose them.
+    let left_items = hide_items_revealed_by(left_list, right_list.nulls());
+    let right_items = hide_items_revealed_by(right_list, left_list.nulls());
+    let merged_items = Arc::new(merge(left_items.as_struct(), right_items.as_struct())?);
     let items_field = Arc::new(Field::new(
         items_field_name,
         merged_items.data_type().clone(),
         items_nullable,
     ));
-    Arc::new(GenericListArray::<T>::new(
+    Ok(Arc::new(GenericListArray::<T>::new(
         items_field,
         left_list.offsets().clone(),
         merged_items,
-        left_list.nulls().cloned(),
-    ))
+        merge_struct_validity(left_list.nulls(), right_list.nulls()),
+    )))
 }
 
 fn merge_list_struct_null_helper<T: OffsetSizeTrait>(
@@ -1019,17 +1052,31 @@ fn merge_list_struct_null(
     }
 }
 
-fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
+/// `left_parent` and `right_parent`, when given, null each side's entries under
+/// its null parent rows before the merge.
+fn merge_list_struct(
+    left: &ArrayRef,
+    right: &ArrayRef,
+    left_parent: Option<&NullBuffer>,
+    right_parent: Option<&NullBuffer>,
+) -> Result<ArrayRef> {
     // Merging fields into a list<struct<...>> is tricky and can only succeed
     // in two ways.  First, if both lists have the same offsets.  Second, if
-    // one of the lists is all-null
-    if left.null_count() == left.len() {
-        return merge_list_struct_null(left, right, right);
-    } else if right.null_count() == right.len() {
-        return merge_list_struct_null(left, right, left);
+    // one of the lists is all-null.  The all-null side is picked before the
+    // parents are applied: a side whose rows all sit under null parents still
+    // supplies the values and types of the result, which are null there anyway.
+    let left_is_null = left.null_count() == left.len();
+    let right_is_null = right.null_count() == right.len();
+    let left = adjust_child_validity(left, left_parent);
+    let right = adjust_child_validity(right, right_parent);
+    let (left, right) = (left.as_ref(), right.as_ref());
+    if left_is_null {
+        return Ok(merge_list_struct_null(left, right, right));
+    } else if right_is_null {
+        return Ok(merge_list_struct_null(left, right, left));
     }
     match (left.data_type(), right.data_type()) {
-        (DataType::List(left_field), DataType::List(_)) => {
+        (DataType::List(left_field), DataType::List(right_field)) => {
             if !lists_have_same_offsets_helper::<i32>(left, right) {
                 panic!("Attempt to merge list struct arrays which do not have same offsets");
             }
@@ -1037,10 +1084,10 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
                 left,
                 right,
                 left_field.name(),
-                left_field.is_nullable(),
+                left_field.is_nullable() || right_field.is_nullable(),
             )
         }
-        (DataType::LargeList(left_field), DataType::LargeList(_)) => {
+        (DataType::LargeList(left_field), DataType::LargeList(right_field)) => {
             if !lists_have_same_offsets_helper::<i64>(left, right) {
                 panic!("Attempt to merge list struct arrays which do not have same offsets");
             }
@@ -1048,7 +1095,7 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
                 left,
                 right,
                 left_field.name(),
-                left_field.is_nullable(),
+                left_field.is_nullable() || right_field.is_nullable(),
             )
         }
         _ => unreachable!(),
@@ -1190,41 +1237,60 @@ fn adjust_child_validity(
         return child.clone();
     }
 
-    let child_validity = child.nulls();
-
-    // Compute the new validity: child_validity AND parent_validity
-    let new_validity = match child_validity {
-        None => {
-            // Fast path: child has no existing validity, just use parent's
-            parent_validity.clone()
-        }
-        Some(child_nulls) => {
-            let child_buffer = child_nulls.inner();
-            let parent_buffer = parent_validity.inner();
-
-            // Perform bitwise AND directly on BooleanBuffers
-            // This preserves the correct semantics: 1 = valid, 0 = null
-            let merged_buffer = child_buffer & parent_buffer;
-
-            arrow_buffer::NullBuffer::from(merged_buffer)
-        }
-    };
-
-    // Create new array with adjusted validity
+    // A row is valid only if both the child and the parent are. The union keeps
+    // the bit offset of a sliced parent, which a raw buffer handed to
+    // `ArrayData` at the child's offset would lose.
+    let new_validity = NullBuffer::union(child.nulls(), Some(parent_validity));
     arrow_array::make_array(
-        arrow_data::ArrayData::try_new(
-            child.data_type().clone(),
-            child.len(),
-            Some(new_validity.into_inner().into_inner()),
-            child.offset(),
-            child.to_data().buffers().to_vec(),
-            child.to_data().child_data().to_vec(),
-        )
-        .unwrap(),
+        child
+            .to_data()
+            .into_builder()
+            .nulls(new_validity)
+            .build()
+            .unwrap(),
     )
 }
 
-fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
+/// Fails if `field`, a non-nullable child of one side's struct, sits under a
+/// row that is null on that side but valid in `merged`. The merged row is valid
+/// because the other side has it, and this side has no value to show there.
+fn check_hideable(
+    field: &Field,
+    parent: Option<&NullBuffer>,
+    merged: Option<&NullBuffer>,
+) -> Result<()> {
+    let Some(parent) = parent.filter(|_| !field.is_nullable()) else {
+        return Ok(());
+    };
+    let revealed = match merged {
+        Some(merged) => merged.inner() & &!parent.inner(),
+        None => !parent.inner(),
+    };
+    match revealed.set_indices().next() {
+        None => Ok(()),
+        Some(row) => Err(ArrowError::InvalidArgumentError(format!(
+            "Cannot merge non-nullable field '{}': its parent is null on one side but valid \
+             on the other at row {row}, where the field has no value",
+            field.name()
+        ))),
+    }
+}
+
+/// `column`, a child of one side's struct, with that struct's null rows pushed
+/// into it. The merged struct is valid where either side is, so the column
+/// would otherwise show, at a row only the other side has, what its own null
+/// parent hides.
+fn hide_under_parent(
+    field: &Field,
+    column: &ArrayRef,
+    parent: Option<&NullBuffer>,
+    merged: Option<&NullBuffer>,
+) -> Result<ArrayRef> {
+    check_hideable(field, parent, merged)?;
+    Ok(adjust_child_validity(column, parent))
+}
+
+fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> Result<StructArray> {
     let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
     let right_fields = right_struct_array.fields();
@@ -1236,6 +1302,7 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
 
     // Compute merged validity
     let merged_validity = merge_struct_validity(left_validity, right_validity);
+    let merged = merged_validity.as_ref();
 
     // iterate through the fields on the left hand side
     for (left_field, left_column) in left_struct_array
@@ -1254,9 +1321,13 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                 // if both fields are struct, merge them recursively
                 match (left_field.data_type(), right_field.data_type()) {
                     (DataType::Struct(_), DataType::Struct(_)) => {
-                        let left_sub_array = left_column.as_struct();
-                        let right_sub_array = right_column.as_struct();
-                        let merged_sub_array = merge(left_sub_array, right_sub_array);
+                        // Both sides feed this column, so a row one side's parent
+                        // hides can still take its value from the other side, and
+                        // the field's nullability is checked on the merged result.
+                        let left_sub_array = adjust_child_validity(left_column, left_validity);
+                        let right_sub_array = adjust_child_validity(right_column, right_validity);
+                        let merged_sub_array =
+                            merge(left_sub_array.as_struct(), right_sub_array.as_struct())?;
                         fields.push(Field::new(
                             left_field.name(),
                             merged_sub_array.data_type().clone(),
@@ -1265,18 +1336,29 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                         columns.push(Arc::new(merged_sub_array) as ArrayRef);
                     }
                     (DataType::List(left_list), DataType::List(right_list))
+                    | (DataType::LargeList(left_list), DataType::LargeList(right_list))
                         if left_list.data_type().is_struct()
                             && right_list.data_type().is_struct() =>
                     {
                         // Identical inner types: nothing to merge, keep the left column.
                         if left_list.data_type() == right_list.data_type() {
                             fields.push(left_field.as_ref().clone());
-                            columns.push(left_column.clone());
+                            columns.push(hide_under_parent(
+                                left_field,
+                                left_column,
+                                left_validity,
+                                merged,
+                            )?);
                         } else {
                             // The struct fields differ, so merge them structurally. merge_list_struct
                             // only succeeds when both lists share offsets or one side is all-null;
                             // it panics otherwise.
-                            let merged_sub_array = merge_list_struct(&left_column, &right_column);
+                            let merged_sub_array = merge_list_struct(
+                                left_column,
+                                right_column,
+                                left_validity,
+                                right_validity,
+                            )?;
 
                             fields.push(Field::new(
                                 left_field.name(),
@@ -1290,41 +1372,41 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                     _ => {
                         // TODO handle list-of-struct and other types
                         fields.push(left_field.as_ref().clone());
-                        // Adjust the column validity: if left struct was null, propagate to child
-                        let adjusted_column = adjust_child_validity(left_column, left_validity);
-                        columns.push(adjusted_column);
+                        columns.push(hide_under_parent(
+                            left_field,
+                            left_column,
+                            left_validity,
+                            merged,
+                        )?);
                     }
                 }
             }
             None => {
                 fields.push(left_field.as_ref().clone());
-                // Adjust the column validity: if left struct was null, propagate to child
-                let adjusted_column = adjust_child_validity(left_column, left_validity);
-                columns.push(adjusted_column);
+                columns.push(hide_under_parent(
+                    left_field,
+                    left_column,
+                    left_validity,
+                    merged,
+                )?);
             }
         }
     }
 
     // now iterate through the fields on the right hand side
-    right_fields
-        .iter()
-        .zip(right_columns.iter())
-        .for_each(|(field, column)| {
-            // add new columns on the right
-            if !left_struct_array
-                .fields()
-                .iter()
-                .any(|f| f.name() == field.name())
-            {
-                fields.push(field.as_ref().clone());
-                // This field doesn't exist on the left
-                // We use the right's column but need to adjust for struct validity
-                let adjusted_column = adjust_child_validity(column, right_validity);
-                columns.push(adjusted_column);
-            }
-        });
+    for (field, column) in right_fields.iter().zip(right_columns.iter()) {
+        // add new columns on the right
+        if !left_struct_array
+            .fields()
+            .iter()
+            .any(|f| f.name() == field.name())
+        {
+            fields.push(field.as_ref().clone());
+            columns.push(hide_under_parent(field, column, right_validity, merged)?);
+        }
+    }
 
-    StructArray::try_new(Fields::from(fields), columns, merged_validity).unwrap()
+    StructArray::try_new(Fields::from(fields), columns, merged_validity)
 }
 
 fn merge_with_schema(
@@ -1599,6 +1681,7 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
         BinaryArray, BinaryViewArray, FixedSizeBinaryArray, Float32Array, Int32Array,
         LargeBinaryArray, ListArray, NullArray, StringArray, StructArray, new_empty_array,
@@ -1979,6 +2062,427 @@ mod tests {
         assert_eq!(merged, left);
     }
 
+    /// A list of `items`, one item per entry.
+    fn one_item_per_entry(large: bool, items: ArrayRef) -> ArrayRef {
+        let item_field = Arc::new(Field::new("item", items.data_type().clone(), true));
+        let lengths = vec![1; items.len()];
+        if large {
+            Arc::new(LargeListArray::new(
+                item_field,
+                OffsetBuffer::<i64>::from_lengths(lengths),
+                items,
+                None,
+            ))
+        } else {
+            Arc::new(ListArray::new(
+                item_field,
+                OffsetBuffer::<i32>::from_lengths(lengths),
+                items,
+                None,
+            ))
+        }
+    }
+
+    /// A batch with the single column `s`, valid per `parent_validity`.
+    fn batch_of_parent(parent: StructArray) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                parent.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(parent)],
+        )
+        .unwrap()
+    }
+
+    /// `{s: struct<l: list<struct<{child}: int32>>>}`, one row per value, each
+    /// list holding one item, and `s` valid per `parent_validity`.
+    fn list_struct_under_parent(
+        large: bool,
+        child: &str,
+        parent_validity: &[bool],
+        values: &[i32],
+    ) -> RecordBatch {
+        let items = Arc::new(StructArray::new(
+            vec![Field::new(child, DataType::Int32, true)].into(),
+            vec![Arc::new(Int32Array::from(values.to_vec()))],
+            None,
+        ));
+        let list = one_item_per_entry(large, items);
+        batch_of_parent(StructArray::new(
+            vec![Field::new("l", list.data_type().clone(), true)].into(),
+            vec![list],
+            Some(parent_validity.to_vec().into()),
+        ))
+    }
+
+    /// The child `name` of the single item in row `row` of the merged `s.l`.
+    fn merged_item_child(merged: &RecordBatch, large: bool, row: usize, name: &str) -> ArrayRef {
+        let list = merged.column(0).as_struct().column(0);
+        let item = if large {
+            list.as_list::<i64>().value(row)
+        } else {
+            list.as_list::<i32>().value(row)
+        };
+        item.as_struct().column_by_name(name).unwrap().clone()
+    }
+
+    #[test]
+    fn test_merge_list_struct_identical_schema_hides_a_null_parent_row() {
+        for large in [false, true] {
+            let left = list_struct_under_parent(large, "x", &[false, true], &[11, 12]);
+            let right = list_struct_under_parent(large, "x", &[true, true], &[21, 22]);
+            let merged = left.merge(&right).unwrap();
+            let parent = merged.column(0).as_struct();
+            assert!(parent.is_valid(0), "large={large}");
+            assert!(
+                parent.column(0).is_null(0),
+                "large={large}: the list under the null left parent became visible"
+            );
+            assert!(parent.column(0).is_valid(1), "large={large}");
+        }
+    }
+
+    #[test]
+    fn test_merge_list_struct_hides_the_items_of_a_null_parent_row() {
+        for large in [false, true] {
+            // Null parent on the left: row 0 keeps the right item, not x = 11.
+            let left = list_struct_under_parent(large, "x", &[false, true], &[11, 12]);
+            let right = list_struct_under_parent(large, "y", &[true, true], &[21, 22]);
+            let merged = left.merge(&right).unwrap();
+            assert!(merged.column(0).as_struct().column(0).is_valid(0));
+            assert!(
+                merged_item_child(&merged, large, 0, "x").is_null(0),
+                "large={large}: x under the null left parent became visible"
+            );
+            let y = merged_item_child(&merged, large, 0, "y");
+            assert_eq!(y.as_primitive::<Int32Type>().value(0), 21, "large={large}");
+
+            // Null parent on the right: row 0 keeps x = 11, not y = 21.
+            let left = list_struct_under_parent(large, "x", &[true, true], &[11, 12]);
+            let right = list_struct_under_parent(large, "y", &[false, true], &[21, 22]);
+            let merged = left.merge(&right).unwrap();
+            let x = merged_item_child(&merged, large, 0, "x");
+            assert_eq!(x.as_primitive::<Int32Type>().value(0), 11, "large={large}");
+            assert!(
+                merged_item_child(&merged, large, 0, "y").is_null(0),
+                "large={large}: y under the null right parent became visible"
+            );
+
+            // Row 1 is valid on both sides and keeps both items.
+            let x = merged_item_child(&merged, large, 1, "x");
+            let y = merged_item_child(&merged, large, 1, "y");
+            assert_eq!(x.as_primitive::<Int32Type>().value(0), 12, "large={large}");
+            assert_eq!(y.as_primitive::<Int32Type>().value(0), 22, "large={large}");
+        }
+    }
+
+    #[test]
+    fn test_merge_list_struct_follows_a_sliced_parent() {
+        for large in [false, true] {
+            // After slicing, row 0 is the null parent row and row 1 is valid.
+            let left = list_struct_under_parent(large, "x", &[true, false, true], &[10, 11, 12]);
+            let left = left.slice(1, 2);
+
+            let same = list_struct_under_parent(large, "x", &[true, true, true], &[20, 21, 22]);
+            let merged = left.merge(&same.slice(1, 2)).unwrap();
+            let list = merged.column(0).as_struct().column(0);
+            assert!(list.is_null(0), "large={large}");
+            assert!(list.is_valid(1), "large={large}");
+
+            let other = list_struct_under_parent(large, "y", &[true, true, true], &[20, 21, 22]);
+            let merged = left.merge(&other.slice(1, 2)).unwrap();
+            assert!(
+                merged_item_child(&merged, large, 0, "x").is_null(0),
+                "large={large}"
+            );
+            let x = merged_item_child(&merged, large, 1, "x");
+            assert_eq!(x.as_primitive::<Int32Type>().value(0), 12, "large={large}");
+        }
+    }
+
+    /// A non-nullable `l` or item child cannot be nulled under a parent row that
+    /// only the other side has, so the merge fails there rather than show the
+    /// hidden value. Where both sides agree on the parent, nothing is revealed
+    /// and the same fields merge.
+    #[test]
+    fn test_merge_list_struct_with_non_nullable_fields_under_a_null_parent() {
+        #[derive(Clone, Copy)]
+        struct Shape {
+            child: &'static str,
+            l_nullable: bool,
+            item_nullable: bool,
+            child_nullable: bool,
+            null_first_entry: bool,
+            null_first_item: bool,
+        }
+        let shape = |child| Shape {
+            child,
+            l_nullable: true,
+            item_nullable: true,
+            child_nullable: true,
+            null_first_entry: false,
+            null_first_item: false,
+        };
+        let batch = |shape: Shape, parent_validity: [bool; 2]| {
+            let items = Arc::new(StructArray::new(
+                vec![Field::new(
+                    shape.child,
+                    DataType::Int32,
+                    shape.child_nullable,
+                )]
+                .into(),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                shape.null_first_item.then(|| vec![false, true].into()),
+            ));
+            let list: ArrayRef = Arc::new(ListArray::new(
+                Arc::new(Field::new(
+                    "item",
+                    items.data_type().clone(),
+                    shape.item_nullable,
+                )),
+                OffsetBuffer::<i32>::from_lengths([1, 1]),
+                items,
+                shape.null_first_entry.then(|| vec![false, true].into()),
+            ));
+            batch_of_parent(StructArray::new(
+                vec![Field::new("l", list.data_type().clone(), shape.l_nullable)].into(),
+                vec![list],
+                Some(parent_validity.to_vec().into()),
+            ))
+        };
+        let null_first = [false, true];
+        let all_valid = [true, true];
+        let cases = [
+            // Non-nullable `l`, identical item types.
+            (
+                Shape {
+                    l_nullable: false,
+                    ..shape("x")
+                },
+                Shape {
+                    l_nullable: false,
+                    ..shape("x")
+                },
+                Some("Cannot merge non-nullable field 'l'"),
+            ),
+            // Non-nullable `l` on the left, a null entry on the right: neither
+            // side has an entry at the merged row.
+            (
+                Shape {
+                    l_nullable: false,
+                    ..shape("x")
+                },
+                Shape {
+                    null_first_entry: true,
+                    ..shape("y")
+                },
+                Some("non-nullable StructArray field \"l\""),
+            ),
+            // A non-nullable child of the item struct.
+            (
+                Shape {
+                    child_nullable: false,
+                    ..shape("x")
+                },
+                shape("y"),
+                Some("Cannot merge non-nullable field 'x'"),
+            ),
+            // A non-nullable item can be hidden where the right item is null.
+            (
+                Shape {
+                    item_nullable: false,
+                    ..shape("x")
+                },
+                Shape {
+                    null_first_item: true,
+                    ..shape("y")
+                },
+                None,
+            ),
+        ];
+        for (case, (left, right, rejected)) in cases.into_iter().enumerate() {
+            let merged = batch(left, null_first).merge(&batch(right, all_valid));
+            match rejected {
+                Some(expected) => {
+                    let message = merged.unwrap_err().to_string();
+                    assert!(message.contains(expected), "case {case}: {message}");
+                }
+                None => assert!(merged.is_ok(), "case {case}: {merged:?}"),
+            }
+            let agreed = batch(left, null_first).merge(&batch(right, null_first));
+            assert!(
+                agreed.is_ok(),
+                "case {case} with agreeing parents: {agreed:?}"
+            );
+        }
+    }
+
+    /// The fragment reader merges a data batch with an all-null placeholder for
+    /// a nested child the file lacks. Only the placeholder's top-level field is
+    /// nullable, so a non-nullable field below it must still merge, in either
+    /// order, keeping the data and filling the new child with nulls.
+    #[test]
+    fn test_merge_with_a_placeholder_under_a_non_nullable_field() {
+        let inner =
+            |child: &str| -> Fields { vec![Field::new(child, DataType::Int32, true)].into() };
+        for wrap in ["struct", "list", "large_list"] {
+            let wrapped = |fields: Fields| match wrap {
+                "struct" => DataType::Struct(fields),
+                "list" => {
+                    DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true)))
+                }
+                _ => DataType::LargeList(Arc::new(Field::new(
+                    "item",
+                    DataType::Struct(fields),
+                    true,
+                ))),
+            };
+            let outer = |child: &str| {
+                DataType::Struct(vec![Field::new("inner", wrapped(inner(child)), false)].into())
+            };
+            let items: ArrayRef = Arc::new(StructArray::new(
+                inner("a"),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                None,
+            ));
+            let data_inner = match wrap {
+                "struct" => items,
+                "list" => one_item_per_entry(false, items),
+                _ => one_item_per_entry(true, items),
+            };
+            let data = batch_of_parent(StructArray::new(
+                vec![Field::new("inner", data_inner.data_type().clone(), false)].into(),
+                vec![data_inner],
+                None,
+            ));
+            let placeholder = batch_of_parent(new_null_array(&outer("b"), 2).as_struct().clone());
+
+            for (left, right) in [(&data, &placeholder), (&placeholder, &data)] {
+                let merged = left.merge(right).unwrap();
+                let inner = merged
+                    .column(0)
+                    .as_struct()
+                    .column_by_name("inner")
+                    .unwrap();
+                let items = match wrap {
+                    "struct" => inner.clone(),
+                    "list" => inner.as_list::<i32>().values().clone(),
+                    _ => inner.as_list::<i64>().values().clone(),
+                };
+                let items = items.as_struct();
+                let a = items.column_by_name("a").unwrap();
+                assert_eq!(a.as_primitive::<Int32Type>().values(), &[1, 2], "{wrap}");
+                assert_eq!(a.null_count(), 0, "{wrap}");
+                assert_eq!(items.column_by_name("b").unwrap().null_count(), 2, "{wrap}");
+            }
+        }
+    }
+
+    /// The null parent row's values stay hidden below a struct nested in the
+    /// list item, and below a plain struct field.
+    #[test]
+    fn test_merge_hides_nested_structs_of_a_null_parent_row() {
+        let nested = |child: &str, values: Vec<i32>| {
+            let leaf = StructArray::new(
+                vec![Field::new(child, DataType::Int32, true)].into(),
+                vec![Arc::new(Int32Array::from(values))],
+                None,
+            );
+            StructArray::new(
+                vec![Field::new("payload", leaf.data_type().clone(), true)].into(),
+                vec![Arc::new(leaf)],
+                None,
+            )
+        };
+        let x_of = |payload: &dyn Array, row: usize| {
+            let x = payload.as_struct().column_by_name("x").unwrap().clone();
+            x.is_null(row)
+        };
+
+        for large in [false, true] {
+            let in_list = |child: &str, parent: [bool; 2]| {
+                let list = one_item_per_entry(large, Arc::new(nested(child, vec![11, 12])));
+                batch_of_parent(StructArray::new(
+                    vec![Field::new("l", list.data_type().clone(), true)].into(),
+                    vec![list],
+                    Some(parent.to_vec().into()),
+                ))
+            };
+            let merged = in_list("x", [false, true])
+                .merge(&in_list("y", [true, true]))
+                .unwrap();
+            let list = merged.column(0).as_struct().column(0);
+            let item = if large {
+                list.as_list::<i64>().value(0)
+            } else {
+                list.as_list::<i32>().value(0)
+            };
+            let payload = item.as_struct().column_by_name("payload").unwrap();
+            assert!(x_of(payload.as_ref(), 0), "large={large}");
+        }
+
+        let in_struct = |child: &str, parent: [bool; 2]| {
+            let inner = nested(child, vec![11, 12]);
+            batch_of_parent(StructArray::new(
+                vec![Field::new("c", inner.data_type().clone(), true)].into(),
+                vec![Arc::new(inner)],
+                Some(parent.to_vec().into()),
+            ))
+        };
+        let merged = in_struct("x", [false, true])
+            .merge(&in_struct("y", [true, true]))
+            .unwrap();
+        let c = merged.column(0).as_struct().column(0);
+        let payload = c.as_struct().column_by_name("payload").unwrap();
+        assert!(x_of(payload.as_ref(), 0));
+        assert!(!x_of(payload.as_ref(), 1));
+    }
+
+    /// A batch whose parent rows are all null still supplies its own list when
+    /// merged with an all-null placeholder whose item struct holds more fields.
+    #[test]
+    fn test_merge_list_struct_under_null_parents_with_a_placeholder() {
+        for large in [false, true] {
+            let a = Field::new("a", DataType::Int32, true);
+            let inner = StructArray::new(
+                vec![a.clone()].into(),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                None,
+            );
+            let items = Arc::new(StructArray::new(
+                vec![Field::new("x", inner.data_type().clone(), true)].into(),
+                vec![Arc::new(inner)],
+                None,
+            ));
+            let list = one_item_per_entry(large, items);
+            let left = batch_of_parent(StructArray::new(
+                vec![Field::new("l", list.data_type().clone(), true)].into(),
+                vec![list],
+                Some(vec![false, false].into()),
+            ));
+
+            let wider_x =
+                DataType::Struct(vec![a.clone(), Field::new("b", DataType::Int32, true)].into());
+            let wider_items = new_null_array(
+                &DataType::Struct(vec![Field::new("x", wider_x, true)].into()),
+                2,
+            );
+            let wider_list = one_item_per_entry(large, wider_items);
+            let placeholder = new_null_array(
+                &DataType::Struct(
+                    vec![Field::new("l", wider_list.data_type().clone(), true)].into(),
+                ),
+                2,
+            );
+            let right = batch_of_parent(placeholder.as_struct().clone());
+
+            let merged = left.merge(&right).unwrap();
+            assert_eq!(merged.column(0).null_count(), 2, "large={large}");
+        }
+    }
+
     #[test]
     fn test_byte_width_opt() {
         assert_eq!(DataType::Int32.byte_width_opt(), Some(4));
@@ -2211,7 +2715,7 @@ mod tests {
         );
 
         // Merge the two structs
-        let merged = merge(&left_struct, &right_struct);
+        let merged = merge(&left_struct, &right_struct).unwrap();
 
         // Expected:
         // Row 1: both non-null -> {width: 300, height: 500}
@@ -2251,7 +2755,7 @@ mod tests {
             Some(vec![false, false].into()),
         );
 
-        let merged = merge(&all_null_left, &all_null_right);
+        let merged = merge(&all_null_left, &all_null_right).unwrap();
         assert_eq!(merged.null_count(), 2);
 
         // An all-null side is the identity of the merge, so the other side decides each row.
@@ -2260,7 +2764,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
             Some(vec![true, false].into()),
         );
-        let merged = merge(&partial_left, &all_null_right);
+        let merged = merge(&partial_left, &all_null_right).unwrap();
         assert!(!merged.is_null(0));
         assert!(merged.is_null(1));
 
@@ -2270,7 +2774,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
             None,
         );
-        let merged = merge(&all_valid_left, &all_null_right);
+        let merged = merge(&all_valid_left, &all_null_right).unwrap();
         assert_eq!(merged.null_count(), 0);
 
         // An explicit all-valid buffer has the same semantics as a missing buffer.
@@ -2297,7 +2801,7 @@ mod tests {
         );
 
         // Previously panicked: "Arrays of type Null cannot contain a null bitmask"
-        let merged = merge(&left_struct, &right_struct);
+        let merged = merge(&left_struct, &right_struct).unwrap();
         assert_eq!(merged.len(), 2);
         let b_col = merged.column_by_name("b").unwrap();
         // DataType::Null implies all-null by definition; no null bitmap is stored.
