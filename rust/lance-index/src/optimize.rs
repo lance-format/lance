@@ -10,7 +10,7 @@ use crate::progress::{IndexBuildProgress, noop_progress};
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OptimizeOptions {
-    /// Number of delta indices to merge for one column. Default: 1.
+    /// Number of delta indices to merge for one column. Default: None.
     ///
     /// If `num_indices_to_merge` is None, lance will create a new delta index if no partition is split, otherwise it will merge all delta indices.
     /// If `num_indices_to_merge` is Some(N), the delta updates and latest N indices
@@ -22,6 +22,15 @@ pub struct OptimizeOptions {
     /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
     /// and accumulate a few delta indices, then merge them into the snapshot.
     pub num_indices_to_merge: Option<usize>,
+
+    /// Allow automatic IVF partition splitting and joining with an explicit merge count.
+    /// Default: false.
+    ///
+    /// Rebalancing is restricted to the latest `num_indices_to_merge` segments.
+    /// If no partition needs adjustment, those segments are still merged with new data.
+    /// With an unset merge count, automatic rebalancing remains enabled regardless of
+    /// this option. An explicit merge count of zero is incompatible with this option.
+    pub enable_partition_rebalancing: bool,
 
     /// the index names to optimize. If None, all indices will be optimized.
     pub index_names: Option<Vec<String>>,
@@ -54,6 +63,7 @@ impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
             num_indices_to_merge: None,
+            enable_partition_rebalancing: false,
             index_names: None,
             retrain: false,
             transaction_properties: None,
@@ -94,6 +104,16 @@ impl OptimizeOptions {
 
     pub fn num_indices_to_merge(mut self, num: Option<usize>) -> Self {
         self.num_indices_to_merge = num;
+        self
+    }
+
+    /// Enable automatic IVF partition splitting and joining within the merge window.
+    ///
+    /// For example, `OptimizeOptions::merge(1).with_partition_rebalancing()` merges
+    /// new data into the latest segment and adjusts its partitions when needed.
+    /// Earlier segments keep their existing models and files.
+    pub fn with_partition_rebalancing(mut self) -> Self {
+        self.enable_partition_rebalancing = true;
         self
     }
 

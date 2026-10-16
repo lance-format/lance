@@ -3275,6 +3275,11 @@ impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
 
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
+        if options.enable_partition_rebalancing && options.num_indices_to_merge == Some(0) {
+            return Err(Error::invalid_input(
+                "enable_partition_rebalancing requires num_indices_to_merge to be positive or unset, got Some(0)",
+            ));
+        }
         let dataset = Arc::new(self.clone());
         // Grouped from the complete list so a name's segments are all accounted
         // for. A segment this build cannot read is still coverage, and merging

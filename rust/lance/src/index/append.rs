@@ -1373,6 +1373,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 .await?;
                 let mut append_options = options.clone();
                 append_options.num_indices_to_merge = Some(0);
+                append_options.enable_partition_rebalancing = false;
                 append_options.retrain = false;
                 let (new_uuid, indices_merged, files) = optimize_vector_indices(
                     dataset.as_ref().clone(),
@@ -2007,8 +2008,141 @@ mod tests {
             .value(0)
     }
 
+    #[tokio::test]
+    async fn test_partition_rebalancing_rejects_append_only() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .into_dataset("memory://", FragmentCount(1), FragmentRowCount(1))
+            .await
+            .unwrap();
+        let error = dataset
+            .optimize_indices(&OptimizeOptions::append().with_partition_rebalancing())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("num_indices_to_merge"));
+        assert!(error.to_string().contains("Some(0)"));
+    }
+
+    #[rstest]
+    #[case::unchanged(1, 128, std::cmp::Ordering::Equal)]
+    #[case::split(1, 8, std::cmp::Ordering::Greater)]
+    #[case::join(8, 64, std::cmp::Ordering::Less)]
+    #[tokio::test]
+    async fn test_merge_latest_segment_with_partition_rebalancing(
+        #[case] num_partitions: usize,
+        #[case] target_partition_size: usize,
+        #[case] expected_partition_change: std::cmp::Ordering,
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+        ]));
+        let (first, first_vectors) = clustered_vector_batch(schema.clone(), 0, 64, 2, 0.0);
+        let (last, last_vectors) = clustered_vector_batch(schema.clone(), 64, 64, 2, 100.0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first), Ok(last)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                num_partitions: Some(num_partitions),
+                target_partition_size: Some(target_partition_size),
+                max_iters: 2,
+                sample_rate: 2,
+                ..Default::default()
+            },
+        );
+        let mut segments = Vec::with_capacity(2);
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let first_uuid = segments[0].uuid;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        for round in 0..3 {
+            let (batch, vectors) = clustered_vector_batch(
+                schema.clone(),
+                128 + round * 16,
+                16,
+                2,
+                101.0 + round as f32,
+            );
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(1).with_partition_rebalancing())
+                .await
+                .unwrap();
+            let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            assert_eq!(segments.len(), 2, "each append must replace only the tail");
+            assert_eq!(
+                segments[0].uuid, first_uuid,
+                "earlier segments must not change"
+            );
+            assert!(
+                dataset
+                    .unindexed_fragments("vector_idx")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let logical = dataset
+                .open_logical_vector_index("vector", "vector_idx")
+                .await
+                .unwrap();
+            let partitions = logical.as_ivf().unwrap().num_partitions_per_segment();
+            assert_eq!(partitions[0].1, num_partitions);
+            assert_eq!(
+                partitions[1].1.cmp(&num_partitions),
+                expected_partition_change
+            );
+            let nprobes = partitions.iter().map(|(_, count)| *count).max().unwrap();
+            for (expected, query) in [
+                (0, first_vectors.value(0)),
+                (64, last_vectors.value(0)),
+                (128 + round * 16, vectors.value(0)),
+            ] {
+                assert_eq!(
+                    nearest_id(&dataset, query.as_primitive::<Float32Type>(), nprobes).await,
+                    expected
+                );
+            }
+        }
+    }
+
     #[rstest]
     #[case::append(OptimizeOptions::append(), false)]
+    #[case::default_with_rebalancing(OptimizeOptions::new().with_partition_rebalancing(), false)]
     #[case::default_with_stable_row_ids_and_delete(OptimizeOptions::default(), true)]
     #[tokio::test]
     async fn test_vector_append_is_segment_set_native_with_distinct_models(
