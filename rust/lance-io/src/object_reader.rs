@@ -202,14 +202,27 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let object_store = self.object_store.clone();
-        let path = self.path.clone();
         let range = Range {
             start: range.start as u64,
             end: range.end as u64,
         };
+        // Downloading a range is the same two layers as downloading the whole
+        // object, so it goes through the same retry loop: object store retries
+        // the request, and this retries a body that stops partway.
+        let get_request = Arc::new(GetRequest {
+            object_store: self.object_store.clone(),
+            path: self.path.clone(),
+            options: GetOptions {
+                range: Some(range.clone().into()),
+                ..Default::default()
+            },
+        });
+        let download_retry_count = self.download_retry_count;
         Box::pin(async move {
-            do_with_retry(|| Box::pin(object_store.get_range(&path, range.clone()))).await
+            do_get_with_outer_retry(download_retry_count, get_request, move || {
+                format!("range {}..{}", range.start, range.end)
+            })
+            .await
         })
     }
 
@@ -459,5 +472,167 @@ impl DeepSizeOf for SmallReader {
         }
 
         size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::{Debug, Display, Formatter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        Attributes, CopyOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+        ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as OSResult, path::Path,
+    };
+    use rstest::rstest;
+
+    use super::*;
+
+    fn failure() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "CountingStore",
+            source: "connection reset".into(),
+        }
+    }
+
+    /// Counts `get_opts` calls, and fails either the request or the body it
+    /// hands back, so the counts separate the two retry layers.
+    struct CountingStore {
+        inner: InMemory,
+        get_opts_calls: AtomicUsize,
+        fail_request: bool,
+    }
+
+    impl CountingStore {
+        fn new(fail_request: bool) -> Self {
+            Self {
+                inner: InMemory::new(),
+                get_opts_calls: AtomicUsize::new(0),
+                fail_request,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.get_opts_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Display for CountingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    impl Debug for CountingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CountingStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.get_opts_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_request {
+                return Err(failure());
+            }
+            let range = options
+                .range
+                .expect("the reader asks for a range")
+                .as_range(1024)
+                .expect("the range fits the object");
+            Ok(GetResult {
+                // The request succeeded; the body stops partway.
+                payload: GetResultPayload::Stream(
+                    futures::stream::once(async { Err(failure()) }).boxed(),
+                ),
+                meta: ObjectMeta {
+                    location: location.clone(),
+                    last_modified: Default::default(),
+                    size: 1024,
+                    e_tag: None,
+                    version: None,
+                },
+                range,
+                attributes: Attributes::default(),
+                extensions: Default::default(),
+            })
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    fn reader(store: Arc<CountingStore>, download_retry_count: usize) -> CloudObjectReader {
+        CloudObjectReader::new(
+            store,
+            Path::from("test/data.lance"),
+            4096,
+            None,
+            download_retry_count,
+        )
+        .unwrap()
+    }
+
+    /// A body that stops partway is what `download_retry_count` documents, and
+    /// `get_range` has to honor it like `get_all` already did.
+    #[rstest]
+    #[case::no_retries(0, 1)]
+    #[case::one_retry(1, 2)]
+    #[case::default(3, 4)]
+    #[case::raised(10, 11)]
+    #[tokio::test]
+    async fn get_range_retries_a_partial_download_as_configured(
+        #[case] download_retry_count: usize,
+        #[case] expected_requests: usize,
+    ) {
+        let store = Arc::new(CountingStore::new(false));
+        let reader = reader(store.clone(), download_retry_count);
+
+        reader.get_range(0..128).await.unwrap_err();
+
+        assert_eq!(store.calls(), expected_requests);
+    }
+
+    /// The request layer is object store's to retry, so the configured
+    /// download count does not stretch or shrink it.
+    #[tokio::test]
+    async fn get_range_leaves_the_request_retries_alone() {
+        let store = Arc::new(CountingStore::new(true));
+        let reader = reader(store.clone(), 10);
+
+        reader.get_range(0..128).await.unwrap_err();
+
+        assert_eq!(store.calls(), 4);
     }
 }
