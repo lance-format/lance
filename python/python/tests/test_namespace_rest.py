@@ -11,12 +11,16 @@ These tests mirror test_namespace_dir.py to ensure parity between
 DirectoryNamespace and RestNamespace implementations.
 """
 
+import json
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import lance.namespace
 import pyarrow as pa
 import pytest
 from lance_namespace import (
+    AlterTableBackfillColumnsRequest,
     CreateNamespaceRequest,
     CreateTableRequest,
     DeclareTableRequest,
@@ -28,10 +32,12 @@ from lance_namespace import (
     ListNamespacesRequest,
     ListTablesRequest,
     NamespaceExistsRequest,
+    RefreshMaterializedViewRequest,
     RegisterTableRequest,
     TableExistsRequest,
     connect,
 )
+from pydantic import ConfigDict
 
 
 def create_test_data():
@@ -747,3 +753,157 @@ class TestDynamicContextProvider:
 
                 # Explicit provider should have been used
                 assert explicit_called["called"]
+
+
+class _CapturingHandler(BaseHTTPRequestHandler):
+    """Records the raw JSON body of every POST and answers with a job id.
+
+    Standing in for a real Phalanx server: RestNamespace only needs a 2xx
+    response shaped like AlterTableBackfillColumnsResponse /
+    RefreshMaterializedViewResponse (just `job_id`) to consider the call
+    successful, so this doesn't need to understand the request at all.
+    """
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        self.server.captured_bodies.append(json.loads(body.decode("utf-8")))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"job_id": "captured-job-id"}).encode())
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        pass
+
+
+@pytest.fixture
+def capturing_server():
+    """A minimal HTTP server that records request bodies instead of routing
+    them anywhere -- lets a test assert on exactly what RestNamespace put on
+    the wire, independent of how any particular backend would handle it."""
+    server = HTTPServer(("127.0.0.1", 0), _CapturingHandler)
+    server.captured_bodies = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+def _with_options(request_cls):
+    """A caller-side request model that accepts unknown kwargs as extras.
+
+    Mirrors exactly what Geneva's `build_remote_request` does in production
+    (geneva/src/geneva/utils/remote_options.py) -- the real-world shape that
+    exposed this bug. Kept local to this test rather than imported from
+    anywhere, since callers are expected to build this themselves; Lance
+    doesn't ship a helper for it.
+    """
+    return type(
+        f"{request_cls.__name__}WithOptions",
+        (request_cls,),
+        {"model_config": ConfigDict(**{**dict(request_cls.model_config), "extra": "allow"})},
+    )
+
+
+class TestBackfillAndRefreshExtraOptions:
+    """Regression coverage for the `extra_options` extraction boundary in
+    the Python binding (python/src/namespace.rs).
+
+    `alter_table_backfill_columns` / `refresh_materialized_view` are the
+    only two RestNamespace operations where a caller's Python object may
+    carry fields the generated request struct doesn't declare -- e.g. a
+    Geneva tuning knob like `use_cpu_only_pool` that predates the struct's
+    schema. Everything else in this file exercises the two `_with_extra`
+    Rust methods directly, with a hand-built `serde_json::Map` -- that
+    covers the merge, but never calls `depythonize` on a real Python
+    object, so it would keep passing even if `extra_options` regressed.
+    These tests go through the actual PyO3 entry point instead, against a
+    server that records exactly what arrived.
+    """
+
+    def test_backfill_forwards_unknown_field_to_wire(self, capturing_server):
+        request_cls = _with_options(AlterTableBackfillColumnsRequest)
+        request = request_cls(
+            id=["db", "table"],
+            column="embedding",
+            concurrency=4,
+            use_cpu_only_pool=True,
+        )
+        assert request.model_extra == {"use_cpu_only_pool": True}
+
+        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+        client.alter_table_backfill_columns(request)
+
+        assert len(capturing_server.captured_bodies) == 1
+        body = capturing_server.captured_bodies[0]
+        # The knob the generated struct has no field for still made it.
+        assert body["use_cpu_only_pool"] is True
+        # Declared fields are unaffected.
+        assert body["column"] == "embedding"
+        assert body["concurrency"] == 4
+
+    def test_refresh_forwards_unknown_field_to_wire(self, capturing_server):
+        # `max_rows_per_fragment` et al. are declared fields on this schema
+        # today (ENT-2133 added them) -- pick a name the struct genuinely
+        # doesn't know about, the same way `use_cpu_only_pool` predates
+        # AlterTableBackfillColumnsRequest catching up to it.
+        request_cls = _with_options(RefreshMaterializedViewRequest)
+        request = request_cls(
+            id=["db", "view"],
+            a_future_refresh_knob=1000,
+        )
+        assert request.model_extra == {"a_future_refresh_knob": 1000}
+
+        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+        client.refresh_materialized_view(request)
+
+        assert len(capturing_server.captured_bodies) == 1
+        assert capturing_server.captured_bodies[0]["a_future_refresh_knob"] == 1000
+
+    def test_backfill_no_extras_matches_plain_request_body(self, capturing_server):
+        """An extras-*capable* request with nothing actually extra set must
+        send the identical body a plain (non extras-enabled) request would.
+
+        Regression guard for a bug review caught before merge: the generated
+        struct's optional fields use `skip_serializing_if`, so an *unset*
+        field is absent from `serde_json::to_value(typed)` but present as
+        `null` in a raw `depythonize` of the whole object. A diff between
+        those two would misread every unset field as an "extra" and add it
+        back as an explicit `null` -- turning e.g. `branch: None` into a
+        `"branch": null` on the wire, which some namespace implementations
+        reject for a field that's optional but not nullable. Comparing full
+        captured bodies (not just checking one field's absence) is what
+        would have caught that.
+        """
+        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+
+        client.alter_table_backfill_columns(
+            AlterTableBackfillColumnsRequest(id=["db", "table"], column="embedding")
+        )
+        plain_body = capturing_server.captured_bodies[-1]
+
+        extras_capable_request_cls = _with_options(AlterTableBackfillColumnsRequest)
+        client.alter_table_backfill_columns(
+            extras_capable_request_cls(id=["db", "table"], column="embedding")
+        )
+        no_extras_set_body = capturing_server.captured_bodies[-1]
+
+        assert no_extras_set_body == plain_body
+
+    def test_refresh_no_extras_matches_plain_request_body(self, capturing_server):
+        """See test_backfill_no_extras_matches_plain_request_body -- same
+        guard, for refresh_materialized_view."""
+        client = connect("rest", {"uri": f"http://127.0.0.1:{capturing_server.server_port}"})
+
+        client.refresh_materialized_view(RefreshMaterializedViewRequest(id=["db", "view"]))
+        plain_body = capturing_server.captured_bodies[-1]
+
+        extras_capable_request_cls = _with_options(RefreshMaterializedViewRequest)
+        client.refresh_materialized_view(extras_capable_request_cls(id=["db", "view"]))
+        no_extras_set_body = capturing_server.captured_bodies[-1]
+
+        assert no_extras_set_body == plain_body
