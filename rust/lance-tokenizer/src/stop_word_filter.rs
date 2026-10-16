@@ -7,6 +7,9 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[path = "stop_word_filter/arabic.rs"]
+mod arabic;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -14,7 +17,7 @@ use crate::{Language, Token, TokenFilter, TokenStream, Tokenizer};
 
 fn all_stop_words() -> impl Iterator<Item = &'static str> {
     [
-        stop_words::get("ar"),
+        arabic::ARABIC,
         stopwords::DANISH,
         stopwords::DUTCH,
         // Use the fuller `stop-words` crate English list (~198 words) rather
@@ -43,6 +46,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
+    .filter(|word| !arabic::UNION_EXCLUSIONS.contains(word))
 }
 
 #[derive(Clone)]
@@ -53,7 +57,7 @@ pub struct StopWordFilter {
 impl StopWordFilter {
     pub fn new(language: Language) -> Option<Self> {
         let words = match language {
-            Language::Arabic => stop_words::get("ar"),
+            Language::Arabic => arabic::ARABIC,
             Language::Danish => stopwords::DANISH,
             Language::Dutch => stopwords::DUTCH,
             // Use the fuller `stop-words` crate English list (~198 words); the
