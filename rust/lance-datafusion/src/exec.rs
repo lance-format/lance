@@ -491,17 +491,24 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
 fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
-) -> Arc<TaskContext> {
+) -> Result<Arc<TaskContext>> {
     // Build from the session state in place. `SessionContext::state` would clone
     // the whole state (every function map, rule list and option) only to drop
     // it, which is a measurable share of CPU for short queries.
     let task_ctx = TaskContext::from(session_ctx);
     let Some(batch_size) = options.batch_size else {
-        return Arc::new(task_ctx);
+        return Ok(Arc::new(task_ctx));
     };
+    // Writing the option directly skips the `batch_size > 0` check that
+    // `SessionConfig::with_batch_size` asserts, so check it here instead.
+    if batch_size == 0 {
+        return Err(Error::invalid_input(
+            "batch_size must be greater than 0, got 0",
+        ));
+    }
     let mut session_config = task_ctx.session_config().clone();
     session_config.options_mut().execution.batch_size = batch_size;
-    Arc::new(task_ctx.with_session_config(session_config))
+    Ok(Arc::new(task_ctx.with_session_config(session_config)))
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -749,7 +756,7 @@ pub fn execute_plan(
         Arc::new(CoalescePartitionsExec::new(plan))
     };
 
-    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+    let stream = plan.execute(0, get_task_context(&session_ctx, &options)?)?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
@@ -796,7 +803,10 @@ pub async fn analyze_plan_with_context(
     ));
 
     let session_ctx = get_session_context(&options);
-    let task_context = task_context.unwrap_or_else(|| get_task_context(&session_ctx, &options));
+    let task_context = match task_context {
+        Some(task_context) => task_context,
+        None => get_task_context(&session_ctx, &options)?,
+    };
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
         .execute(0, task_context)
@@ -1412,11 +1422,11 @@ mod tests {
 
         let default_options = LanceExecutionOptions::default();
         let session_ctx = get_session_context(&default_options);
-        let task_ctx = get_task_context(&session_ctx, &default_options);
+        let task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
         // Lance operators key per-execution state on the task context's identity.
         assert!(!Arc::ptr_eq(
             &task_ctx,
-            &get_task_context(&session_ctx, &default_options)
+            &get_task_context(&session_ctx, &default_options).unwrap()
         ));
         assert_eq!(task_ctx.session_id(), session_ctx.session_id());
         assert_eq!(
@@ -1437,7 +1447,7 @@ mod tests {
             ..Default::default()
         };
         let spill_session_ctx = get_session_context(&spill_options);
-        let spill_task_ctx = get_task_context(&spill_session_ctx, &spill_options);
+        let spill_task_ctx = get_task_context(&spill_session_ctx, &spill_options).unwrap();
         assert_eq!(spill_task_ctx.session_config().batch_size(), 17);
         assert_eq!(spill_task_ctx.session_config().target_partitions(), 3);
         assert!(
@@ -1487,6 +1497,33 @@ mod tests {
         assert_eq!(
             sorted["x"].as_primitive::<Int32Type>(),
             &Int32Array::from(vec![0, 1, 2, 3, 4, 5])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_batch_size_is_rejected() {
+        let batch = record_batch!(("x", Int32, [1, 2, 3])).unwrap();
+        let options = LanceExecutionOptions {
+            batch_size: Some(0),
+            ..Default::default()
+        };
+
+        let plan = Arc::new(OneShotExec::from_batch(batch.clone()));
+        let Err(err) = execute_plan(plan, options.clone()) else {
+            panic!("execute_plan accepted batch_size 0");
+        };
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than 0")
+        );
+
+        let plan = Arc::new(OneShotExec::from_batch(batch));
+        let err = analyze_plan(plan, options).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than 0")
         );
     }
 
