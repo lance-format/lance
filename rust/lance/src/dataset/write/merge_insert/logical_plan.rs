@@ -267,9 +267,10 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
                 // Partial-schema upsert: the `create_plan` builder adds
                 // unqualified columns (named after dataset fields) for every
                 // column missing from the source, filled from the target
-                // side of the join. Those columns carry the values that
-                // should be written for non-source columns, so they must
-                // flow through to the write exec alongside `source.*`.
+                // side of the join or with NULL. Those columns carry the
+                // values that should be written for non-source columns, so
+                // they must flow through to the write exec alongside
+                // `source.*`.
                 None if self.dataset.schema().field(field.name()).is_some() => true,
 
                 // Skip other target columns (target.value, target.key, target._rowid) - not needed for write

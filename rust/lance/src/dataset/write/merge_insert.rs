@@ -1238,6 +1238,10 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
 /// dataset field and makes it a normal data column from the write exec's
 /// perspective.
 ///
+/// A column `from_target` rejects is filled with a NULL of the target column's
+/// type instead, which keeps it out of the target scan. That is only correct
+/// when no row that reaches the write needs its stored value.
+///
 /// A filled column replaces `target.X` in place rather than being appended, so
 /// the output is the join schema with some columns unqualified, in the same
 /// order, and the same width. Appending instead would leave both `target.X` and
@@ -1246,6 +1250,7 @@ fn fill_missing_target_columns(
     df: DataFrame,
     dataset_schema: &Schema,
     source_field_names: &HashSet<String>,
+    from_target: impl Fn(&str) -> bool,
 ) -> Result<DataFrame> {
     let missing_from_source: HashSet<&str> = dataset_schema
         .fields()
@@ -1270,14 +1275,23 @@ fn fill_missing_target_columns(
             if qualifier == Some(&target_qualifier)
                 && missing_from_source.contains(field.name().as_str())
             {
+                // Same type and metadata as the target column, so the write
+                // handles both alike.
+                let expr = match from_target(field.name()) {
+                    true => expr,
+                    false => logical_expr::lit_with_metadata(
+                        ScalarValue::try_from(field.data_type())?,
+                        Some(field.as_ref().into()),
+                    ),
+                };
                 // An alias is unqualified, which is what drops the `target.`
                 // prefix and makes this a plain data column.
-                expr.alias(field.name())
+                Ok(expr.alias(field.name()))
             } else {
-                expr
+                Ok(expr)
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     Ok(df.select(projection)?)
 }
 
@@ -2649,8 +2663,29 @@ impl MergeInsertJob {
         // already hold the matched rows, so the missing columns keep their
         // stored values and must not be filled here. Skipping the fill is also
         // what keeps them out of the target scan's projection.
+        //
+        // Only an update writes back a row that already exists, so only it
+        // needs the stored values. Every other row written is an insert, whose
+        // target side the join leaves NULL, so without an update the columns are
+        // filled with NULL and not scanned. A deferred `DeleteIf` reads its
+        // columns through the fill (`MergeConditionExec`), so those are still
+        // filled from the target.
         if write_sink == WriteSink::RewriteRows {
-            df = fill_missing_target_columns(df, &dataset_schema, &source_field_names)?;
+            // Exhaustive, so a new variant has to decide whether it updates.
+            let updates = match self.params.when_matched {
+                WhenMatched::UpdateAll
+                | WhenMatched::UpdateIf(_)
+                | WhenMatched::UpdateIfExpr(_) => true,
+                WhenMatched::DoNothing | WhenMatched::Fail | WhenMatched::Delete => false,
+            };
+            let delete_if_columns = deferred_delete_if
+                .iter()
+                .flat_map(|condition| condition.column_refs())
+                .map(|column| column.name.as_str())
+                .collect::<HashSet<_>>();
+            df = fill_missing_target_columns(df, &dataset_schema, &source_field_names, |name| {
+                updates || delete_if_columns.contains(name)
+            })?;
         }
 
         let (session_state, logical_plan) = df.into_parts();
@@ -4063,7 +4098,8 @@ mod tests {
                 .unwrap();
             let source_field_names: HashSet<String> = std::iter::once("c0".to_string()).collect();
             let filled =
-                fill_missing_target_columns(joined, &dataset_schema, &source_field_names).unwrap();
+                fill_missing_target_columns(joined, &dataset_schema, &source_field_names, |_| true)
+                    .unwrap();
             depth(filled.logical_plan())
         }
 
@@ -17577,6 +17613,66 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 payloads(&updated, "key IN (25, 75)").await,
                 vec![(25, Some(b"new".to_vec()))]
             );
+        }
+
+        /// Without an update no row written needs a stored value, so the
+        /// columns the source omits are filled with NULL rather than scanned:
+        /// a delete by key reads only the key.
+        #[tokio::test]
+        async fn delete_by_key_scans_only_the_key() {
+            let Fixture { ds, io, .. } = fixture().await;
+            let source = record_batch!(("key", Int32, [325, 30, 130])).unwrap();
+            let job = builder(&ds)
+                .when_matched(WhenMatched::Delete)
+                .try_build()
+                .unwrap();
+
+            let plan = explain(&job, &source).await;
+            assert!(scan_line(&plan).contains("projection=[key]"), "{plan}");
+
+            io.incremental_stats();
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!(stats.num_deleted_rows, 3);
+            let read_bytes = io.incremental_stats().read_bytes;
+            assert!(
+                read_bytes < COLUMN_BYTES / 2,
+                "read {read_bytes} bytes against a {COLUMN_BYTES}-byte column"
+            );
+            assert_eq!(payloads(&updated, "key IN (325, 30, 130)").await, vec![]);
+            assert_eq!(updated.count_rows(None).await.unwrap(), NUM_ROWS - 3);
+        }
+
+        /// A `DeleteIf` over a column the source omits reads the filled copy,
+        /// so that column is still filled from the target when nothing is
+        /// updated; filled with NULL, no row would pass the condition.
+        #[tokio::test]
+        async fn delete_if_over_column_the_source_omits() {
+            let Fixture { ds, batch, .. } = fixture().await;
+            let source = record_batch!(("key", Int32, [25, 30, 1000])).unwrap();
+            let job = builder(&ds)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(
+                    WhenNotMatchedBySource::delete_if(&ds, "other < 3").unwrap(),
+                )
+                .try_build()
+                .unwrap();
+
+            let plan = explain(&job, &source).await;
+            assert!(
+                scan_line(&plan).contains("other")
+                    && !scan_line(&plan).contains("payload")
+                    && plan.contains("take=[]"),
+                "{plan}"
+            );
+
+            let (updated, stats) = run(job, &source).await;
+            assert_eq!((stats.num_inserted_rows, stats.num_deleted_rows), (1, 3));
+            assert_eq!(payloads(&updated, "key < 3").await, vec![]);
+            assert_eq!(
+                payloads(&updated, "key IN (25, 30, 1000)").await,
+                vec![(25, None), (30, stored(&batch, 30)), (1000, None)]
+            );
+            assert_eq!(updated.count_rows(None).await.unwrap(), NUM_ROWS - 3 + 1);
         }
 
         /// Both conditions deferred at once, over different columns. The
