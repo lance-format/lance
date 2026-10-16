@@ -555,6 +555,7 @@ mod tests {
     use super::*;
     use arrow_array::types::UInt32Type;
     use arrow_schema::{DataType, Field};
+    use datafusion::execution::TaskContext;
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
     use lance_datagen::{array, gen_batch};
@@ -1196,5 +1197,29 @@ mod tests {
         assert!(back.filters.contains_key(&1));
         // After roundtrip, the decoded expressions should be shared via Arc too
         assert!(Arc::ptr_eq(&back.filters[&0], &back.filters[&1]));
+    }
+
+    /// A planned read hands every fragment the same filter, so the encoded
+    /// plan carries the filter once rather than once per fragment
+    #[tokio::test]
+    async fn test_planned_filter_encoded_once() {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let filter = datafusion_expr::col("x").gt(datafusion_expr::lit(5u32));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(None, Some(filter))
+            .unwrap();
+        let exec = FilteredReadExec::try_new(dataset, options, None).unwrap();
+        exec.get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+
+        let plan = filtered_read_exec_to_proto(&exec, &state)
+            .await
+            .unwrap()
+            .plan
+            .unwrap();
+        assert_eq!(plan.fragment_filter_ids.len(), 2);
+        assert_eq!(plan.filter_expressions.len(), 1);
     }
 }
