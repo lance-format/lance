@@ -695,13 +695,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> plan = builder.explain_plan()  # Uses dataset schema
         >>> print(plan) # doctest: +ELLIPSIS
         MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
-          CoalescePartitionsExec
-            ProjectionExec: expr=[...]
-              HashJoinExec: mode=CollectLeft, join_type=Right, ...
+          ProjectionExec: expr=[...]
+            HashJoinExec: mode=CollectLeft, join_type=Left, ...
+              ProjectionExec: expr=[..., true as __merge_source_sentinel]
+                StreamingTableExec: partition_sizes=1, ...
+              CooperativeExec
                 LanceRead: uri=test_dataset/data, projection=[id], ...
-                RepartitionExec: ...
-                  ProjectionExec: expr=[..., true as __merge_source_sentinel]
-                    StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
 
         This is always the streaming shape. `explain_plan` receives a schema rather
@@ -720,10 +719,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> plan = builder.explain_plan(source_schema, verbose=True)
         >>> print(plan) # doctest: +ELLIPSIS
         MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
-          CoalescePartitionsExec
-            ProjectionExec: expr=[...]
-              HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                ...
+          ProjectionExec: expr=[...]
+            HashJoinExec: mode=CollectLeft, join_type=Left, ...
+              ...
         """
         return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
 
@@ -783,23 +781,18 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> analysis = builder.analyze_plan(new_data)
         >>> print(analysis) # doctest: +ELLIPSIS
             MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
-              CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
-                ProjectionExec: elapsed=..., expr=[...], metrics=[...]
-                  RepartitionExec: ...
-                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                      ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
-                        DataSourceExec: ..., metrics=[]
+              ProjectionExec: elapsed=..., expr=[...], metrics=[...]
+                HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
+                  ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
+                    DataSourceExec: ..., metrics=[]
+                  CooperativeExec, elapsed=..., metrics=[]
+                    LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
 
         The reported plan follows how the source was passed. `new_data` above is a
-        `pa.Table`, so it is wrapped in an in-memory table that reports exact
-        statistics, while a `pa.RecordBatchReader` reports none. DataFusion picks
-        the side it collects from those statistics and from the two sides' sizes.
-        The target here is three rows, so it is the collected side either way; with
-        a larger target the same merge can plan differently depending on which
-        source you hand it. Use `explain_plan` only for the streaming shape: it
-        takes a schema rather than data, so it cannot know how the source would be
-        wrapped.
+        `pa.Table`, so it is read from an in-memory table (`DataSourceExec`), while
+        a `pa.RecordBatchReader` streams (`StreamingTableExec`). Either way the
+        source is the side the join collects. `explain_plan` takes a schema rather
+        than data, so it always reports the streaming shape.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes

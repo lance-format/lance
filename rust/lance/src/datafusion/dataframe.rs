@@ -43,6 +43,7 @@ pub struct LanceTableProvider {
     blob_handling: Option<lance_core::datatypes::BlobHandling>,
     batch_size: Option<usize>,
     batch_size_bytes: Option<u64>,
+    io_buffer_size: Option<u64>,
 }
 
 impl LanceTableProvider {
@@ -77,6 +78,7 @@ impl LanceTableProvider {
             blob_handling: None,
             batch_size: None,
             batch_size_bytes: None,
+            io_buffer_size: None,
         }
     }
 
@@ -137,6 +139,12 @@ impl LanceTableProvider {
         self
     }
 
+    /// Overrides the dataset scan's I/O buffer size (see `Scanner::io_buffer_size`).
+    pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
+        self.io_buffer_size = Some(io_buffer_size);
+        self
+    }
+
     pub fn dataset(&self) -> Arc<Dataset> {
         self.dataset.clone()
     }
@@ -168,6 +176,9 @@ impl TableProvider for LanceTableProvider {
         }
         if let Some(batch_size_bytes) = self.batch_size_bytes {
             scan.batch_size_bytes(batch_size_bytes);
+        }
+        if let Some(io_buffer_size) = self.io_buffer_size {
+            scan.io_buffer_size(io_buffer_size);
         }
 
         if self.row_created_at_idx.is_some() {
