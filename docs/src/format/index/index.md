@@ -246,6 +246,19 @@ There are both part of the `table.proto` file in the Lance source code.
 
 </details>
 
+### Index Segment Metadata
+
+Like `Manifest.table_metadata`, `IndexMetadata.metadata` is a `map<string, string>`
+for arbitrary metadata associated with the index segment.
+It may be empty. Use namespaced keys and small values. Any metadata stored here
+must remain valid after changes to the segment.
+
+- Changed segments preserve all entries, including unknown ones.
+- New segments do not automatically inherit metadata.
+
+A nonempty map requires `FLAG_OBJECT_METADATA` (`1 << 17`) in
+`writer_feature_flags`. Readers may ignore it.
+
 ## Handling deleted and invalidated rows
 
 Since index segments are immutable, they may contain references to rows that have been deleted

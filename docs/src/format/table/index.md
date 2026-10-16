@@ -144,6 +144,19 @@ fragment's row lineage sequences when they are not stored in the manifest; see
 fragment's `files`, next to user columns or in a file holding nothing else, and at
 most one file of a fragment may carry each of these ids.
 
+### Fragment Metadata
+
+Like `Manifest.table_metadata`, `DataFragment.metadata` is a `map<string, string>`
+for arbitrary metadata associated with the fragment. It may be empty. Use namespaced
+keys and small values. Any metadata stored here must remain valid regardless of
+operations on the same fragment, including column replacement, overlays, and deletions.
+
+- Changes to the same fragment preserve all entries, including unknown ones.
+- New fragments do not automatically inherit metadata from their inputs.
+
+A nonempty map requires `FLAG_OBJECT_METADATA` (`1 << 17`) in
+`writer_feature_flags`. Readers may ignore it.
+
 ## Data Files
 
 Data files store column data for a fragment using the Lance file format.

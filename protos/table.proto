@@ -8,6 +8,7 @@ package lance.table;
 import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "file.proto";
+import "clustering.proto";
 import public "fragment_metadata.proto";
 
 /*
@@ -301,6 +302,20 @@ message Manifest {
    * both be set or both be absent. A mismatch is invalid.
    */
   optional int32 max_allocated_field_id = 24;
+
+  /* Immutable definitions referenced by fragment and index segment clustering_id.
+   * IDs are unique and non-zero. Keep every referenced definition in this snapshot.
+   * Requires writer flag 1 << 17; no clustering reader flag.
+   */
+  repeated Clustering clustering = 25;
+
+  /* Highest clustering ID ever allocated in this lineage; zero before the first.
+   * Allocate max_clustering_id + 1 and update this value in the same commit.
+   * Never decreases, including after definition removal or restore.
+   * u32::MAX exhausts the ID space. A nonzero value requires FLAG_OBJECT_METADATA.
+   */
+  uint32 max_clustering_id = 26;
+
 } // Manifest
 
 // external dataset base path
@@ -426,6 +441,19 @@ message IndexMetadata {
    * withdraw the payload while leaving this declaration in place.
    */
   repeated int32 covering_fields = 11;
+
+  /* Optional reference to a clustering definition in the same manifest.
+   * When present, the ID must be non-zero. Requires FLAG_OBJECT_METADATA (1 << 17)
+   * in writer_feature_flags; no clustering reader flag is required.
+   */
+  optional uint32 clustering_id = 12;
+
+  /* Arbitrary metadata associated with this index segment, like Manifest.table_metadata.
+   * Entries must remain valid after changes to the segment. Changes to the same
+   * segment preserve all entries, including unknown keys. New segments do not
+   * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
+   */
+  map<string, string> metadata = 13;
 }
 
 // Metadata about a single file within an index segment.

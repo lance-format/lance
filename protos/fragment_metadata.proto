@@ -85,6 +85,20 @@ message DataFragment {
    * `deletion_file.num_deleted_rows` from this value.
    */
   uint64 physical_rows = 4;
+
+  /* Optional reference to a clustering definition in the same manifest.
+   * When present, the ID must be non-zero. Requires FLAG_OBJECT_METADATA (1 << 17)
+   * in writer_feature_flags; no clustering reader flag is required.
+   */
+  optional uint32 clustering_id = 15;
+
+  /* Arbitrary metadata associated with this fragment, like Manifest.table_metadata.
+   * Entries must remain valid after operations on the same fragment, including
+   * column replacement, overlays, and deletions. Those operations preserve all
+   * entries, including unknown keys. New fragments do not inherit entries automatically.
+   * Requires writer flag 1 << 17 while this map is nonempty.
+   */
+  map<string, string> metadata = 16;
 }
 
 message DataFile {
