@@ -1961,22 +1961,37 @@ async fn test_top_level_cross_column_multimatch_uses_field_local_compound_scorer
 }
 
 #[rstest]
+#[case::full(false)]
+#[case::hybrid(true)]
 #[tokio::test]
-async fn test_multimatch_shared_prefilter(#[values(false, true)] use_scalar_index: bool) {
+async fn test_multimatch_shared_prefilter(
+    #[values(false, true)] use_scalar_index: bool,
+    #[case] partial_scalar_coverage: bool,
+) {
     const FILTER: &str = "id IN (0, 2, 5, 6, 8)";
     const LIMIT: usize = 3;
 
     let mut dataset = write_cross_column_compound_dataset().await;
     create_fragmented_fts_index(&mut dataset, "title", true).await;
     create_fragmented_fts_index(&mut dataset, "body", true).await;
+    let covered = if partial_scalar_coverage {
+        1
+    } else {
+        dataset.fragments().len()
+    };
+    let fragments = dataset.fragments()[..covered]
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let segment = dataset
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_owned())
+        .fragments(fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap();
     dataset
-        .create_index(
-            &["id"],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            true,
-        )
+        .commit_existing_index_segments("id_idx", "id", vec![segment])
         .await
         .unwrap();
     let query: FtsQuery = MultiMatchQuery::try_new(
@@ -2023,6 +2038,23 @@ async fn test_multimatch_shared_prefilter(#[values(false, true)] use_scalar_inde
         usize::from(use_scalar_index) * 2,
         "each field should declare the shared prefilter dependency:\n{plan}"
     );
+    if use_scalar_index && partial_scalar_coverage {
+        assert_eq!(plan.matches("PrefilterUnion:").count(), 2, "{plan}");
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        let unions = analyzed
+            .lines()
+            .filter(|line| line.trim_start().starts_with("PrefilterUnion:"))
+            .collect::<Vec<_>>();
+        assert_eq!(unions.len(), 2, "{analyzed}");
+        assert_eq!(
+            unions
+                .iter()
+                .filter(|line| line.contains("prefilter_loads=1,"))
+                .count(),
+            1,
+            "the shared source must load missing-fragment row IDs once: {analyzed}"
+        );
+    }
 
     let batch = scanner.try_into_batch().await.unwrap();
     let actual = batch[ROW_ID]

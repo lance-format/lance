@@ -9,6 +9,7 @@
 ///
 /// This benchmark is primarily intended for developers to use for profiling and debugging.  The python
 /// benchmark is more comprehensive and will cover regression testing.
+///
 use std::{collections::BTreeSet, env, sync::Arc};
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
@@ -23,12 +24,11 @@ use lance_index::{
 use lance_testing::pprof::{Output, PProfProfiler};
 use tempfile::TempDir;
 
+mod fts_common;
+use fts_common::{BenchDataset, build_segmented_fts_dataset, grouped_fragment_ids};
+
 const WIKIPEDIA_DATASET_ENV_VAR: &str = "LANCE_WIKIPEDIA_DATASET_PATH";
-const INDEX_NAME: &str = "segmented_fts";
 const PARTITION_COMPARE_INDEX_NAME: &str = "partition_shape_fts";
-const INDEXED_FRAGMENT_COUNT: usize = 12;
-const UNINDEXED_FRAGMENT_COUNT: usize = 1;
-const ROWS_PER_FRAGMENT: usize = 64;
 const PARTITION_COMPARE_INDEXED_FRAGMENT_COUNT: usize = 64;
 const PARTITION_COMPARE_UNINDEXED_FRAGMENT_COUNT: usize = 1;
 const PARTITION_COMPARE_ROWS_PER_FRAGMENT: usize = 512;
@@ -43,30 +43,6 @@ fn get_wikipedia_dataset_path() -> String {
             WIKIPEDIA_DATASET_ENV_VAR
         )
     })
-}
-
-struct BenchDataset {
-    _tmpdir: TempDir,
-    dataset: Dataset,
-}
-
-fn create_fragment_batch(fragment_id: usize) -> RecordBatch {
-    let start = (fragment_id * ROWS_PER_FRAGMENT) as i32;
-    let ids = Arc::new(Int32Array::from_iter_values(
-        start..start + ROWS_PER_FRAGMENT as i32,
-    ));
-    let texts = Arc::new(StringArray::from_iter_values((0..ROWS_PER_FRAGMENT).map(
-        |row| {
-            let term = match (fragment_id + row) % 4 {
-                0 => "alpha",
-                1 => "beta",
-                2 => "gamma",
-                _ => "delta",
-            };
-            format!("shared {term} fragment-{fragment_id} row-{row}")
-        },
-    )));
-    RecordBatch::try_from_iter(vec![("id", ids as ArrayRef), ("text", texts as ArrayRef)]).unwrap()
 }
 
 fn create_partition_compare_fragment_batch(fragment_id: usize) -> RecordBatch {
@@ -93,65 +69,6 @@ fn create_partition_compare_fragment_batch(fragment_id: usize) -> RecordBatch {
         }),
     ));
     RecordBatch::try_from_iter(vec![("id", ids as ArrayRef), ("text", texts as ArrayRef)]).unwrap()
-}
-
-fn grouped_fragment_ids(total_fragments: usize, segment_count: usize) -> Vec<Vec<u32>> {
-    let fragments_per_segment = total_fragments / segment_count;
-    (0..segment_count)
-        .map(|segment_idx| {
-            let start = segment_idx * fragments_per_segment;
-            let end = start + fragments_per_segment;
-            (start..end).map(|fragment_id| fragment_id as u32).collect()
-        })
-        .collect()
-}
-
-async fn build_segmented_fts_dataset(segment_count: usize) -> BenchDataset {
-    let tmpdir = TempDir::new().unwrap();
-    let uri = format!("file://{}", tmpdir.path().display());
-    let batches = RecordBatchIterator::new(
-        (0..(INDEXED_FRAGMENT_COUNT + UNINDEXED_FRAGMENT_COUNT))
-            .map(|fragment_id| Ok(create_fragment_batch(fragment_id)))
-            .collect::<Vec<_>>(),
-        create_fragment_batch(0).schema(),
-    );
-    let mut dataset = Dataset::write(
-        batches,
-        &uri,
-        Some(WriteParams {
-            max_rows_per_file: ROWS_PER_FRAGMENT,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        dataset.get_fragments().len(),
-        INDEXED_FRAGMENT_COUNT + UNINDEXED_FRAGMENT_COUNT
-    );
-
-    let params = InvertedIndexParams::default();
-    let mut staged_segments = Vec::with_capacity(segment_count);
-    for fragment_ids in grouped_fragment_ids(INDEXED_FRAGMENT_COUNT, segment_count) {
-        let segment = dataset
-            .create_index_builder(&["text"], IndexType::Inverted, &params)
-            .name(INDEX_NAME.to_string())
-            .fragments(fragment_ids)
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        staged_segments.push(segment);
-    }
-    dataset
-        .commit_existing_index_segments(INDEX_NAME, "text", staged_segments)
-        .await
-        .unwrap();
-
-    BenchDataset {
-        _tmpdir: tmpdir,
-        dataset,
-    }
 }
 
 fn count_partitions(segment: &lance_table::format::IndexMetadata) -> usize {
@@ -240,7 +157,7 @@ async fn build_partition_compare_dataset_with_memory_limit(
     }
 
     BenchDataset {
-        _tmpdir: tmpdir,
+        _data_dir: tmpdir,
         dataset,
     }
 }

@@ -260,6 +260,10 @@ name = "fts_search"
 harness = false
 
 [[bench]]
+name = "scalar_prefilter"
+harness = false
+
+[[bench]]
 name = "vector_throughput"
 harness = false
 

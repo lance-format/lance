@@ -76,7 +76,7 @@ where
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
     FilteredRowIds(Arc<dyn ExecutionPlan>),
-    /// The prefilter input is a selection vector from an index query
+    /// The input is one serialized selection mask, including composed index and row-ID sources.
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
     /// There is no prefilter
     None,
