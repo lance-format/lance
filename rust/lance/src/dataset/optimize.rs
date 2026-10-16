@@ -7003,6 +7003,135 @@ mod tests {
         assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
     }
 
+    /// A merge translates its sources through the fragment-reuse index, so the merged segment
+    /// is caught up with the manifest it read and must be stamped with it. Stamped with the
+    /// oldest source instead, the trim keeps every reuse version that source predates, forever.
+    #[tokio::test]
+    async fn test_segment_merge_is_stamped_with_the_version_it_was_built_from() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str().to_string();
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(4_000),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A deferred-remap compaction leaves a reuse version that the base segment predates.
+        dataset.delete("id % 10 == 0").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("a deferred-remap compaction leaves a reuse index");
+        let reuse_details = load_frag_reuse_index_details(&dataset, &reuse_meta)
+            .await
+            .unwrap();
+        assert_eq!(reuse_details.versions.len(), 1);
+        let base_version = dataset.load_indices_by_name("id_idx").await.unwrap()[0].dataset_version;
+        assert!(
+            base_version < reuse_details.versions[0].dataset_version,
+            "the base segment must predate the reuse version for the stamp to matter"
+        );
+
+        // New rows for the merge to fold into the base segment.
+        Dataset::write(
+            data_gen.batch(1_000),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let filter = "id >= 1500 and id < 4500".to_owned();
+        let mut oracle = dataset.scan();
+        oracle.filter(&filter).unwrap();
+        oracle.use_scalar_index(false);
+        let expected = oracle.count_rows().await.unwrap();
+
+        let built_from = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let merged = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(
+            merged.len(),
+            1,
+            "the new rows must merge into the base segment"
+        );
+        assert_eq!(
+            merged[0].dataset_version, built_from,
+            "a merged segment is caught up with the manifest it was built from"
+        );
+
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the reuse index survives cleanup, trimmed to zero versions");
+        let details = load_frag_reuse_index_details(&dataset, &reuse_meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            details.versions.len(),
+            0,
+            "the trim must drop the reuse version the merged segment is past"
+        );
+
+        // Nothing translates addresses any more, so only a correct merge answers right, and the
+        // plan must show the merged index answering for every fragment rather than a scan.
+        let fresh = Dataset::open(&uri).await.unwrap();
+        let mut scanner = fresh.scan();
+        scanner.filter(&filter).unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "the merged index must answer the query: {plan}"
+        );
+        assert!(
+            !plan.contains("LanceScan"),
+            "no fragment may fall back to a scan: {plan}"
+        );
+        assert_eq!(scanner.count_rows().await.unwrap(), expected);
+    }
+
     #[tokio::test]
     async fn test_defer_index_remap_skips_fri_when_no_indexed_data() {
         // A deferred compaction touching no indexed data must write no FRI --
