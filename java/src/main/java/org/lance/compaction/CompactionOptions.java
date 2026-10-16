@@ -309,11 +309,17 @@ public class CompactionOptions implements Serializable {
     }
 
     public Builder withNumThreads(long numThreads) {
+      if (numThreads <= 0) {
+        throw new IllegalArgumentException("numThreads must be greater than 0, got " + numThreads);
+      }
       this.numThreads = Optional.of(numThreads);
       return this;
     }
 
     public Builder withBatchSize(long batchSize) {
+      if (batchSize <= 0) {
+        throw new IllegalArgumentException("batchSize must be greater than 0, got " + batchSize);
+      }
       this.batchSize = Optional.of(batchSize);
       return this;
     }
