@@ -54,6 +54,7 @@ criterion.workspace = true
 pretty_assertions.workspace = true
 proptest.workspace = true
 rstest.workspace = true
+wiremock.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true

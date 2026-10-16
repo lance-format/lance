@@ -6,17 +6,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::RequestId;
-use aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
 };
-use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
+use aws_sdk_dynamodb::types::{
+    AttributeValue, DeleteRequest, KeyType, ScalarAttributeType, WriteRequest,
+};
 use object_store::path::Path;
 use snafu::OptionExt;
 use tokio::sync::RwLock;
@@ -107,6 +109,9 @@ where
 ///
 /// Transaction Safety: This store uses DynamoDB conditional write to ensure
 /// only one writer can win per version.
+///
+/// Deleting manifest entries requires the `dynamodb:BatchWriteItem` IAM
+/// permission for the table.
 #[derive(Debug)]
 pub struct DynamoDBExternalManifestStore {
     client: Arc<Client>,
@@ -233,6 +238,26 @@ impl DynamoDBExternalManifestStore {
             )));
         }
 
+        for (name, expected_type) in [
+            (base_uri!(), ScalarAttributeType::S),
+            (version!(), ScalarAttributeType::N),
+        ] {
+            let attribute_type = table
+                .attribute_definitions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|attribute| attribute.attribute_name == name)
+                .map(|attribute| &attribute.attribute_type);
+            if attribute_type != Some(&expected_type) {
+                return Err(Error::invalid_input(format!(
+                    "dynamodb table: {table_name} key `{name}` must have type {}, found {}",
+                    expected_type.as_str(),
+                    attribute_type.map_or("missing", ScalarAttributeType::as_str)
+                )));
+            }
+        }
+
         SANITY_CHECK_CACHE
             .write()
             .await
@@ -259,8 +284,32 @@ impl DynamoDBExternalManifestStore {
             .consistent_read(true)
     }
 
-    fn ddb_delete(&self) -> DeleteItemFluentBuilder {
-        self.client.delete_item().table_name(&self.table_name)
+    async fn delete_batch(&self, requests: Vec<WriteRequest>) -> Result<()> {
+        let mut request_items = HashMap::from([(self.table_name.clone(), requests)]);
+        // Throttled writes are returned in a successful response. Retry only
+        // those writes with exponential backoff, bounded to five attempts.
+        for attempt in 0..5 {
+            let result = self
+                .client
+                .batch_write_item()
+                .set_request_items(Some(request_items))
+                .send()
+                .await
+                .wrap_err()?;
+            request_items = result.unprocessed_items.unwrap_or_default();
+            request_items.retain(|_, requests| !requests.is_empty());
+            if request_items.is_empty() {
+                return Ok(());
+            }
+            if attempt < 4 {
+                tokio::time::sleep(Duration::from_millis(50 << attempt)).await;
+            }
+        }
+        Err(Error::io(format!(
+            "dynamodb table: {} has {} unprocessed manifest deletes after 5 attempts",
+            self.table_name,
+            request_items.values().map(Vec::len).sum::<usize>()
+        )))
     }
 }
 
@@ -485,36 +534,304 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
     /// Delete the manifest information for the given base_uri in dynamodb
     async fn delete(&self, base_uri: &str) -> Result<()> {
-        let query_result = self
-            .ddb_query()
-            .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
-            .expression_attribute_values(
-                format!(":{}", base_uri!()),
-                AttributeValue::S(base_uri.into()),
-            )
-            .send()
-            .await
-            .wrap_err()?;
+        let mut last_evaluated_key = None;
+        loop {
+            let query_result = self
+                .ddb_query()
+                .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
+                .expression_attribute_values(
+                    format!(":{}", base_uri!()),
+                    AttributeValue::S(base_uri.into()),
+                )
+                .projection_expression("#base_uri, #version")
+                .expression_attribute_names("#base_uri", base_uri!())
+                .expression_attribute_names("#version", version!())
+                .set_exclusive_start_key(last_evaluated_key.take())
+                .send()
+                .await
+                .wrap_err()?;
 
-        if let Some(items) = query_result.items {
-            for item in items {
-                if let Some(AttributeValue::N(version)) = item.get("version") {
-                    self.ddb_delete()
-                        .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
-                        .key(version!(), AttributeValue::N(version.clone()))
-                        .send()
-                        .await
-                        .wrap_err()?;
-                }
+            let items = query_result.items.unwrap_or_default();
+            // DynamoDB accepts at most 25 writes in one batch.
+            for batch in items.chunks(25) {
+                let requests = batch
+                    .iter()
+                    .map(|item| {
+                        let request = DeleteRequest::builder()
+                            .set_key(Some(item.clone()))
+                            .build()
+                            .map_err(|error| {
+                                Error::invalid_input(format!(
+                                    "dynamodb table: {} invalid manifest key: {error}",
+                                    self.table_name
+                                ))
+                            })?;
+                        Ok(WriteRequest::builder().delete_request(request).build())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.delete_batch(requests).await?;
+            }
+            last_evaluated_key = query_result
+                .last_evaluated_key
+                .filter(|key| !key.is_empty());
+            if last_evaluated_key.is_none() {
+                return Ok(());
             }
         }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use aws_credential_types::Credentials;
+    use aws_sdk_dynamodb::config::{Region, retry::RetryConfig};
+    use rstest::rstest;
+    use serde_json::{Value, json};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate, matchers::method};
+
     use super::*;
+
+    async fn mock_client(responses: Vec<Value>) -> (Arc<Client>, MockServer) {
+        let server = MockServer::start().await;
+        let count = responses.len() as u64;
+        let responses = Mutex::new(VecDeque::from(responses));
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                ResponseTemplate::new(200).set_body_json(
+                    responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("unexpected DynamoDB request"),
+                )
+            })
+            .expect(count)
+            .up_to_n_times(count)
+            .mount(&server)
+            .await;
+        let config = aws_sdk_dynamodb::config::Builder::new()
+            .behavior_version_latest()
+            .endpoint_url(server.uri())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .build();
+        (Arc::new(Client::from_conf(config)), server)
+    }
+
+    async fn assert_requests(server: &MockServer, expected: Vec<(&str, Value)>) {
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), expected.len());
+        for (request, (operation, body)) in requests.iter().zip(expected) {
+            assert_eq!(
+                request.headers["x-amz-target"].to_str().unwrap(),
+                format!("DynamoDB_20120810.{operation}")
+            );
+            assert_eq!(request.body_json::<Value>().unwrap(), body);
+        }
+    }
+
+    #[rstest]
+    #[case::valid(Some("S"), Some("N"), None)]
+    #[case::numeric_base_uri(Some("N"), Some("N"), Some("base_uri"))]
+    #[case::binary_base_uri(Some("B"), Some("N"), Some("base_uri"))]
+    #[case::string_version(Some("S"), Some("S"), Some("version"))]
+    #[case::binary_version(Some("S"), Some("B"), Some("version"))]
+    #[case::missing_base_uri(None, Some("N"), Some("base_uri"))]
+    #[case::missing_version(Some("S"), None, Some("version"))]
+    #[tokio::test]
+    async fn test_key_attribute_types(
+        #[case] base_uri_type: Option<&str>,
+        #[case] version_type: Option<&str>,
+        #[case] invalid_key: Option<&str>,
+    ) {
+        let definitions: Vec<_> = [("base_uri", base_uri_type), ("version", version_type)]
+            .into_iter()
+            .filter_map(|(name, scalar_type)| {
+                scalar_type
+                    .map(|scalar_type| json!({"AttributeName": name, "AttributeType": scalar_type}))
+            })
+            .collect();
+        let response = json!({"Table": {
+            "KeySchema": [
+                {"AttributeName": "base_uri", "KeyType": "HASH"},
+                {"AttributeName": "version", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": definitions
+        }});
+        let responses = if invalid_key.is_some() {
+            vec![response.clone(), response]
+        } else {
+            vec![response]
+        };
+        let (client, server) = mock_client(responses).await;
+        let table_name = uuid::Uuid::new_v4().to_string();
+        // Only a successful validation may populate the sanity-check cache.
+        for _ in 0..2 {
+            let result = DynamoDBExternalManifestStore::new_external_store(
+                client.clone(),
+                &table_name,
+                "test",
+            )
+            .await;
+            if let Some(key) = invalid_key {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                let expected_type = if key == "base_uri" { "S" } else { "N" };
+                let actual_type = if key == "base_uri" {
+                    base_uri_type
+                } else {
+                    version_type
+                }
+                .unwrap_or("missing");
+                assert!(error.to_string().contains(&format!(
+                    "dynamodb table: {table_name} key `{key}` must have type {expected_type}, found {actual_type}"
+                )));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+        let request = ("DescribeTable", json!({"TableName": table_name}));
+        assert_requests(
+            &server,
+            if invalid_key.is_some() {
+                vec![request.clone(), request]
+            } else {
+                vec![request]
+            },
+        )
+        .await;
+    }
+
+    fn manifest_key(version: u64) -> Value {
+        json!({"base_uri": {"S": "s3://bucket/table"}, "version": {"N": version.to_string()}})
+    }
+
+    fn delete_requests(versions: std::ops::RangeInclusive<u64>) -> Value {
+        Value::Array(
+            versions
+                .map(|version| json!({"DeleteRequest": {"Key": manifest_key(version)}}))
+                .collect(),
+        )
+    }
+
+    fn delete_query() -> Value {
+        json!({
+            "TableName": "manifests",
+            "ConsistentRead": true,
+            "KeyConditionExpression": "base_uri = :base_uri",
+            "ExpressionAttributeValues": {":base_uri": {"S": "s3://bucket/table"}},
+            "ProjectionExpression": "#base_uri, #version",
+            "ExpressionAttributeNames": {"#base_uri": "base_uri", "#version": "version"}
+        })
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_pages_in_batches() {
+        let (client, server) = mock_client(vec![
+            json!({"Items": (1..=26).map(manifest_key).collect::<Vec<_>>(),
+                "LastEvaluatedKey": manifest_key(26)}),
+            json!({}),
+            json!({}),
+            json!({"Items": [manifest_key(27)], "LastEvaluatedKey": {}}),
+            json!({}),
+        ])
+        .await;
+        let store = DynamoDBExternalManifestStore {
+            client,
+            table_name: "manifests".into(),
+            committer_name: "test".into(),
+        };
+        store.delete("s3://bucket/table").await.unwrap();
+        let mut next_query = delete_query();
+        next_query["ExclusiveStartKey"] = manifest_key(26);
+        assert_requests(
+            &server,
+            vec![
+                ("Query", delete_query()),
+                (
+                    "BatchWriteItem",
+                    json!({"RequestItems": {"manifests": delete_requests(1..=25)}}),
+                ),
+                (
+                    "BatchWriteItem",
+                    json!({"RequestItems": {"manifests": delete_requests(26..=26)}}),
+                ),
+                ("Query", next_query),
+                (
+                    "BatchWriteItem",
+                    json!({"RequestItems": {"manifests": delete_requests(27..=27)}}),
+                ),
+            ],
+        )
+        .await;
+    }
+
+    #[rstest]
+    #[case::no_items(json!({}))]
+    #[case::empty_items(json!({"Items": []}))]
+    #[tokio::test]
+    async fn test_delete_empty_dataset(#[case] response: Value) {
+        let (client, server) = mock_client(vec![response]).await;
+        let store = DynamoDBExternalManifestStore {
+            client,
+            table_name: "manifests".into(),
+            committer_name: "test".into(),
+        };
+        store.delete("s3://bucket/table").await.unwrap();
+        assert_requests(&server, vec![("Query", delete_query())]).await;
+    }
+
+    #[rstest]
+    #[case::eventual_success(false)]
+    #[case::retry_exhaustion(true)]
+    #[tokio::test]
+    async fn test_delete_unprocessed_items(#[case] is_exhausted: bool) {
+        let unprocessed = json!({"UnprocessedItems": {"manifests": delete_requests(2..=2)}});
+        let mut responses = vec![
+            json!({"Items": [manifest_key(1), manifest_key(2)]}),
+            unprocessed.clone(),
+        ];
+        if is_exhausted {
+            responses.extend(vec![unprocessed; 4]);
+        } else {
+            responses.push(json!({"UnprocessedItems": {"manifests": []}}));
+        }
+        let (client, server) = mock_client(responses).await;
+        let store = DynamoDBExternalManifestStore {
+            client,
+            table_name: "manifests".into(),
+            committer_name: "test".into(),
+        };
+        let result = store.delete("s3://bucket/table").await;
+        if is_exhausted {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains(
+                "dynamodb table: manifests has 1 unprocessed manifest deletes after 5 attempts"
+            ));
+        } else {
+            result.unwrap();
+        }
+        let mut requests = vec![
+            ("Query", delete_query()),
+            (
+                "BatchWriteItem",
+                json!({"RequestItems": {"manifests": delete_requests(1..=2)}}),
+            ),
+        ];
+        requests.extend(vec![
+            (
+                "BatchWriteItem",
+                json!({"RequestItems": {"manifests": delete_requests(2..=2)}}),
+            );
+            if is_exhausted { 4 } else { 1 }
+        ]);
+        assert_requests(&server, requests).await;
+    }
 
     fn item(size: Option<AttributeValue>) -> HashMap<String, AttributeValue> {
         let mut item = HashMap::from([
