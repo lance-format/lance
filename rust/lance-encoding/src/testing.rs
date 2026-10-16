@@ -24,6 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use lance_core::{Error, Result, datatypes::Field as LanceField, utils::bit::pad_bytes};
 use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
+use crate::compression::PerValueGeneralCompression;
 use crate::compression::try_packed_struct_per_value;
 use crate::{
     EncodingsIo,
@@ -184,7 +185,14 @@ impl CompressionStrategy for TestCompressionStrategy {
         if let Some(compressor) = packed {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_variable_width_per_value(field, data, &params)? {
+        let general_compression = if self.encoding == TestEncoding::StructuralSparse {
+            PerValueGeneralCompression::Any
+        } else {
+            PerValueGeneralCompression::ZstdOnly
+        };
+        if let Some(compressor) =
+            try_variable_width_per_value(field, data, &params, general_compression)?
+        {
             return Ok(compressor);
         }
         Err(lance_core::Error::not_supported_source(
