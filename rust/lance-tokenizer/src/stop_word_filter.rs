@@ -7,6 +7,9 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[path = "stop_word_filter/korean.rs"]
+mod korean;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -39,7 +42,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stop_words::get("tr"),
         stop_words::get("zh"),
         stop_words::get("ja"),
-        stop_words::get("ko"),
+        korean::KOREAN,
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
