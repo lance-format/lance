@@ -3351,10 +3351,6 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
-    // Collect the rewritten fragments' file paths up front so every failure
-    // path below can clean them up (or deliberately keep them). Fragment ids
-    // may still be reassigned by reserve_fragment_ids; cleanup only needs the
-    // file paths, which never change.
     let all_new_fragments: Vec<Fragment> = completed_tasks
         .iter()
         .flat_map(|t| t.new_fragments.iter().cloned())
@@ -3368,14 +3364,9 @@ pub async fn commit_compaction(
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        match reserve_fragment_ids(dataset, frags.into_iter()).await {
-            Ok(version) => reserved_version = Some(version),
-            Err(e) => {
-                cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments)
-                    .await;
-                return Err(e);
-            }
-        }
+        // A replayed result shares file paths with its earlier commit, so a failed
+        // reservation cannot prove the files are unreferenced. Leave them for GC.
+        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter()).await?);
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -3591,10 +3582,8 @@ pub async fn commit_compaction(
             .iter_mut()
             .flat_map(|group| group.new_fragments.iter_mut())
             .collect::<Vec<_>>();
-        if let Err(e) = reserve_fragment_ids(dataset, new_fragments.into_iter()).await {
-            cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments).await;
-            return Err(e);
-        }
+        // As above, reservation failure does not make replayed files safe to delete.
+        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
         Vec::new()
     } else {
         Vec::new()
@@ -3792,22 +3781,6 @@ async fn normalize_source_fragments(
     Ok(normalized)
 }
 
-/// Remove rewritten files after fragment-id reservation fails. Reservation
-/// commits do not reference the rewritten files, so they are still owned by
-/// this uncommitted compaction attempt and are safe to delete.
-async fn cleanup_compaction_files_after_reservation_failure(
-    dataset: &Dataset,
-    all_new_fragments: &[Fragment],
-) {
-    cleanup_data_fragments(
-        &dataset.object_store,
-        &dataset.base,
-        None,
-        all_new_fragments,
-    )
-    .await;
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -3827,7 +3800,9 @@ mod tests {
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::session::caches::{ManifestKey, RowIdIndexKey, TransactionKey};
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{
+        AmbiguousCommitHandler, AmbiguousFailure, DatagenExt, FragmentCount, FragmentRowCount,
+    };
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
@@ -4710,32 +4685,44 @@ mod tests {
         assert!(dataset.object_store.exists(&path).await.unwrap());
     }
 
-    /// A failed ReserveFragments commit cannot reference the rewritten files,
-    /// so both stable-row-id reservation paths must still clean them up.
+    #[rstest]
+    #[case::address_style(false, true)]
+    #[case::stable_row_ids(true, false)]
     #[tokio::test]
-    async fn test_compaction_cleans_up_files_when_fragment_reservation_fails() {
-        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
-
+    async fn test_compaction_retains_files_when_fragment_reservation_fails(
+        #[case] enable_stable_row_ids: bool,
+        #[case] defer_index_remap: bool,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
-        let data = sample_data();
-        let num_rows = data.num_rows();
         let handler = Arc::new(AmbiguousCommitHandler::default());
-
-        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-        let write_params = WriteParams {
-            max_rows_per_file: 3_000,
-            enable_stable_row_ids: true,
-            commit_handler: Some(handler.clone()),
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    enable_stable_row_ids,
+                    commit_handler: Some(handler.clone()),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
         let files_before = list_data_files(test_uri);
-        let options = CompactionOptions::default();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        };
         let completed = execute_compaction_plan(&dataset, &options).await;
-        assert!(list_data_files(test_uri).len() > files_before.len());
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].row_addrs.is_some(), defer_index_remap);
+        let files_after_rewrite = list_data_files(test_uri);
+        assert!(files_after_rewrite.len() > files_before.len());
 
         handler.fail_next_reserve(AmbiguousFailure::FailOutright);
         let err = commit_compaction(
@@ -4746,21 +4733,92 @@ mod tests {
         )
         .await
         .expect_err("fragment reservation that did not land must fail");
+        assert!(matches!(&err, Error::IO { .. }), "{err:?}");
         assert!(
-            !err.is_commit_status_unknown(),
-            "a verified-absent reservation is a definite failure, got: {:?}",
-            err
+            err.to_string()
+                .contains("simulated outright commit failure")
         );
+        assert_eq!(list_data_files(test_uri), files_after_rewrite);
 
-        let files_after = list_data_files(test_uri);
-        let leftover: Vec<_> = files_after.difference(&files_before).collect();
-        assert!(
-            leftover.is_empty(),
-            "rewritten files must be cleaned up after reservation fails; leftover: {:?}",
-            leftover
-        );
         let ds = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+        // No writes remain in progress, so unverified output can be reclaimed.
+        ds.cleanup_old_versions(chrono::Duration::zero(), Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(list_data_files(test_uri), files_before);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::address_style(false, true)]
+    #[case::stable_row_ids(true, false)]
+    #[tokio::test]
+    async fn test_replayed_compaction_reservation_failure_keeps_published_files(
+        #[case] enable_stable_row_ids: bool,
+        #[case] defer_index_remap: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    enable_stable_row_ids,
+                    commit_handler: Some(handler.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        };
+        let completed = execute_compaction_plan(&dataset, &options).await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].row_addrs.is_some(), defer_index_remap);
+        let serialized = serde_json::to_vec(&completed).unwrap();
+        commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let published_version = dataset.version().version;
+        let published_files = list_data_files(test_uri);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.get_fragments().len(), 1);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+
+        handler.fail_next_reserve(AmbiguousFailure::FailOutright);
+        let err = commit_compaction(
+            &mut dataset,
+            serde_json::from_slice(&serialized).unwrap(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("the injected reservation failure must fail the replay");
+        assert!(matches!(&err, Error::IO { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("simulated outright commit failure")
+        );
+        assert_eq!(list_data_files(test_uri), published_files);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.version().version, published_version);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
     }
 
     #[tokio::test]
