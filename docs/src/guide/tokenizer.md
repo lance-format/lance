@@ -59,6 +59,60 @@ Use `icu/split` when mixed-language text also contains punctuation-delimited ide
 ds.create_scalar_index("text", "INVERTED", base_tokenizer="icu/split")
 ```
 
+## Code Analyzer
+
+The code analyzer tokenizes code-like text so identifiers and operators can be
+searched. Enable it with `analyzer="code"`; `base_tokenizer="code"` is
+equivalent and infers the same profile:
+
+```python
+ds.create_scalar_index("source", "INVERTED", analyzer="code")
+```
+
+Indexes built with the code analyzer require FTS format v3.
+
+Identifiers are Unicode alphanumeric characters plus `_`. Everything else is a
+lexical boundary, and punctuation that is not an indexed operator (for example
+`.` `@` `#` `$`) is dropped.
+
+The code profile changes the defaults and adds four flags:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `split_identifiers` | `False` | Split identifiers such as `getUserName` into subwords (`get`, `User`, `Name`). |
+| `split_on_numerics` | `True` | Split subwords at letter/number boundaries (for example `value42` into `value` and `42`). |
+| `preserve_original` | `True` | Index the complete identifier in addition to its subwords. |
+| `index_operators` | `False` | Index operators such as `::`, `->`, and `!=`. |
+
+`split_on_numerics` and `preserve_original` only take effect when
+`split_identifiers=True`. The code profile also disables stemming and stop-word
+removal, and keeps the default `max_token_length` of 40.
+
+Because `split_identifiers` defaults to `False`, `getUserName` is not found by
+`user`; enable splitting to match subwords:
+
+```python
+tokens = lance.tokenize("getUserName::value42", analyzer="code")
+[(token.text, token.position) for token in tokens]
+# [("getusername", 0), ("value42", 1)]
+
+tokens = lance.tokenize(
+    "getUserName::value42",
+    analyzer="code",
+    split_identifiers=True,
+    index_operators=True,
+)
+[(token.text, token.position) for token in tokens]
+# [("getusername", 0), ("get", 0), ("user", 1), ("name", 2),
+#  ("::", 3), ("value42", 4), ("value", 4), ("42", 5)]
+```
+
+When identifiers are split, subwords are assigned consecutive positions starting
+at the identifier's position, and the preserved original identifier is stored at
+the first position with a length covering all subwords. With
+`with_position=True`, phrase queries can match subword sequences inside a single
+identifier, such as `'user name'` within `getUserName`.
+
 ## Language Models of Jieba
 
 ### Downloading the Model
