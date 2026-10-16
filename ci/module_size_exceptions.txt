@@ -7,7 +7,6 @@ rust/lance-index/src/scalar/inverted/wand.rs
 rust/lance-namespace-impls/src/dir.rs
 rust/lance/src/dataset/mem_wal/write.rs
 rust/lance/src/dataset/optimize.rs
-rust/lance/src/dataset/scanner.rs
 rust/lance/src/dataset/write/merge_insert.rs
 rust/lance/src/index.rs
 rust/lance/src/io/commit/conflict_resolver.rs
