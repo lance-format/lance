@@ -103,8 +103,8 @@ pub struct KMeansParams {
     /// training already iterates globally and ignores it.
     pub refine_iters: u32,
 
-    /// Seed for centroid initialization. `None` draws a seed from the OS, so two
-    /// trainings of the same data may pick different initial centroids.
+    /// Seed for centroid initialization and hierarchical subsampling. `None`
+    /// uses OS randomness, so two trainings of the same data may differ.
     pub seed: Option<u64>,
 
     /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
@@ -194,7 +194,8 @@ impl KMeansParams {
         self
     }
 
-    /// Seed centroid initialization, making training reproducible.
+    /// Seed centroid initialization and hierarchical subsampling, making
+    /// training reproducible.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -208,7 +209,7 @@ impl KMeansParams {
     }
 
     /// The same parameters with a seed derived for one sub-problem, so sibling
-    /// sub-trees of a hierarchical training do not share initial centroids.
+    /// sub-trees do not share subsampling and initialization randomness.
     /// Unseeded parameters stay unseeded.
     fn derive(&self, salt: u64) -> Self {
         let mut params = self.clone();
@@ -1322,12 +1323,12 @@ impl KMeans {
     /// Grow the sub-tree under one node of the proportional hierarchy.
     ///
     /// `indices` are the node's training vectors and `quota` the number of leaf
-    /// centroids it owes. `salt` derives per-node seeds from a seeded training,
-    /// so sibling sub-trees do not repeat each other's initialization.
+    /// centroids it owes. `salt` derives per-node seeds for subsampling and
+    /// initialization, so sibling sub-trees use different randomness.
     fn grow_proportional_subtree<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
         data_values: &[T::Native],
         dimension: usize,
-        indices: Vec<usize>,
+        mut indices: Vec<usize>,
         quota: usize,
         params: &KMeansParams,
         salt: u64,
@@ -1348,18 +1349,22 @@ impl KMeans {
 
         let branching = params.hierarchical_k.max(2);
         let k = branching.min(quota).min(n);
-        // Train on a prefix of the node's rows, which is a uniform subsample
-        // because the sample is in random order (`train_kmeans` would take the
-        // same prefix itself). Gathering only the prefix, and assigning the rest
-        // in chunks, keeps memory at the sample plus one chunk instead of a copy
-        // of every level of the tree.
-        let training_rows = indices.len().min(k * TRAINING_ROWS_PER_CENTROID);
-        let training = Self::create_array_from_indices::<T>(
-            &indices[..training_rows],
-            data_values,
-            dimension,
-        )?;
-        let kmeans = Self::train_kmeans::<T, Algo>(&training, k, &params.derive(salt))?;
+        // Each node samples uniformly regardless of input order: upstream
+        // reads can be sorted, and merging zero-quota children appends rows.
+        // Partially shuffle the existing indices instead of copying all vectors
+        // or allocating another full index array. All rows still get assigned.
+        let node_params = params.derive(salt);
+        let training_rows = n.min(k * TRAINING_ROWS_PER_CENTROID);
+        let training_indices = if training_rows < n {
+            indices
+                .partial_shuffle(&mut node_params.rng(), training_rows)
+                .0
+        } else {
+            indices.as_mut_slice()
+        };
+        let training =
+            Self::create_array_from_indices::<T>(training_indices, data_values, dimension)?;
+        let kmeans = Self::train_kmeans::<T, Algo>(&training, k, &node_params)?;
         drop(training);
         let membership = Self::membership_of_rows::<T, Algo>(
             kmeans.centroids.as_primitive::<T>().values(),
@@ -2957,6 +2962,120 @@ mod tests {
             sizes[cluster as usize] += 1;
         }
         sizes
+    }
+
+    #[rstest::rstest]
+    #[case::all_rows(8)]
+    #[case::subsampled(1024)]
+    fn test_hierarchical_node_handles_sorted_input(#[case] rows_per_group: usize) {
+        // Contiguous groups model upstream samples read in source-row order.
+        let mut values = vec![0.0_f32; rows_per_group];
+        values.extend(repeat_n(100.0, rows_per_group));
+        let params = KMeansParams {
+            max_iters: 5,
+            hierarchical_k: 2,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let leaves =
+            KMeans::grow_proportional_subtree::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                &values,
+                1,
+                (0..values.len()).collect(),
+                2,
+                &params,
+                7,
+            )
+            .unwrap();
+        let mut centroids: Vec<f32> = leaves.iter().map(|leaf| leaf.centroid[0]).collect();
+        centroids.sort_by(f32::total_cmp);
+        assert_eq!(centroids, vec![0.0, 100.0]);
+        let mut indices: Vec<usize> = leaves.into_iter().flat_map(|leaf| leaf.indices).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..values.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_hierarchical_node_handles_merged_children() {
+        // A zero-quota child is merged into its nearest funded sibling.
+        // Its rows must participate in the sibling's clustering.
+        let mut values = vec![0.0_f32; 2048];
+        values.extend(repeat_n(1000.0, 4096));
+        values.extend(repeat_n(100.0, 128));
+        let children = vec![
+            (0, (0..2048).collect()),
+            (1, (2048..6144).collect()),
+            (2, (6144..6272).collect()),
+        ];
+        let quotas = allocate_quotas(&[2048, 4096, 128], 5);
+        assert_eq!(quotas, vec![2, 3, 0]);
+        let (mut children, quotas) =
+            KMeans::merge_unfunded_children::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                &values,
+                1,
+                children,
+                quotas,
+                &[0.0, 1000.0, 100.0],
+                DistanceType::L2,
+            )
+            .unwrap();
+        assert_eq!(children[0].len(), 2176);
+        let params = KMeansParams {
+            max_iters: 5,
+            hierarchical_k: 2,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let leaves =
+            KMeans::grow_proportional_subtree::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                &values,
+                1,
+                std::mem::take(&mut children[0]),
+                quotas[0],
+                &params,
+                4,
+            )
+            .unwrap();
+        let mut centroids: Vec<f32> = leaves.iter().map(|leaf| leaf.centroid[0]).collect();
+        centroids.sort_by(f32::total_cmp);
+        assert_eq!(centroids, vec![0.0, 100.0]);
+        let mut indices: Vec<usize> = leaves.into_iter().flat_map(|leaf| leaf.indices).collect();
+        indices.sort_unstable();
+        let expected: Vec<usize> = (0..2048).chain(6144..6272).collect();
+        assert_eq!(indices, expected);
+    }
+
+    #[test]
+    fn test_hierarchical_kmeans_sorted_groups() {
+        const K: usize = 257; // Greater than 256 to trigger hierarchical clustering
+        // Ordered groups include exactly K distinct vectors, so successful
+        // hierarchical training must recover every group.
+        let mut values = vec![0.0_f32; 1024];
+        for group in 1..K {
+            values.extend(repeat_n(group as f32, 4));
+        }
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 1).unwrap();
+        let params = KMeansParams {
+            max_iters: 5,
+            hierarchical_k: 2,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let kmeans = KMeans::new_with_params(&data, K, &params).unwrap();
+        assert_eq!(kmeans.dimension, 1);
+        assert_eq!(kmeans.centroids.data_type(), &DataType::Float32);
+        let mut centroids = kmeans
+            .centroids
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        centroids.sort_by(f32::total_cmp);
+        assert_eq!(
+            centroids,
+            (0..K).map(|group| group as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(kmeans.compute_loss(&data).unwrap(), 0.0);
+        assert!(assigned_sizes(&kmeans, &data).iter().all(|&size| size > 0));
     }
 
     #[test]
