@@ -17,6 +17,8 @@ import org.lance.Dataset;
 import org.lance.JniLoader;
 import org.lance.LockManager;
 
+import org.apache.arrow.util.Preconditions;
+
 import java.util.Optional;
 
 /**
@@ -44,8 +46,8 @@ public class DatasetDeltaBuilder {
 
   /**
    * Compare the current dataset version against the specified version. The delta will automatically
-   * order the versions so that `begin_version` is less than `end_version`. Cannot be used together
-   * with explicit `with_begin_version` and `with_end_version`.
+   * order the versions so that the begin version is less than the end version. Cannot be used
+   * together with explicit `withBeginVersion` and `withEndVersion`.
    */
   public DatasetDeltaBuilder comparedAgainstVersion(long version) {
     this.comparedAgainst = Optional.of(version);
@@ -54,7 +56,7 @@ public class DatasetDeltaBuilder {
 
   /**
    * Set the beginning version for the delta (exclusive). Must be used together with
-   * `with_end_version`.
+   * `withEndVersion`.
    */
   public DatasetDeltaBuilder withBeginVersion(long version) {
     this.beginVersion = Optional.of(version);
@@ -63,7 +65,7 @@ public class DatasetDeltaBuilder {
 
   /**
    * Set the ending version for the delta (inclusive). Must be used together with
-   * `with_begin_version`. Cannot be used together with `compared_against_version`.
+   * `withBeginVersion`. Cannot be used together with `comparedAgainstVersion`.
    */
   public DatasetDeltaBuilder withEndVersion(long version) {
     this.endVersion = Optional.of(version);
@@ -72,6 +74,17 @@ public class DatasetDeltaBuilder {
 
   /** Build the DatasetDelta after validating builder state. */
   public DatasetDelta build() {
+    // The two version-selection modes are mutually exclusive and a range needs
+    // both ends. Without this, comparedAgainstVersion paired with a range makes
+    // nativeBuild silently drop the range (its if/else-if in lance-jni delta.rs
+    // takes comparedAgainst first), and a half-set range only fails deep in the
+    // native layer instead of at this documented contract.
+    Preconditions.checkArgument(
+        !(comparedAgainst.isPresent() && (beginVersion.isPresent() || endVersion.isPresent())),
+        "comparedAgainstVersion is mutually exclusive with beginVersion/endVersion");
+    Preconditions.checkArgument(
+        beginVersion.isPresent() == endVersion.isPresent(),
+        "beginVersion and endVersion must be set together");
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
       return nativeBuild(dataset, comparedAgainst, beginVersion, endVersion);
     }
