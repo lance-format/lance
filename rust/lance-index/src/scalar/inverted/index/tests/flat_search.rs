@@ -421,6 +421,84 @@ async fn flat_bm25_search_code_and_uses_position_groups() {
     assert_eq!(row_ids, vec![0, 1]);
 }
 
+#[rstest::rstest]
+#[case::camel_case("userName", 0, &[0, 1, 6])]
+#[case::whole_identifier("getUserName", 0, &[0, 1, 6])]
+#[case::snake_case("get_user_name", 0, &[0, 1, 6])]
+#[case::acronym("HttpRequest", 0, &[2])]
+#[case::digits("html2json", 0, &[3])]
+#[case::plain_words("user name", 0, &[0, 1, 6])]
+#[case::multiple_groups("getUser Name", 0, &[0, 1, 6])]
+#[case::slop("userName", 1, &[0, 1, 4, 6])]
+#[case::repeated_groups("getUserName getUserName", 0, &[6])]
+#[tokio::test]
+async fn flat_phrase_code_uses_position_groups(
+    #[case] query: &str,
+    #[case] slop: u32,
+    #[case] expected: &[u64],
+) {
+    let docs = [
+        Some("def getUserName(user_id): pass"),
+        Some("let x = get_user_name();"),
+        Some("class XMLHttpRequest {}"),
+        Some("parse_html2json(input)"),
+        Some("getUser gap name"),
+        Some("name user"),
+        Some("getUserName get_user_name"),
+        None,
+        Some(""),
+    ];
+    let batch = arrow_array::record_batch!(
+        ("_rowid", UInt64, (0..docs.len() as u64).collect::<Vec<_>>()),
+        ("code", Utf8, docs.to_vec())
+    )
+    .unwrap();
+    let mut tokenizer = InvertedIndexParams::code()
+        .split_identifiers(true)
+        .build()
+        .unwrap();
+    let query_tokens = try_collect_query_tokens(query, &mut tokenizer).unwrap();
+    let direct_matches = docs
+        .iter()
+        .enumerate()
+        .filter_map(|(row, doc)| {
+            doc.filter(|doc| {
+                document_matches_flat_query(doc, &mut tokenizer, &query_tokens, Some(slop)).unwrap()
+            })
+            .map(|_| row as u64)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(direct_matches, expected);
+
+    let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::iter(vec![Ok(batch)]),
+    ));
+    let (result_stream, _) = flat_bm25_search_stream_with_options_and_scorer(
+        input,
+        "code".to_string(),
+        query.to_string(),
+        tokenizer,
+        None,
+        FlatBm25SearchOptions {
+            target_batch_size: 100,
+            elapsed_compute: None,
+            document_granularity: DocumentGranularity::Row,
+            operator: Operator::And,
+            boost: 1.0,
+            phrase_slop: Some(slop),
+        },
+    )
+    .await
+    .unwrap();
+    let batches = result_stream.try_collect::<Vec<_>>().await.unwrap();
+    let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+    assert_eq!(
+        scored[ROW_ID].as_primitive::<UInt64Type>().values(),
+        expected
+    );
+}
+
 #[tokio::test]
 async fn flat_bm25_search_code_and_counts_repeated_subwords() {
     let schema = Arc::new(Schema::new(vec![

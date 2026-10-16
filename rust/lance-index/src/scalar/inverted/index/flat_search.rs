@@ -156,6 +156,7 @@ pub(super) fn document_matches_flat_query(
     }
     Ok(phrase_matches_positions(
         query_tokens,
+        &query_position_groups(query_tokens),
         &document_positions,
         slop,
     ))
@@ -167,27 +168,36 @@ pub(super) const FLAT_PHRASE_MATCH_COL: &str = "phrase_match";
 
 pub(super) fn phrase_matches_positions(
     query_tokens: &Tokens,
+    query_groups: &[Vec<usize>],
     document_positions: &[Vec<u32>],
     slop: u32,
 ) -> bool {
-    let Some(first_positions) = document_positions.first() else {
+    debug_assert_eq!(query_tokens.len(), document_positions.len());
+    let Some(first_group) = query_groups.first() else {
         return false;
     };
-    if first_positions.is_empty() {
+    // Same-position tokens are alternatives, just like the indexed posting unions.
+    let mut candidates = first_group
+        .iter()
+        .flat_map(|index| &document_positions[*index])
+        .copied()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
         return false;
     }
 
-    let mut candidates = first_positions.clone();
-    debug_assert_eq!(query_tokens.len(), document_positions.len());
-    for (query_index, positions) in document_positions.iter().enumerate().skip(1) {
+    for groups in query_groups.windows(2) {
         let Some(query_delta) = query_tokens
-            .position(query_index)
-            .checked_sub(query_tokens.position(query_index - 1))
+            .position(groups[1][0])
+            .checked_sub(query_tokens.position(groups[0][0]))
         else {
             return false;
         };
         let mut next_candidates = Vec::new();
-        for &position in positions {
+        for &position in groups[1]
+            .iter()
+            .flat_map(|index| &document_positions[*index])
+        {
             let position = u64::from(position);
             if candidates.iter().any(|candidate| {
                 let least = u64::from(*candidate) + u64::from(query_delta);
@@ -251,6 +261,7 @@ pub(super) async fn tokenize_and_count(
     let output_schema = Arc::new(Schema::new(output_fields));
     let output_schema_clone = output_schema.clone();
     let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+    let query_groups = Arc::new(query_position_groups(query_tokens.as_ref()));
     let bytes_accumulated = Arc::new(AtomicU64::new(0));
     let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
 
@@ -260,6 +271,7 @@ pub(super) async fn tokenize_and_count(
             let output_schema = output_schema.clone();
             let query_tokens = query_tokens.clone();
             let query_token_indices = query_token_indices.clone();
+            let query_groups = query_groups.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
@@ -328,6 +340,7 @@ pub(super) async fn tokenize_and_count(
                     let matches = phrase_slop.is_none_or(|slop| {
                         phrase_matches_positions(
                             query_tokens.as_ref(),
+                            &query_groups,
                             &temp_query_positions,
                             slop,
                         )
