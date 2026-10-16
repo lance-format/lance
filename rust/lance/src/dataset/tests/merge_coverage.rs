@@ -683,9 +683,9 @@ async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_u
     );
 }
 
-/// Two groups compacted separately, the second overlaid first: the first
-/// compaction does not vouch for the second's inputs, and the second's
-/// staleness does not cost the first its coverage.
+/// Two groups compacted separately, the leading group overlaid first: the
+/// clean trailing group's compaction does not vouch for the leading inputs,
+/// and its metadata-only relabel keeps the clean group's coverage.
 #[cfg(feature = "geo")]
 #[tokio::test]
 async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
@@ -696,8 +696,8 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
     let geometry = dataset.schema().field("geometry").unwrap().id;
     let staged = geo::stage_rtree_segments(&mut dataset, &params, sources.clone()).await;
 
-    // Overlay the second group before either compaction.
-    let held_back = [sources[2], sources[3]];
+    // Exclude the leading group so the clean pair is an eligible suffix.
+    let held_back = [sources[0], sources[1]];
     let mut dataset = rtree_overlay_geometry(dataset, geometry, held_back[0] as u64).await;
 
     let pair = CompactionOptions {
@@ -705,7 +705,7 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
         defer_index_remap: true,
         ..Default::default()
     };
-    compact_files(
+    let metrics = compact_files(
         &mut dataset,
         CompactionOptions {
             excluded_fragment_ids: held_back.to_vec(),
@@ -715,11 +715,13 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
     )
     .await
     .unwrap();
-    let clean = fragment_ids(&dataset)
-        .into_iter()
-        .find(|id| !held_back.contains(id))
-        .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    let clean_files = dataset.fragments().last().unwrap().files.clone();
     compact_files(&mut dataset, pair, None).await.unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let clean = dataset.fragments().last().unwrap();
+    assert_eq!(clean.files, clean_files);
+    let clean = clean.id as u32;
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     let coverage = merged
@@ -827,19 +829,22 @@ async fn test_rtree_merge_keeps_a_mapped_group_when_another_was_retired_unmapped
         excluded_fragment_ids: excluded,
         ..Default::default()
     };
-    // One pair remapped inline, so it leaves no mapping.
-    compact_files(&mut dataset, pair(sources[2..].to_vec(), false), None)
+    // Retire the trailing pair inline, so it leaves no mapping.
+    let metrics = compact_files(&mut dataset, pair(sources[..2].to_vec(), false), None)
         .await
         .unwrap();
-    // The other pair deferred.
-    compact_files(&mut dataset, pair(sources[..2].to_vec(), true), None)
+    assert_eq!(metrics.fragments_removed, 2);
+    // Defer the leading pair and the metadata-only relabel of the trailing output.
+    let metrics = compact_files(&mut dataset, pair(vec![], true), None)
         .await
         .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(dataset.fragments().len(), 2);
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert_eq!(
-        merged.fragment_bitmap.as_ref().unwrap().len(),
-        1,
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([dataset.fragments()[0].id as u32]),
         "the deferred pair's coverage was given up because an unrelated pair was \
          retired without a reuse mapping"
     );
@@ -1117,7 +1122,7 @@ async fn test_btree_merge_leaves_out_only_an_overlaid_fragment() {
     let mut dataset = commit_overlay(
         dataset,
         "overlay",
-        2,
+        0,
         &[val],
         OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
         vec![i32_array([Some(999)])],
@@ -1126,13 +1131,14 @@ async fn test_btree_merge_leaves_out_only_an_overlaid_fragment() {
     let options = CompactionOptions {
         target_rows_per_fragment: (2 * ROWS) as usize,
         defer_index_remap: true,
-        excluded_fragment_ids: vec![2],
+        excluded_fragment_ids: vec![0],
         ..Default::default()
     };
-    compact_files(&mut dataset, options, None).await.unwrap();
+    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
     let compacted = fragment_ids(&dataset)
         .into_iter()
-        .find(|id| *id != 2)
+        .find(|id| *id != 0)
         .unwrap();
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();

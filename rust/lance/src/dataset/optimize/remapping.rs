@@ -3141,9 +3141,8 @@ mod tests {
             let source_uri = format!("{}/source", dir.as_str());
             let clone_uri = format!("{}/clone", dir.as_str());
 
-            // Source: fragments {0,1} of 4 rows, fragment {2} of 8 rows (at
-            // the compaction target, so it stays untouched), indexed by
-            // i_idx.
+            // Keep the healthy fragment {0} before the compacted pair {1,2},
+            // so its physical addresses stay unchanged by suffix relabeling.
             let batch = lance_datagen::gen_batch()
                 .col("i", lance_datagen::array::step::<Int32Type>())
                 .into_batch_rows(lance_datagen::RowCount::from(8))
@@ -3153,7 +3152,7 @@ mod tests {
                 RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
                 &source_uri,
                 Some(crate::dataset::WriteParams {
-                    max_rows_per_file: 4,
+                    max_rows_per_file: 8,
                     ..Default::default()
                 }),
             )
@@ -3166,7 +3165,7 @@ mod tests {
             let mut source = InsertBuilder::new(Arc::new(source.clone()))
                 .with_params(&WriteParams {
                     mode: WriteMode::Append,
-                    max_rows_per_file: 8,
+                    max_rows_per_file: 4,
                     ..Default::default()
                 })
                 .execute(vec![batch])
@@ -3216,7 +3215,7 @@ mod tests {
                 .filter(|id| *id > 2)
                 .collect();
             let mut dataset = commit_stable_partition(dataset, &appended, 10).await;
-            compact_files(
+            let metrics = compact_files(
                 &mut dataset,
                 CompactionOptions {
                     target_rows_per_fragment: 8,
@@ -3227,10 +3226,13 @@ mod tests {
             )
             .await
             .unwrap();
-            // The compaction consumed {0,1}; narrow the inherited segment so
+            assert_eq!(metrics.fragments_removed, 4);
+            assert_eq!(metrics.fragments_added, 2);
+            assert_eq!(dataset.fragments()[0].id, 0);
+            // The compaction consumed {1,2}; narrow the inherited segment so
             // the remap straddles that group while keeping live coverage of
-            // the untouched fragment {2}.
-            narrow_index_bitmap(&mut dataset, "i_idx", &[0, 2]).await;
+            // the untouched fragment {0}.
+            narrow_index_bitmap(&mut dataset, "i_idx", &[0, 1]).await;
 
             remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
                 .await
@@ -3246,14 +3248,14 @@ mod tests {
             );
             assert_eq!(
                 after.fragment_bitmap.as_ref().unwrap(),
-                &RoaringBitmap::from_iter([2u32])
+                &RoaringBitmap::from_iter([0u32])
             );
 
             // The surviving coverage is served by opening the files from the
             // source base.
             assert_eq!(
-                sorted_values(&dataset, Some("i = 9")).await,
-                vec![9],
+                sorted_values(&dataset, Some("i = 1")).await,
+                vec![1],
                 "queries must still open the inherited files from the source base"
             );
             assert_eq!(
