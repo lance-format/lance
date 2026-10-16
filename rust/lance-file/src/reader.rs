@@ -223,6 +223,14 @@ pub struct FileMetadataIndex {
     pub(crate) version: ConcreteFileVersion,
     pub(crate) file_size_bytes: u64,
     pub(crate) retained_global_buffers: BTreeMap<u32, Bytes>,
+    /// The part of the column metadata region that the tail read at open
+    /// captured, with the file offset of its first byte.
+    ///
+    /// Column metadata is written contiguously right before the offsets table,
+    /// so on small and medium files the whole region sits inside the tail
+    /// window and the lazy loader can decode a column without another request.
+    /// `None` when the window ends before the region starts.
+    pub(crate) retained_column_metadata: Option<(u64, Bytes)>,
 }
 
 impl FileMetadataIndex {
@@ -746,6 +754,24 @@ impl FileReader {
         Ok(retained_buffers)
     }
 
+    fn retained_column_metadata_from_tail(
+        footer: &Footer,
+        tail_bytes: &Bytes,
+        tail_offset: u64,
+    ) -> Option<(u64, Bytes)> {
+        let start = footer.column_meta_start.max(tail_offset);
+        let end = footer.column_meta_offsets_start;
+        if start >= end || end > tail_offset + tail_bytes.len() as u64 {
+            return None;
+        }
+        let rel_start = (start - tail_offset) as usize;
+        let rel_end = (end - tail_offset) as usize;
+        Some((
+            start,
+            Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]),
+        ))
+    }
+
     // Checks to make sure the footer is written correctly and returns the
     // position of the file descriptor (which comes from the footer)
     fn decode_footer(footer_bytes: &Bytes) -> Result<Footer> {
@@ -1086,6 +1112,8 @@ impl FileReader {
             tail_offset,
             file_len,
         )?;
+        let retained_column_metadata =
+            Self::retained_column_metadata_from_tail(&footer, &tail_bytes, tail_offset);
 
         Ok(FileMetadataIndex {
             file_schema,
@@ -1096,6 +1124,7 @@ impl FileReader {
             version: file_version,
             file_size_bytes: file_len,
             retained_global_buffers,
+            retained_column_metadata,
         })
     }
 
@@ -1626,6 +1655,18 @@ impl FileMetadataProvider {
         Ok(position..end)
     }
 
+    /// The column metadata bytes for `range` when the tail read at open already
+    /// holds them, so no request is needed to decode the column.
+    fn retained_column_metadata(
+        metadata_index: &FileMetadataIndex,
+        range: &Range<u64>,
+    ) -> Option<Bytes> {
+        let (start, bytes) = metadata_index.retained_column_metadata.as_ref()?;
+        let end = start + bytes.len() as u64;
+        (range.start >= *start && range.end <= end)
+            .then(|| bytes.slice((range.start - start) as usize..(range.end - start) as usize))
+    }
+
     pub(crate) async fn load_indexed_column_infos<F>(
         metadata_index: &FileMetadataIndex,
         io: &Arc<dyn EncodingsIo>,
@@ -1637,38 +1678,48 @@ impl FileMetadataProvider {
         F: Fn(u32, &pbfile::ColumnMetadata) -> Result<Arc<ColumnInfo>>,
     {
         let mut column_infos = vec![None; column_indices.len()];
+        let mut retained_columns = Vec::new();
         let mut missing_columns = Vec::new();
 
         for (result_index, column_index) in column_indices.iter().copied().enumerate() {
             let cache_key = ColumnMetadataCacheKey { column_index };
             if let Some(cached) = cache.get_with_key(&cache_key).await {
                 column_infos[result_index] = Some(cached.column_info.clone());
-            } else {
-                let range = Self::column_metadata_range(metadata_index, column_index)?;
-                missing_columns.push((result_index, column_index, range));
+                continue;
+            }
+            let range = Self::column_metadata_range(metadata_index, column_index)?;
+            match Self::retained_column_metadata(metadata_index, &range) {
+                Some(bytes) => retained_columns.push((result_index, column_index, bytes)),
+                None => missing_columns.push((result_index, column_index, range)),
             }
         }
 
         missing_columns.sort_by_key(|(_, _, range)| range.start);
-        if !missing_columns.is_empty() {
+        let fetched_bytes = if missing_columns.is_empty() {
+            Vec::new()
+        } else {
             let ranges = missing_columns
                 .iter()
                 .map(|(_, _, range)| range.clone())
                 .collect::<Vec<_>>();
-            let metadata_bytes = io.submit_request(ranges, 0).await?;
-            for ((result_index, column_index, _), bytes) in
-                missing_columns.into_iter().zip(metadata_bytes)
-            {
-                let column_metadata = pbfile::ColumnMetadata::decode(bytes)?;
-                let column_info = decode_column(column_index, &column_metadata)?;
-                let cached = Arc::new(CachedColumnMetadata {
-                    column_metadata,
-                    column_info: column_info.clone(),
-                });
-                let cache_key = ColumnMetadataCacheKey { column_index };
-                cache.insert_with_key(&cache_key, cached).await;
-                column_infos[result_index] = Some(column_info);
-            }
+            io.submit_request(ranges, 0).await?
+        };
+        let fetched_columns = missing_columns
+            .into_iter()
+            .zip(fetched_bytes)
+            .map(|((result_index, column_index, _), bytes)| (result_index, column_index, bytes));
+        for (result_index, column_index, bytes) in
+            retained_columns.into_iter().chain(fetched_columns)
+        {
+            let column_metadata = pbfile::ColumnMetadata::decode(bytes)?;
+            let column_info = decode_column(column_index, &column_metadata)?;
+            let cached = Arc::new(CachedColumnMetadata {
+                column_metadata,
+                column_info: column_info.clone(),
+            });
+            let cache_key = ColumnMetadataCacheKey { column_index };
+            cache.insert_with_key(&cache_key, cached).await;
+            column_infos[result_index] = Some(column_info);
         }
 
         column_infos
@@ -3696,6 +3747,54 @@ mod tests {
         assert_eq!(
             stats.read_bytes, 0,
             "cached column metadata should avoid repeat metadata reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reader_serves_column_metadata_from_tail() {
+        let fs = FsFixture::default();
+        // Few columns: the whole column metadata region lands inside the tail
+        // read performed at open, so decoding a column needs no request.
+        let written_file = create_wide_direct_file(&fs, 2).await;
+
+        let projection = versions::reader_projection_from_column_names(
+            ConcreteFileVersion::V2_1,
+            &written_file.schema,
+            &["c1"],
+        )
+        .unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let lazy_reader = ProjectedFileReader::try_open(
+            file_scheduler,
+            Some(projection.clone()),
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        fs.object_store.io_stats_incremental();
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::Range(0..0),
+                1024,
+                Some(projection),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches = collect_read_tasks(tasks, 1).await;
+        assert!(batches.is_empty());
+
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 0,
+            "column metadata already captured by the tail read must not be fetched again"
         );
     }
 
