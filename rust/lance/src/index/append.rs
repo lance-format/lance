@@ -519,7 +519,6 @@ async fn rebuild_scalar_segment(
     dataset: &Dataset,
     reference_index: &Arc<dyn ScalarIndex>,
     field_path: &str,
-    column_name: &str,
     uuid: Uuid,
     fragment_ids: Vec<u32>,
 ) -> Result<CreatedIndex> {
@@ -534,9 +533,15 @@ async fn rebuild_scalar_segment(
         Some(fragment_ids),
     )
     .await?;
+    // `build_scalar_index` resolves the column through `Schema::field`, which
+    // needs the full dotted path for a nested field. Passing the leaf name here
+    // (e.g. `child` instead of `st.child`) made an index built over an empty
+    // dataset unextendable: its segment covers no fragments, so optimize takes
+    // this rebuild path rather than the merge path that already uses
+    // `field_path` (issue #9145).
     super::scalar::build_scalar_index(
         dataset,
-        column_name,
+        field_path,
         uuid,
         &params,
         true,
@@ -773,7 +778,6 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 &reference_index,
                 field_path,
-                column_name,
                 new_uuid,
                 rebuild_frags.iter().collect(),
             )
@@ -5114,6 +5118,86 @@ mod tests {
             .unwrap();
         let fts_count = scan.count_rows().await.unwrap();
         assert_eq!(fts_count, 25, "FTS index returned stale rows");
+    }
+
+    /// An index built while the dataset is empty covers no fragments, so the
+    /// next `optimize_indices` rebuilds it from a scan instead of merging into
+    /// it. That rebuild must resolve a nested column by its full path: handing
+    /// `build_scalar_index` the leaf name made optimize fail with
+    /// `No column with name child` (issue #9145).
+    #[tokio::test]
+    async fn test_optimize_extends_nested_scalar_index_built_empty() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let child_field = Field::new("child", DataType::Int32, true);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("uid", DataType::Utf8, true),
+            Field::new(
+                "st",
+                DataType::Struct(vec![child_field.clone()].into()),
+                true,
+            ),
+        ]));
+
+        // Build the index while the dataset holds zero rows.
+        let empty = RecordBatch::new_empty(schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(empty)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset
+            .create_index(
+                &["st.child"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Append a fragment the empty index does not cover.
+        let st = StructArray::from(Vec::<(Arc<Field>, ArrayRef)>::from_iter(vec![(
+            Arc::new(child_field.clone()),
+            Arc::new(Int32Array::from_iter_values(100..104)) as ArrayRef,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..4).map(|i| format!("u{i}")),
+                )),
+                Arc::new(st),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Before the fix this failed with `No column with name child`.
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        // The rebuilt index reaches full coverage over the appended rows.
+        let count = dataset
+            .scan()
+            .filter("st.child >= 100")
+            .unwrap()
+            .count_rows()
+            .await
+            .unwrap();
+        assert_eq!(count, 4, "rebuilt nested index missed appended rows");
     }
 
     /// Multi-segment variant (Jack Ye's repro, PR #7359): with one BTree segment
