@@ -9314,6 +9314,10 @@ mod tests {
             }
         }
 
+        async fn invalidate(&self, key: &lance_core::cache::InternalCacheKey) {
+            self.inner.invalidate(key).await;
+        }
+
         async fn clear(&self) {
             self.inner.clear().await;
         }

@@ -129,6 +129,11 @@ impl CacheBackend for SerializingCacheBackend {
         Ok((entry, false))
     }
 
+    async fn invalidate(&self, key: &InternalCacheKey) {
+        self.serialized.entries.lock().await.remove(key);
+        self.l1.invalidate(key).await;
+    }
+
     async fn clear(&self) {
         self.serialized.entries.lock().await.clear();
         self.l1.clear().await;

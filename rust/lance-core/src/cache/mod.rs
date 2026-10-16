@@ -632,6 +632,39 @@ impl LanceCache {
         }
     }
 
+    /// Remove a single entry from the cache by its exact logical key.
+    ///
+    /// The physical key is rebuilt exactly as it was for the original
+    /// [`insert_with_key`](Self::insert_with_key) or read call, so this never
+    /// matches by prefix and never touches unrelated entries. Use it when a
+    /// specific logical entry is known to have become stale — for example,
+    /// dataset cleanup invalidating the manifest entry of a version whose
+    /// files it just deleted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::borrow::Cow;
+    /// # use std::sync::Arc;
+    /// # use lance_core::cache::{CacheKey, LanceCache};
+    /// # struct ManifestKey(u64);
+    /// # impl CacheKey for ManifestKey {
+    /// #     type ValueType = Vec<i32>;
+    /// #     fn key(&self) -> Cow<'_, str> { format!("manifest/{}", self.0).into() }
+    /// #     fn type_name() -> &'static str { "Manifest" }
+    /// # }
+    /// # async fn example() {
+    /// let cache = LanceCache::with_capacity(1024);
+    /// cache.insert_with_key(&ManifestKey(5), Arc::new(vec![1])).await;
+    /// cache.invalidate_key(&ManifestKey(5)).await;
+    /// assert!(cache.get_with_key(&ManifestKey(5)).await.is_none());
+    /// # }
+    /// ```
+    pub async fn invalidate_key<K: CacheKey>(&self, cache_key: &K) {
+        let key = self.sized_key(cache_key);
+        self.state.backend.invalidate(&key).await;
+    }
+
     fn sized_key<K: CacheKey>(&self, cache_key: &K) -> InternalCacheKey {
         let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
         cache_key.write_key(&mut builder);
@@ -1118,6 +1151,10 @@ mod tests {
             Ok((entry, false))
         }
 
+        async fn invalidate(&self, key: &InternalCacheKey) {
+            self.entries.lock().await.remove(key);
+        }
+
         async fn clear(&self) {
             self.entries.lock().await.clear();
         }
@@ -1166,6 +1203,8 @@ mod tests {
         ) -> Result<(CacheEntry, bool)> {
             Ok((Arc::new(String::from("wrong type")), true))
         }
+
+        async fn invalidate(&self, _key: &InternalCacheKey) {}
 
         async fn clear(&self) {}
 

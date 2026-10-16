@@ -164,6 +164,10 @@ impl CacheBackend for MokaCacheBackend {
         }
     }
 
+    async fn invalidate(&self, key: &InternalCacheKey) {
+        self.cache.invalidate(key).await;
+    }
+
     async fn clear(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
@@ -276,6 +280,24 @@ mod tests {
         assert!(backend.get(&key, None).await.is_none());
         assert_eq!(backend.num_entries().await, 0);
         assert_eq!(backend.size_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn invalidate_removes_only_the_target_entry() {
+        let backend = MokaCacheBackend::with_capacity(1024);
+        let stale = InternalCacheKey::from_bytes([1; 16]);
+        let live = InternalCacheKey::from_bytes([2; 16]);
+        backend.insert(&stale, Arc::new(1_u64), 8, None).await;
+        backend.insert(&live, Arc::new(2_u64), 8, None).await;
+
+        backend.invalidate(&stale).await;
+
+        assert!(backend.get(&stale, None).await.is_none());
+        assert!(backend.get(&live, None).await.is_some());
+        assert_eq!(backend.num_entries().await, 1);
+        // Invalidating an absent key is a safe no-op.
+        backend.invalidate(&stale).await;
+        assert_eq!(backend.num_entries().await, 1);
     }
 
     #[test]

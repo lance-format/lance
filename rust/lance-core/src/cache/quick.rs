@@ -295,6 +295,14 @@ impl CacheBackend for QuickCacheBackend {
         }
     }
 
+    async fn invalidate(&self, key: &InternalCacheKey) {
+        self.cache.remove(key);
+        self.priority
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
     async fn clear(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         let dropped = {
@@ -411,6 +419,24 @@ mod tests {
         fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
+    }
+
+    #[tokio::test]
+    async fn invalidate_removes_only_the_target_entry() {
+        let backend = QuickCacheBackend::with_capacity(1024);
+        let stale = InternalCacheKey::from_bytes([1; 16]);
+        let live = InternalCacheKey::from_bytes([2; 16]);
+        backend.insert(&stale, Arc::new(1_u64), 8, None).await;
+        backend.insert(&live, Arc::new(2_u64), 8, None).await;
+
+        backend.invalidate(&stale).await;
+
+        assert!(backend.get(&stale, None).await.is_none());
+        assert!(backend.get(&live, None).await.is_some());
+        assert_eq!(backend.num_entries().await, 1);
+        // Invalidating an absent key is a safe no-op.
+        backend.invalidate(&stale).await;
+        assert_eq!(backend.num_entries().await, 1);
     }
 
     #[tokio::test]
