@@ -742,6 +742,20 @@ impl ShardManifestStore {
     where
         F: Fn(&ShardManifest) -> ShardManifest,
     {
+        self.try_commit_update(local_epoch, |current| Ok(prepare_fn(current)))
+            .await
+    }
+
+    /// Like [`Self::commit_update`], with validation against the manifest used
+    /// by each CAS attempt, including retries after a concurrent commit.
+    pub(crate) async fn try_commit_update<F>(
+        &self,
+        local_epoch: u64,
+        prepare_fn: F,
+    ) -> Result<ShardManifest>
+    where
+        F: Fn(&ShardManifest) -> Result<ShardManifest>,
+    {
         const MAX_RETRIES: usize = 10;
 
         for attempt in 0..MAX_RETRIES {
@@ -762,7 +776,7 @@ impl ShardManifestStore {
             Self::check_fenced_against(&Some(current.clone()), local_epoch, self.shard_id)?;
 
             // Step 3: Prepare new manifest
-            let new_manifest = prepare_fn(&current);
+            let new_manifest = prepare_fn(&current)?;
 
             // Check the successor against `current`, the manifest the closure
             // actually built on. The store's position is shared and moves

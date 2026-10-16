@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Test-only object store that injects WAL-write failures (for the WAL
-//! persistence-failure fencing path) and records the paths it serves (for
+//! Test-only object store that injects WAL and SSTable write failures and
+//! records the paths it serves (for
 //! asserting which opens actually resolved through a given `ObjectStoreParams`).
 
 use std::fmt::{Debug, Display, Formatter};
@@ -19,14 +19,21 @@ use object_store::{
     ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     RenameOptions, Result as OSResult,
 };
+use tokio::sync::Notify;
 
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
 };
 
-/// Knobs controlling injected WAL-entry write failures, shared with the test.
+/// Knobs controlling injected write failures, shared with the test.
 #[derive(Debug, Default)]
 pub struct FailControls {
+    /// Hold generation writes while later flushes are queued, then fail a
+    /// bounded number of attempts once released. WAL writes remain independent.
+    sstable_put_failures: AtomicUsize,
+    block_sstable_puts: AtomicBool,
+    sstable_put_release: Notify,
+    sstable_put_attempts: AtomicUsize,
     /// Remaining WAL-entry `put_opts` calls to fail; saturates at 0. Set high to
     /// "always fail", set to 0 to "recover".
     wal_put_failures: AtomicUsize,
@@ -50,6 +57,44 @@ pub struct FailControls {
 }
 
 impl FailControls {
+    pub fn fail_sstable_puts(&self, n: usize) {
+        self.sstable_put_failures.store(n, Ordering::SeqCst);
+    }
+    pub fn hold_sstable_puts(&self) {
+        self.block_sstable_puts.store(true, Ordering::SeqCst);
+    }
+    pub fn release_sstable_puts(&self) {
+        self.block_sstable_puts.store(false, Ordering::SeqCst);
+        self.sstable_put_release.notify_waiters();
+    }
+    pub fn sstable_attempts(&self) -> usize {
+        self.sstable_put_attempts.load(Ordering::SeqCst)
+    }
+
+    async fn before_sstable_put(&self, location: &Path) -> OSResult<()> {
+        if !location.as_ref().contains("_gen_") {
+            return Ok(());
+        }
+        self.sstable_put_attempts.fetch_add(1, Ordering::SeqCst);
+        let released = self.sstable_put_release.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if self.block_sstable_puts.load(Ordering::SeqCst) {
+            released.await;
+        }
+        if self
+            .sstable_put_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(object_store::Error::Generic {
+                store: "failing-test-store",
+                source: "injected SSTable write failure".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn fail_wal_puts(&self, n: usize) {
         self.wal_put_failures.store(n, Ordering::SeqCst);
     }
@@ -174,6 +219,7 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        self.controls.before_sstable_put(location).await?;
         if self.controls.fails_write(location) {
             return Err(Self::injected_error());
         }
@@ -220,6 +266,7 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        self.controls.before_sstable_put(location).await?;
         if self.controls.fails_write(location) {
             return Err(Self::injected_error());
         }
