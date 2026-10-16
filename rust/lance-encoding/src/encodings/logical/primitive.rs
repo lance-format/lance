@@ -10290,12 +10290,11 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(shard, range)| {
-                        drop(io.submit_request(vec![range.clone()], range.start));
+                        let read = io.submit_request(vec![range.clone()], range.start);
                         PageLoadTask {
-                            decoder_fut: std::future::ready(Err(lance_core::Error::internal(
-                                "fake page",
-                            )))
-                            .boxed(),
+                            decoder_fut: read
+                                .map(|_| Err(lance_core::Error::internal("fake page")))
+                                .boxed(),
                             // The page's rows are reported once, on the first shard.
                             num_rows: if shard == 0 { num_rows } else { 0 },
                         }

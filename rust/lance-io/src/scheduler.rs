@@ -803,6 +803,7 @@ pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
+    io_buffer_size: u64,
 }
 
 impl Debug for ScanScheduler {
@@ -927,6 +928,7 @@ impl ScanScheduler {
             object_store,
             io_queue,
             stats,
+            io_buffer_size: config.io_buffer_size_bytes,
         })
     }
 
@@ -1325,6 +1327,13 @@ impl FileScheduler {
 
             Ok(final_bytes)
         })
+    }
+
+    /// The read-ahead budget in bytes of the scan scheduler this file reads
+    /// through ([`SchedulerConfig::io_buffer_size_bytes`]). 0 means the scheduler
+    /// never waits for its consumer.
+    pub fn io_buffer_size(&self) -> u64 {
+        self.root.io_buffer_size
     }
 
     pub fn with_priority(&self, priority: u64) -> Self {
