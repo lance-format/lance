@@ -209,7 +209,7 @@ rand_xoshiro = "0.7.0"
 rangemap = { version = "1.0" }
 rayon = "1.10"
 regex-syntax = "0.8.10"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 roaring = "0.11.4"
 rstest = "0.26.1"
 serde = { version = "^1" }

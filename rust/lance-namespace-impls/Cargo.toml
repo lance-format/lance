@@ -38,7 +38,9 @@ reqwest = { workspace = true, optional = true, features = [
     "gzip",
     "http2",
     "stream",
-    "rustls-tls-native-roots",
+    "rustls",
+    "query",
+    "form",
 ] }
 # Directory implementation dependencies (always enabled)
 url = { workspace = true }
