@@ -21,8 +21,8 @@ use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::scalar::OldIndexDataFilter;
 use crate::vector::bq::storage::{
-    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
-    pack_codes, rabit_binary_code_field, rabit_ex_code_field,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RQRowLayout, RabitQuantizationMetadata,
+    RabitQueryEstimator, pack_codes, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
@@ -361,6 +361,17 @@ pub async fn init_writer_for_sq(
     Ok(w)
 }
 
+/// The merger reads and writes the column layout only: a plane-row shard, or
+/// plane-row output, is not supported until it handles packed row columns.
+fn reject_plane_rows(rq_meta: &RabitQuantizationMetadata, what: &str) -> Result<()> {
+    if rq_meta.row_layout == RQRowLayout::PlaneRows {
+        return Err(Error::not_supported(format!(
+            "Distributed RQ merge: {what} uses the plane-row layout, which the merger does not support; merge column-layout segments and convert the result"
+        )));
+    }
+    Ok(())
+}
+
 /// Create and initialize a unified writer for RQ storage.
 pub async fn init_writer_for_rq(
     object_store: &lance_io::object_store::ObjectStore,
@@ -369,6 +380,7 @@ pub async fn init_writer_for_rq(
     rq_meta: &RabitQuantizationMetadata,
     format_version: ConcreteFileVersion,
 ) -> Result<FileWriter> {
+    reject_plane_rows(rq_meta, "the merged auxiliary file")?;
     let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
         rabit_binary_code_field(rq_meta.rotated_dim()),
@@ -378,7 +390,15 @@ pub async fn init_writer_for_rq(
     if rq_meta.query_estimator == RabitQueryEstimator::RawQuery {
         fields.push(ERROR_FACTORS_FIELD.clone());
     }
-    if let Some(ex_code_field) = rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)? {
+    if rq_meta.layered {
+        fields = crate::vector::bq::layered::storage_fields(
+            rq_meta.rotated_dim(),
+            rq_meta.num_bits,
+            fields,
+        )?;
+    } else if let Some(ex_code_field) =
+        rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)?
+    {
         fields.push(ex_code_field);
         fields.push(EX_ADD_FACTORS_FIELD.clone());
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
@@ -1140,6 +1160,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 };
                 let mut rq_meta_parsed: RabitQuantizationMetadata = serde_json::from_str(&rq_json)
                     .map_err(|e| Error::index(format!("RQ metadata parse error: {}", e)))?;
+                reject_plane_rows(&rq_meta_parsed, &format!("source shard {idx}"))?;
                 if rq_meta_parsed.rotation_type == crate::vector::bq::RQRotationType::Matrix
                     && rq_meta_parsed.rotate_mat.is_none()
                     && let Some(buf_idx) = rq_meta_parsed.buffer_index()
@@ -1169,17 +1190,20 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if let Some(existing_rq) = rq_meta.as_ref()
                     && (existing_rq.code_dim != rq_meta_parsed.code_dim
                         || existing_rq.num_bits != rq_meta_parsed.num_bits
+                        || existing_rq.layered != rq_meta_parsed.layered
                         || existing_rq.rotation_type != rq_meta_parsed.rotation_type
                         || existing_rq.query_estimator != rq_meta_parsed.query_estimator
                         || existing_rq.fast_rotation_signs != rq_meta_parsed.fast_rotation_signs)
                 {
                     return Err(Error::index(format!(
-                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}), current(code_dim={}, num_bits={}, rotation_type={:?})",
+                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, layered={}, rotation_type={:?}), current(code_dim={}, num_bits={}, layered={}, rotation_type={:?})",
                         existing_rq.code_dim,
                         existing_rq.num_bits,
+                        existing_rq.layered,
                         existing_rq.rotation_type,
                         rq_meta_parsed.code_dim,
                         rq_meta_parsed.num_bits,
+                        rq_meta_parsed.layered,
                         rq_meta_parsed.rotation_type
                     )));
                 }
@@ -1628,12 +1652,12 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     Some(meta) if meta.num_bits > 1 => batches
                         .into_iter()
                         .map(|batch| {
-                            crate::vector::bq::storage::load_blocked_ex_codes(
+                            crate::vector::bq::storage::load_ex_code_planes(
                                 batch,
                                 meta.rotated_dim(),
                                 meta.num_bits,
                             )
-                            .map(|(batch, _)| batch)
+                            .map(|(batch, _, _)| batch)
                         })
                         .collect::<Result<Vec<_>>>()?,
                     _ => batches,
@@ -2428,7 +2452,14 @@ mod tests {
         distance_type: DistanceType,
     ) -> Result<usize> {
         let num_bytes = (metadata.code_dim as usize).div_ceil(u8::BITS as usize);
-        let ex_code_field = rabit_ex_code_field(metadata.code_dim as usize, metadata.num_bits)?;
+        let layout = metadata
+            .layered
+            .then(|| crate::vector::bq::layered::RQLayout::try_new(metadata.num_bits))
+            .transpose()?;
+        let ex_code_field = rabit_ex_code_field(
+            metadata.code_dim as usize,
+            layout.map_or(metadata.num_bits, |layout| layout.high_bits + 1),
+        )?;
         let ex_code_bytes = ex_code_field.as_ref().map(|field| {
             let DataType::FixedSizeList(_, num_bytes) = field.data_type() else {
                 panic!("RQ ex-code field should be FixedSizeList");
@@ -2451,7 +2482,13 @@ mod tests {
         if metadata.query_estimator == RabitQueryEstimator::RawQuery {
             fields.push(ERROR_FACTORS_FIELD.clone());
         }
-        if let Some(field) = ex_code_field {
+        if metadata.layered {
+            fields = crate::vector::bq::layered::storage_fields(
+                metadata.code_dim as usize,
+                metadata.num_bits,
+                fields,
+            )?;
+        } else if let Some(field) = ex_code_field {
             fields.push(field);
             fields.push(EX_ADD_FACTORS_FIELD.clone());
             fields.push(EX_SCALE_FACTORS_FIELD.clone());
@@ -2529,8 +2566,29 @@ mod tests {
                 UInt8Array::from(ex_codes),
                 ex_code_bytes as i32,
             )?));
+            if let Some(layout) = layout {
+                let bytes = crate::vector::bq::ex_dot::blocked_ex_code_bytes(
+                    metadata.code_dim as usize,
+                    layout.low_bits,
+                );
+                columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(vec![0x55; total_rows * bytes]),
+                    bytes as i32,
+                )?));
+            }
             columns.push(Arc::new(Float32Array::from(ex_add_factors)));
             columns.push(Arc::new(Float32Array::from(ex_scale_factors)));
+            if metadata.layered {
+                columns.push(Arc::new(Float32Array::from(vec![100.; total_rows])));
+                columns.push(Arc::new(Float32Array::from(vec![10.; total_rows])));
+                // The high and full estimator bounds, three floats each.
+                for bound in [1.0f32, 2.0] {
+                    columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                        Float32Array::from(vec![bound; total_rows * 3]),
+                        3,
+                    )?));
+                }
+            }
         }
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
 
@@ -2752,6 +2810,8 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: false,
+            layered: false,
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2884,6 +2944,8 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: true,
+            layered: false,
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -2925,8 +2987,75 @@ mod tests {
         }
     }
 
+    /// The merger handles the column layout only: a shard whose metadata
+    /// declares plane rows is not supported, whether its codes are packed
+    /// or not, and it never writes plane-row metadata over columns.
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_merge_ivf_rq_multi_bit_preserves_split_columns() {
+    async fn test_merge_ivf_rq_rejects_plane_row_shard(#[values(false, true)] packed: bool) {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq_plane_rows");
+        let aux0 = index_dir
+            .clone()
+            .join("partial_0")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let rq_meta = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 1,
+            packed,
+            layered: false,
+            row_layout: RQRowLayout::PlaneRows,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let writer = init_writer_for_rq(
+            &object_store,
+            &aux0,
+            DistanceType::L2,
+            &rq_meta,
+            ConcreteFileVersion::V2_0,
+        )
+        .await;
+        match writer {
+            Err(Error::NotSupported { .. }) => {}
+            Err(other) => panic!("expected Error::NotSupported, got {other:?}"),
+            Ok(_) => panic!("the merger wrote plane-row metadata over columns"),
+        }
+        // The shard's rows are written in columns; only its metadata matters.
+        write_rq_partial_aux(&object_store, &aux0, &rq_meta, &[2, 1], 0, DistanceType::L2)
+            .await
+            .unwrap();
+
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            std::slice::from_ref(&aux0),
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await;
+        match res {
+            Err(Error::NotSupported { source, .. }) => {
+                let message = source.to_string();
+                assert!(message.contains("source shard 0"), "{message}");
+                assert!(message.contains("plane-row layout"), "{message}");
+            }
+            other => panic!("expected Error::NotSupported for a plane-row shard, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::single(4, false)]
+    #[case::rq5(5, true)]
+    #[case::rq7(7, true)]
+    #[case::rq9(9, true)]
+    #[tokio::test]
+    async fn test_merge_ivf_rq_multi_bit_preserves_split_columns(
+        #[case] num_bits: u8,
+        #[case] layered: bool,
+    ) {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq_multi_bit");
 
@@ -2944,8 +3073,10 @@ mod tests {
             fast_rotation_signs: Some(vec![0xAA; 2]),
             rotation_type: RQRotationType::Fast,
             code_dim: 16,
-            num_bits: 4,
+            num_bits,
             packed: false,
+            layered,
+            row_layout: RQRowLayout::Columns,
             query_estimator: RabitQueryEstimator::RawQuery,
         };
 
@@ -3000,7 +3131,8 @@ mod tests {
         let meta = reader.metadata();
         let rq_meta_json = meta.file_schema.metadata.get(RABIT_METADATA_KEY).unwrap();
         let merged_rq_meta: RabitQuantizationMetadata = serde_json::from_str(rq_meta_json).unwrap();
-        assert_eq!(merged_rq_meta.num_bits, 4);
+        assert_eq!(merged_rq_meta.num_bits, num_bits);
+        assert_eq!(merged_rq_meta.layered, layered);
         assert!(merged_rq_meta.packed);
 
         let mut total_rows = 0usize;
@@ -3025,7 +3157,32 @@ mod tests {
                     panic!("RQ ex-code field should be FixedSizeList");
                 };
                 // code_dim=16 padded to one 64-dim block at ex_bits=3.
-                assert_eq!(*ex_code_bytes, 24);
+                let high_bits = if layered {
+                    crate::vector::bq::layered::RQLayout::try_new(num_bits)
+                        .unwrap()
+                        .high_bits
+                } else {
+                    num_bits - 1
+                };
+                assert_eq!(
+                    *ex_code_bytes,
+                    crate::vector::bq::ex_dot::blocked_ex_code_bytes(16, high_bits) as i32
+                );
+                if layered {
+                    assert!(
+                        schema
+                            .field_with_name(
+                                crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_LO_COLUMN
+                            )
+                            .is_ok()
+                    );
+                    assert_eq!(
+                        batch[crate::vector::bq::layered::HIGH_ADD_FACTORS_COLUMN]
+                            .as_primitive::<Float32Type>()
+                            .value(0),
+                        100.
+                    );
+                }
                 assert!(schema.field_with_name(ERROR_FACTORS_FIELD.name()).is_ok());
                 assert!(schema.field_with_name(EX_ADD_FACTORS_COLUMN).is_ok());
                 assert!(schema.field_with_name(EX_SCALE_FACTORS_COLUMN).is_ok());
@@ -3040,6 +3197,50 @@ mod tests {
             .map(|(a, b)| (*a + *b) as usize)
             .sum();
         assert_eq!(total_rows, expected_total);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rq_rejects_mixed_layouts() {
+        let store = ObjectStore::memory();
+        let root = Path::from("mixed-rq");
+        let a = root
+            .clone()
+            .join("partial_0")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let b = root
+            .clone()
+            .join("partial_1")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let mut metadata = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 5,
+            packed: false,
+            layered: false,
+            row_layout: RQRowLayout::Columns,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        write_rq_partial_aux(&store, &a, &metadata, &[2], 0, DistanceType::L2)
+            .await
+            .unwrap();
+        metadata.layered = true;
+        write_rq_partial_aux(&store, &b, &metadata, &[2], 10, DistanceType::L2)
+            .await
+            .unwrap();
+        let error = merge_partial_vector_auxiliary_files(
+            &store,
+            &[a, b],
+            &root,
+            crate::progress::noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(error.to_string().contains("structural mismatch"));
+        assert!(error.to_string().contains("layered=true"));
     }
 
     #[tokio::test]

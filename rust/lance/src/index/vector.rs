@@ -2221,6 +2221,8 @@ fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
 fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
     RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
+        layered: Some(rabit_quantizer.metadata_ref().layered),
+        row_layout: rabit_quantizer.metadata_ref().row_layout,
         rotation_type: rabit_quantizer.rotation_type(),
         rotation: None,
     }

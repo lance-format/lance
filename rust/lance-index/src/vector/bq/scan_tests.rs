@@ -322,7 +322,10 @@ impl Fixture {
 }
 
 fn full_options(approx_mode: ApproxMode) -> DistanceCalculatorOptions {
-    DistanceCalculatorOptions { approx_mode }
+    DistanceCalculatorOptions {
+        approx_mode,
+        ..Default::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

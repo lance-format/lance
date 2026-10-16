@@ -20,7 +20,7 @@
 //! reach a cache entry; [`resident_store_views`] counts the live ones and
 //! [`shares_resident_store`] tells whether a batch holds store memory.
 //!
-//! The first read loads the store; callers can also load it explicitly.
+//! An index loads the store when it opens, so that no read waits for it.
 //! The store is an entry of the index cache ([`ResidentColumnsKey`]),
 //! charged what its arrays allocate and evictable under ordinary cache
 //! pressure. Each live index holds an `Arc` to its store independently of
@@ -54,18 +54,25 @@ use lance_io::ReadBatchParams;
 use lance_io::scheduler::IoStats;
 use tokio::sync::OnceCell;
 
+use super::layered::{FULL_BOUNDS_COLUMN, HIGH_BOUNDS_COLUMN};
 use super::scan_stats;
-use super::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RABIT_EX_CODE_COLUMN};
+use super::storage::{
+    RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN, RABIT_CODE_COLUMN,
+    RABIT_EX_CODE_COLUMN,
+};
 use crate::vector::exact_buffers::{exact_array, exact_batch};
 use crate::vector::storage::{
     IndexFileKey, ResidentAttach, ResidentLifetime, WeakRegistry, shared_by_key,
 };
 
 /// Code columns, which hold most of the file's bytes and are fetched per read.
-const FILE_COLUMNS: [&str; 3] = [
+const FILE_COLUMNS: [&str; 6] = [
     RABIT_CODE_COLUMN,
     RABIT_EX_CODE_COLUMN,
     RABIT_BLOCKED_EX_CODE_COLUMN,
+    RABIT_BLOCKED_EX_CODE_LO_COLUMN,
+    HIGH_BOUNDS_COLUMN,
+    FULL_BOUNDS_COLUMN,
 ];
 
 /// Byte width of `field`'s values when the store keeps the column: every

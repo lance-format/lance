@@ -335,6 +335,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            rq_precision: Default::default(),
+            rq_cascade_factor: None,
         };
         query.validate_search_effort()?;
         Ok(query)

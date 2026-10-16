@@ -17,8 +17,8 @@ use rand_distr::Distribution;
 use rayon::prelude::*;
 
 use crate::vector::bq::storage::{
-    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
-    RabitQueryEstimator, rabit_binary_code_field, rabit_ex_code_field,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RQRowLayout, RabitQuantizationMetadata,
+    RabitQuantizationStorage, RabitQueryEstimator, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
@@ -63,11 +63,8 @@ pub struct RabitQuantizer {
 pub(crate) struct RabitQuantizedBatch {
     pub binary_codes: ArrayRef,
     pub ex_codes: Option<ArrayRef>,
-    #[cfg(test)]
     pub ex_res_dot_dists: Option<Vec<f32>>,
-    #[cfg(test)]
     pub rotated_residuals: Option<Vec<f32>>,
-    #[cfg(test)]
     pub ex_code_values: Option<Vec<u8>>,
 }
 
@@ -542,11 +539,8 @@ impl RabitQuantizer {
             } else {
                 None
             },
-            #[cfg(test)]
             rotated_residuals: None,
-            #[cfg(test)]
             ex_code_values: None,
-            #[cfg(test)]
             ex_res_dot_dists: None,
         })
     }
@@ -583,6 +577,8 @@ impl RabitQuantizer {
                     code_dim: code_dim as u32,
                     num_bits,
                     packed: false,
+                    layered: false,
+                    row_layout: RQRowLayout::Columns,
                     query_estimator: RabitQueryEstimator::RawQuery,
                 }
             }
@@ -594,6 +590,8 @@ impl RabitQuantizer {
                 code_dim: code_dim as u32,
                 num_bits,
                 packed: false,
+                layered: false,
+                row_layout: RQRowLayout::Columns,
                 query_estimator: RabitQueryEstimator::RawQuery,
             },
         };
@@ -1035,11 +1033,8 @@ impl RabitQuantizer {
                         .map(|array| Arc::new(array) as ArrayRef)
                 })
                 .transpose()?,
-            #[cfg(test)]
             ex_res_dot_dists,
-            #[cfg(test)]
             rotated_residuals: Some(rotated_residuals),
-            #[cfg(test)]
             ex_code_values,
         })
     }
@@ -1056,6 +1051,10 @@ impl Quantization for RabitQuantizer {
         params: &Self::BuildParams,
     ) -> Result<Self> {
         validate_rq_num_bits(params.num_bits)?;
+        let is_layered = params.is_layered();
+        if is_layered {
+            super::layered::RQLayout::try_new(params.num_bits)?;
+        }
 
         let dim = data.as_fixed_size_list().value_length() as usize;
         if !dim.is_multiple_of(u8::BITS as usize) {
@@ -1063,11 +1062,13 @@ impl Quantization for RabitQuantizer {
                 "vector dimension must be divisible by 8 for IVF_RQ",
             ));
         }
-        if let Some(q) = Self::from_supplied_rotation(params, dim)? {
+        if let Some(mut q) = Self::from_supplied_rotation(params, dim)? {
+            q.metadata.layered = is_layered;
+            q.metadata.row_layout = params.row_layout;
             return Ok(q);
         }
 
-        let q = match data.as_fixed_size_list().value_type() {
+        let mut q = match data.as_fixed_size_list().value_type() {
             DataType::Float16 => Self::new_with_rotation::<Float16Type>(
                 params.num_bits,
                 data.as_fixed_size_list().value_length(),
@@ -1090,6 +1091,8 @@ impl Quantization for RabitQuantizer {
                 )));
             }
         };
+        q.metadata.layered = is_layered;
+        q.metadata.row_layout = params.row_layout;
         Ok(q)
     }
 
@@ -1152,6 +1155,14 @@ impl Quantization for RabitQuantizer {
         _: lance_linalg::distance::DistanceType,
     ) -> Result<Quantizer> {
         validate_rq_num_bits(metadata.num_bits)?;
+        if metadata.layered {
+            super::layered::RQLayout::try_new(metadata.num_bits)?;
+            if metadata.query_estimator != RabitQueryEstimator::RawQuery {
+                return Err(Error::invalid_input(
+                    "layered IVF_RQ requires the raw-query estimator",
+                ));
+            }
+        }
         Ok(Quantizer::Rabit(Self {
             metadata: metadata.clone(),
         }))
@@ -1162,19 +1173,36 @@ impl Quantization for RabitQuantizer {
     }
 
     fn extra_fields(&self) -> Vec<Field> {
-        let mut fields = vec![ADD_FACTORS_FIELD.clone(), SCALE_FACTORS_FIELD.clone()];
-        if self.metadata.query_estimator == RabitQueryEstimator::RawQuery {
-            fields.push(ERROR_FACTORS_FIELD.clone());
-        }
-        if let Some(ex_code_field) = rabit_ex_code_field(self.code_dim(), self.metadata.num_bits)
-            .expect("RabitQ num_bits should be validated")
-        {
-            fields.push(ex_code_field);
-            fields.push(EX_ADD_FACTORS_FIELD.clone());
-            fields.push(EX_SCALE_FACTORS_FIELD.clone());
-        }
+        let mut fields = rabit_storage_fields(&self.metadata)
+            .expect("RabitQ num_bits and layered layout validated at build");
+        // The first is the binary code field, `Self::field`.
+        fields.remove(0);
         fields
     }
+}
+
+/// The fields an IVF_RQ storage file with `metadata` stores after the row id
+/// in the column layout, in their order: the binary codes and their factors,
+/// then the ex codes and factors, as plain or layered planes.
+pub fn rabit_storage_fields(metadata: &RabitQuantizationMetadata) -> Result<Vec<Field>> {
+    let rotated_dim = metadata.rotated_dim();
+    let mut fields = vec![
+        rabit_binary_code_field(rotated_dim),
+        ADD_FACTORS_FIELD.clone(),
+        SCALE_FACTORS_FIELD.clone(),
+    ];
+    if metadata.query_estimator == RabitQueryEstimator::RawQuery {
+        fields.push(ERROR_FACTORS_FIELD.clone());
+    }
+    if metadata.layered {
+        return super::layered::storage_fields(rotated_dim, metadata.num_bits, fields);
+    }
+    if let Some(ex_code_field) = rabit_ex_code_field(rotated_dim, metadata.num_bits)? {
+        fields.push(ex_code_field);
+        fields.push(EX_ADD_FACTORS_FIELD.clone());
+        fields.push(EX_SCALE_FACTORS_FIELD.clone());
+    }
+    Ok(fields)
 }
 
 impl TryFrom<Quantizer> for RabitQuantizer {
@@ -1666,6 +1694,36 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    fn test_rabit_quantizer_resolves_layered_layout(
+        #[values(None, Some(false), Some(true))] layered: Option<bool>,
+        #[values(1, 2, 5)] num_bits: u8,
+        #[values(false, true)] supplied_rotation: bool,
+    ) {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let data = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+        let mut params = RQBuildParams {
+            layered,
+            ..RQBuildParams::new(num_bits)
+        };
+        if supplied_rotation {
+            params.rotation = Some(
+                RabitQuantizer::new_with_rotation::<Float32Type>(
+                    num_bits,
+                    32,
+                    RQRotationType::Fast,
+                )
+                .metadata(None),
+            );
+        }
+        let quantizer = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+        assert_eq!(
+            quantizer.metadata_ref().layered,
+            num_bits > 2 && layered.unwrap_or(false)
+        );
+        assert_eq!(quantizer.metadata_ref().num_bits, num_bits);
+    }
+
     #[test]
     fn test_rabit_quantizer_reuses_supplied_rotation() {
         let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
@@ -1683,6 +1741,27 @@ mod tests {
         assert_eq!(metadata.num_bits, 3);
         assert_eq!(metadata.rotation_type, RQRotationType::Fast);
         assert_eq!(metadata.fast_rotation_signs, supplied_signs);
+        assert_eq!(metadata.row_layout, RQRowLayout::Columns);
+    }
+
+    /// The build params' row layout reaches the quantizer's metadata, which
+    /// the writer reads it from, whether the rotation is new or supplied.
+    #[test]
+    fn test_rabit_quantizer_takes_row_layout_from_params() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+        let params = RQBuildParams::new(7)
+            .with_layered(true)
+            .with_row_layout(RQRowLayout::PlaneRows);
+        let quantizer = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap();
+        assert_eq!(quantizer.metadata_ref().row_layout, RQRowLayout::PlaneRows);
+        assert_eq!(quantizer.metadata(None).row_layout, RQRowLayout::PlaneRows);
+
+        // A rotation supplied from a plane-row index takes the params' layout.
+        let mut params = RQBuildParams::new(7).with_layered(true);
+        params.rotation = Some(quantizer.metadata(None));
+        let quantizer = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap();
+        assert_eq!(quantizer.metadata_ref().row_layout, RQRowLayout::Columns);
     }
 
     #[test]

@@ -6,7 +6,6 @@
 
 use lance_core::utils::address::RowAddress;
 use lance_index::scalar::RowAddrTranslator;
-use lance_index::vector::storage::ResidentColumns;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -45,6 +44,7 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::storage::ResidentColumns;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
     FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmResult, FtsPrewarmSegmentStatus,
@@ -4227,10 +4227,12 @@ impl Dataset {
         // or reconstruction below runs, and where a reconstruction adds the
         // I/O of a resident store load.
         let open_context = IvfOpenContext {
+            rabit_scan_factory: self.session.rabit_scan_factory.clone(),
             origin_latency_hint: self.session.index_origin_latency(),
             resident_columns: self.session.index_resident_columns(),
             file_cache: Some(file_cache),
             resident_columns_handle,
+            io_stats: metrics.io_stats(),
         };
         let resolved =
             frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
