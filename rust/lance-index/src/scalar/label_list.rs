@@ -154,7 +154,16 @@ impl Index for LabelListIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
+        // The values index and the null-list set are both keyed by row id
+        // (trained with `with_row_id`), which no longer identifies a fragment
+        // once stable row ids are enabled; the fragment bitmap recorded in the
+        // index metadata is authoritative. Return not_supported like MinHash
+        // LSH rather than derive a wrong set (`migrate_indices` handles it).
+        Err(Error::not_supported(
+            "label list indices do not recalculate fragment coverage from their files; \
+             the fragment bitmap of the index metadata is authoritative"
+                .to_string(),
+        ))
     }
 }
 
@@ -1596,6 +1605,28 @@ mod tests {
             .await
             .unwrap();
         (tmpdir, index)
+    }
+
+    /// `calculate_included_frags` reports that coverage cannot be rebuilt from
+    /// the index files rather than panicking (it was `unimplemented!()`): the
+    /// values index and null-list set are keyed by row id, which does not
+    /// identify a fragment once stable row ids are enabled. `migrate_indices`
+    /// relies on this error to keep the authoritative fragment bitmap.
+    #[tokio::test]
+    async fn test_label_list_calculate_included_frags_is_unsupported() {
+        let rows: Vec<SampleRow> = vec![
+            (1u64 << 32, Some(vec![Some("a".to_string())])),
+            (2u64 << 32, Some(vec![Some("b".to_string())])),
+            (3u64 << 32, None),
+        ];
+        let (_dir, index) = build_label_list_segment(&rows).await;
+
+        let err = index.calculate_included_frags().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("do not recalculate fragment coverage from their files"),
+            "label list coverage recovery must be not_supported, got: {err}"
+        );
     }
 
     /// `remap` carries `list_nulls` in a global buffer written through the
