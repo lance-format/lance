@@ -98,8 +98,8 @@ message InvertedIndexDetails {
   bool prefix_only = 11;
   /* Number of documents per compressed posting block. An absent value means
    * the index predates this field and must use the legacy block size of 128.
-   * A present value records the block size used by the index; 256 is valid
-   * with format versions 3 and 4.
+   * A present value records the block size used by the index; 256 requires
+   * format version 3.
    */
   optional uint32 block_size = 12;
   /* Options for base_tokenizer = "code". Presence records the code tokenizer
