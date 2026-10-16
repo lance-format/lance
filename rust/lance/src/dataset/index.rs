@@ -88,9 +88,14 @@ impl IndexRemapper for DatasetIndexRemapper {
         // The compaction remap is fully materialized: one shared synchronous
         // translator serves every index.
         let mapping = RowAddrTranslator::sync(mapping);
+        // On a stable-row-id table a row-id-domain index's ids survive the
+        // rewrite untouched; translating them through an address map would
+        // corrupt them.
+        let uses_stable_row_ids = self.dataset.manifest.uses_stable_row_ids();
         let mut remapped = Vec::with_capacity(self.indices.len());
         for index in self.indices.iter() {
             let needs_remapped = !is_system_index(index)
+                && (!uses_stable_row_ids || index.results_are_row_addrs())
                 && match &index.fragment_bitmap {
                     None => true,
                     Some(fragment_bitmap) => fragment_bitmap

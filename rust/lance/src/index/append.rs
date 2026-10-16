@@ -4508,16 +4508,21 @@ mod tests {
     }
 
     /// BTree stores row addresses (`BTREE_ROW_ADDR_DOMAIN_VERSION`), so a plain
-    /// eager compaction on a stable-row-id dataset invalidates it exactly like a
-    /// zone map: with nothing to repair the addresses it stores, the rewritten
-    /// fragment drops out of its coverage (still correct -- the scanner falls
-    /// back to a full scan for it -- just uncovered). `defer_index_remap` is
-    /// what keeps the guarantee this test used to make about eager compaction:
-    /// the FRI it writes lets the btree follow its data to the new fragment, and
-    /// draining that FRI via `optimize_indices` (a segment merge, not a rescan)
-    /// must not change any answer either.
+    /// eager compaction on a stable-row-id dataset needs explicit repair, unlike
+    /// a row-id-domain index whose ids survive the rewrite for free. An eager
+    /// commit remaps the btree in place -- the same way it would on a
+    /// non-stable-row-id table -- and writes no fragment reuse index.
+    /// `defer_index_remap` instead leaves the btree untouched and writes an FRI
+    /// that lets it follow its data to the new fragment at read time; draining
+    /// that FRI via `optimize_indices` (a segment merge, not a rescan) must not
+    /// change any answer either.
+    #[rstest]
+    #[case::eager(false)]
+    #[case::deferred(true)]
     #[tokio::test]
-    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction() {
+    async fn test_optimize_btree_keeps_rows_with_stable_row_ids_after_compaction(
+        #[case] defer_index_remap: bool,
+    ) {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
             dataset
                 .scan()
@@ -4567,7 +4572,7 @@ mod tests {
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
                 target_rows_per_fragment: 512,
-                defer_index_remap: true,
+                defer_index_remap,
                 ..Default::default()
             },
             None,
@@ -4575,13 +4580,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            dataset
-                .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .is_some(),
-            "a deferred compaction over an address-domain index must write an FRI"
+        let has_fri = dataset
+            .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some();
+        assert_eq!(
+            has_fri, defer_index_remap,
+            "only a deferred compaction over an address-domain index writes an FRI; an \
+             eager one remaps the btree in place instead"
         );
 
         let frags = dataset.get_fragments();
@@ -4593,12 +4600,13 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty(),
-            "the FRI must let the btree follow its data to the rewritten fragment"
+            "the btree must cover the rewritten fragment, either because the FRI lets it \
+             follow its data (deferred) or because the eager commit remapped it in place"
         );
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
 
-        // Draining the FRI into the index (a segment merge, not a rescan) must
-        // not change any answer.
+        // Draining the FRI into the index (a segment merge, not a rescan), or
+        // simply reopening an eagerly-remapped index, must not change any answer.
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await

@@ -473,16 +473,16 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
         .await
         .unwrap();
 
-    async fn index_set(dataset: &Dataset) -> HashSet<Uuid> {
+    async fn index_by_name(dataset: &Dataset) -> HashMap<String, Uuid> {
         dataset
             .load_indices()
             .await
             .unwrap()
             .iter()
-            .map(|index| index.uuid)
+            .map(|index| (index.name.clone(), index.uuid))
             .collect()
     }
-    let indices = index_set(&dataset).await;
+    let indices = index_by_name(&dataset).await;
 
     async fn vector_query(dataset: &Dataset) -> RecordBatch {
         let mut scanner = dataset.scan();
@@ -520,8 +520,28 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
     };
     let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
-    let current_indices = index_set(&dataset).await;
-    assert_eq!(indices, current_indices);
+    // The vector index is row-id-domain: stable row ids survive the rewrite
+    // on their own, so it follows its data for free and keeps its uuid. The
+    // scalar index defaults to BTree, which is address-domain under stable
+    // row ids and supports remap, so eager compaction remaps it in place (a
+    // new uuid, but full coverage of the live fragments).
+    let current_indices = index_by_name(&dataset).await;
+    assert_eq!(current_indices["vector"], indices["vector"]);
+    assert_ne!(current_indices["scalar"], indices["scalar"]);
+
+    let live_fragments: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let scalar_index = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == "scalar")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        scalar_index.effective_fragment_bitmap(&live_fragments),
+        Some(live_fragments)
+    );
 
     let after_vec_result = vector_query(&dataset).await;
     assert_eq!(before_vec_result, after_vec_result);
