@@ -762,9 +762,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-    use lance_table::feature_flags::{
-        FLAG_SPILLED_ROW_LINEAGE, frag_reuse_with_stable_row_ids_enabled,
-    };
+    use lance_table::feature_flags::FLAG_SPILLED_ROW_LINEAGE;
     use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
     use rstest::rstest;
 
@@ -2515,23 +2513,7 @@ mod tests {
                         defer_index_remap: true,
                         ..one_fragment()
                     };
-                    let read_version = self.dataset.version().version;
-                    let result = compact_files(&mut self.dataset, options, None).await;
-                    if !frag_reuse_with_stable_row_ids_enabled() {
-                        // FRI with stable row ids has its own release gate,
-                        // independent of where the row lineage is stored.
-                        let error = result.expect_err("stable row ids with FRI remain gated");
-                        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-                        assert!(
-                            error
-                                .to_string()
-                                .contains("stable row IDs and carries a fragment reuse index"),
-                            "{error}"
-                        );
-                        assert_eq!(self.dataset.version().version, read_version);
-                        return Ok(());
-                    }
-                    result?;
+                    compact_files(&mut self.dataset, options, None).await?;
                     if self.dataset.load_index_by_name("j_idx").await?.is_some() {
                         assert!(
                             self.dataset

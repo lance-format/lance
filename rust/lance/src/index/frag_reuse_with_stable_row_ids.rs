@@ -8,9 +8,7 @@
 use lance_core::{Error, Result};
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::registry::display_type_from_url;
-use lance_table::feature_flags::{
-    FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, frag_reuse_with_stable_row_ids_enabled,
-};
+use lance_table::feature_flags::FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
 use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
 use lance_table::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
@@ -19,6 +17,8 @@ use prost_types::Any;
 
 use super::scalar::IndexDetails;
 use super::{index_is_usable, unsupported_index_version};
+
+pub mod history;
 
 fn details_type_name(details: &Any) -> &str {
     details
@@ -38,6 +38,18 @@ fn is_mem_wal_index_entry(index: &IndexMetadata) -> bool {
 /// An empty fragment reuse index counts.
 pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexMetadata]) -> bool {
     manifest.uses_stable_row_ids() && indices.iter().any(is_frag_reuse_index_entry)
+}
+
+/// Whether a compaction of this stable-row-id table records its row-address
+/// moves. `defer_index_remap` starts recording; once the entry exists, even an
+/// empty one, every compaction records whatever the option says.
+pub fn records_compaction_moves(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+    defer_index_remap: bool,
+) -> bool {
+    manifest.uses_stable_row_ids()
+        && (defer_index_remap || has_frag_reuse_with_stable_row_ids(manifest, indices))
 }
 
 /// `supports_batch_row_id_remapping` is only a proxy for applying the legacy
@@ -122,29 +134,10 @@ pub fn validate_frag_reuse_with_stable_row_ids(
     manifest: &Manifest,
     indices: &[IndexMetadata],
 ) -> Result<()> {
-    validate_frag_reuse_with_stable_row_ids_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
-/// Split out so the release-build refusal is testable from a debug build.
-fn validate_frag_reuse_with_stable_row_ids_when(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-    is_supported: bool,
-) -> Result<()> {
     if !has_frag_reuse_with_stable_row_ids(manifest, indices) {
         return Ok(());
     }
     let version = manifest.version;
-    if !is_supported {
-        return Err(Error::not_supported(format!(
-            "Cannot commit version {version}: the dataset uses stable row IDs and carries a \
-             fragment reuse index, which this build of Lance does not support"
-        )));
-    }
     let frag_reuse_entries: Vec<_> = indices
         .iter()
         .filter(|index| is_frag_reuse_index_entry(index))
@@ -181,25 +174,6 @@ pub fn ensure_frag_reuse_recording_allowed(
     manifest: &Manifest,
     indices: &[IndexMetadata],
 ) -> Result<()> {
-    ensure_frag_reuse_recording_allowed_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
-fn ensure_frag_reuse_recording_allowed_when(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-    is_supported: bool,
-) -> Result<()> {
-    if !is_supported {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
-             recording their row-address moves in a fragment reuse index is not supported by \
-             this build of Lance",
-        ));
-    }
     // The tagged-history flag is sticky, so it can outlive a trim and a
     // migration to stable row ids.
     let frag_reuse_entry = indices
@@ -389,7 +363,8 @@ mod tests {
     #[rstest]
     #[case::zone_map(details(&pbold::ZoneMapIndexDetails::default()), 0, true)]
     #[case::bloom_filter(details(&pb::BloomFilterIndexDetails::default()), 0, true)]
-    #[case::btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
+    #[case::btree(details(&pbold::BTreeIndexDetails::default()), 1, true)]
+    #[case::legacy_btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
     #[case::bitmap(details(&pbold::BitmapIndexDetails::default()), 0, false)]
     #[case::label_list(details(&pbold::LabelListIndexDetails::default()), 0, false)]
     #[case::ngram(details(&pbold::NGramIndexDetails::default()), 0, false)]
@@ -488,30 +463,18 @@ mod tests {
             0,
         );
         let valid = vec![frag_reuse_entry(0), zone_map.clone()];
-        validate_frag_reuse_with_stable_row_ids_when(&manifest, &valid, true).unwrap();
-
-        // As a release build.
-        let error =
-            validate_frag_reuse_with_stable_row_ids_when(&manifest, &valid, false).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-        assert!(error.to_string().contains("does not support"), "{error}");
+        validate_frag_reuse_with_stable_row_ids(&manifest, &valid).unwrap();
 
         let mut without_stable_row_ids = manifest.clone();
         without_stable_row_ids.reader_feature_flags = 0;
         without_stable_row_ids.writer_feature_flags = 0;
         let bitmap = index_with("bitmap", details(&pbold::BitmapIndexDetails::default()), 0);
-        validate_frag_reuse_with_stable_row_ids_when(
+        validate_frag_reuse_with_stable_row_ids(
             &without_stable_row_ids,
             &[frag_reuse_entry(0), bitmap.clone()],
-            false,
         )
         .unwrap();
-        validate_frag_reuse_with_stable_row_ids_when(
-            &manifest,
-            std::slice::from_ref(&bitmap),
-            false,
-        )
-        .unwrap();
+        validate_frag_reuse_with_stable_row_ids(&manifest, std::slice::from_ref(&bitmap)).unwrap();
 
         for (indices, expected) in [
             (
@@ -521,8 +484,7 @@ mod tests {
             (vec![frag_reuse_entry(1)], "support only index_version 0"),
             (vec![frag_reuse_entry(0), zone_map, bitmap], "`bitmap`"),
         ] {
-            let error = validate_frag_reuse_with_stable_row_ids_when(&manifest, &indices, true)
-                .unwrap_err();
+            let error = validate_frag_reuse_with_stable_row_ids(&manifest, &indices).unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             let message = error.to_string();
             assert!(message.contains(expected), "{message}");
@@ -541,28 +503,19 @@ mod tests {
         );
         let bitmap = index_with("bitmap", details(&pbold::BitmapIndexDetails::default()), 0);
         let manifest = stable_row_id_manifest();
-        ensure_frag_reuse_recording_allowed_when(
-            &manifest,
-            &[frag_reuse_entry(0), zone_map.clone()],
-            true,
-        )
-        .unwrap();
-
-        // As a release build.
-        let error = ensure_frag_reuse_recording_allowed_when(&manifest, &[], false).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        ensure_frag_reuse_recording_allowed(&manifest, &[frag_reuse_entry(0), zone_map.clone()])
+            .unwrap();
 
         let mut flagged = manifest.clone();
         flagged.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         flagged.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         for (manifest, indices) in [(&flagged, vec![]), (&manifest, vec![frag_reuse_entry(1)])] {
-            let error =
-                ensure_frag_reuse_recording_allowed_when(manifest, &indices, true).unwrap_err();
+            let error = ensure_frag_reuse_recording_allowed(manifest, &indices).unwrap_err();
             assert!(matches!(error, Error::NotSupported { .. }), "{error}");
             assert!(error.to_string().contains("tagged"), "{error}");
         }
 
-        let result = ensure_frag_reuse_recording_allowed_when(&manifest, &[zone_map, bitmap], true);
+        let result = ensure_frag_reuse_recording_allowed(&manifest, &[zone_map, bitmap]);
         assert!(
             !result
                 .as_ref()
@@ -691,6 +644,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!has_flag(&dataset));
+        let without_entry = dataset.version().version;
 
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
         commit_new_indices(&mut dataset, vec![frag_reuse])
@@ -717,8 +671,12 @@ mod tests {
         assert!(deep.manifest.uses_stable_row_ids());
         assert!(has_flag(&deep));
 
-        dataset.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap();
-        assert!(!has_flag(&dataset));
+        let error = dataset.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(has_flag(&dataset));
+        let mut restored = dataset.checkout_version(without_entry).await.unwrap();
+        restored.restore().await.unwrap();
+        assert!(!has_flag(&restored));
     }
 
     #[tokio::test]

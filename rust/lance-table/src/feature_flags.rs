@@ -56,8 +56,8 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The table uses stable row ids and carries a fragment reuse index.
 ///
-/// Understood only by debug builds until support is released (see
-/// [`frag_reuse_with_stable_row_ids_enabled`]).
+/// Release builds of earlier versions refuse it: v12.0.0 and older do not know
+/// the bit, and later versions understood it only in debug builds.
 pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// Tagged FRI requires a reader that interprets its mappings and a writer that
 /// preserves them during maintenance. Legacy-only FRI does not set this bit.
@@ -292,13 +292,6 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
-/// Debug builds only, with no environment override, until continuous recording
-/// and retention land. Hidden because it is removed then.
-#[doc(hidden)]
-pub fn frag_reuse_with_stable_row_ids_enabled() -> bool {
-    cfg!(debug_assertions)
-}
-
 /// Clear `flag` from `flags` when its gating feature is not enabled in this
 /// build; leave it set otherwise. One call per unstable flag, so support for
 /// several unstable features chains cleanly.
@@ -311,20 +304,12 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// The feature-flag bits this build understands, given which unstable features
 /// are enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
-fn supported_flags_when(
-    overlay_enabled: bool,
-    frag_reuse_with_stable_row_ids_enabled: bool,
-) -> u64 {
+fn supported_flags_when(overlay_enabled: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
-    );
-    mark_supported(
-        &mut supported,
-        FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
-        frag_reuse_with_stable_row_ids_enabled,
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
@@ -333,10 +318,7 @@ fn supported_flags_when(
 }
 
 fn supported_flags() -> u64 {
-    supported_flags_when(
-        data_overlay_files_enabled(),
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
+    supported_flags_when(data_overlay_files_enabled())
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
@@ -530,29 +512,18 @@ mod tests {
     }
 
     #[test]
-    fn test_frag_reuse_with_stable_row_ids_flag_release_gating() {
-        // v12.0.0's unknown boundary, so every released client refuses it.
+    fn test_frag_reuse_with_stable_row_ids_flag_is_supported() {
+        // v12.0.0's unknown boundary, and later releases understood it only in
+        // debug builds, so every earlier release refuses it.
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, 512);
-        let without_support = supported_flags_when(true, false);
-        assert_ne!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !without_support, 0);
-        assert_eq!(FLAG_STABLE_ROW_IDS & !without_support, 0);
-        let enabled = supported_flags_when(false, true);
-        assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !enabled, 0);
-        for unrelated in [
-            FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-            FLAG_FRAGMENT_TREE,
-            FLAG_UNKNOWN,
-        ] {
-            assert_ne!(unrelated & !enabled, 0);
-        }
+        // Supported with every unstable feature off, in every build profile.
         assert_eq!(
-            can_read_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS),
-            frag_reuse_with_stable_row_ids_enabled()
+            FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !supported_flags_when(false),
+            0
         );
-        assert_eq!(
-            can_write_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS),
-            frag_reuse_with_stable_row_ids_enabled()
-        );
+        let flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+        assert!(can_read_dataset(flags));
+        assert!(can_write_dataset(flags));
     }
 
     #[test]
@@ -593,12 +564,12 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false, false);
+        let supported = supported_flags_when(false);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true, false);
+        let supported = supported_flags_when(true);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
     }
 
@@ -606,14 +577,13 @@ mod tests {
     fn test_spilled_row_lineage_flag_is_stable() {
         assert_eq!(FLAG_SPILLED_ROW_LINEAGE, 2048);
         // Support must not depend on enabling unrelated experimental formats.
-        let supported = supported_flags_when(false, false);
+        let supported = supported_flags_when(false);
         let flags = FLAG_STABLE_ROW_IDS | FLAG_SPILLED_ROW_LINEAGE;
         assert_eq!(flags & !supported, 0);
         assert!(can_read_dataset(flags));
         assert!(can_write_dataset(flags));
         for unsupported in [
             FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-            FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
             FLAG_FRAGMENT_TREE,
             FLAG_UNKNOWN,
         ] {
