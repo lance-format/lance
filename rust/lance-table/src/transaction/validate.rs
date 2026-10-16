@@ -912,7 +912,7 @@ fn merge_schema_valid(
             )));
         }
         if let Some(changes) = shared_field_binding_changes(prior_field, field)
-            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
+            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, prior_field, field)
         {
             return Err(Error::invalid_input(format!(
                 "Merge operation changes field id {} (\"{}\") without rewriting it in \
@@ -988,27 +988,37 @@ fn file_materializes_field(file_field_ids: &[i32], field: &Field) -> bool {
 fn is_field_binding_fully_rewritten(
     manifest: &Manifest,
     new_fragment_map: &HashMap<u64, &Fragment>,
-    field_id: i32,
+    prior_field: &Field,
+    proposed_field: &Field,
 ) -> bool {
+    // Match the sibling file_materializes_field: STABLE files record only leaf
+    // ids (no struct parent ids), so a plain contains() on a struct's own id
+    // would report a fully-rewritten merge as unmaterialized and reject it.
+    //
+    // The two sides use different fields on purpose. A new file has to carry
+    // data for the binding being proposed, and the files that have to be gone
+    // are the ones carrying the prior binding.
+    let materializes_proposed =
+        |file: &crate::format::DataFile| file_materializes_field(&file.fields, proposed_field);
+    let materializes_prior =
+        |file: &crate::format::DataFile| file_materializes_field(&file.fields, prior_field);
+
     manifest.fragments.iter().all(|prior_fragment| {
         let Some(new_fragment) = new_fragment_map.get(&prior_fragment.id) else {
             return false;
         };
 
-        let is_materialized = new_fragment
-            .files
-            .iter()
-            .any(|file| file.fields.contains(&field_id));
+        let is_materialized = new_fragment.files.iter().any(&materializes_proposed);
         if !is_materialized {
             return false;
         }
 
         prior_fragment
             .referenced_lance_files()
-            .filter(|file| file.fields.contains(&field_id))
+            .filter(|file| materializes_prior(file))
             .all(|prior_file| {
                 !new_fragment.referenced_lance_files().any(|new_file| {
-                    new_file.fields.contains(&field_id)
+                    materializes_proposed(new_file)
                         && new_file.base_id == prior_file.base_id
                         && new_file.path == prior_file.path
                 })
@@ -1975,6 +1985,151 @@ mod tests {
             message.contains("assigns id 1 to new field \"b\"") && message.contains("exhausted"),
             "unexpected error: {}",
             message
+        );
+    }
+
+    /// A Merge that changes a struct's own binding (nullability) with every
+    /// fragment fully rewritten must validate on STABLE data, whose files record
+    /// only leaf ids (no struct ids at all).
+    /// is_field_binding_fully_rewritten used a plain contains(&struct_id) and
+    /// rejected such merges; the nested case additionally needs the field looked
+    /// up in the whole schema rather than only among the top-level fields.
+    #[rstest::rstest]
+    #[case::top_level_struct(false)]
+    #[case::nested_struct(true)]
+    fn test_merge_struct_binding_fully_rewritten_stable_files(#[case] nested: bool) {
+        use arrow_schema::Fields;
+
+        // Field ids, top-level case: id=0, address=1, address.city=2.
+        // Nested case: id=0, address=1, address.inner=2, address.inner.city=3.
+        // STABLE files record only the leaves.
+        let leaf_fields = if nested { vec![0, 3] } else { vec![0, 2] };
+
+        let mk_schema = |flip: bool| {
+            let city = ArrowField::new("city", DataType::Utf8, false);
+            // The struct whose own binding changes is the innermost one.
+            let address_children = if nested {
+                vec![ArrowField::new(
+                    "inner",
+                    DataType::Struct(Fields::from(vec![city])),
+                    flip,
+                )]
+            } else {
+                vec![city]
+            };
+            let arrow_schema = ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new(
+                    "address",
+                    DataType::Struct(Fields::from(address_children)),
+                    !nested && flip,
+                ),
+            ]);
+            LanceSchema::try_from(&arrow_schema).unwrap()
+        };
+        let prior_schema = mk_schema(false);
+        let schema = mk_schema(true);
+
+        let mk_fragment = |path: &str| Fragment {
+            id: 0,
+            files: vec![DataFile::new(
+                path,
+                leaf_fields.clone(),
+                (0..leaf_fields.len() as i32).collect(),
+                ConcreteFileVersion::V2_2,
+                None,
+                None,
+            )],
+            physical_rows: Some(10),
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            prior_schema,
+            Arc::new(vec![mk_fragment("old.lance")]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_2),
+            HashMap::new(),
+        );
+
+        let operation = Operation::Merge {
+            fragments: vec![mk_fragment("new.lance")],
+            schema,
+            preserves_nullability: false,
+        };
+        validate_operation(Some(&manifest), &operation).unwrap();
+    }
+
+    /// The rewrite proof has to match new files against the PROPOSED binding.
+    /// A new file that carries only the prior child materializes the prior
+    /// field while holding no data for the proposed one, and accepting that
+    /// would let a binding change through on data that does not have it.
+    #[test]
+    fn test_merge_struct_binding_checks_the_proposed_field() {
+        use arrow_schema::Fields;
+
+        let mk_schema = |child: &str, struct_nullable: bool| {
+            let arrow_schema = ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new(
+                    "address",
+                    DataType::Struct(Fields::from(vec![ArrowField::new(
+                        child,
+                        DataType::Utf8,
+                        false,
+                    )])),
+                    struct_nullable,
+                ),
+            ]);
+            LanceSchema::try_from(&arrow_schema).unwrap()
+        };
+        // prior: id=0, address=1 (not null), address.city=2
+        // proposed: the struct keeps id 1 and flips to nullable, but its child
+        // is a different field (id 5, above max_field_id)
+        let prior_schema = mk_schema("city", false);
+        let mut proposed_schema = mk_schema("zip", true);
+        proposed_schema.fields[1].children[0].id = 5;
+
+        let mk_fragment = |path: &str, fields: Vec<i32>| Fragment {
+            id: 0,
+            files: vec![DataFile::new(
+                path,
+                fields.clone(),
+                (0..fields.len() as i32).collect(),
+                ConcreteFileVersion::V2_2,
+                None,
+                None,
+            )],
+            physical_rows: Some(10),
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            prior_schema,
+            Arc::new(vec![mk_fragment("old.lance", vec![0, 2])]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_2),
+            HashMap::new(),
+        );
+
+        // The replacement file carries the prior leaf only, so it holds nothing
+        // for the proposed binding.
+        let operation = Operation::Merge {
+            fragments: vec![mk_fragment("new.lance", vec![0, 2])],
+            schema: proposed_schema,
+            preserves_nullability: false,
+        };
+        let err = validate_operation(Some(&manifest), &operation)
+            .expect_err("a replacement without data for the proposed binding must be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {err}"
         );
     }
 
