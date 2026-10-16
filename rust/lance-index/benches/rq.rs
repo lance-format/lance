@@ -28,7 +28,7 @@ use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_index::vector::transform::Transformer;
 use lance_index::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
-use lance_linalg::distance::{DistanceType, norm_squared_fsl};
+use lance_linalg::distance::{DistanceType, try_norm_squared_fsl};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
@@ -694,7 +694,7 @@ fn build_transform(c: &mut Criterion) {
                     dim as i32,
                 )
                 .unwrap();
-                let norm = Float32Array::from(norm_squared_fsl(&vectors));
+                let norm = Float32Array::from(try_norm_squared_fsl(&vectors).unwrap());
                 let parts =
                     UInt32Array::from((0..rows).map(|row| (row % 4) as u32).collect::<Vec<_>>());
                 let batch = RecordBatch::try_from_iter([

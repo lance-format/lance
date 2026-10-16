@@ -84,7 +84,7 @@ impl PartitionTransformer {
                 continue;
             };
             let centroid = self.centroids.slice(part_id as usize, 1);
-            let dist = self.distance_type.arrow_batch_func()(vector.as_ref(), &centroid)?;
+            let dist = self.distance_type.batch(vector.as_ref(), &centroid)?;
             dists.push(Some(dist.value(0)));
         }
         let loss = dists

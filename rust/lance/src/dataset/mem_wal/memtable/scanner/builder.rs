@@ -3917,7 +3917,7 @@ mod tests {
         for row in rows.iter().filter(|row| row.batch < visible_batches) {
             newest.insert(row.id, row);
         }
-        let l2 = DistanceType::L2.func::<f32>();
+        let l2 = DistanceType::L2.try_func::<f32>().unwrap();
         let mut out: Vec<(i64, f32)> = newest
             .values()
             .filter(|row| keep(row))

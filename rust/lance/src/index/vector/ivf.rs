@@ -8166,7 +8166,7 @@ mod tests {
             .chunks(dim)
             .enumerate()
             .map(|(i, vec)| {
-                let dist = distance_type.func()(query, vec);
+                let dist = distance_type.try_func().unwrap()(query, vec);
                 (dist, i as u32)
             })
             .collect_vec();
