@@ -34,7 +34,10 @@ use rand_distr::Zipf;
 fn bench_inverted(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;
 
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     let make_store = |path: &std::path::Path| {
         let index_dir = Path::from_filesystem_path(path).unwrap();

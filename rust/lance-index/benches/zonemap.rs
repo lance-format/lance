@@ -29,7 +29,10 @@ fn bench_zonemap(c: &mut Criterion) {
 
     env_logger::init();
 
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();

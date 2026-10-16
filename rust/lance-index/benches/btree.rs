@@ -88,7 +88,12 @@ static TEMP_DIRS: OnceLock<Vec<tempfile::TempDir>> = OnceLock::new();
 
 /// Get or create the tokio runtime
 fn get_runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().build().unwrap())
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    })
 }
 
 /// Get the cache - either a singleton cache or no_cache based on use_cache parameter
