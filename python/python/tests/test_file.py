@@ -3,6 +3,7 @@
 
 import os
 import threading
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -917,3 +918,26 @@ def test_struct_null_regression():
 
     ds = lance.write_dataset(batch, "memory://", data_storage_version="2.2")
     ds.to_table()
+
+
+@pytest.mark.parametrize("batch_size", [128, 2048, 8192])
+def test_read_legacy_wrapped_bitpacked_levels(batch_size):
+    path = Path(__file__).parents[3] / "test_data/v6.0.1/wrapped_bitpacked_levels.lance"
+    vector = np.arange(2048, dtype=np.float16).tolist()
+    values = [vector] * 64 + [None] * 70_000 + [vector]
+    expected = pa.table(
+        {
+            "id": pa.array(range(len(values)), type=pa.int64()),
+            "vector": pa.array(values, type=pa.large_list(pa.float16())),
+        }
+    )
+    reader = LanceFileReader(str(path))
+    actual = reader.read_all(batch_size=batch_size, batch_readahead=1).to_table()
+    assert actual == expected
+
+    for start, length in [(60, 12), (65_530, 20), (70_060, 5)]:
+        actual = reader.read_range(start, length, batch_size=batch_size).to_table()
+        assert actual == expected.slice(start, length)
+
+    indices = [63, 64, 65_535, 65_536, 70_063, 70_064]
+    assert reader.take_rows(indices).to_table() == expected.take(indices)

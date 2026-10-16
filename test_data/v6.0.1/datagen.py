@@ -5,7 +5,9 @@ import shutil
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
+from lance.file import LanceFileWriter
 
 EXPECTED_LANCE_VERSION = "6.0.1"
 NUM_DENSE_ROWS = 513
@@ -41,3 +43,32 @@ except pa.ArrowInvalid as error:
     assert 'StructArray field "captions", expected 8192 got 513' in str(error)
 else:
     raise AssertionError("expected the v6.0.1 miniblock level-count overflow")
+
+# A legacy list page whose structural count exceeds a u16, with out-of-line
+# bitpacked rep/def buffers that retain every level.
+vector = np.arange(2048, dtype=np.float16).tolist()
+values = [vector] * 64 + [None] * 70_000 + [vector]
+table = pa.table(
+    {
+        "id": pa.array(range(len(values)), type=pa.int64()),
+        "vector": pa.array(values, type=pa.large_list(pa.float16())),
+    },
+    schema=pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(
+                "vector",
+                pa.large_list(pa.float16()),
+                metadata={
+                    b"lance-encoding:structural-encoding": b"miniblock",
+                },
+            ),
+        ]
+    ),
+)
+with LanceFileWriter(
+    str(Path(__file__).with_name("wrapped_bitpacked_levels.lance")),
+    table.schema,
+    version="2.1",
+) as writer:
+    writer.write_batch(table)

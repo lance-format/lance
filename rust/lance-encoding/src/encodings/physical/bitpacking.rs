@@ -639,6 +639,80 @@ impl BlockCompressor for OutOfLineBitpacking {
 }
 
 impl BlockDecompressor for OutOfLineBitpacking {
+    fn infer_u16_wrapped_count(
+        &self,
+        data: &LanceBuffer,
+        declared_count: u16,
+    ) -> Result<Option<u64>> {
+        // Zero-width buffers carry no count information. Only u16 structural
+        // levels use the legacy header, and genuine bitpacking narrows the word.
+        if self.uncompressed_bit_width != 16 || !(1..16).contains(&self.compressed_bit_width) {
+            return Ok(None);
+        }
+        let modulus = u64::from(u16::MAX) + 1;
+        let residue = u64::from(declared_count);
+        let tail_values = residue % ELEMS_PER_CHUNK;
+        let [raw_bytes, padded_bytes] =
+            out_of_line_payload_byte_lengths(residue, 16, self.compressed_bit_width)?;
+        // 65536 is divisible by the 1024-value packing block, so every possible
+        // wrap preserves the tail and adds exactly 64 complete packed blocks.
+        let [bytes_per_wrap, _] =
+            out_of_line_payload_byte_lengths(modulus, 16, self.compressed_bit_width)?;
+        let payload_bytes = data.len() as u64;
+        let mut inferred = None;
+        for base_bytes in [padded_bytes, raw_bytes] {
+            let Some(extra_bytes) = payload_bytes.checked_sub(base_bytes) else {
+                continue;
+            };
+            if extra_bytes % bytes_per_wrap != 0 {
+                continue;
+            }
+            let count = (extra_bytes / bytes_per_wrap)
+                .checked_mul(modulus)
+                .and_then(|extra| extra.checked_add(residue))
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "miniblock_levels",
+                        "bitpacked structural count overflow",
+                    )
+                })?;
+            // At equal lengths, one-/two-bit packing leaves the raw tail
+            // unchanged. Wider packing can rearrange its bits, so the count
+            // alone cannot identify a recovered tail's layout.
+            if count > residue
+                && tail_values > 0
+                && padded_bytes == raw_bytes
+                && self.compressed_bit_width > 2
+            {
+                return Err(Error::corrupt_file_named(
+                    "miniblock_levels",
+                    format!(
+                        "ambiguous raw or padded bitpacked tail for recovered structural count {count}"
+                    ),
+                ));
+            }
+            if let Some(previous) = inferred
+                && previous != count
+            {
+                return Err(Error::corrupt_file_named(
+                    "miniblock_levels",
+                    format!("ambiguous bitpacked structural counts {previous} and {count}"),
+                ));
+            }
+            inferred = Some(count);
+        }
+        inferred.map(Some).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "miniblock_levels",
+                format!(
+                    "bitpacked structural payload has {payload_bytes} bytes at {} bits per level, \
+                     inconsistent with declared count {declared_count} modulo 65536",
+                    self.compressed_bit_width,
+                ),
+            )
+        })
+    }
+
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Out-of-line bitpacking")?;
         let word_size = match self.uncompressed_bit_width {
@@ -906,6 +980,140 @@ mod test {
         metadata.insert("lance-encoding:rle-threshold".to_string(), "0".to_string());
 
         check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+    }
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::normal_raw_tail(1025)]
+    #[case::normal_padded_tail(6520)]
+    #[case::maximum_header(65535)]
+    #[case::zero_header(65536)]
+    #[case::wrapped_raw_tail(65537)]
+    #[case::wrapped_padded_tail(72056)]
+    #[case::multiple_wraps(131089)]
+    fn test_wrapped_bitpacked_counts(
+        #[case] num_values: usize,
+        #[values(1, 2, 15)] packed_width: usize,
+    ) {
+        let values: Vec<u16> = (0..num_values).map(|i| (i % 2) as u16).collect();
+        let block = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            bits_per_value: 16,
+            num_values: num_values as u64,
+            block_info: BlockInfo::new(),
+        };
+        let packed = bitpack_out_of_line::<u16>(block, packed_width);
+        let codec = OutOfLineBitpacking::new(packed_width as u64, 16);
+        let inferred = codec
+            .infer_u16_wrapped_count(&packed, num_values as u16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inferred, num_values as u64);
+        let decoded = codec.decompress(Some(packed), inferred).unwrap();
+        assert_eq!(
+            decoded
+                .as_fixed_width()
+                .unwrap()
+                .data
+                .borrow_to_typed_slice::<u16>()
+                .as_ref(),
+            values.as_slice()
+        );
+    }
+
+    #[rstest]
+    #[case::small_tail(1, 65553)]
+    #[case::equal_one_bit_tail(1, 65600)]
+    #[case::equal_two_bit_tail(2, 65664)]
+    fn test_wrapped_bitpacked_legacy_padded_tail(
+        #[case] packed_width: usize,
+        #[case] num_values: usize,
+    ) {
+        // Older writers padded even tiny tails instead of storing them raw.
+        let mut values: Vec<u16> = (0..num_values)
+            .map(|i| (i % (1 << packed_width)) as u16)
+            .collect();
+        values.resize(num_values.div_ceil(1024) * 1024, 0);
+        let block = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            bits_per_value: 16,
+            num_values: values.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+        let packed = bitpack_out_of_line::<u16>(block, packed_width);
+        let codec = OutOfLineBitpacking::new(packed_width as u64, 16);
+        let inferred = codec
+            .infer_u16_wrapped_count(&packed, num_values as u16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(inferred, num_values as u64);
+        let decoded = codec.decompress(Some(packed), inferred).unwrap();
+        assert_eq!(
+            decoded
+                .as_fixed_width()
+                .unwrap()
+                .data
+                .borrow_to_typed_slice::<u16>()
+                .as_ref(),
+            &values[..num_values]
+        );
+    }
+
+    #[rstest]
+    #[case::three_bits(3, 192)]
+    #[case::four_bits(4, 256)]
+    #[case::eight_bits(8, 512)]
+    #[case::fifteen_bits(15, 960)]
+    fn test_wrapped_bitpacked_rejects_ambiguous_tail(#[case] width: u64, #[case] tail: u16) {
+        let codec = OutOfLineBitpacking::new(width, 16);
+        let recovered_bytes = (64 + 1) * 128 * width as usize;
+        let error = codec
+            .infer_u16_wrapped_count(&LanceBuffer::from(vec![0; recovered_bytes]), tail)
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous raw or padded bitpacked tail")
+        );
+        // Ordinary decoding keeps the existing raw-tail convention.
+        assert_eq!(
+            codec
+                .infer_u16_wrapped_count(&LanceBuffer::from(vec![0; 128 * width as usize]), tail,)
+                .unwrap(),
+            Some(u64::from(tail))
+        );
+    }
+
+    #[rstest]
+    #[case::truncated(9086)]
+    #[case::extra_bytes(9090)]
+    #[case::missing_block(8960)]
+    fn test_wrapped_bitpacked_rejects_inconsistent_sizes(#[case] size: usize) {
+        let codec = OutOfLineBitpacking::new(1, 16);
+        let error = codec
+            .infer_u16_wrapped_count(&LanceBuffer::from(vec![0; size]), 6520)
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("inconsistent with declared count 6520 modulo 65536")
+        );
+    }
+
+    #[rstest]
+    #[case::zero_width(0, 16)]
+    #[case::not_narrower(16, 16)]
+    #[case::invalid_width(17, 16)]
+    #[case::not_levels(1, 32)]
+    fn test_wrapped_bitpacked_unsupported(#[case] packed: u64, #[case] unpacked: u64) {
+        assert_eq!(
+            OutOfLineBitpacking::new(packed, unpacked)
+                .infer_u16_wrapped_count(&LanceBuffer::from(vec![0; 9088]), 6520)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
