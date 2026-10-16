@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
 use super::manifest::write_manifest;
+use bytes::Bytes;
 use futures::Stream;
 use futures::future::Either;
 use futures::{
@@ -37,11 +38,16 @@ use futures::{
     stream::BoxStream,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
+use lance_io::object_writer::{
+    ObjectWriter, WriteResult, get_etag, initial_upload_size, max_upload_parallelism,
+};
 use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutMultipartOptions,
+    PutResult, path::Path,
+};
 use tracing::info;
 use url::Url;
 
@@ -1609,6 +1615,102 @@ impl Debug for RenameCommitHandler {
     }
 }
 
+/// Manifests larger than this many bytes are written with a conditional multipart upload when
+/// the store supports one. Set with `LANCE_MANIFEST_MULTIPART_THRESHOLD`; defaults to 8 MiB.
+fn manifest_multipart_threshold() -> usize {
+    static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("LANCE_MANIFEST_MULTIPART_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8 * 1024 * 1024)
+    })
+}
+
+/// Writes `data` to `path` only if no object exists there.
+///
+/// Uses a multipart upload when `data` is larger than `multipart_threshold` and the store
+/// enforces [`PutMode::Create`] at multipart completion; otherwise a single conditional PUT.
+/// An existing object is reported as [`CommitError::CommitConflict`] on either path.
+async fn put_manifest_if_absent(
+    object_store: &ObjectStore,
+    path: &Path,
+    data: Bytes,
+    multipart_threshold: usize,
+) -> std::result::Result<PutResult, CommitError> {
+    let res =
+        if object_store.supports_conditional_multipart_put() && data.len() > multipart_threshold {
+            put_multipart_if_absent(object_store.inner.as_ref(), path, data).await
+        } else {
+            object_store
+                .inner
+                .put_opts(
+                    path,
+                    data.into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+        };
+    res.map_err(|err| match err {
+        ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+            CommitError::CommitConflict
+        }
+        _ => CommitError::OtherError(err.into()),
+    })
+}
+
+/// Uploads `data` to `path` as a [`PutMode::Create`] multipart upload, aborting it on failure.
+async fn put_multipart_if_absent(
+    store: &dyn OSObjectStore,
+    path: &Path,
+    data: Bytes,
+) -> object_store::Result<PutResult> {
+    // S3 allows at most 10,000 parts per upload.
+    const MAX_PARTS: usize = 10_000;
+    let part_size = initial_upload_size().max(data.len().div_ceil(MAX_PARTS));
+
+    let mut upload = store
+        .put_multipart_opts(
+            path,
+            PutMultipartOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let uploaded = futures::stream::iter(
+        split_into_parts(&data, part_size).map(|part| upload.put_part(part.into())),
+    )
+    .buffer_unordered(max_upload_parallelism())
+    .try_collect::<()>()
+    .await;
+    let res = match uploaded {
+        Ok(()) => upload.complete().await,
+        Err(err) => Err(err),
+    };
+    if res.is_err() {
+        // The store keeps, and bills for, uploaded parts until the upload is aborted.
+        if let Err(error) = upload.abort().await {
+            tracing::warn!(
+                path = %path,
+                error = %error,
+                "Failed to abort manifest multipart upload"
+            );
+        }
+    }
+    res
+}
+
+/// Splits `data` into zero-copy slices of `part_size` bytes; the last may be shorter.
+fn split_into_parts(data: &Bytes, part_size: usize) -> impl Iterator<Item = Bytes> + '_ {
+    (0..data.len())
+        .step_by(part_size)
+        .map(move |start| data.slice(start..data.len().min(start + part_size)))
+}
+
 pub struct ConditionalPutCommitHandler;
 
 #[async_trait::async_trait]
@@ -1645,23 +1747,13 @@ impl CommitHandler for ConditionalPutCommitHandler {
         .await?;
         let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
         let size = dummy_data.len() as u64;
-        let res = object_store
-            .inner
-            .put_opts(
-                &path,
-                dummy_data.into(),
-                PutOptions {
-                    mode: object_store::PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|err| match err {
-                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
-                    CommitError::CommitConflict
-                }
-                _ => CommitError::OtherError(err.into()),
-            })?;
+        let res = put_manifest_if_absent(
+            object_store,
+            &path,
+            dummy_data,
+            manifest_multipart_threshold(),
+        )
+        .await?;
 
         write_version_hint(object_store, base_path, manifest.version).await;
 
@@ -2486,5 +2578,266 @@ mod tests {
              used to follow it drained up to a thousand more, spilling into \
              further listing pages"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct UploadObservations {
+        single_puts: AtomicUsize,
+        /// Sizes of the parts sent to each multipart upload, in the order the uploads began.
+        part_sizes: Mutex<Vec<Vec<usize>>>,
+        aborts: AtomicUsize,
+    }
+
+    /// Wraps `InMemory`, recording how each object is written; optionally fails every part.
+    #[derive(Debug, Default)]
+    struct ObservedUploadStore {
+        inner: Arc<object_store::memory::InMemory>,
+        observations: Arc<UploadObservations>,
+        fail_parts: bool,
+    }
+
+    impl std::fmt::Display for ObservedUploadStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ObservedUploadStore")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObservedUpload {
+        inner: Box<dyn object_store::MultipartUpload>,
+        observations: Arc<UploadObservations>,
+        fail_parts: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::MultipartUpload for ObservedUpload {
+        fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+            self.observations
+                .part_sizes
+                .lock()
+                .unwrap()
+                .last_mut()
+                .unwrap()
+                .push(data.content_length());
+            if self.fail_parts {
+                return Box::pin(future::ready(Err(ObjectStoreError::Generic {
+                    store: "ObservedUploadStore",
+                    source: "injected part failure".into(),
+                })));
+            }
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.observations.aborts.fetch_add(1, Ordering::SeqCst);
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OSObjectStore for ObservedUploadStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.observations.single_puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            assert_eq!(opts.mode, PutMode::Create);
+            self.observations
+                .part_sizes
+                .lock()
+                .unwrap()
+                .push(Vec::new());
+            Ok(Box::new(ObservedUpload {
+                inner: self.inner.put_multipart_opts(location, opts).await?,
+                observations: self.observations.clone(),
+                fail_parts: self.fail_parts,
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A store that honors conditional multipart completion iff `supports_conditional_multipart`,
+    /// backed by an observed in-memory store.
+    fn observed_store(
+        supports_conditional_multipart: bool,
+        fail_parts: bool,
+    ) -> (ObjectStore, Arc<UploadObservations>) {
+        let mut object_store = if supports_conditional_multipart {
+            ObjectStore::memory()
+        } else {
+            ObjectStore::local()
+        };
+        assert_eq!(
+            object_store.supports_conditional_multipart_put(),
+            supports_conditional_multipart
+        );
+        let inner = ObservedUploadStore {
+            fail_parts,
+            ..Default::default()
+        };
+        let observations = inner.observations.clone();
+        object_store.inner = Arc::new(inner);
+        (object_store, observations)
+    }
+
+    const MANIFEST_PATH: &str = "_versions/1.manifest";
+
+    #[tokio::test]
+    async fn test_put_manifest_if_absent_uses_multipart_above_threshold() {
+        let (object_store, observations) = observed_store(true, false);
+        let part_size = initial_upload_size();
+        let data = Bytes::from((0..2 * part_size + 1).map(|i| i as u8).collect::<Vec<_>>());
+
+        put_manifest_if_absent(&object_store, &MANIFEST_PATH.into(), data.clone(), 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(observations.single_puts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *observations.part_sizes.lock().unwrap(),
+            [[part_size, part_size, 1]]
+        );
+        assert_eq!(observations.aborts.load(Ordering::SeqCst), 0);
+        let written = object_store
+            .read_one_all(&MANIFEST_PATH.into())
+            .await
+            .unwrap();
+        assert_eq!(written, data);
+    }
+
+    #[tokio::test]
+    async fn test_put_manifest_if_absent_multipart_conflict() {
+        let (object_store, observations) = observed_store(true, false);
+        let path = Path::from(MANIFEST_PATH);
+        object_store.put(&path, b"existing").await.unwrap();
+
+        let data = Bytes::from(vec![7u8; initial_upload_size() + 1]);
+        let result = put_manifest_if_absent(&object_store, &path, data, 1024).await;
+
+        assert!(
+            matches!(result, Err(CommitError::CommitConflict)),
+            "{result:?}"
+        );
+        assert_eq!(observations.part_sizes.lock().unwrap().len(), 1);
+        assert_eq!(observations.aborts.load(Ordering::SeqCst), 1);
+        let written = object_store.read_one_all(&path).await.unwrap();
+        assert_eq!(written.as_ref(), b"existing");
+    }
+
+    #[tokio::test]
+    async fn test_put_manifest_if_absent_aborts_failed_multipart() {
+        let (object_store, observations) = observed_store(true, true);
+        let path = Path::from(MANIFEST_PATH);
+
+        let data = Bytes::from(vec![7u8; initial_upload_size() + 1]);
+        let result = put_manifest_if_absent(&object_store, &path, data, 1024).await;
+
+        assert!(
+            matches!(result, Err(CommitError::OtherError(_))),
+            "{result:?}"
+        );
+        assert_eq!(observations.aborts.load(Ordering::SeqCst), 1);
+        assert!(!object_store.exists(&path).await.unwrap());
+    }
+
+    #[rstest::rstest]
+    #[case::at_threshold(true, 4)]
+    #[case::store_without_conditional_multipart(false, 0)]
+    #[tokio::test]
+    async fn test_put_manifest_if_absent_single_put(
+        #[case] supports_conditional_multipart: bool,
+        #[case] threshold: usize,
+    ) {
+        let (object_store, observations) = observed_store(supports_conditional_multipart, false);
+        let path = Path::from(MANIFEST_PATH);
+        let data = Bytes::from_static(b"abcd");
+
+        put_manifest_if_absent(&object_store, &path, data.clone(), threshold)
+            .await
+            .unwrap();
+        let result = put_manifest_if_absent(&object_store, &path, data, threshold).await;
+
+        assert!(
+            matches!(result, Err(CommitError::CommitConflict)),
+            "{result:?}"
+        );
+        assert_eq!(observations.single_puts.load(Ordering::SeqCst), 2);
+        assert!(observations.part_sizes.lock().unwrap().is_empty());
+        // `ObjectStore::local()` reads the filesystem directly, so read through `inner`.
+        let written = object_store.inner.get(&path).await.unwrap().bytes().await;
+        assert_eq!(written.unwrap().as_ref(), b"abcd");
+    }
+
+    #[rstest::rstest]
+    #[case::exact_multiple(8, 4, &[4, 4])]
+    #[case::short_last_part(10, 4, &[4, 4, 2])]
+    #[case::single_part(3, 4, &[3])]
+    fn test_split_into_parts(
+        #[case] len: usize,
+        #[case] part_size: usize,
+        #[case] expected_sizes: &[usize],
+    ) {
+        let data = Bytes::from((0..len).map(|i| i as u8).collect::<Vec<_>>());
+        let parts: Vec<Bytes> = split_into_parts(&data, part_size).collect();
+
+        let sizes: Vec<usize> = parts.iter().map(Bytes::len).collect();
+        assert_eq!(sizes, expected_sizes);
+        let mut offset = 0;
+        for part in &parts {
+            // Slices of `data`, not copies.
+            assert_eq!(part.as_ptr(), data[offset..].as_ptr());
+            offset += part.len();
+        }
     }
 }

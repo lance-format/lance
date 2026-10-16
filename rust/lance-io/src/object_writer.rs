@@ -27,7 +27,8 @@ use tokio::runtime::Handle;
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
 
-pub(crate) fn max_upload_parallelism() -> usize {
+/// Maximum number of parts of one multipart upload in flight (`LANCE_UPLOAD_CONCURRENCY`).
+pub fn max_upload_parallelism() -> usize {
     static MAX_UPLOAD_PARALLELISM: OnceLock<usize> = OnceLock::new();
     *MAX_UPLOAD_PARALLELISM.get_or_init(|| {
         std::env::var("LANCE_UPLOAD_CONCURRENCY")
@@ -51,7 +52,8 @@ fn clamp_initial_upload_size(raw: usize) -> (usize, bool) {
     (clamped, clamped != raw)
 }
 
-pub(crate) fn initial_upload_size() -> usize {
+/// Multipart upload part size (`LANCE_INITIAL_UPLOAD_SIZE`), clamped to [5 MiB, 5 GiB).
+pub fn initial_upload_size() -> usize {
     static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
     *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
         let Some(raw) = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")

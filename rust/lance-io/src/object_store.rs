@@ -818,6 +818,12 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// Whether a multipart upload opened with [`PutMode::Create`] fails at completion,
+    /// without replacing the object, when the destination already exists.
+    pub fn supports_conditional_multipart_put(&self) -> bool {
+        self.supports_conditional_multipart_put
+    }
+
     /// The amount of parallelism to use for I/O operations.
     ///
     /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.
