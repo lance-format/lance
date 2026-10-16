@@ -276,3 +276,16 @@ def test_sample_dataset(tmp_path: Path, nrows: int):
     assert isinstance(large_scan[0], pa.RecordBatch)
     assert large_scan[0].schema == pa.schema([pa.field("vec", fsl.type)])
     assert large_scan[0].num_rows == min(nrows, 128)
+
+
+@pytest.mark.parametrize("n", [100, 3000, 4095])
+def test_sample_dataset_returns_n_rows(tmp_path: Path, n: int):
+    ds = lance.write_dataset(pa.table({"id": range(10000)}), tmp_path / "data.lance")
+
+    batches = list(maybe_sample(ds, n, ["id"], max_takes=32))
+
+    ids = pa.concat_arrays([batch["id"] for batch in batches]).to_pylist()
+    assert len(ids) == n
+    assert len(set(ids)) == n
+    # Samples are spread over the whole dataset, not just its head.
+    assert max(ids) >= 10000 - 10000 // 32
