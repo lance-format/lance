@@ -5225,6 +5225,7 @@ dependencies = [
  "protobuf-src",
  "rand 0.9.5",
  "rangemap",
+ "rayon",
  "roaring",
  "rstest",
  "semver",

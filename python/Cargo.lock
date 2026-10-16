@@ -4591,6 +4591,7 @@ dependencies = [
  "prost-types",
  "rand 0.9.5",
  "rangemap",
+ "rayon",
  "roaring",
  "semver",
  "serde",
