@@ -116,10 +116,14 @@ print(ds.branches.list())
 
 ### Delete a branch
 ```python
-# Ensure the branch is no longer needed before deletion
+# A branch cannot be deleted while other branches or tags reference it.
+# "new-experiment" was created from "experiment" and the "experiment-rc" tag
+# points into it, so remove those first.
+ds.branches.delete("new-experiment")
+ds.tags.delete("experiment-rc")
 ds.branches.delete("experiment")
-print(ds.branches.list_ordered(order="desc"))
-# {'new-experiment': {'parent_branch': 'experiment', 'parent_version': 2, 'create_at': ..., 'manifest_size': ...}, ...}
+print(ds.branches.list())
+# {}
 ```
 
 !!! note
