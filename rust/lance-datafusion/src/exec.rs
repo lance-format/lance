@@ -25,6 +25,7 @@ use datafusion::{
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
     },
+    logical_expr::LogicalPlan,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
         SendableRecordBatchStream,
@@ -772,9 +773,8 @@ pub async fn analyze_plan(
 /// When `task_context` is `Some`, the plan executes under it instead of the
 /// context derived from `options`. Callers whose nodes read session-config
 /// extensions at execution time (e.g. distributed routing identity) must pass
-/// the context carrying those extensions; otherwise the nodes error during
-/// `execute` and `AnalyzeExec` reports an empty, unexecuted plan tree instead
-/// of surfacing the error.
+/// the context carrying those extensions. Errors from executing the plan or
+/// reading its output are propagated to the caller.
 pub async fn analyze_plan_with_context(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
@@ -784,7 +784,6 @@ pub async fn analyze_plan_with_context(
     // partition, and we want these to be connected to the parent span
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
 
-    let schema = plan.schema();
     // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
     let analyze = Arc::new(AnalyzeExec::new(
         true,
@@ -792,7 +791,7 @@ pub async fn analyze_plan_with_context(
         vec![MetricType::Summary],
         None,
         plan,
-        schema,
+        LogicalPlan::explain_schema(),
     ));
 
     let session_ctx = get_session_context(&options);
@@ -803,7 +802,9 @@ pub async fn analyze_plan_with_context(
         .map_err(|err| Error::io(format!("Failed to execute analyze plan: {}", err)))?;
 
     // fully execute the plan
-    while (stream.next().await).is_some() {}
+    while let Some(batch) = stream.next().await {
+        batch?;
+    }
 
     let result = format_plan(analyze);
     Ok(result)
@@ -1637,8 +1638,7 @@ mod tests {
 
     // Regression: analyze must run under a caller-provided TaskContext so nodes
     // that read a session-config extension at execute time see it. Without the
-    // context the node errors and AnalyzeExec would otherwise report an empty,
-    // unexecuted plan tree.
+    // context the node's execution error must be propagated.
     #[tokio::test]
     async fn test_analyze_plan_uses_provided_task_context() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1646,16 +1646,16 @@ mod tests {
         let executed = Arc::new(AtomicBool::new(false));
         let plan: Arc<dyn ExecutionPlan> = Arc::new(NeedsExtensionExec::new(executed.clone()));
 
-        // Default context lacks the extension: the node errors during execute
-        // (never reaching the `executed` flag), but AnalyzeExec absorbs that
-        // per-partition failure and reports an empty, unexecuted plan tree
-        // rather than propagating the error. This is the regression symptom.
-        let report = analyze_plan(plan.clone(), LanceExecutionOptions::default())
+        // The default context lacks the extension, so execution must fail.
+        let error = analyze_plan(plan.clone(), LanceExecutionOptions::default())
             .await
-            .expect("AnalyzeExec swallows the node's execute error into an Ok report");
+            .unwrap_err();
+        assert!(matches!(error, Error::Execution { .. }), "{error:?}");
         assert!(
-            report.contains("NeedsExtensionExec, metrics=[]"),
-            "expected an empty, unexecuted NeedsExtensionExec node, got: {report}"
+            error
+                .to_string()
+                .contains("missing required session-config extension"),
+            "{error}"
         );
         assert!(
             !executed.load(Ordering::SeqCst),
