@@ -5824,6 +5824,30 @@ def test_stats(tmp_path: Path):
     assert data_stats.fields[2].bytes_on_disk > 0
 
 
+def test_column_layout_stats(tmp_path: Path):
+    table = pa.table({"x": range(8), "y": range(8)})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=4)
+
+    stats = dataset.stats.column_layout_stats()
+    assert [s["fragment_id"] for s in stats] == [
+        f.fragment_id for f in dataset.get_fragments()
+    ]
+    for s in stats:
+        assert s["live_file_count"] == 1
+        assert s["fields_per_file"] == [2]
+        assert s["file_sizes"][0] > 0
+        assert s["dead_slot_ratio"] == 0.0
+        assert s["overlay_count"] == 0
+
+    dataset.add_columns({"z": "x + 1"})
+    dataset.drop_columns(["y"])
+    for s in dataset.stats.column_layout_stats():
+        assert s["live_file_count"] == 2
+        assert s["fields_per_file"] == [1, 1]
+        # `y` is still a slot of the first file, with nothing reading it.
+        assert s["dead_slot_ratio"] == pytest.approx(1 / 3)
+
+
 def test_default_storage_version(tmp_path: Path):
     table = pa.table({"x": [0]})
     dataset = lance.write_dataset(table, tmp_path)

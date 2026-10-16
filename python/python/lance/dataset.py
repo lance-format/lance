@@ -8078,6 +8078,24 @@ class DatasetStats(TypedDict):
     num_small_files: int
 
 
+class FragmentColumnLayoutStats(TypedDict):
+    fragment_id: int
+    #: Data files holding at least one column of the schema. A file holding
+    #: only tombstones, dropped columns, or spilled row lineage is not counted.
+    live_file_count: int
+    #: Recorded size in bytes of each data file, in the fragment's file order;
+    #: ``None`` when the manifest has no size for the file.
+    file_sizes: List[Optional[int]]
+    #: Number of schema fields each data file holds, in the fragment's file order.
+    fields_per_file: List[int]
+    #: Share of the fragment's field slots holding no live data (tombstoned by a
+    #: column update, or left by a dropped column). Spilled row lineage is not
+    #: counted. A fragment rewrite reclaims these slots.
+    dead_slot_ratio: float
+    #: Data overlay files attached to the fragment.
+    overlay_count: int
+
+
 class LanceStats:
     """
     Statistics about a LanceDataset.
@@ -8113,6 +8131,15 @@ class LanceStats:
         Statistics about the data in the dataset.
         """
         return self._ds.data_stats()
+
+    def column_layout_stats(self) -> List[FragmentColumnLayoutStats]:
+        """
+        How each fragment's columns are laid out across data files, in
+        manifest fragment order. Only manifest metadata is read.
+
+        This is an experimental API. It may change at any time.
+        """
+        return self._ds.column_layout_stats()
 
 
 def write_dataset(

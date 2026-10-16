@@ -69,6 +69,7 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+pub mod compaction_stats;
 mod data_file;
 mod data_file_part;
 pub mod delta;
