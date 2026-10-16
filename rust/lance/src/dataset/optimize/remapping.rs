@@ -24,6 +24,7 @@ use lance_index::scalar::{
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
+use lance_table::transaction::RewriteGroup;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -63,6 +64,18 @@ pub trait IndexRemapper: Send + Sync {
         index_map: RowAddrRemap,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>>;
+
+    /// Remap with the completed rewrite groups that determine which source
+    /// segments must be published as one atomic replacement. Existing remappers
+    /// retain their independent-segment behavior through the default method.
+    async fn remap_indices_with_context(
+        &self,
+        index_map: RowAddrRemap,
+        affected_fragment_ids: &[u64],
+        _rewrite_groups: &[RewriteGroup],
+    ) -> Result<Vec<RemappedIndex>> {
+        self.remap_indices(index_map, affected_fragment_ids).await
+    }
 }
 
 /// Options for creating an [IndexRemapper]
@@ -71,6 +84,12 @@ pub trait IndexRemapper: Send + Sync {
 /// want to keep a placeholder
 #[async_trait]
 pub trait IndexRemapperOptions: Send + Sync {
+    /// Whether this publication path can atomically replace compatible vector
+    /// segments connected by a rewrite. The default preserves physical boundaries.
+    fn supports_vector_segment_replacement(&self) -> bool {
+        false
+    }
+
     /// Creates a remapper when the dataset has indices that need row address remapping.
     ///
     /// Returns `None` when no remappable indices exist, allowing compaction to avoid

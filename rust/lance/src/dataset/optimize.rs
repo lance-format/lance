@@ -88,7 +88,10 @@ use std::ops::{AddAssign, Range};
 use std::sync::Arc;
 
 use super::fragment::FileFragment;
-use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
+use super::index::{
+    DatasetIndexRemapperOptions, load_indices_for_remapping,
+    vector_segment_merge_groups_for_compaction,
+};
 use super::rowids::RowVersionKind;
 use super::rowids::{
     RowLineage, RowLineagePlan, RowLineageSpill, inline_row_lineage_max_bytes,
@@ -806,6 +809,7 @@ pub trait CompactionPlanner: Send + Sync {
 pub struct DefaultCompactionPlanner {
     options: CompactionOptions,
     excluded_fragment_ids: RoaringBitmap,
+    can_replace_vector_segments: bool,
 }
 
 impl DefaultCompactionPlanner {
@@ -815,7 +819,24 @@ impl DefaultCompactionPlanner {
         Ok(Self {
             options,
             excluded_fragment_ids,
+            can_replace_vector_segments: false,
         })
+    }
+
+    /// Select the publication contract used by this plan. Without an explicit
+    /// remapper, planning preserves physical index boundaries. Distributed callers
+    /// using [`DatasetIndexRemapperOptions`] at commit may opt into atomic merges.
+    ///
+    /// ```
+    /// use lance::dataset::index::DatasetIndexRemapperOptions;
+    /// use lance::dataset::optimize::{CompactionOptions, DefaultCompactionPlanner};
+    /// let planner = DefaultCompactionPlanner::new(CompactionOptions::default())?
+    ///     .with_index_remapper(&DatasetIndexRemapperOptions::default());
+    /// # Ok::<(), lance::Error>(())
+    /// ```
+    pub fn with_index_remapper(mut self, remapper: &dyn IndexRemapperOptions) -> Self {
+        self.can_replace_vector_segments = remapper.supports_vector_segment_replacement();
+        self
     }
 }
 
@@ -884,16 +905,6 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             })
             .buffered(dataset.object_store.as_ref().io_parallelism());
 
-        let index_fragmaps = load_index_fragmaps(dataset).await?;
-        let indices_containing_frag = |frag_id: u32| {
-            index_fragmaps
-                .iter()
-                .enumerate()
-                .filter(|(_, bitmap)| bitmap.contains(frag_id))
-                .map(|(pos, _)| pos)
-                .collect::<Vec<_>>()
-        };
-
         let schema_field_ids = dataset
             .schema()
             .fields_pre_order()
@@ -951,7 +962,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 None
             };
 
-            let indices = indices_containing_frag(fragment.id as u32);
+            let indices = Vec::new();
 
             match (candidacy, &mut current_bin) {
                 (None, None) => {} // keep searching
@@ -966,25 +977,10 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                     });
                 }
                 (Some(candidacy), Some(bin)) => {
-                    // We cannot mix "indexed" and "non-indexed" fragments and so we only consider
-                    // the existing bin if it contains the same indices
-                    if bin.indices == indices {
-                        // Add to current bin
-                        bin.fragments.push(fragment);
-                        bin.pos_range.end += 1;
-                        bin.candidacy.push(candidacy);
-                        bin.row_counts.push(metrics.num_rows());
-                    } else {
-                        // Index set is different.  Complete previous bin and start new one
-                        candidate_bins.push(current_bin.take().unwrap());
-                        current_bin = Some(CandidateBin {
-                            fragments: vec![fragment],
-                            pos_range: i..(i + 1),
-                            candidacy: vec![candidacy],
-                            row_counts: vec![metrics.num_rows()],
-                            indices,
-                        });
-                    }
+                    bin.fragments.push(fragment);
+                    bin.pos_range.end += 1;
+                    bin.candidacy.push(candidacy);
+                    bin.row_counts.push(metrics.num_rows());
                 }
                 (None, Some(_)) => {
                     // Bin is complete
@@ -1000,7 +996,68 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<(TaskData, usize)> = candidate_bins
+        // Candidate windows precede index constraints: the old boundary-constrained
+        // plan can be empty even when crossing a compatible boundary would help.
+        let candidate_windows = candidate_bins
+            .iter()
+            .filter(|bin| bin.fragments.len() > 1)
+            .map(|bin| {
+                bin.fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect::<RoaringBitmap>()
+            })
+            .collect::<Vec<_>>();
+        // Removing a physical index boundary is safe only when publication remaps
+        // and atomically replaces every segment in the resulting merge group.
+        let can_merge_vector_segments = self.can_replace_vector_segments
+            && !self.options.defer_index_remap
+            && !dataset.manifest.uses_stable_row_ids();
+        let index_fragmaps =
+            load_index_fragmaps(dataset, can_merge_vector_segments, &candidate_windows).await?;
+        let indices_containing_frag = |frag_id: u32| {
+            index_fragmaps
+                .iter()
+                .enumerate()
+                .filter(|(_, bitmap)| bitmap.contains(frag_id))
+                .map(|(pos, _)| pos)
+                .collect::<Vec<_>>()
+        };
+
+        let mut constrained_bins = Vec::new();
+        for bin in candidate_bins {
+            let mut current: Option<CandidateBin> = None;
+            for (offset, ((fragment, candidacy), row_count)) in bin
+                .fragments
+                .into_iter()
+                .zip(bin.candidacy)
+                .zip(bin.row_counts)
+                .enumerate()
+            {
+                let indices = indices_containing_frag(fragment.id as u32);
+                if current
+                    .as_ref()
+                    .is_some_and(|current| current.indices != indices)
+                {
+                    constrained_bins.extend(current.take());
+                }
+                let pos = bin.pos_range.start + offset;
+                let current = current.get_or_insert_with(|| CandidateBin {
+                    fragments: Vec::new(),
+                    candidacy: Vec::new(),
+                    row_counts: Vec::new(),
+                    pos_range: pos..pos,
+                    indices,
+                });
+                current.fragments.push(fragment);
+                current.candidacy.push(candidacy);
+                current.row_counts.push(row_count);
+                current.pos_range.end = pos + 1;
+            }
+            constrained_bins.extend(current);
+        }
+
+        let all_tasks: Vec<(TaskData, usize)> = constrained_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
@@ -1042,8 +1099,11 @@ pub async fn compact_files(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    let planner = DefaultCompactionPlanner::new(options)?;
-    compact_files_with_planner(dataset, remap_options, &planner).await
+    let remap_options =
+        remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
+    let planner =
+        DefaultCompactionPlanner::new(options)?.with_index_remapper(remap_options.as_ref());
+    compact_files_with_planner(dataset, Some(remap_options), &planner).await
 }
 
 pub async fn compact_files_with_planner(
@@ -1051,7 +1111,22 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
+    let remap_options =
+        remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+    if !remap_options.supports_vector_segment_replacement()
+        || compaction_plan.options.defer_index_remap
+        || dataset.manifest.uses_stable_row_ids()
+    {
+        validate_fragment_groups_preserve_index_boundaries(
+            dataset,
+            compaction_plan
+                .tasks
+                .iter()
+                .map(|task| task.fragments.as_slice()),
+        )
+        .await?;
+    }
 
     // A tagged FRI history is maintained by appending transitions to the
     // tagged entry, which only the deferred-remap commit path does; eager
@@ -1091,7 +1166,6 @@ pub async fn compact_files_with_planner(
         );
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
-    let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
     let metrics = commit_compaction(
         dataset,
         completed_tasks,
@@ -2282,7 +2356,11 @@ impl CandidateBin {
     }
 }
 
-async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
+async fn load_index_fragmaps(
+    dataset: &Dataset,
+    can_merge_vector_segments: bool,
+    candidate_windows: &[RoaringBitmap],
+) -> Result<Vec<RoaringBitmap>> {
     // Coverage, not usability: these bitmaps decide the rewrite groups. Under
     // stable row ids `Transaction::recalculate_fragment_bitmap` then rejects any
     // group that splits an index's coverage, and it walks every index the new
@@ -2294,12 +2372,72 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     // repair its coverage.
     let indices = load_all_indices(dataset).await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
+    let mut segments_by_name = HashMap::<&str, Vec<_>>::new();
+    for index in indices.iter().filter(|idx| !is_system_index(idx)) {
+        segments_by_name
+            .entry(index.name.as_str())
+            .or_default()
+            .push(index);
+    }
+
+    // Apply all manifest-known boundaries before loading any stored models.
+    // Eligible segments can potentially share coverage; scalar, opaque and
+    // unsupported vector layouts retain their individual boundaries.
+    let mut potential_boundaries = Vec::new();
+    if can_merge_vector_segments {
+        for segments in segments_by_name.values() {
+            let mut eligible_coverage = RoaringBitmap::new();
+            for segment in segments {
+                let coverage = index_fragment_coverage(dataset, segment).await?;
+                if crate::dataset::index::is_merge_candidate(segment) {
+                    eligible_coverage |= coverage;
+                } else {
+                    potential_boundaries.push(coverage);
+                }
+            }
+            if !eligible_coverage.is_empty() {
+                potential_boundaries.push(eligible_coverage);
+            }
+        }
+    }
+    let candidate_windows = crate::dataset::index::constrain_candidate_windows(
+        candidate_windows,
+        &potential_boundaries,
+    );
+
+    let mut visited_names = HashSet::new();
     // System indices (fragment-reuse, mem-wal) don't define data coverage and
     // aren't remapped per rewrite group, so they must not constrain compaction
     // bins -- otherwise deferred compaction's fragment-reuse index repeatedly
     // splits the small-fragment run and they never coalesce.
     for index in indices.iter().filter(|idx| !is_system_index(idx)) {
-        index_fragmaps.push(index_fragment_coverage(dataset, index).await?);
+        if !visited_names.insert(index.name.as_str()) {
+            continue;
+        }
+
+        let segments = &segments_by_name[index.name.as_str()];
+        let merge_groups = if can_merge_vector_segments {
+            let (relevant, other): (Vec<_>, Vec<_>) =
+                segments.iter().copied().partition(|segment| {
+                    segment.fragment_bitmap.as_ref().is_some_and(|coverage| {
+                        candidate_windows.iter().any(|window| {
+                            !coverage.is_disjoint(window) && !window.is_subset(coverage)
+                        })
+                    })
+                });
+            let mut groups = vector_segment_merge_groups_for_compaction(dataset, &relevant).await;
+            groups.extend(other.into_iter().map(|segment| vec![segment]));
+            groups
+        } else {
+            segments.iter().map(|segment| vec![*segment]).collect()
+        };
+        for merge_group in merge_groups {
+            let mut group_fragment_bitmap = RoaringBitmap::new();
+            for segment in merge_group {
+                group_fragment_bitmap |= index_fragment_coverage(dataset, segment).await?;
+            }
+            index_fragmaps.push(group_fragment_bitmap);
+        }
     }
     Ok(index_fragmaps)
 }
@@ -2314,6 +2452,7 @@ async fn index_fragment_coverage(
     if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
         return Ok(fragment_bitmap.clone());
     }
+
     let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
     // max_fragment_id is inclusive (the highest id); +1 for an exclusive
     // upper bound so the last fragment is covered (None => empty range).
@@ -3070,6 +3209,51 @@ fn place_row_lineage_in_files(
     Ok(())
 }
 
+async fn validate_fragment_groups_preserve_index_boundaries<'a>(
+    dataset: &Dataset,
+    groups: impl Iterator<Item = &'a [Fragment]>,
+) -> Result<()> {
+    let indices = load_all_indices(dataset).await?;
+    let mut physical_index_boundaries = Vec::new();
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
+        physical_index_boundaries.push((
+            index.name.clone(),
+            index.uuid,
+            index_fragment_coverage(dataset, index).await?,
+        ));
+    }
+
+    for (task_idx, fragments) in groups.enumerate() {
+        let old_fragment_ids = fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        for (index_name, segment_id, fragment_bitmap) in &physical_index_boundaries {
+            let covered_fragment_ids = old_fragment_ids
+                .iter()
+                .copied()
+                .filter(|fragment_id| {
+                    u32::try_from(*fragment_id)
+                        .is_ok_and(|fragment_id| fragment_bitmap.contains(fragment_id))
+                })
+                .collect::<Vec<_>>();
+            if !covered_fragment_ids.is_empty()
+                && covered_fragment_ids.len() != old_fragment_ids.len()
+            {
+                return Err(Error::invalid_input(format!(
+                    "Compaction rewrite group {task_idx} with old fragments {old_fragment_ids:?} \
+                     crosses the physical coverage boundary of index '{index_name}' segment \
+                     {segment_id} (covered fragments {covered_fragment_ids:?}), but the selected \
+                     remapper/publication path cannot atomically replace vector segments. \
+                     Use a boundary-preserving DefaultCompactionPlanner plan, or select the \
+                     built-in DatasetIndexRemapperOptions with eager address remapping"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fit the lineage planned for output fragments of `planned_rows` rows each to
 /// the fragments the writer actually produced, one lineage per fragment.
 ///
@@ -3329,6 +3513,15 @@ pub async fn commit_compaction(
     } else {
         None
     };
+    if index_remapper.is_none() || !remap_options.supports_vector_segment_replacement() {
+        validate_fragment_groups_preserve_index_boundaries(
+            dataset,
+            completed_tasks
+                .iter()
+                .map(|task| task.original_fragments.as_slice()),
+        )
+        .await?;
+    }
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
@@ -3403,7 +3596,7 @@ pub async fn commit_compaction(
     // Stable row ids record every group: the moves also serve address translation.
     let indexed_frags: RoaringBitmap = if options.defer_index_remap && !uses_stable_row_ids {
         let mut covered = RoaringBitmap::new();
-        for bm in load_index_fragmaps(dataset).await? {
+        for bm in load_index_fragmaps(dataset, false, &[]).await? {
             covered |= bm;
         }
         // The stored listing works for v0 and tagged entries alike (the
@@ -3572,7 +3765,9 @@ pub async fn commit_compaction(
             IndexRemapMode::Direct => RowAddrRemap::direct(direct_row_id_map),
             IndexRemapMode::Compact => RowAddrRemap::compact(remap_group_inputs)?,
         };
-        let remapped_indices = index_remapper.remap_indices(remap, &affected_ids).await?;
+        let remapped_indices = index_remapper
+            .remap_indices_with_context(remap, &affected_ids, &rewrite_groups)
+            .await?;
         remapped_indices
             .into_iter()
             .map(|rewritten| RewrittenIndex {
@@ -3823,34 +4018,39 @@ mod tests {
         INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY, get_row_id_index,
     };
     use crate::dataset::scanner::ColumnOrdering;
+    use crate::index::CreateIndexBuilder;
     use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::session::caches::{ManifestKey, RowIdIndexKey, TransactionKey};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
-        ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        PrimitiveArray, RecordBatch, RecordBatchIterator,
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeBinaryArray,
+        LargeStringArray, PrimitiveArray, RecordBatch, RecordBatchIterator,
     };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
-    use lance_arrow::BLOB_META_KEY;
+    use lance_arrow::{BLOB_META_KEY, FixedSizeListArrayExt};
     use lance_core::Error;
     use lance_core::ROW_ID;
     use lance_core::ROW_ID_FIELD_ID;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::Dimension;
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::CompactFragReuseIndexHandle;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
+    use lance_index::vector::bq::RQBuildParams;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{Index, IndexType};
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::{DistanceType, MetricType};
@@ -4419,7 +4619,12 @@ mod tests {
         dataset: &Dataset,
         options: &CompactionOptions,
     ) -> Vec<RewriteResult> {
-        let plan = plan_compaction(dataset, options).await.unwrap();
+        let plan = DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .with_index_remapper(&DatasetIndexRemapperOptions::default())
+            .plan(dataset)
+            .await
+            .unwrap();
         assert!(!plan.tasks.is_empty());
         let snapshot = dataset.clone();
         futures::stream::iter(plan.tasks)
@@ -11157,6 +11362,1123 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::pq("pq", 1_000)]
+    #[case::rq("rq", 1_000)]
+    #[case::hnsw("hnsw", 1_000)]
+    #[case::no_window("flat", 1)]
+    #[tokio::test]
+    async fn test_compaction_planning_skips_ineligible_index_io(
+        #[case] layout: &str,
+        #[case] target_rows_per_fragment: usize,
+    ) {
+        const DIM: u32 = 8;
+        let dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_reader_rows(RowCount::from(16), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0; DIM as usize]),
+            DIM as i32,
+        )
+        .unwrap();
+        let ivf = IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap();
+        let params = match layout {
+            "pq" => VectorIndexParams::with_ivf_pq_params(
+                DistanceType::L2,
+                ivf,
+                PQBuildParams {
+                    num_bits: 4,
+                    num_sub_vectors: 2,
+                    max_iters: 1,
+                    ..Default::default()
+                },
+            ),
+            "rq" => VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                ivf,
+                RQBuildParams::default(),
+            ),
+            "hnsw" => {
+                VectorIndexParams::ivf_hnsw(DistanceType::L2, ivf, HnswBuildParams::default())
+            }
+            _ => VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf),
+        };
+        let template = CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+            .name("vec_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        // Readable files make accidental opens observable: failed reads alone
+        // would not increment the object store's successful-read counter.
+        let mut indices = Vec::new();
+        for fragment in 0..2 {
+            let mut segment = template.clone();
+            segment.uuid = Uuid::new_v4();
+            segment.fragment_bitmap = Some(RoaringBitmap::from_iter([fragment]));
+            for file in template.files.as_ref().unwrap() {
+                dataset
+                    .object_store
+                    .copy(
+                        &dataset
+                            .indices_dir()
+                            .join(template.uuid.to_string())
+                            .join(file.path.as_str()),
+                        &dataset
+                            .indices_dir()
+                            .join(segment.uuid.to_string())
+                            .join(file.path.as_str()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            indices.push(segment);
+        }
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: indices,
+                        removed_indices: Vec::new(),
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let dataset = Dataset::open(dir.as_str()).await.unwrap();
+        // Keep metadata-loading I/O separate from grouping (legacy inference can
+        // read index files; these fixtures have explicit modern manifest details).
+        load_all_indices(&dataset).await.unwrap();
+        dataset.object_store.io_stats_incremental();
+        let plan = DefaultCompactionPlanner::new(CompactionOptions {
+            target_rows_per_fragment,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_index_remapper(&DatasetIndexRemapperOptions::default())
+        .plan(&dataset)
+        .await
+        .unwrap();
+        assert_eq!(plan.num_tasks(), 0);
+        assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+        dataset
+            .open_logical_vector_index("vec", "vec_idx")
+            .await
+            .unwrap();
+        assert!(
+            dataset.object_store.io_stats_incremental().read_iops > 0,
+            "opening the cold, readable segments must register index-file I/O"
+        );
+    }
+
+    struct IndependentRemapperOptions;
+
+    #[async_trait]
+    impl IndexRemapperOptions for IndependentRemapperOptions {
+        async fn create_remapper(
+            &self,
+            dataset: &Dataset,
+        ) -> Result<Option<Box<dyn IndexRemapper>>> {
+            Ok(Some(Box::new(IndependentRemapper {
+                inner: DatasetIndexRemapperOptions::default()
+                    .create_remapper(dataset)
+                    .await?
+                    .unwrap(),
+            })))
+        }
+    }
+
+    struct IndependentRemapper {
+        inner: Box<dyn IndexRemapper>,
+    }
+
+    #[async_trait]
+    impl IndexRemapper for IndependentRemapper {
+        async fn remap_indices(
+            &self,
+            mapping: RowAddrRemap,
+            affected: &[u64],
+        ) -> Result<Vec<RemappedIndex>> {
+            self.inner.remap_indices(mapping, affected).await
+        }
+    }
+
+    #[rstest]
+    #[case::builtin(0, 1)]
+    #[case::ignore(1, 2)]
+    #[case::custom(2, 2)]
+    #[tokio::test]
+    async fn test_compaction_selected_remapper_boundaries(
+        #[case] remapper_kind: usize,
+        #[case] expected_segments: usize,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(4)),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(8))
+            .await
+            .unwrap();
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 4]), 4).unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let mut segments = Vec::new();
+        for pair in [[0, 1], [2, 3]] {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(pair.to_vec())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+        let remapper: Arc<dyn IndexRemapperOptions> = match remapper_kind {
+            0 => Arc::new(DatasetIndexRemapperOptions::default()),
+            1 => Arc::new(IgnoreRemap::default()),
+            _ => Arc::new(IndependentRemapperOptions),
+        };
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_compaction(&dataset, &options)
+                .await
+                .unwrap()
+                .num_tasks(),
+            2
+        );
+        if remapper_kind != 0 {
+            let crossing = DefaultCompactionPlanner::new(options.clone())
+                .unwrap()
+                .with_index_remapper(&DatasetIndexRemapperOptions::default());
+            let version = dataset.version().version;
+            let error = compact_files_with_planner(&mut dataset, Some(remapper.clone()), &crossing)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("remapper/publication path"));
+            assert_eq!(dataset.version().version, version);
+        }
+        compact_files(&mut dataset, options, Some(remapper))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), expected_segments);
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            expected_segments
+        );
+        if remapper_kind != 1 {
+            assert_vector_index_coverage(&dataset).await;
+        }
+    }
+
+    async fn assert_vector_index_coverage(dataset: &Dataset) {
+        let expected_batch = dataset
+            .scan()
+            .filter("vec IS NOT NULL")
+            .unwrap()
+            .project::<String>(&[])
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let expected = expected_batch[ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<roaring::RoaringTreemap>();
+        let mut stored = roaring::RoaringTreemap::new();
+        let indices = dataset.load_indices_by_name("vec_idx").await.unwrap();
+        for metadata in indices {
+            let index = dataset
+                .open_vector_index("vec", &metadata.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            for partition in 0..index.ivf_model().num_partitions() {
+                let mut stream = index
+                    .partition_reader(partition, false, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    for address in batch[ROW_ID]
+                        .as_primitive::<arrow_array::types::UInt64Type>()
+                        .values()
+                    {
+                        assert!(
+                            stored.insert(*address),
+                            "duplicate stored address {address}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(stored, expected);
+    }
+
+    #[rstest]
+    #[case::noop(1)]
+    #[case::rewrite(10_000)]
+    #[tokio::test]
+    async fn test_compaction_legacy_segments(#[case] target_rows_per_fragment: usize) {
+        let dir =
+            crate::utils::test::copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        dataset.index_statistics("vector_idx").await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let rows = dataset.count_rows(None).await.unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment,
+            ..Default::default()
+        };
+        DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .with_index_remapper(&DatasetIndexRemapperOptions::default())
+            .plan(&dataset)
+            .await
+            .unwrap();
+        compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), rows);
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        dataset.validate().await.unwrap();
+    }
+
+    #[rstest]
+    #[case::independent(vec![vec![0, 1], vec![2, 3]], 4)]
+    #[case::crossing(vec![vec![1, 2]], 3)]
+    #[case::transitive(vec![vec![1, 2], vec![3, 4]], 2)]
+    #[tokio::test]
+    async fn test_compaction_merges_only_connected_segments(
+        #[case] groups: Vec<Vec<usize>>,
+        #[case] expected_segments: usize,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(4)),
+            )
+            .into_ram_dataset(FragmentCount::from(8), FragmentRowCount::from(8))
+            .await
+            .unwrap();
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 4]), 4).unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata.clone())
+            .collect::<Vec<_>>();
+        let mut segments = Vec::new();
+        for pair in fragments.chunks(2) {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(pair.iter().map(|fragment| fragment.id as u32).collect())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let mut completed = Vec::new();
+        for group in groups {
+            let task = TaskData {
+                fragments: group.iter().map(|idx| fragments[*idx].clone()).collect(),
+            };
+            completed.push(
+                rewrite_files(Cow::Borrowed(&dataset), task, &options)
+                    .await
+                    .unwrap(),
+            );
+        }
+        commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            expected_segments
+        );
+        assert_vector_index_coverage(&dataset).await;
+    }
+
+    #[rstest]
+    #[case::flat_one(false, 1, None, false)]
+    #[case::flat_multi(false, 2, None, false)]
+    #[case::flat_deletions(false, 2, Some("id % 3 = 0"), false)]
+    #[case::flat_deleted_source(false, 2, Some("id < 128"), false)]
+    #[case::sq_one(true, 1, None, false)]
+    #[case::sq_multi(true, 2, Some("id % 3 = 0"), false)]
+    #[case::flat_nulls(false, 2, None, true)]
+    #[case::sq_nulls(true, 2, None, true)]
+    #[tokio::test]
+    async fn test_compaction_merges_compatible_vector_segments(
+        #[case] is_sq: bool,
+        #[case] partitions: usize,
+        #[case] deletion: Option<&str>,
+        #[case] has_nulls: bool,
+    ) {
+        const DIM: u32 = 4;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)).with_nulls(
+                    if has_nulls {
+                        &[false, false, true]
+                    } else {
+                        &[false]
+                    },
+                ),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(128))
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..partitions)
+                    .flat_map(|i| std::iter::repeat_n(i as f32, DIM as usize))
+                    .collect::<Vec<_>>(),
+            ),
+            DIM as i32,
+        )
+        .unwrap();
+        let ivf = IvfBuildParams::try_with_centroids(partitions, Arc::new(centroids)).unwrap();
+        let params = if is_sq {
+            VectorIndexParams::with_ivf_sq_params(DistanceType::L2, ivf, SQBuildParams::default())
+        } else {
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf)
+        };
+        // Copy one stored model to ensure exact SQ compatibility. Each source
+        // deliberately contains stale rows owned by the other two segments.
+        let template = CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+            .name("vec_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            let mut segment = template.clone();
+            segment.uuid = Uuid::new_v4();
+            segment.fragment_bitmap = Some(RoaringBitmap::from_iter([fragment.id() as u32]));
+            for file in ["index.idx", "auxiliary.idx"] {
+                dataset
+                    .object_store
+                    .copy(
+                        &dataset
+                            .indices_dir()
+                            .join(template.uuid.to_string())
+                            .join(file),
+                        &dataset
+                            .indices_dir()
+                            .join(segment.uuid.to_string())
+                            .join(file),
+                    )
+                    .await
+                    .unwrap();
+            }
+            segments.push(segment);
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            3
+        );
+
+        if let Some(predicate) = deletion {
+            dataset.delete(predicate).await.unwrap();
+        }
+        let query = vec![0.5; DIM as usize];
+        let before = vector_knn_ids(&dataset, &query, 10).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let conservative = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(
+            conservative
+                .tasks()
+                .iter()
+                .all(|task| task.fragments.len() == 1)
+        );
+        let plan = DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .with_index_remapper(&DatasetIndexRemapperOptions::default())
+            .plan(&dataset)
+            .await
+            .unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        assert_eq!(
+            plan.tasks()[0].fragments.len(),
+            dataset.get_fragments().len()
+        );
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let indices = dataset.load_indices_by_name("vec_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([dataset.get_fragments()[0].id() as u32])
+        );
+        dataset.validate().await.unwrap();
+
+        let after = vector_knn_ids(&dataset, &query, 10).await;
+        let query_array = Float32Array::from(query);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &query_array, 10).unwrap();
+        scanner.nprobes(partitions).project(&["id"]).unwrap();
+        let execution = scanner.explain_plan(false).await.unwrap();
+        assert!(execution.contains("ANNSubIndex"), "{execution}");
+        assert!(!execution.contains("LanceScan"), "{execution}");
+        scanner.use_index(false);
+        let truth = scanner.try_into_batch().await.unwrap();
+        let truth = truth["id"].as_primitive::<Int32Type>().values();
+        if is_sq {
+            assert!(after.iter().filter(|id| truth.contains(id)).count() >= 5);
+        } else {
+            assert_eq!(after, before);
+            assert_eq!(after.as_slice(), truth.as_ref());
+        }
+        assert_vector_index_coverage(&dataset).await;
+    }
+
+    #[rstest]
+    #[case::stable_row_ids(true, false)]
+    #[case::deferred_remap(false, true)]
+    #[tokio::test]
+    async fn test_compaction_preserves_vector_boundaries_without_immediate_remap(
+        #[case] enable_stable_row_ids: bool,
+        #[case] defer_index_remap: bool,
+    ) {
+        const DIM: u32 = 16;
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let mut segments = Vec::new();
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+
+        let plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.num_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_vector_boundary_crossing_when_remap_mode_changes() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut segments = Vec::new();
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+
+        let plan_options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let completed_tasks = execute_compaction_plan(&dataset, &plan_options).await;
+        assert_eq!(completed_tasks.len(), 1);
+        assert_eq!(completed_tasks[0].original_fragments.len(), 2);
+
+        let deferred_options = CompactionOptions {
+            defer_index_remap: true,
+            ..plan_options.clone()
+        };
+        let version_before_commit = dataset.manifest.version;
+        let error = commit_compaction(
+            &mut dataset,
+            completed_tasks.clone(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &deferred_options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("physical coverage boundary"));
+        assert_eq!(dataset.manifest.version, version_before_commit);
+
+        commit_compaction(
+            &mut dataset,
+            completed_tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &plan_options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            1
+        );
+        dataset.validate().await.unwrap();
+    }
+
+    /// A deferred commit over a plan that groups covered and uncovered fragments
+    /// must refuse to cross a physical index boundary even when this build cannot
+    /// open the covering segment.
+    ///
+    /// The commit guard reloads live non-system segment coverage before
+    /// publication; it must see every physical boundary, not only the ones in the
+    /// usable-index view. Filtering out a segment this build cannot open would
+    /// let the deferred rewrite delete old covered fragment ids during bitmap
+    /// repair without adding the merged fragment, stranding a capable reader on a
+    /// flat scan of that range.
+    #[tokio::test]
+    async fn test_deferred_compaction_rejects_crossing_an_unsupported_index_boundary() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        // A single physical vector segment covering only the first two fragments,
+        // so a plan rewriting all four fragments together partially crosses it.
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let segment = CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+            .name("vec_idx".to_string())
+            .fragments(fragment_ids[..2].to_vec())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", vec![segment])
+            .await
+            .unwrap();
+
+        // Raise the segment's version so this build can no longer open it, keeping
+        // its physical coverage over the first two fragments intact.
+        let committed = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "vec_idx")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 1);
+        let mut hidden = committed.clone();
+        hidden[0].index_version = IndexType::max_vector_version() as i32 + 1;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: hidden.clone(),
+                removed_indices: committed,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name("vec_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the segment must be hidden from the usable-index view"
+        );
+
+        // A public/custom plan can group the covered fragments (0,1) with the
+        // uncovered ones (2,3) into one rewrite task - something the default
+        // planner never does, because it keeps covered and uncovered fragments in
+        // separate candidate bins. Execute that plan and commit it deferred, so
+        // publication runs the guard without any remapper.
+        let deferred_options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let task = CompactionTask {
+            task: TaskData {
+                fragments: dataset.fragments().as_ref().clone(),
+            },
+            read_version: dataset.manifest.version,
+            options: deferred_options.clone(),
+        };
+        let rewrite_result = task.execute(&dataset).await.unwrap();
+        let completed_tasks = vec![rewrite_result];
+        assert_eq!(completed_tasks[0].original_fragments.len(), 4);
+
+        let version_before_commit = dataset.manifest.version;
+        let error = commit_compaction(
+            &mut dataset,
+            completed_tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &deferred_options,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("physical coverage boundary"));
+        assert_eq!(dataset.manifest.version, version_before_commit);
+    }
+
+    #[tokio::test]
+    async fn test_compaction_preserves_pq_segment_boundaries() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let codebook = Arc::new(Float32Array::from_iter_values(std::iter::repeat_n(
+            0.0,
+            DIM as usize * 16,
+        )));
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+            PQBuildParams::with_codebook(4, 4, codebook),
+        );
+        let mut segments = Vec::new();
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+
+        let plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.num_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_compaction_merges_compatible_vector_segment_subset() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut segments = Vec::with_capacity(fragment_ids.len());
+        for (fragment_id, centroid) in fragment_ids.into_iter().zip([0.0, 0.0, 1.0]) {
+            let centroids = FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(std::iter::repeat_n(centroid, DIM as usize)),
+                DIM as i32,
+            )
+            .unwrap();
+            let params = VectorIndexParams::with_ivf_flat_params(
+                DistanceType::L2,
+                IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+            );
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
+                    .name("vec_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", segments)
+            .await
+            .unwrap();
+
+        let query = vec![0.5; DIM as usize];
+        let before = vector_knn_ids(&dataset, &query, 10).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .with_index_remapper(&DatasetIndexRemapperOptions::default())
+            .plan(&dataset)
+            .await
+            .unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        assert_eq!(plan.tasks()[0].fragments.len(), 2);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            2
+        );
+        dataset.validate().await.unwrap();
+        let after = vector_knn_ids(&dataset, &query, 10).await;
+        assert_eq!(after, before);
+        assert_vector_index_coverage(&dataset).await;
+    }
+
+    #[tokio::test]
+    async fn test_compaction_keeps_incompatible_vector_segments_separate() {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let params = |centroid: f32| {
+            let centroids = FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(std::iter::repeat_n(centroid, DIM as usize)),
+                DIM as i32,
+            )
+            .unwrap();
+            VectorIndexParams::with_ivf_flat_params(
+                DistanceType::L2,
+                IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+            )
+        };
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let first =
+            CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params(0.0))
+                .name("vec_idx".to_string())
+                .fragments(fragment_ids[..2].to_vec())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let second =
+            CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params(1.0))
+                .name("vec_idx".to_string())
+                .fragments(fragment_ids[2..].to_vec())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", vec![first, second])
+            .await
+            .unwrap();
+
+        let query = vec![0.5; DIM as usize];
+        let before = vector_knn_ids(&dataset, &query, 10).await;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.num_tasks(), 2);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            2
+        );
+        dataset.validate().await.unwrap();
+        let after = vector_knn_ids(&dataset, &query, 10).await;
+        assert_eq!(after, before);
+        assert_vector_index_coverage(&dataset).await;
+    }
+
+    #[rstest]
+    #[case::flat_same(false, false)]
+    #[case::flat_different(false, true)]
+    #[case::sq_same(true, false)]
+    #[tokio::test]
+    async fn test_compaction_keeps_hnsw_parameter_boundaries(
+        #[case] is_sq: bool,
+        #[case] different_params: bool,
+    ) {
+        const DIM: u32 = 16;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(64))
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+            DIM as i32,
+        )
+        .unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap();
+        let params = |num_edges| {
+            let hnsw = HnswBuildParams::default().num_edges(num_edges);
+            if is_sq {
+                VectorIndexParams::with_ivf_hnsw_sq_params(
+                    DistanceType::L2,
+                    ivf_params.clone(),
+                    hnsw,
+                    SQBuildParams::default(),
+                )
+            } else {
+                VectorIndexParams::ivf_hnsw(DistanceType::L2, ivf_params.clone(), hnsw)
+            }
+        };
+        let default_params = params(8);
+        let custom_params = params(if different_params { 16 } else { 8 });
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let first =
+            CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &default_params)
+                .name("vec_idx".to_string())
+                .fragments(fragment_ids[..2].to_vec())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let second =
+            CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &custom_params)
+                .name("vec_idx".to_string())
+                .fragments(fragment_ids[2..].to_vec())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        dataset
+            .commit_existing_index_segments("vec_idx", "vec", vec![first, second])
+            .await
+            .unwrap();
+
+        dataset.delete("id % 7 = 0").await.unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_000,
+            ..Default::default()
+        };
+        let plan = DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .with_index_remapper(&DatasetIndexRemapperOptions::default())
+            .plan(&dataset)
+            .await
+            .unwrap();
+        assert_eq!(plan.num_tasks(), 2);
+        compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(
+            dataset.load_indices_by_name("vec_idx").await.unwrap().len(),
+            2
+        );
+        assert_vector_index_coverage(&dataset).await;
+        let query = Float32Array::from(vec![0.5; DIM as usize]);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &query, 10).unwrap();
+        scanner.project(&["id"]).unwrap();
+        let execution = scanner.explain_plan(false).await.unwrap();
+        assert!(execution.contains("ANNSubIndex"), "{execution}");
+        assert!(!execution.contains("LanceScan"), "{execution}");
+        let ann = scanner.try_into_batch().await.unwrap();
+        scanner.use_index(false);
+        let truth = scanner.try_into_batch().await.unwrap();
+        let truth = truth["id"].as_primitive::<Int32Type>().values();
+        assert!(
+            ann["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .filter(|id| truth.contains(id))
+                .count()
+                >= 5
+        );
+    }
+
     #[tokio::test]
     async fn test_read_ivf_rq_index_v3_with_defer_index_remap() {
         use arrow_array::cast::AsArray;
@@ -11295,6 +12617,7 @@ mod tests {
         let qa = PrimitiveArray::<Float32Type>::from_iter_values(query.iter().copied());
         let mut scanner = dataset.scan();
         scanner.nearest("vec", &qa, k).unwrap();
+        scanner.nprobes(64);
         scanner.project(&["id"]).unwrap();
         let batches = scanner
             .try_into_stream()
