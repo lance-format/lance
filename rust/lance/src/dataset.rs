@@ -2516,7 +2516,7 @@ impl Dataset {
                 .base_paths
                 .get(&id)
                 .ok_or_else(|| {
-                    Error::invalid_input(format!("Managed blob references unknown base_id {id}"))
+                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
                 })?
                 .extract_path(self.session.store_registry()),
             None => Ok(self.base.clone()),

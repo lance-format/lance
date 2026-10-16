@@ -290,7 +290,7 @@ mod tests {
     use super::*;
 
     use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
-    use crate::dataset::blob::locate::BlobV2DescriptorColumns;
+    use crate::dataset::blob::locate::StoredBlob;
     use arrow::array::AsArray;
     use arrow_array::RecordBatch;
     use arrow_schema::Schema;
@@ -318,10 +318,14 @@ mod tests {
         let (field, array) = builder.finish().unwrap().into_parts();
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
         let batch = prepared_blob_batch_to_descriptors(&batch).unwrap();
-        let columns = BlobV2DescriptorColumns::new(batch["blob"].as_struct());
-        assert_eq!(columns.managed_base_id(0), base_id);
-        assert_eq!(columns.positions.value(0), offset);
-        assert_eq!(columns.sizes.value(0), size);
-        assert_eq!(columns.blob_uris.value(0), "_blobs/payload.blob");
+        assert_eq!(
+            StoredBlob::parse(batch["blob"].as_struct(), 0).unwrap(),
+            Some(StoredBlob::Managed {
+                base_id,
+                uri: "_blobs/payload.blob",
+                position: offset,
+                size,
+            })
+        );
     }
 }

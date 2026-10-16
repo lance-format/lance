@@ -19,11 +19,11 @@ use futures::future::BoxFuture;
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use tokio::sync::Notify;
 
-use super::locate::{BlobV2DescriptorColumns, BlobV2ReadContext, blob_version_from_descriptions};
+use super::locate::{BlobLocator, StoredBlob, blob_version_from_descriptions};
 use super::read::BlobEntry;
 use super::read::{ReadBlobsExecution, execute_blob_entries_with_execution};
 use crate::dataset::Dataset;
-use lance_core::datatypes::{BlobKind, BlobVersion, Field as LanceField, Schema};
+use lance_core::datatypes::{BlobVersion, Field as LanceField, Schema};
 use lance_core::{Error, ROW_ADDR, Result};
 
 #[derive(Debug)]
@@ -549,28 +549,14 @@ fn estimate_blob_v2_materialized_array_bytes<'a>(
                     row_addrs.len()
                 )));
             }
-            let columns = BlobV2DescriptorColumns::new(descriptions);
-            let mut read_context = BlobV2ReadContext::new(dataset, field.id as u32);
+            let mut locator = BlobLocator::new(dataset, field.id as u32);
             let mut payload_bytes = 0_u64;
             for (idx, row_addr) in row_addrs.iter().copied().enumerate() {
-                if columns.is_null_blob(idx) {
-                    continue;
-                }
-                let kind = BlobKind::try_from(columns.kinds.value(idx))?;
-                if matches!(kind, BlobKind::Inline)
-                    && columns.positions.value(idx) == 0
-                    && columns.sizes.value(idx) == 0
-                {
-                    continue;
-                }
-                let file = read_context
-                    .collect_file(&columns, idx, row_addr)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "blob v2 descriptor at index {idx} unexpectedly resolved to null"
-                        ))
-                    })?;
+                let blob = match StoredBlob::parse(descriptions, idx)? {
+                    None | Some(StoredBlob::Empty) => continue,
+                    Some(blob) => blob,
+                };
+                let file = locator.locate(&blob, row_addr).await?;
                 payload_bytes = payload_bytes.saturating_add(file.size);
             }
             let offsets_bytes =
@@ -805,33 +791,24 @@ async fn materialize_blob_v2_descriptors(
         BlobVersion::V2 => {}
     }
 
-    let columns = BlobV2DescriptorColumns::new(descriptions);
-    let mut read_context = BlobV2ReadContext::new(dataset, blob_field_id);
+    let mut locator = BlobLocator::new(dataset, blob_field_id);
     let mut entries = Vec::with_capacity(descriptions.len());
     let mut payloads = vec![None; descriptions.len()];
+    let mut null_blobs = vec![false; descriptions.len()];
 
     for (idx, row_addr) in row_addrs.iter().copied().enumerate() {
-        if descriptions.is_null(idx) || columns.kinds.is_null(idx) {
-            continue;
-        }
-
-        let kind = BlobKind::try_from(columns.kinds.value(idx))?;
-        if matches!(kind, BlobKind::Inline)
-            && columns.positions.value(idx) == 0
-            && columns.sizes.value(idx) == 0
-        {
-            payloads[idx] = Some(Bytes::new());
-            continue;
-        }
-
-        let file = read_context
-            .collect_file(&columns, idx, row_addr)
-            .await?
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "blob v2 descriptor at index {idx} unexpectedly resolved to null"
-                ))
-            })?;
+        let blob = match StoredBlob::parse(descriptions, idx)? {
+            None => {
+                null_blobs[idx] = true;
+                continue;
+            }
+            Some(StoredBlob::Empty) => {
+                payloads[idx] = Some(Bytes::new());
+                continue;
+            }
+            Some(blob) => blob,
+        };
+        let file = locator.locate(&blob, row_addr).await?;
         entries.push(BlobEntry {
             selection_index: idx,
             row_address: row_addr,
@@ -864,8 +841,8 @@ async fn materialize_blob_v2_descriptors(
 
     let payload_capacity = payloads.iter().flatten().map(Bytes::len).sum::<usize>();
     let mut builder = LargeBinaryBuilder::with_capacity(descriptions.len(), payload_capacity);
-    for (idx, payload) in payloads.into_iter().enumerate() {
-        if descriptions.is_null(idx) || columns.kinds.is_null(idx) {
+    for (idx, (payload, is_null)) in payloads.into_iter().zip(null_blobs).enumerate() {
+        if is_null {
             builder.append_null();
         } else {
             let payload = payload.ok_or_else(|| {

@@ -23,7 +23,9 @@ use self::plan::{
     plan_blob_read_plans, plan_disjoint_blob_reads,
 };
 use super::file::{BlobFile, BlobSource};
-use super::locate::{blob_version_from_descriptions, collect_blob_files_v1, collect_blob_files_v2};
+use super::locate::{
+    blob_version_from_descriptions, collect_blob_files_v1, collect_blob_v2_descriptor_files,
+};
 use crate::dataset::take::{MissingRowPolicy, TakeBuilder};
 use crate::dataset::{Dataset, ProjectionRequest};
 use lance_core::datatypes::{BlobVersion, parse_field_path};
@@ -963,7 +965,13 @@ async fn collect_blob_selection_for_selection(
     let files = match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
         BlobVersion::V2 => {
-            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
+            collect_blob_v2_descriptor_files(
+                dataset,
+                blob_field_id,
+                descriptions,
+                row_addrs.values(),
+            )
+            .await
         }
     }?;
     if files.len() != row_addrs.len() {
