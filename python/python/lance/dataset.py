@@ -15,7 +15,7 @@ import uuid
 import warnings
 from abc import ABC
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -5478,6 +5478,8 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         begin_version: Optional[int] = None,
         end_version: Optional[int] = None,
+        begin_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
     ) -> "DatasetDelta":
         """
         Compare changes between two versions of this dataset.
@@ -5498,6 +5500,12 @@ class LanceDataset(pa.dataset.Dataset):
         end_version : int, optional
             The end version (inclusive) for the comparison range.
             Must be used together with ``begin_version``.
+        begin_date : datetime, optional
+            Exclusive start of a time window. Naive datetimes are treated as UTC.
+            Must not be combined with a version range.
+        end_date : datetime, optional
+            Inclusive end of a time window. Naive datetimes are treated as UTC.
+            Requires ``begin_date``. When omitted, the latest version is the end.
 
         Returns
         -------
@@ -5544,7 +5552,20 @@ class LanceDataset(pa.dataset.Dataset):
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
         if has_compared_against:
+            if begin_date is not None or end_date is not None:
+                raise ValueError(
+                    "Cannot combine compared_against with begin_date/end_date"
+                )
             builder = builder.compared_against_version(compared_against)
+        elif begin_date is not None or end_date is not None:
+            if begin_version is not None or end_version is not None:
+                raise ValueError(
+                    "Cannot combine begin_date/end_date with begin_version/end_version"
+                )
+            if begin_date is not None:
+                builder = builder.with_begin_date(begin_date)
+            if end_date is not None:
+                builder = builder.with_end_date(end_date)
         else:
             if begin_version is not None:
                 builder = builder.with_begin_version(begin_version)
@@ -6055,6 +6076,12 @@ class SqlQueryBuilder:
         return SqlQuery(self._builder.build())
 
 
+def _as_utc(timestamp: datetime) -> datetime:
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
 class DatasetDelta:
     """
     A view of differences between two versions.
@@ -6092,6 +6119,15 @@ class DatasetDelta:
         """
         return self._delta.get_deleted_row_ids()
 
+    def get_upserted_rows(self) -> pa.RecordBatchReader:
+        """
+        Return a streaming RecordBatchReader for inserted and updated rows.
+
+        Requires stable row ids. The batches include ``_rowid``,
+        ``_row_created_at_version``, and ``_row_last_updated_at_version``.
+        """
+        return self._delta.get_upserted_rows()
+
 
 class _DatasetDeltaBuilder:
     """Internal builder for :class:`DatasetDelta`.
@@ -6112,6 +6148,14 @@ class _DatasetDeltaBuilder:
 
     def with_end_version(self, version: int) -> "_DatasetDeltaBuilder":
         self._builder = self._builder.with_end_version(version)
+        return self
+
+    def with_begin_date(self, timestamp: datetime) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_begin_date(_as_utc(timestamp))
+        return self
+
+    def with_end_date(self, timestamp: datetime) -> "_DatasetDeltaBuilder":
+        self._builder = self._builder.with_end_date(_as_utc(timestamp))
         return self
 
     def build(self) -> DatasetDelta:

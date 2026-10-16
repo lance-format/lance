@@ -165,3 +165,57 @@ def test_delta_get_deleted_row_ids():
         deleted.extend(batch.column("_rowid").to_pylist())
 
     assert sorted(deleted) == sorted([row_ids[1], row_ids[2]])
+
+
+def test_delta_get_upserted_rows():
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "val": pa.array(["a", "b", "c"], type=pa.string()),
+        }
+    )
+    ds = write_dataset(
+        table, "memory://delta_api_test_upsert", enable_stable_row_ids=True
+    )
+    ds.update({"val": "'b_updated'"}, where="id = 2")
+    ds.insert(
+        pa.table(
+            {
+                "id": pa.array([4], type=pa.int32()),
+                "val": pa.array(["d"], type=pa.string()),
+            }
+        )
+    )
+
+    rows = ds.delta(begin_version=1, end_version=3).get_upserted_rows().read_all()
+    assert sorted(rows.column("id").to_pylist()) == [2, 4]
+
+
+def test_delta_with_dates():
+    from datetime import datetime, timedelta, timezone
+
+    table = pa.table({"id": pa.array([1, 2], type=pa.int32())})
+    ds = write_dataset(
+        table, "memory://delta_api_test_dates", enable_stable_row_ids=True
+    )
+    # versions() returns a naive local datetime. Attach the local zone before
+    # converting to UTC; labeling that wall time as UTC shifts the window.
+    created = ds.versions()[0]["timestamp"]
+    local_tz = datetime.now().astimezone().tzinfo
+    created_utc = created.replace(tzinfo=local_tz).astimezone(timezone.utc)
+    begin = created_utc + timedelta(microseconds=1)
+    ds.insert(pa.table({"id": pa.array([3], type=pa.int32())}))
+
+    end = datetime.now(timezone.utc) + timedelta(hours=1)
+    inserted = ds.delta(begin_date=begin, end_date=end).get_inserted_rows().read_all()
+    assert inserted.column("id").to_pylist() == [3]
+
+    # Naive datetimes are treated as UTC, so drop the zone from a UTC value.
+    naive_begin = begin.replace(tzinfo=None)
+    naive_end = end.replace(tzinfo=None)
+    inserted = (
+        ds.delta(begin_date=naive_begin, end_date=naive_end)
+        .get_inserted_rows()
+        .read_all()
+    )
+    assert inserted.column("id").to_pylist() == [3]
