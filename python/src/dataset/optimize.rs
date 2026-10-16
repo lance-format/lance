@@ -438,6 +438,15 @@ impl PyRewriteResult {
     }
 
     /// Load a result from a JSON representation.
+    ///
+    /// Parameters
+    /// ----------
+    /// json : str
+    ///     The JSON representation of the result.
+    ///
+    /// Returns
+    /// -------
+    /// RewriteResult
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
         let result = serde_json::from_str(&json).map_err(|err| {

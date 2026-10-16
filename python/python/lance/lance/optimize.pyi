@@ -16,7 +16,8 @@ from typing import List, Optional
 
 from lance import LanceDataset
 from lance.fragment import FragmentMetadata
-from lance.optimize import CompactionOptions
+
+from ..optimize import CompactionOptions
 
 class CompactionMetrics:
     fragments_removed: int
@@ -27,20 +28,102 @@ class CompactionMetrics:
 class RewriteResult:
     read_version: int
     metrics: CompactionMetrics
-    old_fragments: List["FragmentMetadata"]
+    original_fragments: List["FragmentMetadata"]
     new_fragments: List["FragmentMetadata"]
+
+    def json(self) -> str:
+        """Get a JSON representation of the result.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @staticmethod
+    def from_json(json: str) -> RewriteResult:
+        """Load a result from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the result.
+
+        Returns
+        -------
+        RewriteResult
+        """
+        ...
 
 class CompactionTask:
     read_version: int
     fragments: List["FragmentMetadata"]
 
     def execute(self, dataset: "LanceDataset") -> RewriteResult: ...
+    def json(self) -> str:
+        """Get a JSON representation of the task.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @staticmethod
+    def from_json(json: str) -> CompactionTask:
+        """Load a task from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the task.
+
+        Returns
+        -------
+        CompactionTask
+        """
+        ...
 
 class CompactionPlan:
     read_version: int
     tasks: List[CompactionTask]
 
     def num_tasks(self) -> int: ...
+    def json(self) -> str:
+        """Get a JSON representation of the plan.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @staticmethod
+    def from_json(json: str) -> CompactionPlan:
+        """Load a plan from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the plan.
+
+        Returns
+        -------
+        CompactionPlan
+        """
+        ...
 
 class Compaction:
     @staticmethod
