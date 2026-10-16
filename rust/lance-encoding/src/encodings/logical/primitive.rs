@@ -4140,6 +4140,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             // Slow path, unzipping needed
             let mut rep = Vec::with_capacity(self.num_rows);
             let mut def = Vec::with_capacity(self.num_rows);
+            let mut num_visible_items: u64 = 0;
 
             for task_item in self.data.into_iter() {
                 let PerValueDataBlock::Fixed(fixed_data) = task_item.data else {
@@ -4187,16 +4188,19 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 };
                 let decompressed = decompressor.decompress(fixed_data, visible_items)?;
                 data_builder.append(&decompressed, 0..visible_items)?;
+                num_visible_items += visible_items;
             }
 
             let repetition = if rep.is_empty() { None } else { Some(rep) };
             let definition = if def.is_empty() { None } else { Some(def) };
 
+            // Items, not rows: a list row spans any number of items and a null or
+            // empty list spans none.
             let unraveler = RepDefUnraveler::new(
                 repetition,
                 definition,
                 self.details.def_meaning.clone(),
-                self.num_rows as u64,
+                num_visible_items,
             );
             let data = data_builder.finish();
 
@@ -8072,10 +8076,10 @@ mod tests {
     use crate::testing::TestEncoding;
     use crate::testing::{SimulatedScheduler, TestCases, check_round_trip_encoding_of_data};
     use arrow_array::{
-        Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array,
+        Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, ListArray,
         PrimitiveArray, StringArray, UInt8Array, make_array, new_null_array, types::Int32Type,
     };
-    use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
     use futures::{FutureExt, future::BoxFuture};
     use prost::Message;
@@ -8580,6 +8584,66 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(decoded_array.as_ref(), &sample);
+    }
+
+    /// One list of vectors per entry: `None` is a null list and `Some(items)` holds one
+    /// vector per item, where `None` is a null vector.  The vectors are wide enough that
+    /// the leaf is full-zip encoded.
+    fn list_of_vectors(lists: &[Option<Vec<Option<f32>>>]) -> ArrayRef {
+        const DIMENSION: i32 = 128;
+        let mut values = Vec::new();
+        let mut vector_validity = Vec::new();
+        let mut offsets = vec![0_i32];
+        let mut list_validity = Vec::new();
+        for list in lists {
+            if let Some(items) = list {
+                for item in items {
+                    values.extend(std::iter::repeat_n(item.unwrap_or(0.0), DIMENSION as usize));
+                    vector_validity.push(item.is_some());
+                }
+            }
+            list_validity.push(list.is_some());
+            offsets.push(vector_validity.len() as i32);
+        }
+        let vectors = FixedSizeListArray::new(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            DIMENSION,
+            Arc::new(Float32Array::from(values)),
+            vector_validity
+                .contains(&false)
+                .then(|| NullBuffer::from(vector_validity)),
+        );
+        Arc::new(ListArray::new(
+            Arc::new(ArrowField::new("item", vectors.data_type().clone(), true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(vectors),
+            Some(NullBuffer::from(list_validity)),
+        ))
+    }
+
+    /// A read that spans a page whose vectors are all valid and a page holding a null
+    /// vector must restore one validity bit per vector, not one per list.
+    #[tokio::test]
+    async fn test_fullzip_list_read_across_pages_with_mixed_item_validity() {
+        let all_valid_page = list_of_vectors(&[
+            Some(vec![Some(1.0), Some(2.0), Some(3.0)]),
+            None,
+            Some(vec![Some(4.0), Some(5.0)]),
+        ]);
+        let null_vector_page = list_of_vectors(&[
+            Some(vec![Some(6.0), None, Some(7.0)]),
+            Some(vec![Some(8.0)]),
+        ]);
+        check_round_trip_encoding_of_data(
+            vec![all_valid_page, null_vector_page],
+            &TestCases::default()
+                .with_structural_encodings()
+                // One page per input array
+                .with_page_sizes(vec![1])
+                .with_indices(vec![2, 3, 4]),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test]
