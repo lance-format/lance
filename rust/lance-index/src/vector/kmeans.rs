@@ -44,7 +44,7 @@ use rayon::prelude::*;
 use {
     lance_linalg::distance::{
         Dot,
-        l2::{L2, l2_distance_batch},
+        l2::{L2, L2Prepared, l2_distance_batch},
     },
     lance_linalg::kernels::argmin_value,
 };
@@ -430,6 +430,28 @@ impl MaybeF16 for Float16Type {
 impl MaybeF16 for Float32Type {}
 impl MaybeF16 for Float64Type {}
 
+/// The `f32` counterpart of [`MaybeF16`], for the pre-transposed L2 path below.
+pub(crate) trait MaybeF32: ArrowNumericType {
+    fn as_f32_slice(_values: &[Self::Native]) -> Option<&[f32]> {
+        None
+    }
+}
+
+impl MaybeF32 for Float32Type {
+    fn as_f32_slice(values: &[f32]) -> Option<&[f32]> {
+        Some(values)
+    }
+}
+impl MaybeF32 for Float16Type {}
+impl MaybeF32 for Float64Type {}
+
+/// [`L2Prepared`] (SoA, all centroids of a vector in one pass) is used only for
+/// PQ sub-vectors: at most 16 dimensions, where the per-centroid kernels are
+/// dominated by call overhead (a 16 × 512 IVF node ran 4× slower through SoA),
+/// and a table that fits the L1 data cache.
+const L2_PREPARED_MAX_DIMENSION: usize = 16;
+const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
+
 /// Per-thread score-buffer budget for [`dot_membership_amx_f16`], in f32
 /// values: 256 KB, sized to stay within a typical private L2 alongside the
 /// vectors and packed centroids a block streams past.
@@ -522,7 +544,7 @@ where
     phantom_data: std::marker::PhantomData<T>,
 }
 
-impl<T: ArrowNumericType + MaybeF16> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
+impl<T: ArrowNumericType + MaybeF16 + MaybeF32> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
     T::Native: Float + Dot + L2 + MulAssign + DivAssign + AddAssign + FromPrimitive + Sync,
     PrimitiveArray<T>: From<Vec<T::Native>>,
@@ -536,6 +558,8 @@ where
         cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+        let biases =
+            || cluster_sizes.map(|size| size.iter().map(|size| balance_factor * *size as f32));
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -549,16 +573,37 @@ where
                 })
                 .collect::<Vec<_>>(),
             None => match distance_type {
-                DistanceType::L2 => data
-                    .par_chunks(dimension)
-                    .map(|vec| {
-                        argmin_value_float_with_bias(
-                            l2_distance_batch(vec, centroids, dimension),
-                            cluster_sizes
-                                .map(|size| size.iter().map(|size| balance_factor * *size as f32)),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
+                DistanceType::L2 => match T::as_f32_slice(centroids)
+                    .zip(T::as_f32_slice(data))
+                    .filter(|_| {
+                        dimension <= L2_PREPARED_MAX_DIMENSION
+                            && centroids.len() * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
+                    }) {
+                    // PQ sub-vector codebooks: one SoA pass per vector instead of one
+                    // kernel call per centroid, whose call and dispatch overhead
+                    // dominates at these dimensions.
+                    Some((centroids, data)) => {
+                        let prepared = L2Prepared::new(centroids, dimension);
+                        data.par_chunks(dimension)
+                            .map_init(
+                                || vec![0f32; prepared.num_targets()],
+                                |dists, vec| {
+                                    prepared.distances_into(vec, dists);
+                                    argmin_value_float_with_bias(dists.iter().copied(), biases())
+                                },
+                            )
+                            .collect::<Vec<_>>()
+                    }
+                    None => data
+                        .par_chunks(dimension)
+                        .map(|vec| {
+                            argmin_value_float_with_bias(
+                                l2_distance_batch(vec, centroids, dimension),
+                                biases(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                },
                 DistanceType::Dot => T::as_f16_slice(centroids)
                     .zip(T::as_f16_slice(data))
                     // The kill switch is enforced here rather than inside the
@@ -608,35 +653,29 @@ where
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut centroids = vec![T::Native::zero(); k * dimension];
-
-        let mut num_cpus = get_num_compute_intensive_cpus();
-        if k < num_cpus || k < 16 {
-            num_cpus = 1;
-        }
-        let chunk_size = k / num_cpus;
-
-        centroids
-            .par_chunks_mut(dimension * chunk_size)
-            .enumerate()
-            .with_max_len(1)
-            .for_each(|(i, centroids)| {
-                let start = i * chunk_size;
-                let end = ((i + 1) * chunk_size).min(k);
-                data.chunks(dimension)
-                    .zip(membership.iter())
-                    .filter_map(|(vector, cluster_id)| {
-                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
-                    })
-                    .for_each(|(vector, cluster_id)| {
-                        if start <= cluster_id && cluster_id < end {
-                            let local_id = cluster_id - start;
-                            let centroid =
-                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                        }
-                    });
-            });
+        // One pass: a partial table per chunk, at most one chunk per worker.
+        let row_bytes = dimension * size_of::<T::Native>();
+        let rows_per_chunk = (MEMBERSHIP_CHUNK_BYTES / row_bytes)
+            .max(membership.len().div_ceil(get_num_compute_intensive_cpus()))
+            .max(1);
+        let mut centroids = data
+            .par_chunks(rows_per_chunk * dimension)
+            .zip(membership.par_chunks(rows_per_chunk))
+            .map(|(vectors, members)| {
+                let mut sums = vec![T::Native::zero(); k * dimension];
+                for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
+                    if let Some(cluster_id) = cluster_id {
+                        let centroid = &mut sums[*cluster_id as usize * dimension..][..dimension];
+                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                    }
+                }
+                sums
+            })
+            .reduce_with(|mut total, sums| {
+                total.iter_mut().zip(sums).for_each(|(t, s)| *t += s);
+                total
+            })
+            .unwrap_or_else(|| vec![T::Native::zero(); k * dimension]);
 
         centroids
             .par_chunks_mut(dimension)
@@ -2243,6 +2282,75 @@ mod tests {
             DistanceType::L2,
         );
         assert_eq!(expected, actual);
+    }
+
+    /// A PQ-sized table (256 centroids × 8 dimensions) goes through the SoA
+    /// path; it must pick the same centroid as the per-centroid kernels, up to
+    /// rounding on exact ties.
+    #[test]
+    fn test_prepared_l2_assignment_matches_per_centroid_path() {
+        const DIM: usize = 8;
+        const K: usize = 256;
+        assert!(K * DIM * size_of::<f32>() <= L2_PREPARED_MAX_BYTES);
+        let centroids = generate_random_array_with_seed::<Float32Type>(DIM * K, [7; 32]);
+        let data = generate_random_array_with_seed::<Float32Type>(DIM * 1000, [8; 32]);
+        let (prepared, prepared_dists) =
+            KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                centroids.values(),
+                data.values(),
+                DIM,
+                DistanceType::L2,
+                0.0,
+                None,
+                None,
+            );
+        let widen = |array: &Float32Array| arrow::compute::cast(array, &DataType::Float64).unwrap();
+        let (reference, reference_dists) =
+            KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
+                widen(&centroids).as_primitive::<Float64Type>().values(),
+                widen(&data).as_primitive::<Float64Type>().values(),
+                DIM,
+                DistanceType::L2,
+                0.0,
+                None,
+                None,
+            );
+        assert_eq!(prepared, reference);
+        for (dist, expected) in prepared_dists.iter().zip(&reference_dists) {
+            let (dist, expected) = (dist.unwrap(), expected.unwrap());
+            assert!(
+                (dist - expected).abs() <= 1e-4 * expected.max(1.0),
+                "{dist} vs {expected}"
+            );
+        }
+    }
+
+    /// The chunked centroid update must return the member means.
+    #[test]
+    fn test_to_kmeans_centroids_are_member_means() {
+        let (k, dim) = (3, 2);
+        let rows = 2 * k;
+        let data: Vec<f32> = (0..rows).flat_map(|row| vec![row as f32; dim]).collect();
+        let membership: Vec<Option<u32>> = (0..rows).map(|row| Some((row % k) as u32)).collect();
+        let mut cluster_sizes = vec![2; k];
+        let model = KMeansAlgoFloat::<Float32Type>::to_kmeans(
+            &data,
+            dim,
+            k,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+        for (cluster, centroid) in centroids.chunks(dim).enumerate() {
+            // Rows `cluster` and `cluster + k` are its members.
+            let mean = cluster as f32 + k as f32 / 2.0;
+            assert!(
+                centroid.iter().all(|&v| (v - mean).abs() < 1e-5),
+                "cluster {cluster}: expected {mean}, got {centroid:?}"
+            );
+        }
     }
 
     #[test]
