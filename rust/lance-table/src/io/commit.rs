@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
 use super::manifest::write_manifest;
+use chrono::{DateTime, Utc};
 use futures::Stream;
 use futures::future::Either;
 use futures::{
@@ -261,6 +262,17 @@ pub struct ManifestLocation {
     /// where it keeps one (`ExternalManifestStore::get_identity`). A dataset
     /// recreated at the same version has a different one.
     pub identity: Option<String>,
+    /// When the manifest object was last written, if the listing reported it.
+    ///
+    /// This is the object's write time, not `Manifest::timestamp`, which is the
+    /// logical commit time recorded inside the manifest. They agree closely in normal
+    /// operation but are not the same value: rewriting an object by copy or migration
+    /// moves this and leaves the commit time alone. Callers that need the commit time
+    /// must read the manifest.
+    ///
+    /// Populated by listings that see `ObjectMeta`; `None` when the location was
+    /// resolved by another route, such as probing a known version.
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
@@ -282,6 +294,7 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
             naming_scheme: scheme,
             e_tag: meta.e_tag,
             identity: None,
+            last_modified: Some(meta.last_modified),
         })
     }
 }
@@ -406,6 +419,7 @@ async fn read_version_hint_and_probe(
         naming_scheme: scheme,
         e_tag: meta.e_tag,
         identity: None,
+        last_modified: None,
     })
 }
 
@@ -535,6 +549,7 @@ async fn list_manifests_since_version_with_hint(
             naming_scheme: scheme,
             e_tag: meta.e_tag,
             identity: None,
+            last_modified: None,
         })
         .collect();
 
@@ -557,6 +572,7 @@ async fn list_manifests_since_version_with_hint(
                             naming_scheme: scheme,
                             e_tag: meta.e_tag,
                             identity: None,
+                            last_modified: None,
                         })
                 })
                 .buffer_unordered(object_store.io_parallelism())
@@ -614,6 +630,7 @@ async fn resolve_version_from_listing(
                 naming_scheme: scheme,
                 e_tag: meta.e_tag,
                 identity: None,
+                last_modified: None,
             })
         }
         // If the list is not lexically ordered, we need to iterate all manifests
@@ -648,6 +665,7 @@ async fn resolve_version_from_listing(
                 naming_scheme: scheme,
                 e_tag: current_meta.e_tag,
                 identity: None,
+                last_modified: None,
             })
         }
         (None, _) => Err(Error::not_found(
@@ -714,6 +732,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             naming_scheme,
             e_tag: Some(get_etag(&metadata)),
             identity: None,
+            last_modified: None,
         }))
     } else {
         Ok(None)
@@ -749,6 +768,7 @@ fn detached_manifest_location_from_meta(
         naming_scheme: ManifestNamingScheme::V2,
         e_tag: meta.e_tag,
         identity: None,
+        last_modified: None,
     })
 }
 
@@ -1070,6 +1090,7 @@ async fn default_resolve_version(
             size: None,
             e_tag: None,
             identity: None,
+            last_modified: None,
         });
     }
 
@@ -1084,6 +1105,7 @@ async fn default_resolve_version(
             naming_scheme: scheme,
             e_tag: meta.e_tag,
             identity: None,
+            last_modified: None,
         }),
         Err(ObjectStoreError::NotFound { .. }) => {
             // fallback to V1
@@ -1095,6 +1117,7 @@ async fn default_resolve_version(
                 naming_scheme: scheme,
                 e_tag: None,
                 identity: None,
+                last_modified: None,
             })
         }
         Err(e) => Err(e.into()),
@@ -1346,6 +1369,7 @@ impl CommitHandler for UnsafeCommitHandler {
             path: version_path,
             e_tag: res.e_tag,
             identity: None,
+            last_modified: None,
         })
     }
 }
@@ -1497,6 +1521,7 @@ where
             path,
             e_tag: res.e_tag,
             identity: None,
+            last_modified: None,
         })
     }
 }
@@ -1586,6 +1611,7 @@ impl CommitHandler for RenameCommitHandler {
                     naming_scheme,
                     e_tag: None, // Re-name can change e-tag.,
                     identity: None,
+                    last_modified: None,
                 })
             }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
@@ -1672,6 +1698,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
             naming_scheme,
             e_tag: res.e_tag,
             identity: None,
+            last_modified: None,
         })
     }
 }
@@ -1868,6 +1895,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+
+    #[tokio::test]
+    async fn test_list_manifest_locations_reports_last_modified() {
+        // The listing already sees ObjectMeta, so the manifest write time is free.
+        // Dropping it forces callers that only need a version's age to read the whole
+        // manifest, which is the cost `expire_versions` exists to avoid.
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+        for version in 0..3 {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        let locations = ConditionalPutCommitHandler
+            .list_manifest_locations(&base, &object_store, true)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(locations.len(), 3);
+        for location in &locations {
+            assert!(
+                location.last_modified.is_some(),
+                "version {} lost its write time in the listing",
+                location.version
+            );
+        }
     }
 
     #[tokio::test]
