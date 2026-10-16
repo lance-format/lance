@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::*;
 use arrow_array::{
     ArrayRef, BinaryArray, BinaryViewArray, Float16Array, Float32Array, Float64Array, Int32Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, RecordBatchIterator, StringArray,
     StringViewArray,
 };
 use arrow_schema::DataType;
@@ -338,6 +338,67 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
             }
         })
         .await
+}
+
+#[tokio::test]
+async fn test_signed_zero_between_columns_and_in_array_has() {
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..7)) as ArrayRef,
+        ),
+        (
+            "a",
+            Arc::new(Float64Array::from(vec![
+                Some(-0.0),
+                Some(0.0),
+                Some(1.0),
+                Some(-1.0),
+                Some(1.0),
+                None,
+                Some(0.0),
+            ])) as ArrayRef,
+        ),
+        (
+            "b",
+            Arc::new(Float64Array::from(vec![
+                Some(0.0),
+                Some(-0.0),
+                Some(1.0),
+                Some(1.0),
+                Some(-1.0),
+                Some(0.0),
+                None,
+            ])) as ArrayRef,
+        ),
+        (
+            "l",
+            Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+                Some(vec![Some(-0.0)]),
+                Some(vec![Some(0.0)]),
+                Some(vec![Some(1.0)]),
+                Some(vec![None, Some(-0.0)]),
+                Some(vec![None]),
+                Some(vec![]),
+                None,
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+
+    DatasetTestCases::from_data(batch)
+        .with_index_types("l", [Some(IndexType::LabelList)])
+        .run(|ds: Dataset, _original: RecordBatch| async move {
+            assert_filter_ids(&ds, "a = b", &[0, 1, 2]).await;
+            assert_filter_ids(&ds, "a != b", &[3, 4]).await;
+            assert_filter_ids(&ds, "a < b", &[3]).await;
+            assert_filter_ids(&ds, "a <= b", &[0, 1, 2, 3]).await;
+            assert_filter_ids(&ds, "a > b", &[4]).await;
+            assert_filter_ids(&ds, "a >= b", &[0, 1, 2, 4]).await;
+            assert_filter_ids(&ds, "array_has(l, 0.0)", &[0, 1, 3]).await;
+            assert_filter_ids(&ds, "array_has(l, -0.0)", &[0, 1, 3]).await;
+        })
+        .await;
 }
 
 /// A rewritten zero predicate still has to reach a scalar index. Without this,
