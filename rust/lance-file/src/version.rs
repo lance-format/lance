@@ -16,6 +16,30 @@ pub const V2_FORMAT_2_1: &str = "2.1";
 pub const V2_FORMAT_2_2: &str = "2.2";
 pub const V2_FORMAT_2_3: &str = "2.3";
 
+/// Warning emitted when a new dataset is created with the legacy v1 storage version.
+pub const LEGACY_STORAGE_VERSION_WARNING: &str = "Creating a dataset with the legacy \
+    storage version (0.1). This format is extremely old and does not achieve the same \
+    performance as newer versions. Support for writing this version will be removed in an \
+    upcoming release; please use storage version 2.0 or higher.";
+
+/// The deprecation warning a newly created dataset on `version` deserves, if any.
+pub const fn legacy_storage_version_warning(version: ConcreteFileVersion) -> Option<&'static str> {
+    match version {
+        ConcreteFileVersion::V1 => Some(LEGACY_STORAGE_VERSION_WARNING),
+        _ => None,
+    }
+}
+
+/// Warn when a dataset is about to be created with the legacy v1 storage version.
+///
+/// Call this at dataset creation only; appending to an existing legacy dataset has no
+/// choice of version and should not nag the caller on every write.
+pub fn warn_if_legacy_storage_version(version: ConcreteFileVersion) {
+    if let Some(warning) = legacy_storage_version_warning(version) {
+        log::warn!("{}", warning);
+    }
+}
+
 /// Resolve the current stable release policy to an exact file version.
 pub const fn stable_file_version() -> ConcreteFileVersion {
     ConcreteFileVersion::V2_2
@@ -287,6 +311,20 @@ mod tests {
         ConcreteFileVersion::V2_2,
         ConcreteFileVersion::V2_3,
     ];
+
+    #[test]
+    fn only_legacy_creation_warns() {
+        for version in EXACT_VERSIONS {
+            let warning = legacy_storage_version_warning(version);
+            if version == ConcreteFileVersion::V1 {
+                let warning = warning.expect("legacy creation should warn");
+                assert!(warning.contains(LEGACY_FORMAT_VERSION));
+                assert!(warning.contains(V2_FORMAT_2_0));
+            } else {
+                assert_eq!(warning, None, "{version} should not warn");
+            }
+        }
+    }
 
     #[test]
     fn selector_resolution_is_exact() {
