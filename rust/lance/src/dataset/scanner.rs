@@ -4448,7 +4448,16 @@ impl Scanner {
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
-        let effective_projection = self.source_projection()?;
+        let mut effective_projection = self.source_projection()?;
+
+        // A single-stage read may omit row identifiers, so it must also load
+        // unprojected sort columns instead of relying on a later take.
+        if let Some(ordering) = &self.ordering {
+            effective_projection = effective_projection.union_columns(
+                ordering.iter().map(|col| &col.column_name),
+                OnMissing::Error,
+            )?;
+        }
 
         // Plan against the effective filter: with an external mask the SQL filter
         // becomes a refine, so its columns must be retained even when the original
@@ -14042,6 +14051,94 @@ mod test {
     }
 
     #[rstest]
+    #[case::equals("category = 'x'")]
+    #[case::not_equals("category != 'y'")]
+    #[tokio::test]
+    async fn test_scalar_indexed_filter_with_unprojected_sort(
+        #[case] filter: &str,
+        #[values(BuiltinIndexType::Bitmap, BuiltinIndexType::BTree)] index_type: BuiltinIndexType,
+        #[values(false, true)] has_full_index_coverage: bool,
+        #[values(false, true)] has_stable_row_ids: bool,
+    ) {
+        let data = arrow_array::record_batch!(
+            ("id", Utf8, ["a", "b", "c", "d", "e", "f"]),
+            (
+                "category",
+                Utf8,
+                [Some("x"), Some("x"), Some("y"), Some("x"), Some("x"), None]
+            ),
+            (
+                "t",
+                Int32,
+                [Some(3), Some(1), Some(2), Some(0), None, Some(4)]
+            )
+        )
+        .unwrap();
+        let indexed_rows = if has_full_index_coverage { 6 } else { 3 };
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, indexed_rows))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids: has_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::for_builtin(index_type),
+                false,
+            )
+            .await
+            .unwrap();
+        if !has_full_index_coverage {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(data.slice(3, 3))], data.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("t".to_string())]))
+            .unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(
+            batch["id"].as_string::<i32>(),
+            &StringArray::from(vec!["e", "d", "b", "a"])
+        );
+
+        let mut unindexed_scanner = scanner.clone();
+        unindexed_scanner.use_scalar_index(false);
+        assert_eq!(unindexed_scanner.try_into_batch().await.unwrap(), batch);
+
+        scanner.limit(Some(2), Some(1)).unwrap();
+        let limited = scanner.try_into_batch().await.unwrap();
+        assert_eq!(limited.num_columns(), 1);
+        assert_eq!(
+            limited["id"].as_string::<i32>(),
+            &StringArray::from(vec!["d", "b"])
+        );
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_sort_multi_columns(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -20509,8 +20606,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         check("_rowaddr NOT IN (2, 4, 6, 8)", complement).await;
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_nested_field_ordering() {
+    async fn test_nested_field_ordering(#[values(false, true)] is_sort_column_projected: bool) {
         use arrow_array::StructArray;
 
         // Create test data with nested structs
@@ -20544,6 +20642,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         // Test ordering by nested field
         let mut scanner = dataset.scan();
+        if !is_sort_column_projected {
+            scanner.project(&["id"]).unwrap();
+        }
         scanner
             .order_by(Some(vec![ColumnOrdering {
                 column_name: "nested.value".to_string(),
@@ -20552,11 +20653,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             }]))
             .unwrap(); // ascending order
 
-        let stream = scanner.try_into_stream().await.unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.num_columns(),
+            if is_sort_column_projected { 2 } else { 1 }
+        );
 
         // Check that results are sorted by nested.value
-        let sorted_ids = batches[0].column(0).as_primitive::<Int32Type>().values();
+        let sorted_ids = batch["id"].as_primitive::<Int32Type>().values();
         assert_eq!(sorted_ids[0], 1); // id=1 has nested.value=10
         assert_eq!(sorted_ids[1], 2); // id=2 has nested.value=20
         assert_eq!(sorted_ids[2], 3); // id=3 has nested.value=30
