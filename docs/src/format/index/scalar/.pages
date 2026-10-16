@@ -5,6 +5,7 @@ nav:
   - Label List: label_list.md
   - Zone Map: zonemap.md
   - Zone Write Seeds: zone_write_seeds.md
+  - Fragment Column Statistics: fragment_column_stats.md
   - Bloom Filter: bloom_filter.md
   - Full Text Search: fts.md
   - N-gram: ngram.md

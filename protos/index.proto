@@ -325,6 +325,11 @@ message JsonIndexDetails {
 }
 message BloomFilterIndexDetails {}
 
+/* One summary per fragment for the single field in IndexMetadata.fields.
+ * The file schema and pruning contract are defined by IndexMetadata.index_version.
+ */
+message FragmentColumnStatsIndexDetails {}
+
 message RTreeIndexDetails {}
 
 message FMIndexDetails {}
