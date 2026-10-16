@@ -252,6 +252,8 @@ fn ex_code_storage_load(c: &mut Criterion) {
         code_dim: LOAD_DIM as u32,
         num_bits: NUM_BITS,
         packed: true,
+        layered: false,
+        row_layout: Default::default(),
         query_estimator: RabitQueryEstimator::RawQuery,
     };
     let code_len = LOAD_DIM / 8;
@@ -465,7 +467,10 @@ fn ex_bulk_paths(c: &mut Criterion) {
                 0.0,
                 None,
                 &mut f32_scratch,
-                DistanceCalculatorOptions { approx_mode },
+                DistanceCalculatorOptions {
+                    rq_precision: Default::default(),
+                    approx_mode,
+                },
             );
             let mut dists = Vec::new();
             let mut u16_scratch = Vec::new();
@@ -613,7 +618,10 @@ fn heap_topk(c: &mut Criterion) {
             1.0,
             None,
             &mut f32_scratch,
-            DistanceCalculatorOptions { approx_mode },
+            DistanceCalculatorOptions {
+                rq_precision: Default::default(),
+                approx_mode,
+            },
         );
         let mut heap = BinaryHeap::with_capacity(TOPK_K + 1);
         let mut dists = Vec::new();
@@ -670,6 +678,8 @@ fn build_transform(c: &mut Criterion) {
                     code_dim: dim as u32,
                     num_bits,
                     packed: false,
+                    layered: false,
+                    row_layout: Default::default(),
                     query_estimator: RabitQueryEstimator::RawQuery,
                 };
                 let rq = RabitQuantizer::try_from(

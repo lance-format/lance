@@ -286,15 +286,32 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         Self::try_from_batch(batch, metadata, distance_type, None)
     }
 
-    /// Prepare sign bounds without reading native RaBitQ ex columns.
-    /// Other quantizers do not provide this partial-storage capability.
+    /// Materialize a projected precision level. Non-RQ stores accept only full.
+    fn try_from_batch_at_precision(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        remapper: Option<Arc<dyn RowIdRemapper>>,
+        precision: super::bq::layered::RQPrecision,
+    ) -> Result<Self> {
+        if precision != super::bq::layered::RQPrecision::Full {
+            return Err(Error::invalid_input(
+                "rq_precision requires a layered IVF_RQ index",
+            ));
+        }
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, remapper)
+    }
+
+    /// Materialize only the sign plane of a layered partition for the lazy
+    /// full-precision scan, which bounds every row from it before reading the
+    /// ex planes of the survivors. Only layered IVF_RQ storage supports it.
     fn try_from_sign_plane_for_full(
         _batch: RecordBatch,
         _metadata: &Self::Metadata,
         _distance_type: DistanceType,
     ) -> Result<Self> {
         Err(Error::not_supported(
-            "sign-only preparation requires current native RaBitQ storage".to_string(),
+            "sign-plane-only storage requires a layered IVF_RQ index".to_string(),
         ))
     }
 

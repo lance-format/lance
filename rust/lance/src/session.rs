@@ -264,7 +264,7 @@ impl Session {
         self.index_resident_columns
     }
 
-    /// Install a runtime scan strategy for native RaBitQ indices
+    /// Install a runtime scan strategy for native and layered RaBitQ indices
     /// with current plane storage, including reconstruction from cached metadata.
     /// Without a factory, queries use Lance's built-in full scan.
     ///

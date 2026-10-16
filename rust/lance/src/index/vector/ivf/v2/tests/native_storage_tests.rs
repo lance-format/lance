@@ -36,6 +36,8 @@ pub(super) fn lazy_test_query(key: ArrayRef, k: usize, nprobes: usize) -> Query 
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Normal,
+        rq_precision: Default::default(),
+        rq_cascade_factor: None,
     }
 }
 
@@ -157,7 +159,7 @@ async fn native_planes_and_gathers_match_full_reads(
         let expected = expected.to_batches().unwrap().next().unwrap();
         let full = resident
             .storage
-            .load_rabit_partition_planes(part, &cache, None)
+            .load_rabit_partition_planes(part, Default::default(), &cache, None)
             .await
             .unwrap();
         assert_eq!(full.to_batches().unwrap().next().unwrap(), expected);
@@ -220,7 +222,9 @@ async fn native_planes_and_gathers_match_full_reads(
             )
             .await
             .unwrap();
-        let GatheredRabitEx::Native { batch, index, .. } = &gathered;
+        let GatheredRabitEx::Native { batch, index, .. } = &gathered else {
+            panic!("native storage returned layered ex rows")
+        };
         assert_eq!(*index, ExIndex::Compact);
         assert_eq!(batch, &ex.take(&UInt32Array::from(rows)).unwrap());
         assert!(!lance_index::vector::storage::shares_resident_store(batch));

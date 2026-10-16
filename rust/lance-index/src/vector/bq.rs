@@ -14,6 +14,7 @@ use lance_core::{Error, Result};
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
 
+pub use crate::vector::bq::storage::RQRowLayout;
 use crate::vector::bq::storage::RabitQuantizationMetadata;
 use crate::vector::quantizer::QuantizerBuildParams;
 
@@ -21,13 +22,15 @@ pub mod builder;
 pub(crate) mod dist_table_quant;
 pub mod ex_dot;
 pub mod layered;
+#[cfg(test)]
+mod lazy_tests;
 pub(crate) mod pairwise;
 pub mod partition_codes;
 mod plane_cache;
 pub mod planes;
 pub mod prune;
 pub mod raw_body;
-pub(crate) mod resident;
+pub mod resident;
 pub mod rotation;
 pub mod scan_stats;
 pub mod storage;
@@ -37,7 +40,7 @@ pub const RABIT_MIN_NUM_BITS: u8 = 1;
 pub const RABIT_MAX_NUM_BITS: u8 = 9;
 pub const RABIT_BINARY_NUM_BITS: u8 = 1;
 /// Default number of bits per dimension for IVF_RQ indexes.
-pub(crate) const RABIT_DEFAULT_NUM_BITS: u8 = 5;
+pub const RABIT_DEFAULT_NUM_BITS: u8 = 5;
 
 #[derive(Clone, Default)]
 pub struct BinaryQuantization {}
@@ -130,6 +133,12 @@ pub struct RQBuildParams {
     /// rotates vectors identically. This is transient build-time state and is never
     /// persisted to the `RabitQuantization` params proto.
     pub rotation: Option<RabitQuantizationMetadata>,
+    /// Store prefix code planes; ignored for 1 or 2 bits.
+    /// `None` leaves the choice to the product: false in OSS, true in Enterprise.
+    pub layered: Option<bool>,
+    /// Auxiliary row layout. This build supports [`RQRowLayout::Columns`];
+    /// plane-row read/write support is provided by the follow-up implementation.
+    pub row_layout: RQRowLayout,
 }
 
 pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
@@ -166,11 +175,44 @@ pub fn rabit_ex_code_bytes(rotated_dim: usize, ex_bits: u8) -> Result<usize> {
 }
 
 impl RQBuildParams {
+    /// Override the product default for the layered format.
+    /// Ignored for 1 or 2 bits. Otherwise requires a reader with layered RQ support.
+    pub fn with_layered(mut self, layered: bool) -> Self {
+        self.layered = Some(layered);
+        self
+    }
+
+    /// Whether the resolved layout uses prefix planes. OSS defaults to false;
+    /// 1-bit and 2-bit codes always use the single-plane layout.
+    ///
+    /// ```
+    /// use lance_index::vector::bq::RQBuildParams;
+    /// assert!(RQBuildParams::new(5).with_layered(true).is_layered());
+    /// assert!(!RQBuildParams::new(2).with_layered(true).is_layered());
+    /// ```
+    pub fn is_layered(&self) -> bool {
+        self.num_bits > 2 && self.layered.unwrap_or(false)
+    }
+
+    /// Select the auxiliary row layout. Plane rows require a build with that implementation.
+    ///
+    /// ```
+    /// use lance_index::vector::bq::{RQBuildParams, RQRowLayout};
+    /// let params = RQBuildParams::new(5).with_row_layout(RQRowLayout::Columns);
+    /// assert_eq!(params.row_layout, RQRowLayout::Columns);
+    /// ```
+    pub fn with_row_layout(mut self, row_layout: RQRowLayout) -> Self {
+        self.row_layout = row_layout;
+        self
+    }
+
     pub fn new(num_bits: u8) -> Self {
         Self {
             num_bits,
             rotation_type: RQRotationType::default(),
             rotation: None,
+            layered: None,
+            row_layout: RQRowLayout::Columns,
         }
     }
 
@@ -179,15 +221,22 @@ impl RQBuildParams {
             num_bits,
             rotation_type,
             rotation: None,
+            layered: None,
+            row_layout: RQRowLayout::Columns,
         }
     }
 }
 
 impl From<&RQBuildParams> for RabitQuantization {
     fn from(value: &RQBuildParams) -> Self {
-        use crate::pb::vector_index_details::rabit_quantization::RotationType;
+        use crate::pb::vector_index_details::rabit_quantization::{RotationType, RowLayout};
         Self {
             num_bits: value.num_bits as u32,
+            layered: value.layered,
+            row_layout: match value.row_layout {
+                RQRowLayout::Columns => RowLayout::Columns as i32,
+                RQRowLayout::PlaneRows => RowLayout::PlaneRows as i32,
+            },
             rotation_type: match value.rotation_type {
                 RQRotationType::Fast => RotationType::Fast as i32,
                 RQRotationType::Matrix => RotationType::Matrix as i32,
@@ -208,6 +257,8 @@ impl Default for RQBuildParams {
             num_bits: RABIT_DEFAULT_NUM_BITS,
             rotation_type: RQRotationType::default(),
             rotation: None,
+            layered: None,
+            row_layout: RQRowLayout::Columns,
         }
     }
 }
@@ -217,6 +268,8 @@ mod tests {
     use super::*;
 
     use half::{bf16, f16};
+    use prost::Message;
+    use rstest::rstest;
 
     fn test_bq<T: Float>() {
         let data: Vec<T> = [1.0, -1.0, 1.0, -5.0, -7.0, -1.0, 1.0, -1.0, -0.2, 1.2, 3.2]
@@ -252,6 +305,32 @@ mod tests {
     #[test]
     fn test_rq_build_params_default_num_bits() {
         assert_eq!(RQBuildParams::default().num_bits, 5);
+        assert_eq!(RQBuildParams::default().row_layout, RQRowLayout::Columns);
+        assert_eq!(RQBuildParams::default().layered, None);
+        assert_eq!(RQBuildParams::new(5).layered, None);
+        assert_eq!(
+            RQBuildParams::with_rotation_type(5, RQRotationType::Fast).layered,
+            None
+        );
+    }
+
+    #[rstest]
+    #[case::unset(None)]
+    #[case::single_plane(Some(false))]
+    #[case::layered(Some(true))]
+    fn test_rq_layered_presence_round_trip(
+        #[case] layered: Option<bool>,
+        #[values(RQRowLayout::Columns, RQRowLayout::PlaneRows)] row_layout: RQRowLayout,
+    ) {
+        let params = RQBuildParams {
+            layered,
+            row_layout,
+            ..Default::default()
+        };
+        let details = RabitQuantization::from(&params);
+        let decoded = RabitQuantization::decode(details.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.layered, layered);
+        assert_eq!(decoded.row_layout, details.row_layout);
     }
 
     #[test]

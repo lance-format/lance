@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Persistent native plane entries. The sign plane keeps its transposed
+//! Persistent RaBitQ plane entries. The sign plane keeps its transposed
 //! codes in a raw fixed-width body. Ex entries are addressable by row:
 //!
 //! ```text
 //! sign : [plane = 0: u8][raw fixed-width body]
-//! ex   : [plane = 1: u8][factor_columns: u8][rows: u64 LE][width: u32 LE][rows]
+//! ex   : [plane = 1/2/4: u8][factor_columns: u8][rows: u64 LE][width: u32 LE][rows]
 //! row  : [codes: width bytes][add: f32 LE][scale: f32 LE] (all columns)
 //!        [codes: width bytes]                          (code-only)
 //! ```
+//! Tags 1 and 2 hold layered high/low rows; tag 4 holds native full factors.
+//! Tag 3 is a raw body for layered estimator bounds.
 //! Index files are unchanged; these bodies belong only to the persistent cache.
 
 use std::ops::Range;
@@ -25,10 +27,14 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheRangeReader};
 use lance_core::{Error, Result};
 
-use super::planes::{PlaneBatch, plane_columns};
+use super::layered::{SIGN_BOUNDS_PLANE, SignBounds, plane_columns};
+use super::planes::PlaneBatch;
 use super::raw_body::{read_raw_batch, write_raw_batch};
-use super::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
+use super::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN};
+use super::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
 
+/// Tag for native full factors; layered high factors use tag 1.
+const NATIVE_EX_PLANE_TAG: u8 = 4;
 const BODY_VERSION: u32 = 1;
 const EX_HEADER_BYTES: usize = 14;
 const EX_FACTOR_COLUMNS: u8 = 2;
@@ -38,10 +44,64 @@ const COALESCE_GAP_BYTES: usize = 4096;
 fn validate_version(version: u32) -> Result<()> {
     if version != BODY_VERSION {
         return Err(Error::invalid_input(format!(
-            "unsupported native plane cache version {version}"
+            "unsupported plane cache version {version}"
         )));
     }
     Ok(())
+}
+
+fn cached_plane_columns(plane: u8) -> &'static [&'static str] {
+    if plane == NATIVE_EX_PLANE_TAG {
+        &[
+            RABIT_BLOCKED_EX_CODE_COLUMN,
+            EX_ADD_FACTORS_COLUMN,
+            EX_SCALE_FACTORS_COLUMN,
+        ]
+    } else {
+        plane_columns(plane, SignBounds::default())
+    }
+}
+
+/// The serialized ex-plane kind, or `None` for sign and bounds entries.
+/// Code-only native and high entries have identical schemas; full native
+/// entries need a distinct tag to preserve their full factor column names.
+fn ex_plane(batch: &RecordBatch) -> Option<u8> {
+    if batch
+        .column_by_name(RABIT_BLOCKED_EX_CODE_LO_COLUMN)
+        .is_some()
+    {
+        Some(2)
+    } else if batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some() {
+        Some(
+            if batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
+                || batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some()
+            {
+                NATIVE_EX_PLANE_TAG
+            } else {
+                1
+            },
+        )
+    } else {
+        None
+    }
+}
+
+/// The plane tag of a sign or bounds plane batch: [`SIGN_BOUNDS_PLANE`] for
+/// exactly the bounds plane's columns, 0 otherwise.
+fn whole_plane(batch: &RecordBatch) -> u8 {
+    let bounds = plane_columns(SIGN_BOUNDS_PLANE, SignBounds::Lazy);
+    let schema = batch.schema_ref();
+    if schema.fields().len() == bounds.len()
+        && schema
+            .fields()
+            .iter()
+            .zip(bounds)
+            .all(|(field, name)| field.name() == name)
+    {
+        SIGN_BOUNDS_PLANE
+    } else {
+        0
+    }
 }
 
 struct Header {
@@ -62,7 +122,7 @@ impl Header {
         let header = bytes.get(..len).ok_or_else(invalid)?;
         let (factor_columns, fields) = (header[1], &header[2..]);
         let plane = header[0];
-        let supported_plane = plane == 1;
+        let supported_plane = matches!(plane, 1 | 2 | NATIVE_EX_PLANE_TAG);
         if !supported_plane || !matches!(factor_columns, 0 | EX_FACTOR_COLUMNS) {
             return Err(invalid());
         }
@@ -87,7 +147,7 @@ impl Header {
     }
 
     fn batch(&self, codes: Vec<u8>, adds: Vec<f32>, scales: Vec<f32>) -> Result<PlaneBatch> {
-        let names = plane_columns(self.plane);
+        let names = cached_plane_columns(self.plane);
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(codes), self.width as i32)?;
         let mut fields = vec![Field::new(names[0], codes.data_type().clone(), true)];
@@ -167,7 +227,7 @@ impl PlaneBatch {
     /// Write an ex plane as rows. Its factor columns are both present (2) or
     /// both absent (0).
     fn serialize_ex_plane(&self, plane: u8, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
-        let names = plane_columns(plane);
+        let names = cached_plane_columns(plane);
         let batch = &self.0;
         let codes = batch
             .column_by_name(names[0])
@@ -237,21 +297,18 @@ impl CacheCodecImpl for PlaneBatch {
     const SUPPORTS_ROW_SELECTION: bool = true;
 
     fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
-        if self
-            .0
-            .column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN)
-            .is_some()
-        {
-            self.serialize_ex_plane(1, writer)
-        } else {
-            writer.write_u8(0)?;
-            write_raw_batch(writer, &self.0)
+        match ex_plane(&self.0) {
+            Some(plane) => self.serialize_ex_plane(plane, writer),
+            None => {
+                writer.write_u8(whole_plane(&self.0))?;
+                write_raw_batch(writer, &self.0)
+            }
         }
     }
 
     fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
         validate_version(reader.version())?;
-        if reader.body().first().copied() == Some(0) {
+        if matches!(reader.body().first().copied(), Some(0 | SIGN_BOUNDS_PLANE)) {
             reader.read_u8()?;
             Ok(Self(read_raw_batch(reader)?))
         } else {
@@ -356,7 +413,9 @@ fn row_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vector::bq::planes::{EntryColumns, PlaneKey, plane_entry_columns};
+    use crate::vector::bq::layered::{
+        EntryColumns, FULL_BOUNDS_COLUMN, HIGH_BOUNDS_COLUMN, PlaneKey, plane_entry_columns,
+    };
     use crate::vector::bq::raw_body::RAW_BODY_KIND;
     use crate::vector::bq::storage::RABIT_CODE_COLUMN;
     use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
@@ -365,10 +424,15 @@ mod tests {
     use lance_arrow::RecordBatchExt;
     use lance_core::cache::{CacheCodec, CacheDecode, CacheKey, CacheMissReason};
     use std::cell::{Cell, RefCell};
+
+    /// Ex-plane code widths, including one that is not a multiple of 8.
     const WIDTHS: [usize; 4] = [56, 128, 512, 1024];
+
+    /// Envelope bytes ahead of a plane entry's body.
     fn body_offset() -> usize {
         4 + 1 + 2 + PlaneBatch::TYPE_ID.len() + 4
     }
+
     fn encode(codec: &CacheCodec, batch: &RecordBatch) -> Bytes {
         let mut encoded = Vec::new();
         codec
@@ -379,6 +443,7 @@ mod tests {
             .unwrap();
         Bytes::from(encoded)
     }
+
     fn decode(codec: &CacheCodec, encoded: &Bytes) -> CacheDecode<RecordBatch> {
         match codec.deserialize(encoded) {
             CacheDecode::Hit(decoded) => {
@@ -387,6 +452,7 @@ mod tests {
             CacheDecode::Miss(reason) => CacheDecode::Miss(reason),
         }
     }
+
     fn decode_rows(codec: &CacheCodec, encoded: &Bytes, rows: &[u32]) -> CacheDecode<RecordBatch> {
         let read = |range: Range<usize>| -> Result<Bytes> { Ok(encoded.slice(range)) };
         match codec.deserialize_rows(&read, rows) {
@@ -396,6 +462,7 @@ mod tests {
             CacheDecode::Miss(reason) => CacheDecode::Miss(reason),
         }
     }
+
     fn ex_plane_batch(plane: u8, rows: usize, width: usize, factor_columns: u8) -> RecordBatch {
         Header {
             plane,
@@ -412,6 +479,8 @@ mod tests {
         .unwrap()
         .0
     }
+
+    /// A sign or bounds plane batch with the columns `names`.
     fn whole_plane_batch(names: &[&str], rows: usize) -> RecordBatch {
         let columns = names
             .iter()
@@ -429,6 +498,15 @@ mod tests {
                         )
                         .unwrap(),
                     ),
+                    HIGH_BOUNDS_COLUMN | FULL_BOUNDS_COLUMN => Arc::new(
+                        FixedSizeListArray::try_new_from_values(
+                            Float32Array::from(
+                                (0..rows * 3).map(|v| v as f32 - 1.5).collect::<Vec<_>>(),
+                            ),
+                            3,
+                        )
+                        .unwrap(),
+                    ),
                     _ => Arc::new(Float32Array::from(
                         (0..rows).map(|v| v as f32 + 0.25).collect::<Vec<_>>(),
                     )),
@@ -438,12 +516,12 @@ mod tests {
             .collect::<Vec<_>>();
         RecordBatch::try_from_iter(columns).unwrap()
     }
+
     #[test]
     fn ex_planes_round_trip_whole_and_by_rows() {
         const ROWS: usize = 700;
         let codec = CacheCodec::from_impl::<PlaneBatch>();
-        {
-            let plane = 1;
+        for plane in [1, 2] {
             for width in WIDTHS {
                 for factor_columns in [EX_FACTOR_COLUMNS, 0] {
                     let context = format!("plane {plane} width {width} factors {factor_columns}");
@@ -487,10 +565,51 @@ mod tests {
             }
         }
     }
+
+    #[rstest::rstest]
+    #[case::codes(false)]
+    #[case::all(true)]
+    fn native_ex_plane_round_trip_preserves_factors(#[case] with_factors: bool) {
+        let columns = ex_plane_batch(1, 40, 56, if with_factors { 2 } else { 0 });
+        let mut native_columns = vec![(RABIT_BLOCKED_EX_CODE_COLUMN, columns.column(0).clone())];
+        if with_factors {
+            native_columns.push((EX_ADD_FACTORS_COLUMN, columns.column(1).clone()));
+            native_columns.push((EX_SCALE_FACTORS_COLUMN, columns.column(2).clone()));
+        }
+        let fields: Vec<_> = native_columns
+            .iter()
+            .map(|(name, values)| Field::new(*name, values.data_type().clone(), true))
+            .collect();
+        let original = RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            native_columns
+                .into_iter()
+                .map(|(_, values)| values)
+                .collect(),
+        )
+        .unwrap();
+        let codec = CacheCodec::from_impl::<PlaneBatch>();
+        let encoded = encode(&codec, &original);
+        let CacheDecode::Hit(restored) = decode(&codec, &encoded) else {
+            panic!("native whole-plane cache entry did not decode")
+        };
+        assert_eq!(restored, original);
+        for rows in [vec![], vec![0], vec![0, 17, 39], (0..40).collect()] {
+            let CacheDecode::Hit(selected) = decode_rows(&codec, &encoded, &rows) else {
+                panic!("native sparse cache entry did not decode")
+            };
+            assert_eq!(
+                selected,
+                original
+                    .take(&arrow_array::UInt32Array::from(rows))
+                    .unwrap()
+            );
+        }
+    }
+
     #[test]
     fn sparse_plane_cache_reads_match_full_decode() {
-        {
-            let plane = 1;
+        for plane in [1, 2] {
             let original = ex_plane_batch(plane, 4096, 128, EX_FACTOR_COLUMNS);
             let codec = CacheCodec::from_impl::<PlaneBatch>();
             let encoded = encode(&codec, &original);
@@ -512,6 +631,7 @@ mod tests {
             assert!(bytes_read.get() < encoded.len() / 10);
         }
     }
+
     #[test]
     fn row_plan_matches_ranges_read_by_decode() {
         const ROWS: usize = 4096;
@@ -560,10 +680,120 @@ mod tests {
             }
         }
     }
+
+    /// Sign and bounds plane entries hold a raw body: they round trip whole,
+    /// with their schema, and have no row directory, so a row read misses.
+    #[test]
+    fn sign_and_bounds_planes_round_trip_through_raw_bodies() {
+        let sign_lazy = plane_columns(0, SignBounds::Lazy);
+        let sign_eager = plane_columns(0, SignBounds::Eager);
+        let bounds = plane_columns(SIGN_BOUNDS_PLANE, SignBounds::Lazy);
+        let cases: [(&[&str], u8, SignBounds); 5] = [
+            (sign_lazy, 0, SignBounds::Lazy),
+            (sign_eager, 0, SignBounds::Eager),
+            (bounds, SIGN_BOUNDS_PLANE, SignBounds::Lazy),
+            // Code-only sign entries: the file columns alone.
+            (&[RABIT_CODE_COLUMN], 0, SignBounds::Lazy),
+            (
+                &[RABIT_CODE_COLUMN, HIGH_BOUNDS_COLUMN, FULL_BOUNDS_COLUMN],
+                0,
+                SignBounds::Eager,
+            ),
+        ];
+        for (names, tag, sign_bounds) in cases {
+            for rows in [0, 70] {
+                let codec = PlaneKey {
+                    partition: 0,
+                    plane: tag,
+                    sign_bounds,
+                    entry_columns: EntryColumns::default(),
+                }
+                .codec_for_key()
+                .unwrap();
+                let original = whole_plane_batch(names, rows);
+                let encoded = encode(&codec, &original);
+                let body = &encoded[body_offset()..];
+                assert_eq!(&body[..2], &[tag, RAW_BODY_KIND], "{names:?}");
+                let CacheDecode::Hit(decoded) = decode(&codec, &encoded) else {
+                    panic!("{names:?} decode failed")
+                };
+                assert_eq!(decoded, original, "{names:?}");
+                assert_eq!(decoded.schema(), original.schema(), "{names:?}");
+                assert!(matches!(
+                    decode_rows(&codec, &encoded, &[0]),
+                    CacheDecode::Miss(_)
+                ));
+                let read = |range: Range<usize>| -> Result<Bytes> { Ok(encoded.slice(range)) };
+                assert!(codec.plan_rows(&read, &[0]).is_none());
+            }
+        }
+    }
+
+    /// Code-only entries (`EntryColumns::Codes`) hold the file columns of
+    /// their plane: an ex plane's rows carry no factor columns, and the sign
+    /// and bounds planes keep raw bodies, whole and by rows.
+    #[test]
+    fn code_only_entries_round_trip() {
+        const ROWS: usize = 90;
+        for sign_bounds in [SignBounds::Lazy, SignBounds::Eager] {
+            for plane in [0, 1, 2, SIGN_BOUNDS_PLANE] {
+                let names = plane_entry_columns(plane, sign_bounds, EntryColumns::Codes);
+                if names.is_empty() {
+                    continue;
+                }
+                let codec = PlaneKey {
+                    partition: 0,
+                    plane,
+                    sign_bounds,
+                    entry_columns: EntryColumns::Codes,
+                }
+                .codec_for_key()
+                .unwrap();
+                let context = format!("plane {plane} {sign_bounds:?} {names:?}");
+                let original = match plane {
+                    1 | 2 => ex_plane_batch(plane, ROWS, 128, 0),
+                    _ => whole_plane_batch(&names, ROWS),
+                };
+                let schema = original.schema();
+                let columns: Vec<&str> = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect();
+                assert_eq!(columns, names, "{context}");
+                let encoded = encode(&codec, &original);
+                let body = &encoded[body_offset()..];
+                match plane {
+                    1 | 2 => {
+                        assert_eq!(&body[..2], &[plane, 0], "{context}");
+                        assert_eq!(body.len(), EX_HEADER_BYTES + ROWS * 128, "{context}");
+                        let rows = [0, 7, 8, 89];
+                        let CacheDecode::Hit(selected) = decode_rows(&codec, &encoded, &rows)
+                        else {
+                            panic!("{context}: row decode missed")
+                        };
+                        assert_eq!(
+                            selected,
+                            original
+                                .take(&arrow_array::UInt32Array::from(rows.to_vec()))
+                                .unwrap(),
+                            "{context}"
+                        );
+                    }
+                    _ => assert_eq!(body[1], RAW_BODY_KIND, "{context}"),
+                }
+                let CacheDecode::Hit(decoded) = decode(&codec, &encoded) else {
+                    panic!("{context}: decode missed")
+                };
+                assert_eq!(decoded, original, "{context}");
+            }
+        }
+    }
+
     #[test]
     fn mismatched_factor_columns_are_errors() {
         let ex = ex_plane_batch(1, 10, 56, EX_FACTOR_COLUMNS);
-        let names = plane_columns(1);
+        let names = plane_columns(1, SignBounds::default());
         let only_add = ex.project(&[0, 1]).unwrap();
         let only_scale = ex.project(&[0, 2]).unwrap();
         let (codes, adds, scales) = (
@@ -608,12 +838,13 @@ mod tests {
             CacheDecode::Miss(_)
         ));
     }
+
     #[test]
     fn newer_version_is_a_miss() {
         let codec = CacheCodec::from_impl::<PlaneBatch>();
         for original in [
             ex_plane_batch(1, 20, 128, EX_FACTOR_COLUMNS),
-            whole_plane_batch(plane_columns(0), 20),
+            whole_plane_batch(plane_columns(0, SignBounds::Lazy), 20),
         ] {
             let mut encoded = encode(&codec, &original).to_vec();
             let version_at = body_offset() - 4;
@@ -634,102 +865,6 @@ mod tests {
             ));
             let read = |range: Range<usize>| -> Result<Bytes> { Ok(encoded.slice(range)) };
             assert!(codec.plan_rows(&read, &[0]).is_none());
-        }
-    }
-    #[rstest::rstest]
-    #[case::codes(false)]
-    #[case::all(true)]
-    fn native_ex_plane_round_trip_preserves_factors(#[case] with_factors: bool) {
-        let columns = ex_plane_batch(1, 40, 56, if with_factors { 2 } else { 0 });
-        let mut native_columns = vec![(RABIT_BLOCKED_EX_CODE_COLUMN, columns.column(0).clone())];
-        if with_factors {
-            native_columns.push((EX_ADD_FACTORS_COLUMN, columns.column(1).clone()));
-            native_columns.push((EX_SCALE_FACTORS_COLUMN, columns.column(2).clone()));
-        }
-        let fields: Vec<_> = native_columns
-            .iter()
-            .map(|(name, values)| Field::new(*name, values.data_type().clone(), true))
-            .collect();
-        let original = RecordBatch::try_new(
-            Arc::new(Schema::new(fields)),
-            native_columns
-                .into_iter()
-                .map(|(_, values)| values)
-                .collect(),
-        )
-        .unwrap();
-        let codec = CacheCodec::from_impl::<PlaneBatch>();
-        let encoded = encode(&codec, &original);
-        let CacheDecode::Hit(restored) = decode(&codec, &encoded) else {
-            panic!("native whole-plane cache entry did not decode")
-        };
-        assert_eq!(restored, original);
-        for rows in [vec![], vec![0], vec![0, 17, 39], (0..40).collect()] {
-            let CacheDecode::Hit(selected) = decode_rows(&codec, &encoded, &rows) else {
-                panic!("native sparse cache entry did not decode")
-            };
-            assert_eq!(
-                selected,
-                original
-                    .take(&arrow_array::UInt32Array::from(rows))
-                    .unwrap()
-            );
-        }
-    }
-
-    #[rstest::rstest]
-    fn sign_planes_round_trip_through_raw_bodies(
-        #[values(0, 1, 40)] rows: usize,
-        #[values(EntryColumns::All, EntryColumns::Codes)] columns: EntryColumns,
-    ) {
-        let names = plane_entry_columns(0, columns);
-        let original = whole_plane_batch(&names, rows);
-        let key = PlaneKey {
-            partition: 0,
-            plane: 0,
-            entry_columns: columns,
-        };
-        let codec = key.codec_for_key().unwrap();
-        let encoded = encode(&codec, &original);
-        assert_eq!(
-            &encoded[body_offset()..body_offset() + 2],
-            &[0, RAW_BODY_KIND]
-        );
-        let CacheDecode::Hit(decoded) = decode(&codec, &encoded) else {
-            panic!("sign plane did not decode")
-        };
-        assert_eq!(decoded, original);
-        assert!(matches!(
-            decode_rows(&codec, &encoded, &[0]),
-            CacheDecode::Miss(_)
-        ));
-    }
-
-    #[test]
-    fn key_compositions_are_disjoint() {
-        let keys: Vec<_> = [0, 1]
-            .into_iter()
-            .flat_map(|plane| {
-                [EntryColumns::All, EntryColumns::Codes]
-                    .into_iter()
-                    .map(move |entry_columns| PlaneKey {
-                        partition: 7,
-                        plane,
-                        entry_columns,
-                    })
-            })
-            .map(|key| {
-                let mut builder = lance_core::cache::KeyBuilder::new(
-                    lance_core::cache::CacheNamespace::root(),
-                    PlaneBatch::TYPE_ID,
-                    PlaneKey::schema(),
-                );
-                key.write_key(&mut builder);
-                builder.finish()
-            })
-            .collect();
-        for (i, key) in keys.iter().enumerate() {
-            assert!(!keys[i + 1..].contains(key));
         }
     }
 }

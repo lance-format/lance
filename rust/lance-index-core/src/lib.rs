@@ -224,6 +224,12 @@ impl IndexType {
     /// Indices which higher version than these will be ignored for compatibility,
     /// This would happen when creating index in a newer version of Lance,
     /// but then opening the index in older version of Lance
+    ///
+    /// For [`Self::IvfRq`] this identifies the latest declared row layout.
+    /// Use [`Self::max_vector_version`] for the reader capability of this build:
+    /// an IVF_RQ writer commits the version of the row layout it writes
+    /// (`lance_index::ivf_rq_index_version`), so a column-layout index keeps
+    /// the version older readers accept.
     pub fn version(&self) -> i32 {
         match self {
             Self::Scalar => 0,
@@ -253,7 +259,8 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => 1,
-            Self::IvfRq => 2,
+            // 2: the column layout; 3: the plane-row layout.
+            Self::IvfRq => 3,
         }
     }
 
@@ -290,7 +297,11 @@ impl IndexType {
             Self::IvfRq,
         ]
         .into_iter()
-        .map(|index_type| index_type.version() as u32)
+        // Plane-row version 3 is reserved by the API; its reader lands separately.
+        .map(|index_type| match index_type {
+            Self::IvfRq => 2,
+            _ => index_type.version() as u32,
+        })
         .max()
         .unwrap_or(1)
     }

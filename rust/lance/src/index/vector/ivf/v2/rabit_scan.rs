@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Session-scoped execution strategies for native RaBitQ scans.
+//! Session-scoped execution strategies for native and layered RaBitQ scans.
 //!
 //! Strategies choose how to schedule partition reads. The context keeps
 //! filtering, query preparation and scoring on the same implementation as
@@ -22,6 +22,7 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::Query;
 use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::layered::RQPrecision;
 use lance_index::vector::bq::scan_stats;
 use lance_index::vector::bq::storage::{
     ExRows, RabitPruneCounters, SignStage, StagePruneCounts, SurvivorRow,
@@ -29,8 +30,8 @@ use lance_index::vector::bq::storage::{
 use lance_index::vector::flat::index::FlatIndex;
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{
-    DistanceCalculatorOptions, ExIndex, GatheredRabitEx, IndexFileKey, IvfQuantizationStorage,
-    OriginLatencyClass, RabitExLayout, RabitRawQueryContext, VectorStore,
+    DistanceCalculatorOptions, ExIndex, GatheredEx, GatheredRabitEx, IndexFileKey,
+    IvfQuantizationStorage, OriginLatencyClass, RabitExLayout, RabitRawQueryContext, VectorStore,
 };
 
 use super::{
@@ -53,6 +54,7 @@ pub trait RabitScanFactory: Debug + Send + Sync {
 }
 
 /// Cache granularity requested by an installed strategy for native RaBitQ.
+/// Layered storage always uses its physical plane entries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RabitCacheLayout {
     /// Preserve the ordinary native whole-partition cache and prewarm path.
@@ -233,6 +235,7 @@ impl RabitScanContext {
                     residual,
                     &mut scratch.query_f32,
                     DistanceCalculatorOptions {
+                        rq_precision: context.query.rq_precision,
                         approx_mode: context.query.approx_mode,
                     },
                 );
@@ -286,7 +289,41 @@ impl RabitScanContext {
         })
     }
 
-    /// Score native gathered rows with the same full-precision
+    /// Score sorted survivor offsets using the native full-precision kernel.
+    ///
+    /// `gathered` must cover these offsets in its declared row layout. The
+    /// caller supplies counts from its sign-bound selection and may observe
+    /// the threshold when this partition first fills the heap. The callback
+    /// is monomorphized with the batch scorer, never dynamically dispatched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn score_survivors(
+        &self,
+        sign: &RabitSignPartition,
+        survivors: &[u32],
+        stage1: StagePruneCounts,
+        gathered: &GatheredEx,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        on_first_full: impl FnMut(f32),
+    ) -> Result<RabitPruneCounters> {
+        let layout = self.storage().layered_ex_layout()?;
+        let ex_rows = ExRows::from_plane_batches(
+            &gathered.high,
+            &gathered.low,
+            layout.rotated_dim,
+            layout.num_bits,
+        )?;
+        self.score_ex_survivors(
+            sign,
+            survivors,
+            stage1,
+            gathered.index,
+            ex_rows,
+            heap,
+            on_first_full,
+        )
+    }
+
+    /// Score native or layered gathered rows with the same full-precision
     /// kernel, filters and live heap bounds as the built-in scan.
     #[allow(clippy::too_many_arguments)]
     pub fn score_rabit_survivors(
@@ -299,12 +336,20 @@ impl RabitScanContext {
         on_first_full: impl FnMut(f32),
     ) -> Result<RabitPruneCounters> {
         match gathered {
+            GatheredRabitEx::Layered(gathered) => {
+                self.score_survivors(sign, survivors, stage1, gathered, heap, on_first_full)
+            }
             GatheredRabitEx::Native { batch, index, .. } => {
                 let RabitExLayout::Native {
                     rotated_dim,
                     num_bits,
                     ..
-                } = self.storage().rabit_ex_layout()?;
+                } = self.storage().rabit_ex_layout()?
+                else {
+                    return Err(Error::invalid_input(
+                        "native gathered rows require native RaBitQ storage",
+                    ));
+                };
                 let ex_rows = ExRows::from_native_batch(batch, rotated_dim, num_bits)?;
                 self.score_ex_survivors(
                     sign,
@@ -385,6 +430,7 @@ impl RabitScanContext {
                 residual,
                 &mut scratch.query_f32,
                 DistanceCalculatorOptions {
+                    rq_precision: RQPrecision::Full,
                     approx_mode: self.query.approx_mode,
                 },
                 ex_rows,

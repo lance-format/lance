@@ -17,7 +17,9 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::pb::VectorMetricType;
 use lance_index::pb::index::Implementation;
-use lance_index::pb::vector_index_details::{Compression, FlatCompression, rabit_quantization};
+use lance_index::pb::vector_index_details::{
+    Compression, FlatCompression, RabitQuantization, rabit_quantization,
+};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -144,7 +146,9 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
                 );
             }
             StageParams::RQ(rq) => {
-                compression = Some(Compression::Rq(rq.into()));
+                let mut details = RabitQuantization::from(rq);
+                details.layered = Some(rq.is_layered());
+                compression = Some(Compression::Rq(details));
             }
         }
     }
@@ -294,7 +298,18 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
             VectorIndexParams::with_ivf_rq_params(
                 metric,
                 ivf,
-                RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type),
+                RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type)
+                    .with_layered(rq.layered.unwrap_or(false))
+                    .with_row_layout(
+                        match rabit_quantization::RowLayout::try_from(rq.row_layout).ok()? {
+                            rabit_quantization::RowLayout::Columns => {
+                                lance_index::vector::bq::RQRowLayout::Columns
+                            }
+                            rabit_quantization::RowLayout::PlaneRows => {
+                                lance_index::vector::bq::RQRowLayout::PlaneRows
+                            }
+                        },
+                    ),
             )
         }
         (Some(hnsw), Some(Compression::Pq(pq))) => VectorIndexParams::with_ivf_hnsw_pq_params(
@@ -687,7 +702,17 @@ async fn convert_v3_metadata_to_details(
                             rabit_quantization::RotationType::Matrix
                         }
                     };
+                    let row_layout = match rq.row_layout {
+                        lance_index::vector::bq::RQRowLayout::Columns => {
+                            rabit_quantization::RowLayout::Columns
+                        }
+                        lance_index::vector::bq::RQRowLayout::PlaneRows => {
+                            rabit_quantization::RowLayout::PlaneRows
+                        }
+                    };
                     Some(Compression::Rq(RabitQuantization {
+                        layered: Some(rq.layered),
+                        row_layout: row_layout.into(),
                         num_bits: rq.num_bits as u32,
                         rotation_type: rotation_type.into(),
                     }))
@@ -774,6 +799,8 @@ mod tests {
             ),
             (
                 Some(Compression::Rq(RabitQuantization {
+                    layered: Some(false),
+                    row_layout: rabit_quantization::RowLayout::Columns as i32,
                     num_bits: 1,
                     rotation_type: 0,
                 })),
@@ -866,6 +893,8 @@ mod tests {
             VectorMetricType::Dot,
             None,
             Some(Compression::Rq(RabitQuantization {
+                layered: Some(false),
+                row_layout: rabit_quantization::RowLayout::Columns as i32,
                 num_bits: 1,
                 rotation_type: rabit_quantization::RotationType::Matrix as i32,
             })),
@@ -882,6 +911,8 @@ mod tests {
             VectorMetricType::L2,
             None,
             Some(Compression::Rq(RabitQuantization {
+                layered: Some(false),
+                row_layout: rabit_quantization::RowLayout::Columns as i32,
                 num_bits: 1,
                 rotation_type: rabit_quantization::RotationType::Fast as i32,
             })),
@@ -1369,6 +1400,33 @@ mod tests {
         IvfHnswFlat,
         IvfHnswPq,
         IvfHnswSq,
+    }
+
+    #[rstest::rstest]
+    fn test_rq_details_resolve_layout_and_preserve_historical_missing(
+        #[values(None, Some(false), Some(true))] layered: Option<bool>,
+        #[values(1, 2, 5)] num_bits: u8,
+    ) {
+        let rq = RQBuildParams {
+            layered,
+            ..RQBuildParams::new(num_bits)
+        };
+        let params =
+            VectorIndexParams::with_ivf_rq_params(DistanceType::L2, IvfBuildParams::default(), rq);
+        let any = vector_index_details(&params);
+        let mut details = any.to_msg::<VectorIndexDetails>().unwrap();
+        let Some(Compression::Rq(rq)) = &mut details.compression else {
+            panic!("expected RQ compression");
+        };
+        assert_eq!(rq.layered, Some(num_bits > 2 && layered.unwrap_or(false)));
+        // Historical metadata never adopts a product's current build default.
+        rq.layered = None;
+        let any = prost_types::Any::from_msg(&details).unwrap();
+        let restored = vector_params_from_details(&any).unwrap();
+        let StageParams::RQ(rq) = &restored.stages[1] else {
+            panic!("expected RQ stage");
+        };
+        assert_eq!(rq.layered, Some(false));
     }
 
     fn build_roundtrip_params(combo: Combo, metric: DistanceType) -> VectorIndexParams {

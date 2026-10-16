@@ -17,6 +17,9 @@ use rayon::prelude::*;
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
+use crate::vector::bq::layered::{
+    HIGH_ADD_FACTORS_COLUMN, HIGH_SCALE_FACTORS_COLUMN, RQLayout, split_codes, storage_fields,
+};
 use crate::vector::bq::rabit_ex_bits;
 use crate::vector::bq::storage::{
     RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQueryEstimator,
@@ -33,7 +36,7 @@ pub const EX_ADD_FACTORS_COLUMN: &str = "__add_factors_ex";
 pub const EX_SCALE_FACTORS_COLUMN: &str = "__scale_factors_ex";
 pub const ERROR_FACTORS_COLUMN: &str = "__error_factors";
 
-const RABIT_ERROR_EPSILON: f32 = 1.9;
+pub(super) const RABIT_ERROR_EPSILON: f32 = 1.9;
 
 pub static ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(ADD_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
@@ -446,7 +449,13 @@ impl Transformer for RQTransformer {
         let has_split_codes = self.rq.num_bits() == 1
             || (batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some()
                 && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
-                && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
+                && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some()
+                && (!self.rq.metadata_ref().layered
+                    || (batch
+                        .column_by_name(super::storage::RABIT_BLOCKED_EX_CODE_LO_COLUMN)
+                        .is_some()
+                        && batch.column_by_name(HIGH_ADD_FACTORS_COLUMN).is_some()
+                        && batch.column_by_name(HIGH_SCALE_FACTORS_COLUMN).is_some())));
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
             return Ok(batch.clone());
         }
@@ -485,7 +494,10 @@ impl Transformer for RQTransformer {
             }
         };
 
-        if self.rq.metadata_ref().query_estimator == RabitQueryEstimator::RawQuery {
+        // Layered encoding also needs per-dimension codes for its high/low planes.
+        if self.rq.metadata_ref().query_estimator == RabitQueryEstimator::RawQuery
+            && !self.rq.metadata_ref().layered
+        {
             return self.transform_raw_query(batch, residual_vectors, &res_norm_square);
         }
 
@@ -575,6 +587,147 @@ impl Transformer for RQTransformer {
             batch = batch
                 .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?
                 .try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
+        } else {
+            // New RQ indexes use the RaBitQ-Library raw-query estimator.
+            let ex_bits = rabit_ex_bits(self.rq.num_bits())?;
+            let ex_codes = rq_codes.ex_codes;
+            let ex_res_dot_dists = rq_codes.ex_res_dot_dists;
+            let rotated_residuals = rq_codes.rotated_residuals.ok_or_else(|| {
+                Error::internal("RabitQ quantization did not return rotated residuals".to_string())
+            })?;
+            let ex_code_values = rq_codes.ex_code_values;
+            if ex_bits != 0
+                && (ex_codes.is_none() || ex_res_dot_dists.is_none() || ex_code_values.is_none())
+            {
+                return Err(Error::internal(
+                    "RabitQ multi-bit quantization did not return split-code values".to_string(),
+                ));
+            }
+
+            let part_ids = batch[PART_ID_COLUMN].as_primitive::<UInt32Type>();
+            let rotated_centroids = self.rotated_centroids.as_ref().ok_or_else(|| {
+                Error::internal("RabitQ raw-query transformer is missing rotated centroids")
+            })?;
+            let raw_query_factors = compute_raw_query_factors(
+                self.distance_type,
+                &res_norm_square,
+                &rotated_residuals,
+                rotated_centroids,
+                part_ids,
+                ex_code_values.as_deref(),
+                ex_res_dot_dists.as_deref(),
+                ex_bits,
+                self.rq.dim(),
+            )?;
+
+            let layered = if self.rq.metadata_ref().layered {
+                let layout = RQLayout::try_new(self.rq.num_bits())?;
+                let values = ex_code_values
+                    .as_deref()
+                    .ok_or_else(|| Error::internal("missing full ex codes"))?;
+                let (hi, lo, hi_values) = split_codes(values, self.rq.dim(), layout)?;
+                let bias = -((1u32 << layout.high_bits) as f32 - 0.5);
+                let hi_res_dot: Vec<f32> = rotated_residuals
+                    .chunks_exact(self.rq.dim())
+                    .zip(hi_values.chunks_exact(self.rq.dim()))
+                    .map(|(residual, codes)| {
+                        residual
+                            .iter()
+                            .zip(codes)
+                            .map(|(&r, &c)| {
+                                let sign = u32::from(r.is_sign_positive());
+                                r * (((sign << layout.high_bits) + u32::from(c)) as f32 + bias)
+                            })
+                            .sum()
+                    })
+                    .collect();
+                let factors = compute_raw_query_factors(
+                    self.distance_type,
+                    &res_norm_square,
+                    &rotated_residuals,
+                    rotated_centroids,
+                    part_ids,
+                    Some(&hi_values),
+                    Some(&hi_res_dot),
+                    layout.high_bits,
+                    self.rq.dim(),
+                )?;
+                let high_bounds = super::layered::estimator_bounds(
+                    &rotated_residuals,
+                    &hi_values,
+                    self.rq.dim(),
+                    layout.high_bits,
+                    &raw_query_factors,
+                    &factors,
+                )?;
+                let full_bounds = super::layered::estimator_bounds(
+                    &rotated_residuals,
+                    values,
+                    self.rq.dim(),
+                    ex_bits,
+                    &raw_query_factors,
+                    &raw_query_factors,
+                )?;
+                Some((hi, lo, factors, high_bounds, full_bounds))
+            } else {
+                None
+            };
+
+            batch = batch
+                .try_with_column(
+                    ADD_FACTORS_FIELD.clone(),
+                    Arc::new(raw_query_factors.add_factors),
+                )?
+                .try_with_column(
+                    SCALE_FACTORS_FIELD.clone(),
+                    Arc::new(raw_query_factors.scale_factors),
+                )?
+                .try_with_column(
+                    ERROR_FACTORS_FIELD.clone(),
+                    Arc::new(raw_query_factors.error_factors),
+                )?;
+
+            if let Some((hi, lo, factors, high_bounds, full_bounds)) = layered {
+                let fields = storage_fields(self.rq.dim(), self.rq.num_bits(), Vec::new())?;
+                batch = batch
+                    .try_with_column(fields[0].clone(), hi)?
+                    .try_with_column(fields[1].clone(), lo)?
+                    .try_with_column(fields[6].clone(), high_bounds)?
+                    .try_with_column(fields[7].clone(), full_bounds)?
+                    .try_with_column(
+                        fields[4].clone(),
+                        Arc::new(
+                            factors
+                                .ex_add_factors
+                                .ok_or_else(|| Error::internal("missing high add factors"))?,
+                        ),
+                    )?
+                    .try_with_column(
+                        fields[5].clone(),
+                        Arc::new(
+                            factors
+                                .ex_scale_factors
+                                .ok_or_else(|| Error::internal("missing high scale factors"))?,
+                        ),
+                    )?;
+            } else if let Some(ex_codes) = ex_codes {
+                batch = batch.try_with_column(
+                    crate::vector::bq::storage::rabit_ex_code_field(
+                        self.rq.dim(),
+                        self.rq.num_bits(),
+                    )?
+                    .expect("ex-code field should exist for num_bits > 1"),
+                    ex_codes,
+                )?;
+            }
+            if let Some(ex_add_factors) = raw_query_factors.ex_add_factors {
+                batch = batch
+                    .try_with_column(EX_ADD_FACTORS_FIELD.clone(), Arc::new(ex_add_factors))?;
+            }
+            if let Some(ex_scale_factors) = raw_query_factors.ex_scale_factors {
+                batch = batch
+                    .try_with_column(EX_SCALE_FACTORS_FIELD.clone(), Arc::new(ex_scale_factors))?;
+            }
         }
 
         let batch = batch
@@ -599,6 +752,7 @@ mod tests {
 
     use crate::vector::bq::RQRotationType;
     use crate::vector::bq::builder::RabitQuantizer;
+
     use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
     use crate::vector::transform::Transformer;

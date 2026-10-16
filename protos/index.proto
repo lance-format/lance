@@ -211,8 +211,22 @@ message VectorIndexDetails {
       FAST = 0;
       MATRIX = 1;
     }
+    // How the auxiliary file stores each row's fields.
+    enum RowLayout {
+      // One column per field.
+      COLUMNS = 0;
+      // One fixed-width row column per plane; requires index version 3.
+      PLANE_ROWS = 1;
+    }
     uint32 num_bits = 1;
     RotationType rotation_type = 2;
+    /* Fixed prefix planes. Unset build requests use the product's default;
+     * writers persist the resolved layout. Missing stored values retain the
+     * historical single-plane layout. Widths 1 and 2 always use single-plane.
+     */
+    optional bool layered = 3;
+    // Absent/COLUMNS retains one column per field.
+    RowLayout row_layout = 4;
   }
 
   // No quantization; vectors are stored as-is.
