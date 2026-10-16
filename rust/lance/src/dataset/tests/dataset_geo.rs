@@ -5,13 +5,18 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::Dataset;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::tests::dataset_transactions::execute_sql;
+use crate::dataset::{UpdateBuilder, WriteParams};
 
 use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
+use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float64Type;
+use arrow_array::types::UInt32Type;
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::{assert_contains, assert_not_contains};
 use geo_types::{Rect, coord, line_string};
 use geoarrow_array::{
@@ -21,6 +26,7 @@ use geoarrow_array::{
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 
 #[tokio::test]
@@ -229,4 +235,133 @@ async fn test_geo_rtree_index() {
         .unwrap();
 
     assert_intersects_sql(&mut dataset, true).await;
+}
+
+#[rstest::rstest]
+#[case::row_addresses(false, false)]
+#[case::stable_row_ids(true, false)]
+#[case::fragment_reuse(false, true)]
+#[tokio::test]
+async fn test_rtree_optimize_drops_rewritten_rows(
+    #[case] enable_stable_row_ids: bool,
+    #[case] compact: bool,
+) {
+    let point_type = PointType::new(Dimension::XY, Default::default());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        point_type.clone().to_field("point", true),
+        point_type.clone().to_field("replacement", true),
+    ]));
+    let mut points = PointBuilder::new(point_type.clone());
+    let mut replacements = PointBuilder::new(point_type);
+    for id in 0..8 {
+        if id % 2 == 0 {
+            points.push_null();
+            replacements.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
+        } else {
+            points.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+            replacements.push_null();
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..8)),
+            points.finish().to_array_ref(),
+            replacements.finish().to_array_ref(),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .create_index(
+            &["point"],
+            IndexType::RTree,
+            Some("rtree_index".to_string()),
+            &ScalarIndexParams::new("RTree".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+    if compact {
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+    }
+    // Keep other rows in the source fragment live while replacing a NULL with
+    // a point and a point with a NULL. Stable IDs are reused by the replacements.
+    dataset = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id < 2")
+        .unwrap()
+        .set("point", "replacement")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset
+        .as_ref()
+        .clone();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let indices = dataset.load_indices_by_name("rtree_index").await.unwrap();
+    assert_eq!(indices.len(), 1);
+
+    for (predicate, expected) in [
+        ("point IS NULL", vec![1, 2, 4, 6]),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))'))",
+            vec![3, 5, 7],
+        ),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((9 9, 11 9, 11 11, 9 11, 9 9))'))",
+            vec![0],
+        ),
+    ] {
+        let mut indexed = dataset.scan();
+        indexed.project(&["id"]).unwrap().filter(predicate).unwrap();
+        assert_contains!(
+            indexed.explain_plan(false).await.unwrap(),
+            "ScalarIndexQuery"
+        );
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let scanned = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .filter(predicate)
+            .unwrap()
+            .use_scalar_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut indexed_ids = indexed["id"].as_primitive::<UInt32Type>().values().to_vec();
+        let mut scanned_ids = scanned["id"].as_primitive::<UInt32Type>().values().to_vec();
+        indexed_ids.sort_unstable();
+        scanned_ids.sort_unstable();
+        assert_eq!(indexed_ids, expected, "indexed predicate: {predicate}");
+        assert_eq!(indexed_ids, scanned_ids, "predicate: {predicate}");
+    }
 }
