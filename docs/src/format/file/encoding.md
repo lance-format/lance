@@ -55,8 +55,8 @@ Structural encoding is fairly complicated! However, the goal is to suck out all 
 scheduling so that compression libraries can focus on compression. This keeps our compression traits simple
 without sacrificing our ability to perform random access.
 
-There are only a few structural encodings. The structural encoding is described by the `PageLayout` message and
-is the top-level message for the encoding.
+Lance 2.1 and 2.2 describe structural encodings with `lance.encodings21.PageLayout`.
+Lance 2.3 uses the independent planes described in [Planar Page Layout](#planar-page-layout).
 
 ```protobuf
 %%% proto.message.PageLayout %%%
@@ -327,12 +327,92 @@ The protobuf for the full zip layout describes the compression of the data buffe
 size of the control words and how many bits we have per value (for fixed-width data) or how many bits we
 have per offset (for variable-width data).
 
-### Sparse Page Layout
+### Planar Page Layout
 
-Sparse pages require Lance 2.3 and are identified by `PageLayout`. They represent Arrow structure as ordered
-slot-domain mappings and store leaf values in independently readable mini-block chunks.
+The **unstable Lance 2.3** format uses `lance.encodings23.PlanarLayout` as every primitive page's
+encoding description. Both the structure and value planes are required. Earlier unstable 2.3 metadata
+is not supported. Lance 2.0, 2.1, and 2.2 retain their original metadata and physical grammars.
 
-#### Structural Domains
+`encodings_v2_3.proto` defines the complete 2.3 metadata grammar, including the recursive
+`lance.encodings23.CompressiveEncoding` tree and repetition/definition layer interpretations.
+It does not import the stable `encodings_v2_1.proto`. Range, Delta, generic variable-width offsets,
+and generic unsigned sequence compositions belong to 2.3. The stable `lance.encodings21` package
+contains only the 2.1/2.2 grammar; matching codec names across packages do not imply that their
+allowed compositions are interchangeable.
+
+```text
+PlanarLayout
++-- structure
+|   +-- Dense: repetition/definition layer interpretations
+|   +-- Sparse: outer-to-inner slot-domain mappings
++-- values
+    +-- Chunked: independently compressed mini-blocks, optional dictionary
+    +-- Zipped: individually addressable fixed- or variable-width values
+    +-- Indexed: sparse slot indices into individually addressable dictionary items
+    +-- Constant: one inline non-null scalar
+    +-- None: no materialized leaf values
+```
+
+| Structure | Chunked | Zipped | Indexed | Constant | None |
+|---|---|---|---|---|---|
+| Dense | Dense levels alongside values | Control words alongside values | Not supported | Trivial all-valid layers only | Single null leaf only |
+| Sparse | All terminal slots, including null slots | Only materialized leaf values | All terminal slot indices; addressed dictionary items | Scalar at materialized leaf positions | No materialized values, or an empty-struct leaf |
+
+Dense layers run from inner-most to outer-most. Dense chunked and zipped values retain the existing
+u32 mini-block and full-zip physical grammars. Their dense level metadata lives in `DenseChunkLevels`
+or `DenseZipLevels`; these messages must be absent with sparse structure. Compression descriptors,
+including generic variable-width offsets, follow the 2.3 compression grammar.
+
+A materialized leaf position is valid in every ancestor layer and in the terminal validity layer.
+Null structs and fixed-size lists exclude all their child positions. Readers derive this set from
+structure, without an additional stored leaf-position map. Sparse zipped values follow these
+positions in increasing order. A null-only selection requires no value I/O after structural initialization.
+
+Indexed values require sparse structure and a binary or string leaf. The first buffer contains
+one encoded unsigned 32-bit index for every terminal slot, including null slots. The remaining two
+buffers contain zipped dictionary items and their byte-offset table. Every index is less than the
+item count. Indices use the typed unsigned sequence grammar; metadata-only encodings have an empty first buffer. Items have no dense controls, and item count equals visible item count. Readers initialize
+indices and item offsets, validate their domains, then fetch only dictionary items referenced by the
+selected slots. Repeated indices may share one item read. Null semantics remain entirely structural.
+
+Constant stores exactly one non-null fixed-width scalar, between 1 and 32 bytes, whose width matches
+the leaf type. Boolean uses one byte. It excludes nested values and variable-width scalars. Constant
+and None have no value buffers; sparse structural buffers may still be required.
+
+Blob v1 binary pages are not part of the 2.3 grammar. Blob v2 descriptor structs use ordinary planar
+pages for their descriptor fields; external blob storage and lifecycle remain unchanged.
+
+Writers choose the two planes independently. The current writer uses sparse structure for an explicit
+`sparse` request with nontrivial structure, dense structural-budget overflow, complex constants,
+structural-only pages, and mostly-null wide values. Trivial all-valid pages remain dense. Narrow
+sparse values use chunked storage; wide values use zipped storage. Dictionary and variable-width
+packed structs can compose with sparse structure. Codec selection is a writer policy, not a reader restriction.
+
+```protobuf
+%%% proto.message.PlanarLayout %%%
+```
+
+```protobuf
+%%% proto.message.StructuralPlane %%%
+```
+
+```protobuf
+%%% proto.message.ValuePlane %%%
+```
+
+```protobuf
+%%% proto.message.IndexedValues %%%
+```
+
+```protobuf
+%%% proto.message.ChunkedValues %%%
+```
+
+```protobuf
+%%% proto.message.ZippedValues %%%
+```
+
+#### Sparse Structural Domains
 
 A domain is a layer-local coordinate space `[0, size)`. Layers are ordered from outer-most to inner-most:
 
@@ -369,37 +449,42 @@ Every layer has validity with one of two meanings:
 
 The unspecified meaning is invalid. Non-empty list positions must be valid.
 
-#### Buffers
+#### Sparse Buffers
 
-Buffer 0 contains one 8-byte metadata entry per value chunk: `(chunk_size / 8) - 1` as little-endian `u32`, followed
-by the chunk's leaf slot count as little-endian `u32`. Chunk sizes are positive multiples of 8; each chunk contains
-between 1 and 32,768 leaf slots. The byte sum equals buffer 1's length and the slot sum equals the terminal domain size.
-An empty terminal domain has empty buffers 0 and 1.
+Value buffers precede structural buffers:
 
-Buffer 1 contains mini-block value chunks. Each chunk starts with a zero little-endian `u16` repetition/definition
-level count, followed by one little-endian `u32` byte length for each value buffer required by `value_compression`.
-The header and each value buffer are padded to an 8-byte boundary. Value buffers follow their descriptor-defined order.
-The header, buffers, and padding must consume the chunk exactly. Value compression follows the shared mini-block
-contract, including generic variable-width offsets.
+- Chunked uses the shared u32 mini-block grammar: chunk metadata, chunk data, then an optional dictionary.
+  Chunk metadata uses the same packed size/count words as dense mini-blocks. The value count equals
+  the terminal slot domain. There are no repetition/definition streams or repetition index.
+  `num_buffers` describes the value codec's buffers per chunk; `num_items` is zero because structure
+  determines the count. The optional dictionary is shared by all value chunks.
+- Fixed-width zipped uses one value buffer. Each materialized value occupies `bits_per_value / 8`
+  bytes. The buffer length must equal that width times `num_items`.
+- Variable-width zipped uses the full-zip value buffer and byte index. There are no control words;
+  each value retains the full-zip length prefix. The index contains `num_items + 1` absolute byte
+  offsets, using the width derived from the index buffer's length. Both zipped counts equal the
+  number of materialized leaf positions.
+- Constant and None use no value buffers.
 
 Remaining buffers contain zero or one payload per generic structural sequence. Sequences are visited in
 outer-to-inner layer order. Within a list layer the order is non-empty positions, counts, then validity positions.
 Validity and fixed-size-list layers contain only their validity sequence. Each sequence consumes the payload count
 specified by its generic codec; missing or extra buffers are invalid.
 
-The structural domains map row selections to leaf ranges. Buffer 0 locates the independently readable value chunks
-intersecting those ranges. Empty leaf selections require no value payload. Cache placement and codec selection
-policies are implementation choices.
+The structural domains map row selections to terminal leaf ranges. Chunked reads fetch only intersecting
+mini-blocks. Zipped reads map selected materialized leaf positions to byte ranges. Empty terminal selections
+require no value payload. Cache placement is an implementation choice.
 
 #### Validation
 
-Readers reject malformed metadata and payloads. Validation covers checked domain arithmetic and buffer ranges,
-sequence cardinality and position bounds/order, validity meaning, non-empty-list validity, positive counts and their
-child-domain sum, and exact chunk byte/slot sums and consumption. Structural sequence validation otherwise follows
-the generic unsigned block contract.
+Readers reject missing planes and layer variants, invalid scalar widths, inconsistent codec/buffer counts,
+overflowing buffer ranges and domain arithmetic, invalid validity meanings, unordered or out-of-bounds positions,
+and list counts that disagree with their child domain. Zipped value counts must agree with the materialized
+positions. None requires no materialized positions, except for an empty-struct leaf. Structural payload validation
+follows the generic unsigned block contract; chunked and zipped values follow their shared value grammars.
 
 ```protobuf
-%%% proto.message.SparseLayout %%%
+%%% proto.message.SparseStructure %%%
 ```
 
 ```protobuf
@@ -746,7 +831,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
-| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Force a structural encoding; `sparse` requires Lance 2.3.                                |
+| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural policy; `sparse` requires Lance 2.3 and retains canonical dense all-valid pages.                                |
 
 ### Configuration Details
 

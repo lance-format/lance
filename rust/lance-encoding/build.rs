@@ -19,5 +19,7 @@ fn main() -> Result<()> {
     prost_build.compile_protos(&["./protos/encodings_v2_0.proto"], &["./protos"])?;
     prost_build.compile_protos(&["./protos/encodings_v2_1.proto"], &["./protos"])?;
 
+    prost_build.compile_protos(&["./protos/encodings_v2_3.proto"], &["./protos"])?;
+
     Ok(())
 }

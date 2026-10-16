@@ -1,0 +1,511 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+package lance.encodings23;
+
+/* Unstable 2.3 page metadata. Structure maps rows to leaf slots; values map
+ * those slots to bytes. Neither plane may be absent. There is no compatibility
+ * contract with previous unstable revisions. All referenced messages and enums
+ * belong to this package; stable format schemas are not dependencies.
+ */
+message PlanarLayout {
+  StructuralPlane structure = 1;
+  ValuePlane values = 2;
+}
+
+message StructuralPlane {
+  oneof codec {
+    DenseStructure dense = 1;
+    SparseStructure sparse = 2;
+  }
+}
+
+message DenseStructure {
+  // Inner-most to outer-most interpretation of dense repetition/definition levels.
+  repeated RepDefLayer layers = 1;
+}
+
+message SparseStructure {
+  // Outer-most to inner-most slot-domain mappings.
+  repeated SparseStructuralLayer layers = 1;
+}
+
+message ValuePlane {
+  oneof codec {
+    ChunkedValues chunked = 1;
+    ZippedValues zipped = 2;
+    ConstantValue constant = 3;
+    NoValues none = 4;
+    IndexedValues indexed = 5;
+  }
+}
+
+/* Sparse value slots reference independently addressable dictionary items.
+ * Buffers are: one encoded UInt32 index buffer (empty for a metadata-only codec), then the zipped item buffers.
+ * Index cardinality is the sparse leaf-slot domain; each index is less than
+ * items.num_items. Item values have no dense levels or nested dictionary.
+ */
+message IndexedValues {
+  CompressiveEncoding indices = 1;
+  ZippedValues items = 2;
+}
+
+message ChunkedValues {
+  CompressiveEncoding compression = 1;
+  /* Present only with dense structure. Sparse chunks have a zero level count
+   * and contain only independently compressed value buffers.
+   */
+  DenseChunkLevels levels = 2;
+  // Optional dictionary shared by the value chunks.
+  CompressiveEncoding dictionary = 3;
+  uint64 num_dictionary_items = 4;
+  // Number of value buffers per chunk, excluding repetition and definition.
+  uint64 num_buffers = 5;
+  // Dense structural event count. Sparse counts are derived from its domains.
+  uint64 num_items = 6;
+}
+
+message DenseChunkLevels {
+  // Absent when the page has no repetition stream.
+  CompressiveEncoding repetition = 1;
+  // Absent when the page has no definition stream.
+  CompressiveEncoding definition = 2;
+  uint32 repetition_index_depth = 3;
+}
+
+message ZippedValues {
+  CompressiveEncoding compression = 1;
+  // Present only with dense structure; sparse values contain no control words.
+  DenseZipLevels levels = 2;
+  oneof addressing {
+    uint32 bits_per_value = 3;
+    uint32 bits_per_offset = 4;
+  }
+  // Dense event count or sparse materialized value count.
+  uint64 num_items = 5;
+  // Leaf slots for dense pages; equal to num_items for sparse pages.
+  uint64 num_visible_items = 6;
+}
+
+message DenseZipLevels {
+  uint32 bits_repetition = 1;
+  uint32 bits_definition = 2;
+}
+
+message ConstantValue {
+  // Exactly one non-null fixed-width scalar, at most 32 bytes. Boolean uses one byte.
+  bytes scalar = 1;
+}
+
+message NoValues {}
+
+/* A domain is a layer-local integer coordinate space [0, size). A slot is one
+ * element in that space. The outer-most domain is the page's top-level rows; each
+ * layer's child domain is the next layer's parent domain, and the terminal child
+ * domain contains the leaf value slots. Parent sizes are derived from the page row count
+ * and preceding layers, not stored in each layer. The outer size is the page row count
+ * divided exactly by the product of all fixed-size-list dimensions, including those below lists.
+ */
+message SparseStructuralLayer {
+  // Exactly one layer kind is required.
+  oneof layer {
+    SparseValiditySet validity = 1;
+    SparseListLayer list = 2;
+    SparseFixedSizeListLayer fixed_size_list = 3;
+  }
+}
+
+message SparseListLayer {
+  // Child-domain size, equal to the sum of counts; available before reading count payloads.
+  uint64 num_child_slots = 1;
+  // Non-empty parent slots. Valid parent slots absent from this set are empty lists.
+  CompressiveEncoding non_empty_positions = 2;
+  // Cardinality of both non_empty_positions and counts.
+  uint64 num_non_empty_positions = 3;
+  // Positive child counts corresponding one-for-one with non_empty_positions.
+  CompressiveEncoding counts = 4;
+  // Validity for the parent slots in this layer.
+  SparseValiditySet validity = 5;
+}
+
+message SparseFixedSizeListLayer {
+  // Positive number of children per parent slot. The child-domain size is parent size * dimension.
+  uint64 dimension = 1;
+  // Validity for the parent slots in this layer.
+  SparseValiditySet validity = 2;
+}
+
+message SparseValiditySet {
+  enum Meaning {
+    SPARSE_VALIDITY_UNSPECIFIED = 0;
+    // Stored positions are null; all other positions are valid.
+    SPARSE_VALIDITY_NULL_POSITIONS = 1;
+    // Stored positions are valid; all other positions are null.
+    SPARSE_VALIDITY_VALID_POSITIONS = 2;
+  }
+
+  Meaning meaning = 1;
+  /* Required unsigned u64 block encoding of strictly increasing absolute positions.
+   * The cardinality is num_positions. All values must be below the owning domain's
+   * derived size. This descriptor is required even when the sequence is empty.
+   *
+   * Positions and list counts follow the generic unsigned block contract,
+   * including empty sequences and payload framing. Counts need not be increasing.
+   */
+  CompressiveEncoding positions = 2;
+  // Semantic cardinality of the stored positions.
+  uint64 num_positions = 3;
+}
+
+enum RepDefLayer {
+  // Should never be used, reserved as the invalid default value
+  REPDEF_UNSPECIFIED = 0;
+  // All values are valid (can be primitive or struct)
+  REPDEF_ALL_VALID_ITEM = 1;
+  // All list values are valid
+  REPDEF_ALL_VALID_LIST = 2;
+  // There are one or more null items (can be primitive or struct)
+  REPDEF_NULLABLE_ITEM = 3;
+  // A list layer with null lists but no empty lists
+  REPDEF_NULLABLE_LIST = 4;
+  // A list layer with empty lists but no null lists
+  REPDEF_EMPTYABLE_LIST = 5;
+  // A list layer with both empty lists and null lists
+  REPDEF_NULL_AND_EMPTY_LIST = 6;
+}
+
+enum CompressionScheme {
+  COMPRESSION_ALGORITHM_UNSPECIFIED = 0;
+  COMPRESSION_ALGORITHM_LZ4 = 1;
+  COMPRESSION_ALGORITHM_ZSTD = 2;
+}
+
+/* Compression applied to a single buffer of data
+ *
+ * A buffer is the leaf of the compression tree.  Unlike data blocks, which can
+ * be further compressed with a variety of techniques, a buffer cannot be understood
+ * in any particular way.
+ *
+ * A general compression scheme may be applied to a buffer.  This is something like
+ * zstd, lz4, etc.  The entire buffer is compressed as a single unit.  If this happens
+ * then any parent encoding becomes opaque, even if it would normally be transparent.
+ *
+ * This is a leaf, no further compression is applied to the data.
+ */
+message BufferCompression {
+  // A general compression scheme to apply to the buffer
+  CompressionScheme scheme = 1;
+  /* The compression level
+   *
+   * Optional, if not present a scheme-specific default value will be used.
+   *
+   * Interpretation of this value depends on the compression scheme.  Generally, larger
+   * values indicate more compression at the expense of more CPU time.
+   */
+  optional int32 level = 2;
+}
+
+/* Fixed width items placed contiguously in a single buffer
+ *
+ * This is a leaf encoding, there is no compression applied to the data.
+ *
+ * This is a transparent encoding by definition.
+ *
+ * The input is a fixed-width data block.
+ * The output is a single buffer.
+ */
+message Flat {
+  /* the number of bits per value, must be greater than 0, does
+   * not need to be a multiple of 8
+   */
+  uint64 bits_per_value = 1;
+  // The compression applied to the data
+  optional BufferCompression data = 2;
+}
+
+/* Variable width items have the values stored in one buffer and the
+ * offsets are output as a data block that may be further compressed.
+ *
+ * This is a partial leaf encoding.  Values are not compressed but
+ * the offsets may be further compressed.
+ *
+ * This is a transparent encoding by definition.
+ *
+ * The input is a variable-width data block.
+ * The output is a single fixed-width data block (the offsets) and
+ * a single buffer (the values)
+ */
+message Variable {
+  // Describes how the offsets data block is compressed
+  CompressiveEncoding offsets = 1;
+  // The compression applied to the values
+  optional BufferCompression values = 2;
+}
+
+/* Compression algorithm where all values have a constant value (encoded in the description)
+ *
+ * This is a leaf encoding, there is no compression applied to the data.
+ *
+ * The input can be any kind of data block.
+ * There is no output.
+ */
+message Constant {
+  // The value (TODO: define encoding for literals?)
+  optional bytes value = 1;
+}
+
+/* A metadata-only arithmetic sequence for unstable Lance 2.3 only.
+ *
+ * The value at index i is `start + step * i`. The container supplies the
+ * number of values. Writers use this encoding only when step is positive and
+ * the final value fits in the declared bit width.
+ *
+ * The input is a u32 or u64 fixed-width data block.
+ * There is no output buffer.
+ */
+message Range {
+  // The width of each decompressed value. Must be 32 or 64.
+  uint64 uncompressed_bits_per_value = 1;
+  // The first value in the sequence.
+  uint64 start = 2;
+  // The positive difference between adjacent values.
+  uint64 step = 3;
+}
+
+/* An unstable Lance 2.3 non-decreasing unsigned fixed-width sequence
+ * represented by its first value and the differences between adjacent values.
+ *
+ * The child contains one fewer value than the input. The container supplies
+ * the input cardinality. Delta has a payload exactly when its child has one.
+ *
+ * The input is a u32 or u64 fixed-width data block.
+ */
+message Delta {
+  // The width of each decompressed value. Must be 32 or 64.
+  uint64 uncompressed_bits_per_value = 1;
+  // The first uncompressed value.
+  uint64 base = 2;
+  // Compression applied to the adjacent differences.
+  CompressiveEncoding deltas = 3;
+}
+
+/* A compression scheme in which a single fixed-width block is "packed" into
+ * a smaller fixed-width block values where each value has fewer bits.
+ *
+ * This is typically done by throwing away the most significant bits of each value when
+ * those bits are all the same.
+ *
+ * In this scheme the number of bits per value is fixed across the entire buffer and stored
+ * in this message.
+ *
+ * This is a transparent encoding.
+ *
+ * The input is a fixed-width data block.
+ * The output is a single fixed-width data block.
+ */
+message OutOfLineBitpacking {
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 1;
+  // The compression used to store the bitpacked values data block
+  CompressiveEncoding values = 3;
+}
+
+/* Bitpacking variant where the bits per value are stored inline in the chunks themselves
+ *
+ * This variation of bitpacking allows for the number of bits per value to change throughout the
+ * buffer, which makes the compression more robust to outliers.
+ *
+ * This is an opaque encoding.
+ *
+ * The input is a fixed-width data block.
+ * The output is a single buffer.
+ */
+message InlineBitpacking {
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 1;
+  // The compression applied to the values
+  optional BufferCompression values = 2;
+}
+
+/* A compression scheme for variable-width data
+ *
+ * A small dictionary (referred to as a "symbol table") is used to compress the values.
+ * In this scheme there is a single symbol table for the entire page and it is stored in the
+ * encoding description itself.
+ *
+ * This is a transparent encoding.
+ *
+ * The input is a variable-width data block.
+ * The output is a single variable-width data block.
+ */
+message Fsst {
+  // The FSST symbol table
+  bytes symbol_table = 1;
+  // The compression used to store the compressed values data block
+  CompressiveEncoding values = 2;
+}
+
+/* A compression scheme where common values are stored in a dictionary and the values are
+ * encoded as indices into the dictionary.
+ *
+ * This is an opaque encoding unless the dictionary is considered metadata.
+ *
+ * The input is a any kind of data block.
+ * There are two outputs:
+ * - A data block of the same kind as the input (the dictionary)
+ * - A fixed-width data block containing the indices into the dictionary.
+ */
+message Dictionary {
+  // The compression used to store the indices data block
+  CompressiveEncoding indices = 1;
+  // The compression used to store the dictionary items data block
+  CompressiveEncoding items = 2;
+  // The number of items in the dictionary
+  uint32 num_dictionary_items = 3;
+}
+
+/* A compression scheme where runs of common values are encoded as a single value and a count
+ *
+ * This is an opaque encoding unless the run lengths are considered metadata.
+ *
+ * The input is a single data block of any kind.
+ * There are two outputs:
+ * - A data block of the same kind as the input (the run values)
+ * - A fixed-width data block containing the lengths of the runs
+ */
+message Rle {
+  // The compression used to store the run values data block
+  CompressiveEncoding values = 1;
+  // The compression used to store the run lengths data block
+  CompressiveEncoding run_lengths = 2;
+}
+
+/* Converts a fixed-size-list of values into a flattened list of values
+ *
+ * This encoding does not actually compress the data, it just flattens out the FSL layers.
+ *
+ * This is a transparent encoding.
+ *
+ * The input is a single block of fixed-width data (with a wide width and few items)
+ * The output is a single block of fixed-width data (with a narrow width and many items)
+ */
+message FixedSizeList {
+  // The number of items in this layer of FSL
+  uint64 items_per_value = 1;
+  // Whether or not there is a validity buffer
+  bool has_validity = 3;
+  // The compression used to store the flattened values data block
+  CompressiveEncoding values = 2;
+}
+
+/* Packs a struct containing only fixed-width children into a single fixed-width data block
+ *
+ * The children are concatenated row by row and stored as a single fixed-width buffer. This is
+ * the fixed-width packed struct representation.
+ */
+message PackedStruct {
+  // The number of bits contributed by each child field in the packed row
+  repeated uint64 bits_per_value = 1;
+  // The compression used to store the packed fixed-width values
+  CompressiveEncoding values = 2;
+}
+
+/* Variable-width packed struct encoding
+ *
+ * Each child value is compressed independently before being transposed into
+ * a row-major layout. This preserves per-field compression boundaries at the
+ * cost of disabling mini-block compression. The compression variant selects
+ * this representation independently from fixed-width PackedStruct.
+ */
+message VariablePackedStruct {
+  // Per-field encoding metadata in struct order
+  repeated FieldEncoding fields = 1;
+
+  // Encoding description for a single child field
+  message FieldEncoding {
+    // Compression applied to individual field values before transposition
+    CompressiveEncoding value = 1;
+    oneof layout {
+      // Bit width of each compressed value (when fixed width)
+      uint64 bits_per_value = 2;
+      // Bit width of the length prefix for variable-width compressed values
+      uint64 bits_per_length = 3;
+    }
+  }
+}
+
+/* A compression scheme that wraps the underlying data with general compression
+ *
+ * Note: The application of wrapped compression will depend on the layout of the data.
+ * If we apply it to mini-block data then we compress entire mini-blocks.  If we apply
+ * it to full-zip data then we compress each value individually.
+ *
+ * Note: Wrapped compression is somewhat unique at the moment as it is applied to the
+ * output of the inner encoding and not the input like all other compressive encodings.
+ *
+ * Note: General compression can usually be applied in two spots.  We can apply
+ * it to individual buffers or we can apply it here, to the entire array.
+ *
+ * For example, let's say we are storing mini-blocks of strings and we are using
+ * FSST and bitpacking the offsets.  We have something like this...
+ *
+ * WRAPPED(†3) -> FSST -> VARIABLE -(offsets)-> INLINE_BITPACKING -(data)-> FLAT -> BUFFER (†1)
+ *                                 -(data)-> BUFFER (†2)
+ *
+ * General compression can be applied at †1, †2, or †3 (or any combination of these).
+ *
+ * If we apply it at †1 then we apply it just to the bitpacked offsets
+ * If we apply it at †2 then we apply it just to the FSST compressed data
+ * If we apply it at †3 then we apply it to the entire mini-block (both offsets and data)
+ *
+ * The input is a single data block of any kind.
+ * The output is a single data block of the same kind as the input.
+ */
+message General {
+  // The compression to apply to the values
+  BufferCompression compression = 1;
+  // The compression used to store the output data block
+  CompressiveEncoding values = 3;
+}
+
+/* A compression scheme where fixed-width values are transposed into a series of byte streams
+ *
+ * This is commonly used for floating point values where the upper bits (the mantissa) have a
+ * significantly different meaning than the lower bits.  By splitting the values into byte streams
+ * we group the mantissa bits together and the exponent bits together.  The end result is typically
+ * more compressible.
+ *
+ * Note that this encoding is mostly useful when combined with other encodings.  It does not do any
+ * compression on its own.
+ *
+ * This is an opaque encoding.
+ *
+ * The input is a fixed-width data block
+ * The output is a single fixed-width data block
+ */
+message ByteStreamSplit {
+  // The compression used to store the values
+  CompressiveEncoding values = 1;
+}
+
+// An encoding that compresses a data block into buffers
+message CompressiveEncoding {
+    oneof compression {
+        Flat flat = 1;
+        Variable variable = 2;
+        Constant constant = 3;
+        OutOfLineBitpacking out_of_line_bitpacking = 4;
+        InlineBitpacking inline_bitpacking = 5;
+        Fsst fsst = 6;
+        Dictionary dictionary = 7;
+        Rle rle = 8;
+        ByteStreamSplit byte_stream_split = 9;
+        General general = 10;
+        FixedSizeList fixed_size_list = 11;
+        PackedStruct packed_struct = 12;
+        VariablePackedStruct variable_packed_struct = 13;
+        Range range = 14;
+        Delta delta = 15;
+    }
+}

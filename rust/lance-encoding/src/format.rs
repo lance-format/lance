@@ -32,6 +32,12 @@ pub mod pb21 {
     include!(concat!(env!("OUT_DIR"), "/lance.encodings21.rs"));
 }
 
+/// Metadata for the unstable 2.3 planar page format.
+pub mod pb23 {
+    #![allow(clippy::all)]
+    include!(concat!(env!("OUT_DIR"), "/lance.encodings23.rs"));
+}
+
 use pb::{
     ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Block, Dictionary, FixedSizeBinary,
     FixedSizeList, Flat, Fsst, InlineBitpacking, Nullable, OutOfLineBitpacking, PackedStruct,
