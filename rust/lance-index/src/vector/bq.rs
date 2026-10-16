@@ -25,6 +25,7 @@ pub mod partition_codes;
 mod plane_cache;
 pub mod planes;
 pub mod prune;
+pub mod raw_body;
 pub(crate) mod resident;
 pub mod rotation;
 pub mod scan_stats;
