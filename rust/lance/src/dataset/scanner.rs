@@ -6718,61 +6718,82 @@ impl Scanner {
                         None
                     }
                 }
-            }
-            // An index can only answer a query on the column it is keyed on, which is
-            // always `fields[0]`. Not `contains`: `fields` also lists columns the index
-            // merely carries values for, which it cannot search. Not a boundary derived
-            // from `covering_fields` either -- that is computed from a field older
-            // writers drop, so it would widen to the carried columns exactly when the
-            // declaration is lost.
-            else if let Some(index) = indices.iter().find(|i| {
-                i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
-            }) {
-                // Try to get metric type from index metadata first (fast path for newer indices)
-                let index_metric = if let Some(metric) =
-                    crate::index::vector::details::metric_type_from_index_metadata(index)
-                {
-                    metric
-                } else {
-                    // Fall back to opening the index for legacy indices without details
-                    let idx = self
-                        .dataset
-                        .open_vector_index(q.column.as_str(), &index.uuid, &NoOpMetricsCollector)
-                        .await?;
-                    idx.metric_type()
-                };
+            } else {
+                // An index can only answer a query on the column it is keyed on, which
+                // is always `fields[0]`. Not `contains`: `fields` also lists columns the
+                // index merely carries values for, which it cannot search. Not a boundary
+                // derived from `covering_fields` either -- that is computed from a field
+                // older writers drop, so it would widen to the carried columns exactly
+                // when the declaration is lost.
+                let candidates = indices.iter().filter(|i| {
+                    i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+                });
 
-                let use_this_index = match q.metric_type {
-                    Some(user_metric) => {
-                        if user_metric == index_metric {
-                            true
+                // A column may carry several vector indices with different metrics. The
+                // query's metric has to take part in *selecting* one, not merely veto the
+                // first candidate: picking the first keyed index and then rejecting it on
+                // a metric mismatch brute-forced the whole column even when another index
+                // on it had exactly the requested metric (issue #9873).
+                let mut selected: Option<(&IndexMetadata, MetricType)> = None;
+                let mut saw_candidate = false;
+                for index in candidates {
+                    saw_candidate = true;
+                    // Resolve the metric from index metadata first (fast path for newer
+                    // indices); open the index only for legacy candidates without details.
+                    let index_metric = if let Some(metric) =
+                        crate::index::vector::details::metric_type_from_index_metadata(index)
+                    {
+                        metric
+                    } else {
+                        self.dataset
+                            .open_vector_index(
+                                q.column.as_str(),
+                                &index.uuid,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?
+                            .metric_type()
+                    };
+                    match q.metric_type {
+                        // No metric requested: the first keyed index answers, as before.
+                        None => {
+                            selected = Some((index, index_metric));
+                            break;
+                        }
+                        Some(user_metric) if user_metric == index_metric => {
+                            selected = Some((index, index_metric));
+                            break;
+                        }
+                        // Metric mismatch: keep looking at the column's other indices.
+                        Some(_) => continue,
+                    }
+                }
+
+                match selected {
+                    Some((index, index_metric)) => {
+                        let index_segments = self.retain_relevant_index_segments(
+                            self.dataset.load_indices_by_name(&index.name).await?,
+                        );
+                        let index_frags = self.get_indexed_frags(&index_segments);
+                        if !index_segments.is_empty() && !index_frags.is_empty() {
+                            Some((index.name.clone(), index_segments, index_metric))
                         } else {
-                            log::warn!(
-                                "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
-                                user_metric,
-                                index_metric
-                            );
-                            false
+                            None
                         }
                     }
-                    None => true,
-                };
-
-                if use_this_index {
-                    let index_segments = self.retain_relevant_index_segments(
-                        self.dataset.load_indices_by_name(&index.name).await?,
-                    );
-                    let index_frags = self.get_indexed_frags(&index_segments);
-                    if !index_segments.is_empty() && !index_frags.is_empty() {
-                        Some((index.name.clone(), index_segments, index_metric))
-                    } else {
+                    None => {
+                        if saw_candidate {
+                            // Every index on this column uses a different metric than the
+                            // query asked for, so none can accelerate it.
+                            log::warn!(
+                                "Requested metric {:?} does not match any index on column '{}', falling back to brute-force search",
+                                q.metric_type,
+                                q.column
+                            );
+                        }
                         None
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
             }
         } else {
             None
@@ -8817,6 +8838,17 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index_with_metric(&mut self, metric: MetricType) -> Result<()> {
+            self.make_named_vector_index_with_metric("idx", metric)
+                .await
+        }
+
+        /// Build an IVF_PQ index on the `vec` column under an explicit name, so a
+        /// test can place several indices with different metrics on one column.
+        pub async fn make_named_vector_index_with_metric(
+            &mut self,
+            name: &str,
+            metric: MetricType,
+        ) -> Result<()> {
             let mut params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
             // Two partitions over 400 vectors only holds at a sample rate this
             // fixture can cover: the trained count is capped at the vectors
@@ -8828,7 +8860,7 @@ pub mod test_dataset {
                 .create_index(
                     &["vec"],
                     IndexType::Vector,
-                    Some("idx".to_string()),
+                    Some(name.to_string()),
                     &params,
                     true,
                 )
@@ -13711,6 +13743,54 @@ mod test {
         assert!(
             plan.contains("ANNSubIndex") && plan.to_lowercase().contains("l2"),
             "Expected ANN index with L2 metric in plan:\n{}",
+            plan
+        );
+    }
+
+    /// A column can carry more than one vector index. The query's metric has to
+    /// take part in selecting which index answers, not merely veto the first one
+    /// keyed on the column: a cosine query on a column holding both an L2 and a
+    /// cosine index must reach the cosine index instead of brute-forcing.
+    /// Regression test for https://github.com/lance-format/lance/issues/9873
+    #[tokio::test]
+    async fn test_knn_selects_index_matching_requested_metric() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        // Two indices on the same `vec` column: L2 created first, cosine second.
+        test_ds
+            .make_named_vector_index_with_metric("idx_l2", MetricType::L2)
+            .await
+            .unwrap();
+        test_ds
+            .make_named_vector_index_with_metric("idx_cos", MetricType::Cosine)
+            .await
+            .unwrap();
+
+        let dataset = &test_ds.dataset;
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        // The cosine query must use the cosine index. Before the fix the first
+        // keyed index (idx_l2) was selected, vetoed on the metric mismatch, and
+        // the whole column brute-forced even though idx_cos matched.
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.distance_metric(MetricType::Cosine);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex") && plan.to_lowercase().contains("cosine"),
+            "Expected the cosine index to answer a cosine query, got plan:\n{}",
+            plan
+        );
+
+        // An L2 query still selects the L2 index.
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.distance_metric(MetricType::L2);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex") && plan.to_lowercase().contains("l2"),
+            "Expected the L2 index to answer an L2 query, got plan:\n{}",
             plan
         );
     }
