@@ -117,6 +117,7 @@ include = [
     "python/lance/file.py",
     "python/lance/util.py",
     "python/lance/arrow.py",
+    "python/lance/mem_wal.py",
     "python/tests/test_arrow.py",
     "python/tests/test_fragment_typing.py",
     "python/tests/test_udf.py",
