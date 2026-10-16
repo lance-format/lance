@@ -77,12 +77,20 @@ impl PartitionTransformer {
             .column_by_name(&self.output_column)
             .expect("checked by the caller")
             .as_primitive::<UInt32Type>();
+        let num_centroids = self.centroids.len();
         let mut dists = Vec::with_capacity(fsl.len());
         for (vector, part_id) in fsl.iter().zip(part_ids.iter()) {
             let (Some(vector), Some(part_id)) = (vector, part_id) else {
                 dists.push(None);
                 continue;
             };
+            // The ids can come from the caller (a precomputed partitions file
+            // or shuffle buffers), so they are checked before indexing.
+            if part_id as usize >= num_centroids {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "partition id {part_id} is out of range for {num_centroids} centroids"
+                )));
+            }
             let centroid = self.centroids.slice(part_id as usize, 1);
             let dist = self.distance_type.arrow_batch_func()(vector.as_ref(), &centroid)?;
             dists.push(Some(dist.value(0)));
@@ -341,6 +349,30 @@ mod tests {
             .as_primitive::<arrow_array::types::Float32Type>();
         assert!((dists.value(0) - 99.0_f32 * 99.0 * 2.0).abs() < 1e-3);
         assert!((loss_of(&output) - 99.0_f64 * 99.0 * 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_rejects_a_chosen_partition_beyond_the_centroids() {
+        let batch = vector_batch(vec![vec![1.0, 1.0]])
+            .try_with_column(
+                PART_ID_FIELD.clone(),
+                Arc::new(UInt32Array::from(vec![5_u32])),
+            )
+            .unwrap();
+        let error = transformer()
+            .with_distance(true)
+            .transform(&batch)
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("partition id 5 is out of range for 2 centroids"),
+            "{error}"
+        );
     }
 
     #[test]

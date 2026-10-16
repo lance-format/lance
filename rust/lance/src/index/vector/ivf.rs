@@ -5493,6 +5493,7 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::progress::noop_progress;
     use lance_index::scalar::OldIndexDataFilter;
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
@@ -6088,6 +6089,79 @@ mod tests {
             .unwrap();
         assert_eq!(1, results.len());
         assert_eq!(5, results[0].num_rows());
+    }
+
+    /// A precomputed partitions file is user data. Its ids index the centroids
+    /// in the transform, so IVF_PQ's residual step and IVF_RQ's distance to the
+    /// chosen centroid reach a bad id before the shuffler's own range check
+    /// (`v3/shuffler.rs`) can run.
+    #[rstest]
+    #[case::ivf_pq(IndexType::IvfPq)]
+    #[case::ivf_rq(IndexType::IvfRq)]
+    #[tokio::test]
+    async fn test_create_index_rejects_out_of_range_precomputed_partition(
+        #[case] index_type: IndexType,
+    ) {
+        let test_dir = TempStrDir::default();
+        let test_uri = format!("{}/ds", test_dir.as_str());
+        let partitions_uri = format!("{}/parts", test_dir.as_str());
+
+        let (mut dataset, _) = generate_test_dataset(&test_uri, 0.0..1.0).await;
+        let num_rows = dataset.count_rows(None).await.unwrap() as u64;
+
+        // Partition 7 does not exist in a 2-partition index.
+        let parts_schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("partition", DataType::UInt32, false),
+        ]));
+        let parts_batch = RecordBatch::try_new(
+            parts_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..num_rows).map(|i| if i == 3 { 7 } else { 0 }),
+                )),
+            ],
+        )
+        .unwrap();
+        let parts_reader =
+            RecordBatchIterator::new(vec![parts_batch].into_iter().map(Ok), parts_schema);
+        Dataset::write(parts_reader, &partitions_uri, None)
+            .await
+            .unwrap();
+
+        let centroids = generate_random_array(2 * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+        ivf_params.precomputed_partitions_file = Some(partitions_uri);
+        let params = match index_type {
+            IndexType::IvfPq => {
+                let pq_params =
+                    PQBuildParams::with_codebook(4, 8, Arc::new(generate_random_array(256 * DIM)));
+                VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfRq => VectorIndexParams::with_ivf_rq_params(
+                MetricType::L2,
+                ivf_params,
+                RQBuildParams::default(),
+            ),
+            _ => unreachable!("not a case of this test"),
+        };
+
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect_err("an out-of-range precomputed partition must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("partition id 7") && message.contains("out of range for 2"),
+            "the error must name the id and the partition count: {message}"
+        );
     }
 
     fn partition_ids(mut ids: Vec<u64>, num_parts: u32) -> Vec<Vec<u64>> {
