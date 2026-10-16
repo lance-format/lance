@@ -836,7 +836,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
+                data: data.slice_with_length(first as usize, last as usize - first as usize),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 64,
                 num_values,
@@ -866,7 +866,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
+                data: data.slice_with_length(first as usize, last as usize - first as usize),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 32,
                 num_values,
@@ -1967,6 +1967,48 @@ mod tests {
             } else {
                 panic!("Expected VariableWidth block");
             }
+        }
+    }
+
+    #[test]
+    fn test_binary_miniblock_slices_values_zero_copy() {
+        use super::BinaryMiniBlockDecompressor;
+        use crate::buffer::LanceBuffer;
+        use crate::compression::MiniBlockDecompressor;
+        use crate::data::DataBlock;
+
+        // The value region of a chunk is handed out as a shared slice of the chunk
+        // buffer, not as a fresh allocation: a page is decoded chunk by chunk, so a
+        // copy here copies every value byte read out of it.
+        for (bits_per_offset, offsets, values) in [
+            (32u8, vec![12u64, 15, 20], b"ABCXYZ".to_vec()),
+            (64u8, vec![24u64, 29, 40], b"HelloWorld".to_vec()),
+        ] {
+            let mut chunk = Vec::new();
+            for offset in &offsets {
+                if bits_per_offset == 32 {
+                    chunk.extend_from_slice(&(*offset as u32).to_le_bytes());
+                } else {
+                    chunk.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            chunk.extend_from_slice(&values);
+            chunk.resize(*offsets.last().unwrap() as usize, 0);
+            let buffer = LanceBuffer::from(chunk);
+            let chunk_start = buffer.as_ref().as_ptr() as usize;
+
+            let decompressor = BinaryMiniBlockDecompressor::new(bits_per_offset).unwrap();
+            let DataBlock::VariableWidth(block) = decompressor.decompress(vec![buffer], 2).unwrap()
+            else {
+                panic!("expected a variable-width block");
+            };
+
+            assert_eq!(
+                block.data.as_ref().as_ptr() as usize,
+                chunk_start + offsets[0] as usize,
+                "value region must point into the chunk buffer, not a copy of it"
+            );
+            assert_eq!(&block.data.as_ref()[..values.len()], &values[..]);
         }
     }
 
