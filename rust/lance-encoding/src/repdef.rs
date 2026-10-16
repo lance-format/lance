@@ -1945,7 +1945,9 @@ impl RepDefUnraveler {
             //  def: 1 1 1 0 1 1 0
             //
             // Maybe there's some special logic for empty/null lists?  I'll save the headache for future me.
-            todo!("Not yet supported FSL<...List<...>>");
+            return Err(Error::not_supported(
+                "Reading a column that combines a fixed-size-list with a list-like layer is not yet supported: the fixed-size-list layer cannot decimate repetition levels",
+            ));
         }
         let Some(def_levels) = self.def_levels.as_mut() else {
             return Ok(());
@@ -3141,6 +3143,48 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl_over_list_is_not_supported() {
+        // A fixed-size-list whose child contains a list serializes repetition levels, and
+        // decimating those through the fixed-size dimension is not implemented.  The write
+        // side accepts such a column, so the read side has to report it instead of hitting
+        // the todo!() this used to end in (which panicked inside a decode task).
+        //
+        // Layers as the writer emits them for FSL<Struct<List<Int32>>>: the fixed-size-list
+        // layer, then the struct layer, then the list offsets, then the leaf validity.
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, true])), 2, 2);
+        builder.add_no_null(4);
+        builder.add_offsets(offsets_32(&[0, 2, 2, 3, 5]), None);
+        builder.add_validity_bitmap(validity(&[true, true, true, true, true]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+            5,
+        )]);
+
+        // Consume the inner layers in the order the decoder does, so the fixed-size-list
+        // layer is the one that fails
+        unraveler.unravel_validity(5).unwrap();
+        unraveler.unravel_offsets::<i32>().unwrap();
+        unraveler.unravel_validity(4).unwrap();
+
+        let err = unraveler.unravel_fsl_validity(2, 2).unwrap_err();
+        assert!(matches!(err, lance_core::Error::NotSupported { .. }));
+        assert!(
+            err.to_string()
+                .contains("cannot decimate repetition levels"),
             "unexpected error: {}",
             err
         );
