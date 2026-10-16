@@ -21,6 +21,10 @@ geo-types = { workspace = true, optional = true }
 lance-core.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+rstest.workspace = true
+tokio.workspace = true
+
 [features]
 geo = ["dep:geoarrow-array", "dep:geoarrow-schema", "dep:geodatafusion", "dep:geo-traits", "dep:geo-types"]
 

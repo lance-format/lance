@@ -4879,7 +4879,9 @@ dependencies = [
  "geoarrow-schema",
  "geodatafusion",
  "lance-core",
+ "rstest",
  "serde",
+ "tokio",
 ]
 
 [[package]]
