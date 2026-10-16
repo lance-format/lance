@@ -998,13 +998,20 @@ pub(crate) async fn merge_segments(
         source_indices.push(Arc::new(inverted_index.clone()));
     }
 
+    // Like the BTree merge, each source keeps only its rows still stored in the
+    // fragments it covers, so a stale posting for a row that moved into another
+    // source's fragment is not carried into the merged segment.
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let (_, old_data_filters) =
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
+
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
-        None,
+        &old_data_filters,
         lance_index::progress::noop_progress(),
     )
     .await?;

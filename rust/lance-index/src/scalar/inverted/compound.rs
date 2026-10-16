@@ -4387,6 +4387,7 @@ async fn compound_search_impl(
     let mut collector = TopKCollector::with_competitive_score(limit, competitive_score);
 
     for (segment_ordinal, index) in indices.iter().enumerate() {
+        let mask = index.restrict_mask(mask.clone());
         let loads =
             index
                 .partitions
