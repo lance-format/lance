@@ -6920,6 +6920,51 @@ def test_file_reader_options(tmp_path: Path):
     assert iops_scanner <= iops_without_cache
 
 
+def test_transaction_audit_fields(tmp_path):
+    import uuid
+
+    from lance.mem_wal import CompactedSsTable
+
+    dataset = lance.write_dataset(pa.table({"id": [1, 2]}), tmp_path / "base")
+    dataset = lance.write_dataset(
+        pa.table({"id": [3, 4]}), tmp_path / "base", mode="append"
+    )
+
+    empty = lance.LanceOperation.UpdateMemWalState()
+    tagged = lance.Transaction(
+        read_version=dataset.version, operation=empty, tag="audit-window"
+    )
+    dataset = lance.LanceDataset.commit(dataset, tagged)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.tag == "audit-window"
+    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
+    assert list(read_back.operation.compacted_sstables) == []
+
+    shard_id = str(uuid.uuid4())
+    recorded = lance.LanceOperation.UpdateMemWalState(
+        compacted_sstables=[CompactedSsTable(shard_id, 3)]
+    )
+    with pytest.raises(OSError, match="__lance_mem_wal"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.Transaction(read_version=dataset.version, operation=recorded),
+        )
+
+    update = lance.LanceOperation.Update(
+        compacted_sstables=[CompactedSsTable(shard_id, 1)]
+    )
+    with pytest.raises(OSError, match="__lance_mem_wal"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.Transaction(read_version=dataset.version, operation=update),
+        )
+
+    dataset.optimize.compact_files()
+    rewrite = dataset.read_transaction(dataset.version)
+    assert isinstance(rewrite.operation, lance.LanceOperation.Rewrite)
+    assert rewrite.operation.frag_reuse_index is None
+
+
 def test_read_transaction_properties(tmp_path):
     """Test retrieving properties from transactions at different versions."""
     # Create schema and data for the dataset

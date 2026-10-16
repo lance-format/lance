@@ -6125,12 +6125,22 @@ class BulkCommitResult(TypedDict):
 
 @dataclass
 class Transaction:
+    """A dataset change based on one read version.
+
+    Attributes
+    ----------
+    tag: str, optional
+        Optional label stored with the transaction and returned by
+        :meth:`LanceDataset.read_transaction`.
+    """
+
     read_version: int
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
+    tag: Optional[str] = None
 
 
 class Tag(TypedDict):
@@ -6466,6 +6476,9 @@ class LanceOperation:
             each serialized in the portable RoaringBitmap format. Set on
             ``rewrite_columns`` updates over stable row ids so the commit
             refreshes row-level version metadata for the matched rows only.
+        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
+            MemWAL SSTables to record as compacted. An empty list changes
+            nothing. A non-empty list requires a MemWAL index on the table.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6479,6 +6492,9 @@ class LanceOperation:
         )
         update_mode: str = ""
         updated_fragment_offsets: Optional[Dict[int, bytes]] = None
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
+            default_factory=list
+        )
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -6634,6 +6650,9 @@ class LanceOperation:
             Groups of files that have been rewritten.
         rewritten_indices: list[RewrittenIndex]
             Indices that have been rewritten.
+        frag_reuse_index: Index, optional
+            Fragment reuse index entry to install with this rewrite. ``None``
+            leaves the existing entry unchanged.
 
         Warning
         -------
@@ -6641,7 +6660,8 @@ class LanceOperation:
         """
 
         groups: Iterable[LanceOperation.RewriteGroup]
-        rewritten_indices: Iterable[LanceOperation.RewrfittenIndex]
+        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+        frag_reuse_index: Optional[Index] = None
 
         def __post_init__(self):
             all_frags = [old for group in self.groups for old in group.old_fragments]
@@ -6837,6 +6857,23 @@ class LanceOperation:
         table_metadata_updates: Optional[LanceOperation.UpdateMap] = None
         schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
         field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
+
+    @dataclass
+    class UpdateMemWalState(BaseOperation):
+        """Record MemWAL SSTables compacted into the base table.
+
+        An empty list commits as a no-op. A non-empty list requires a MemWAL
+        index (``__lance_mem_wal``) and updates that index's compaction record.
+
+        Attributes
+        ----------
+        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
+            SSTables to mark compacted, one entry per shard.
+        """
+
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
+            default_factory=list
+        )
 
 
 @dataclass
