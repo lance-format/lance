@@ -43,6 +43,15 @@ pub async fn read_manifest(
     } else {
         object_store.inner.head(path).await?.size
     };
+    if file_size < 16 {
+        if known_size.is_some() {
+            return Box::pin(read_manifest(object_store, path, None)).await;
+        }
+        return Err(Error::corrupt_file(
+            path.clone(),
+            format!("Invalid format: manifest is only {file_size} bytes (minimum 16)"),
+        ));
+    }
     const PREFETCH_SIZE: u64 = 64 * 1024;
     let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
     let range = Range {
@@ -262,9 +271,25 @@ mod test {
         reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
     };
     use rand::{Rng, distr::Alphanumeric};
+    use rstest::rstest;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    #[rstest]
+    #[case::listed_size(Some(0))]
+    #[case::head_size(None)]
+    #[tokio::test]
+    async fn test_read_empty_manifest_reports_path(#[case] known_size: Option<u64>) {
+        let store = ObjectStore::memory();
+        let path = Path::from("dataset/_versions/1.manifest");
+        store.inner.put(&path, Bytes::new().into()).await.unwrap();
+
+        let error = read_manifest(&store, &path, known_size).await.unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(error.to_string().contains(path.as_ref()), "{error}");
+        assert!(error.to_string().contains("0 bytes"), "{error}");
+    }
 
     async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
         let store = ObjectStore::memory();

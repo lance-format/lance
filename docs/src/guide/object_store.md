@@ -42,6 +42,29 @@ These options apply to all object stores.
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 
+### Local filesystem durability
+
+Set `local_fsync` to `"true"` for local datasets when writes must be durable
+before they return:
+
+```python
+import lance
+import pyarrow as pa
+
+lance.write_dataset(
+    pa.table({"id": [1]}),
+    "/path/to/data.lance",
+    storage_options={"local_fsync": "true"},
+)
+```
+
+The default is `"false"`. When enabled, Lance syncs local data, transaction,
+and manifest files before reporting successful writes, including copied files
+during deep clones. Local copies use the destination's setting. On Unix it also
+syncs their directory entries, including newly created directories. This increases
+write latency. Pass the option again when reopening a dataset for later writes;
+it is a store setting, not a dataset property. Only `"true"` and `"false"` are accepted.
+
 ### Bulk copy strategy
 
 Lance streams bulk index-file movement and dataset deep-clone files through
