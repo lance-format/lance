@@ -134,6 +134,7 @@ async fn main() {
         let results: HashSet<u32> = hnsw
             .search_basic(q.clone(), k, &params, None, vector_store.as_ref())
             .unwrap()
+            .0
             .iter()
             .map(|node| node.id)
             .collect();
