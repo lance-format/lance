@@ -11903,6 +11903,20 @@ mod tests {
             ErrorCode::TableAlreadyExists,
             "expected TableAlreadyExists error code"
         );
+
+        // A namespace holding the name is the same conflict, and the declare
+        // must leave no marker behind.
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["taken".to_string()]);
+        namespace.create_namespace(create_req).await.unwrap();
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["taken".to_string()]);
+        let err = namespace
+            .declare_table(declare_req)
+            .await
+            .expect_err("declare over a namespace must fail");
+        assert_eq!(mutation_error_code(err), ErrorCode::TableAlreadyExists);
+        assert!(!temp_dir.join("taken.lance").exists());
     }
 
     #[tokio::test]
