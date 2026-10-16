@@ -209,6 +209,31 @@ def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
             time.sleep(0.05)
 
 
+def test_shard_writer_lsm_scanner_reads_frozen_memtables(tmp_path):
+    """A row is readable from the moment ``put`` returns.
+
+    ``max_memtable_batches=1`` seals the MemTable on every put, so each row
+    spends time in a frozen MemTable: no longer the active one, not yet an
+    SSTable. The scanner must read that state too.
+    """
+    ds_path = str(tmp_path / "base")
+    shard_id = str(uuid.uuid4())
+    ds = lance.write_dataset(_lookup_table([0], "base"), ds_path, schema=_LOOKUP_SCHEMA)
+    ds.initialize_mem_wal()
+
+    with ds.mem_wal_writer(
+        shard_id,
+        durable_write=True,
+        max_wal_buffer_size=1,
+        max_wal_flush_interval_ms=10,
+        max_memtable_batches=1,
+    ) as writer:
+        for row_id in range(1, 9):
+            writer.put(_lookup_table([row_id], "writer"))
+            table = writer.lsm_scanner().to_table()
+            assert sorted(table["id"].to_pylist()) == list(range(row_id + 1))
+
+
 def test_shard_writer_delete_binding_masks_base_row(tmp_path):
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
