@@ -8,6 +8,7 @@ nav:
   - Object Store Configuration: object_store.md
   - Observability: observability.md
   - Distributed Write: distributed_write.md
+  - Update Join Strategies: update_join.md
   - Distributed Indexing: distributed_indexing.md
   - Migration Guide: migration.md
   - Performance Guide: performance.md
