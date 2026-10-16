@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use datafusion::{
+    common::tree_node::TreeNodeRecursion,
     error::{DataFusionError, Result},
     execution::TaskContext,
     physical_plan::{
@@ -16,7 +17,7 @@ use datafusion::{
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
     },
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, utils::address::RowAddress};
 use lance_index::prefilter::FilterLoader;
@@ -135,9 +136,9 @@ impl PrefilterUnionExec {
     async fn selection(
         dataset: Arc<Dataset>,
         scope: RoaringBitmap,
-    ) -> lance_core::Result<RowAddrMask> {
+    ) -> lance_core::Result<Arc<RowAddrMask>> {
         if scope.is_empty() {
-            return Ok(RowAddrMask::allow_nothing());
+            return Ok(Arc::new(RowAddrMask::allow_nothing()));
         }
         let missing = &scope - dataset.fragment_bitmap.as_ref();
         if !missing.is_empty() {
@@ -148,12 +149,7 @@ impl PrefilterUnionExec {
         }
         if dataset.manifest().uses_stable_row_ids() {
             // Stable IDs must be selected by their current fragment membership.
-            return Ok(
-                DatasetPreFilter::do_create_deletion_mask_row_id(dataset, Some(scope))
-                    .await?
-                    .as_ref()
-                    .clone(),
-            );
+            return DatasetPreFilter::do_create_deletion_mask_row_id(dataset, Some(scope)).await;
         }
         let mut addresses = RowAddrTreeMap::new();
         for fragment in dataset
@@ -174,7 +170,7 @@ impl PrefilterUnionExec {
             )))?;
             addresses.insert_range(start..start + u64::from(rows));
         }
-        Ok(RowAddrMask::from_allowed(addresses))
+        Ok(Arc::new(RowAddrMask::from_allowed(addresses)))
     }
 }
 
@@ -190,6 +186,13 @@ impl DisplayAs for PrefilterUnionExec {
 }
 
 impl ExecutionPlan for PrefilterUnionExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "PrefilterUnionExec"
     }
@@ -285,7 +288,15 @@ impl ExecutionPlan for PrefilterUnionExec {
             // which can complete its first poll without yielding.
             let (missing, selection, scalar) =
                 futures::try_join!(missing_future, selection, scalar_future)?;
-            IndexExprResult::exact((scalar & selection) | missing)
+            let scalar = match scalar {
+                RowAddrMask::AllowList(mut rows) => {
+                    rows.mask(&selection);
+                    RowAddrMask::from_allowed(rows)
+                }
+                // A complement needs the scope's allow-list to become a finite selection.
+                RowAddrMask::BlockList(_) => scalar & selection.as_ref().clone(),
+            };
+            IndexExprResult::exact(scalar | missing)
                 .serialize(&coverage, format)
                 .map_err(DataFusionError::from)
         };
@@ -308,6 +319,9 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::record_batch;
     use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_plan::execution_plan::{
+        ChildrenPropertiesMode, ReplaceChildrenOptions,
+    };
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch};
     use rstest::rstest;
@@ -452,9 +466,18 @@ mod tests {
         ));
         let rewritten = plan
             .clone()
-            .with_new_children(plan.children().into_iter().cloned().collect())
+            .replace_children(
+                plan.children().into_iter().cloned().collect(),
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .unwrap();
-        let error = plan.clone().with_new_children(vec![]).unwrap_err();
+        let error = plan
+            .clone()
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Plan(_)));
         assert!(error.to_string().contains("expected 2 children"));
         for plan in [plan as Arc<dyn ExecutionPlan>, rewritten] {

@@ -1502,6 +1502,7 @@ impl Scanner {
                     .map(|fragment| fragment.id as u32)
                     .collect();
                 let mut coverage = scope.clone();
+                let has_missing_fragments = !missing_frags.is_empty();
                 let missing = if !self.fast_search && !missing_frags.is_empty() {
                     if filter_plan.full_expr.is_none() {
                         return Err(Error::internal(format!(
@@ -1552,10 +1553,9 @@ impl Scanner {
                 {
                     exec = exec.with_segment_uuids(segment_uuids);
                 }
-                if missing.is_none()
-                    && self.fragments.is_none()
-                    && scope.len() == self.dataset.manifest().fragments.len() as u64
-                {
+                // The consumer bounds hits to its own index fragments. A separate scope
+                // mask is needed only for explicit selections or skipped/missing coverage.
+                if self.fragments.is_none() && !has_missing_fragments {
                     return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(exec)));
                 }
                 let plan = crate::io::exec::PrefilterUnionExec::new(

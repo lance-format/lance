@@ -1579,8 +1579,7 @@ FilterExec: _distance@... IS NOT NULL
             SortExec: TopK(fetch=8), expr=...
               ANNSubIndex: name=..., k=8, deltas=1, metric=L2
                 ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                PrefilterUnion: scalar_fragments=3, evaluated_fragments=3
-                  ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1635,8 +1634,7 @@ FilterExec: _distance@... IS NOT NULL
             SortExec: TopK(fetch=11), expr=...
               ANNSubIndex: name=..., k=11, deltas=1, metric=L2
                 ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                PrefilterUnion: scalar_fragments=3, evaluated_fragments=3
-                  ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     dataset.make_scalar_index().await?;
     assert_plan_equals(
