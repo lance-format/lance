@@ -6,10 +6,11 @@ use arrow_array::{
     UInt32Array,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use futures::StreamExt;
 use lance::dataset::ProjectionRequest;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
@@ -383,6 +384,116 @@ fn bench_sample(c: &mut Criterion) {
     }
 }
 
+/// Sparse logical takes with a deletion vector in every fragment. Dataset opening
+/// is outside the timed region so cold and warm results measure the same operation.
+/// "cold" uses a fresh Lance session; the filesystem cache remains warm.
+fn bench_sparse_take_with_deletions(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("sparse_take_with_deletions");
+    group.sample_size(20);
+    for num_fragments in [8usize, 128, 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        rt.block_on(async {
+            let data = arrow_array::record_batch!((
+                "i",
+                Int32,
+                (0..(num_fragments * 4) as i32).collect::<Vec<_>>()
+            ))
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                uri,
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            dataset.delete("i % 4 = 0").await.unwrap();
+            assert_eq!(dataset.get_fragments().len(), num_fragments);
+        });
+        let offset = (num_fragments * 3 - 1) as u64;
+        for cache in ["cold", "warm"] {
+            let open = || rt.block_on(DatasetBuilder::from_uri(uri).load()).unwrap();
+            let take = |dataset: &Dataset| {
+                rt.block_on(async {
+                    dataset
+                        .take(
+                            &[offset],
+                            ProjectionRequest::from_columns(["i"], dataset.schema()),
+                        )
+                        .await
+                        .unwrap()
+                })
+            };
+            let dataset = open();
+            let object_store = rt.block_on(dataset.object_store(None)).unwrap();
+            if cache == "warm" {
+                take(&dataset);
+            }
+            object_store.io_stats_incremental();
+            let batch = take(&dataset);
+            assert_eq!(batch.num_rows(), 1);
+            let stats = object_store.io_stats_incremental();
+            let deletion_reads: Vec<_> = stats
+                .requests
+                .iter()
+                .filter(|r| {
+                    r.path.parts().any(|part| part.as_ref() == "_deletions") && r.method != "head"
+                })
+                .collect();
+            let deletion_bytes: u64 = deletion_reads
+                .iter()
+                .map(|r| {
+                    r.range
+                        .as_ref()
+                        .map(|range| range.end - range.start)
+                        .unwrap_or_else(|| {
+                            let name = r.path.filename().unwrap();
+                            std::fs::metadata(dir.path().join("_deletions").join(name))
+                                .unwrap()
+                                .len()
+                        })
+                })
+                .sum();
+            // Include the probe's deletion GETs and bytes in Criterion's persisted
+            // benchmark IDs alongside latency, keeping data-file reads separate.
+            let id = BenchmarkId::new(
+                format!(
+                    "{cache}/deletion_gets={}/deletion_bytes={deletion_bytes}",
+                    deletion_reads.len()
+                ),
+                num_fragments,
+            );
+            group.bench_function(id, |b| {
+                if cache == "cold" {
+                    b.iter_batched_ref(
+                        open,
+                        |dataset| {
+                            take(dataset);
+                        },
+                        BatchSize::PerIteration,
+                    );
+                } else {
+                    b.iter_batched_ref(
+                        || {
+                            object_store.io_stats_incremental();
+                            dataset.clone()
+                        },
+                        |dataset| {
+                            take(dataset);
+                        },
+                        BatchSize::PerIteration,
+                    );
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
 async fn create_dataset(
     path: &str,
     data_storage_version: LanceFileVersion,
@@ -462,10 +573,10 @@ criterion_group!(
         .sample_size(10000)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample, bench_sparse_take_with_deletions);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample, bench_sparse_take_with_deletions);
 criterion_main!(benches);
