@@ -4250,3 +4250,73 @@ def test_fts_filter_vector_search(tmp_path):
 
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+@pytest.mark.parametrize("num_bits", range(3, 10))
+def test_layered_rq_precision_and_cascade(tmp_path, num_bits):
+    rng = np.random.default_rng(472)
+    vectors = rng.normal(size=(512, 64)).astype(np.float32)
+    table = pa.table({"vector": pa.FixedSizeListArray.from_arrays(vectors.ravel(), 64)})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=128)
+    dataset.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_bits=num_bits,
+        layered=True,
+        num_partitions=4,
+    )
+    query = vectors[0]
+    nearest = {"column": "vector", "q": query, "k": 100, "nprobes": 4}
+    exact = dataset.to_table(
+        columns=[], with_row_id=True, nearest={**nearest, "use_index": False}
+    )["_rowid"].to_pylist()
+    full = None
+    for precision in ["sign", "high", "full"]:
+        result = dataset.to_table(
+            columns=[], with_row_id=True, nearest={**nearest, "rq_precision": precision}
+        )
+        assert len(set(result["_rowid"].to_pylist()) & set(exact)) >= 50
+        if precision == "full":
+            full = result
+    cold = lance.dataset(tmp_path, index_cache_size_bytes=0)
+    cascade = cold.to_table(
+        columns=[], with_row_id=True, nearest={**nearest, "rq_cascade_factor": 32}
+    )
+    assert cascade.equals(full)
+    with pytest.raises(ValueError, match="rq_precision"):
+        dataset.to_table(nearest={**nearest, "rq_precision": "invalid"})
+    with pytest.raises(ValueError, match="positive"):
+        dataset.to_table(nearest={**nearest, "rq_cascade_factor": 0})
+
+
+@pytest.mark.parametrize("num_bits", [1, 2, 5])
+@pytest.mark.parametrize("layered", ["unset", None, False, True])
+def test_rq_layered_defaults(tmp_path, num_bits, layered):
+    rng = np.random.default_rng(472)
+    vectors = rng.normal(size=(128, 32)).astype(np.float32)
+    dataset = lance.write_dataset(
+        pa.table({"vector": pa.FixedSizeListArray.from_arrays(vectors.ravel(), 32)}),
+        tmp_path,
+        max_rows_per_file=32,
+    )
+    kwargs = {} if layered == "unset" else {"layered": layered}
+    dataset.create_index(
+        "vector", index_type="IVF_RQ", num_bits=num_bits, num_partitions=2, **kwargs
+    )
+    nearest = {
+        "column": "vector",
+        "q": vectors[0],
+        "k": 10,
+        "nprobes": 2,
+        "refine_factor": 13,
+    }
+    exact = dataset.to_table(
+        columns=[], with_row_id=True, nearest={**nearest, "use_index": False}
+    )["_rowid"].to_pylist()
+    result = dataset.to_table(columns=[], with_row_id=True, nearest=nearest)
+    assert len(set(result["_rowid"].to_pylist()) & set(exact)) >= 5
+    if num_bits > 2 and layered is True:
+        assert len(dataset.to_table(nearest={**nearest, "rq_precision": "high"})) == 10
+    else:
+        with pytest.raises(ValueError, match="rq_precision"):
+            dataset.to_table(nearest={**nearest, "rq_precision": "high"})

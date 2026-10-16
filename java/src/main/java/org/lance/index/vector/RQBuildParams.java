@@ -15,16 +15,21 @@ package org.lance.index.vector;
 
 import com.google.common.base.MoreObjects;
 
+import java.util.Optional;
+
 /** Parameters for building a Rabit Quantizer (RQ) index stage. Defaults to 5 bits per dimension. */
 public class RQBuildParams {
   private final byte numBits;
+  private final Optional<Boolean> layered;
 
   private RQBuildParams(Builder builder) {
     this.numBits = builder.numBits;
+    this.layered = builder.layered;
   }
 
   public static class Builder {
     private byte numBits = 5;
+    private Optional<Boolean> layered = Optional.empty();
 
     public Builder() {}
 
@@ -37,9 +42,28 @@ public class RQBuildParams {
       return this;
     }
 
+    /** Override the product default for prefix planes; ignored for 1 or 2 bits. */
+    public Builder setLayered(boolean layered) {
+      this.layered = Optional.of(layered);
+      return this;
+    }
+
     public RQBuildParams build() {
       return new RQBuildParams(this);
     }
+  }
+
+  /**
+   * @deprecated Use {@link #getLayeredOption()} to preserve the product default.
+   */
+  @Deprecated
+  public boolean getLayered() {
+    return layered.orElse(false);
+  }
+
+  /** Empty uses the product default: false in OSS, true in Enterprise. */
+  public Optional<Boolean> getLayeredOption() {
+    return layered;
   }
 
   public byte getNumBits() {

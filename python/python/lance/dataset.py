@@ -4564,6 +4564,14 @@ class LanceDataset(pa.dataset.Dataset):
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
+            - layered
+                Enable independently readable sign/high/low planes. Default is
+                None, which resolves to False in OSS and True in Enterprise.
+                An explicit boolean overrides the product default. Widths 1 and 2
+                always use the single-plane layout, even when layered is True.
+                Supports total widths 3 through 9: 3 (1+1+1), 4 (1+2+1),
+                5 (1+2+2), 6 (1+4+1), 7 (1+4+2), 8 (1+4+3), and 9 (1+4+4).
+                This layout requires a layered-capable reader.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -7231,6 +7239,8 @@ class ScannerBuilder:
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
+        rq_precision: Literal["sign", "high", "full"] = "full",
+        rq_cascade_factor: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7268,7 +7278,20 @@ class ScannerBuilder:
             RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
-            recall and may increase latency.
+            recall and may increase latency. Layered RQ uses the native angular
+            confidence policy in normal mode and a conservative estimator-difference
+            pruning bound in accurate mode. Neither requires raw-vector refinement.
+        rq_precision: {"sign", "high", "full"}, default "full"
+            Select a stored level of a layered IVF_RQ index. High uses 2 total
+            bits for RQ3, 3 for RQ4/RQ5, and 5 for RQ6 through RQ9.
+            Non-layered indexes only
+            support full. The legacy approx_mode="fast" still scores binary codes.
+        rq_cascade_factor: int, optional
+            Positive oversampling factor for quantized candidate reranking.
+            Requires layered full precision and normal/accurate approx_mode.
+            Lower planes are fetched only for candidates; no raw-vector Take is
+            required. refine_factor may additionally refine with data-file vectors.
+            Range queries and row-id remapping use complete partition scoring.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7283,6 +7306,8 @@ class ScannerBuilder:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            rq_precision=rq_precision,
+            rq_cascade_factor=rq_cascade_factor,
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
@@ -8524,6 +8549,8 @@ def _build_vector_search_query(
     query_parallelism: Optional[int] = None,
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+    rq_precision: Literal["sign", "high", "full"] = "full",
+    rq_cascade_factor: Optional[int] = None,
     search_effort: Optional[float] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -8671,6 +8698,8 @@ def _build_vector_search_query(
         "ef": ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
+        "rq_precision": rq_precision,
+        "rq_cascade_factor": rq_cascade_factor,
         "search_effort": search_effort,
         "distance_range": distance_range,
     }
@@ -8837,6 +8866,8 @@ class VectorSearchQuery:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         search_effort: Optional[float] = None,
+        rq_precision: Literal["sign", "high", "full"] = "full",
+        rq_cascade_factor: Optional[int] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -8850,6 +8881,8 @@ class VectorSearchQuery:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            rq_precision=rq_precision,
+            rq_cascade_factor=rq_cascade_factor,
             approx_mode=approx_mode,
             search_effort=search_effort,
         )

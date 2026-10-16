@@ -25,6 +25,7 @@ import org.lance.index.vector.VectorTrainer;
 import org.lance.ipc.AsyncScanner;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.Query;
+import org.lance.ipc.RQPrecision;
 import org.lance.ipc.ScanOptions;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -470,14 +471,23 @@ public class VectorIndexTest {
     }
   }
 
-  @Test
-  public void testCreateIvfRqIndex(@TempDir Path tempDir) throws Exception {
+  @ParameterizedTest
+  @CsvSource({
+    "1,true", "2,true", "5,", "5,false", "3,true", "4,true", "5,true", "6,true", "7,true", "8,true",
+    "9,true"
+  })
+  public void testCreateIvfRqIndex(int bits, Boolean layered, @TempDir Path tempDir)
+      throws Exception {
     Path datasetPath = tempDir.resolve("ivf_rq_index");
 
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
       try (Dataset dataset = testVectorDataset.create()) {
         IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
-        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).build();
+        RQBuildParams.Builder rqBuilder = new RQBuildParams.Builder().setNumBits((byte) bits);
+        if (layered != null) {
+          rqBuilder.setLayered(layered);
+        }
+        RQBuildParams rq = rqBuilder.build();
 
         VectorIndexParams vectorIndexParams =
             VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
@@ -510,6 +520,39 @@ public class VectorIndexTest {
         assertTrue(
             indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+        boolean isLayered = bits > 2 && Boolean.TRUE.equals(layered);
+        RQPrecision[] precisions =
+            isLayered ? RQPrecision.values() : new RQPrecision[] {RQPrecision.FULL};
+        for (RQPrecision precision : precisions) {
+          Query.Builder query =
+              new Query.Builder()
+                  .setColumn(TestVectorDataset.vectorColumnName)
+                  .setKey(new float[32])
+                  .setK(5)
+                  .setNprobes(2)
+                  .setRqPrecision(precision);
+          if (isLayered && precision == RQPrecision.FULL) {
+            query.setRqCascadeFactor(8);
+          }
+          try (LanceScanner scanner =
+                  dataset.newScan(new ScanOptions.Builder().nearest(query.build()).build());
+              ArrowReader reader = scanner.scanBatches()) {
+            int rows = 0;
+            int correct = 0;
+            while (reader.loadNextBatch()) {
+              rows += reader.getVectorSchemaRoot().getRowCount();
+              IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+              for (int i = 0; i < ids.getValueCount(); i++) {
+                // Each of the five fragments has the same nearest vector at offset zero.
+                if (ids.get(i) % 80 == 0) {
+                  correct++;
+                }
+              }
+            }
+            assertEquals(5, rows);
+            assertTrue(correct / 5.0 >= 0.5, "Expected recall >= 0.5 for " + precision);
+          }
+        }
       }
     }
   }
