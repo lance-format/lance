@@ -16,6 +16,20 @@ Pages are designed so readers can fetch contiguous row ranges with a small and p
 
 The file layer does not bundle table-level statistics or query-side indices into the base file structure. Those capabilities are defined as separate index formats so they can evolve independently of the core file container.
 
+### Encodings as Extensions, Not Built-Ins
+
+Most columnar file formats bundle a fixed catalog of encodings directly into the format specification. Adding a new one means changing the spec and updating every reader implementation, which is slow and tends to fragment the ecosystem as readers fall in and out of sync with which encodings they support.
+
+Lance takes the opposite approach. The file container itself has no built-in concept of encoding, and no built-in type system. A Lance file is only aware of columns, pages, and buffers; how the bytes in those buffers should be interpreted is entirely up to the encoding that produced them. Encodings are described using self-describing protobuf messages attached to the column metadata, so a reader can identify which encoding a page uses even if it does not know how to decode it, and can surface a clear "unsupported encoding" error rather than silently misreading the data.
+
+This is why the file structure below is described as a *container specification* rather than a file format in the traditional sense — comparable to how a video container (e.g. MP4) separates the container from the codecs used to fill it. It means:
+
+- New encodings, including experimental or workload-specific ones, can be introduced without changing the container format, the file writer, or unrelated file readers.
+- Different columns in the same file, or even different pages in the same column, can use different encodings.
+- The container format can stay stable and simple while the [encoding strategy](encoding.md) evolves quickly underneath it.
+
+See the [Encoding Strategy](encoding.md) page for how Lance's default encodings are built on top of this container.
+
 ## File Structure
 
 A Lance file is a container for tabular data. The data is stored in "disk pages". Each disk page contains some rows
