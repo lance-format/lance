@@ -174,6 +174,7 @@ fn dict_encode_variable_width<T>(
     bits_per_offset: u8,
     max_dict_entries: u32,
     max_encoded_size: usize,
+    max_dict_bytes: usize,
 ) -> Option<(DataBlock, DataBlock)>
 where
     T: ArrowNativeType,
@@ -224,6 +225,9 @@ where
                     return None;
                 }
                 dictionary_buffer.extend_from_slice(key);
+                if dictionary_buffer.len() > max_dict_bytes {
+                    return None;
+                }
                 let dict_offset = T::from_usize(dictionary_buffer.len())?;
                 dictionary_offsets_buffer.push(dict_offset);
                 let idx = curr_idx;
@@ -274,11 +278,16 @@ where
 ///
 /// Currently only supported for some common cases (string / binary / 64-bit / 128-bit)
 ///
+/// Gives up (returns `None`) once the dictionary would exceed `max_dict_entries` entries,
+/// once dictionary plus indices would exceed `max_encoded_size`, or, for variable-width
+/// values, once the dictionary values would exceed `max_dict_bytes`.
+///
 /// Returns a block of indices (will always be a fixed width data block) and a block of dictionary
 pub fn dictionary_encode(
     data_block: &DataBlock,
     max_dict_entries: u32,
     max_encoded_size: usize,
+    max_dict_bytes: usize,
 ) -> Option<(DataBlock, DataBlock)> {
     match data_block {
         DataBlock::FixedWidth(fixed_width_data_block) => {
@@ -412,12 +421,14 @@ pub fn dictionary_encode(
                     32,
                     max_dict_entries,
                     max_encoded_size,
+                    max_dict_bytes,
                 ),
                 64 => dict_encode_variable_width::<u64>(
                     variable_width_data_block,
                     64,
                     max_dict_entries,
                     max_encoded_size,
+                    max_dict_bytes,
                 ),
                 _ => None,
             }
@@ -460,7 +471,7 @@ mod tests {
 
         // Dictionary encoding should abort and return None
         let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
-        let result = dictionary_encode(&data_block, 1000, max_encoded_size);
+        let result = dictionary_encode(&data_block, 1000, max_encoded_size, usize::MAX);
         assert!(
             result.is_none(),
             "Dictionary encoding should abort for high cardinality u128 data"
@@ -491,7 +502,7 @@ mod tests {
 
         // Dictionary encoding should succeed and return Some
         let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
-        let result = dictionary_encode(&data_block, 1000, max_encoded_size);
+        let result = dictionary_encode(&data_block, 1000, max_encoded_size, usize::MAX);
         assert!(
             result.is_some(),
             "Dictionary encoding should succeed for low cardinality u128 data"
@@ -531,7 +542,7 @@ mod tests {
 
         // Dictionary encoding should abort and return None
         let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
-        let result = dictionary_encode(&data_block, 10, max_encoded_size);
+        let result = dictionary_encode(&data_block, 10, max_encoded_size, usize::MAX);
         assert!(
             result.is_none(),
             "Dictionary encoding should abort for high cardinality string data"
@@ -554,7 +565,7 @@ mod tests {
 
         // Dictionary encoding should succeed and return Some
         let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
-        let result = dictionary_encode(&data_block, 100, max_encoded_size);
+        let result = dictionary_encode(&data_block, 100, max_encoded_size, usize::MAX);
         assert!(
             result.is_some(),
             "Dictionary encoding should succeed for low cardinality data"
@@ -590,7 +601,7 @@ mod tests {
             other => panic!("Expected VariableWidth data block, got {:?}", other),
         };
         let max_encoded_size = usize::try_from(invalid_block.data_size()).unwrap_or(usize::MAX);
-        assert!(dictionary_encode(&invalid_block, 100, max_encoded_size).is_none());
+        assert!(dictionary_encode(&invalid_block, 100, max_encoded_size, usize::MAX).is_none());
     }
 
     #[test]
@@ -608,8 +619,8 @@ mod tests {
 
         let full_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
         let too_small_limit = full_size / 10;
-        assert!(dictionary_encode(&data_block, 1000, too_small_limit).is_none());
-        assert!(dictionary_encode(&data_block, 1000, full_size).is_some());
+        assert!(dictionary_encode(&data_block, 1000, too_small_limit, usize::MAX).is_none());
+        assert!(dictionary_encode(&data_block, 1000, full_size, usize::MAX).is_some());
     }
 
     #[test]
@@ -626,7 +637,21 @@ mod tests {
         let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
 
         let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
-        assert!(dictionary_encode(&data_block, 10, max_encoded_size).is_none());
-        assert!(dictionary_encode(&data_block, 500, max_encoded_size).is_some());
+        assert!(dictionary_encode(&data_block, 10, max_encoded_size, usize::MAX).is_none());
+        assert!(dictionary_encode(&data_block, 500, max_encoded_size, usize::MAX).is_some());
+    }
+
+    #[test]
+    fn test_dictionary_encode_respects_dict_byte_limit() {
+        // 300 values of 256 bytes with 100 distinct: the dictionary holds 25,600 bytes
+        // while dictionary plus indices stay far below the raw size.
+        let array = StringArray::from_iter_values((0..300).map(|i| format!("{:0256}", i % 100)));
+        let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
+
+        let max_encoded_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
+        assert!(dictionary_encode(&data_block, 1000, max_encoded_size, 16 * 1024).is_none());
+        let (_, dictionary) =
+            dictionary_encode(&data_block, 1000, max_encoded_size, 25_600).unwrap();
+        assert_eq!(dictionary.num_values(), 100);
     }
 }

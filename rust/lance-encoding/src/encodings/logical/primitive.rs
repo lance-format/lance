@@ -73,7 +73,7 @@ use lance_core::{Result, datatypes::Field, utils::tokio::spawn_cpu};
 
 use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
-    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
+    DICT_MAX_SIZE_META_KEY, DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY,
 };
@@ -108,6 +108,10 @@ const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
+/// Largest dictionary a page is encoded with unless `lance-encoding:dict-max-size` says
+/// otherwise. The reader loads a page's dictionary whole on first touch, so this bounds
+/// the read amplification of a point lookup into a dictionary-encoded page.
+const DEFAULT_DICT_MAX_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 
 /// Largest level count a direct legacy u16-value/U8-run RLE frame can prove.
@@ -5571,6 +5575,8 @@ struct SerializedMiniBlockPage {
 struct DictEncodingBudget {
     max_dict_entries: u32,
     max_encoded_size: usize,
+    /// Upper bound on the dictionary's value bytes; see `DICT_MAX_SIZE_META_KEY`.
+    max_dict_bytes: usize,
 }
 
 enum PrimitivePageStructure {
@@ -6941,6 +6947,15 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
+        // The reader loads a page's dictionary whole the first time the page is touched,
+        // so a dictionary of large values (images, documents) turns every point read into
+        // a read of the whole dictionary even when it shrinks the page.
+        let max_dict_bytes: usize = field
+            .metadata
+            .get(DICT_MAX_SIZE_META_KEY)
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(DEFAULT_DICT_MAX_SIZE_BYTES);
+
         // Avoid probing dictionary encoding on data that appears to be near-unique
         // or likely to exceed the dictionary budget.
         if let Some(sample_unique_ratio) =
@@ -6960,6 +6975,7 @@ impl PrimitiveStructuralEncoder {
         Some(DictEncodingBudget {
             max_dict_entries,
             max_encoded_size,
+            max_dict_bytes,
         })
     }
 
@@ -7440,6 +7456,7 @@ impl PrimitiveStructuralEncoder {
                 &data_block,
                 budget.max_dict_entries,
                 budget.max_encoded_size,
+                budget.max_dict_bytes,
             )
         });
 
@@ -11258,6 +11275,32 @@ mod tests {
         assert!(
             result.is_some(),
             "Should use dictionary encode based on size"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encode_skips_dictionary_above_max_dict_size() {
+        use crate::constants::DICT_MAX_SIZE_META_KEY;
+
+        // 2000 values of 64 bytes with 500 distinct: the dictionary alone is 32 KiB,
+        // well within the size ratio, so only the byte cap can veto it.
+        let array = Arc::new(StringArray::from_iter_values(
+            (0..2000).map(|i| format!("{:064}", i % 500)),
+        )) as ArrayRef;
+
+        let field = arrow_schema::Field::new("test", DataType::Utf8, false);
+        let page = encode_first_page(field, array.clone(), TestEncoding::StructuralU32).await;
+        assert!(
+            miniblock_layout(&page).dictionary.is_some(),
+            "a 32 KiB dictionary must be used under the default cap"
+        );
+
+        let metadata = HashMap::from([(DICT_MAX_SIZE_META_KEY.to_string(), "4096".to_string())]);
+        let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+        let page = encode_first_page(field, array, TestEncoding::StructuralU32).await;
+        assert!(
+            miniblock_layout(&page).dictionary.is_none(),
+            "a dictionary over lance-encoding:dict-max-size must not be written"
         );
     }
 

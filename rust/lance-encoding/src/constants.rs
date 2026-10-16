@@ -26,6 +26,12 @@ pub const DICT_DIVISOR_META_KEY: &str = "lance-encoding:dict-divisor";
 /// Example: 0.8 means use dict if encoded size < 80% of raw size
 /// Default: 0.8
 pub const DICT_SIZE_RATIO_META_KEY: &str = "lance-encoding:dict-size-ratio";
+/// Metadata key for the largest dictionary, in bytes of variable-width values, a page
+/// may be encoded with. A page's dictionary is read whole the first time the page is
+/// touched, so a dictionary of large values (images, documents) turns every point read
+/// into a read of the whole dictionary even when it shrinks the page.
+/// Default: 8 MiB
+pub const DICT_MAX_SIZE_META_KEY: &str = "lance-encoding:dict-max-size";
 /// Metadata key for selecting general compression scheme for dictionary values
 /// Valid values: "lz4", "zstd", "none"
 pub const DICT_VALUES_COMPRESSION_META_KEY: &str = "lance-encoding:dict-values-compression";
