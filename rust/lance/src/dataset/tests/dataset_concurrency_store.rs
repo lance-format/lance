@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec;
 
@@ -10,11 +11,12 @@ use crate::{Dataset, Error, Result};
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
-use arrow_array::{Int32Array, RecordBatchIterator};
+use arrow_array::{Int32Array, RecordBatchIterator, record_batch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::{IndexType, scalar::ScalarIndexParams};
+use lance_table::format::BasePath;
 
 #[tokio::test]
 async fn concurrent_create() {
@@ -285,6 +287,81 @@ async fn test_add_bases() {
     );
 }
 
+/// Files refer to their base by ID, so binding an ID already in use to another
+/// location would redirect every file stored through it.
+#[tokio::test]
+async fn test_add_bases_refuses_a_base_id_in_use() {
+    let test_dir = TempStrDir::default();
+    let uri = format!("{}/primary", test_dir.as_str());
+    let base = |id, name: &str| {
+        BasePath::new(
+            id,
+            format!("{}/{name}", test_dir.as_str()),
+            Some(name.to_string()),
+            true,
+        )
+    };
+    let data = record_batch!(("id", Int32, [0, 1, 2, 3])).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+        &uri,
+        Some(WriteParams {
+            initial_bases: Some(vec![base(7, "in_use")]),
+            target_bases: Some(vec![7]),
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| &fragment.metadata.files)
+            .all(|file| file.base_id == Some(7))
+    );
+    let dataset = Arc::new(dataset);
+
+    // A new name and path, so only the ID collides.
+    let error = dataset
+        .add_bases(vec![base(7, "elsewhere")], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("Cannot replace base ID 7"),
+        "{error}"
+    );
+
+    let reopened = Dataset::open(&uri).await.unwrap();
+    assert_eq!(reopened.version().version, dataset.version().version);
+    assert_eq!(reopened.manifest.base_paths, dataset.manifest.base_paths);
+    assert_eq!(reopened.scan().try_into_batch().await.unwrap(), data);
+
+    // An unused ID is accepted, and 0 still asks for one to be assigned.
+    let updated = Arc::new(reopened)
+        .add_bases(vec![base(9, "unused"), base(0, "assigned")], None)
+        .await
+        .unwrap();
+    let ids = updated
+        .manifest
+        .base_paths
+        .iter()
+        .map(|(id, base)| (base.name.as_deref().unwrap(), *id))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        ids,
+        HashMap::from([("in_use", 7), ("unused", 9), ("assigned", 1)])
+    );
+    assert_eq!(
+        updated.manifest.base_paths[&7],
+        dataset.manifest.base_paths[&7]
+    );
+    assert_eq!(updated.scan().try_into_batch().await.unwrap(), data);
+}
+
 #[tokio::test]
 async fn test_concurrent_add_bases_conflict() {
     use lance_table::format::BasePath;
@@ -463,6 +540,54 @@ async fn test_concurrent_add_bases_path_conflict() {
             .to_string()
             .contains("incompatible with concurrent transaction")
     );
+}
+
+/// Conflict resolution compares only IDs both transactions named, so an
+/// explicit ID that a concurrent commit assigned is refused when the rebased
+/// manifest is built.
+#[tokio::test]
+async fn test_concurrent_add_bases_assigned_id_conflict() {
+    let test_dir = TempStrDir::default();
+    let uri = format!("{}/primary", test_dir.as_str());
+    let base = |id, name: &str| {
+        BasePath::new(
+            id,
+            format!("{}/{name}", test_dir.as_str()),
+            Some(name.to_string()),
+            true,
+        )
+    };
+    let data = record_batch!(("id", Int32, [0, 1])).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+        &uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let stale = Arc::new(dataset.clone());
+
+    let assigned = Arc::new(dataset)
+        .add_bases(vec![base(0, "assigned")], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        assigned.manifest.base_paths[&1].name.as_deref(),
+        Some("assigned")
+    );
+
+    let error = stale
+        .add_bases(vec![base(1, "explicit")], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("Cannot replace base ID 1"),
+        "{error}"
+    );
+    let latest = Dataset::open(&uri).await.unwrap();
+    assert_eq!(latest.version().version, assigned.version().version);
+    assert_eq!(latest.manifest.base_paths, assigned.manifest.base_paths);
 }
 
 #[tokio::test]

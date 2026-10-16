@@ -1990,9 +1990,9 @@ impl Transaction {
                             .copied()
                             .chain(std::iter::once(0)),
                     )?;
-                } else if manifest.has_managed_blobs()
-                    && let Some(existing) = manifest.base_paths.get(&base_to_add.id)
-                {
+                } else if let Some(existing) = manifest.base_paths.get(&base_to_add.id) {
+                    // Files refer to their base by ID, so rebinding an ID would
+                    // redirect every file already stored through it.
                     return Err(Error::invalid_input(format!(
                         "Cannot replace base ID {} bound to {:?} with {:?}",
                         base_to_add.id, existing.path, base_to_add.path
