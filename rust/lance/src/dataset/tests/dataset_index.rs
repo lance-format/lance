@@ -16,12 +16,13 @@ use crate::dataset::tests::dataset_transactions::{assert_results, execute_sql};
 use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
 use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
-use crate::utils::test::covering;
+use crate::utils::test::{copy_test_data_to_tmp, covering};
 use crate::{Dataset, Error, Result};
 use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
-use crate::index::DatasetIndexExt;
+use crate::index::scalar::load_scalar_segment_params;
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -44,9 +45,12 @@ use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::pb::VectorIndexDetails;
+use lance_index::scalar::btree::BTreeParameters;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
+    DocumentGranularity, InvertedIndex, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -7703,41 +7707,295 @@ async fn test_manifest_read_recovers_from_stale_size() {
     assert_eq!(indices[0].name, "id_idx");
 }
 
-/// `load_segment_params` must match the fully opened segment's params,
-/// including `custom_stop_words` — the field `InvertedIndexDetails` loses.
+#[rstest]
+#[case::btree("btree", Some(2))]
+#[case::bitmap("bitmap", None)]
 #[tokio::test]
-async fn test_load_segment_params_full_fidelity() {
-    use crate::index::DatasetIndexInternalExt;
-    use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndex};
-
-    let batch = RecordBatch::try_new(
-        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
-        vec![Arc::new(StringArray::from(vec![
-            "the quick brown fox",
-            "lazy dogs sleep",
-        ]))],
+async fn test_load_scalar_segment_params(#[case] index_type: &str, #[case] zone_size: Option<u64>) {
+    let test_uri = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        (
+            "value",
+            Int32,
+            [Some(1), None, Some(3), Some(2), None, Some(4)]
+        ),
+        ("payload", Int32, [10, 20, 30, 40, 50, 60])
     )
     .unwrap();
-    let schema = batch.schema();
-    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-    let mut dataset = Dataset::write(stream, "memory://test/segment_params", None)
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    let mut params = ScalarIndexParams::new(index_type.to_string());
+    if zone_size.is_some() {
+        params = params.with_params(&BTreeParameters {
+            zone_size,
+            range_id: None,
+        });
+    }
+    dataset
+        .create_index(&["value"], IndexType::Scalar, None, &params, false)
         .await
         .unwrap();
+    drop(dataset);
 
-    let params = InvertedIndexParams::default().custom_stop_words(Some(vec!["quick".to_string()]));
+    let mut dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    let recovered = load_scalar_segment_params(&dataset, &indices[0])
+        .await
+        .unwrap();
+    assert_eq!(recovered.index_type, index_type);
+    if let Some(zone_size) = zone_size {
+        let recovered_btree: BTreeParameters =
+            serde_json::from_str(recovered.params.as_deref().unwrap()).unwrap();
+        assert_eq!(recovered_btree.zone_size, Some(zone_size));
+    } else {
+        assert_eq!(recovered.params, None);
+    }
+    let opened = dataset
+        .open_scalar_index("value", &indices[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(recovered, opened.derive_index_params().unwrap());
+
+    let mut covered = indices[0].clone();
+    let payload_id = dataset.schema().field_id("payload").unwrap();
+    covered.fields.push(payload_id);
+    covered.covering_fields.push(payload_id);
+    assert_eq!(
+        load_scalar_segment_params(&dataset, &covered)
+            .await
+            .unwrap(),
+        recovered
+    );
+
+    dataset
+        .create_index(&["value"], IndexType::Scalar, None, &recovered, true)
+        .await
+        .unwrap();
+    let result = dataset
+        .scan()
+        .filter("value = 3 OR value IS NULL")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 3);
+    assert_eq!(result["value"].null_count(), 2);
+}
+
+#[tokio::test]
+async fn test_load_scalar_segment_params_json_rebuild_preserves_type() {
+    let test_uri = TempStrDir::default();
+    let batch = json_batch(vec![
+        r#"{"val": 1}"#,
+        r#"{"val": 2}"#,
+        r#"{"val": null}"#,
+        r#"{"other": 3}"#,
+        r#"{"val": null}"#,
+        r#"{}"#,
+    ]);
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+
+    let target_params = BTreeParameters {
+        zone_size: Some(2),
+        range_id: None,
+    };
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "path": "val",
+        "target_index_type": "btree",
+        "target_index_parameters": serde_json::to_string(&target_params).unwrap(),
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    drop(dataset);
+
+    let mut dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    let recovered = load_scalar_segment_params(&dataset, &segments[0])
+        .await
+        .unwrap();
+    assert_eq!(recovered.index_type, "json");
+    let recovered_json: serde_json::Value =
+        serde_json::from_str(recovered.params.as_deref().unwrap()).unwrap();
+    assert_eq!(recovered_json["path"], "val");
+    assert_eq!(recovered_json["target_index_type"], "btree");
+    assert_eq!(recovered_json["target_data_type"], "Int64");
+    let recovered_target: BTreeParameters =
+        serde_json::from_str(recovered_json["target_index_parameters"].as_str().unwrap()).unwrap();
+    assert_eq!(recovered_target.zone_size, Some(2));
+
+    // These fragments have no non-null path values from which to infer Int64.
+    dataset
+        .create_index_builder(&["json"], IndexType::Scalar, &recovered)
+        .name("json_idx".to_string())
+        .replace(true)
+        .fragments(vec![1, 2])
+        .await
+        .unwrap();
+    drop(dataset);
+
+    let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].fragment_bitmap.as_ref().unwrap(),
+        &roaring::RoaringBitmap::from_iter([1, 2])
+    );
+    assert_eq!(
+        load_scalar_segment_params(&dataset, &segments[0])
+            .await
+            .unwrap(),
+        recovered
+    );
+    let opened = dataset
+        .open_scalar_index("json", &segments[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(opened.training_data_type(), Some(DataType::Int64));
+
+    let predicate = "json_get_int(json, 'val') IS NULL";
+    let result = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline = dataset.scan();
+    baseline.use_scalar_index(false);
+    let baseline = baseline
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(result, baseline);
+}
+
+#[rstest]
+#[case::no_key(vec![], false, "one keyed field")]
+#[case::multiple_keys(vec![0, 1], false, "one keyed field")]
+#[case::vector(vec![0], true, "vector index")]
+#[tokio::test]
+async fn test_load_scalar_segment_params_rejects_invalid_metadata(
+    #[case] fields: Vec<i32>,
+    #[case] is_vector: bool,
+    #[case] message: &str,
+) {
+    let batch =
+        arrow_array::record_batch!(("value", Int32, [1, 2]), ("other", Int32, [3, 4])).unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let mut segment = dataset
+        .create_index(
+            &["value"],
+            IndexType::Bitmap,
+            None,
+            &ScalarIndexParams::new("bitmap".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    segment.fields = fields;
+    if is_vector {
+        segment.index_details = Some(Arc::new(
+            prost_types::Any::from_msg(&VectorIndexDetails::default()).unwrap(),
+        ));
+    }
+    let error = load_scalar_segment_params(&dataset, &segment)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert_contains!(error.to_string(), message);
+}
+
+/// Both parameter loaders must match the fully opened segment's params,
+/// including `custom_stop_words`, without populating the index cache.
+#[rstest]
+#[case::row(DocumentGranularity::Row, InvertedListFormatVersion::V2)]
+#[case::list_element_v2(DocumentGranularity::ListElement, InvertedListFormatVersion::V2)]
+#[case::list_element_v3(DocumentGranularity::ListElement, InvertedListFormatVersion::V3)]
+#[tokio::test]
+async fn test_load_segment_params_full_fidelity(
+    #[case] granularity: DocumentGranularity,
+    #[case] format_version: InvertedListFormatVersion,
+) {
+    let mut text = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    text.values().append_value("the quick brown fox");
+    text.values().append_null();
+    text.append(true);
+    text.append(false);
+    text.append(true);
+    text.values().append_value("lazy dogs sleep");
+    text.append(true);
+    let batch =
+        RecordBatch::try_from_iter([("text", Arc::new(text.finish()) as ArrayRef)]).unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(
+        stream,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    let params = InvertedIndexParams::default()
+        .custom_stop_words(Some(vec!["quick".to_string()]))
+        .document_granularity(granularity)
+        .format_version(format_version);
     dataset
         .create_index(&["text"], IndexType::Inverted, None, &params, true)
         .await
         .unwrap();
 
-    let segments = crate::index::scalar::load_segments(&dataset, "text", DocumentGranularity::Row)
+    let segments = crate::index::scalar::load_segments(&dataset, "text", granularity)
         .await
         .unwrap()
         .expect("FTS index segments");
+    dataset.session().index_cache.clear().await;
+    let cache_entries = dataset.index_cache_entry_count().await;
     let read = crate::index::scalar::load_segment_params(&dataset, &segments[0])
         .await
         .unwrap();
+    let recovered = load_scalar_segment_params(&dataset, &segments[0])
+        .await
+        .unwrap();
+    assert_eq!(dataset.index_cache_entry_count().await, cache_entries);
 
     let generic = dataset
         .open_generic_index("text", &segments[0].uuid, &NoOpMetricsCollector)
@@ -7747,7 +8005,58 @@ async fn test_load_segment_params_full_fidelity() {
         .as_any()
         .downcast_ref::<InvertedIndex>()
         .expect("inverted index");
-    assert_eq!(&read, opened.params());
+    // The typed loader reads only the physical tokenizer parameters.
+    assert_eq!(&read.document_granularity(granularity), opened.params());
+    let derived = opened.derive_index_params().unwrap();
+    assert_eq!(recovered.index_type, derived.index_type);
+    let recovered_json: serde_json::Value =
+        serde_json::from_str(recovered.params.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        recovered_json["document_granularity"],
+        serde_json::to_value(granularity).unwrap()
+    );
+    assert_eq!(
+        recovered_json["format_version"],
+        format_version.index_version()
+    );
+    assert_eq!(
+        recovered_json,
+        serde_json::from_str::<serde_json::Value>(derived.params.as_deref().unwrap()).unwrap()
+    );
+    assert!(dataset.index_cache_entry_count().await > cache_entries);
+}
+
+#[rstest]
+#[case::legacy("0.27.0/legacy_fts_index")]
+#[case::v1("v3.0.1/fts_v1")]
+#[case::v2("v4.0.1/fts_v2")]
+#[tokio::test]
+async fn test_load_scalar_segment_params_legacy_fts(
+    #[case] fixture_path: &str,
+    #[values(false, true)] omit_details: bool,
+) {
+    let test_dir = copy_test_data_to_tmp(fixture_path).unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    let mut segment = indices[0].clone();
+    if omit_details {
+        segment.index_details = None;
+    }
+    let recovered = load_scalar_segment_params(&dataset, &segment)
+        .await
+        .unwrap();
+
+    let opened = dataset
+        .open_scalar_index("text", &indices[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let derived = opened.derive_index_params().unwrap();
+    assert_eq!(recovered.index_type, derived.index_type);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(recovered.params.as_deref().unwrap()).unwrap(),
+        serde_json::from_str::<serde_json::Value>(derived.params.as_deref().unwrap()).unwrap()
+    );
 }
 
 /// Compaction of a covered index must succeed. `remap_index` rejected any

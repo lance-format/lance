@@ -49,7 +49,7 @@ use lance_index::pbold::{
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
-use lance_index::scalar::inverted::METADATA_FILE;
+use lance_index::scalar::inverted::{InvertedIndex, METADATA_FILE};
 use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
@@ -584,6 +584,80 @@ pub async fn fetch_index_details(
     }
 
     Ok(index_details)
+}
+
+/// Recover the build parameters of a committed scalar index segment.
+///
+/// The segment must index one keyed field in `dataset`'s current schema. Carried
+/// covering fields do not affect parameter recovery. The returned index type and
+/// parameters can be passed to [`DatasetIndexExt::create_index`] with
+/// [`IndexType::Scalar`], including for wrapper indices such as JSON.
+///
+/// Inverted indices use the metadata-only [`load_segment_params`] path without
+/// opening or caching the index. Other scalar indices are opened through the
+/// dataset's index cache and recover their parameters with
+/// [`ScalarIndex::derive_index_params`]. Only persisted or reconstructible
+/// settings are recovered; creation-only options such as FTS worker counts and
+/// memory limits are not retained.
+///
+/// # Example
+///
+/// ```
+/// # use lance::{Dataset, Result};
+/// use lance::index::{DatasetIndexExt, scalar::load_scalar_segment_params};
+/// use lance_index::IndexType;
+///
+/// # async fn rebuild(dataset: &mut Dataset) -> Result<()> {
+/// let indices = dataset.load_indices().await?;
+/// if let Some(segment) = indices.iter().find(|index| index.name == "text_idx") {
+///     let params = load_scalar_segment_params(dataset, segment).await?;
+///     dataset
+///         .create_index(
+///             &["text"],
+///             IndexType::Scalar,
+///             Some(segment.name.clone()),
+///             &params,
+///             true,
+///         )
+///         .await?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn load_scalar_segment_params(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<ScalarIndexParams> {
+    let field_id = segment.keyed_field().ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Scalar index {} ({}) must have one keyed field, got {:?}",
+            segment.name,
+            segment.uuid,
+            segment.keyed_fields()
+        ))
+    })?;
+    let column = dataset.schema().field_path(field_id)?;
+    let details = IndexDetails(fetch_index_details(dataset, &column, segment).await?);
+    if details.is_vector() {
+        return Err(Error::invalid_input(format!(
+            "Index {} ({}) is a vector index, not a scalar index",
+            segment.name, segment.uuid
+        )));
+    }
+
+    if details.supports_fts() {
+        let inverted_details = InvertedIndexDetails::decode(details.0.value.as_slice())?;
+        let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+        return InvertedIndex::load_training_params(
+            &store,
+            inverted_details.document_granularity.try_into()?,
+        )
+        .await;
+    }
+
+    open_scalar_index(dataset, &column, segment, &NoOpMetricsCollector)
+        .await?
+        .derive_index_params()
 }
 
 async fn validate_label_list_index_compatibility(
