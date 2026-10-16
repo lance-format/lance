@@ -20,7 +20,7 @@
 //! reach a cache entry; [`resident_store_views`] counts the live ones and
 //! [`shares_resident_store`] tells whether a batch holds store memory.
 //!
-//! The first read loads the store; callers can also load it explicitly.
+//! An index loads the store when it opens, so that no read waits for it.
 //! The store is an entry of the index cache ([`ResidentColumnsKey`]),
 //! charged what its arrays allocate and evictable under ordinary cache
 //! pressure. Each live index holds an `Arc` to its store independently of

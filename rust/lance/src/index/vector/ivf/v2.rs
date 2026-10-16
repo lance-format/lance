@@ -1084,6 +1084,12 @@ pub(crate) struct IvfOpenContext {
     /// A strong reference acquired before opening the index can evict the
     /// cached store. Dropped if the index does not use resident columns.
     pub(crate) resident_columns_handle: Option<ResidentColumns>,
+    /// The opening query's I/O stats, which a load of the resident store in
+    /// a reconstruction from a cached [`IvfIndexState`] adds to; `None` when
+    /// the opener records none. [`IVFIndex::try_new`] ignores it: its own
+    /// scheduler records the load with the rest of the open's I/O
+    /// ([`VectorIndex::open_io_stats`]).
+    pub(crate) io_stats: Option<IoStats>,
 }
 
 /// The key of the auxiliary (storage) file of index `uuid` in `index_dir`
@@ -1716,6 +1722,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .with_resident_columns(resident_store)
             .with_resident_columns_enabled(resident_columns)
             .with_entry_columns(Self::entry_columns_at_open()?);
+        // Load the store before any read needs it. The scheduler records the
+        // load's requests with the rest of the open's I/O, so the load adds
+        // them to no other stats.
+        storage.load_resident_store(None).await?;
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
@@ -1735,7 +1745,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
         // The scheduler is freshly created above and, at this point, has served
         // only the open-time reads (file footers, IVF centroids, quantization
-        // metadata) -- partition reads happen
+        // metadata, and the resident store's load) -- partition reads happen
         // later, during queries.  So its cumulative stats are exactly the
         // one-time index-open I/O.
         let open_io_stats = scheduler.stats();
@@ -1896,6 +1906,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// The opener's strong reference bridges eviction during index opening.
     /// Otherwise use an independent store that loads only if residency is
     /// enabled later.
+    /// The opening index loads the bound store next, unless it is loaded already.
     async fn resident_store_at_open(
         resident: bool,
         file: &IndexFileKey,
@@ -2545,7 +2556,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
-        self.storage.load_resident_store(None).await?;
+        // Every IVF index loaded its resident store when it opened, and its
+        // handle keeps it for the index's life, so prewarm has none to load.
+        debug_assert!(
+            !self.storage.resident_columns_enabled()
+                || self.storage.resident_columns().loaded_bytes().is_some(),
+            "IVF_RQ index {} prewarms with a resident store its open did not load",
+            self.uuid
+        );
         self.prewarm_partitions().await?;
         Ok(())
     }
@@ -3507,12 +3525,17 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         context.file_cache.as_ref(),
         context.resident_columns,
     )?;
+    let io_stats = context.io_stats.clone();
     let resident_columns =
         IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
     let storage = storage
         .with_resident_columns(resident_columns)
         .with_resident_columns_enabled(resident)
         .with_entry_columns(IVFIndex::<S, Q>::entry_columns_at_open()?);
+    // Load the store, unless a live index or the cache holds it, as an open
+    // does. A reconstruction reports no open I/O, so the load's requests go
+    // to the opening query's stats.
+    storage.load_resident_store(io_stats.as_ref()).await?;
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
@@ -10348,5 +10371,6 @@ mod tests {
         assert_ge!(recall, 0.5);
     }
 
+    mod native_resident_tests;
     mod native_storage_tests;
 }

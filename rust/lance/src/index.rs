@@ -4231,6 +4231,7 @@ impl Dataset {
             resident_columns: self.session.index_resident_columns(),
             file_cache: Some(file_cache),
             resident_columns_handle,
+            io_stats: metrics.io_stats(),
         };
         let resolved =
             frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)

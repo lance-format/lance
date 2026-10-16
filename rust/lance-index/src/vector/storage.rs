@@ -1438,7 +1438,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// Load the resident store through this storage's handle, admitted to
     /// the index cache the handle is bound to, unless it is
-    /// loaded already. Callers may prepare the store before reading partitions. The load's I/O is added to `io_stats`. Nothing to load
+    /// loaded already: an index loads its store when it opens, so that no
+    /// read loads it. The load's I/O is added to `io_stats`. Nothing to load
     /// unless [`Self::resident_columns_enabled`].
     pub async fn load_resident_store(&self, io_stats: Option<&IoStats>) -> Result<()> {
         if !self.resident_columns_enabled {
@@ -2092,7 +2093,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// says (copies by default), selected rows as copies. The
     /// batch is for this read alone and must never be cached, since a view
     /// keeps its store column's whole allocation alive. The index loaded the
-    /// store explicitly, or this first attach loads it and adds the I/O to
+    /// store when it opened; a storage built outside an index open loads it
+    /// on its first attach, as a fallback, and adds the load's I/O to
     /// `load_stats`.
     pub async fn attach_resident(
         &self,
@@ -2509,7 +2511,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// The resident store, when [`Self::resident_columns_enabled`] and it
     /// keeps some of `schema`'s columns. The index loaded it when it opened
-    /// ([`Self::load_resident_store`]); otherwise a read loads it,
+    /// ([`Self::load_resident_store`]); a read loads it only as a fallback,
     /// for a storage built outside an index open, which counts
     /// `resident_columns_read_loads` and adds the load's I/O to that read's
     /// `io_stats`.
