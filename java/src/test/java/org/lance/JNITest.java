@@ -33,6 +33,7 @@ import java.util.Arrays;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class JNITest {
@@ -58,6 +59,7 @@ public class JNITest {
     assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
     assertEquals(0.5, defaultQuery.getSearchEffort());
     assertEquals(Optional.empty(), defaultQuery.getSearchEffortOption());
+    assertFalse(defaultQuery.getQuantizedRefineFactor().isPresent());
 
     Query nprobesQuery =
         new Query.Builder()
@@ -68,20 +70,31 @@ public class JNITest {
     assertEquals(20, nprobesQuery.getMinimumNprobes());
     assertEquals(Optional.of(20), nprobesQuery.getMaximumNprobes());
 
-    JniTestHelper.parseQuery(
-        Optional.of(
+    Query configuredQuery =
+        new Query.Builder()
+            .setColumn("column")
+            .setKey(new float[] {1.0f, 2.0f, 3.0f})
+            .setK(10)
+            .setNprobes(20)
+            .setEf(30)
+            .setRefineFactor(40)
+            .setQuantizedRefineFactor(4)
+            .setDistanceType(DistanceType.L2)
+            .setUseIndex(true)
+            .setQueryParallelism(-1)
+            .setApproxMode(ApproxMode.ACCURATE)
+            .build();
+    assertEquals(Optional.of(4), configuredQuery.getQuantizedRefineFactor());
+    JniTestHelper.parseQuery(Optional.of(configuredQuery));
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
             new Query.Builder()
                 .setColumn("column")
-                .setKey(new float[] {1.0f, 2.0f, 3.0f})
-                .setK(10)
-                .setNprobes(20)
-                .setEf(30)
-                .setRefineFactor(40)
-                .setDistanceType(DistanceType.L2)
-                .setUseIndex(true)
-                .setQueryParallelism(-1)
-                .setApproxMode(ApproxMode.ACCURATE)
-                .build()));
+                .setKey(new float[] {1.0f})
+                .setQuantizedRefineFactor(0)
+                .build());
   }
 
   @ParameterizedTest
