@@ -10372,5 +10372,6 @@ mod tests {
     }
 
     mod native_resident_tests;
+    mod native_share_tests;
     mod native_storage_tests;
 }

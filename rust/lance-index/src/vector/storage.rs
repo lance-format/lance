@@ -1026,7 +1026,7 @@ fn entry_columns_from(value: Option<&str>) -> Result<EntryColumns> {
 
 /// How a read of an IVF_RQ index with resident small columns attaches the
 /// store's rows to a batch of a whole partition or plane that is never
-/// cached: copy (default) or share. Gathered rows, whole reads that
+/// cached: share (default) or copy. Gathered rows, whole reads that
 /// become cache entries, and partitions streamed out of the index to its
 /// caller are always copied.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -1036,10 +1036,10 @@ pub enum ResidentAttach {
     /// is charged what a copy is. A view keeps its store column's whole
     /// allocation alive until it drops, so no view may reach a cache entry
     /// or outlive the read that made it.
+    #[default]
     Share,
     /// Every attach copies the store's rows into buffers of their own, as
     /// before the store was shared.
-    #[default]
     Copy,
 }
 
@@ -1500,8 +1500,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// How reads attach the resident rows to a batch of a whole partition
     /// or plane that is never cached: views of the store
-    /// ([`ResidentAttach::Copy`]) unless the index set
-    /// [`ResidentAttach::Share`] with [`Self::with_resident_attach`].
+    /// ([`ResidentAttach::Share`]) unless the index set
+    /// [`ResidentAttach::Copy`] with [`Self::with_resident_attach`].
     /// Gathered rows, whole reads that become cache entries, and partitions
     /// streamed out of the index are always copied.
     pub fn resident_attach(&self) -> ResidentAttach {
@@ -1711,7 +1711,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// rows, attached as `attach` says, the others the entry's, in the order
     /// a storage built from a read of the file holds them, so the storage is
     /// that one, bit for bit and byte for byte. A read's own storage takes
-    /// [`Self::resident_attach`] (copies by default); one handed
+    /// [`Self::resident_attach`] (views of the store by default); one handed
     /// out of the index, which may outlive the index and its lease on the
     /// store, takes [`ResidentAttach::Copy`]. The storage is built for one
     /// read and never cached: views of the store must not reach the cache.
@@ -2090,7 +2090,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// rows' file offsets, in the plane's column order, so the batch is the
     /// one, bit for bit and byte for byte, that a read of the file returns
     /// (see [`Self::read_plane`]): a whole plane as [`Self::resident_attach`]
-    /// says (copies by default), selected rows as copies. The
+    /// says (views of the store by default), selected rows as copies. The
     /// batch is for this read alone and must never be cached, since a view
     /// keeps its store column's whole allocation alive. The index loaded the
     /// store when it opened; a storage built outside an index open loads it
