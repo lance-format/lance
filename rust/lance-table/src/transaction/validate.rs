@@ -912,7 +912,7 @@ fn merge_schema_valid(
             )));
         }
         if let Some(changes) = shared_field_binding_changes(prior_field, field)
-            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
+            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, prior_field)
         {
             return Err(Error::invalid_input(format!(
                 "Merge operation changes field id {} (\"{}\") without rewriting it in \
@@ -988,8 +988,9 @@ fn file_materializes_field(file_field_ids: &[i32], field: &Field) -> bool {
 fn is_field_binding_fully_rewritten(
     manifest: &Manifest,
     new_fragment_map: &HashMap<u64, &Fragment>,
-    field_id: i32,
+    field: &Field,
 ) -> bool {
+    // STABLE files omit struct ids, so track their materialization through descendants.
     manifest.fragments.iter().all(|prior_fragment| {
         let Some(new_fragment) = new_fragment_map.get(&prior_fragment.id) else {
             return false;
@@ -998,17 +999,17 @@ fn is_field_binding_fully_rewritten(
         let is_materialized = new_fragment
             .files
             .iter()
-            .any(|file| file.fields.contains(&field_id));
+            .any(|file| file_materializes_field(file.fields.as_ref(), field));
         if !is_materialized {
             return false;
         }
 
         prior_fragment
             .referenced_lance_files()
-            .filter(|file| file.fields.contains(&field_id))
+            .filter(|file| file_materializes_field(file.fields.as_ref(), field))
             .all(|prior_file| {
                 !new_fragment.referenced_lance_files().any(|new_file| {
-                    new_file.fields.contains(&field_id)
+                    file_materializes_field(new_file.fields.as_ref(), field)
                         && new_file.base_id == prior_file.base_id
                         && new_file.path == prior_file.path
                 })
@@ -1776,6 +1777,118 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[rstest::rstest]
+    #[case::top_level("address")]
+    #[case::nested("address.inner")]
+    fn test_merge_struct_binding_change_requires_full_rewrite(#[case] path: &str) {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "address",
+                DataType::Struct(
+                    vec![ArrowField::new(
+                        "inner",
+                        DataType::Struct(
+                            vec![
+                                ArrowField::new("city", DataType::Utf8, false),
+                                ArrowField::new("country", DataType::Utf8, false),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )]
+                    .into(),
+                ),
+                false,
+            ),
+        ]))
+        .unwrap();
+        let fragment = |id, prefix| {
+            let mut fragment = Fragment::new(id);
+            // STABLE files contain leaf ids, omitting both struct ids (1 and 2).
+            fragment.files = vec![
+                DataFile::new(
+                    format!("{prefix}-{id}.lance"),
+                    vec![0, 3],
+                    vec![0, 1],
+                    ConcreteFileVersion::V2_2,
+                    None,
+                    None,
+                ),
+                DataFile::new(
+                    format!("{prefix}-country-{id}.lance"),
+                    vec![4],
+                    vec![0],
+                    ConcreteFileVersion::V2_2,
+                    None,
+                    None,
+                ),
+            ];
+            fragment
+        };
+        let mut prior_fragments = vec![fragment(0, "old"), fragment(1, "old")];
+        prior_fragments[1].overlays.push(DataOverlayFile {
+            data_file: DataFile::new(
+                "old-overlay.lance",
+                vec![4],
+                vec![0],
+                ConcreteFileVersion::V2_2,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        });
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(prior_fragments.clone()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_2),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        let field_id = new_schema.field(path).unwrap().id;
+        new_schema.mut_field_by_id(field_id).unwrap().nullable = true;
+        let rewritten_fragments = vec![fragment(0, "new"), fragment(1, "new")];
+        let operation = |fragments| Operation::Merge {
+            fragments,
+            schema: new_schema.clone(),
+            preserves_nullability: false,
+        };
+        validate_operation(Some(&manifest), &operation(rewritten_fragments.clone())).unwrap();
+
+        let mut retained_base = rewritten_fragments.clone();
+        retained_base[1].files[1] = prior_fragments[1].files[1].clone();
+        let mut retained_overlay = rewritten_fragments.clone();
+        retained_overlay[1].overlays = prior_fragments[1].overlays.clone();
+        let mut missing_struct = rewritten_fragments.clone();
+        missing_struct[1].files.clear();
+        missing_struct[1].files.push(DataFile::new(
+            "id-only.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_2,
+            None,
+            None,
+        ));
+        let partial_rewrite = vec![rewritten_fragments[0].clone(), prior_fragments[1].clone()];
+        for fragments in [
+            partial_rewrite,
+            retained_base,
+            retained_overlay,
+            missing_struct,
+        ] {
+            let err = validate_operation(Some(&manifest), &operation(fragments)).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(
+                err.to_string().contains(&format!(
+                    "changes field id {field_id} (\"{path}\") without rewriting it in \
+                     every existing fragment: nullable false -> true"
+                )),
+                "{err}"
+            );
+        }
     }
 
     #[test]
