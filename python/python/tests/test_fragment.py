@@ -328,7 +328,12 @@ def test_fragment_meta():
     data = {
         "id": 0,
         "files": [
-            {"path": "0.lance", "fields": [0], "file_size_bytes": 100},
+            {
+                "path": "0.lance",
+                "fields": [0],
+                "file_size_bytes": 100,
+                "file_metadata_size_bytes": 25,
+            },
             {"path": "1.lance", "fields": [1]},
         ],
         "deletion_file": None,
@@ -340,7 +345,9 @@ def test_fragment_meta():
     assert len(meta.files) == 2
     with pytest.warns(DeprecationWarning):
         assert meta.files[0].path() == "0.lance"
+    assert meta.files[0].file_metadata_size_bytes == 25
     assert meta.files[1].path == "1.lance"
+    assert meta.files[1].file_metadata_size_bytes is None
 
     assert repr(meta) == (
         "FragmentMetadata(id=0, files=[DataFile(path='0.lance', fields=[0], "

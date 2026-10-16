@@ -423,6 +423,20 @@ message IndexFile {
   string path = 1;
   // Size of the file in bytes
   uint64 size_bytes = 2;
+  /* Size in bytes of the file's metadata suffix, or 0 if unknown.
+   *
+   * For a Lance file of format version 2.0 or later, this is the file size minus
+   * the position of global buffer 0, which holds the file's `FileDescriptor`.
+   * That position is stored in the first entry of the global buffer offset
+   * table, which the footer locates. It is always 0 for legacy (0.1) Lance files
+   * and for files in other formats. Writers record either this exact value or 0.
+   *
+   * This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+   * bytes of the file before decoding the footer. The footer stays
+   * authoritative: readers must ignore a value larger than the file and read
+   * any metadata the footer references outside the hinted range.
+   */
+  uint64 file_metadata_size_bytes = 3;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.

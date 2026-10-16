@@ -249,6 +249,8 @@ class DataFile:
         The minor version of the data storage format.
     file_size_bytes : Optional[int]
         The size of the data file in bytes, if available.
+    file_metadata_size_bytes : Optional[int]
+        The size of the data file's metadata suffix in bytes, if available.
     """
 
     _path: str
@@ -258,6 +260,7 @@ class DataFile:
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
     base_id: Optional[int] = None
+    file_metadata_size_bytes: Optional[int] = None
 
     def __init__(
         self,
@@ -268,6 +271,7 @@ class DataFile:
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
         base_id: Optional[int] = None,
+        file_metadata_size_bytes: Optional[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -277,6 +281,7 @@ class DataFile:
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
         self.base_id = base_id
+        self.file_metadata_size_bytes = file_metadata_size_bytes
 
     def __repr__(self):
         # pretend we have a 'path' attribute

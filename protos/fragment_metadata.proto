@@ -180,6 +180,21 @@ message DataFile {
    * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
    */
   optional uint32 base_id = 7;
+
+  /* Size in bytes of the file's metadata suffix, or 0 if unknown.
+   *
+   * For a Lance file of format version 2.0 or later, this is the file size minus
+   * the position of global buffer 0, which holds the file's `FileDescriptor`.
+   * That position is stored in the first entry of the global buffer offset
+   * table, which the footer locates. It is always 0 for legacy (0.1) files.
+   * Writers record either this exact value or 0.
+   *
+   * This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+   * bytes of the file before decoding the footer. The footer stays
+   * authoritative: readers must ignore a value larger than the file and read
+   * any metadata the footer references outside the hinted range.
+   */
+  uint64 file_metadata_size_bytes = 8;
 } // DataFile
 
 /* An overlay file supplies new values for a subset of (row offset, field) cells
