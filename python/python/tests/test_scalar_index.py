@@ -5495,6 +5495,73 @@ def test_bloomfilter_segment_merge_and_commit_from_python(tmp_path):
     )
 
 
+def test_minhashlsh_segment_merge_and_commit_from_python():
+    base = "the quick brown fox jumps over the lazy dog and runs away very fast"
+    near = base.replace("fast", "quickly")
+    texts = [
+        base,
+        "completely unrelated sentence about columnar storage in lance files",
+        near,
+        "another unrelated row that talks about vector indices and recall",
+        base,
+        None,
+    ]
+    tbl = pa.table({"id": list(range(len(texts))), "text": texts})
+    ds = lance.write_dataset(tbl, "memory://minhash_segments", max_rows_per_file=2)
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    assert len(fragment_ids) == 3
+
+    config = IndexConfig(
+        index_type="minhashlsh",
+        parameters={"num_hashes": 64, "num_bands": 16, "shingle_size": 2},
+    )
+    index_name = "text_idx"
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index("text", config, fragment_ids=fragment_ids[:1])
+
+    segments = [
+        ds.create_index_uncommitted(
+            "text", config, name=index_name, fragment_ids=[fragment_id]
+        )
+        for fragment_id in fragment_ids
+    ]
+    for segment, fragment_id in zip(segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+        assert {file.path for file in segment.files} >= {
+            "signatures.lance",
+            "bands.lance",
+        }
+
+    merged = ds.merge_existing_index_segments(segments[1:])
+    assert merged.fragment_ids == set(fragment_ids[1:])
+    ds = ds.commit_existing_index_segments(index_name, "text", [segments[0], merged])
+
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "MinHashLsh"
+    assert len(descriptions[index_name].segments) == 2
+    stats = ds.stats.index_stats(index_name)
+    assert [segment["num_hashes"] for segment in stats["indices"]] == [64, 64]
+    assert [segment["num_docs"] for segment in stats["indices"]] == [2, 3]
+
+    query = MinHashQuery(base, "text")
+    plan = ds.scanner(nearest=query, limit=3).explain_plan()
+    assert "MinHashSearch: column=text, limit=3" in plan
+    assert "MinHashFlatSearch" not in plan
+    result = ds.to_table(nearest=query, limit=3, columns=["id"])
+    ids = result["id"].to_pylist()
+    assert set(ids[:2]) == {0, 4} and ids[2] == 2
+    distances = result["_distance"].to_pylist()
+    assert distances[:2] == [0.0, 0.0] and 0.0 < distances[2] < 0.5
+
+    ds.create_scalar_index("text", "MINHASHLSH", name=index_name, replace=True)
+    stats = ds.stats.index_stats(index_name)
+    assert len(stats["indices"]) == 1
+    assert stats["indices"][0]["num_hashes"] == 128
+    assert stats["indices"][0]["num_bands"] == 16
+    assert stats["indices"][0]["shingle_size"] == 3
+    assert ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist()[2] == 2
+
+
 def test_merge_index_metadata_btree_soft_break(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=2, rows_per_fragment=100

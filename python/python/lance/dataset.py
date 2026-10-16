@@ -3576,12 +3576,13 @@ class LanceDataset(pa.dataset.Dataset):
                 "FTS",
                 "BLOOMFILTER",
                 "RTREE",
+                "MINHASHLSH",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
+                        '"INVERTED", "BLOOMFILTER", "RTREE" or "MINHASHLSH" are '
+                        f"supported for scalar columns.  Received {index_type}",
                     )
                 )
 
@@ -3683,6 +3684,7 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASHLSH",
         }
 
     @classmethod
@@ -3698,6 +3700,7 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASHLSH",
         }
 
     def create_scalar_index(
@@ -3713,6 +3716,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
+            Literal["MINHASHLSH"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3817,7 +3821,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -4704,7 +4708,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, and MINHASHLSH
+        scalar index construction.
         Unlike :meth:`create_index`, this method does not publish the index into
         the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4720,9 +4725,10 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
-        LABEL_LIST segments may be merged with
-        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER,
+        LABEL_LIST, and MINHASHLSH segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. MINHASHLSH
+        segments of one index must share parameters. NGRAM segments
         built before a deferred compaction must be merged before commit so
         their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional

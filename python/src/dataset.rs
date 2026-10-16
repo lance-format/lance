@@ -2645,6 +2645,7 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "ZONEMAP" => IndexType::ZoneMap,
             "BLOOMFILTER" => IndexType::BloomFilter,
+            "MINHASHLSH" => IndexType::MinHashLsh,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
@@ -2682,6 +2683,10 @@ impl Dataset {
             }),
             "BLOOMFILTER" => Box::new(ScalarIndexParams {
                 index_type: "bloomfilter".to_string(),
+                params: None,
+            }),
+            "MINHASHLSH" => Box::new(ScalarIndexParams {
+                index_type: "minhashlsh".to_string(),
                 params: None,
             }),
             "RTREE" => Box::new(ScalarIndexParams {
