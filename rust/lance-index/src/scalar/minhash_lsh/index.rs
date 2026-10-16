@@ -9,9 +9,19 @@ use super::*;
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
+
+/// A heap pays for itself only when enough buckets have mostly distinct heads.
+/// The bounded sample delays heap construction until there are enough emitted
+/// candidates to estimate overlap. Every window is reconsidered so dense
+/// clusters cannot permanently disable the heap; the wider return threshold
+/// avoids bouncing between strategies.
+const HEAP_MIN_BUCKETS: usize = 32;
+const HEAP_SAMPLE_CANDIDATES: usize = 64;
 
 use futures::future::try_join_all;
+use smallvec::SmallVec;
 
 /// One logical page of `bands.lance`, cached per page.
 #[derive(Debug, DeepSizeOf)]
@@ -415,7 +425,7 @@ impl MinHashLshIndex {
                 });
             }
         }
-        Ok(BucketScan { cursors })
+        Ok(BucketScan::new(cursors))
     }
 
     /// Fetch pages through the cache; the pages missing from the cache are
@@ -521,12 +531,17 @@ impl MinHashLshIndex {
         scan: &mut BucketScan,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<(u32, u32)>> {
-        let live = |cursor: &BucketCursor| cursor.next < cursor.end;
-        let drained = |cursor: &BucketCursor| live(cursor) && cursor.window.as_slice().is_empty();
-        if scan.cursors.iter().any(drained) {
+        if scan.needs_refill() {
             // The page budget is shared by the buckets still being walked, so
             // a walk that outlives the others reads in full batches.
-            let live_cursors = scan.cursors.iter().filter(|cursor| live(cursor)).count();
+            let live_cursors = if scan.heap.is_some() {
+                scan.live_cursors
+            } else {
+                scan.cursors
+                    .iter()
+                    .filter(|cursor| cursor.next < cursor.end)
+                    .count()
+            };
             let pages = (self.window_pages / live_cursors.max(1)).max(1);
             let window_rows = pages * self.page_rows;
             // One round tops up every bucket that is running low, not only the
@@ -560,22 +575,11 @@ impl MinHashLshIndex {
                     cursor.window = held.into_iter();
                 }
             }
+            scan.refresh_heads();
         }
-        let mut min_doc = u32::MAX;
-        let mut shared = 0u32;
-        for cursor in &scan.cursors {
-            if let Some(&doc_id) = cursor.window.as_slice().first() {
-                if doc_id < min_doc {
-                    min_doc = doc_id;
-                    shared = 1;
-                } else if doc_id == min_doc {
-                    shared += 1;
-                }
-            }
-        }
-        if shared == 0 {
+        let Some((min_doc, shared)) = scan.pop_candidate() else {
             return Ok(None);
-        }
+        };
         if min_doc as usize >= self.num_docs {
             return Err(Error::corrupt_file_named(
                 BANDS_FILENAME,
@@ -584,12 +588,6 @@ impl MinHashLshIndex {
                     self.num_docs
                 ),
             ));
-        }
-        for cursor in &mut scan.cursors {
-            if cursor.window.as_slice().first() == Some(&min_doc) {
-                cursor.window.next();
-                cursor.next += 1;
-            }
         }
         Ok(Some((min_doc, shared)))
     }
@@ -974,9 +972,205 @@ struct BucketCursor {
 /// [`MinHashLshIndex::next_candidate`].
 struct BucketScan {
     cursors: Vec<BucketCursor>,
+    heap: Option<BinaryHeap<Reverse<(u32, usize)>>>,
+    strategy: SelectionStrategy,
+    sampled: usize,
+    shared_total: usize,
+    live_cursors: usize,
+    drained: bool,
+}
+
+#[derive(Clone, Copy)]
+enum SelectionStrategy {
+    Sampling,
+    Heap,
+    Linear,
 }
 
 impl BucketScan {
+    fn new(cursors: Vec<BucketCursor>) -> Self {
+        let live_cursors = cursors
+            .iter()
+            .filter(|cursor| cursor.next < cursor.end)
+            .count();
+        Self {
+            cursors,
+            heap: None,
+            strategy: if live_cursors >= HEAP_MIN_BUCKETS {
+                SelectionStrategy::Sampling
+            } else {
+                SelectionStrategy::Linear
+            },
+            sampled: 0,
+            shared_total: 0,
+            live_cursors,
+            drained: false,
+        }
+    }
+
+    fn needs_refill(&self) -> bool {
+        match self.strategy {
+            SelectionStrategy::Heap => self.drained,
+            _ => self
+                .cursors
+                .iter()
+                .any(|cursor| cursor.next < cursor.end && cursor.window.as_slice().is_empty()),
+        }
+    }
+
+    fn refresh_heads(&mut self) {
+        self.drained = false;
+        if let Some(heap) = &mut self.heap {
+            let mut has_head = vec![false; self.cursors.len()];
+            for head in heap.iter() {
+                has_head[head.0.1] = true;
+            }
+            for (index, cursor) in self.cursors.iter().enumerate() {
+                if cursor.next < cursor.end && cursor.window.as_slice().is_empty() {
+                    self.drained = true;
+                }
+                // A refill only adds a head for cursors which had no window.
+                if !has_head[index]
+                    && let Some(&doc_id) = cursor.window.as_slice().first()
+                {
+                    heap.push(Reverse((doc_id, index)));
+                }
+            }
+        }
+    }
+
+    fn build_heap(&mut self) {
+        self.live_cursors = self
+            .cursors
+            .iter()
+            .filter(|cursor| cursor.next < cursor.end)
+            .count();
+        self.heap = Some(
+            self.cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cursor)| {
+                    cursor
+                        .window
+                        .as_slice()
+                        .first()
+                        .map(|&doc_id| Reverse((doc_id, index)))
+                })
+                .collect(),
+        );
+        self.drained = self
+            .cursors
+            .iter()
+            .any(|cursor| cursor.next < cursor.end && cursor.window.as_slice().is_empty());
+        self.strategy = SelectionStrategy::Heap;
+    }
+
+    fn advance(&mut self, index: usize) {
+        let cursor = &mut self.cursors[index];
+        cursor.window.next();
+        cursor.next += 1;
+        if cursor.next == cursor.end {
+            self.live_cursors -= 1;
+        } else if cursor.window.as_slice().is_empty() {
+            self.drained = true;
+        }
+    }
+
+    #[inline]
+    fn pop_candidate(&mut self) -> Option<(u32, u32)> {
+        if matches!(self.strategy, SelectionStrategy::Linear) {
+            return self.pop_linear_candidate();
+        }
+        let (doc_id, shared) = if let Some(heap) = &mut self.heap {
+            let Reverse((doc_id, index)) = heap.pop()?;
+            let mut indices = SmallVec::<[usize; 4]>::new();
+            indices.push(index);
+            while heap.peek().is_some_and(|head| head.0.0 == doc_id) {
+                let Reverse((_, index)) = heap.pop()?;
+                indices.push(index);
+            }
+            let shared = indices.len() as u32;
+            for index in indices {
+                self.advance(index);
+                if let Some(&next_doc) = self.cursors[index].window.as_slice().first() {
+                    self.heap.as_mut()?.push(Reverse((next_doc, index)));
+                }
+            }
+            (doc_id, shared)
+        } else {
+            self.pop_linear_candidate()?
+        };
+        if matches!(
+            self.strategy,
+            SelectionStrategy::Sampling | SelectionStrategy::Heap
+        ) {
+            self.sampled += 1;
+            self.shared_total += shared as usize;
+            if self.sampled == HEAP_SAMPLE_CANDIDATES {
+                let active_cursors = if self.heap.is_some() {
+                    self.live_cursors
+                } else {
+                    self.cursors
+                        .iter()
+                        .filter(|cursor| cursor.next < cursor.end)
+                        .count()
+                };
+                if active_cursors < HEAP_MIN_BUCKETS {
+                    // Cursors only become exhausted during a walk. Sampling
+                    // cannot lead to another heap until a seek resets it.
+                    self.heap = None;
+                    self.strategy = SelectionStrategy::Linear;
+                } else {
+                    match self.strategy {
+                        SelectionStrategy::Sampling
+                            if self.shared_total
+                                <= active_cursors * HEAP_SAMPLE_CANDIDATES / 32 =>
+                        {
+                            self.build_heap();
+                        }
+                        SelectionStrategy::Heap
+                            if self.shared_total >= active_cursors * HEAP_SAMPLE_CANDIDATES / 8 =>
+                        {
+                            self.heap = None;
+                            self.strategy = SelectionStrategy::Sampling;
+                        }
+                        _ => {}
+                    }
+                }
+                self.sampled = 0;
+                self.shared_total = 0;
+            }
+        }
+        Some((doc_id, shared))
+    }
+    // Low-bucket scans cannot use the heap. Keep their per-candidate path
+    // independent of heap dispatch and overlap sampling.
+    #[inline]
+    fn pop_linear_candidate(&mut self) -> Option<(u32, u32)> {
+        let mut doc_id = u32::MAX;
+        let mut shared = 0;
+        for cursor in &self.cursors {
+            if let Some(&head) = cursor.window.as_slice().first() {
+                if head < doc_id {
+                    doc_id = head;
+                    shared = 1;
+                } else if head == doc_id {
+                    shared += 1;
+                }
+            }
+        }
+        if shared == 0 {
+            return None;
+        }
+        for cursor in &mut self.cursors {
+            if cursor.window.as_slice().first() == Some(&doc_id) {
+                cursor.window.next();
+                cursor.next += 1;
+            }
+        }
+        Some((doc_id, shared))
+    }
+
     /// The absolute row each cursor stands at.
     fn positions(&self) -> Vec<usize> {
         self.cursors.iter().map(|cursor| cursor.next).collect()
@@ -988,6 +1182,20 @@ impl BucketScan {
             cursor.next = row;
             cursor.window = Vec::new().into_iter();
         }
+        self.heap = None;
+        self.sampled = 0;
+        self.shared_total = 0;
+        self.live_cursors = self
+            .cursors
+            .iter()
+            .filter(|cursor| cursor.next < cursor.end)
+            .count();
+        self.strategy = if self.live_cursors >= HEAP_MIN_BUCKETS {
+            SelectionStrategy::Sampling
+        } else {
+            SelectionStrategy::Linear
+        };
+        self.drained = false;
     }
 }
 
@@ -1353,4 +1561,180 @@ pub async fn merge_minhash_indices(
         .rebuild_from(signature_sources, None, dest_store)
         .await?;
     first.created_index(files)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use rstest::rstest;
+    use std::collections::BTreeMap;
+
+    #[rstest]
+    #[case::sparse(0)]
+    #[case::dense(1)]
+    #[case::skewed(2)]
+    #[case::partial_overlap(3)]
+    #[case::sparse_then_dense(4)]
+    #[case::dense_prefix(5)]
+    #[case::dense_then_sparse(6)]
+    #[case::sparse_dense_sparse(7)]
+    fn test_bucket_selection_matches_all_postings_across_refills_and_seek(#[case] shape: usize) {
+        let buckets: Vec<Vec<u32>> = (0..64)
+            .map(|band| match shape {
+                0 => (0..128).map(|row| (row * 64 + band) as u32).collect(),
+                1 => (0..128).map(|row| row as u32).collect(),
+                2 if band == 0 => (0..512).map(|row| row as u32).collect(),
+                2 => (0..16).map(|row| (row * 64 + band) as u32).collect(),
+                4 => (0..64)
+                    .map(|row| (row * 64 + band) as u32)
+                    .chain(10_000..10_128)
+                    .collect(),
+                5 | 6 => (0..if shape == 5 { 8 } else { 128 })
+                    .chain((0..128).map(|row| 10_000 + row * 64 + band as u32))
+                    .collect(),
+                7 => (0..128)
+                    .map(|row| (row * 64 + band) as u32)
+                    .chain(10_000..10_128)
+                    .chain((0..128).map(|row| 20_000 + row * 64 + band as u32))
+                    .collect(),
+                _ => (0..128).map(|row| (row * 32 + band / 2) as u32).collect(),
+            })
+            .collect();
+        let expected: Vec<(u32, u32)> = {
+            let mut counts = BTreeMap::new();
+            for bucket in &buckets {
+                for &doc_id in bucket {
+                    *counts.entry(doc_id).or_insert(0) += 1;
+                }
+            }
+            counts.into_iter().collect()
+        };
+        let cursors = buckets
+            .iter()
+            .map(|bucket| {
+                let mut window = Vec::with_capacity(2);
+                window.extend_from_slice(&bucket[..bucket.len().min(2)]);
+                BucketCursor {
+                    next: 0,
+                    end: bucket.len(),
+                    window: window.into_iter(),
+                }
+            })
+            .collect();
+        let mut scan = BucketScan::new(cursors);
+        let mut actual = Vec::new();
+        let mut saved = None;
+        let mut has_heap_after_dense = false;
+        let mut has_sampling_after_heap = false;
+        loop {
+            if scan.needs_refill() {
+                for (cursor, bucket) in scan.cursors.iter_mut().zip(&buckets) {
+                    let held = cursor.window.as_slice().len();
+                    if held < 4 && cursor.next + held < cursor.end {
+                        let mut window = cursor.window.as_slice().to_vec();
+                        window.extend_from_slice(
+                            &bucket[cursor.next + held..(cursor.next + held + 2).min(cursor.end)],
+                        );
+                        cursor.window = window.into_iter();
+                    }
+                }
+                scan.refresh_heads();
+            }
+            let Some(candidate) = scan.pop_candidate() else {
+                break;
+            };
+            if (shape == 5 || shape == 6) && candidate.0 >= 10_000
+                || shape == 7 && candidate.0 >= 20_000
+            {
+                has_heap_after_dense |= matches!(scan.strategy, SelectionStrategy::Heap);
+            }
+            if shape == 7 && (10_000..10_128).contains(&candidate.0) {
+                has_sampling_after_heap |= matches!(scan.strategy, SelectionStrategy::Sampling);
+            }
+            actual.push(candidate);
+            if actual.len() == 80 {
+                assert_eq!(
+                    matches!(scan.strategy, SelectionStrategy::Heap),
+                    !matches!(shape, 1 | 5 | 6),
+                    "shape {shape} selected the wrong strategy"
+                );
+                saved = Some(scan.positions());
+            }
+        }
+        assert_eq!(actual, expected);
+        if matches!(shape, 5..=7) {
+            assert!(
+                has_heap_after_dense,
+                "shape {shape} did not return to heap merging"
+            );
+        }
+        if shape == 7 {
+            assert!(
+                has_sampling_after_heap,
+                "dense cluster did not leave heap merging"
+            );
+        }
+        if shape == 4 {
+            assert!(matches!(scan.strategy, SelectionStrategy::Linear));
+        }
+        let positions = saved.unwrap();
+        scan.seek(&positions);
+        let resumed = expected[80..].to_vec();
+        let mut actual = Vec::new();
+        while actual.len() < resumed.len() {
+            if scan.needs_refill() {
+                for (cursor, bucket) in scan.cursors.iter_mut().zip(&buckets) {
+                    let held = cursor.window.as_slice().len();
+                    if held < 4 && cursor.next + held < cursor.end {
+                        let mut window = cursor.window.as_slice().to_vec();
+                        window.extend_from_slice(
+                            &bucket[cursor.next + held..(cursor.next + held + 2).min(cursor.end)],
+                        );
+                        cursor.window = window.into_iter();
+                    }
+                }
+                scan.refresh_heads();
+            }
+            actual.push(scan.pop_candidate().unwrap());
+        }
+        assert_eq!(actual, resumed);
+    }
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::default(16)]
+    #[case::below_threshold(31)]
+    #[case::at_threshold(32)]
+    fn test_sampling_only_when_heap_is_possible(#[case] bands: usize) {
+        let cursors = (0..bands)
+            .map(|band| BucketCursor {
+                next: 0,
+                end: 128,
+                window: (0..128)
+                    .map(|row| (row * bands + band) as u32)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            })
+            .collect();
+        let mut scan = BucketScan::new(cursors);
+        for doc_id in 0..HEAP_SAMPLE_CANDIDATES {
+            if bands == 0 {
+                assert_eq!(scan.pop_candidate(), None);
+            } else {
+                assert_eq!(scan.pop_candidate(), Some((doc_id as u32, 1)));
+            }
+        }
+        assert_eq!(
+            matches!(scan.strategy, SelectionStrategy::Heap),
+            bands >= HEAP_MIN_BUCKETS
+        );
+        assert_eq!(scan.sampled, 0);
+        assert_eq!(scan.shared_total, 0);
+        scan.seek(&vec![0; bands]);
+        assert_eq!(
+            matches!(scan.strategy, SelectionStrategy::Sampling),
+            bands >= HEAP_MIN_BUCKETS
+        );
+        assert!(scan.heap.is_none());
+    }
 }
