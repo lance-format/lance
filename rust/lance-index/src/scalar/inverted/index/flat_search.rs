@@ -165,6 +165,18 @@ pub(super) const FLAT_ALL_TOKENS_COL: &str = "all_tokens";
 pub(super) const FLAT_QUERY_TOKEN_COUNTS_COL: &str = "query_token_counts";
 pub(super) const FLAT_PHRASE_MATCH_COL: &str = "phrase_match";
 
+static FLAT_ALL_TOKENS_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false)));
+static FLAT_QUERY_TOKEN_COUNTS_ITEM_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new("item", DataType::UInt64, true)));
+static FLAT_PHRASE_MATCH_FIELD: LazyLock<Arc<Field>> = LazyLock::new(|| {
+    Arc::new(Field::new(
+        FLAT_PHRASE_MATCH_COL,
+        DataType::Boolean,
+        false,
+    ))
+});
+
 pub(super) fn phrase_matches_positions(
     query_tokens: &Tokens,
     document_positions: &[Vec<u32>],
@@ -229,24 +241,29 @@ pub(super) async fn tokenize_and_count(
     coordinate_rank: usize,
     phrase_slop: Option<u32>,
 ) -> DataFusionResult<RecordBatch> {
-    let mut output_fields = vec![ROW_ID_FIELD.clone()];
+    let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
     output_fields.extend(
-        (0..coordinate_rank)
-            .map(|rank| Field::new(doc_index_storage_column(rank), DataType::UInt32, false)),
+        (0..coordinate_rank).map(|rank| {
+            Arc::new(Field::new(
+                doc_index_storage_column(rank),
+                DataType::UInt32,
+                false,
+            ))
+        }),
     );
     output_fields.extend([
-        Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false),
-        Field::new(
+        FLAT_ALL_TOKENS_FIELD.clone(),
+        Arc::new(Field::new(
             FLAT_QUERY_TOKEN_COUNTS_COL,
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt64, true)),
+                FLAT_QUERY_TOKEN_COUNTS_ITEM_FIELD.clone(),
                 query_tokens.len() as i32,
             ),
             false,
-        ),
+        )),
     ]);
     if phrase_slop.is_some() {
-        output_fields.push(Field::new(FLAT_PHRASE_MATCH_COL, DataType::Boolean, false));
+        output_fields.push(FLAT_PHRASE_MATCH_FIELD.clone());
     }
     let output_schema = Arc::new(Schema::new(output_fields));
     let output_schema_clone = output_schema.clone();
