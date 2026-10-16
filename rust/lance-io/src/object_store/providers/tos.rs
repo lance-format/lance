@@ -160,14 +160,292 @@ impl ObjectStoreProvider for TosStoreProvider {
 
 #[cfg(test)]
 mod tests {
+    use http::{Method, Request, Response};
+    use object_store::path::Path;
+    use object_store::{ObjectStoreExt as _, memory::InMemory};
+    use opendal::{Buffer, HttpBody, HttpTransport, HttpTransporter, OperationContext, Operator};
+    use rstest::rstest;
+    use serde_json::json;
+    use std::collections::BTreeSet;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use super::TosStoreProvider;
+    use super::{Tos, TosStoreProvider};
     use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
+    use crate::object_store::{ObjectStore, opendal_store::OpendalStore};
     use crate::object_store::{ObjectStoreProvider, StorageOptionsAccessor};
     use url::Url;
+
+    #[derive(Clone, Default)]
+    struct HierarchicalTos {
+        keys: Arc<Mutex<BTreeSet<String>>>,
+        deleted: Arc<Mutex<Vec<String>>>,
+        fail_delete: Option<String>,
+        list_requests: Arc<Mutex<usize>>,
+        page_size: Option<usize>,
+    }
+
+    impl HttpTransport for HierarchicalTos {
+        async fn fetch(&self, request: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
+            let mut keys = self.keys.lock().unwrap();
+            let (status, body) = if request.method() == Method::GET {
+                let url = Url::parse(&request.uri().to_string()).unwrap();
+                let prefix = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "prefix")
+                    .unwrap()
+                    .1;
+                *self.list_requests.lock().unwrap() += 1;
+                let token = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "continuation-token")
+                    .map(|(_, value)| value.into_owned());
+                let mut remaining = keys.iter().filter(|key| {
+                    key.starts_with(prefix.as_ref())
+                        && token.as_ref().is_none_or(|token| *key > token)
+                });
+                let page = remaining
+                    .by_ref()
+                    .take(self.page_size.unwrap_or(usize::MAX))
+                    .collect::<Vec<_>>();
+                let is_truncated = remaining.next().is_some();
+                let next_token = page.last().copied();
+                let contents = page
+                    .iter()
+                    .map(|key| {
+                        // Include both nonempty files and zero-byte files alongside directories.
+                        let size = if key.ends_with("part.lance") { 128 } else { 0 };
+                        json!({"Key": key, "Size": size, "LastModified": "2026-10-09T00:00:00Z"})
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    200,
+                    json!({"Contents": contents, "IsTruncated": is_truncated, "NextContinuationToken": next_token}),
+                )
+            } else {
+                assert_eq!(
+                    request.method(),
+                    Method::DELETE,
+                    "directory deletion must use single-object requests"
+                );
+                let key =
+                    opendal::raw::percent_decode_path(request.uri().path().trim_start_matches('/'));
+                self.deleted.lock().unwrap().push(key.clone());
+                let directory = format!("{}/", key.trim_end_matches('/'));
+                if self.fail_delete.as_deref() == Some(key.as_str()) {
+                    (
+                        403,
+                        json!({"Code": "AccessDenied", "Message": "Deletion denied"}),
+                    )
+                } else if keys.contains(&directory)
+                    && keys
+                        .iter()
+                        .any(|child| child.starts_with(&directory) && child != &directory)
+                {
+                    (
+                        409,
+                        json!({"Code": "CannotDelete", "Message": "Directory is not empty"}),
+                    )
+                } else {
+                    keys.remove(&key);
+                    keys.remove(&directory);
+                    (204, json!({}))
+                }
+            };
+            let buffer = Buffer::from(body.to_string());
+            let size = buffer.len() as u64;
+            Ok(Response::builder()
+                .status(status)
+                .body(HttpBody::new(
+                    futures::stream::iter([Ok(buffer)]),
+                    Some(size),
+                ))
+                .unwrap())
+        }
+    }
+
+    async fn hierarchical_store(mock: HierarchicalTos) -> Arc<ObjectStore> {
+        let operator = Operator::from_iter::<Tos>(HashMap::from([
+            ("bucket".to_string(), "test-bucket".to_string()),
+            (
+                "endpoint".to_string(),
+                "https://tos-cn-beijing.volces.com".to_string(),
+            ),
+            ("region".to_string(), "cn-beijing".to_string()),
+            ("access_key_id".to_string(), "test-key".to_string()),
+            ("secret_access_key".to_string(), "test-secret".to_string()),
+        ]))
+        .unwrap()
+        .with_context(OperationContext::new().with_http_transport(HttpTransporter::new(mock)));
+        let native = Arc::new(OpendalStore::new(operator));
+        let (mut store, _) = ObjectStore::from_uri("memory://").await.unwrap();
+        let store_mut = Arc::get_mut(&mut store).unwrap();
+        store_mut.inner = native;
+        store
+    }
+
+    #[rstest]
+    #[case::hierarchical("dataset", true)]
+    #[case::flat("dataset", false)]
+    #[case::reserved_character("dataset/run~1", true)]
+    #[case::literal_percent_escape("dataset/run%25231", true)]
+    #[tokio::test]
+    async fn test_remove_dir_all_preserves_directory_semantics(
+        #[case] base_url: &str,
+        #[case] hierarchical: bool,
+        #[values(None, Some(2))] page_size: Option<usize>,
+    ) {
+        let base = Path::from_url_path(base_url).unwrap();
+        let prefix = opendal::raw::percent_decode_path(base.as_ref());
+        let mut keys = BTreeSet::from([
+            format!("{prefix}/data/part.lance"),
+            format!("{prefix}/_versions/1.manifest"),
+            format!("{prefix}-other/keep"),
+        ]);
+        if hierarchical {
+            keys.extend([
+                format!("{prefix}/"),
+                format!("{prefix}/data/"),
+                format!("{prefix}/_versions/"),
+                format!("{prefix}/empty/"),
+                format!("{prefix}/empty/nested/"),
+            ]);
+        }
+        let mock = HierarchicalTos {
+            page_size,
+            keys: Arc::new(Mutex::new(keys)),
+            ..Default::default()
+        };
+        let entry_count = mock.keys.lock().unwrap().len() - 1;
+        let store = hierarchical_store(mock.clone()).await;
+        store.remove_dir_all(base.clone()).await.unwrap();
+        assert_eq!(
+            *mock.list_requests.lock().unwrap(),
+            entry_count.div_ceil(page_size.unwrap_or(entry_count))
+        );
+        assert_eq!(
+            *mock.keys.lock().unwrap(),
+            BTreeSet::from([format!("{prefix}-other/keep")])
+        );
+        // Zero-byte files must also be deleted before their parent directories.
+        {
+            let deleted = mock.deleted.lock().unwrap();
+            assert_eq!(deleted.len(), if hierarchical { 7 } else { 2 });
+            if hierarchical {
+                assert_eq!(deleted.last().unwrap(), &prefix);
+            }
+        }
+        store.remove_dir_all(base).await.unwrap();
+    }
+
+    #[rstest]
+    #[case::empty_directory(true)]
+    #[case::missing_directory(false)]
+    #[tokio::test]
+    async fn test_remove_empty_or_missing_directory(#[case] exists: bool) {
+        let mock = HierarchicalTos::default();
+        if exists {
+            mock.keys.lock().unwrap().insert("empty/".to_string());
+        }
+        hierarchical_store(mock.clone())
+            .await
+            .remove_dir_all("empty")
+            .await
+            .unwrap();
+        assert!(mock.keys.lock().unwrap().is_empty());
+        assert_eq!(mock.deleted.lock().unwrap().len(), usize::from(exists));
+    }
+
+    #[rstest]
+    #[case::empty_file("dataset/file")]
+    #[case::nonempty_file("dataset/part.lance")]
+    #[case::directory("dataset")]
+    #[tokio::test]
+    async fn test_remove_dir_all_propagates_deletion_failure(#[case] fail_delete: &str) {
+        let file = if fail_delete == "dataset/part.lance" {
+            fail_delete
+        } else {
+            "dataset/file"
+        };
+        let keys = BTreeSet::from(["dataset/".to_string(), file.to_string()]);
+        let mock = HierarchicalTos {
+            keys: Arc::new(Mutex::new(keys.clone())),
+            fail_delete: Some(fail_delete.to_string()),
+            ..Default::default()
+        };
+        let error = hierarchical_store(mock.clone())
+            .await
+            .remove_dir_all("dataset")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::IO { .. }));
+        assert!(error.to_string().contains("Deletion denied"), "{error}");
+        if fail_delete == file {
+            assert_eq!(*mock.keys.lock().unwrap(), keys);
+            assert_eq!(*mock.deleted.lock().unwrap(), [file]);
+        } else {
+            assert_eq!(
+                *mock.keys.lock().unwrap(),
+                BTreeSet::from(["dataset/".to_string()])
+            );
+            assert_eq!(*mock.deleted.lock().unwrap(), ["dataset/file", "dataset"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_all_respects_wrapped_listing_and_deletion() {
+        let mock = HierarchicalTos {
+            keys: Arc::new(Mutex::new(BTreeSet::from([
+                "dataset/".to_string(),
+                "dataset/hidden".to_string(),
+            ]))),
+            ..Default::default()
+        };
+        let mut store = hierarchical_store(mock.clone()).await;
+        let wrapped = Arc::new(InMemory::new());
+        wrapped
+            .put(&Path::from("dataset/visible"), bytes::Bytes::new().into())
+            .await
+            .unwrap();
+        Arc::get_mut(&mut store).unwrap().inner = wrapped.clone();
+        store.remove_dir_all("dataset").await.unwrap();
+        assert!(matches!(
+            wrapped.head(&Path::from("dataset/visible")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(mock.deleted.lock().unwrap().is_empty());
+        assert!(mock.keys.lock().unwrap().contains("dataset/hidden"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_all_respects_rewritten_paths() {
+        let mock = HierarchicalTos {
+            keys: Arc::new(Mutex::new(BTreeSet::from([
+                "tenant/dataset/".to_string(),
+                "tenant/dataset/data/".to_string(),
+                "tenant/dataset/data/part.lance".to_string(),
+                "tenant/dataset/data/empty".to_string(),
+                "tenant/other/keep".to_string(),
+            ]))),
+            ..Default::default()
+        };
+        let mut store = hierarchical_store(mock.clone()).await;
+        let store_mut = Arc::get_mut(&mut store).unwrap();
+        store_mut.inner = Arc::new(object_store::prefix::PrefixStore::new(
+            store_mut.inner.clone(),
+            "tenant",
+        ));
+        store.remove_dir_all("dataset").await.unwrap();
+        assert_eq!(
+            *mock.keys.lock().unwrap(),
+            BTreeSet::from(["tenant/other/keep".to_string()])
+        );
+        assert_eq!(*mock.list_requests.lock().unwrap(), 1);
+        let deleted = mock.deleted.lock().unwrap();
+        assert_eq!(deleted.first().unwrap(), "tenant/dataset/data/part.lance");
+        assert_eq!(deleted.last().unwrap(), "tenant/dataset");
+    }
 
     #[test]
     fn test_tos_store_path() {
