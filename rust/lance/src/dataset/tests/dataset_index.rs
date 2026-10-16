@@ -27,7 +27,7 @@ use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
 use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
 use arrow_array::{
-    ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
     types::{Float32Type, Int32Type, Int64Type},
 };
@@ -45,6 +45,7 @@ use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
@@ -501,14 +502,71 @@ async fn test_create_scalar_index(
     dataset.index_statistics(&index_name).await.unwrap();
 }
 
+const NULLABLE_INT_PREDICATES: &[(&str, bool)] = &[
+    ("value = 7", true),
+    ("value IN (7, 99)", true),
+    ("NOT (value = 99)", true),
+    ("NOT (value = 7)", true),
+    ("NOT (value = 99 OR value = 7)", true),
+    ("NOT (NOT (value = 7))", true),
+    ("value = 99 OR value = 7", true),
+];
+
+// `flag IS TRUE` is FALSE on NULL rows while `flag = true` is NULL, so only
+// the former turns NULL rows into matches under `NOT`.
+const NULLABLE_BOOL_PREDICATES: &[(&str, bool)] = &[
+    ("flag", true),
+    ("NOT flag", true),
+    ("NOT (flag = true)", true),
+    ("flag IS TRUE", true),
+    ("NOT (flag IS TRUE)", true),
+    ("flag IS FALSE", true),
+    ("NOT (flag IS FALSE)", true),
+];
+
+// The FM index skips NULL text rows, so `NOT contains` must not use it.
+const NULLABLE_TEXT_PREDICATES: &[(&str, bool)] = &[
+    ("contains(text, 'cat')", true),
+    ("NOT contains(text, 'cat')", false),
+];
+
+/// Indexed filters on nullable columns must return the same rows as an
+/// unindexed scan. `NOT` is the sensitive case: an index that reports a NULL
+/// row as FALSE makes it TRUE after negation.
+#[rstest]
+#[case::btree_int("value", BuiltinIndexType::BTree, "BTree", NULLABLE_INT_PREDICATES)]
+#[case::btree_bool("flag", BuiltinIndexType::BTree, "BTree", NULLABLE_BOOL_PREDICATES)]
+#[case::bitmap_bool("flag", BuiltinIndexType::Bitmap, "Bitmap", NULLABLE_BOOL_PREDICATES)]
+#[case::fm_text("text", BuiltinIndexType::Fm, "Fm", NULLABLE_TEXT_PREDICATES)]
 #[tokio::test]
-async fn test_btree_nullable_filters_match_unindexed_scan() {
-    let test_uri = TempStrDir::default();
-    let num_rows = 10_000u64;
+async fn test_nullable_filters_match_unindexed_scan(
+    #[case] column: &str,
+    #[case] index_type: BuiltinIndexType,
+    #[case] index_name_in_plan: &str,
+    #[case] predicates: &[(&str, bool)],
+) {
+    let num_rows = 1_000u64;
     let values: Int32Array = (0..num_rows).map(|id| (id % 5 == 0).then_some(7)).collect();
+    let flags: BooleanArray = (0..num_rows)
+        .map(|id| match id % 3 {
+            0 => Some(true),
+            1 => Some(false),
+            _ => None,
+        })
+        .collect();
+    let texts: StringArray = (0..num_rows)
+        .map(|id| match id % 4 {
+            0 => Some("cat fish"),
+            1 => Some("dog"),
+            2 => None,
+            _ => Some("catch"),
+        })
+        .collect();
     let ids = UInt64Array::from_iter_values(0..num_rows);
     let batch = RecordBatch::try_from_iter(vec![
         ("value", Arc::new(values) as ArrayRef),
+        ("flag", Arc::new(flags) as ArrayRef),
+        ("text", Arc::new(texts) as ArrayRef),
         ("id", Arc::new(ids) as ArrayRef),
     ])
     .unwrap();
@@ -516,9 +574,9 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
     let reader = RecordBatchIterator::new([Ok(batch)], schema);
     let mut dataset = Dataset::write(
         reader,
-        &test_uri,
+        "memory://",
         Some(WriteParams {
-            max_rows_per_file: 2_500,
+            max_rows_per_file: 250,
             ..Default::default()
         }),
     )
@@ -528,24 +586,22 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
 
     dataset
         .create_index(
-            &["value"],
-            IndexType::BTree,
-            Some("value_btree".to_string()),
-            &ScalarIndexParams::default(),
+            &[column],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::for_builtin(index_type),
             true,
         )
         .await
         .unwrap();
 
-    for predicate in [
-        "value = 7",
-        "value IN (7, 99)",
-        "NOT (value = 99)",
-        "NOT (value = 7)",
-        "NOT (value = 99 OR value = 7)",
-        "NOT (NOT (value = 7))",
-        "value = 99 OR value = 7",
-    ] {
+    let sorted_ids = |batch: &RecordBatch| {
+        let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    };
+
+    for &(predicate, uses_index) in predicates {
         let mut indexed_scan = dataset.scan();
         indexed_scan
             .filter(predicate)
@@ -553,9 +609,10 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
             .project(&["id"])
             .unwrap();
         let plan = indexed_scan.explain_plan(false).await.unwrap();
-        assert!(
-            plan.contains("ScalarIndexQuery") && plan.contains("BTree"),
-            "Expected BTree scalar index query for {predicate}:\n{plan}"
+        assert_eq!(
+            plan.contains("ScalarIndexQuery") && plan.contains(index_name_in_plan),
+            uses_index,
+            "unexpected index usage for {predicate}:\n{plan}"
         );
         let indexed = indexed_scan.try_into_batch().await.unwrap();
 
@@ -566,21 +623,20 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
             .unwrap()
             .project(&["id"])
             .unwrap();
-        let baseline = baseline_scan.try_into_batch().await.unwrap();
+        let baseline = sorted_ids(&baseline_scan.try_into_batch().await.unwrap());
 
-        let sorted_ids = |batch: &RecordBatch| {
-            let mut ids = batch
-                .column(0)
-                .as_primitive::<UInt64Type>()
-                .values()
-                .to_vec();
-            ids.sort_unstable();
-            ids
-        };
         assert_eq!(
             sorted_ids(&indexed),
-            sorted_ids(&baseline),
+            baseline,
             "indexed result differs for {predicate}"
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some(predicate.to_string()))
+                .await
+                .unwrap(),
+            baseline.len(),
+            "indexed count differs for {predicate}"
         );
     }
 }

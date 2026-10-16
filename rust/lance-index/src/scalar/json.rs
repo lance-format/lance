@@ -340,6 +340,10 @@ impl AnyQuery for JsonQuery {
             None => false,
         }
     }
+
+    fn reports_null_rows(&self) -> bool {
+        self.target_query.reports_null_rows()
+    }
 }
 
 #[derive(Debug)]
