@@ -8478,6 +8478,7 @@ impl Scanner {
                     .map(|fragment| fragment.id as u32)
                     .collect();
                 let mut coverage = scope.clone();
+                let has_missing_fragments = !missing_frags.is_empty();
                 let missing = if !self.fast_search && !missing_frags.is_empty() {
                     if filter_plan.full_expr.is_none() {
                         return Err(Error::internal(format!(
@@ -8528,10 +8529,9 @@ impl Scanner {
                 {
                     exec = exec.with_segment_uuids(segment_uuids);
                 }
-                if missing.is_none()
-                    && self.fragments.is_none()
-                    && scope.len() == self.dataset.manifest().fragments.len() as u64
-                {
+                // The consumer bounds hits to its own index fragments. A separate scope
+                // mask is needed only for explicit selections or skipped/missing coverage.
+                if self.fragments.is_none() && !has_missing_fragments {
                     return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(exec)));
                 }
                 let plan = crate::io::exec::PrefilterUnionExec::new(
@@ -19142,8 +19142,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 SortExec: TopK(fetch=8), expr=...
                   ANNSubIndex: name=..., k=8, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                    PrefilterUnion: scalar_fragments=3, evaluated_fragments=3
-                      ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+                    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -19200,8 +19199,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 SortExec: TopK(fetch=11), expr=...
                   ANNSubIndex: name=..., k=11, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                    PrefilterUnion: scalar_fragments=3, evaluated_fragments=3
-                      ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+                    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         dataset.make_scalar_index().await?;
         assert_plan_equals(
@@ -22092,22 +22090,23 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[rstest]
-    #[case::covered(vec![1], false, "i >= 5", false)]
-    #[case::hybrid(vec![1, 2], false, "i >= 5", false)]
-    #[case::missing(vec![2], false, "i >= 5", false)]
-    #[case::fast_hybrid(vec![1, 2], true, "i >= 5", false)]
-    #[case::fast_missing(vec![2], true, "i >= 5", false)]
-    #[case::empty(vec![], false, "i >= 5", false)]
-    #[case::duplicates(vec![1, 1], false, "i >= 5", false)]
-    #[case::reordered(vec![2, 1], false, "i >= 5", false)]
-    #[case::all_covered(vec![0, 1], false, "i >= 5", false)]
-    #[case::all_fragments(vec![0, 1, 2], false, "i >= 5", false)]
-    #[case::negation(vec![1, 2], false, "NOT (i < 5)", false)]
-    #[case::conjunction(vec![1, 2], false, "i >= 5 AND i < 10", false)]
-    #[case::disjunction(vec![1, 2], false, "i = 6 OR i = 10", true)]
-    #[case::nulls(vec![1, 2], false, "i IS NULL", false)]
-    #[case::fast_nulls(vec![1, 2], true, "i IS NULL", false)]
-    #[case::no_matches(vec![1, 2], false, "i < 0", false)]
+    #[case::covered(vec![1], false, "i >= 5", false, true)]
+    #[case::hybrid(vec![1, 2], false, "i >= 5", false, true)]
+    #[case::missing(vec![2], false, "i >= 5", false, true)]
+    #[case::fast_hybrid(vec![1, 2], true, "i >= 5", false, true)]
+    #[case::fast_missing(vec![2], true, "i >= 5", false, true)]
+    #[case::empty(vec![], false, "i >= 5", false, true)]
+    #[case::duplicates(vec![1, 1], false, "i >= 5", false, true)]
+    #[case::reordered(vec![2, 1], false, "i >= 5", false, true)]
+    #[case::all_covered(vec![0, 1], false, "i >= 5", false, true)]
+    #[case::all_fragments(vec![0, 1, 2], false, "i >= 5", false, true)]
+    #[case::negation(vec![1, 2], false, "NOT (i < 5)", false, true)]
+    #[case::conjunction(vec![1, 2], false, "i >= 5 AND i < 10", false, true)]
+    #[case::disjunction(vec![1, 2], false, "i = 6 OR i = 10", true, true)]
+    #[case::nulls(vec![1, 2], false, "i IS NULL", false, true)]
+    #[case::fast_nulls(vec![1, 2], true, "i IS NULL", false, true)]
+    #[case::fast_negation_implicit(vec![0, 1, 2], true, "NOT (i < 5)", false, false)]
+    #[case::no_matches(vec![1, 2], false, "i < 0", false, true)]
     #[tokio::test]
     async fn test_hybrid_prefilter_scope_and_io(
         #[values(false, true)] stable_row_ids: bool,
@@ -22115,6 +22114,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         #[case] fast_search: bool,
         #[case] predicate: &str,
         #[case] expect_missing_reads: bool,
+        #[case] explicit_fragments: bool,
     ) {
         let data_dir = TempStrDir::default();
         let indexed = arrow_array::record_batch!((
@@ -22174,7 +22174,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .unwrap();
         let fragments = dataset.fragments();
         let mut scanner = dataset.scan();
-        scanner.with_fragments(selected.iter().map(|id| fragments[*id].clone()).collect());
+        if explicit_fragments {
+            scanner.with_fragments(selected.iter().map(|id| fragments[*id].clone()).collect());
+        }
         if fast_search {
             scanner.fast_search();
         }
@@ -22305,25 +22307,38 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
         fixture.make_fts_index().await.unwrap();
-        fixture.dataset.delete("i = 252").await.unwrap();
-        let dataset = &fixture.dataset;
-        let mut oracle = dataset.scan();
-        oracle.use_scalar_index(false).with_row_id();
-        oracle.filter("i >= 250 AND i % 2 = 0").unwrap();
-        oracle.with_fragments(dataset.fragments()[1..].to_vec());
-        let expected = oracle.try_into_batch().await.unwrap();
+        let mut before_delete = fixture.dataset.scan();
+        before_delete.use_scalar_index(false).with_row_id();
+        before_delete.filter("i >= 250 AND i % 2 = 0").unwrap();
+        before_delete.with_fragments(fixture.dataset.fragments()[1..].to_vec());
+        let before_delete = before_delete.try_into_batch().await.unwrap();
         let external = lance_select::RowAddrMask::from_allowed(
-            expected[ROW_ID]
+            before_delete[ROW_ID]
                 .as_primitive::<UInt64Type>()
                 .values()
                 .iter()
                 .copied()
                 .collect(),
         );
+        fixture.dataset.delete("i = 252").await.unwrap();
+        let dataset = &fixture.dataset;
+        let mut oracle = dataset.scan();
+        oracle.use_scalar_index(false).with_row_id();
+        oracle
+            .filter(if consumer == "batch" {
+                "i >= 250"
+            } else {
+                "i >= 250 AND i % 2 = 0"
+            })
+            .unwrap();
+        oracle.with_fragments(dataset.fragments()[1..].to_vec());
+        let expected = oracle.try_into_batch().await.unwrap();
         let mut scanner = dataset.scan();
         scanner.with_fragments(dataset.fragments()[1..].to_vec());
         scanner.filter("i >= 250").unwrap().prefilter(true);
-        scanner.with_row_id_prefilter(external);
+        if consumer != "batch" {
+            scanner.with_row_id_prefilter(external);
+        }
         scanner.project(&["i"]).unwrap();
         if fast_search {
             scanner.fast_search();
@@ -22345,6 +22360,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         }
         let plan = scanner.explain_plan(true).await.unwrap();
         assert!(plan.contains("PrefilterUnion:"), "{plan}");
+        if consumer == "batch" {
+            assert!(plan.contains("ANNIvfBatch:"), "{plan}");
+        }
         assert_eq!(
             plan.contains("projection=[], num_fragments=1"),
             !fast_search,
@@ -22444,7 +22462,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             scalar_index_node.contains("indices_loaded=1,"),
             "expected one scalar segment to be loaded, plan was:\n{analyzed}"
         );
-        assert!(analyzed.contains("PrefilterUnion:"), "{analyzed}");
+        assert_eq!(
+            analyzed.contains("PrefilterUnion:"),
+            explicit_fragments,
+            "{analyzed}"
+        );
         assert!(
             !analyzed.contains("projection=[], num_fragments=1"),
             "{analyzed}"

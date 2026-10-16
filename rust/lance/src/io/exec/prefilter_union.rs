@@ -135,9 +135,9 @@ impl PrefilterUnionExec {
     async fn selection(
         dataset: Arc<Dataset>,
         scope: RoaringBitmap,
-    ) -> lance_core::Result<RowAddrMask> {
+    ) -> lance_core::Result<Arc<RowAddrMask>> {
         if scope.is_empty() {
-            return Ok(RowAddrMask::allow_nothing());
+            return Ok(Arc::new(RowAddrMask::allow_nothing()));
         }
         let missing = &scope - dataset.fragment_bitmap.as_ref();
         if !missing.is_empty() {
@@ -148,12 +148,7 @@ impl PrefilterUnionExec {
         }
         if dataset.manifest().uses_stable_row_ids() {
             // Stable IDs must be selected by their current fragment membership.
-            return Ok(
-                DatasetPreFilter::do_create_deletion_mask_row_id(dataset, Some(scope))
-                    .await?
-                    .as_ref()
-                    .clone(),
-            );
+            return DatasetPreFilter::do_create_deletion_mask_row_id(dataset, Some(scope)).await;
         }
         let mut addresses = RowAddrTreeMap::new();
         for fragment in dataset
@@ -174,7 +169,7 @@ impl PrefilterUnionExec {
             )))?;
             addresses.insert_range(start..start + u64::from(rows));
         }
-        Ok(RowAddrMask::from_allowed(addresses))
+        Ok(Arc::new(RowAddrMask::from_allowed(addresses)))
     }
 }
 
@@ -285,7 +280,15 @@ impl ExecutionPlan for PrefilterUnionExec {
             // which can complete its first poll without yielding.
             let (missing, selection, scalar) =
                 futures::try_join!(missing_future, selection, scalar_future)?;
-            IndexExprResult::exact((scalar & selection) | missing)
+            let scalar = match scalar {
+                RowAddrMask::AllowList(mut rows) => {
+                    rows.mask(&selection);
+                    RowAddrMask::from_allowed(rows)
+                }
+                // A complement needs the scope's allow-list to become a finite selection.
+                RowAddrMask::BlockList(_) => scalar & selection.as_ref().clone(),
+            };
+            IndexExprResult::exact(scalar | missing)
                 .serialize(&coverage, format)
                 .map_err(DataFusionError::from)
         };
