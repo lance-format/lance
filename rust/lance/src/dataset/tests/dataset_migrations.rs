@@ -9,7 +9,7 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::{ColumnAlteration, InsertBuilder, NewColumnTransform};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
-use crate::{Dataset, Result};
+use crate::{Dataset, Error, Result};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
@@ -1541,4 +1541,68 @@ fn test_migration_allocates_from_the_given_mark(
         .collect();
     let expected: Vec<Vec<u64>> = expected.into_iter().map(|r| r.collect()).collect();
     assert_eq!(sequences, expected);
+}
+
+#[tokio::test]
+async fn test_count_rows_falls_back_to_files() {
+    // Three fragments of 10 rows, 2 rows deleted from each.
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..30))],
+    )
+    .unwrap();
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://count_rows_partial_counts",
+        Some(write_params),
+    )
+    .await
+    .unwrap();
+    dataset.delete("id % 10 < 2").await.unwrap();
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
+
+    // Drop the physical row count from one fragment and the deletion count
+    // from another, as manifests written by old versions may have; those
+    // are counted from their files and the third from the manifest.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[0].physical_rows = None;
+    fragments[1]
+        .deletion_file
+        .as_mut()
+        .unwrap()
+        .num_deleted_rows = None;
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
+
+    // A fragment without data files is an error, even when the manifest has
+    // its counts.
+    let mut no_files = dataset.clone();
+    let mut manifest = no_files.manifest.as_ref().clone();
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[2].files.clear();
+    manifest.fragments = Arc::new(fragments);
+    no_files.manifest = Arc::new(manifest);
+    let err = no_files.count_rows(None).await.unwrap_err();
+    assert!(matches!(err, Error::NotFound { .. }), "{err}");
+
+    // Without a writer version no physical row count in the manifest is
+    // trusted (#1531), not even one smaller than the deletion count.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.writer_version = None;
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[2].physical_rows = Some(1);
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
 }

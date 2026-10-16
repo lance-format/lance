@@ -1761,12 +1761,32 @@ impl Dataset {
     }
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {
-        let cnts = stream::iter(self.get_fragments())
+        // Sum the counts already in the manifest. A fragment goes through
+        // `FileFragment::count_rows` (which may open its files) only when a
+        // count is missing, the manifest predates `writer_version` (see
+        // `FileFragment::physical_rows`), or it has no data files (an error).
+        // Those are checked before `num_rows`, since an untrusted physical row
+        // count can be smaller than the deletion count.
+        let trust_metadata = self.manifest.writer_version.is_some();
+        let dataset = Arc::new(self.clone());
+        let mut num_rows = 0;
+        let mut need_io = Vec::new();
+        for fragment in self.manifest.fragments.iter() {
+            if trust_metadata
+                && !fragment.files.is_empty()
+                && let Some(rows) = fragment.num_rows()
+            {
+                num_rows += rows;
+            } else {
+                need_io.push(FileFragment::new(dataset.clone(), fragment.clone()));
+            }
+        }
+        let cnts = stream::iter(need_io)
             .map(|f| async move { f.count_rows(None).await })
             .buffer_unordered(16)
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(cnts.iter().sum())
+        Ok(num_rows + cnts.iter().sum::<usize>())
     }
 
     /// Take rows by indices.
