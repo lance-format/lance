@@ -3,7 +3,7 @@
 
 mod should_maxscore;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
@@ -32,7 +32,8 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled, iu_tight_search,
+        iu_tight_search_multi, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -68,8 +69,8 @@ impl ScoredRow<u64> {
 /// operations cannot round an upper bound below an exact score.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ScoreBounds {
-    lower: f32,
-    upper: f32,
+    pub(super) lower: f32,
+    pub(super) upper: f32,
 }
 
 impl ScoreBounds {
@@ -269,7 +270,10 @@ pub(super) trait ComposableScorer: Send {
     fn advance_shallow(&mut self, target: u64) -> Result<u64>;
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds>;
     /// Conservative list-wide score upper bound, independent of iterator
-    /// position. `None` keeps the scorer on exact eager composition paths.
+    /// position: it must cover every document of the list, not a range.
+    /// Understating it lets a parent prune documents that can still compete,
+    /// so implementations return `None` rather than guess. `None` keeps the
+    /// scorer on exact eager composition paths.
     fn global_score_upper_bound(&self) -> Option<f32> {
         None
     }
@@ -298,9 +302,137 @@ pub(super) trait ComposableScorer: Send {
     fn scores_non_negative(&self) -> bool {
         false
     }
+
+    /// Drain one cached shallow window of confirmed hits.
+    ///
+    /// An empty window is not exhaustion: the collector must call again after a
+    /// skipped or hitless range. Emit every confirmed document whose score is
+    /// at least `min_score` (inclusive). `max_hits` caps this window only; the
+    /// scorer stays on the first document that did not fit so the next call
+    /// can continue without re-emitting.
+    fn collect_confirmed_window(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        collect_confirmed_window_default(self, min_score, out, max_hits)
+    }
+
+    #[cfg(test)]
+    fn debug_type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    #[cfg(test)]
+    fn debug_last_min_competitive_score(&self) -> Option<f32> {
+        None
+    }
+}
+
+/// Upper bound on hits one `collect_confirmed_window` drain may buffer. The
+/// drain pauses and re-offers, so this bounds scratch memory without changing
+/// which documents are collected.
+pub(super) const CONFIRMED_WINDOW_MAX_HITS: usize = 4096;
+
+/// One confirmed hit produced by [`ComposableScorer::collect_confirmed_window`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ConfirmedHit {
+    pub document_key: u64,
+    pub score: f32,
+}
+
+/// Status of one shallow-window drain.
+///
+/// Zero hits does not mean the scorer is finished. Only [`Self::exhausted`]
+/// tells the collector to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WindowCollect {
+    pub exhausted: bool,
 }
 
 pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
+
+fn collect_confirmed_window_default<S: ComposableScorer + ?Sized>(
+    scorer: &mut S,
+    min_score: f32,
+    out: &mut Vec<ConfirmedHit>,
+    max_hits: usize,
+) -> Result<WindowCollect> {
+    if max_hits == 0 {
+        return Ok(WindowCollect { exhausted: true });
+    }
+    scorer.set_min_competitive_score(min_score)?;
+    let Some(doc_id) = (match scorer.doc() {
+        Some(doc) => Some(doc),
+        None => scorer.next()?,
+    }) else {
+        return Ok(WindowCollect { exhausted: true });
+    };
+
+    let up_to = scorer.advance_shallow(doc_id)?;
+    let bounds = scorer.score_bounds(up_to)?;
+    if bounds.upper < min_score {
+        let next = if up_to == u64::MAX {
+            None
+        } else {
+            scorer.advance(up_to + 1)?
+        };
+        return Ok(WindowCollect {
+            exhausted: next.is_none(),
+        });
+    }
+
+    loop {
+        if out.len() >= max_hits {
+            return Ok(WindowCollect { exhausted: false });
+        }
+        if min_score.is_finite()
+            && scorer.supports_doc_local_confirmation_pruning()
+            && scorer
+                .current_score_upper_bound()?
+                .is_some_and(|upper| upper < min_score)
+        {
+            match scorer.next()? {
+                // `next` feeds only this guard; the walk resumes from the
+                // scorer's own position.
+                Some(next) if next <= up_to => continue,
+                Some(_) => return Ok(WindowCollect { exhausted: false }),
+                None => return Ok(WindowCollect { exhausted: true }),
+            }
+        }
+        if let Some(match_cost) = scorer.match_cost()
+            && (!match_cost.is_finite() || match_cost < 0.0)
+        {
+            return Err(Error::internal(format!(
+                "FTS scorer reported invalid two-phase match cost: {match_cost}"
+            )));
+        }
+        if scorer.matches()? {
+            let score = checked_score(scorer.score()?, "compound scorer")?;
+            if score >= min_score {
+                let document_key = scorer.document_key().ok_or_else(|| {
+                    Error::internal("compound FTS scorer did not expose its current document key")
+                })?;
+                out.push(ConfirmedHit {
+                    document_key,
+                    score,
+                });
+            }
+        }
+        match scorer.next()? {
+            // Same as above: the guard is the only read of `next`.
+            Some(next) if next <= up_to => continue,
+            Some(_) => return Ok(WindowCollect { exhausted: false }),
+            None => return Ok(WindowCollect { exhausted: true }),
+        }
+    }
+}
 
 fn sum_global_score_upper_bounds(children: &[BoxScorer<'_>]) -> Option<f32> {
     children.iter().try_fold(0.0, |upper, child| {
@@ -724,7 +856,7 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new(
+            } => BooleanScorer::try_root(
                 should
                     .iter()
                     .map(|child| child.build(leaves))
@@ -736,7 +868,7 @@ impl CompoundScorerPlan {
                     .iter()
                     .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
-            )?)),
+            ),
         }
     }
 }
@@ -803,6 +935,71 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn scores_non_negative(&self) -> bool {
         true
+    }
+
+    fn collect_confirmed_window(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        if max_hits == 0 {
+            return Ok(WindowCollect { exhausted: true });
+        }
+        self.set_min_competitive_score(min_score)?;
+        let Some(start) = (match self.doc() {
+            Some(doc) => Some(doc),
+            None => self.next()?,
+        }) else {
+            return Ok(WindowCollect { exhausted: true });
+        };
+        let up_to = self.advance_shallow(start)?;
+        let upper = self.score_upper_bound(up_to)?;
+        if upper < min_score {
+            let next = if up_to == u64::MAX {
+                None
+            } else {
+                self.advance(up_to + 1)?
+            };
+            return Ok(WindowCollect {
+                exhausted: next.is_none(),
+            });
+        }
+
+        loop {
+            if out.len() >= max_hits {
+                return Ok(WindowCollect { exhausted: false });
+            }
+            let Some(doc) = self.doc() else {
+                return Ok(WindowCollect { exhausted: true });
+            };
+            if doc > up_to {
+                return Ok(WindowCollect { exhausted: false });
+            }
+            let score = checked_score(self.current_score()?, "window drain emit")?;
+            // Inclusive collector floor. wand_factor only raises the skip
+            // threshold inside next(); it must not tighten this emit test.
+            let competitive = score >= min_score;
+            let confirmed = if competitive && self.match_cost().is_some() {
+                self.matches()?
+            } else {
+                competitive
+            };
+            if confirmed && competitive {
+                let document_key = self.document_key().ok_or_else(|| {
+                    Error::internal("posting FTS scorer did not expose its current document key")
+                })?;
+                out.push(ConfirmedHit {
+                    document_key,
+                    score,
+                });
+            }
+            match self.next()? {
+                Some(next) if next <= up_to => {}
+                Some(_) => return Ok(WindowCollect { exhausted: false }),
+                None => return Ok(WindowCollect { exhausted: true }),
+            }
+        }
     }
 }
 
@@ -1042,6 +1239,11 @@ impl ComposableScorer for MaterializedScorer {
 
     fn scores_non_negative(&self) -> bool {
         self.scores_non_negative
+    }
+
+    #[cfg(test)]
+    fn debug_last_min_competitive_score(&self) -> Option<f32> {
+        Some(self.min_competitive_score)
     }
 }
 
@@ -2043,6 +2245,10 @@ impl<K: Copy + Ord> TopKCollector<K> {
         }
     }
 
+    fn min_competitive_score(&self) -> f32 {
+        self.competitive_score.get()
+    }
+
     fn prune_obsolete_score_floors(&mut self) {
         while self.heap.len() > self.limit {
             let floor = self
@@ -2080,64 +2286,79 @@ impl<K: Copy + Ord> TopKCollector<K> {
         self.heap
             .reserve(expected.saturating_sub(self.heap.capacity()));
 
-        scorer.set_min_competitive_score(self.competitive_score.get())?;
-        let mut doc = scorer.next()?;
-        while let Some(doc_id) = doc {
+        // A COUNT-style collector carries limit == usize::MAX; draining with
+        // that as max_hits would buffer the whole match set in the scratch
+        // window (24 bytes per hit) before a single insert. The drain pauses
+        // and re-offers, so the cap only bounds that scratch vector.
+        let window_cap = capacity_limit.min(CONFIRMED_WINDOW_MAX_HITS);
+
+        let mut window = Vec::with_capacity(DEFAULT_BLOCK_SIZE.min(window_cap));
+        loop {
             let min_score = self.competitive_score.get();
-            scorer.set_min_competitive_score(min_score)?;
-            let up_to = scorer.advance_shallow(doc_id)?;
-            let bounds = scorer.score_bounds(up_to)?;
-            if bounds.upper < min_score {
-                doc = if up_to == u64::MAX {
-                    None
-                } else {
-                    scorer.advance(up_to + 1)?
+            if min_score <= 0.0 {
+                // No usable floor: the drain filters nothing, so its per-window
+                // bookkeeping is pure cost -- measured ~4x slower on COUNT for
+                // small match sets. Walk the scorer document by document.
+                scorer.set_min_competitive_score(min_score)?;
+                let Some(doc_id) = (match scorer.doc() {
+                    Some(doc) => Some(doc),
+                    None => scorer.next()?,
+                }) else {
+                    break;
                 };
+                let up_to = scorer.advance_shallow(doc_id)?;
+                // score_bounds positions the two-phase match cost; the drain
+                // does the same before deciding whether a window can compete.
+                let _bounds = scorer.score_bounds(up_to)?;
+                if let Some(match_cost) = scorer.match_cost()
+                    && (!match_cost.is_finite() || match_cost < 0.0)
+                {
+                    return Err(Error::internal(format!(
+                        "FTS scorer reported invalid two-phase match cost: {match_cost}"
+                    )));
+                }
+                if scorer.matches()? {
+                    let score = checked_score(scorer.score()?, "compound scorer")?;
+                    if score >= self.competitive_score.get() {
+                        let document_key = scorer.document_key().ok_or_else(|| {
+                            Error::internal(
+                                "compound FTS scorer did not expose its current document key",
+                            )
+                        })?;
+                        let status = self.insert(ScoredRow {
+                            row_id: map_document(document_key)?,
+                            score,
+                        });
+                        if status == CollectionStatus::ScoreFloorOverflow {
+                            return Ok(status);
+                        }
+                    }
+                }
+                if scorer.next()?.is_none() {
+                    break;
+                }
                 continue;
             }
-
-            // Phrase leaves expose their score from posting frequencies before
-            // positions are decoded. Composite scorers combine those doc-local
-            // uppers with sibling residuals, so a strict miss can bypass every
-            // pending position confirmation. Equality remains live because row
-            // id is the final top-k tie breaker.
-            if min_score.is_finite()
-                && scorer.supports_doc_local_confirmation_pruning()
-                && scorer
-                    .current_score_upper_bound()?
-                    .is_some_and(|upper| upper < min_score)
-            {
-                doc = scorer.next()?;
-                continue;
-            }
-
-            if let Some(match_cost) = scorer.match_cost()
-                && (!match_cost.is_finite() || match_cost < 0.0)
-            {
-                return Err(Error::internal(format!(
-                    "FTS scorer reported invalid two-phase match cost: {match_cost}"
-                )));
-            }
-            if scorer.matches()? {
-                let score = checked_score(scorer.score()?, "compound scorer")?;
+            window.clear();
+            let collect = scorer.collect_confirmed_window(min_score, &mut window, window_cap)?;
+            for hit in &window {
                 // A shared partition floor is already known to be globally
                 // competitive. Scores strictly below it cannot enter final top-k.
-                if score >= self.competitive_score.get() {
-                    let document_key = scorer.document_key().ok_or_else(|| {
-                        Error::internal(
-                            "compound FTS scorer did not expose its current document key",
-                        )
-                    })?;
+                // Window emit is inclusive; re-check here because the heap
+                // floor can rise while this window is being inserted.
+                if hit.score >= self.competitive_score.get() {
                     let status = self.insert(ScoredRow {
-                        row_id: map_document(document_key)?,
-                        score,
+                        row_id: map_document(hit.document_key)?,
+                        score: hit.score,
                     });
                     if status == CollectionStatus::ScoreFloorOverflow {
                         return Ok(status);
                     }
                 }
             }
-            doc = scorer.next()?;
+            if collect.exhausted {
+                break;
+            }
         }
 
         Ok(CollectionStatus::Complete)
@@ -2368,6 +2589,11 @@ impl ComposableScorer for ScaleScorer<'_> {
 
     fn scores_non_negative(&self) -> bool {
         self.child.scores_non_negative()
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        vec![self.child.debug_type_name()]
     }
 }
 
@@ -2618,6 +2844,14 @@ impl ComposableScorer for DisjunctionScorer<'_> {
         self.children
             .iter()
             .all(|child| child.scores_non_negative())
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        self.children
+            .iter()
+            .map(|child| child.debug_type_name())
+            .collect()
     }
 }
 
@@ -2892,6 +3126,30 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
             .iter()
             .all(|child| child.scores_non_negative())
     }
+
+    fn collect_confirmed_window(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        if self.children.len() == 1 {
+            let status = self.children[0].collect_confirmed_window(min_score, out, max_hits)?;
+            self.current = self.children[0].doc();
+            self.confirmed_doc = None;
+            self.confirmed = false;
+            return Ok(status);
+        }
+        collect_confirmed_window_default(self, min_score, out, max_hits)
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        self.children
+            .iter()
+            .map(|child| child.debug_type_name())
+            .collect()
+    }
 }
 
 /// Positive-driven Boost scorer with signed conservative bounds.
@@ -3053,6 +3311,11 @@ struct ReqOptScorer<'a> {
     confirmed: bool,
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
+    /// Set once the heap floor passes the required clause's list-wide upper
+    /// bound: from then on no document can reach the heap on the required
+    /// clause alone, so the optional clause is mandatory for the rest of the
+    /// scan and the query is an intersection.
+    optional_globally_required: bool,
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -3072,6 +3335,7 @@ impl<'a> ReqOptScorer<'a> {
             confirmed: false,
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
+            optional_globally_required: false,
         }
     }
 
@@ -3092,6 +3356,84 @@ impl<'a> ReqOptScorer<'a> {
             self.confirmed = false;
         }
         self.optional_is_required = required;
+    }
+
+    /// Promote the optional clause to required once the required clause's
+    /// list-wide upper bound can no longer reach the heap. The floor only ever
+    /// rises, so this decision is permanent. Past this point there is nothing
+    /// for a required-only walk to contribute, and the per-window bookkeeping
+    /// is pure overhead.
+    fn promote_optional_if_required(&mut self) -> Result<()> {
+        if self.optional_globally_required || !self.min_competitive_score.is_finite() {
+            return Ok(());
+        }
+        let Some(required_upper) = self.required.global_score_upper_bound() else {
+            return Ok(());
+        };
+        if !required_upper.is_finite() || required_upper >= self.min_competitive_score {
+            return Ok(());
+        }
+        self.optional_globally_required = true;
+        self.shallow_bounds = None;
+        Ok(())
+    }
+
+    /// Intersect both sides directly. Used once the optional clause is known to
+    /// be mandatory: the required clause alone can no longer produce a
+    /// competitive document, so the window bookkeeping earns nothing. The
+    /// cheaper list drives, so a huge MUST paired with a sparse SHOULD walks the
+    /// sparse list instead of the MUST tail.
+    fn position_intersection(&mut self, target: u64) -> Result<Option<u64>> {
+        self.shallow_bounds = None;
+        if self.optional.cost() < self.required.cost() {
+            self.intersect_from_optional(target)
+        } else {
+            self.intersect_from_required(target)
+        }
+    }
+
+    /// Leapfrog driven by the required (MUST) list.
+    fn intersect_from_required(&mut self, target: u64) -> Result<Option<u64>> {
+        let Some(mut required_doc) = self.required.advance(target)? else {
+            return Ok(self.exhaust());
+        };
+        loop {
+            self.set_current(Some(required_doc));
+            self.set_optional_required(true);
+            let Some(optional_doc) = self.ensure_optional_at_or_after(required_doc)? else {
+                return Ok(self.exhaust());
+            };
+            if optional_doc == required_doc {
+                return Ok(self.current);
+            }
+            let Some(next_required) = self.required.advance(optional_doc)? else {
+                return Ok(self.exhaust());
+            };
+            required_doc = next_required;
+        }
+    }
+
+    /// Leapfrog driven by the optional (SHOULD) list, which is the cheaper list
+    /// once the optional is mandatory.
+    fn intersect_from_optional(&mut self, target: u64) -> Result<Option<u64>> {
+        self.optional_initialized = true;
+        let Some(mut optional_doc) = self.optional.advance(target)? else {
+            return Ok(self.exhaust());
+        };
+        loop {
+            let Some(required_doc) = self.required.advance(optional_doc)? else {
+                return Ok(self.exhaust());
+            };
+            if required_doc == optional_doc {
+                self.set_current(Some(optional_doc));
+                self.set_optional_required(true);
+                return Ok(self.current);
+            }
+            let Some(next_optional) = self.optional.advance(required_doc)? else {
+                return Ok(self.exhaust());
+            };
+            optional_doc = next_optional;
+        }
     }
 
     fn exhaust(&mut self) -> Option<u64> {
@@ -3156,6 +3498,9 @@ impl<'a> ReqOptScorer<'a> {
     fn position(&mut self, mut target: u64) -> Result<Option<u64>> {
         if self.exhausted {
             return Ok(None);
+        }
+        if self.optional_globally_required {
+            return self.position_intersection(target);
         }
 
         'search: loop {
@@ -3339,6 +3684,9 @@ impl ComposableScorer for ReqOptScorer<'_> {
         }
         if min_score > self.min_competitive_score {
             self.min_competitive_score = min_score;
+            // Once the required clause alone can no longer reach the heap the
+            // optional clause is mandatory, so switch to a direct intersection.
+            self.promote_optional_if_required()?;
         }
         Ok(())
     }
@@ -3402,9 +3750,15 @@ impl ComposableScorer for ReqOptScorer<'_> {
     fn scores_non_negative(&self) -> bool {
         true
     }
-}
 
-/// Boolean scorer preserving the current membership and score semantics.
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        vec![
+            self.required.debug_type_name(),
+            self.optional.debug_type_name(),
+        ]
+    }
+}
 pub(super) struct BooleanScorer<'a> {
     driver: BoxScorer<'a>,
     optional: Option<BoxScorer<'a>>,
@@ -3444,7 +3798,11 @@ impl<'a> BooleanScorer<'a> {
                         as BoxScorer<'a>,
                 )
             };
-            let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
+            let required = if must.len() == 1 {
+                must.into_iter().next().expect("must has one child")
+            } else {
+                Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>
+            };
             let driver = if required.scores_non_negative()
                 && optional
                     .as_ref()
@@ -3490,6 +3848,19 @@ impl<'a> BooleanScorer<'a> {
             optional_matches: false,
             defer_confirmation: scores_non_negative && has_doc_local_confirmation,
         })
+    }
+
+    pub(super) fn try_root(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+    ) -> Result<BoxScorer<'a>> {
+        let boolean = Self::try_new(should, must, must_not)?;
+        if boolean.optional.is_none() && boolean.prohibited.is_none() {
+            Ok(boolean.driver)
+        } else {
+            Ok(Box::new(boolean))
+        }
     }
 
     fn set_current(&mut self, current: Option<u64>) -> Option<u64> {
@@ -3709,6 +4080,36 @@ impl ComposableScorer for BooleanScorer<'_> {
                 .optional
                 .as_ref()
                 .is_none_or(|optional| optional.scores_non_negative())
+    }
+
+    fn collect_confirmed_window(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        if self.optional.is_none() && self.prohibited.is_none() {
+            let status = self
+                .driver
+                .collect_confirmed_window(min_score, out, max_hits)?;
+            self.current = self.driver.doc();
+            self.confirmed_doc = None;
+            self.confirmed = false;
+            return Ok(status);
+        }
+        collect_confirmed_window_default(self, min_score, out, max_hits)
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        let mut names = vec![self.driver.debug_type_name()];
+        if let Some(optional) = &self.optional {
+            names.push(optional.debug_type_name());
+        }
+        if let Some(prohibited) = &self.prohibited {
+            names.push(prohibited.debug_type_name());
+        }
+        names
     }
 }
 
@@ -4007,6 +4408,158 @@ struct CollectedPartitions {
     boundary: Option<PartitionCollectionBoundary>,
 }
 
+fn is_compound_term_leaf(leaf: &LoadedLeaf) -> bool {
+    leaf.postings.len() == 1
+        && leaf.params.phrase_slop.is_none()
+        && !leaf.postings[0].has_grouped_terms()
+}
+
+/// The leaf children of a flat Boolean plan, split by strength. Children that
+/// are not single leaves are skipped; `must_children` counts the raw MUST
+/// children and `all_leaves` reports whether every child (including MUST_NOT)
+/// was a leaf.
+struct BooleanLeafSplit {
+    must_leaves: Vec<(usize, f32)>,
+    should_leaves: Vec<(usize, f32)>,
+    must_children: usize,
+    has_must_not: bool,
+    all_leaves: bool,
+}
+
+fn boolean_leaf_split(plan: &CompoundScorerPlan) -> Option<BooleanLeafSplit> {
+    let CompoundScorerPlan::Boolean {
+        should,
+        must,
+        must_not,
+    } = plan
+    else {
+        return None;
+    };
+    fn leaf_children(children: &[CompoundScorerPlan]) -> Vec<(usize, f32)> {
+        children
+            .iter()
+            .filter_map(|child| match child {
+                CompoundScorerPlan::Leaf { index, boost } => Some((*index, *boost)),
+                _ => None,
+            })
+            .collect()
+    }
+    let all_leaves = should
+        .iter()
+        .chain(must_not.iter())
+        .chain(must.iter())
+        .all(|child| matches!(child, CompoundScorerPlan::Leaf { .. }));
+    Some(BooleanLeafSplit {
+        must_leaves: leaf_children(must),
+        should_leaves: leaf_children(should),
+        must_children: must.len(),
+        has_must_not: !must_not.is_empty(),
+        all_leaves,
+    })
+}
+
+/// Whether a leaf may step its single posting directly instead of paying the
+/// WAND wrapper. TermLeafScorer consults no competitive floor —
+/// `set_min_competitive_score` is a no-op and it never skips — so the swap
+/// also gives up the wrapper's block-max skipping. Where that skipping earns
+/// nothing the wrapper is pure overhead; where it earns, the leaf keeps its
+/// cursor.
+///
+/// The ReqOpt scorer holds its floor itself and never forwards it to either
+/// side (`ReqOptScorer::set_min_competitive_score`); it prunes by consulting
+/// each side's `advance_shallow`/`score_bounds`, and it probes the optional side
+/// by exact `advance(required_doc)`. So on that path neither leaf is steered by
+/// a floor and the wrapper's skipping earns nothing — swapping the leaf in wins
+/// on the required/optional Boolean shapes:
+///
+/// - the single MUST child of a 1-MUST Boolean: its candidates are admitted
+///   one by one and the wrapper spent its time on window bookkeeping;
+/// - the SHOULD children of the same 1-MUST Boolean: the wrapper has no union
+///   machine to steer and only adds seek and scoring bookkeeping;
+/// - the leaves of a multi-MUST conjunction are driven by their parent's own
+///   skipping, and the optional children of a SHOULD-only union sit inside a
+///   union machine — both measured slower with the swap.
+///
+/// The remaining arms (MUST_NOT, Boost-positive, MultiMatch, nested shapes) are
+/// left on the WAND wrapper: TermLeafScorer never skips, and those arms are
+/// correctness-safe either way but have no measurement behind the swap. Note
+/// that a MUST_NOT Boolean still drives through `ReqOptScorer`; excluding it is
+/// deliberate conservatism, not a structural difference.
+fn leaf_admits_term_leaf(plan: &CompoundScorerPlan, index: usize) -> bool {
+    match plan {
+        CompoundScorerPlan::Boolean { .. } => {
+            let Some(split) = boolean_leaf_split(plan) else {
+                return false;
+            };
+            if split.must_children != 1 {
+                return false;
+            }
+            // The single MUST leaf keeps its existing admission.
+            let Some(&(must_index, _)) = split.must_leaves.first() else {
+                return false;
+            };
+            if must_index == index {
+                return true;
+            }
+            // In a 1-MUST ReqOpt, the SHOULD leaves are probed by
+            // `advance(doc)` once per required document, and the ReqOpt scorer
+            // holds the floor itself (it forwards it to neither side). A direct
+            // posting seek beats the WAND machine there, so admit them too.
+            // MUST_NOT is deliberately excluded — the ReqOpt scorer still drives
+            // in that case, but admitting it is unmeasured — and a multi-MUST
+            // conjunction or a SHOULD-only union stays on the WAND cursor, which
+            // the parent's or the union's block skipping steers.
+            !split.has_must_not
+                && split
+                    .should_leaves
+                    .iter()
+                    .any(|&(should_index, _)| should_index == index)
+        }
+        // A standalone single-leaf plan (one term query): TermLeafScorer is
+        // the whole scorer, so there is no wrapper bookkeeping to save.
+        CompoundScorerPlan::Leaf {
+            index: leaf_index,
+            boost: _,
+        } => *leaf_index == index,
+        _ => false,
+    }
+}
+
+fn box_leaf_scorer<'a, D>(
+    leaf: LoadedLeaf,
+    documents: &'a D,
+    metrics: &'a dyn MetricsCollector,
+    admits_term_leaf: bool,
+) -> BoxScorer<'a>
+where
+    D: WandDocuments + Sync,
+{
+    if leaf.postings.is_empty() {
+        return Box::new(EmptyScorer);
+    }
+    if admits_term_leaf && is_compound_term_leaf(&leaf) {
+        let posting = leaf
+            .postings
+            .into_iter()
+            .next()
+            .expect("is_compound_term_leaf requires one posting");
+        return Box::new(TermLeafScorer::new(
+            posting,
+            documents,
+            leaf.scorer,
+            metrics,
+        ));
+    }
+    Box::new(WandCursor::new(
+        leaf.operator,
+        leaf.postings,
+        documents,
+        leaf.scorer,
+        leaf.params.as_ref(),
+        metrics,
+    ))
+}
+
 fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
@@ -4019,22 +4572,37 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
+    // The IU fast paths replace the generic scorer tree for the "K required
+    // + N optional" shapes over plain single-posting leaves. `LANCE_FTS_IU_TIGHT`
+    // gates them for A/B and rollout. Known imbalance: when every required
+    // list is dense while an optional list is rare, the optional clause's
+    // large upper bound keeps the multi kernel's floor prune inert and the
+    // generic path's block-max window skipping can win; an optional-driven
+    // intersection is the planned fix, the env switch is the escape hatch.
+    if iu_tight_enabled()
+        && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
+        && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
+    {
+        // Every `K >= 1 required + N >= 1 optional` shape over plain
+        // single-posting leaves takes the tight kernels. The relative cost
+        // gate that used to hold K=1 back is gone: with the bulk optional
+        // merge in place the kernel wins for close-cost shapes too.
+        return collect_iu_tight(
+            documents,
+            leaves,
+            &must_indices,
+            &should_indices,
+            metrics,
+            collector,
+            map_document,
+        );
+    }
     let mut leaf_scorers = leaves
         .into_iter()
-        .map(|leaf| {
-            let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
-                Box::new(EmptyScorer)
-            } else {
-                Box::new(WandCursor::new(
-                    leaf.operator,
-                    leaf.postings,
-                    documents,
-                    leaf.scorer,
-                    leaf.params.as_ref(),
-                    metrics,
-                ))
-            };
-            Some(scorer)
+        .enumerate()
+        .map(|(index, leaf)| {
+            let admits = leaf_admits_term_leaf(plan, index);
+            Some(box_leaf_scorer(leaf, documents, metrics, admits))
         })
         .collect::<Vec<_>>();
     let mut scorer = plan.build(&mut leaf_scorers)?;
@@ -4044,6 +4612,161 @@ where
         ));
     }
     collector.collect_mapped(scorer.as_mut(), &mut map_document)
+}
+
+/// IU clause indices for K >= 1 required clauses plus N >= 1 optional
+/// clauses, all identity-boost single-leaf children of one flat Boolean plan
+/// with no MUST_NOT.
+fn iu_tight_clause_indices(plan: &CompoundScorerPlan) -> Option<(Vec<usize>, Vec<usize>)> {
+    let split = boolean_leaf_split(plan)?;
+    if split.all_leaves && !split.has_must_not {
+        let identity_boost = |children: &[(usize, f32)]| {
+            !children.is_empty() && children.iter().all(|&(_, boost)| boost == 1.0)
+        };
+        if identity_boost(&split.must_leaves) && identity_boost(&split.should_leaves) {
+            return Some((
+                split
+                    .must_leaves
+                    .into_iter()
+                    .map(|(index, _)| index)
+                    .collect(),
+                split
+                    .should_leaves
+                    .into_iter()
+                    .map(|(index, _)| index)
+                    .collect(),
+            ));
+        }
+    }
+    None
+}
+
+/// Whether every IU clause leaf is a single compressed ungrouped posting.
+fn iu_tight_clauses_ready(
+    leaves: &[LoadedLeaf],
+    must_indices: &[usize],
+    should_indices: &[usize],
+) -> bool {
+    if must_indices.iter().any(|&index| index >= leaves.len())
+        || should_indices.iter().any(|&index| index >= leaves.len())
+    {
+        return false;
+    }
+    must_indices
+        .iter()
+        .chain(should_indices.iter())
+        .all(|&index| {
+            let leaf = &leaves[index];
+            is_compound_term_leaf(leaf) && leaf.postings[0].is_compressed()
+        })
+}
+
+/// Shared collection tail for the two IU kernels: floor-checked top-k
+/// insertion with overflow tracking and comparison counting. The `floor`
+/// handle passed into [`Self::hit`] carries the latest competitive floor back
+/// to the kernels.
+struct IuCollector<'a, K: Copy + Ord, F> {
+    collector: &'a mut TopKCollector<K>,
+    map_document: F,
+    overflow: bool,
+    comparisons: usize,
+}
+
+impl<K: Copy + Ord, F: FnMut(u64) -> Result<K>> IuCollector<'_, K, F> {
+    /// The kernels' `on_hit`.
+    fn hit(&mut self, floor: &Cell<f32>, key: u64, score: f32) -> Result<bool> {
+        self.comparisons += 1;
+        let score = checked_score(score, "iu_tight kernel")?;
+        if score < self.collector.min_competitive_score() {
+            return Ok(true);
+        }
+        let row_id = (self.map_document)(key)?;
+        let status = self.collector.insert(ScoredRow { row_id, score });
+        floor.set(self.collector.min_competitive_score());
+        if status == CollectionStatus::ScoreFloorOverflow {
+            self.overflow = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn finish(&self, metrics: &dyn MetricsCollector) -> CollectionStatus {
+        // Counted here: candidates scored (on_hit calls). WandCursor's
+        // num_comparisons counts heap advances instead, so the two metrics
+        // use different units and must not be compared directly.
+        metrics.record_comparisons(self.comparisons);
+        if self.overflow {
+            CollectionStatus::ScoreFloorOverflow
+        } else {
+            CollectionStatus::Complete
+        }
+    }
+}
+
+/// Collect the IU shapes with the tight kernels: one required clause drives
+/// MUST blocks with a bulk optional merge; two or more required clauses align
+/// their cursors by seek-to-max. Both score the required clauses first and
+/// then the matching optional clauses, in plan order, so the f32 result
+/// matches the generic `ReqOptScorer` path.
+fn collect_iu_tight<D, K>(
+    documents: &D,
+    mut leaves: Vec<LoadedLeaf>,
+    must_indices: &[usize],
+    should_indices: &[usize],
+    metrics: &dyn MetricsCollector,
+    collector: &mut TopKCollector<K>,
+    map_document: impl FnMut(u64) -> Result<K>,
+) -> Result<CollectionStatus>
+where
+    D: WandDocuments + Sync,
+    K: Copy + Ord,
+{
+    let mut take_posting = |index: usize| -> Result<PostingIterator> {
+        leaves[index]
+            .postings
+            .drain(..)
+            .next()
+            .ok_or_else(|| Error::internal("iu_tight_clauses_ready checked a single posting"))
+    };
+    let required = must_indices
+        .iter()
+        .map(|&leaf_index| take_posting(leaf_index))
+        .collect::<Result<Vec<_>>>()?;
+    let optional = should_indices
+        .iter()
+        .map(|&leaf_index| take_posting(leaf_index))
+        .collect::<Result<Vec<_>>>()?;
+    let scorer = leaves[must_indices[0]].scorer.clone();
+    let floor = Cell::new(collector.min_competitive_score());
+    let mut iu = IuCollector {
+        collector,
+        map_document,
+        overflow: false,
+        comparisons: 0,
+    };
+    let result = if required.len() == 1 {
+        let mut required = required;
+        iu_tight_search(
+            documents,
+            scorer.as_ref(),
+            required.pop().expect("checked one required clause"),
+            optional,
+            &mut |key, score| iu.hit(&floor, key, score),
+            || floor.get(),
+        )
+    } else {
+        iu_tight_search_multi(
+            documents,
+            scorer.as_ref(),
+            required,
+            optional,
+            &mut |key, score| iu.hit(&floor, key, score),
+            || floor.get(),
+        )
+    };
+    let status = iu.finish(metrics);
+    result?;
+    Ok(status)
 }
 
 fn collect_loaded_partitions(
@@ -4460,10 +5183,13 @@ mod tests {
     use super::super::documents::{
         ordered_row_address_projection_for_test, resident_row_address_projection_for_test,
     };
+    use super::super::encoding::compress_posting_list;
     use super::super::index::{PlainPostingList, PostingList};
     use super::super::scorer::Scorer;
+    use super::super::wand::GroupedTermScorer;
+    use super::super::{CompressedPostingList, LEGACY_BLOCK_SIZE, PostingTailCodec};
     use super::*;
-    use crate::metrics::NoOpMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::inverted::query::MultiMatchQuery;
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
@@ -5999,6 +6725,56 @@ mod tests {
     }
 
     #[test]
+    fn empty_window_does_not_stop_collection() {
+        // A later optional max of 3.0 keeps the sticky MUST floor loose, so
+        // next() still lands in the first block. That block's own optional
+        // upper is only 0.15, so the window skip must fire and must not be
+        // treated as end-of-stream.
+        let mut required_values = (0..32).map(|doc| (doc, 1.5)).collect::<Vec<_>>();
+        required_values.push((32, 4.0));
+        let mut optional_values = (0..32).map(|doc| (doc, 0.15)).collect::<Vec<_>>();
+        optional_values.push((32, 1.0));
+        optional_values.push((200, 3.0));
+        let required = Box::new(
+            MaterializedScorer::try_new(rows(&required_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let optional = Box::new(
+            MaterializedScorer::try_new(rows(&optional_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let mut scorer = ReqOptScorer::new(required, optional);
+
+        let mut first_window = Vec::new();
+        let first = scorer
+            .collect_confirmed_window(4.5, &mut first_window, 8)
+            .unwrap();
+        assert!(
+            first_window.is_empty(),
+            "non-competitive first window should emit nothing: {first_window:?}"
+        );
+        assert!(
+            !first.exhausted,
+            "skipping a non-competitive window must not look like end-of-stream"
+        );
+
+        let mut second_window = Vec::new();
+        let second = scorer
+            .collect_confirmed_window(4.5, &mut second_window, 8)
+            .unwrap();
+        assert_eq!(
+            second_window
+                .iter()
+                .map(|hit| (hit.document_key, hit.score))
+                .collect::<Vec<_>>(),
+            vec![(32, 5.0)]
+        );
+        assert!(second.exhausted || second_window.len() == 1);
+    }
+
+    #[test]
     fn reqopt_temporarily_requires_optional_contribution() {
         let values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
         let (required, required_work) = instrumented(materialized(&values));
@@ -6016,6 +6792,40 @@ mod tests {
         assert_eq!(required_work.confirmations.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(optional_work.advances.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(optional_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reqopt_promotes_optional_once_required_cannot_reach_the_heap() {
+        // The required clause tops out at 4.5 while doc 40 reaches 5.0 only
+        // through the optional clause. Once the heap floor passes 4.5 the
+        // required clause alone is hopeless, so the scan switches to a direct
+        // intersection and must still surface doc 40 -- a document in the
+        // sparse tail of the required list.
+        let mut required_values = (0..32).map(|doc| (doc, 4.5)).collect::<Vec<_>>();
+        required_values.extend((32..64).map(|doc| (doc, 2.0)));
+        let mut optional_values = (0..32).map(|doc| (doc, 0.15)).collect::<Vec<_>>();
+        optional_values.push((40, 3.0));
+        let required = Box::new(
+            MaterializedScorer::try_new(rows(&required_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let optional = Box::new(
+            MaterializedScorer::try_new(rows(&optional_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let mut scorer = ReqOptScorer::new(required, optional);
+        assert!(!scorer.optional_globally_required);
+
+        let results = TopKCollector::new(3).collect(&mut scorer).unwrap();
+
+        assert_eq!(results, rows(&[(40, 5.0), (0, 4.65), (1, 4.65)]));
+        assert!(
+            scorer.optional_globally_required,
+            "a heap floor above the required clause's global upper must promote \
+             the optional clause"
+        );
     }
 
     #[test]
@@ -6331,6 +7141,37 @@ mod tests {
 
     fn plan_leaf(index: usize) -> CompoundScorerPlan {
         CompoundScorerPlan::Leaf { index, boost: 1.0 }
+    }
+
+    #[test]
+    fn iu_tight_leaf_indices_matches_flat_must_should_terms() {
+        let plan = CompoundScorerPlan::Boolean {
+            should: vec![plan_leaf(0), plan_leaf(1)],
+            must: vec![plan_leaf(2)],
+            must_not: Vec::new(),
+        };
+        assert_eq!(iu_tight_clause_indices(&plan), Some((vec![2], vec![0, 1])));
+
+        let boosted = CompoundScorerPlan::Boolean {
+            should: vec![CompoundScorerPlan::Leaf {
+                index: 0,
+                boost: 2.0,
+            }],
+            must: vec![plan_leaf(1)],
+            must_not: Vec::new(),
+        };
+        assert_eq!(iu_tight_clause_indices(&boosted), None);
+
+        let nested = CompoundScorerPlan::Boolean {
+            should: vec![CompoundScorerPlan::Boolean {
+                should: vec![plan_leaf(0)],
+                must: Vec::new(),
+                must_not: Vec::new(),
+            }],
+            must: vec![plan_leaf(1)],
+            must_not: Vec::new(),
+        };
+        assert_eq!(iu_tight_clause_indices(&nested), None);
     }
 
     #[test]
@@ -7036,5 +7877,830 @@ mod tests {
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
         }
+    }
+
+    fn plain_unit_posting(token: &str, doc_ids: Vec<u64>) -> PostingIterator {
+        let freqs = vec![1.0_f32; doc_ids.len()];
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            0,
+            0,
+            1.0,
+            PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(doc_ids),
+                ScalarBuffer::from(freqs),
+                Some(1.0),
+                None,
+            )),
+            1,
+        )
+    }
+
+    fn loaded_leaf(postings: Vec<PostingIterator>, phrase_slop: Option<u32>) -> LoadedLeaf {
+        let params = FtsSearchParams::default().with_phrase_slop(phrase_slop);
+        LoadedLeaf {
+            postings,
+            params: Arc::new(params),
+            operator: Operator::Or,
+            scorer: Arc::new(MemBM25Scorer::new(1, 1, HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn term_leaf_optional_probe_matches_wand_cursor() {
+        // After the ReqOpt change a SHOULD leaf of a 1-MUST Boolean is driven by
+        // TermLeafScorer instead of WandCursor. For the probe pattern the parent
+        // uses (`advance(required_doc)`), the two must visit exactly the same
+        // documents and report the same scores.
+        let mut docs = DocSet::default();
+        for row in 0..8u64 {
+            docs.append(row, 3);
+        }
+        let ids = vec![1u64, 3, 5, 6];
+        let metrics = NoOpMetricsCollector;
+        let leaf = || loaded_leaf(vec![plain_unit_posting("s", ids.clone())], None);
+        let mut term = box_leaf_scorer(leaf(), &docs, &metrics, true);
+        let mut wand = box_leaf_scorer(leaf(), &docs, &metrics, false);
+
+        assert!(
+            term.debug_type_name().contains("TermLeafScorer"),
+            "got {}",
+            term.debug_type_name()
+        );
+        assert!(
+            !wand.debug_type_name().contains("TermLeafScorer"),
+            "got {}",
+            wand.debug_type_name()
+        );
+
+        let mut visited = std::collections::BTreeSet::new();
+        for target in [0u64, 1, 2, 3, 4, 5, 6, 7, 8] {
+            let t = term.advance(target).unwrap();
+            let w = wand.advance(target).unwrap();
+            assert_eq!(t, w, "advance({target})");
+            assert_eq!(term.doc(), wand.doc(), "doc after advance({target})");
+            if let Some(doc) = t {
+                visited.insert(doc);
+                assert_eq!(
+                    term.score().unwrap(),
+                    wand.score().unwrap(),
+                    "score at {target}"
+                );
+            }
+        }
+        assert_eq!(
+            visited,
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "every posting document was probed"
+        );
+    }
+
+    #[test]
+    fn box_leaf_scorer_uses_term_leaf_for_one_ungrouped_term() {
+        let documents = DocSet::default();
+        let metrics = NoOpMetricsCollector;
+        let leaf = loaded_leaf(vec![plain_unit_posting("a", vec![0])], None);
+        let scorer = box_leaf_scorer(leaf, &documents, &metrics, true);
+        assert!(
+            scorer.debug_type_name().contains("TermLeafScorer"),
+            "got {}",
+            scorer.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn reqopt_admits_one_must_and_its_shoulds() {
+        // The ReqOpt shape (one MUST + N SHOULD): the parent holds the floor
+        // itself and probes the optional side by `advance(required_doc)` once
+        // per required document. Neither side is steered by a union machine or
+        // by a forwarded floor, so both may step a direct posting: WandCursor's
+        // window bookkeeping is pure overhead there, and TermLeafScorer's
+        // no-floor contract costs nothing.
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+        assert!(leaf_admits_term_leaf(&plan, 0), "required side");
+        assert!(
+            leaf_admits_term_leaf(&plan, 1),
+            "optional side of a 1-MUST Boolean"
+        );
+
+        // A MUST_NOT still drives through ReqOptScorer, but admitting its
+        // optional side is unmeasured, so it keeps the WAND cursor.
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: vec![leaf_node(2)],
+        };
+        assert!(leaf_admits_term_leaf(&plan, 0));
+        assert!(!leaf_admits_term_leaf(&plan, 1));
+
+        // A multi-MUST conjunction is driven by the parent's skipping; its
+        // leaves are not admitted.
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: Vec::new(),
+            must_not: Vec::new(),
+        };
+        assert!(!leaf_admits_term_leaf(&plan, 0));
+        assert!(!leaf_admits_term_leaf(&plan, 1));
+
+        // A SHOULD-only union: every leaf keeps its WAND cursor.
+        let plan = CompoundScorerPlan::Boolean {
+            must: Vec::new(),
+            should: vec![leaf_node(0), leaf_node(1)],
+            must_not: Vec::new(),
+        };
+        assert!(!leaf_admits_term_leaf(&plan, 0));
+        assert!(!leaf_admits_term_leaf(&plan, 1));
+    }
+
+    #[test]
+    fn reqopt_fallback_enumerates_every_must_doc_for_counting() {
+        // The COUNT path has no competitive floor: it relies on the IU fast
+        // path and the ReqOptScorer fallback both enumerating every MUST
+        // document. Plain postings fail `iu_tight_clauses_ready` (not
+        // compressed), so this exercises the ReqOptScorer fallback; the
+        // kernel side is pinned by
+        // `iu_tight_search_sums_must_and_matching_shoulds` (floor = -inf).
+        let mut docs = DocSet::default();
+        for doc_id in 0..50_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must_docs: Vec<u64> = (0..50).step_by(2).collect();
+        let should_docs: Vec<u64> = (0..50).step_by(3).collect();
+
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+
+        let build_leaves = || {
+            vec![
+                loaded_leaf(vec![plain_unit_posting("must", must_docs.clone())], None),
+                loaded_leaf(
+                    vec![plain_unit_posting("should", should_docs.clone())],
+                    None,
+                ),
+            ]
+        };
+
+        let leaves = build_leaves();
+        let (must_indices, should_indices) =
+            iu_tight_clause_indices(&plan).expect("1+1 shape must resolve");
+        assert_eq!(must_indices, vec![0]);
+        assert_eq!(should_indices, vec![1]);
+        assert!(
+            !iu_tight_clauses_ready(&leaves, &must_indices, &should_indices),
+            "plain postings must route to the ReqOptScorer fallback"
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut collector = TopKCollector::new(10_000);
+        let status = collect_partition_with_documents(
+            &docs,
+            build_leaves(),
+            &plan,
+            &NoOpMetricsCollector,
+            &mut collector,
+            |key| {
+                seen.insert(key);
+                Ok(key)
+            },
+        )
+        .unwrap();
+        assert_eq!(status, CollectionStatus::Complete);
+
+        let want: std::collections::BTreeSet<u64> = must_docs.iter().copied().collect();
+        assert_eq!(
+            seen, want,
+            "a floor-less collection must enumerate every MUST document"
+        );
+    }
+
+    fn compressed_unit_posting(token: &str, doc_ids: Vec<u32>) -> PostingIterator {
+        let max_score = 1.0_f32;
+        let freqs = vec![1_u32; doc_ids.len()];
+        let block_max_scores = vec![max_score; doc_ids.len()];
+        let blocks = compress_posting_list(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            block_max_scores.into_iter(),
+        )
+        .unwrap();
+        let num_docs = doc_ids.iter().copied().max().unwrap_or(0) as usize + 1;
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            0,
+            0,
+            1.0,
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                max_score,
+                doc_ids.len() as u32,
+                PostingTailCodec::VarintDelta,
+                LEGACY_BLOCK_SIZE,
+                None,
+                None,
+            )),
+            num_docs,
+        )
+    }
+
+    #[test]
+    fn iu_tight_multi_dry_optional_ends_dense_intersection() {
+        // Two dense required clauses over 65,536 documents plus an optional
+        // whose only document is doc 0. Once that optional runs dry, every
+        // remaining candidate is provably below the floor, so the walk must
+        // end after a couple of candidates instead of scoring the whole
+        // intersection. Without the budget the kernel scored all 65,536
+        // candidates.
+        let n = 65_536;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id, 1);
+        }
+        let leaves = || {
+            vec![
+                loaded_leaf(
+                    vec![compressed_unit_posting("a", (0..n as u32).collect())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("b", (0..n as u32).collect())],
+                    None,
+                ),
+                loaded_leaf(vec![compressed_unit_posting("c", vec![0])], None),
+            ]
+        };
+        let metrics = LocalMetricsCollector::default();
+        let mut tight = TopKCollector::new(1);
+        collect_iu_tight(&docs, leaves(), &[0, 1], &[2], &metrics, &mut tight, Ok).unwrap();
+        let rows = tight.into_rows();
+        assert_eq!(rows.len(), 1, "top-1");
+        assert_eq!(rows[0].row_id, 0);
+        assert_eq!(rows[0].score, 3.0);
+        let comparisons = metrics
+            .comparisons
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            comparisons <= 2,
+            "the dry optional must end the walk within a couple of candidates, got {comparisons}"
+        );
+    }
+
+    #[test]
+    fn iu_tight_multi_finite_floor_keeps_far_optional_hit() {
+        // The dry budget must only count cursors that are truly exhausted.
+        // Two optionals hit only doc 500: at candidate 0 their cursors sit
+        // past the candidate without being dry. Once the near optional dries
+        // at candidate 10, a walk that mistook "past the candidate" for dry
+        // would drop both bounds, prove 2 < floor=3, and terminate — losing
+        // doc 500, whose two optional hits make it the top hit.
+        let n = 501;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id, 1);
+        }
+        let leaves = || {
+            vec![
+                loaded_leaf(
+                    vec![compressed_unit_posting("a", (0..n as u32).collect())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("b", (0..n as u32).collect())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("c1", (0..10_u32).collect())],
+                    None,
+                ),
+                loaded_leaf(vec![compressed_unit_posting("c2", vec![500])], None),
+                loaded_leaf(vec![compressed_unit_posting("c3", vec![500])], None),
+            ]
+        };
+        let metrics = LocalMetricsCollector::default();
+        let mut tight = TopKCollector::new(1);
+        collect_iu_tight(
+            &docs,
+            leaves(),
+            &[0, 1],
+            &[2, 3, 4],
+            &metrics,
+            &mut tight,
+            Ok,
+        )
+        .unwrap();
+        let rows = tight.into_rows();
+        assert_eq!(rows.len(), 1, "top-1");
+        assert_eq!(rows[0].row_id, 500, "the far double optional hit must win");
+        assert_eq!(rows[0].score, 4.0);
+        // Generic-tree contract check on the same shape.
+        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: vec![leaf_node(2), leaf_node(3), leaf_node(4)],
+            must_not: Vec::new(),
+        };
+        let generic_metrics = NoOpMetricsCollector;
+        let mut generic_leaves = leaves()
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
+            .collect::<Vec<_>>();
+        let mut generic = plan.build(&mut generic_leaves).unwrap();
+        let mut collector = TopKCollector::new(1);
+        let mut current = generic.next().unwrap();
+        while let Some(id) = current {
+            let floor = collector.min_competitive_score();
+            generic.set_min_competitive_score(floor).unwrap();
+            let up_to = generic.advance_shallow(id).unwrap();
+            if generic.score_bounds(up_to).unwrap().upper < floor {
+                current = if up_to == u64::MAX {
+                    None
+                } else {
+                    generic.advance(up_to + 1).unwrap()
+                };
+                continue;
+            }
+            if generic.matches().unwrap() {
+                let score = generic.score().unwrap();
+                collector.insert(ScoredRow {
+                    row_id: generic.document_key().unwrap(),
+                    score,
+                });
+            }
+            current = generic.next().unwrap();
+        }
+        assert_eq!(rows, collector.into_rows());
+    }
+
+    #[test]
+    fn iu_tight_multi_misaligned_blocks_match_generic() {
+        // The two required cursors pack their 128-doc blocks at different
+        // boundaries (must_a has a hole at 1..255, must_b is dense from 0),
+        // so their block ends are misaligned while the block prune walks.
+        // The optional's hits sit far apart. Results must stay bit-identical
+        // to the generic tree under a real collector floor.
+        let n = 3_000;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id, 1);
+        }
+        let must_a_docs: Vec<u32> = [0_u32].into_iter().chain(256..n as u32).collect();
+        let must_b_docs: Vec<u32> = (0..n as u32).collect();
+        let optional_docs: Vec<u32> = vec![50, 500, 1500, 2900];
+        let leaves = || {
+            vec![
+                loaded_leaf(
+                    vec![compressed_unit_posting("a", must_a_docs.clone())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("b", must_b_docs.clone())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("c", optional_docs.clone())],
+                    None,
+                ),
+            ]
+        };
+        let metrics = LocalMetricsCollector::default();
+        let mut tight = TopKCollector::new(10);
+        collect_iu_tight(&docs, leaves(), &[0, 1], &[2], &metrics, &mut tight, Ok).unwrap();
+        let tight_rows = tight.into_rows();
+        let generic_metrics = NoOpMetricsCollector;
+        let mut generic_leaves = leaves()
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
+            .collect::<Vec<_>>();
+        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: vec![leaf_node(2)],
+            must_not: Vec::new(),
+        };
+        let mut generic = plan.build(&mut generic_leaves).unwrap();
+        let mut collector = TopKCollector::new(10);
+        let mut current = generic.next().unwrap();
+        while let Some(id) = current {
+            let floor = collector.min_competitive_score();
+            generic.set_min_competitive_score(floor).unwrap();
+            let up_to = generic.advance_shallow(id).unwrap();
+            if generic.score_bounds(up_to).unwrap().upper < floor {
+                current = if up_to == u64::MAX {
+                    None
+                } else {
+                    generic.advance(up_to + 1).unwrap()
+                };
+                continue;
+            }
+            if generic.matches().unwrap() {
+                let score = generic.score().unwrap();
+                collector.insert(ScoredRow {
+                    row_id: generic.document_key().unwrap(),
+                    score,
+                });
+            }
+            current = generic.next().unwrap();
+        }
+        assert_eq!(tight_rows, collector.into_rows());
+
+        // The far optional hit must be part of the result.
+        assert!(tight_rows.iter().any(|r| r.row_id == 2900));
+    }
+
+    #[test]
+    fn multi_promotion_keeps_far_optional_hit_cheaply() {
+        // A promotion must drive from the lone sparse optional once the
+        // floor rises past the required lists' combined bound: the far hit
+        // (doc 299999, must+optional) is scored exactly once and the walk
+        // never touches the other ~300k members. Deleting the promotion or
+        // mis-recomputing required_ub blows the comparisons bound.
+        let n = 300_000;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id, 1);
+        }
+        let mut optional_docs: Vec<u32> = (0..10_u32).collect();
+        optional_docs.push(n as u32 - 1);
+        let leaves = || {
+            vec![
+                loaded_leaf(
+                    vec![compressed_unit_posting("a", (0..n as u32).collect())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("b", (0..n as u32).collect())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("c", optional_docs.clone())],
+                    None,
+                ),
+            ]
+        };
+        let metrics = LocalMetricsCollector::default();
+        let mut tight = TopKCollector::new(10);
+        collect_iu_tight(&docs, leaves(), &[0, 1], &[2], &metrics, &mut tight, Ok).unwrap();
+        let comparisons = metrics
+            .comparisons
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (11..=100).contains(&comparisons),
+            "promotion must drive from the sparse optional, got {comparisons} comparisons"
+        );
+        let rows = tight.into_rows();
+        assert_eq!(rows.len(), 10);
+        assert!(rows.iter().all(|r| r.score == 3.0));
+    }
+
+    #[test]
+    fn iu_tight_collector_admits_score_equal_floor_with_smaller_row() {
+        // `IuCollector::hit` must admit a document whose score exactly equals
+        // the competitive floor: TopKCollector resolves score ties by row id,
+        // so a later document with a smaller mapped row can still displace
+        // the incumbent. This walks the real collector (the differential
+        // kernel tests carry their own hit closures and never see it).
+        let mut docs = DocSet::default();
+        for id in 0..6_u64 {
+            docs.append(id, 1);
+        }
+        let leaves = || {
+            vec![
+                loaded_leaf(vec![compressed_unit_posting("a", vec![0, 1])], None),
+                loaded_leaf(vec![compressed_unit_posting("b", vec![0, 1])], None),
+                loaded_leaf(vec![compressed_unit_posting("s", vec![5])], None),
+            ]
+        };
+        let metrics = LocalMetricsCollector::default();
+        let mut tight = TopKCollector::new(1);
+        collect_iu_tight(
+            &docs,
+            leaves(),
+            &[0, 1],
+            &[2],
+            &metrics,
+            &mut tight,
+            |key| Ok(1000 - key),
+        )
+        .unwrap();
+        let rows = tight.into_rows();
+        assert_eq!(rows.len(), 1, "top-1");
+        assert_eq!(
+            rows[0].row_id, 999,
+            "doc 1 maps to the smaller row and wins the tie"
+        );
+        assert_eq!(rows[0].score, 2.0);
+    }
+
+    #[test]
+    fn iu_tight_routing_ignores_clause_cost() {
+        // Routing is a shape predicate: a K=1 IU plan over single compressed
+        // postings takes the kernel whatever the clause costs are. This pins
+        // that cost stays out of the decision — a regenerated relative cost
+        // gate inside the condition would show up here as a false match.
+        // (It cannot catch a gate added *after* the two helpers, so the
+        // ablation in the commit message stays the performance record.)
+        let mut docs = DocSet::default();
+        for doc_id in 0..50_u64 {
+            docs.append(doc_id, 1);
+        }
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+        // Close-cost shapes measured faster through the kernel than through
+        // the fallback path, so clause cost stays out of the decision.
+        let leaves = vec![
+            loaded_leaf(
+                vec![compressed_unit_posting("must", (0..50).collect())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("should", (0..50).collect())],
+                None,
+            ),
+        ];
+        let (must_indices, should_indices) = iu_tight_clause_indices(&plan).expect("1+1 shape");
+        assert_eq!(must_indices, vec![0]);
+        assert_eq!(should_indices, vec![1]);
+        assert!(
+            iu_tight_clauses_ready(&leaves, &must_indices, &should_indices),
+            "a close-cost 1+1 shape must still route to the kernel"
+        );
+    }
+
+    #[test]
+    fn iu_tight_fast_paths_record_comparisons() {
+        // The IU fast paths bypass the scorer tree, so they must report their
+        // own comparison counts; a zero here means the metric was dropped.
+        let mut docs = DocSet::default();
+        for doc_id in 0..50_u64 {
+            docs.append(doc_id, 1);
+        }
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+
+        // K=1: the dense MUST against two sparse SHOULDs clears the 3x gate.
+        let k1_plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+        let k1_leaves = vec![
+            loaded_leaf(
+                vec![compressed_unit_posting("must", (0..50).collect())],
+                None,
+            ),
+            loaded_leaf(vec![compressed_unit_posting("should", vec![3, 9])], None),
+        ];
+        let (k1_must, k1_should) = iu_tight_clause_indices(&k1_plan).expect("1+1 shape");
+        assert!(iu_tight_clauses_ready(&k1_leaves, &k1_must, &k1_should));
+
+        let metrics = LocalMetricsCollector::default();
+        let mut collector = TopKCollector::new(10);
+        let status = collect_partition_with_documents(
+            &docs,
+            k1_leaves,
+            &k1_plan,
+            &metrics,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        assert_eq!(status, CollectionStatus::Complete);
+        assert!(
+            metrics
+                .comparisons
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "K=1 IU fast path must record comparisons"
+        );
+
+        // K>=2: two dense MUSTs plus a sparse SHOULD take the multi kernel.
+        let k2_plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: vec![leaf_node(2)],
+            must_not: Vec::new(),
+        };
+        let k2_leaves = vec![
+            loaded_leaf(
+                vec![compressed_unit_posting("must_a", (0..50).collect())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting(
+                    "must_b",
+                    (0..50).step_by(2).collect(),
+                )],
+                None,
+            ),
+            loaded_leaf(vec![compressed_unit_posting("should", vec![3, 9])], None),
+        ];
+        let (k2_must, k2_should) = iu_tight_clause_indices(&k2_plan).expect("2+1 shape");
+        assert_eq!(k2_must.len(), 2);
+        assert!(iu_tight_clauses_ready(&k2_leaves, &k2_must, &k2_should));
+
+        let metrics = LocalMetricsCollector::default();
+        let mut collector = TopKCollector::new(10);
+        let status = collect_partition_with_documents(
+            &docs,
+            k2_leaves,
+            &k2_plan,
+            &metrics,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        assert_eq!(status, CollectionStatus::Complete);
+        assert!(
+            metrics
+                .comparisons
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "K>=2 IU fast path must record comparisons"
+        );
+    }
+
+    #[test]
+    fn box_leaf_scorer_keeps_wand_cursor_for_phrase_grouped_and_multi_term() {
+        let documents = DocSet::default();
+        let metrics = NoOpMetricsCollector;
+
+        let phrase = loaded_leaf(vec![plain_unit_posting("a", vec![0])], Some(0));
+        let phrase_scorer = box_leaf_scorer(phrase, &documents, &metrics, true);
+        assert!(
+            phrase_scorer.debug_type_name().contains("WandCursor"),
+            "got {}",
+            phrase_scorer.debug_type_name()
+        );
+
+        let list = PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(vec![0_u64]),
+            ScalarBuffer::from(vec![1.0_f32]),
+            Some(1.0),
+            None,
+        ));
+        let grouped =
+            PostingIterator::with_query_weight("g".to_owned(), 0, 0, 1.0, list.clone(), 1)
+                .with_grouped_terms(Arc::from([GroupedTermScorer::new(1.0, &list)]));
+        let grouped_scorer =
+            box_leaf_scorer(loaded_leaf(vec![grouped], None), &documents, &metrics, true);
+        assert!(
+            grouped_scorer.debug_type_name().contains("WandCursor"),
+            "got {}",
+            grouped_scorer.debug_type_name()
+        );
+
+        let multi = loaded_leaf(
+            vec![
+                plain_unit_posting("a", vec![0]),
+                plain_unit_posting("b", vec![0]),
+            ],
+            None,
+        );
+        let multi_scorer = box_leaf_scorer(multi, &documents, &metrics, true);
+        assert!(
+            multi_scorer.debug_type_name().contains("WandCursor"),
+            "got {}",
+            multi_scorer.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn try_root_unwraps_reqopt_for_one_must_and_keeps_boolean_with_must_not() {
+        let root = BooleanScorer::try_root(
+            vec![
+                materialized(&[(0, 1.0), (1, 1.0)]),
+                materialized(&[(1, 2.0)]),
+            ],
+            vec![materialized(&[(0, 3.0), (1, 3.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            root.debug_type_name().contains("ReqOptScorer"),
+            "got {}",
+            root.debug_type_name()
+        );
+        let children = root.debug_child_type_names();
+        assert!(
+            !children[0].contains("RequiredConjunctionScorer"),
+            "required child was {}",
+            children[0]
+        );
+
+        let with_must_not = BooleanScorer::try_root(
+            vec![materialized(&[(0, 1.0)])],
+            vec![materialized(&[(0, 3.0)])],
+            vec![materialized(&[(1, 1.0)])],
+        )
+        .unwrap();
+        assert!(
+            with_must_not.debug_type_name().contains("BooleanScorer"),
+            "got {}",
+            with_must_not.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn plan_build_still_wraps_identity_boost_in_scale() {
+        let mut leaves = vec![Some(materialized(&[(0, 1.0)]))];
+        let identity = CompoundScorerPlan::Leaf {
+            index: 0,
+            boost: 1.0,
+        }
+        .build(&mut leaves)
+        .unwrap();
+        assert!(
+            identity.debug_type_name().contains("ScaleScorer"),
+            "got {}",
+            identity.debug_type_name()
+        );
+
+        let mut leaves = vec![Some(materialized(&[(0, 1.0)]))];
+        let boosted = CompoundScorerPlan::Leaf {
+            index: 0,
+            boost: 2.0,
+        }
+        .build(&mut leaves)
+        .unwrap();
+        assert!(
+            boosted.debug_type_name().contains("ScaleScorer"),
+            "got {}",
+            boosted.debug_type_name()
+        );
+        assert!(
+            boosted.debug_child_type_names()[0].contains("MaterializedScorer"),
+            "got {:?}",
+            boosted.debug_child_type_names()
+        );
+    }
+
+    #[test]
+    fn two_must_children_stay_conjunction_and_do_not_forward_full_floor() {
+        let mut conjunction = RequiredConjunctionScorer::try_new(vec![
+            materialized(&[(0, 1.0)]),
+            materialized(&[(0, 2.0)]),
+        ])
+        .unwrap();
+        assert_eq!(conjunction.children.len(), 2);
+        conjunction.set_min_competitive_score(10.0).unwrap();
+        for child in &conjunction.children {
+            assert_eq!(
+                child.debug_last_min_competitive_score(),
+                Some(f32::NEG_INFINITY)
+            );
+        }
+
+        let boolean = BooleanScorer::try_new(
+            Vec::new(),
+            vec![materialized(&[(0, 1.0)]), materialized(&[(0, 2.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            boolean
+                .driver
+                .debug_type_name()
+                .contains("RequiredConjunctionScorer"),
+            "got {}",
+            boolean.driver.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn signed_should_keeps_boolean_root_and_includes_optional_score() {
+        let signed_should = Box::new(
+            BoostScorer::try_new(materialized(&[(0, 2.0)]), materialized(&[(0, 1.0)]), 1.0)
+                .unwrap(),
+        );
+        assert!(!signed_should.scores_non_negative());
+        let mut root = BooleanScorer::try_root(
+            vec![signed_should],
+            vec![materialized(&[(0, 3.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            root.debug_type_name().contains("BooleanScorer"),
+            "got {}",
+            root.debug_type_name()
+        );
+        assert_eq!(
+            TopKCollector::new(1).collect(root.as_mut()).unwrap(),
+            rows(&[(0, 4.0)])
+        );
     }
 }
