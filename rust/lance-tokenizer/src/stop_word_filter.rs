@@ -7,6 +7,9 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[path = "stop_word_filter/tamil.rs"]
+mod tamil;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -35,7 +38,7 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stopwords::RUSSIAN,
         stopwords::SPANISH,
         stopwords::SWEDISH,
-        stop_words::get("ta"),
+        tamil::TAMIL,
         stop_words::get("tr"),
         stop_words::get("zh"),
         stop_words::get("ja"),
@@ -73,7 +76,7 @@ impl StopWordFilter {
             Language::Russian => stopwords::RUSSIAN,
             Language::Spanish => stopwords::SPANISH,
             Language::Swedish => stopwords::SWEDISH,
-            Language::Tamil => stop_words::get("ta"),
+            Language::Tamil => tamil::TAMIL,
             Language::Turkish => stop_words::get("tr"),
         };
         Some(Self::remove(words.iter().map(|word| (*word).to_owned())))
