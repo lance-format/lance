@@ -870,8 +870,8 @@ mod tests {
                 })
                 .collect()
         };
-        for backend in LookupBackend::supported(num_bits) {
-            let scorer = PQPairScorer::with_backend(&pq, &centroid_array, metric, backend).unwrap();
+        for lookup in supported_lookups(num_bits) {
+            let scorer = PQPairScorer::with_lookup(&pq, &centroid_array, metric, lookup).unwrap();
             let kernel = scorer.kernel(&anchor, &anchor).unwrap();
             let tail_kernel = scorer.kernel(&anchor, &tail).unwrap();
             for a in [0, 1, 17, 31] {
@@ -894,10 +894,11 @@ mod tests {
                     };
                     assert!(
                         (f64::from(distance) - expected).abs() <= 1e-5 * expected.abs().max(1.0),
-                        "{backend:?} bits={num_bits} {metric} a={a} b={b} actual={distance} expected={expected}"
+                        "{} bits={num_bits} {metric} a={a} b={b} actual={distance} expected={expected}",
+                        lookup.name()
                     );
                     if subs[a] == subs[b] && metric != DistanceType::Dot {
-                        assert_eq!(distance, 0.0, "{backend:?} a={a} b={b}");
+                        assert_eq!(distance, 0.0, "{} a={a} b={b}", lookup.name());
                     }
                 }
             }
@@ -940,7 +941,7 @@ mod tests {
         }
     }
 
-    /// Every backend sums each candidate's sub-vectors in the same order, so
+    /// Every kernel sums each candidate's sub-vectors in the same order, so
     /// its values are bit-identical to the reference for any byte grouping,
     /// SIMD block and tail. An 8-bit table is 16x larger per sub-vector than
     /// a 4-bit one, so 8-bit cases stop at 34 sub-vectors to stay fast in
@@ -954,7 +955,7 @@ mod tests {
     #[case::bits8_subs2(8, 2)]
     #[case::bits8_subs18(8, 18)]
     #[case::bits8_subs34(8, 34)]
-    fn test_pq_lookup_backends_bit_identical(
+    fn test_pq_lookup_candidates_bit_identical(
         #[case] num_bits: u32,
         #[case] num_sub_vectors: usize,
     ) {
@@ -975,20 +976,15 @@ mod tests {
         let candidates: Vec<u8> = (0..code_bytes * candidate_stride)
             .map(|_| rng.random())
             .collect();
-        let backends = LookupBackend::supported(num_bits);
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx512f") {
-            assert_ne!(backends[0], LookupBackend::Scalar);
-        }
-        for backend in backends {
+        for lookup in supported_lookups(num_bits) {
             let scorer = PQPairScorer {
                 num_bits,
                 num_sub_vectors,
                 code_bytes,
                 metric: DistanceType::L2,
-                table: CodewordTable::new(table.clone(), backend),
+                table: CodewordTable::new(table.clone(), lookup),
                 squared_norms: Vec::new(),
-                backend,
+                lookup,
             };
             let kernel = PQKernel {
                 scorer: &scorer,
@@ -1008,7 +1004,8 @@ mod tests {
                     assert_eq!(
                         actual.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
                         expected.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
-                        "{backend:?} bits={num_bits} subs={num_sub_vectors} a={anchor_row} {range:?}"
+                        "{} bits={num_bits} subs={num_sub_vectors} a={anchor_row} {range:?}",
+                        lookup.name()
                     );
                 }
             }
