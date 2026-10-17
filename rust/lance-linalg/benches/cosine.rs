@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{
-    Float32Array,
+    FixedSizeListArray, Float32Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lance_arrow::{ArrowFloatType, FloatArray, bfloat16::BFloat16Type};
-use lance_linalg::distance::cosine::{Cosine, cosine_distance_batch};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, bfloat16::BFloat16Type};
+use lance_linalg::distance::cosine::{Cosine, cosine_distance_arrow_batch, cosine_distance_batch};
 use lance_linalg::distance::cosine_u8::{cosine_u8, cosine_u8_scalar};
 use num_traits::Float;
 
@@ -78,6 +78,11 @@ fn bench_distance(c: &mut Criterion) {
         b.iter(|| {
             black_box(cosine_distance_batch(key.values(), target.values(), 8).collect::<Vec<_>>())
         })
+    });
+
+    let target = FixedSizeListArray::try_new_from_values(target, 8).unwrap();
+    c.bench_function("Cosine(f32x8, arrow) rng seed", |b| {
+        b.iter(|| black_box(cosine_distance_arrow_batch(&key, &target).unwrap()))
     });
 
     // u8 cosine benchmarks

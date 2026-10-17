@@ -175,19 +175,6 @@ pub(crate) type PairKernel = unsafe fn(&[f32], &[f32]) -> f32;
 /// into the matching element of `output`.
 pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
 
-/// Target-feature tier for the cosine batch iterators.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-#[derive(Clone, Copy)]
-pub(crate) enum BatchKind {
-    Scalar,
-    Avx,
-    AvxFma,
-    Avx512,
-}
-
 /// Number of distances computed per call into a batch kernel.
 ///
 /// Keeping a small output buffer amortizes the kernel call while avoiding the
@@ -245,6 +232,19 @@ impl<'a> BatchDistances<'a> {
         self.buffer_len = num_vectors;
         true
     }
+
+    /// Kept out of line so that `next`, which reaches this once per buffer,
+    /// stays a leaf when it is not inlined. Inlined, the kernel call made
+    /// every `next` save and restore registers, nearly doubling the cost of a
+    /// dimension-8 distance.
+    #[cold]
+    fn refill_and_next(&mut self) -> Option<f32> {
+        if !self.refill() {
+            return None;
+        }
+        self.buffer_index = 1;
+        Some(self.buffer[0])
+    }
 }
 
 impl Iterator for BatchDistances<'_> {
@@ -252,8 +252,8 @@ impl Iterator for BatchDistances<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.buffer_index == self.buffer_len && !self.refill() {
-            return None;
+        if self.buffer_index == self.buffer_len {
+            return self.refill_and_next();
         }
         let value = self.buffer[self.buffer_index];
         self.buffer_index += 1;

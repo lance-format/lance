@@ -90,6 +90,22 @@ impl<A: ?Sized, B: ?Sized, C, D: ?Sized, R> Kernel<unsafe fn(&A, &B, C, &mut D) 
     }
 }
 
+impl<A: ?Sized, B, C: ?Sized, R> Kernel<unsafe fn(&A, B, &C) -> R> {
+    #[inline(always)]
+    pub fn call(self, a: &A, b: B, c: &C) -> R {
+        // SAFETY: see the two-argument `call`.
+        unsafe { (self.0)(a, b, c) }
+    }
+}
+
+impl<A: ?Sized, B, C, D: ?Sized, R> Kernel<unsafe fn(&A, B, C, &D) -> R> {
+    #[inline(always)]
+    pub fn call(self, a: &A, b: B, c: C, d: &D) -> R {
+        // SAFETY: see the two-argument `call`.
+        unsafe { (self.0)(a, b, c, d) }
+    }
+}
+
 /// One operation's kernels, best first, with the host's choice made once.
 ///
 /// Declare with [`dispatch!`](crate::dispatch). When the build baseline already
@@ -337,6 +353,39 @@ mod tests {
         let mut out = [0.0; 2];
         FILL.get().call(&[1.0], &[2.0, 3.0], 1, &mut out);
         assert_eq!(out, [3.0, 4.0]);
+    }
+
+    type ScaledSumFn = unsafe fn(&[f32], f32, &[f32]) -> f32;
+    type DoublyScaledSumFn = unsafe fn(&[f32], f32, f32, &[f32]) -> f32;
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(SCALED_SUM: ScaledSumFn)]
+        fn scaled_sum(x: &[f32], scale: f32, y: &[f32]) -> f32 {
+            scale * portable_sum(x, y)
+        }
+    }
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(DOUBLY_SCALED_SUM: DoublyScaledSumFn)]
+        fn doubly_scaled_sum(x: &[f32], a: f32, b: f32, y: &[f32]) -> f32 {
+            a * b * portable_sum(x, y)
+        }
+    }
+
+    crate::dispatch! {
+        static SCALED: Dispatch<ScaledSumFn> = &[SCALED_SUM];
+    }
+
+    crate::dispatch! {
+        static DOUBLY_SCALED: Dispatch<DoublyScaledSumFn> = &[DOUBLY_SCALED_SUM];
+    }
+
+    #[test]
+    fn scalar_argument_kernels_are_callable() {
+        assert_eq!(SCALED.get().call(&[1.0], 2.0, &[3.0]), 8.0);
+        assert_eq!(DOUBLY_SCALED.get().call(&[1.0], 2.0, 3.0, &[3.0]), 24.0);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

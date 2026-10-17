@@ -7,10 +7,6 @@
 //!
 //! `bf16, f16, f32, f64` types are supported.
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-use std::arch::x86_64::{
-    _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps, _mm_mul_ps, _mm_shuffle_ps,
-};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -21,18 +17,16 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-#[allow(unused_imports)]
-use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
+use lance_core::utils::cpu::SIMD_SUPPORT;
 
 #[cfg(feature = "fp16kernels")]
 use super::HalfBackend;
 use super::{
-    Dot, HALF_KERNELS_COMPILED, HalfType, Normalize, assert_equal_lengths, dot::dot, half_backend,
-    int8_query_to_f32, norm_l2::norm_l2, x86_half_features,
+    BatchDistances, BatchKernel, Dot, HALF_KERNELS_COMPILED, HalfType, Normalize,
+    assert_batch_layout, assert_equal_lengths, dot::dot, half_backend, int8_query_to_f32,
+    norm_l2::norm_l2, x86_half_features,
 };
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-use crate::distance::BatchKind;
-#[allow(unused_imports)]
+#[cfg(not(target_arch = "x86_64"))]
 use crate::simd::{
     FloatSimd, SIMD,
     f32::{f32x8, f32x16},
@@ -64,14 +58,11 @@ pub trait Cosine: Dot + Normalize {
         x: &'a [Self],
         batch: &'a [Self],
         dimension: usize,
-    ) -> Box<dyn Iterator<Item = f32> + 'a> {
+    ) -> impl Iterator<Item = f32> + 'a {
         let x_norm = norm_l2(x);
-
-        Box::new(
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| Self::cosine_fast(x, x_norm, y)),
-        )
+        batch
+            .chunks_exact(dimension)
+            .map(move |y| Self::cosine_fast(x, x_norm, y))
     }
 }
 
@@ -215,348 +206,387 @@ impl Cosine for f16 {
     }
 }
 
-/// f32 single-vector cosine helpers used by `cosine_batch` for fixed
-/// dimensions 8 and 16.
-///
-/// These were previously a single generic `cosine_once<S, N>` but the
-/// monomorphizations have to dispatch on `SIMD_SUPPORT` for the SIMD path
-/// to stay correct under any compile baseline. Splitting them into two
-/// concrete entry points keeps the dispatch site flat and lets each width
-/// route to a `#[target_feature]` AVX2 inner function.
-mod f32 {
-    use super::*;
+/// Cosine distance from `x`, whose L2 norm is `x_norm`, to `y`.
+type CosineKernel<T> = unsafe fn(&[T], f32, &[T]) -> f32;
 
-    #[cfg(any(test, not(target_arch = "x86_64")))]
+/// Cosine distance between `x` and `y` given both L2 norms, in the argument
+/// order of [`Cosine::cosine_with_norms`].
+type CosineWithNormsKernel = unsafe fn(&[f32], f32, f32, &[f32]) -> f32;
+
+impl Cosine for f32 {
     #[inline]
-    pub(super) fn cosine_once_8(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+    fn cosine_fast(x: &[Self], x_norm: Self, other: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), other.len());
+        COSINE_F32.get().call(x, x_norm, other)
+    }
+
+    #[inline]
+    fn cosine_with_norms(x: &[Self], x_norm: Self, y_norm: Self, y: &[Self]) -> Self {
+        assert_equal_lengths(x.len(), y.len());
+        COSINE_WITH_NORMS_F32.get().call(x, x_norm, y_norm, y)
+    }
+
+    fn cosine_batch<'a>(
+        x: &'a [Self],
+        batch: &'a [Self],
+        dimension: usize,
+    ) -> impl Iterator<Item = Self> + 'a {
+        assert_batch_layout(x.len(), batch.len(), dimension);
+        BatchDistances::new(x, batch, dimension, COSINE_F32_BATCH.get())
+    }
+}
+
+impl Cosine for f64 {
+    #[inline]
+    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
+        COSINE_F64.get().call(x, x_norm, y)
+    }
+}
+
+lance_core::dispatch! {
+    static COSINE_F32: Dispatch<CosineKernel<f32>> = {
         #[cfg(target_arch = "x86_64")]
         {
-            match *SIMD_SUPPORT {
-                SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
-                    cosine_once_x86::cosine_once_8_avx512(x, x_norm, y)
-                },
-                SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe {
-                    cosine_once_x86::cosine_once_8_avx_fma(x, x_norm, y)
-                },
-                SimdSupport::Avx => unsafe { cosine_once_x86::cosine_once_8_avx(x, x_norm, y) },
-                _ => cosine_once_8_scalar(x, x_norm, y),
-            }
+            &[
+                x86::COSINE_F32_AVX512,
+                x86::COSINE_F32_AVX_FMA,
+                x86::COSINE_F32_AVX,
+                COSINE_F32_PORTABLE,
+            ]
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            cosine_once_8_other(x, x_norm, y)
+            &[COSINE_F32_PORTABLE]
         }
-    }
+    };
+}
 
-    #[cfg(any(test, not(target_arch = "x86_64")))]
-    #[inline]
-    pub(super) fn cosine_once_16(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+lance_core::dispatch! {
+    static COSINE_WITH_NORMS_F32: Dispatch<CosineWithNormsKernel> = {
         #[cfg(target_arch = "x86_64")]
         {
-            match *SIMD_SUPPORT {
-                SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
-                    cosine_once_x86::cosine_once_16_avx512(x, x_norm, y)
-                },
-                SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe {
-                    cosine_once_x86::cosine_once_16_avx_fma(x, x_norm, y)
-                },
-                SimdSupport::Avx => unsafe { cosine_once_x86::cosine_once_16_avx(x, x_norm, y) },
-                _ => cosine_once_16_scalar(x, x_norm, y),
-            }
+            &[
+                x86::COSINE_WITH_NORMS_F32_AVX512,
+                x86::COSINE_WITH_NORMS_F32_AVX_FMA,
+                x86::COSINE_WITH_NORMS_F32_AVX,
+                COSINE_WITH_NORMS_F32_PORTABLE,
+            ]
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            cosine_once_16_other(x, x_norm, y)
+            &[COSINE_WITH_NORMS_F32_PORTABLE]
         }
-    }
+    };
+}
 
-    /// Portable scalar `cosine_once` for length-8 vectors. Matches the SIMD
-    /// path modulo summation order.
-    #[cfg(all(target_arch = "x86_64", test))]
+lance_core::dispatch! {
+    /// Unlike `L2_F32_BATCH`, this has an AVX-512 candidate: Haswell builds
+    /// have always used the AVX-512 kernel on AVX-512 hosts outside the 8- and
+    /// 16-dimension paths. Keeping those results means Haswell builds select
+    /// at runtime, at one indirect call per 64 distances.
+    static COSINE_F32_BATCH: Dispatch<BatchKernel> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::COSINE_F32_BATCH_AVX512,
+                x86::COSINE_F32_BATCH_AVX_FMA,
+                x86::COSINE_F32_BATCH_AVX,
+                COSINE_F32_BATCH_PORTABLE,
+            ]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[COSINE_F32_BATCH_PORTABLE]
+        }
+    };
+}
+
+lance_core::dispatch! {
+    static COSINE_F64: Dispatch<CosineKernel<f64>> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::COSINE_F64_AVX512,
+                x86::COSINE_F64_AVX_FMA,
+                x86::COSINE_F64_AVX,
+                COSINE_F64_PORTABLE,
+            ]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[COSINE_F64_PORTABLE]
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F32_PORTABLE: CosineKernel<f32>)]
     #[inline]
-    pub(super) fn cosine_once_8_scalar(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        let mut xy = 0.0f32;
-        let mut y2 = 0.0f32;
-        for i in 0..8 {
-            xy += x[i] * y[i];
-            y2 += y[i] * y[i];
-        }
-        1.0 - xy / x_norm / y2.sqrt()
+    fn cosine_f32_portable(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+        cosine_scalar(x, x_norm, y)
     }
+}
 
-    #[cfg(all(target_arch = "x86_64", any(test, not(target_feature = "avx2"))))]
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_WITH_NORMS_F32_PORTABLE: CosineWithNormsKernel)]
     #[inline]
-    pub(super) fn cosine_once_16_scalar(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        let mut xy = 0.0f32;
-        let mut y2 = 0.0f32;
-        for i in 0..16 {
-            xy += x[i] * y[i];
-            y2 += y[i] * y[i];
-        }
-        1.0 - xy / x_norm / y2.sqrt()
+    fn cosine_with_norms_f32_portable(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
+        cosine_scalar_fast(x, x_norm, y, y_norm)
     }
+}
 
-    #[cfg(target_arch = "x86_64")]
-    pub(super) mod cosine_once_x86 {
-        use std::arch::x86_64::*;
-
-        #[cfg(test)]
-        use super::f32x8;
-        #[cfg(any(test, not(target_feature = "avx2")))]
-        use super::f32x16;
-        #[cfg(any(test, not(target_feature = "avx2")))]
-        use crate::simd::SIMD;
-
-        /// AVX + FMA path for 8-lane cosine. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
-        #[cfg(test)]
-        #[inline]
-        #[target_feature(enable = "avx,fma")]
-        pub unsafe fn cosine_once_8_avx_fma(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-            let xv = f32x8::load_unaligned(x.as_ptr());
-            let yv = f32x8::load_unaligned(y.as_ptr());
-            let y2 = yv * yv;
-            let xy = xv * yv;
-            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
-        }
-
-        /// AVX + FMA path for 16-lane cosine. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
-        #[cfg(any(test, not(target_feature = "avx2")))]
-        #[inline]
-        #[target_feature(enable = "avx,fma")]
-        pub unsafe fn cosine_once_16_avx_fma(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-            let xv = f32x16::load_unaligned(x.as_ptr());
-            let yv = f32x16::load_unaligned(y.as_ptr());
-            let y2 = yv * yv;
-            let xy = xv * yv;
-            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
-        }
-
-        /// AVX-only path for 8-lane cosine (no FMA): body unchanged from AVX2 path; gated on Sandy/Ivy Bridge.
-        #[cfg(test)]
-        #[inline]
-        #[target_feature(enable = "avx")]
-        pub unsafe fn cosine_once_8_avx(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-            let xv = f32x8::load_unaligned(x.as_ptr());
-            let yv = f32x8::load_unaligned(y.as_ptr());
-            let y2 = yv * yv;
-            let xy = xv * yv;
-            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
-        }
-
-        /// AVX-only path for 16-lane cosine (no FMA): body unchanged from AVX2 path; gated on Sandy/Ivy Bridge.
-        #[cfg(any(test, not(target_feature = "avx2")))]
-        #[inline]
-        #[target_feature(enable = "avx")]
-        pub unsafe fn cosine_once_16_avx(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-            let xv = f32x16::load_unaligned(x.as_ptr());
-            let yv = f32x16::load_unaligned(y.as_ptr());
-            let y2 = yv * yv;
-            let xy = xv * yv;
-            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
-        }
-
-        /// AVX-512 path for 8-lane cosine: masked load into a `__m512` lower half, reduce.
-        #[cfg(any(test, target_feature = "avx2"))]
-        #[inline]
-        #[target_feature(enable = "avx512f")]
-        pub unsafe fn cosine_once_8_avx512(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-            // mask 0x00FF: load the lower 8 f32 lanes, zero the upper 8.
-            let mask: __mmask16 = 0x00FF;
-            let xv = _mm512_maskz_loadu_ps(mask, x.as_ptr());
-            let yv = _mm512_maskz_loadu_ps(mask, y.as_ptr());
-            let xy = _mm512_mul_ps(xv, yv);
-            let y2 = _mm512_mul_ps(yv, yv);
-            let xy_sum = _mm512_reduce_add_ps(xy);
-            let y2_sum = _mm512_reduce_add_ps(y2);
-            1.0 - xy_sum / x_norm / y2_sum.sqrt()
-        }
-
-        /// AVX-512 path for 16-lane cosine: single full-width `__m512` load (16 f32 fits one `zmm`).
-        #[inline]
-        #[target_feature(enable = "avx512f")]
-        pub unsafe fn cosine_once_16_avx512(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-            let xv = _mm512_loadu_ps(x.as_ptr());
-            let yv = _mm512_loadu_ps(y.as_ptr());
-            let xy = _mm512_mul_ps(xv, yv);
-            let y2 = _mm512_mul_ps(yv, yv);
-            let xy_sum = _mm512_reduce_add_ps(xy);
-            let y2_sum = _mm512_reduce_add_ps(y2);
-            1.0 - xy_sum / x_norm / y2_sum.sqrt()
-        }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    #[inline]
-    fn cosine_once_8_other(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        let xv = unsafe { f32x8::load_unaligned(x.as_ptr()) };
-        let yv = unsafe { f32x8::load_unaligned(y.as_ptr()) };
-        let y2 = yv * yv;
-        let xy = xv * yv;
-        1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    #[inline]
-    fn cosine_once_16_other(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        let xv = unsafe { f32x16::load_unaligned(x.as_ptr()) };
-        let yv = unsafe { f32x16::load_unaligned(y.as_ptr()) };
-        let y2 = yv * yv;
-        let xy = xv * yv;
-        1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
-    }
-
-    /// Batch-level SIMD helper used for direct AVX/FMA parity tests.
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[target_feature(enable = "avx,fma")]
-    pub(super) unsafe fn cosine_batch_avx_fma(
-        x: &[f32],
-        x_norm: f32,
-        batch: &[f32],
-        dimension: usize,
-        output: &mut [f32],
-    ) {
-        debug_assert_eq!(output.len(), batch.len() / dimension);
-        match dimension {
-            8 => {
-                let x_values = unsafe { f32x8::load_unaligned(x.as_ptr()) };
-                output
-                    .iter_mut()
-                    .zip(batch.as_chunks::<8>().0)
-                    .for_each(|(distance, y)| {
-                        let y_values = unsafe { f32x8::load_unaligned(y.as_ptr()) };
-                        let y2 = y_values * y_values;
-                        let xy = x_values * y_values;
-                        *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
-                    });
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F32_BATCH_PORTABLE: BatchKernel)]
+    fn cosine_batch_f32_portable(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
+        let x_norm = norm_l2(x);
+        if dimension == 8
+            && let Ok(key) = <&[f32; 8]>::try_from(x)
+        {
+            let key = x86::Sse8::new(key);
+            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
+                *distance = key.cosine(x_norm, y);
             }
-            16 => output
-                .iter_mut()
-                .zip(batch.as_chunks::<16>().0)
-                .for_each(|(distance, y)| {
-                    *distance = unsafe { cosine_once_x86::cosine_once_16_avx_fma(x, x_norm, y) };
-                }),
-            _ => output
-                .iter_mut()
-                .zip(batch.chunks_exact(dimension))
-                .for_each(|(distance, y)| {
-                    *distance = unsafe { super::f32_x86::cosine_fast_avx_fma(x, x_norm, y) };
-                }),
-        }
-    }
-
-    #[cfg(all(target_arch = "x86_64", any(test, target_feature = "avx2")))]
-    #[target_feature(enable = "avx512f")]
-    pub(super) unsafe fn cosine_batch_avx512(
-        x: &[f32],
-        x_norm: f32,
-        batch: &[f32],
-        dimension: usize,
-        output: &mut [f32],
-    ) {
-        debug_assert_eq!(output.len(), batch.len() / dimension);
-        match dimension {
-            8 => output
-                .iter_mut()
-                .zip(batch.as_chunks::<8>().0)
-                .for_each(|(distance, y)| {
-                    *distance = unsafe { cosine_once_x86::cosine_once_8_avx512(x, x_norm, y) };
-                }),
-            16 => output
-                .iter_mut()
-                .zip(batch.as_chunks::<16>().0)
-                .for_each(|(distance, y)| {
-                    *distance = unsafe { cosine_once_x86::cosine_once_16_avx512(x, x_norm, y) };
-                }),
-            _ => output
-                .iter_mut()
-                .zip(batch.chunks_exact(dimension))
-                .for_each(|(distance, y)| {
-                    *distance = unsafe { super::f32_x86::cosine_fast_avx512(x, x_norm, y) };
-                }),
-        }
-    }
-
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[target_feature(enable = "avx")]
-    pub(super) unsafe fn cosine_batch_avx(
-        x: &[f32],
-        x_norm: f32,
-        batch: &[f32],
-        dimension: usize,
-        output: &mut [f32],
-    ) {
-        debug_assert_eq!(output.len(), batch.len() / dimension);
-        match dimension {
-            8 => {
-                let x_values = unsafe { f32x8::load_unaligned(x.as_ptr()) };
-                output
-                    .iter_mut()
-                    .zip(batch.as_chunks::<8>().0)
-                    .for_each(|(distance, y)| {
-                        let y_values = unsafe { f32x8::load_unaligned(y.as_ptr()) };
-                        let y2 = y_values * y_values;
-                        let xy = x_values * y_values;
-                        *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
-                    });
+        } else if dimension == 16
+            && let Ok(key) = <&[f32; 16]>::try_from(x)
+        {
+            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
+                let (xy, y2) = key
+                    .iter()
+                    .zip(y)
+                    .fold((0.0f32, 0.0f32), |(xy, y2), (&a, &b)| (xy + a * b, y2 + b * b));
+                *distance = 1.0 - xy / x_norm / y2.sqrt();
             }
-            16 => output
-                .iter_mut()
-                .zip(batch.as_chunks::<16>().0)
-                .for_each(|(distance, y)| {
-                    *distance = unsafe { cosine_once_x86::cosine_once_16_avx(x, x_norm, y) };
-                }),
-            _ => output
-                .iter_mut()
-                .zip(batch.chunks_exact(dimension))
-                .for_each(|(distance, y)| {
-                    *distance = unsafe { super::f32_x86::cosine_fast_avx(x, x_norm, y) };
-                }),
+        } else {
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = cosine_scalar(x, x_norm, y);
+            }
         }
     }
 }
 
-/// Inlined f32 cosine kernels for builds whose baseline already guarantees
-/// AVX2. No `#[target_feature]`, no runtime dispatch: under
-/// `target-feature=+avx2,+fma` these compile to AVX2 and inline into the batch
-/// loop, so explicitly tuned builds are not taxed by the runtime-dispatch
-/// machinery needed below the AVX2 baseline.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-mod f32_baseline {
-    use super::{dot, f32x8, f32x16, norm_l2};
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F64_PORTABLE: CosineKernel<f64>)]
+    #[inline]
+    fn cosine_f64_portable(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
+        cosine_scalar(x, x_norm, y)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::*;
+
+    use super::{CosineKernel, CosineWithNormsKernel, dot, norm_l2};
+    use crate::distance::BatchKernel;
+    use crate::simd::f32::{f32x8, f32x16};
+    use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::x86::{hsum256_pd, hsum256_ps};
     use crate::simd::{FloatSimd, SIMD};
 
-    #[inline]
-    pub fn cosine_once_8(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
-        unsafe {
-            let xv = f32x8::load_unaligned(x.as_ptr());
-            let yv = f32x8::load_unaligned(y.as_ptr());
-            let y2 = yv * yv;
-            let xy = xv * yv;
-            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
+    /// A preloaded 8-dimension key for every x86 batch kernel. SSE is part of
+    /// the x86_64 baseline, so this needs no runtime selection. Its reduction
+    /// order matches `f32x8::reduce_sum`.
+    pub(super) struct Sse8 {
+        lo: __m128,
+        hi: __m128,
+    }
+
+    impl Sse8 {
+        #[inline]
+        pub(super) fn new(key: &[f32; 8]) -> Self {
+            // SAFETY: both loads read within the eight-element array, and
+            // x86_64 guarantees SSE.
+            unsafe {
+                Self {
+                    lo: _mm_loadu_ps(key.as_ptr()),
+                    hi: _mm_loadu_ps(key.as_ptr().add(4)),
+                }
+            }
+        }
+
+        #[inline]
+        pub(super) fn cosine(&self, key_norm: f32, y: &[f32; 8]) -> f32 {
+            // SAFETY: both loads read within the eight-element array, and
+            // x86_64 guarantees SSE.
+            unsafe {
+                let (lo, hi) = (_mm_loadu_ps(y.as_ptr()), _mm_loadu_ps(y.as_ptr().add(4)));
+                let xy = _mm_add_ps(_mm_mul_ps(self.lo, lo), _mm_mul_ps(self.hi, hi));
+                let y2 = _mm_add_ps(_mm_mul_ps(lo, lo), _mm_mul_ps(hi, hi));
+                1.0 - hsum128_ps(xy) / key_norm / hsum128_ps(y2).sqrt()
+            }
         }
     }
 
+    /// # Safety
+    ///
+    /// None beyond SSE, which x86_64 guarantees; `unsafe` only because the
+    /// intrinsics are `#[target_feature(enable = "sse")]`.
     #[inline]
-    pub fn cosine_once_16(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+    unsafe fn hsum128_ps(values: __m128) -> f32 {
         unsafe {
-            let xv = f32x16::load_unaligned(x.as_ptr());
-            let yv = f32x16::load_unaligned(y.as_ptr());
-            let y2 = yv * yv;
-            let xy = xv * yv;
-            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
+            let sum64 = _mm_add_ps(values, _mm_movehl_ps(values, values));
+            let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
+            _mm_cvtss_f32(sum32)
         }
     }
 
+    /// Fills `output` for the 8- and 16-dimension PQ widths shared by every
+    /// AVX batch kernel, returning `false` for any other layout.
+    #[target_feature(enable = "avx")]
     #[inline]
-    pub fn cosine_fast(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-        unsafe {
-            let dim = x.len();
+    fn cosine_batch_f32_narrow(
+        x: &[f32],
+        x_norm: f32,
+        batch: &[f32],
+        dimension: usize,
+        output: &mut [f32],
+    ) -> bool {
+        if dimension == 8
+            && let Ok(key) = <&[f32; 8]>::try_from(x)
+        {
+            // The SSE path benchmarks faster than `f32x8` at this width and
+            // keeps every candidate bit-identical.
+            let key = Sse8::new(key);
+            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
+                *distance = key.cosine(x_norm, y);
+            }
+            true
+        } else if dimension == 16
+            && let Ok(key) = <&[f32; 16]>::try_from(x)
+        {
+            // SAFETY: the load reads within the sixteen-element array.
+            let key = unsafe { f32x16::load_unaligned(key.as_ptr()) };
+            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
+                // SAFETY: the load reads within the sixteen-element array.
+                let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
+                let xy = key * y;
+                let y2 = y * y;
+                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) COSINE_F32_BATCH_AVX512: BatchKernel)]
+        pub(super) fn cosine_batch_f32_avx512(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            let x_norm = norm_l2(x);
+            if !cosine_batch_f32_narrow(x, x_norm, batch, dimension, output) {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = cosine_f32_avx512(x, x_norm, y);
+                }
+            }
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) COSINE_F32_BATCH_AVX_FMA: BatchKernel)]
+        pub(super) fn cosine_batch_f32_avx_fma(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            let x_norm = norm_l2(x);
+            if !cosine_batch_f32_narrow(x, x_norm, batch, dimension, output) {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = cosine_f32_avx_fma(x, x_norm, y);
+                }
+            }
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) COSINE_F32_BATCH_AVX: BatchKernel)]
+        pub(super) fn cosine_batch_f32_avx(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            let x_norm = norm_l2(x);
+            if !cosine_batch_f32_narrow(x, x_norm, batch, dimension, output) {
+                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                    *distance = cosine_f32_avx(x, x_norm, y);
+                }
+            }
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) COSINE_F32_AVX512: CosineKernel<f32>)]
+        /// 16-wide `__m512` xy/yy with `vfmadd231ps` per iteration.
+        #[inline]
+        pub(super) fn cosine_f32_avx512(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
+            // Callers pass equal lengths; `min` keeps the unchecked loads in
+            // bounds for any input, as a safe function must.
+            let dim = x.len().min(other.len());
+            let unrolled_len = dim / 16 * 16;
+
+            let mut acc_xy = _mm512_setzero_ps();
+            let mut acc_yy = _mm512_setzero_ps();
+            for i in (0..unrolled_len).step_by(16) {
+                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        _mm512_loadu_ps(x.as_ptr().add(i)),
+                        _mm512_loadu_ps(other.as_ptr().add(i)),
+                    )
+                };
+                acc_xy = _mm512_fmadd_ps(xv, yv, acc_xy);
+                acc_yy = _mm512_fmadd_ps(yv, yv, acc_yy);
+            }
+
+            let mut xy = _mm512_reduce_add_ps(acc_xy);
+            let mut yy = _mm512_reduce_add_ps(acc_yy);
+            for i in unrolled_len..dim {
+                xy += x[i] * other[i];
+                yy += other[i] * other[i];
+            }
+
+            1.0 - xy / x_norm / yy.sqrt()
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) COSINE_F32_AVX_FMA: CosineKernel<f32>)]
+        /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
+        #[inline]
+        pub(super) fn cosine_f32_avx_fma(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(other.len());
             let unrolled_len = dim / 16 * 16;
             let mut y_norm16 = f32x16::zeros();
             let mut xy16 = f32x16::zeros();
             for i in (0..unrolled_len).step_by(16) {
-                let xv = f32x16::load_unaligned(x.as_ptr().add(i));
-                let yv = f32x16::load_unaligned(other.as_ptr().add(i));
+                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        f32x16::load_unaligned(x.as_ptr().add(i)),
+                        f32x16::load_unaligned(other.as_ptr().add(i)),
+                    )
+                };
                 xy16.multiply_add(xv, yv);
                 y_norm16.multiply_add(yv, yv);
             }
@@ -564,390 +594,441 @@ mod f32_baseline {
             let mut y_norm8 = f32x8::zeros();
             let mut xy8 = f32x8::zeros();
             for i in (unrolled_len..aligned_len).step_by(8) {
-                let xv = f32x8::load_unaligned(x.as_ptr().add(i));
-                let yv = f32x8::load_unaligned(other.as_ptr().add(i));
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        f32x8::load_unaligned(x.as_ptr().add(i)),
+                        f32x8::load_unaligned(other.as_ptr().add(i)),
+                    )
+                };
                 xy8.multiply_add(xv, yv);
                 y_norm8.multiply_add(yv, yv);
             }
-            let y_norm = y_norm16.reduce_sum()
-                + y_norm8.reduce_sum()
-                + norm_l2(&other[aligned_len..]).powi(2);
-            let xy = xy16.reduce_sum()
-                + xy8.reduce_sum()
-                + dot(&x[aligned_len..], &other[aligned_len..]);
+            let y_norm =
+                y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
+            let xy =
+                xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
             1.0 - xy / x_norm / y_norm.sqrt()
         }
     }
+
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) COSINE_F32_AVX: CosineKernel<f32>)]
+        /// AVX-only path (no FMA) for Sandy/Ivy Bridge.
+        #[inline]
+        pub(super) fn cosine_f32_avx(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(other.len());
+            let aligned_len = dim / 8 * 8;
+
+            let mut acc_xy = _mm256_setzero_ps();
+            let mut acc_yy = _mm256_setzero_ps();
+            for i in (0..aligned_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        _mm256_loadu_ps(x.as_ptr().add(i)),
+                        _mm256_loadu_ps(other.as_ptr().add(i)),
+                    )
+                };
+                acc_xy = _mm256_add_ps(acc_xy, _mm256_mul_ps(xv, yv));
+                acc_yy = _mm256_add_ps(acc_yy, _mm256_mul_ps(yv, yv));
+            }
+
+            // SAFETY: AVX is enabled for this function.
+            let (xy_main, yy_main) = unsafe { (hsum256_ps(acc_xy), hsum256_ps(acc_yy)) };
+
+            let y_norm = yy_main + norm_l2(&other[aligned_len..]).powi(2);
+            let xy = xy_main + dot(&x[aligned_len..], &other[aligned_len..]);
+            1.0 - xy / x_norm / y_norm.sqrt()
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX512: CosineWithNormsKernel)]
+        /// 16-wide `__m512` with `vfmadd231ps` per iteration.
+        #[inline]
+        pub(super) fn cosine_with_norms_f32_avx512(
+            x: &[f32],
+            x_norm: f32,
+            y_norm: f32,
+            y: &[f32],
+        ) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 16 * 16;
+
+            let mut acc = _mm512_setzero_ps();
+            for i in (0..unrolled_len).step_by(16) {
+                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        _mm512_loadu_ps(x.as_ptr().add(i)),
+                        _mm512_loadu_ps(y.as_ptr().add(i)),
+                    )
+                };
+                acc = _mm512_fmadd_ps(xv, yv, acc);
+            }
+
+            let mut xy = _mm512_reduce_add_ps(acc);
+            for i in unrolled_len..dim {
+                xy += x[i] * y[i];
+            }
+
+            1.0 - xy / x_norm / y_norm
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX_FMA: CosineWithNormsKernel)]
+        /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
+        #[inline]
+        pub(super) fn cosine_with_norms_f32_avx_fma(
+            x: &[f32],
+            x_norm: f32,
+            y_norm: f32,
+            y: &[f32],
+        ) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 16 * 16;
+            let mut xy16 = f32x16::zeros();
+            for i in (0..unrolled_len).step_by(16) {
+                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        f32x16::load_unaligned(x.as_ptr().add(i)),
+                        f32x16::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
+                xy16.multiply_add(xv, yv);
+            }
+            let aligned_len = dim / 8 * 8;
+            let mut xy8 = f32x8::zeros();
+            for i in (unrolled_len..aligned_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        f32x8::load_unaligned(x.as_ptr().add(i)),
+                        f32x8::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
+                xy8.multiply_add(xv, yv);
+            }
+            let xy =
+                xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
+            1.0 - xy / x_norm / y_norm
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX: CosineWithNormsKernel)]
+        /// AVX-only path (no FMA) for Sandy/Ivy Bridge.
+        #[inline]
+        pub(super) fn cosine_with_norms_f32_avx(
+            x: &[f32],
+            x_norm: f32,
+            y_norm: f32,
+            y: &[f32],
+        ) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let aligned_len = dim / 8 * 8;
+
+            let mut acc = _mm256_setzero_ps();
+            for i in (0..aligned_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        _mm256_loadu_ps(x.as_ptr().add(i)),
+                        _mm256_loadu_ps(y.as_ptr().add(i)),
+                    )
+                };
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(xv, yv));
+            }
+
+            // SAFETY: AVX is enabled for this function.
+            let xy_main = unsafe { hsum256_ps(acc) };
+            let xy = xy_main + dot(&x[aligned_len..], &y[aligned_len..]);
+            1.0 - xy / x_norm / y_norm
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) COSINE_F64_AVX512: CosineKernel<f64>)]
+        /// 8-wide `__m512d` xy/yy with `vfmadd231pd` per iteration.
+        #[inline]
+        pub(super) fn cosine_f64_avx512(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 8 * 8;
+
+            let mut acc_xy = _mm512_setzero_pd();
+            let mut acc_yy = _mm512_setzero_pd();
+            for i in (0..unrolled_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        _mm512_loadu_pd(x.as_ptr().add(i)),
+                        _mm512_loadu_pd(y.as_ptr().add(i)),
+                    )
+                };
+                acc_xy = _mm512_fmadd_pd(xv, yv, acc_xy);
+                acc_yy = _mm512_fmadd_pd(yv, yv, acc_yy);
+            }
+
+            let mut xy = _mm512_reduce_add_pd(acc_xy);
+            let mut yy = _mm512_reduce_add_pd(acc_yy);
+            for i in unrolled_len..dim {
+                xy += x[i] * y[i];
+                yy += y[i] * y[i];
+            }
+
+            let y_norm_sq = yy as f32;
+            let xy_f32 = xy as f32;
+            1.0 - xy_f32 / x_norm / y_norm_sq.sqrt()
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) COSINE_F64_AVX_FMA: CosineKernel<f64>)]
+        /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
+        #[inline]
+        pub(super) fn cosine_f64_avx_fma(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 8 * 8;
+            let mut y_norm8 = f64x8::zeros();
+            let mut xy8 = f64x8::zeros();
+            for i in (0..unrolled_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        f64x8::load_unaligned(x.as_ptr().add(i)),
+                        f64x8::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
+                xy8.multiply_add(xv, yv);
+                y_norm8.multiply_add(yv, yv);
+            }
+            let aligned_len = dim / 4 * 4;
+            let mut y_norm4 = f64x4::zeros();
+            let mut xy4 = f64x4::zeros();
+            for i in (unrolled_len..aligned_len).step_by(4) {
+                // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        f64x4::load_unaligned(x.as_ptr().add(i)),
+                        f64x4::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
+                xy4.multiply_add(xv, yv);
+                y_norm4.multiply_add(yv, yv);
+            }
+            let tail_y_norm: f64 = y[aligned_len..].iter().map(|&v| v * v).sum();
+            let tail_xy: f64 = x[aligned_len..]
+                .iter()
+                .zip(y[aligned_len..].iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+
+            let y_norm_sq = (y_norm8.reduce_sum() + y_norm4.reduce_sum() + tail_y_norm) as f32;
+            let xy = (xy8.reduce_sum() + xy4.reduce_sum() + tail_xy) as f32;
+            1.0 - xy / x_norm / y_norm_sq.sqrt()
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) COSINE_F64_AVX: CosineKernel<f64>)]
+        /// AVX-only path (no FMA) for Sandy/Ivy Bridge.
+        #[inline]
+        pub(super) fn cosine_f64_avx(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
+            // See `cosine_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let aligned_len = dim / 4 * 4;
+
+            let mut acc_xy = _mm256_setzero_pd();
+            let mut acc_yy = _mm256_setzero_pd();
+            for i in (0..aligned_len).step_by(4) {
+                // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
+                let (xv, yv) = unsafe {
+                    (
+                        _mm256_loadu_pd(x.as_ptr().add(i)),
+                        _mm256_loadu_pd(y.as_ptr().add(i)),
+                    )
+                };
+                acc_xy = _mm256_add_pd(acc_xy, _mm256_mul_pd(xv, yv));
+                acc_yy = _mm256_add_pd(acc_yy, _mm256_mul_pd(yv, yv));
+            }
+
+            // SAFETY: AVX is enabled for this function.
+            let (xy_main, yy_main) = unsafe { (hsum256_pd(acc_xy), hsum256_pd(acc_yy)) };
+
+            let tail_y_norm: f64 = y[aligned_len..].iter().map(|&v| v * v).sum();
+            let tail_xy: f64 = x[aligned_len..]
+                .iter()
+                .zip(y[aligned_len..].iter())
+                .map(|(&a, &b)| a * b)
+                .sum();
+
+            let y_norm_sq = (yy_main + tail_y_norm) as f32;
+            let xy = (xy_main + tail_xy) as f32;
+            1.0 - xy / x_norm / y_norm_sq.sqrt()
+        }
+    }
 }
 
-impl Cosine for f32 {
+#[cfg(not(target_arch = "x86_64"))]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F32_PORTABLE: CosineKernel<f32>)]
+    /// `simd::f32` is backed by the baseline NEON or LSX on these architectures.
     #[inline]
-    fn cosine_fast(x: &[Self], x_norm: Self, other: &[Self]) -> f32 {
-        // Trait methods cannot carry `#[target_feature]` attributes, so the body
-        // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
-        // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
-        cosine_fast_f32_dispatched(x, x_norm, other)
-    }
-
-    #[inline]
-    fn cosine_with_norms(x: &[Self], x_norm: Self, y_norm: Self, y: &[Self]) -> Self {
-        // Trait methods cannot carry `#[target_feature]` attributes, so the body
-        // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
-        // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
-        cosine_with_norms_f32_dispatched(x, x_norm, y_norm, y)
-    }
-
-    fn cosine_batch<'a>(
-        x: &'a [Self],
-        batch: &'a [Self],
-        dimension: usize,
-    ) -> Box<dyn Iterator<Item = f32> + 'a> {
-        // Preserve the original `chunks_exact` validation before constructing
-        // a specialized iterator.
-        let _ = batch.chunks_exact(dimension);
-        let x_norm = norm_l2(x);
-
-        // On a build whose baseline already guarantees AVX2, avoid the
-        // per-vector runtime dispatch + `#[target_feature]` wrapping that taxes
-        // the tuned path. Dispatch ONCE per batch: AVX-512 hosts get the wide
-        // kernel; everyone else uses the inlined AVX2 baseline path. The
-        // runtime-dispatch path below is only compiled/reached when the baseline
-        // is below AVX2.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        {
-            // dim 8/16 always use the inlined AVX2 baseline: AVX-512 gives no
-            // benefit for such tiny vectors (a masked 512-bit load is slower than
-            // a plain AVX2 load) and only adds dispatch + eager-collect overhead.
-            // Only the larger-dim path routes to AVX-512 on capable hosts — that's
-            // where the wider lanes actually pay off.
-            match dimension {
-                8 => Box::new(
-                    batch
-                        .as_chunks::<8>()
-                        .0
-                        .iter()
-                        .map(move |y| f32_baseline::cosine_once_8(x, x_norm, y)),
-                ),
-                16 => Box::new(
-                    batch
-                        .as_chunks::<16>()
-                        .0
-                        .iter()
-                        .map(move |y| f32_baseline::cosine_once_16(x, x_norm, y)),
-                ),
-                _ => {
-                    if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-                        let mut distances = vec![0.0; batch.len() / dimension];
-                        unsafe {
-                            f32::cosine_batch_avx512(x, x_norm, batch, dimension, &mut distances);
-                        }
-                        Box::new(distances.into_iter())
-                    } else {
-                        Box::new(
-                            batch
-                                .chunks_exact(dimension)
-                                .map(move |y| f32_baseline::cosine_fast(x, x_norm, y)),
-                        )
-                    }
-                }
-            }
-        }
-
-        // Sub-AVX2 build: select once. Dimension 8 uses an inlined SSE
-        // iterator; wider dimensions enter the selected target-feature kernel
-        // once per vector without materializing the full batch.
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-        {
-            if dimension == 8 && x.len() >= 8 {
-                // SAFETY: both loads read from the verified eight-element key,
-                // and x86_64 guarantees SSE.
-                return Box::new(unsafe { CosineBatch8Iter::new(x, x_norm, batch) });
-            }
-
-            let kind = match *SIMD_SUPPORT {
-                SimdSupport::Avx512 | SimdSupport::Avx512FP16 if dimension > 16 => {
-                    BatchKind::Avx512
-                }
-                SimdSupport::Avx512 | SimdSupport::Avx512FP16
-                    if std::is_x86_feature_detected!("fma") =>
-                {
-                    BatchKind::AvxFma
-                }
-                SimdSupport::Avx2 | SimdSupport::AvxFma => BatchKind::AvxFma,
-                SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx => BatchKind::Avx,
-                _ => BatchKind::Scalar,
+    fn cosine_f32_portable(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
+        // Callers pass equal lengths; `min` keeps the unchecked loads in
+        // bounds for any input, as a safe function must.
+        let dim = x.len().min(other.len());
+        let unrolled_len = dim / 16 * 16;
+        let mut y_norm16 = f32x16::zeros();
+        let mut xy16 = f32x16::zeros();
+        for i in (0..unrolled_len).step_by(16) {
+            // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
+            let (xv, yv) = unsafe {
+                (
+                    f32x16::load_unaligned(x.as_ptr().add(i)),
+                    f32x16::load_unaligned(other.as_ptr().add(i)),
+                )
             };
-            Box::new(CosineBatchIter {
-                key: x,
-                key_norm: x_norm,
-                batch,
-                dimension,
-                offset: 0,
-                kind,
-            })
+            xy16.multiply_add(xv, yv);
+            y_norm16.multiply_add(yv, yv);
         }
+        let aligned_len = dim / 8 * 8;
+        let mut y_norm8 = f32x8::zeros();
+        let mut xy8 = f32x8::zeros();
+        for i in (unrolled_len..aligned_len).step_by(8) {
+            // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+            let (xv, yv) = unsafe {
+                (
+                    f32x8::load_unaligned(x.as_ptr().add(i)),
+                    f32x8::load_unaligned(other.as_ptr().add(i)),
+                )
+            };
+            xy8.multiply_add(xv, yv);
+            y_norm8.multiply_add(yv, yv);
+        }
+        let y_norm =
+            y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
+        let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
+        1.0 - xy / x_norm / y_norm.sqrt()
+    }
+}
 
-        // Scalar / non-x86 fallback.
-        #[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(target_arch = "x86_64"))]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_WITH_NORMS_F32_PORTABLE: CosineWithNormsKernel)]
+    /// See `cosine_f32_portable` for the SIMD backends.
+    #[inline]
+    fn cosine_with_norms_f32_portable(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
+        // See `cosine_f32_portable` for `min`.
+        let dim = x.len().min(y.len());
+        let unrolled_len = dim / 16 * 16;
+        let mut xy16 = f32x16::zeros();
+        for i in (0..unrolled_len).step_by(16) {
+            // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
+            let (xv, yv) = unsafe {
+                (
+                    f32x16::load_unaligned(x.as_ptr().add(i)),
+                    f32x16::load_unaligned(y.as_ptr().add(i)),
+                )
+            };
+            xy16.multiply_add(xv, yv);
+        }
+        let aligned_len = dim / 8 * 8;
+        let mut xy8 = f32x8::zeros();
+        for i in (unrolled_len..aligned_len).step_by(8) {
+            // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+            let (xv, yv) = unsafe {
+                (
+                    f32x8::load_unaligned(x.as_ptr().add(i)),
+                    f32x8::load_unaligned(y.as_ptr().add(i)),
+                )
+            };
+            xy8.multiply_add(xv, yv);
+        }
+        let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
+        1.0 - xy / x_norm / y_norm
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F32_BATCH_PORTABLE: BatchKernel)]
+    /// See `cosine_f32_portable` for the SIMD backends.
+    fn cosine_batch_f32_portable(x: &[f32], batch: &[f32], dimension: usize, output: &mut [f32]) {
+        let x_norm = norm_l2(x);
+        if dimension == 8
+            && let Ok(key) = <&[f32; 8]>::try_from(x)
         {
-            match dimension {
-                8 => Box::new(
-                    batch
-                        .chunks_exact(dimension)
-                        .map(move |y| f32::cosine_once_8(x, x_norm, y)),
-                ),
-                16 => Box::new(
-                    batch
-                        .chunks_exact(dimension)
-                        .map(move |y| f32::cosine_once_16(x, x_norm, y)),
-                ),
-                _ => Box::new(
-                    batch
-                        .chunks_exact(dimension)
-                        .map(move |y| Self::cosine_fast(x, x_norm, y)),
-                ),
+            // SAFETY: the load reads within the eight-element array.
+            let key = unsafe { f32x8::load_unaligned(key.as_ptr()) };
+            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<8>().0) {
+                // SAFETY: the load reads within the eight-element array.
+                let y = unsafe { f32x8::load_unaligned(y.as_ptr()) };
+                let xy = key * y;
+                let y2 = y * y;
+                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
+            }
+        } else if dimension == 16
+            && let Ok(key) = <&[f32; 16]>::try_from(x)
+        {
+            // SAFETY: the load reads within the sixteen-element array.
+            let key = unsafe { f32x16::load_unaligned(key.as_ptr()) };
+            for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
+                // SAFETY: the load reads within the sixteen-element array.
+                let y = unsafe { f32x16::load_unaligned(y.as_ptr()) };
+                let xy = key * y;
+                let y2 = y * y;
+                *distance = 1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt();
+            }
+        } else {
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = cosine_f32_portable(x, x_norm, y);
             }
         }
     }
 }
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-struct CosineBatchIter<'a> {
-    key: &'a [f32],
-    key_norm: f32,
-    batch: &'a [f32],
-    dimension: usize,
-    offset: usize,
-    kind: BatchKind,
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-struct CosineBatch8Iter<'a> {
-    key_lo: std::arch::x86_64::__m128,
-    key_hi: std::arch::x86_64::__m128,
-    key_norm: f32,
-    batch: &'a [f32],
-    offset: usize,
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-impl<'a> CosineBatch8Iter<'a> {
-    /// # Safety
-    /// `key` must contain at least eight elements.
+#[cfg(not(target_arch = "x86_64"))]
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F64_PORTABLE: CosineKernel<f64>)]
+    /// `simd::f64` is backed by the baseline NEON or LSX on these architectures.
     #[inline]
-    unsafe fn new(key: &[f32], key_norm: f32, batch: &'a [f32]) -> Self {
-        Self {
-            key_lo: unsafe { _mm_loadu_ps(key.as_ptr()) },
-            key_hi: unsafe { _mm_loadu_ps(key.as_ptr().add(4)) },
-            key_norm,
-            batch,
-            offset: 0,
-        }
-    }
-}
+    fn cosine_f64_portable(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
+        use crate::simd::f64::{f64x4, f64x8};
 
-/// SSE implementation for the dimension-8 boxed iterator. SSE is guaranteed
-/// on x86_64, so this inlines into `Iterator::next` without a target-feature
-/// call boundary while wider kernels remain runtime-dispatched.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-#[inline]
-unsafe fn cosine_once_8_sse(
-    key_lo: std::arch::x86_64::__m128,
-    key_hi: std::arch::x86_64::__m128,
-    key_norm: f32,
-    vector: &[f32],
-) -> f32 {
-    let vector_lo = unsafe { _mm_loadu_ps(vector.as_ptr()) };
-    let vector_hi = unsafe { _mm_loadu_ps(vector.as_ptr().add(4)) };
-    let xy = unsafe { _mm_add_ps(_mm_mul_ps(key_lo, vector_lo), _mm_mul_ps(key_hi, vector_hi)) };
-    let y2 = unsafe {
-        _mm_add_ps(
-            _mm_mul_ps(vector_lo, vector_lo),
-            _mm_mul_ps(vector_hi, vector_hi),
-        )
-    };
-    1.0 - unsafe { hsum128_ps(xy) } / key_norm / unsafe { hsum128_ps(y2) }.sqrt()
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-impl Iterator for CosineBatch8Iter<'_> {
-    type Item = f32;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let end = self.offset + 8;
-        let vector = self.batch.get(self.offset..end)?;
-        self.offset = end;
-        // SAFETY: the constructor preloads a valid key and `vector` contains
-        // exactly eight elements. x86_64 guarantees SSE.
-        Some(unsafe { cosine_once_8_sse(self.key_lo, self.key_hi, self.key_norm, vector) })
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.len();
-        (len, Some(len))
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-impl ExactSizeIterator for CosineBatch8Iter<'_> {
-    #[inline]
-    fn len(&self) -> usize {
-        (self.batch.len() - self.offset) / 8
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-#[inline]
-unsafe fn hsum128_ps(values: std::arch::x86_64::__m128) -> f32 {
-    let sum64 = unsafe { _mm_add_ps(values, _mm_movehl_ps(values, values)) };
-    let sum32 = unsafe { _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55)) };
-    unsafe { _mm_cvtss_f32(sum32) }
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-impl Iterator for CosineBatchIter<'_> {
-    type Item = f32;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let remaining = &self.batch[self.offset..];
-        if remaining.len() < self.dimension {
-            return None;
-        }
-        let vector = &remaining[..self.dimension];
-        self.offset += self.dimension;
-
-        let distance = match self.kind {
-            BatchKind::Scalar => match self.dimension {
-                16 => f32::cosine_once_16_scalar(self.key, self.key_norm, vector),
-                _ => cosine_scalar(self.key, self.key_norm, vector),
-            },
-            // SAFETY: each kind is selected only after runtime detection of
-            // the kernel's required target features.
-            BatchKind::Avx => match self.dimension {
-                16 => unsafe {
-                    f32::cosine_once_x86::cosine_once_16_avx(self.key, self.key_norm, vector)
-                },
-                _ => unsafe { f32_x86::cosine_fast_avx(self.key, self.key_norm, vector) },
-            },
-            BatchKind::AvxFma => match self.dimension {
-                16 => unsafe {
-                    f32::cosine_once_x86::cosine_once_16_avx_fma(self.key, self.key_norm, vector)
-                },
-                _ => unsafe { f32_x86::cosine_fast_avx_fma(self.key, self.key_norm, vector) },
-            },
-            BatchKind::Avx512 => match self.dimension {
-                16 => unsafe {
-                    f32::cosine_once_x86::cosine_once_16_avx512(self.key, self.key_norm, vector)
-                },
-                _ => unsafe { f32_x86::cosine_fast_avx512(self.key, self.key_norm, vector) },
-            },
-        };
-        Some(distance)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.len();
-        (len, Some(len))
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-impl ExactSizeIterator for CosineBatchIter<'_> {
-    #[inline]
-    fn len(&self) -> usize {
-        (self.batch.len() - self.offset) / self.dimension
-    }
-}
-
-impl Cosine for f64 {
-    #[inline]
-    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
-        // Trait methods cannot carry `#[target_feature]` attributes, so the body
-        // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
-        // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
-        cosine_fast_f64_dispatched(x, x_norm, y)
-    }
-}
-
-/// Fast cosine for f64, runtime-dispatched via `SIMD_SUPPORT` on x86_64
-/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses the SIMD
-/// primitives in `crate::simd::f64`.
-#[inline]
-fn cosine_fast_f64_dispatched(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match *SIMD_SUPPORT {
-            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
-                f64_x86::cosine_fast_avx512(x, x_norm, y)
-            },
-            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe {
-                f64_x86::cosine_fast_avx_fma(x, x_norm, y)
-            },
-            SimdSupport::Avx => unsafe { f64_x86::cosine_fast_avx(x, x_norm, y) },
-            _ => cosine_scalar(x, x_norm, y),
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        cosine_fast_f64_simd_other(x, x_norm, y)
-    }
-}
-
-/// AVX2 + FMA implementation of the f64 cosine_fast kernel.
-///
-/// Lives in a `#[target_feature]`-annotated function so the SIMD primitives
-/// in `crate::simd::f64` (which use raw AVX intrinsics) inline correctly
-/// even when the compile baseline does not have AVX2 enabled. Caller must
-/// ensure the host supports AVX2 + FMA.
-#[cfg(target_arch = "x86_64")]
-mod f64_x86 {
-    use std::arch::x86_64::*;
-
-    use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::x86::hsum256_pd;
-    use crate::simd::{FloatSimd, SIMD};
-
-    /// AVX-512 path for f64 fast cosine: 8-wide `__m512d` xy/yy with `vfmadd231pd` per iteration.
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn cosine_fast_avx512(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 8 * 8;
-
-        let mut acc_xy = _mm512_setzero_pd();
-        let mut acc_yy = _mm512_setzero_pd();
-        for i in (0..unrolled_len).step_by(8) {
-            let xv = _mm512_loadu_pd(x.as_ptr().add(i));
-            let yv = _mm512_loadu_pd(y.as_ptr().add(i));
-            acc_xy = _mm512_fmadd_pd(xv, yv, acc_xy);
-            acc_yy = _mm512_fmadd_pd(yv, yv, acc_yy);
-        }
-
-        let mut xy = _mm512_reduce_add_pd(acc_xy);
-        let mut yy = _mm512_reduce_add_pd(acc_yy);
-        for i in unrolled_len..dim {
-            xy += x[i] * y[i];
-            yy += y[i] * y[i];
-        }
-
-        let y_norm_sq = yy as f32;
-        let xy_f32 = xy as f32;
-        1.0 - xy_f32 / x_norm / y_norm_sq.sqrt()
-    }
-
-    /// AVX + FMA path for f64 fast cosine. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
-    #[target_feature(enable = "avx,fma")]
-    pub unsafe fn cosine_fast_avx_fma(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-        let dim = x.len();
+        // See `cosine_f32_portable` for `min`.
+        let dim = x.len().min(y.len());
         let unrolled_len = dim / 8 * 8;
         let mut y_norm8 = f64x8::zeros();
         let mut xy8 = f64x8::zeros();
         for i in (0..unrolled_len).step_by(8) {
-            let xv = f64x8::load_unaligned(x.as_ptr().add(i));
-            let yv = f64x8::load_unaligned(y.as_ptr().add(i));
+            // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+            let (xv, yv) = unsafe {
+                (
+                    f64x8::load_unaligned(x.as_ptr().add(i)),
+                    f64x8::load_unaligned(y.as_ptr().add(i)),
+                )
+            };
             xy8.multiply_add(xv, yv);
             y_norm8.multiply_add(yv, yv);
         }
@@ -955,8 +1036,13 @@ mod f64_x86 {
         let mut y_norm4 = f64x4::zeros();
         let mut xy4 = f64x4::zeros();
         for i in (unrolled_len..aligned_len).step_by(4) {
-            let xv = f64x4::load_unaligned(x.as_ptr().add(i));
-            let yv = f64x4::load_unaligned(y.as_ptr().add(i));
+            // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
+            let (xv, yv) = unsafe {
+                (
+                    f64x4::load_unaligned(x.as_ptr().add(i)),
+                    f64x4::load_unaligned(y.as_ptr().add(i)),
+                )
+            };
             xy4.multiply_add(xv, yv);
             y_norm4.multiply_add(yv, yv);
         }
@@ -971,336 +1057,6 @@ mod f64_x86 {
         let xy = (xy8.reduce_sum() + xy4.reduce_sum() + tail_xy) as f32;
         1.0 - xy / x_norm / y_norm_sq.sqrt()
     }
-
-    /// AVX-only path for f64 fast cosine (no FMA): `_mm256_mul_pd` + `_mm256_add_pd` per iteration; tail handled inline.
-    #[target_feature(enable = "avx")]
-    pub unsafe fn cosine_fast_avx(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-        let dim = x.len();
-        let aligned_len = dim / 4 * 4;
-
-        let mut acc_xy = _mm256_setzero_pd();
-        let mut acc_yy = _mm256_setzero_pd();
-        for i in (0..aligned_len).step_by(4) {
-            let xv = _mm256_loadu_pd(x.as_ptr().add(i));
-            let yv = _mm256_loadu_pd(y.as_ptr().add(i));
-            acc_xy = _mm256_add_pd(acc_xy, _mm256_mul_pd(xv, yv));
-            acc_yy = _mm256_add_pd(acc_yy, _mm256_mul_pd(yv, yv));
-        }
-
-        let xy_main = hsum256_pd(acc_xy);
-        let yy_main = hsum256_pd(acc_yy);
-
-        let tail_y_norm: f64 = y[aligned_len..].iter().map(|&v| v * v).sum();
-        let tail_xy: f64 = x[aligned_len..]
-            .iter()
-            .zip(y[aligned_len..].iter())
-            .map(|(&a, &b)| a * b)
-            .sum();
-
-        let y_norm_sq = (yy_main + tail_y_norm) as f32;
-        let xy = (xy_main + tail_xy) as f32;
-        1.0 - xy / x_norm / y_norm_sq.sqrt()
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn cosine_fast_f64_simd_other(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
-    use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::{FloatSimd, SIMD};
-
-    let dim = x.len();
-    let unrolled_len = dim / 8 * 8;
-    let mut y_norm8 = f64x8::zeros();
-    let mut xy8 = f64x8::zeros();
-    for i in (0..unrolled_len).step_by(8) {
-        unsafe {
-            let xv = f64x8::load_unaligned(x.as_ptr().add(i));
-            let yv = f64x8::load_unaligned(y.as_ptr().add(i));
-            xy8.multiply_add(xv, yv);
-            y_norm8.multiply_add(yv, yv);
-        }
-    }
-    let aligned_len = dim / 4 * 4;
-    let mut y_norm4 = f64x4::zeros();
-    let mut xy4 = f64x4::zeros();
-    for i in (unrolled_len..aligned_len).step_by(4) {
-        unsafe {
-            let xv = f64x4::load_unaligned(x.as_ptr().add(i));
-            let yv = f64x4::load_unaligned(y.as_ptr().add(i));
-            xy4.multiply_add(xv, yv);
-            y_norm4.multiply_add(yv, yv);
-        }
-    }
-    let tail_y_norm: f64 = y[aligned_len..].iter().map(|&v| v * v).sum();
-    let tail_xy: f64 = x[aligned_len..]
-        .iter()
-        .zip(y[aligned_len..].iter())
-        .map(|(&a, &b)| a * b)
-        .sum();
-
-    let y_norm_sq = (y_norm8.reduce_sum() + y_norm4.reduce_sum() + tail_y_norm) as f32;
-    let xy = (xy8.reduce_sum() + xy4.reduce_sum() + tail_xy) as f32;
-    1.0 - xy / x_norm / y_norm_sq.sqrt()
-}
-
-/// Cosine for f32 with known norms, runtime-dispatched via `SIMD_SUPPORT`
-/// on x86_64 (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses
-/// the auto-vectorised scalar loop.
-#[inline]
-fn cosine_with_norms_f32_dispatched(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match *SIMD_SUPPORT {
-            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
-                f32_x86::cosine_with_norms_avx512(x, x_norm, y_norm, y)
-            },
-            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe {
-                f32_x86::cosine_with_norms_avx_fma(x, x_norm, y_norm, y)
-            },
-            SimdSupport::Avx => unsafe { f32_x86::cosine_with_norms_avx(x, x_norm, y_norm, y) },
-            _ => cosine_scalar_fast(x, x_norm, y, y_norm),
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        cosine_with_norms_f32_simd_other(x, x_norm, y_norm, y)
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn cosine_with_norms_f32_simd_other(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-    let dim = x.len();
-    let unrolled_len = dim / 16 * 16;
-    let mut xy16 = f32x16::zeros();
-    for i in (0..unrolled_len).step_by(16) {
-        unsafe {
-            let xv = f32x16::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x16::load_unaligned(y.as_ptr().add(i));
-            xy16.multiply_add(xv, yv);
-        }
-    }
-    let aligned_len = dim / 8 * 8;
-    let mut xy8 = f32x8::zeros();
-    for i in (unrolled_len..aligned_len).step_by(8) {
-        unsafe {
-            let xv = f32x8::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x8::load_unaligned(y.as_ptr().add(i));
-            xy8.multiply_add(xv, yv);
-        }
-    }
-    let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
-    1.0 - xy / x_norm / y_norm
-}
-
-/// Fast cosine for f32, runtime-dispatched via `SIMD_SUPPORT` on x86_64
-/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses the
-/// `simd::f32` primitives, unconditionally backed by NEON / LSX.
-#[inline]
-fn cosine_fast_f32_dispatched(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match *SIMD_SUPPORT {
-            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
-                f32_x86::cosine_fast_avx512(x, x_norm, other)
-            },
-            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe {
-                f32_x86::cosine_fast_avx_fma(x, x_norm, other)
-            },
-            SimdSupport::Avx => unsafe { f32_x86::cosine_fast_avx(x, x_norm, other) },
-            _ => cosine_scalar(x, x_norm, other),
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        cosine_fast_f32_simd_other(x, x_norm, other)
-    }
-}
-
-/// AVX2 + FMA implementation of the f32 fast cosine kernel.
-///
-/// Lives in a `#[target_feature]`-annotated function so the SIMD primitives
-/// in `crate::simd::f32` (which use raw AVX intrinsics) inline correctly
-/// even when the compile baseline does not have AVX2 enabled. Caller must
-/// ensure the host supports AVX2 + FMA.
-#[cfg(target_arch = "x86_64")]
-mod f32_x86 {
-    use std::arch::x86_64::*;
-
-    use super::{dot, f32x8, f32x16, norm_l2};
-    use crate::simd::x86::hsum256_ps;
-    use crate::simd::{FloatSimd, SIMD};
-
-    /// AVX + FMA path for f32 fast cosine. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
-    #[target_feature(enable = "avx,fma")]
-    pub unsafe fn cosine_fast_avx_fma(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 16 * 16;
-        let mut y_norm16 = f32x16::zeros();
-        let mut xy16 = f32x16::zeros();
-        for i in (0..unrolled_len).step_by(16) {
-            let xv = f32x16::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x16::load_unaligned(other.as_ptr().add(i));
-            xy16.multiply_add(xv, yv);
-            y_norm16.multiply_add(yv, yv);
-        }
-        let aligned_len = dim / 8 * 8;
-        let mut y_norm8 = f32x8::zeros();
-        let mut xy8 = f32x8::zeros();
-        for i in (unrolled_len..aligned_len).step_by(8) {
-            let xv = f32x8::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x8::load_unaligned(other.as_ptr().add(i));
-            xy8.multiply_add(xv, yv);
-            y_norm8.multiply_add(yv, yv);
-        }
-        let y_norm =
-            y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
-        let xy =
-            xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
-        1.0 - xy / x_norm / y_norm.sqrt()
-    }
-
-    /// AVX-only path for f32 fast cosine (no FMA): `_mm256_mul_ps` + `_mm256_add_ps` per iteration; tail via trait-routed `dot`/`norm_l2`.
-    #[target_feature(enable = "avx")]
-    pub unsafe fn cosine_fast_avx(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-        let dim = x.len();
-        let aligned_len = dim / 8 * 8;
-
-        let mut acc_xy = _mm256_setzero_ps();
-        let mut acc_yy = _mm256_setzero_ps();
-        for i in (0..aligned_len).step_by(8) {
-            let xv = _mm256_loadu_ps(x.as_ptr().add(i));
-            let yv = _mm256_loadu_ps(other.as_ptr().add(i));
-            acc_xy = _mm256_add_ps(acc_xy, _mm256_mul_ps(xv, yv));
-            acc_yy = _mm256_add_ps(acc_yy, _mm256_mul_ps(yv, yv));
-        }
-
-        let xy_main = hsum256_ps(acc_xy);
-        let yy_main = hsum256_ps(acc_yy);
-
-        let y_norm = yy_main + norm_l2(&other[aligned_len..]).powi(2);
-        let xy = xy_main + dot(&x[aligned_len..], &other[aligned_len..]);
-        1.0 - xy / x_norm / y_norm.sqrt()
-    }
-
-    /// AVX-512 path for f32 fast cosine: 16-wide `__m512` xy/yy with `vfmadd231ps` per iteration.
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn cosine_fast_avx512(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 16 * 16;
-
-        let mut acc_xy = _mm512_setzero_ps();
-        let mut acc_yy = _mm512_setzero_ps();
-        for i in (0..unrolled_len).step_by(16) {
-            let xv = _mm512_loadu_ps(x.as_ptr().add(i));
-            let yv = _mm512_loadu_ps(other.as_ptr().add(i));
-            acc_xy = _mm512_fmadd_ps(xv, yv, acc_xy);
-            acc_yy = _mm512_fmadd_ps(yv, yv, acc_yy);
-        }
-
-        let mut xy = _mm512_reduce_add_ps(acc_xy);
-        let mut yy = _mm512_reduce_add_ps(acc_yy);
-        for i in unrolled_len..dim {
-            xy += x[i] * other[i];
-            yy += other[i] * other[i];
-        }
-
-        1.0 - xy / x_norm / yy.sqrt()
-    }
-
-    /// AVX-512 path for f32 cosine with known norms: 16-wide `__m512` with `vfmadd231ps` per iteration.
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn cosine_with_norms_avx512(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 16 * 16;
-
-        let mut acc = _mm512_setzero_ps();
-        for i in (0..unrolled_len).step_by(16) {
-            let xv = _mm512_loadu_ps(x.as_ptr().add(i));
-            let yv = _mm512_loadu_ps(y.as_ptr().add(i));
-            acc = _mm512_fmadd_ps(xv, yv, acc);
-        }
-
-        let mut xy = _mm512_reduce_add_ps(acc);
-        for i in unrolled_len..dim {
-            xy += x[i] * y[i];
-        }
-
-        1.0 - xy / x_norm / y_norm
-    }
-
-    /// AVX + FMA path for f32 cosine with known norms. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
-    #[target_feature(enable = "avx,fma")]
-    pub unsafe fn cosine_with_norms_avx_fma(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 16 * 16;
-        let mut xy16 = f32x16::zeros();
-        for i in (0..unrolled_len).step_by(16) {
-            let xv = f32x16::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x16::load_unaligned(y.as_ptr().add(i));
-            xy16.multiply_add(xv, yv);
-        }
-        let aligned_len = dim / 8 * 8;
-        let mut xy8 = f32x8::zeros();
-        for i in (unrolled_len..aligned_len).step_by(8) {
-            let xv = f32x8::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x8::load_unaligned(y.as_ptr().add(i));
-            xy8.multiply_add(xv, yv);
-        }
-        let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
-        1.0 - xy / x_norm / y_norm
-    }
-
-    /// AVX-only path for f32 cosine with known norms (no FMA): `_mm256_mul_ps` + `_mm256_add_ps` per iteration; tail via trait-routed `dot`.
-    #[target_feature(enable = "avx")]
-    pub unsafe fn cosine_with_norms_avx(x: &[f32], x_norm: f32, y_norm: f32, y: &[f32]) -> f32 {
-        let dim = x.len();
-        let aligned_len = dim / 8 * 8;
-
-        let mut acc = _mm256_setzero_ps();
-        for i in (0..aligned_len).step_by(8) {
-            let xv = _mm256_loadu_ps(x.as_ptr().add(i));
-            let yv = _mm256_loadu_ps(y.as_ptr().add(i));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(xv, yv));
-        }
-
-        let xy_main = hsum256_ps(acc);
-        let xy = xy_main + dot(&x[aligned_len..], &y[aligned_len..]);
-        1.0 - xy / x_norm / y_norm
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn cosine_fast_f32_simd_other(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
-    let dim = x.len();
-    let unrolled_len = dim / 16 * 16;
-    let mut y_norm16 = f32x16::zeros();
-    let mut xy16 = f32x16::zeros();
-    for i in (0..unrolled_len).step_by(16) {
-        unsafe {
-            let xv = f32x16::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x16::load_unaligned(other.as_ptr().add(i));
-            xy16.multiply_add(xv, yv);
-            y_norm16.multiply_add(yv, yv);
-        }
-    }
-    let aligned_len = dim / 8 * 8;
-    let mut y_norm8 = f32x8::zeros();
-    let mut xy8 = f32x8::zeros();
-    for i in (unrolled_len..aligned_len).step_by(8) {
-        unsafe {
-            let xv = f32x8::load_unaligned(x.as_ptr().add(i));
-            let yv = f32x8::load_unaligned(other.as_ptr().add(i));
-            xy8.multiply_add(xv, yv);
-            y_norm8.multiply_add(yv, yv);
-        }
-    }
-    let y_norm =
-        y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
-    let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
-    1.0 - xy / x_norm / y_norm.sqrt()
 }
 
 /// Fallback non-SIMD implementation
@@ -1344,7 +1100,7 @@ pub fn cosine_distance_batch<'a, T: Cosine>(
     from: &'a [T],
     batch: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
+) -> impl Iterator<Item = f32> + 'a {
     T::cosine_batch(from, batch, dimension)
 }
 
@@ -1359,21 +1115,52 @@ where
     debug_assert_eq!(from.len(), dimension);
 
     // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values =
-        to.values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::InvalidArgumentError(format!(
-                "`to` values have data type {}, expected {} to match `from`",
-                to.values().data_type(),
-                from.data_type()
-            )))?;
+    let to_values = downcast_to_values::<T>(from, to)?;
     let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
 
     Ok(Arc::new(Float32Array::new(
         dists.collect(),
         to.nulls().cloned(),
     )))
+}
+
+/// The f32 case of [`do_cosine_distance_arrow_batch`], which writes every
+/// distance with one batch kernel call. Collecting [`Cosine::cosine_batch`]
+/// instead drives its buffered iterator one `next` at a time, which costs
+/// half again as much at dimension 8.
+fn do_cosine_distance_arrow_batch_f32(
+    from: &Float32Array,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
+    let dimension = to.value_length() as usize;
+    let (from, batch) = (
+        from.as_slice(),
+        downcast_to_values::<Float32Type>(from, to)?.as_slice(),
+    );
+    assert_batch_layout(from.len(), batch.len(), dimension);
+
+    let mut distances = vec![0.0; batch.len() / dimension];
+    COSINE_F32_BATCH
+        .get()
+        .call(from, batch, dimension, &mut distances);
+    Ok(Arc::new(Float32Array::new(
+        distances.into(),
+        to.nulls().cloned(),
+    )))
+}
+
+fn downcast_to_values<'a, T: ArrowFloatType>(
+    from: &T::ArrayType,
+    to: &'a FixedSizeListArray,
+) -> Result<&'a T::ArrayType> {
+    to.values()
+        .as_any()
+        .downcast_ref::<T::ArrayType>()
+        .ok_or(Error::InvalidArgumentError(format!(
+            "`to` values have data type {}, expected {} to match `from`",
+            to.values().data_type(),
+            from.data_type()
+        )))
 }
 
 /// Compute Cosine distance between a vector and a batch of vectors.
@@ -1393,19 +1180,17 @@ where
 ///
 /// # Panics
 ///
-/// With debug assertions on, panics if the length of `from` is not equal to the
-/// dimension (value length) of `to`. Without them the mismatch is not reliably
-/// caught, since cosine has no always-on layout assert of its own, unlike the l2
-/// and dot equivalents.
+/// Panics if the length of `from` is not equal to the dimension (value length)
+/// of `to`. Only `Float32` and `Int8` queries check this when `to` is empty.
 pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
     match *from.data_type() {
         DataType::Float16 => do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
-        DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
+        DataType::Float32 => do_cosine_distance_arrow_batch_f32(from.as_primitive(), to),
         DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_cosine_distance_arrow_batch::<Float32Type>(
+        DataType::Int8 => do_cosine_distance_arrow_batch_f32(
             &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
             &to.convert_to_floating_point()?,
         ),
@@ -1416,8 +1201,8 @@ pub fn cosine_distance_arrow_batch(
     }
 }
 
-/// Portable scalar reference cosine over f64 inputs. Used by parity tests
-/// to compare against every dispatched per-tier inner kernel. Computes
+/// Portable scalar reference cosine over f64 inputs. Used by tests to compare
+/// against every cosine kernel candidate. Computes
 /// `1 - xy / (x_norm * y_norm_sq.sqrt())` in f64 then casts to f32, matching
 /// the reduction order of the dispatched kernels.
 #[cfg(test)]
@@ -1428,7 +1213,7 @@ fn cosine_fast_scalar(x: &[f64], x_norm: f32, y: &[f64]) -> f32 {
 }
 
 /// Portable scalar reference cosine when both norms are known. Mirrors
-/// `cosine_with_norms_f32_dispatched` for parity testing.
+/// `Cosine::cosine_with_norms` for testing.
 #[cfg(test)]
 fn cosine_with_norms_scalar(x: &[f64], x_norm: f32, y_norm: f32, y: &[f64]) -> f32 {
     let xy: f64 = x.iter().zip(y.iter()).map(|(&a, &b)| a * b).sum();
@@ -1567,52 +1352,111 @@ mod tests {
         });
     }
 
+    /// Checks one cosine distance against an f64 reference. The absolute
+    /// `epsilon` covers inputs with extreme dynamic range, where a near-zero
+    /// result differs between f32 and f64 accumulation by more than
+    /// `max_relative` of itself.
+    fn check_cosine(
+        got: f32,
+        want: f32,
+        kernel: &str,
+        dimension: usize,
+    ) -> std::result::Result<(), TestCaseError> {
+        prop_assert!(
+            approx::relative_eq!(got, want, max_relative = 1e-3, epsilon = 1e-6),
+            "{kernel} at dim {dimension}: {got} != {want}"
+        );
+        Ok(())
+    }
+
+    /// Every host-supported f32 kernel, single-pair and batch, must agree with
+    /// an f64 reference. Prefixes of length 8 and 16 pin the batch kernels'
+    /// PQ-width fast paths regardless of the generated dimension.
     #[rstest::rstest]
-    fn test_cosine_fast_f32_scalar_simd_parity(
+    fn test_cosine_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-            let simd = <f32 as Cosine>::cosine_fast(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            for dimension in [8, 16, x.len()].into_iter().filter(|&d| d <= x.len()) {
+                let (x, y) = (&x[..dimension], &y[..dimension]);
+                let (x_norm, y_norm) = (norm_l2(x), norm_l2(y));
+                if x_norm <= 1e-10 || y_norm <= 1e-10 {
+                    continue;
+                }
+                let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+                let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+                let want = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
+                let want_with_norms = cosine_with_norms_scalar(&x_f64, x_norm, y_norm, &y_f64);
+                let want_self = cosine_fast_scalar(&x_f64, x_norm, &x_f64);
+
+                for candidate in COSINE_F32.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    check_cosine(kernel.call(x, x_norm, y), want, candidate.name(), dimension)?;
+                }
+
+                for candidate in COSINE_WITH_NORMS_F32.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let got = kernel.call(x, x_norm, y_norm, y);
+                    check_cosine(got, want_with_norms, candidate.name(), dimension)?;
+                }
+
+                let batch = [y, x].concat();
+                let mut pq_width_result = None;
+                for candidate in COSINE_F32_BATCH.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let mut got = [f32::NAN; 2];
+                    kernel.call(x, &batch, dimension, &mut got);
+                    check_cosine(got[0], want, candidate.name(), dimension)?;
+                    check_cosine(got[1], want_self, candidate.name(), dimension)?;
+
+                    // At the PQ widths every candidate shares one reduction
+                    // order, except the x86 portable kernel at 16 dimensions,
+                    // which cannot use the AVX `f32x16`.
+                    let shares_pq_path = dimension == 8
+                        || (dimension == 16
+                            && (cfg!(not(target_arch = "x86_64"))
+                                || !candidate.features().is_empty()));
+                    if shares_pq_path {
+                        let bits = got.map(f32::to_bits);
+                        let (first, first_bits) =
+                            *pq_width_result.get_or_insert((candidate.name(), bits));
+                        prop_assert_eq!(
+                            bits,
+                            first_bits,
+                            "{} and {} differ at dim {}",
+                            candidate.name(),
+                            first,
+                            dimension
+                        );
+                    }
+                }
+            }
             Ok(())
         });
     }
 
+    /// Every host-supported f64 kernel must agree with an f64 reference.
     #[rstest::rstest]
-    fn test_cosine_with_norms_f32_scalar_simd_parity(
-        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
-    ) {
-        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_with_norms_scalar(&x_f64, x_norm, y_norm, &y_f64);
-            let simd = <f32 as Cosine>::cosine_with_norms(&x, x_norm, y_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
-            Ok(())
-        });
-    }
-
-    #[rstest::rstest]
-    fn test_cosine_fast_f64_scalar_simd_parity(
+    fn test_cosine_f64_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
             prop_assume!(norm_l2(&x) > 1e-20);
             prop_assume!(norm_l2(&y) > 1e-20);
             let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let simd = <f64 as Cosine>::cosine_fast(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            let want = cosine_fast_scalar(&x, x_norm, &y);
+            for candidate in COSINE_F64.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                check_cosine(kernel.call(&x, x_norm, &y), want, candidate.name(), x.len())?;
+            }
             Ok(())
         });
     }
@@ -1632,345 +1476,49 @@ mod tests {
             prop_assume!(norm_l2(&y) > 1e-6);
             do_cosine_test(&x, &y)?;
         }
+    }
 
-        /// AVX-512-direct parity for the f32 cosine_fast kernel. Early-returns
-        /// on hosts without AVX-512F so the test stays portable.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f32_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_scalar(&x, x_norm, &y);
-            let avx512 = unsafe { f32_x86::cosine_fast_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
+    /// The f32 arrow path fills every distance with one batch kernel call; it
+    /// must match the per-vector `cosine` and keep the targets' nulls.
+    #[rstest::rstest]
+    #[case::dim_8(8)]
+    #[case::dim_40(40)]
+    fn test_cosine_arrow_batch_f32_matches_per_vector(#[case] dimension: usize) {
+        let num_vectors = 70;
+        let x: Vec<f32> = (0..dimension)
+            .map(|index| (index % 13) as f32 * 0.25 + 1.0)
+            .collect();
+        let batch: Vec<f32> = (0..dimension * num_vectors)
+            .map(|index| (index % 11) as f32 * 0.5 - 2.0)
+            .collect();
+        let nulls = arrow_buffer::NullBuffer::from_iter((0..num_vectors).map(|i| i % 3 != 0));
+        let to = FixedSizeListArray::try_new(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+            dimension as i32,
+            Arc::new(Float32Array::from(batch.clone())),
+            Some(nulls.clone()),
+        )
+        .unwrap();
 
-        /// AVX + FMA-direct parity for the f32 cosine_fast kernel. Covers
-        /// the AMD Piledriver / Steamroller / FX-7500 tier. Early-returns
-        /// on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f32_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_scalar(&x, x_norm, &y);
-            let avx_fma = unsafe { f32_x86::cosine_fast_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
+        let got = cosine_distance_arrow_batch(&Float32Array::from(x.clone()), &to).unwrap();
 
-        /// AVX-only-direct parity for the f32 cosine_fast kernel. Covers
-        /// the Intel Sandy Bridge / Ivy Bridge tier. Early-returns on
-        /// hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f32_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_scalar(&x, x_norm, &y);
-            let avx = unsafe { f32_x86::cosine_fast_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// AVX-512-direct parity for the f32 cosine_with_norms kernel.
-        /// Early-returns on hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_with_norms_f32_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let scalar = cosine_scalar_fast(&x, x_norm, &y, y_norm);
-            let avx512 = unsafe { f32_x86::cosine_with_norms_avx512(&x, x_norm, y_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the f32 cosine_with_norms kernel.
-        /// Covers the AMD Piledriver / Steamroller / FX-7500 tier.
-        /// Early-returns on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_with_norms_f32_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let scalar = cosine_scalar_fast(&x, x_norm, &y, y_norm);
-            let avx_fma = unsafe { f32_x86::cosine_with_norms_avx_fma(&x, x_norm, y_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the f32 cosine_with_norms kernel.
-        /// Covers the Intel Sandy Bridge / Ivy Bridge tier. Early-returns
-        /// on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_with_norms_f32_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let y_norm = norm_l2(&y);
-            let scalar = cosine_scalar_fast(&x, x_norm, &y, y_norm);
-            let avx = unsafe { f32_x86::cosine_with_norms_avx(&x, x_norm, y_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// AVX-512-direct parity for the f64 cosine_fast kernel. Early-returns
-        /// on hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f64_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let avx512 = unsafe { f64_x86::cosine_fast_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the f64 cosine_fast kernel. Covers
-        /// the AMD Piledriver / Steamroller / FX-7500 tier. Early-returns
-        /// on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f64_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let avx_fma = unsafe { f64_x86::cosine_fast_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the f64 cosine_fast kernel. Covers
-        /// the Intel Sandy Bridge / Ivy Bridge tier. Early-returns on
-        /// hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_fast_f64_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-20);
-            prop_assume!(norm_l2(&y) > 1e-20);
-            let x_norm = norm_l2(&x);
-            let scalar = cosine_fast_scalar(&x, x_norm, &y);
-            let avx = unsafe { f64_x86::cosine_fast_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// Parity check for `cosine_once_8` (despecialised 8-lane width).
-        ///
-        /// The `epsilon = 1e-6` clause handles the case where the proptest
-        /// generator produces inputs with extreme dynamic range (e.g., mixing
-        /// `1e-43` with `1e7` in the same vector). When the dot product is
-        /// dominated by one large term and the cosine result is near zero,
-        /// the f32-precision SIMD path and the f64-precision scalar reference
-        /// can legitimately differ by more than `max_relative = 1e-3` of the
-        /// (near-zero) result. The absolute epsilon catches these without
-        /// masking real bugs (where the absolute error would be > 1e-6).
-        #[test]
-        fn test_cosine_once_8_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-            let simd = f32::cosine_once_8(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3, epsilon = 1e-6));
-        }
-
-        /// Parity check for `cosine_once_16` (despecialised 16-lane width).
-        /// See `test_cosine_once_8_scalar_simd_parity` for `epsilon` rationale.
-        #[test]
-        fn test_cosine_once_16_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-            let simd = f32::cosine_once_16(&x, x_norm, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3, epsilon = 1e-6));
-        }
-
-        /// AVX-512-direct parity for the 8-lane cosine_once kernel. Verifies
-        /// the masked-load (mask 0x00FF) AVX-512 implementation produces
-        /// the same result as the scalar reference. Early-returns on hosts
-        /// without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_8_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
-            let avx512 =
-                unsafe { super::f32::cosine_once_x86::cosine_once_8_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX-512-direct parity for the 16-lane cosine_once kernel. Verifies
-        /// the full-width `__m512` load implementation produces the same
-        /// result as the scalar reference. Early-returns on hosts without
-        /// AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_16_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
-            let avx512 =
-                unsafe { super::f32::cosine_once_x86::cosine_once_16_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the 8-lane cosine_once kernel.
-        /// Covers the AMD Piledriver / Steamroller / FX-7500 tier.
-        /// Early-returns on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_8_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
-            let avx_fma =
-                unsafe { super::f32::cosine_once_x86::cosine_once_8_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX + FMA-direct parity for the 16-lane cosine_once kernel.
-        /// Covers the AMD Piledriver / Steamroller / FX-7500 tier.
-        /// Early-returns on hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_16_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
-            let avx_fma =
-                unsafe { super::f32::cosine_once_x86::cosine_once_16_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the 8-lane cosine_once kernel.
-        /// Covers the Intel Sandy Bridge / Ivy Bridge tier. Early-returns
-        /// on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_8_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 8..9)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
-            let avx = unsafe { super::f32::cosine_once_x86::cosine_once_8_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
-        }
-
-        /// AVX-only-direct parity for the 16-lane cosine_once kernel.
-        /// Covers the Intel Sandy Bridge / Ivy Bridge tier. Early-returns
-        /// on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_cosine_once_16_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 16..17)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            prop_assume!(norm_l2(&x) > 1e-10);
-            prop_assume!(norm_l2(&y) > 1e-10);
-            let x_norm = norm_l2(&x);
-            let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
-            let avx = unsafe { super::f32::cosine_once_x86::cosine_once_16_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
+        assert_eq!(got.nulls(), Some(&nulls));
+        for (got, vector) in got.values().iter().zip(batch.chunks_exact(dimension)) {
+            assert_relative_eq!(*got, f32::cosine(&x, vector), max_relative = 1e-5);
         }
     }
 
+    /// `cosine_batch` must agree with the per-vector `cosine`, including across
+    /// the iterator's 64-distance buffer refills.
     #[rstest::rstest]
     #[case::dim_8(8)]
+    #[case::dim_12(12)]
     #[case::dim_16(16)]
     #[case::dim_40(40)]
+    #[case::dim_1024(1024)]
     fn test_cosine_batch_matches_per_vector(#[case] dimension: usize) {
-        let num_vectors = 5;
+        // Spans two full buffers and a partial one.
+        let num_vectors = 130;
         let x: Vec<f32> = (0..dimension)
             .map(|index| (index % 13) as f32 * 0.25 + 1.0)
             .collect();
@@ -1978,78 +1526,12 @@ mod tests {
             .map(|index| (index % 11) as f32 * 0.5 - 2.0)
             .collect();
 
-        let boxed: Vec<f32> = f32::cosine_batch(&x, &batch, dimension).collect();
+        let got: Vec<f32> = f32::cosine_batch(&x, &batch, dimension).collect();
 
-        assert_eq!(boxed.len(), num_vectors);
-        for (boxed_distance, vector) in boxed.iter().zip(batch.chunks_exact(dimension)) {
+        assert_eq!(got.len(), num_vectors);
+        for (distance, vector) in got.iter().zip(batch.chunks_exact(dimension)) {
             let expected = f32::cosine(&x, vector);
-            assert_relative_eq!(
-                *boxed_distance,
-                expected,
-                max_relative = 1e-5,
-                epsilon = 1e-6
-            );
+            assert_relative_eq!(*distance, expected, max_relative = 1e-5, epsilon = 1e-6);
         }
-    }
-
-    /// Asserts a batch-level f32 cosine SIMD kernel matches the scalar
-    /// `cosine_fast` reference for every vector in a multi-vector batch. Runs
-    /// each of the kernel's three internal dimension arms (8, 16, and the
-    /// general `chunks_exact` path). The AVX/FMA helpers are test-only, while
-    /// the AVX-512 helper is selected only by AVX2-baseline builds, so direct
-    /// calls cover them under the default x86-64-v2 baseline.
-    #[cfg(target_arch = "x86_64")]
-    fn check_cosine_batch_kernel(kernel: unsafe fn(&[f32], f32, &[f32], usize, &mut [f32])) {
-        for dimension in [8_usize, 16, 40] {
-            let x: Vec<f32> = (0..dimension).map(|i| (i as f32) * 0.5 + 1.0).collect();
-            let x_norm = norm_l2(&x);
-            let num_vectors = 3;
-            let batch: Vec<f32> = (0..dimension * num_vectors)
-                .map(|i| ((i % 7) as f32) + 1.0)
-                .collect();
-
-            let mut got = vec![0.0; num_vectors];
-            unsafe { kernel(&x, x_norm, &batch, dimension, &mut got) };
-            assert_eq!(got.len(), num_vectors);
-
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            for (chunk, &g) in batch.chunks_exact(dimension).zip(got.iter()) {
-                let y_f64: Vec<f64> = chunk.iter().map(|&v| v as f64).collect();
-                let expected = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
-                assert_relative_eq!(g, expected, max_relative = 1e-3, epsilon = 1e-6);
-            }
-        }
-    }
-
-    /// AVX + FMA batch kernel parity (AVX2 / AVX+FMA tiers). Runs on any
-    /// Haswell-or-newer host; early-returns without AVX and FMA.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_cosine_batch_avx_fma_matches_scalar() {
-        if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-            return;
-        }
-        check_cosine_batch_kernel(super::f32::cosine_batch_avx_fma);
-    }
-
-    /// AVX-only batch kernel parity (Sandy Bridge / Ivy Bridge tier).
-    /// Early-returns on hosts without AVX.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_cosine_batch_avx_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx") {
-            return;
-        }
-        check_cosine_batch_kernel(super::f32::cosine_batch_avx);
-    }
-
-    /// AVX-512 batch kernel parity. Early-returns on hosts without AVX-512F.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_cosine_batch_avx512_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx512f") {
-            return;
-        }
-        check_cosine_batch_kernel(super::f32::cosine_batch_avx512);
     }
 }
