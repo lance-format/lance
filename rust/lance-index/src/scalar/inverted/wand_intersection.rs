@@ -94,8 +94,19 @@ mod tests {
             .copied()
             .collect::<Vec<_>>();
         let mut actual = Vec::new();
-        intersect_scalar(left, right, &mut actual);
-        assert_eq!(actual, expected);
+        for candidate in INTERSECT.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            actual.clear();
+            kernel.call(left, right, &mut actual);
+            assert_eq!(
+                actual,
+                expected,
+                "{} intersection of {left:?} and {right:?}",
+                candidate.name()
+            );
+        }
         intersect(left, right, &mut actual);
         assert_eq!(actual, expected, "intersection of {left:?} and {right:?}");
     }

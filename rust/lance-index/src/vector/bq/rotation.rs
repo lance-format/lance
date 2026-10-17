@@ -223,6 +223,31 @@ mod tests {
         assert_eq!(random_fast_rotation_signs(130).len(), 68);
     }
 
+    /// Every host-supported sign-flip kernel matches a per-element reference
+    /// bit for bit, across full 8-lane chunks and tails.
+    #[rstest::rstest]
+    fn test_flip_signs_candidates_match_reference(
+        #[values(0, 1, 7, 8, 9, 15, 16, 17, 64, 129)] len: usize,
+    ) {
+        let values: Vec<f32> = (0..len).map(|i| i as f32 - 3.5).collect();
+        let signs = random_fast_rotation_signs(len);
+        let signs = &signs[..sign_bytes_per_round(len)];
+        let expected: Vec<u32> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v.to_bits() ^ (u32::from((signs[i / 8] >> (i % 8)) & 1) << 31))
+            .collect();
+        for candidate in FLIP_SIGNS.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut actual = values.clone();
+            kernel.call(&mut actual, signs);
+            let actual: Vec<u32> = actual.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(actual, expected, "{} len={len}", candidate.name());
+        }
+    }
+
     #[test]
     fn test_fast_rotation_preserves_shape() {
         let input = vec![1.0f32; 129];

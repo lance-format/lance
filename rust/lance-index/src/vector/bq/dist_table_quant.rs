@@ -549,6 +549,7 @@ mod x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::cpu::Kernel;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
     use rstest::rstest;
@@ -607,35 +608,37 @@ mod tests {
         (DistTableDequant::Affine { qmin, qmax }, quantized)
     }
 
-    fn available_kernels() -> Vec<(&'static str, MinMaxFn, QuantizeU8Fn, QuantizeU16Fn)> {
-        // `mut` is only exercised on x86_64 where extra kernels may be pushed.
-        #[allow(unused_mut)]
-        let mut kernels = vec![(
-            "scalar",
-            min_max_fold as MinMaxFn,
-            quantize_u8_scalar as QuantizeU8Fn,
-            quantize_u16_scalar as QuantizeU16Fn,
-        )];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                kernels.push((
-                    "avx2",
-                    x86::min_max_avx2_dispatch,
-                    x86::quantize_u8_avx2_dispatch,
-                    x86::quantize_u16_avx2_dispatch,
-                ));
-            }
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                kernels.push((
-                    "avx512",
-                    x86::min_max_avx512_dispatch,
-                    x86::quantize_u8_avx512_dispatch,
-                    x86::quantize_u16_avx512_dispatch,
-                ));
-            }
-        }
-        kernels
+    /// Host-supported kernels, one tuple per tier: the three operations list
+    /// the same tiers in the same order.
+    fn available_kernels() -> impl Iterator<
+        Item = (
+            &'static str,
+            Kernel<MinMaxFn>,
+            Kernel<QuantizeU8Fn>,
+            Kernel<QuantizeU16Fn>,
+        ),
+    > {
+        let (min_max, quantize_u8, quantize_u16) = (
+            MIN_MAX.candidates(),
+            QUANTIZE_U8.candidates(),
+            QUANTIZE_U16.candidates(),
+        );
+        assert_eq!(min_max.len(), quantize_u8.len());
+        assert_eq!(min_max.len(), quantize_u16.len());
+        min_max
+            .iter()
+            .zip(quantize_u8)
+            .zip(quantize_u16)
+            .filter_map(|((min_max, quantize_u8), quantize_u16)| {
+                assert_eq!(min_max.features(), quantize_u8.features());
+                assert_eq!(min_max.features(), quantize_u16.features());
+                Some((
+                    min_max.name(),
+                    min_max.kernel()?,
+                    quantize_u8.kernel()?,
+                    quantize_u16.kernel()?,
+                ))
+            })
     }
 
     /// Every available kernel must agree bit-exactly with the reference on
@@ -646,7 +649,7 @@ mod tests {
         let (expected_min, expected_max) = reference_min_max(values);
 
         for (name, min_max_fn, quantize_u8_fn, quantize_u16_fn) in available_kernels() {
-            let (qmin, qmax) = min_max_fn(values);
+            let (qmin, qmax) = min_max_fn.call(values);
             assert_eq!(
                 (qmin, qmax),
                 (expected_min, expected_max),
@@ -660,7 +663,7 @@ mod tests {
             let factor_u8 = u8::MAX as f32 / (qmax - qmin);
             if !overflows && factor_u8.is_finite() {
                 let mut out_u8 = Vec::with_capacity(values.len());
-                quantize_u8_fn(
+                quantize_u8_fn.call(
                     values,
                     qmin,
                     factor_u8,
@@ -674,7 +677,7 @@ mod tests {
             let factor_u16 = u16::MAX as f32 / (qmax - qmin);
             if !overflows && factor_u16.is_finite() {
                 let mut out_u16 = Vec::with_capacity(values.len());
-                quantize_u16_fn(
+                quantize_u16_fn.call(
                     values,
                     qmin,
                     factor_u16,
@@ -890,13 +893,13 @@ mod tests {
             let saved = unsafe { _mm_getcsr() };
             unsafe {
                 _mm_setcsr((saved & !_MM_ROUND_MASK) | _MM_ROUND_TOWARD_ZERO);
-                quantize_u8_fn(
+                quantize_u8_fn.call(
                     &values,
                     0.0,
                     factor_u8,
                     &mut out_u8.spare_capacity_mut()[..values.len()],
                 );
-                quantize_u16_fn(
+                quantize_u16_fn.call(
                     &values,
                     0.0,
                     factor_u16,

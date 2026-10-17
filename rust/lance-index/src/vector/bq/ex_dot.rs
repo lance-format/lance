@@ -1746,8 +1746,12 @@ mod tests {
         pad_query_into(&query, &mut ex_query);
 
         let tolerance = 1e-3 * expected.abs().max(1.0);
-        for (name, kernel) in ex_dot_kernel_variants(ex_bits) {
-            let actual = kernel(&ex_query, &codes) as f64;
+        for candidate in ex_dot_dispatch(ex_bits).candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let name = candidate.name();
+            let actual = kernel.call(&ex_query, &codes) as f64;
             assert!(
                 (actual - expected).abs() <= tolerance,
                 "ex_bits={ex_bits} dim={dim} kernel={name}: {actual} != {expected}"
@@ -1918,8 +1922,12 @@ mod tests {
             let mut ex_query = vec![0.0; padded_query_len(dim)];
             pad_query_into(&query, &mut ex_query);
             let tolerance = 1e-3 * expected.abs().max(1.0);
-            for (name, kernel) in ex_dot_kernel_variants(ex_bits) {
-                let actual = kernel(&ex_query, &codes) as f64;
+            for candidate in ex_dot_dispatch(ex_bits).candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let name = candidate.name();
+                let actual = kernel.call(&ex_query, &codes) as f64;
                 assert!(
                     (actual - expected).abs() <= tolerance,
                     "ex_bits={ex_bits} dim={dim} kernel={name}: {actual} != {expected}"

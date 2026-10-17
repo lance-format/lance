@@ -361,26 +361,15 @@ mod x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::cpu::Kernel;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
-    fn available_kernels() -> Vec<(&'static str, ScaledPruneMaskFn)> {
-        // `mut` is only exercised on x86_64 where extra kernels may be pushed.
-        #[allow(unused_mut)]
-        let mut kernels = vec![
-            ("portable", prune_masks_portable as ScaledPruneMaskFn),
-            ("dispatched", scaled_prune_mask_kernel()),
-        ];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                kernels.push(("avx2", x86::prune_masks_avx2_dispatch));
-            }
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                kernels.push(("avx512", x86::prune_masks_avx512_dispatch));
-            }
-        }
-        kernels
+    fn available_kernels() -> impl Iterator<Item = (&'static str, Kernel<ScaledPruneMaskFn>)> {
+        SCALED_PRUNE_MASKS
+            .candidates()
+            .iter()
+            .filter_map(|candidate| Some((candidate.name(), candidate.kernel()?)))
     }
 
     /// Per-lane reference mirroring `raw_query_lower_bound` and the scalar
@@ -431,7 +420,7 @@ mod tests {
             heap_threshold,
         );
         for (name, kernel) in available_kernels() {
-            let actual = kernel(
+            let actual = kernel.call(
                 dists,
                 scale_factors,
                 add_factors,
@@ -450,7 +439,7 @@ mod tests {
     #[rstest::rstest]
     fn test_centered_dot_factor_keeps_constant(#[values(-1e8, 1e8)] add_factor_scale: f32) {
         for (name, kernel) in available_kernels() {
-            let masks = kernel(
+            let masks = kernel.call(
                 &[0.0; PRUNE_LANES],
                 &[0.0; PRUNE_LANES],
                 &[1.0; PRUNE_LANES],

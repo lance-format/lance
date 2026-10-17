@@ -1180,7 +1180,7 @@ mod tests {
         values.iter().map(|v| v.to_bits()).collect()
     }
 
-    /// The dispatched code kernels agree bit for bit with the portable ones
+    /// Every host-supported code kernel agrees bit for bit with the portable one
     /// on candidate groups of every length and offset, dimension tails, and
     /// the extreme codes at the largest dimension the SIMD kernels accept.
     #[rstest]
@@ -1217,21 +1217,27 @@ mod tests {
             })
             .collect();
         let bytes: Vec<u8> = codes.iter().map(|&c| c as u8).collect();
-        let dots = |simd: bool, anchor: usize, candidates: Range<usize>| {
+        let num_candidates = match bits {
+            1 => SIGN_DOTS.candidates().len(),
+            2..=8 => U8_DOTS.candidates().len(),
+            _ => U16_DOTS.candidates().len(),
+        };
+        // Candidate `index`'s scores, or `None` if the host cannot run it.
+        let dots = |index: usize, anchor: usize, candidates: Range<usize>| {
             let mut out = vec![f32::NAN; candidates.len()];
             let sum = sums[anchor];
             let row_sums = &sums[candidates.clone()];
             match bits {
                 1 => {
                     let words = dim.div_ceil(64);
-                    select_sign_dots(simd)(
+                    SIGN_DOTS.candidates()[index].kernel()?.call(
                         &signs[anchor * words..(anchor + 1) * words],
                         &signs[candidates.start * words..candidates.end * words],
                         dim,
                         &mut out,
                     );
                 }
-                2..=8 => select_u8_dots(simd)(
+                2..=8 => U8_DOTS.candidates()[index].kernel()?.call(
                     &bytes[anchor * dim..(anchor + 1) * dim],
                     &bytes[candidates.start * dim..candidates.end * dim],
                     sum,
@@ -1239,7 +1245,7 @@ mod tests {
                     bias,
                     &mut out,
                 ),
-                _ => select_u16_dots(simd)(
+                _ => U16_DOTS.candidates()[index].kernel()?.call(
                     &codes[anchor * dim..(anchor + 1) * dim],
                     &codes[candidates.start * dim..candidates.end * dim],
                     sum,
@@ -1248,20 +1254,29 @@ mod tests {
                     &mut out,
                 ),
             }
-            out
+            Some(out)
         };
-        if bits > 1 {
-            assert!(centered_fits_i32(dim, bits));
-            let extreme = dots(true, 0, 1..2)[0];
-            assert_eq!(extreme, -((dim as i64 * bias * bias) as f32) * 0.25);
-        }
-        for anchor in [0, 1, 5] {
-            for candidates in [0..rows, 1..rows, 3..19, 2..17, 3..10, 7..8, 4..4] {
-                assert_eq!(
-                    to_bits(&dots(true, anchor, candidates.clone())),
-                    to_bits(&dots(false, anchor, candidates.clone())),
-                    "bits={bits} dim={dim} anchor={anchor} candidates={candidates:?}"
-                );
+        let portable = num_candidates - 1;
+        for index in 0..num_candidates {
+            if bits > 1
+                && let Some(extreme) = dots(index, 0, 1..2)
+            {
+                assert!(centered_fits_i32(dim, bits));
+                assert_eq!(extreme[0], -((dim as i64 * bias * bias) as f32) * 0.25);
+            }
+            for anchor in [0, 1, 5] {
+                for candidates in [0..rows, 1..rows, 3..19, 2..17, 3..10, 7..8, 4..4] {
+                    let Some(actual) = dots(index, anchor, candidates.clone()) else {
+                        continue;
+                    };
+                    let expected = dots(portable, anchor, candidates.clone()).unwrap();
+                    assert_eq!(
+                        to_bits(&actual),
+                        to_bits(&expected),
+                        "candidate={index} bits={bits} dim={dim} anchor={anchor} \
+                         candidates={candidates:?}"
+                    );
+                }
             }
         }
     }
