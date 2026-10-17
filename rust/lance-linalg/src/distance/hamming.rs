@@ -1141,14 +1141,32 @@ mod tests {
     }
 
     #[test]
+    fn test_hamming_distance_batch_into() {
+        let query = [0, u8::MAX];
+        let targets = [0, u8::MAX, 1, u8::MAX - 1, u8::MAX, 0];
+        let mut distances = [f32::NAN; 3];
+        hamming_distance_batch_into(&query, &targets, query.len(), &mut distances);
+        assert_eq!(distances, [0.0, 2.0, 16.0]);
+    }
+
+    #[test]
     #[should_panic(
         expected = "distance batch length must be divisible by dimension: batch=5, dimension=2"
     )]
-    fn test_hamming_distance_batch_rejects_partial_vector() {
+    fn test_hamming_distance_batch_into_rejects_partial_vector() {
         let query = [0, 0];
         let targets = [u8::MAX, u8::MAX, 0, 1, 0];
+        let mut distances = [0.0; 2];
+        hamming_distance_batch_into(&query, &targets, query.len(), &mut distances);
+    }
 
-        let _ = hamming_distance_batch(&query, &targets, query.len());
+    #[test]
+    #[should_panic(expected = "distance output length must match")]
+    fn test_hamming_distance_batch_into_rejects_short_output() {
+        let query = [0, 0];
+        let targets = [u8::MAX; 4];
+        let mut distances = [0.0; 1];
+        hamming_distance_batch_into(&query, &targets, query.len(), &mut distances);
     }
 
     #[test]
@@ -1160,47 +1178,45 @@ mod tests {
         assert_eq!(hamming_u64(0xAAAAAAAAAAAAAAAA, 0x5555555555555555), 64);
     }
 
-    /// Runs `kernel` over `n` targets, with 8 guard slots past the output it is
-    /// handed, then checks every value and every guard.
+    /// Runs `kernel` with `num_slots` result slots and 8 guard slots past
+    /// them, then checks that it filled the first `min(targets, slots)` slots
+    /// and wrote nothing else.
     ///
-    /// 8 is the widest unchecked chunk store in the file, so an unchecked chunk
-    /// store that overruns by one chunk lands inside this allocation instead of
-    /// past it. The remainder loops cannot trip the guards at all: all three
-    /// index through bounds-checked `results[..]` and would panic instead.
-    fn check_kernel_tail(n: usize, kernel: impl FnOnce(u64, &[u64], &mut [u32])) {
+    /// 8 is the widest unchecked chunk store in the file, so a chunk store that
+    /// overruns by one chunk lands inside this allocation instead of past it.
+    fn check_kernel(
+        query: u64,
+        targets: &[u64],
+        num_slots: usize,
+        label: &str,
+        kernel: impl FnOnce(u64, &[u64], &mut [u32]),
+    ) {
         const GUARD: u32 = u32::MAX;
         const GUARD_SLOTS: usize = 8;
-        let query = 0xDEAD_BEEF_CAFE_F00D_u64;
-        let targets: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            .collect();
-        let mut results = vec![GUARD; n + GUARD_SLOTS];
+        let mut results = vec![GUARD; num_slots + GUARD_SLOTS];
 
-        kernel(query, &targets, &mut results[..n]);
+        kernel(query, targets, &mut results[..num_slots]);
 
-        for (slot, &target) in targets.iter().enumerate() {
+        let n = targets.len().min(num_slots);
+        for (slot, &target) in targets[..n].iter().enumerate() {
             assert_eq!(
                 results[slot],
                 (query ^ target).count_ones(),
-                "n={n}, slot {slot}"
+                "{label}: n={n}, slot {slot}"
             );
         }
         for (slot, &guard) in results.iter().enumerate().skip(n) {
-            assert_eq!(guard, GUARD, "n={n}: wrote past results, at {slot}");
+            assert_eq!(
+                guard, GUARD,
+                "{label}: n={n}: wrote past results, at {slot}"
+            );
         }
     }
 
-    /// Each kernel behind `hamming_batch_u64` takes a fixed number of targets per
-    /// chunk and finishes the rest in a remainder loop: 4 for
-    /// `hamming_batch_avx2`, 8 for `hamming_batch_avx512` and for the unrolled
-    /// scalar fallback.
-    ///
-    /// The pairwise tests reach a remainder loop only when they are large enough
-    /// to take a parallel path. There the row ranges together pass every width
-    /// from one below the row count down to 1, so whichever kernel the host
-    /// dispatches has every residue covered incidentally, and a dropped or
-    /// out-of-bounds tail write surfaces somewhere in thousands of pairs, as a
-    /// mismatch or a panic. This asserts every slot at each width instead.
+    /// Each candidate takes a fixed number of targets per chunk and finishes
+    /// the rest in a remainder loop: 8 for AVX-512 and the unrolled scalar
+    /// kernel, 4 for AVX2. The cases cover every residue of both widths, with
+    /// and without a chunk ahead of it.
     #[rstest]
     #[case::one(1)]
     #[case::two(2)]
@@ -1215,11 +1231,51 @@ mod tests {
     #[case::sixteen(16)]
     #[case::seventeen(17)]
     #[case::one_hundred_twenty_eight(128)]
-    fn test_hamming_batch_u64(#[case] n: usize) {
-        check_kernel_tail(n, hamming_batch_u64);
-        // Also directly, because an x86_64 host with AVX2 takes an earlier branch
-        // and never reaches the scalar kernel through the dispatcher.
-        check_kernel_tail(n, hamming_batch_scalar);
+    fn test_hamming_batch_u64_kernels(#[case] n: usize) {
+        let random: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let extremes: Vec<u64> = (0..n)
+            .map(|i| if i % 2 == 0 { u64::MAX } else { 0 })
+            .collect();
+        let inputs = [
+            ("random", 0xDEAD_BEEF_CAFE_F00D_u64, random),
+            ("extremes", 0, extremes),
+        ];
+
+        for (pattern, query, targets) in &inputs {
+            for candidate in HAMMING_BATCH_U64.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let label = format!("{} [{pattern}]", candidate.name());
+                check_kernel(*query, targets, n, &label, |query, targets, results| {
+                    kernel.call(query, targets, results)
+                });
+            }
+            let label = format!("hamming_batch_u64 [{pattern}]");
+            check_kernel(*query, targets, n, &label, hamming_batch_u64);
+        }
+    }
+
+    /// The kernels are safe functions, so a length mismatch that
+    /// `hamming_batch_u64` would reject must still stay in bounds.
+    #[rstest]
+    #[case::fewer_slots(17, 9)]
+    #[case::more_slots(9, 17)]
+    fn test_hamming_batch_u64_kernels_stay_in_bounds(
+        #[case] num_targets: usize,
+        #[case] num_slots: usize,
+    ) {
+        let targets: Vec<u64> = (0..num_targets as u64).map(|i| !i).collect();
+        for candidate in HAMMING_BATCH_U64.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            check_kernel(0, &targets, num_slots, candidate.name(), |q, t, r| {
+                kernel.call(q, t, r)
+            });
+        }
     }
 
     #[rstest]
@@ -1800,110 +1856,6 @@ mod tests {
         for i in 1..chunks.len() {
             assert_eq!(chunks[i].0, chunks[i - 1].1, "Gap between chunks");
         }
-    }
-
-    // =========================================================================
-    // SIMD-specific tests
-    // =========================================================================
-
-    // `hamming_batch_simd` returns early on the AVX-512 branch when
-    // `avx512vpopcntdq` and `avx512f` are both present, so on a host with both
-    // nothing reaches `hamming_batch_avx2` through `hamming_batch_u64`. This
-    // calls it directly. The AVX-512 kernel needs no such test: it only runs
-    // where the dispatched test already drives it.
-
-    /// `hamming_batch_avx2` consumes 4 targets per chunk, so `n % 4` covers its
-    /// remainder loop.
-    #[rstest]
-    #[cfg(target_arch = "x86_64")]
-    #[case::one(1)]
-    #[case::two(2)]
-    #[case::three(3)]
-    #[case::four(4)]
-    // Five, six and seven repeat remainders 1 through 3 with a chunk ahead of
-    // them, which one, two and three alone do not reach.
-    #[case::five(5)]
-    #[case::six(6)]
-    #[case::seven(7)]
-    fn test_avx2_covers_tail(#[case] n: usize) {
-        if !is_x86_feature_detected!("avx2") {
-            return;
-        }
-        check_kernel_tail(n, |query, targets, results| {
-            // SAFETY: AVX2 was just detected, and `check_kernel_tail` passes a
-            // `results` of exactly `targets.len()`.
-            unsafe { hamming_batch_avx2(query, targets, results) }
-        });
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_avx2_popcount() {
-        if !is_x86_feature_detected!("avx2") {
-            return;
-        }
-
-        let query = 0u64;
-        let targets = vec![0u64, 1, 3, 7, 15, 31, 63, 127];
-        let mut results = vec![0u32; 8];
-
-        unsafe {
-            hamming_batch_avx2(query, &targets, &mut results);
-        }
-
-        assert_eq!(results[0], 0); // 0 ^ 0 = 0 bits
-        assert_eq!(results[1], 1); // 0 ^ 1 = 1 bit
-        assert_eq!(results[2], 2); // 0 ^ 3 = 2 bits
-        assert_eq!(results[3], 3); // 0 ^ 7 = 3 bits
-        assert_eq!(results[4], 4); // 0 ^ 15 = 4 bits
-        assert_eq!(results[5], 5); // 0 ^ 31 = 5 bits
-        assert_eq!(results[6], 6); // 0 ^ 63 = 6 bits
-        assert_eq!(results[7], 7); // 0 ^ 127 = 7 bits
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_avx2_max_distance() {
-        if !is_x86_feature_detected!("avx2") {
-            return;
-        }
-
-        let query = 0u64;
-        let targets = vec![u64::MAX; 4];
-        let mut results = vec![0u32; 4];
-
-        unsafe {
-            hamming_batch_avx2(query, &targets, &mut results);
-        }
-
-        for &r in &results {
-            assert_eq!(r, 64);
-        }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_avx512_popcount() {
-        if !is_x86_feature_detected!("avx512vpopcntdq") || !is_x86_feature_detected!("avx512f") {
-            return;
-        }
-
-        let query = 0u64;
-        let targets = vec![0u64, 1, 3, 7, 15, 31, 63, 127];
-        let mut results = vec![0u32; 8];
-
-        unsafe {
-            hamming_batch_avx512(query, &targets, &mut results);
-        }
-
-        assert_eq!(results[0], 0);
-        assert_eq!(results[1], 1);
-        assert_eq!(results[2], 2);
-        assert_eq!(results[3], 3);
-        assert_eq!(results[4], 4);
-        assert_eq!(results[5], 5);
-        assert_eq!(results[6], 6);
-        assert_eq!(results[7], 7);
     }
 
     // =========================================================================
