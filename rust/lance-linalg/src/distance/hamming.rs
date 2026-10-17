@@ -46,10 +46,103 @@ pub trait Hamming {
     fn hamming(x: &[u8], y: &[u8]) -> f32;
 }
 
+/// Hamming distance from `x` to `y`.
+type HammingKernel = unsafe fn(&[u8], &[u8]) -> f32;
+
+lance_core::dispatch! {
+    static HAMMING: Dispatch<HammingKernel> = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[aarch64::HAMMING_NEON, HAMMING_PORTABLE]
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            &[HAMMING_PORTABLE]
+        }
+    };
+}
+
+/// Bytes the NEON kernel sums into 16-bit lanes before widening them. Each
+/// lane gains at most 8 per pair of input bytes, so a lane covering
+/// `1023 * 64` bytes stays below `u16::MAX`.
+#[cfg_attr(not(any(target_arch = "aarch64", test)), allow(dead_code))]
+const HAMMING_NEON_FLUSH_BYTES: usize = 1023 * 64;
+
 /// Hamming distance between two vectors.
 #[inline]
 pub fn hamming(x: &[u8], y: &[u8]) -> f32 {
-    hamming_autovec::<64>(x, y)
+    HAMMING.get().call(x, y)
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(HAMMING_PORTABLE: HammingKernel)]
+    #[inline]
+    fn hamming_portable(x: &[u8], y: &[u8]) -> f32 {
+        hamming_autovec::<64>(x, y)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod aarch64 {
+    use std::arch::aarch64::*;
+
+    use super::{HAMMING_NEON_FLUSH_BYTES, HammingKernel};
+
+    lance_core::target_kernel! {
+        #[target_features("neon")]
+        #[candidate(pub(super) HAMMING_NEON: HammingKernel)]
+        /// Sums per-byte popcounts in 16-bit lanes and reduces once per
+        /// block, where the portable kernel reduces every 64 bytes.
+        #[inline]
+        pub(super) fn hamming_neon(x: &[u8], y: &[u8]) -> f32 {
+            let n = x.len().min(y.len());
+            let (mut x, mut y) = (&x[..n], &y[..n]);
+            let mut total = 0;
+            // A plain loop rather than `chunks().zip()`, whose fold LLVM
+            // left as a call per vector.
+            while x.len() > HAMMING_NEON_FLUSH_BYTES {
+                let (x_block, x_rest) = x.split_at(HAMMING_NEON_FLUSH_BYTES);
+                let (y_block, y_rest) = y.split_at(HAMMING_NEON_FLUSH_BYTES);
+                total += hamming_block(x_block, y_block);
+                (x, y) = (x_rest, y_rest);
+            }
+            (total + hamming_block(x, y)) as f32
+        }
+    }
+
+    /// `x` and `y` must have equal lengths.
+    #[inline(always)]
+    fn hamming_block(x: &[u8], y: &[u8]) -> u32 {
+        let (x_64, x_rest) = x.as_chunks::<64>();
+        let (y_64, y_rest) = y.as_chunks::<64>();
+        let (x_16, x_tail) = x_rest.as_chunks::<16>();
+        let (y_16, y_tail) = y_rest.as_chunks::<16>();
+        // SAFETY: every load reads 16 bytes at an offset of at most 48 into a
+        // 64-byte array, or at the start of a 16-byte array.
+        let sum = unsafe {
+            let mut acc = vdupq_n_u16(0);
+            for (a, b) in x_64.iter().zip(y_64) {
+                let (a, b) = (a.as_ptr(), b.as_ptr());
+                let c0 = vcntq_u8(veorq_u8(vld1q_u8(a), vld1q_u8(b)));
+                let c1 = vcntq_u8(veorq_u8(vld1q_u8(a.add(16)), vld1q_u8(b.add(16))));
+                let c2 = vcntq_u8(veorq_u8(vld1q_u8(a.add(32)), vld1q_u8(b.add(32))));
+                let c3 = vcntq_u8(veorq_u8(vld1q_u8(a.add(48)), vld1q_u8(b.add(48))));
+                acc = vpadalq_u8(acc, vaddq_u8(vaddq_u8(c0, c1), vaddq_u8(c2, c3)));
+            }
+            for (a, b) in x_16.iter().zip(y_16) {
+                let c = vcntq_u8(veorq_u8(vld1q_u8(a.as_ptr()), vld1q_u8(b.as_ptr())));
+                acc = vpadalq_u8(acc, c);
+            }
+            vaddlvq_u16(acc)
+        };
+        let tail = x_tail
+            .iter()
+            .zip(y_tail)
+            .map(|(&a, &b)| (a ^ b).count_ones())
+            .sum::<u32>();
+        sum + tail
+    }
 }
 
 #[inline]
