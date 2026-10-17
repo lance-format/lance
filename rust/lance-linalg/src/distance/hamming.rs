@@ -1100,6 +1100,47 @@ mod tests {
         assert_eq!(hamming(&x, &y), 2.0);
     }
 
+    /// Lengths straddle the 16- and 64-byte steps of the NEON kernel; the
+    /// longest ones run past the block after which it flushes its 16-bit
+    /// accumulators, with every bit differing so each lane is at its maximum.
+    #[rstest]
+    #[case::empty(0)]
+    #[case::one(1)]
+    #[case::fifteen(15)]
+    #[case::sixteen(16)]
+    #[case::seventeen(17)]
+    #[case::sixty_three(63)]
+    #[case::sixty_four(64)]
+    #[case::sixty_five(65)]
+    #[case::one_hundred_twenty_eight(128)]
+    #[case::two_hundred(200)]
+    #[case::one_flush(HAMMING_NEON_FLUSH_BYTES + 81)]
+    #[case::two_flushes(2 * HAMMING_NEON_FLUSH_BYTES + 17)]
+    fn test_hamming_kernels_match_reference(#[case] len: usize) {
+        let random: Vec<u8> = (0..2 * len as u64)
+            .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8)
+            .collect();
+        let inputs = [
+            ("random", &random[..len], &random[len..]),
+            (
+                "all bits differ",
+                &vec![0; len][..],
+                &vec![u8::MAX; len][..],
+            ),
+        ];
+        for (pattern, x, y) in inputs {
+            let want = hamming_scalar(x, y);
+            for candidate in HAMMING.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let got = kernel.call(x, y);
+                assert_eq!(got, want, "{} [{pattern}] len={len}", candidate.name());
+            }
+            assert_eq!(hamming(x, y), want, "hamming [{pattern}] len={len}");
+        }
+    }
+
     #[test]
     fn test_hamming_distance_batch_into() {
         let query = [0, u8::MAX];
