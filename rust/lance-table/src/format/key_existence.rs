@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::format::pb;
+use crate::format::pb_transaction;
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch,
@@ -131,12 +131,12 @@ impl KeyExistenceFilterBuilder {
     }
 }
 
-impl From<&KeyExistenceFilterBuilder> for pb::transaction::KeyExistenceFilter {
+impl From<&KeyExistenceFilterBuilder> for pb_transaction::KeyExistenceFilter {
     fn from(builder: &KeyExistenceFilterBuilder) -> Self {
         Self {
             field_ids: builder.field_ids.clone(),
-            data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-                pb::transaction::BloomFilter {
+            data: Some(pb_transaction::key_existence_filter::Data::Bloom(
+                pb_transaction::BloomFilter {
                     bitmap: builder.sbbf.to_bytes(),
                     num_bits: (builder.sbbf.size_bytes() as u32) * 8,
                     number_of_items: BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS,
@@ -212,13 +212,13 @@ impl KeyExistenceFilter {
     }
 }
 
-impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
+impl From<&KeyExistenceFilter> for pb_transaction::KeyExistenceFilter {
     fn from(filter: &KeyExistenceFilter) -> Self {
         match &filter.filter {
             FilterType::ExactSet(hashes) => Self {
                 field_ids: filter.field_ids.clone(),
-                data: Some(pb::transaction::key_existence_filter::Data::Exact(
-                    pb::transaction::ExactKeySetFilter {
+                data: Some(pb_transaction::key_existence_filter::Data::Exact(
+                    pb_transaction::ExactKeySetFilter {
                         key_hashes: hashes.iter().copied().collect(),
                     },
                 )),
@@ -230,8 +230,8 @@ impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
                 probability,
             } => Self {
                 field_ids: filter.field_ids.clone(),
-                data: Some(pb::transaction::key_existence_filter::Data::Bloom(
-                    pb::transaction::BloomFilter {
+                data: Some(pb_transaction::key_existence_filter::Data::Bloom(
+                    pb_transaction::BloomFilter {
                         bitmap: bitmap.clone(),
                         num_bits: *num_bits,
                         number_of_items: *number_of_items,
@@ -243,15 +243,15 @@ impl From<&KeyExistenceFilter> for pb::transaction::KeyExistenceFilter {
     }
 }
 
-impl TryFrom<&pb::transaction::KeyExistenceFilter> for KeyExistenceFilter {
+impl TryFrom<&pb_transaction::KeyExistenceFilter> for KeyExistenceFilter {
     type Error = lance_core::Error;
 
-    fn try_from(message: &pb::transaction::KeyExistenceFilter) -> Result<Self> {
+    fn try_from(message: &pb_transaction::KeyExistenceFilter) -> Result<Self> {
         let filter = match message.data.as_ref() {
-            Some(pb::transaction::key_existence_filter::Data::Exact(exact)) => {
+            Some(pb_transaction::key_existence_filter::Data::Exact(exact)) => {
                 FilterType::ExactSet(exact.key_hashes.iter().copied().collect())
             }
-            Some(pb::transaction::key_existence_filter::Data::Bloom(b)) => {
+            Some(pb_transaction::key_existence_filter::Data::Bloom(b)) => {
                 // Use defaults for backwards compatibility
                 let number_of_items = if b.number_of_items == 0 {
                     BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS
