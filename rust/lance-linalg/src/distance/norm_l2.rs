@@ -536,6 +536,7 @@ mod tests {
     };
     use arrow_array::{Float16Array, Float64Array, UInt8Array};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::cpu::Dispatch;
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
 
@@ -620,6 +621,47 @@ mod tests {
                 );
             }
             Ok(())
+        });
+    }
+
+    /// Every host-supported half-precision kernel must agree with an f64
+    /// reference.
+    fn check_half_norm_l2_kernels<T: ToPrimitive>(
+        dispatch: &Dispatch<NormKernel<T>>,
+        data: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
+        let data_f64 = data.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<_>>();
+        let want = norm_l2_reference(&data_f64);
+        for candidate in dispatch.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let got = kernel.call(data);
+            prop_assert!(
+                approx::relative_eq!(got, want, max_relative = 1e-6),
+                "{} at dim {}: {got} != {want}",
+                candidate.name(),
+                data.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn test_norm_l2_f16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f16, dimension_shard(shard), |data| {
+            check_half_norm_l2_kernels(&NORM_L2_F16, &data)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_norm_l2_bf16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_bf16, dimension_shard(shard), |data| {
+            check_half_norm_l2_kernels(&NORM_L2_BF16, &data)
         });
     }
 

@@ -1219,6 +1219,7 @@ mod tests {
         dimension_shard, run_vector_pair_proptest,
     };
     use approx::assert_relative_eq;
+    use lance_core::utils::cpu::Dispatch;
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
 
@@ -1448,6 +1449,52 @@ mod tests {
                 check_cosine(kernel.call(&x, x_norm, &y), want, candidate.name(), x.len())?;
             }
             Ok(())
+        });
+    }
+
+    /// Every host-supported half-precision kernel must agree with an f64
+    /// reference.
+    fn check_half_cosine_kernels<T: Cosine + AsPrimitive<f64>>(
+        dispatch: &Dispatch<CosineKernel<T>>,
+        x: &[T],
+        y: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
+        let x_norm = norm_l2(x);
+        prop_assume!(x_norm > 1e-6);
+        prop_assume!(norm_l2(y) > 1e-6);
+        let x_f64 = x.iter().map(|&v| v.as_()).collect::<Vec<_>>();
+        let y_f64 = y.iter().map(|&v| v.as_()).collect::<Vec<_>>();
+        let (want, max_error) = cosine_ref(&x_f64, &y_f64, 1e-6);
+        for candidate in dispatch.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let got = kernel.call(x, x_norm, y);
+            prop_assert!(
+                approx::relative_eq!(got, want, epsilon = max_error),
+                "{} at dim {}: {got} != {want}",
+                candidate.name(),
+                x.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn test_cosine_f16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f16, dimension_shard(shard), |x, y| {
+            check_half_cosine_kernels(&COSINE_F16, &x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_cosine_bf16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_bf16, dimension_shard(shard), |x, y| {
+            check_half_cosine_kernels(&COSINE_BF16, &x, &y)
         });
     }
 

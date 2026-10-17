@@ -774,6 +774,7 @@ mod tests {
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
         dimension_shard, run_vector_pair_proptest,
     };
+    use lance_core::utils::cpu::Dispatch;
     use num_traits::{Float, FromPrimitive};
     use proptest::prelude::*;
 
@@ -994,6 +995,50 @@ mod tests {
                 );
             }
             Ok(())
+        });
+    }
+
+    /// Every host-supported half-precision kernel must agree with an f64
+    /// reference.
+    fn check_half_dot_kernels<T: AsPrimitive<f64> + Float>(
+        dispatch: &Dispatch<PairKernel<T>>,
+        x: &[T],
+        y: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
+        let x_f64 = x.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
+        let y_f64 = y.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
+        let want = dot_scalar_ref(&x_f64, &y_f64);
+        let max_error = max_error::<T>(&x_f64, &y_f64);
+        for candidate in dispatch.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let got = kernel.call(x, y);
+            prop_assert!(
+                approx::relative_eq!(got, want, epsilon = max_error),
+                "{} at dim {}: {got} != {want}",
+                candidate.name(),
+                x.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn test_dot_f16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f16, dimension_shard(shard), |x, y| {
+            check_half_dot_kernels(&DOT_F16, &x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_dot_bf16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_bf16, dimension_shard(shard), |x, y| {
+            check_half_dot_kernels(&DOT_BF16, &x, &y)
         });
     }
 

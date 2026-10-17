@@ -971,6 +971,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
+    use lance_core::utils::cpu::Dispatch;
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
 
@@ -1253,6 +1254,49 @@ mod tests {
                 );
             }
             Ok(())
+        });
+    }
+
+    /// Every host-supported half-precision kernel must agree with an f64
+    /// reference.
+    fn check_half_l2_kernels<T: ToPrimitive>(
+        dispatch: &Dispatch<PairKernel<T>>,
+        x: &[T],
+        y: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
+        let x_f64 = x.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<_>>();
+        let y_f64 = y.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<_>>();
+        let want = l2_distance_reference(&x_f64, &y_f64) as f32;
+        for candidate in dispatch.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let got = kernel.call(x, y);
+            prop_assert!(
+                approx::relative_eq!(got, want, max_relative = 1e-6),
+                "{} at dim {}: {got} != {want}",
+                candidate.name(),
+                x.len()
+            );
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    fn test_l2_f16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f16, dimension_shard(shard), |x, y| {
+            check_half_l2_kernels(&L2_F16, &x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_bf16_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_bf16, dimension_shard(shard), |x, y| {
+            check_half_l2_kernels(&L2_BF16, &x, &y)
         });
     }
 
