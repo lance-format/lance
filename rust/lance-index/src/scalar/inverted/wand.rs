@@ -8149,7 +8149,7 @@ mod tests {
     }
 
     #[test]
-    fn find_next_geq_matches_partition_point_for_full_u32_domain() {
+    fn find_next_geq_candidates_match_partition_point_for_full_u32_domain() {
         let cases = [
             vec![],
             vec![7],
@@ -8194,16 +8194,21 @@ mod tests {
             for pos in 0..=docs.len() {
                 for &target in &targets {
                     let expected = pos + docs[pos..].partition_point(|&doc_id| doc_id < target);
-                    let actual = unsafe { find_next_geq(docs.as_ptr(), pos, docs.len(), target) };
-                    assert_eq!(
-                        actual, expected,
-                        "docs={docs:?}, pos={pos}, target={target}"
-                    );
-                    assert_eq!(
-                        find_next_geq_in_block(docs, pos, target),
-                        expected,
-                        "block search: docs={docs:?}, pos={pos}, target={target}"
-                    );
+                    for candidate in FIND_NEXT_GEQ
+                        .candidates()
+                        .iter()
+                        .chain(FIND_NEXT_GEQ_IN_BLOCK.candidates())
+                    {
+                        let Some(kernel) = candidate.kernel() else {
+                            continue;
+                        };
+                        assert_eq!(
+                            kernel.call(docs, pos, target),
+                            expected,
+                            "{}: docs={docs:?}, pos={pos}, target={target}",
+                            candidate.name()
+                        );
+                    }
                 }
             }
         }
