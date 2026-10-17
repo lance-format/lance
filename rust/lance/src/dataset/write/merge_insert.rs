@@ -56,6 +56,7 @@ use super::{
     CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
+use crate::blob::{blob_v2_layout, prepared_to_logical_blob_schema};
 use crate::dataset::rowids::{
     get_row_id_index, inline_row_lineage_max_bytes, load_spilled_row_lineage,
 };
@@ -161,15 +162,39 @@ mod assign_action;
 mod exec;
 mod logical_plan;
 
+/// Whether a partial source's field can be written to `target`: the same type,
+/// or blob input in any layout to a Blob v2 column (as `check_source_schema`
+/// allows), at any depth.
+fn partial_source_field_fits(
+    target: &lance_core::datatypes::Field,
+    source: &lance_core::datatypes::Field,
+) -> bool {
+    if target.data_type() == source.data_type() || (target.is_blob_v2() && source.is_blob()) {
+        return true;
+    }
+    !target.children.is_empty()
+        && target.logical_type == source.logical_type
+        && target.children.len() == source.children.len()
+        && source.children.iter().all(|child| {
+            target
+                .children
+                .iter()
+                .find(|field| field.name == child.name)
+                .is_some_and(|field| partial_source_field_fits(field, child))
+        })
+}
+
 /// Check a merge source against the target schema. As on append, a legacy
-/// blob input matches a Blob v2 target column; the writer converts it.
+/// blob input matches a Blob v2 target column, and a writer-prepared one is
+/// compared as the logical columns it writes; the writer converts both.
 fn check_source_schema(
     source: &lance_core::datatypes::Schema,
     target: &lance_core::datatypes::Schema,
     options: &SchemaCompareOptions,
 ) -> Result<()> {
+    let source = prepared_to_logical_blob_schema(source)?;
     source.check_compatible(target, options).or_else(|err| {
-        let source = super::promote_legacy_blob_schema(source)?;
+        let source = super::promote_legacy_blob_schema(&source)?;
         let target = super::promote_legacy_blob_schema(target)?;
         source.check_compatible(&target, options).map_err(|_| err)
     })
@@ -183,6 +208,11 @@ pub(crate) fn canonical_source_schema(
     target: &Schema,
 ) -> std::result::Result<Schema, ArrowError> {
     fn canonical_field(source: &Field, target: &Field) -> std::result::Result<Field, ArrowError> {
+        // A blob carries what the writer needs beyond the target's columns: a
+        // prepared blob's reference, a logical blob's byte range.
+        if blob_v2_layout(source).is_some() {
+            return Ok(source.clone());
+        }
         let data_type = match (source.data_type(), target.data_type()) {
             (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
                 let fields = target_fields
@@ -2844,8 +2874,10 @@ impl MergeInsertJob {
     /// `InvalidInput` error, because inserted rows would otherwise attempt to
     /// write a non-nullable NULL downstream.
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
-        // Convert to lance schema for comparison
-        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
+        // Convert to lance schema for comparison; prepared blobs compare as logical.
+        let lance_schema = prepared_to_logical_blob_schema(
+            &lance_core::datatypes::Schema::try_from(source_schema)?,
+        )?;
         let full_schema = self.dataset.schema();
         let is_full_schema = check_source_schema(
             &lance_schema,
@@ -2862,18 +2894,13 @@ impl MergeInsertJob {
         .is_ok();
 
         // Partial-schema upsert: every source field must exist in the target
-        // and have a compatible data type (legacy blob input matches Blob v2,
-        // as in `check_source_schema`). Missing target columns will be
+        // and have a compatible data type. Missing target columns will be
         // filled from the target side of the join in `create_plan`.
         let is_subset_schema = !is_full_schema
             && lance_schema.fields.iter().all(|sf| {
                 full_schema
                     .field(&sf.name)
-                    .map(|tf| {
-                        tf.data_type() == sf.data_type()
-                            || (tf.is_blob_v2() && sf.is_blob() && !sf.is_blob_v2())
-                    })
-                    .unwrap_or(false)
+                    .is_some_and(|tf| partial_source_field_fits(tf, sf))
             });
 
         // If the user is inserting unmatched rows with a partial source, any

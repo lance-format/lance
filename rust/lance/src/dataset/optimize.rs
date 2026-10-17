@@ -1683,7 +1683,10 @@ impl BlobV2FieldRewritePlan {
                 )));
             };
             let output_field = match BlobV2Layout::classify(input_children) {
-                Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
+                // The writer takes both as they are.
+                Some(BlobV2Layout::Logical | BlobV2Layout::Prepared) => {
+                    Arc::new(input_field.clone())
+                }
                 Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
                     field,
                     if preserve_managed {
@@ -1694,7 +1697,7 @@ impl BlobV2FieldRewritePlan {
                 ),
                 Some(actual) => {
                     return Err(Error::invalid_input(format!(
-                        "Blob v2 field '{}' has {actual} input layout; expected logical or descriptor layout during rewrite",
+                        "Blob v2 field '{}' has {actual} input layout; expected logical, prepared or descriptor layout during rewrite",
                         field.name
                     )));
                 }
@@ -1808,7 +1811,7 @@ impl BlobV2FieldRewritePlan {
                 } => {
                     let struct_arr = array.as_struct();
                     match BlobV2Layout::classify(struct_arr.fields()) {
-                        Some(BlobV2Layout::Logical) => Ok(array),
+                        Some(BlobV2Layout::Logical | BlobV2Layout::Prepared) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
                             if matches!(output_field.data_type(), ArrowDataType::Struct(fields) if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Prepared)) {
                                 return super::blob::preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
@@ -1830,7 +1833,7 @@ impl BlobV2FieldRewritePlan {
                             Ok(Arc::new(logical) as ArrayRef)
                         }
                         Some(actual) => Err(Error::invalid_input(format!(
-                            "Blob v2 field '{}' has {actual} layout; expected logical or descriptor layout during rewrite",
+                            "Blob v2 field '{}' has {actual} layout; expected logical, prepared or descriptor layout during rewrite",
                             field_name
                         ))),
                         None => Err(Error::invalid_input(format!(
