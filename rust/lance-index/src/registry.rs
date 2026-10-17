@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use lance_core::{Error, Result};
@@ -22,6 +22,102 @@ use crate::{
 /// Scalar detail package emitted by Lance 0.36 before the messages moved back
 /// to `lance.table` for forward compatibility.
 const V036_SCALAR_DETAILS_PACKAGE: &str = "lance.index.pb";
+
+struct PluginRegistration {
+    name: String,
+    details_type_name: String,
+    install: fn(&mut IndexPluginRegistry),
+}
+
+#[derive(Default)]
+struct PluginRegistrations {
+    plugins: Vec<PluginRegistration>,
+    is_frozen: bool,
+}
+
+impl PluginRegistrations {
+    fn register<
+        DetailsType: prost::Message + prost::Name,
+        PluginType: ScalarIndexPlugin + Default + 'static,
+    >(
+        &mut self,
+    ) -> Result<()> {
+        if self.is_frozen {
+            return Err(Error::invalid_input(
+                "scalar index plugins must be registered before the first plugin registry is built",
+            ));
+        }
+        let name = plugin_name_from_details_url(DetailsType::NAME);
+        let details_type_name = DetailsType::full_name().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err(Error::invalid_input(
+                "scalar index plugin name must not be empty",
+            ));
+        }
+        let builtins = IndexPluginRegistry::with_builtin_plugins();
+        if builtins.plugins.contains_key(&name)
+            || builtins.details_type_names.contains(&details_type_name)
+            || self
+                .plugins
+                .iter()
+                .any(|plugin| plugin.name == name || plugin.details_type_name == details_type_name)
+        {
+            return Err(Error::invalid_input(format!(
+                "scalar index plugin '{name}' or details type '{}' is already registered",
+                DetailsType::full_name()
+            )));
+        }
+        self.plugins.push(PluginRegistration {
+            name,
+            details_type_name,
+            install: |registry| registry.add_plugin::<DetailsType, PluginType>(),
+        });
+        Ok(())
+    }
+
+    fn freeze(&mut self) -> Vec<fn(&mut IndexPluginRegistry)> {
+        self.is_frozen = true;
+        self.plugins.iter().map(|plugin| plugin.install).collect()
+    }
+}
+
+static PLUGIN_REGISTRATIONS: Mutex<PluginRegistrations> = Mutex::new(PluginRegistrations {
+    plugins: Vec::new(),
+    is_frozen: false,
+});
+
+/// Register a statically linked scalar index plugin before using any datasets.
+///
+/// The details message determines the creation name, as in
+/// [`IndexPluginRegistry::add_plugin`]. Every subsequently constructed default
+/// registry includes the plugin. Registrations are frozen when the first such
+/// registry is built; late registrations and name or details-type collisions
+/// return an error. Register each plugin once at process startup.
+///
+/// A custom index must persist its details message in [`crate::scalar::CreatedIndex`]
+/// so another process can select the registered reader. This registers Rust
+/// implementations linked into the application, not dynamic libraries.
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_index::scalar::registry::ScalarIndexPlugin;
+/// # fn register<D, P>() -> Result<()>
+/// # where D: prost::Message + prost::Name,
+/// #       P: ScalarIndexPlugin + Default + 'static,
+/// # {
+/// lance_index::registry::register_scalar_index_plugin::<D, P>()?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn register_scalar_index_plugin<
+    DetailsType: prost::Message + prost::Name,
+    PluginType: ScalarIndexPlugin + Default + 'static,
+>() -> Result<()> {
+    PLUGIN_REGISTRATIONS
+        .lock()
+        .map_err(|_| Error::internal("scalar index plugin registration lock poisoned"))?
+        .register::<DetailsType, PluginType>()
+}
 
 /// Derive the scalar index plugin name from a details type URL.
 ///
@@ -94,8 +190,30 @@ impl IndexPluginRegistry {
             .insert(format!("{}.{}", package, DetailsType::NAME).to_ascii_lowercase());
     }
 
-    /// Create a registry with the default plugins
+    /// Create a registry with builtin and startup-registered plugins.
+    ///
+    /// The first call freezes [`register_scalar_index_plugin`]. Later calls
+    /// construct independent registries with the same registered plugin types.
     pub fn with_default_plugins() -> Arc<Self> {
+        let mut registry = Self::with_builtin_plugins();
+        // Freeze atomically with registration, but run plugin constructors
+        // outside the lock so they cannot deadlock registration.
+        let installers = PLUGIN_REGISTRATIONS
+            .lock()
+            .expect("scalar index plugin registration lock poisoned")
+            .freeze();
+        for install in installers {
+            install(&mut registry);
+        }
+
+        let registry = Arc::new(registry);
+        for plugin in registry.plugins.values() {
+            plugin.attach_registry(registry.clone());
+        }
+        registry
+    }
+
+    fn with_builtin_plugins() -> Self {
         let mut registry = Self {
             plugins: HashMap::new(),
             details_type_names: HashSet::new(),
@@ -123,11 +241,6 @@ impl IndexPluginRegistry {
         registry.add_details_type_alias::<pbold::NGramIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
         registry.add_details_type_alias::<pbold::ZoneMapIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
         registry.add_details_type_alias::<pbold::InvertedIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
-
-        let registry = Arc::new(registry);
-        for plugin in registry.plugins.values() {
-            plugin.attach_registry(registry.clone());
-        }
 
         registry
     }
@@ -180,7 +293,108 @@ impl IndexPluginRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::*;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ExampleIndexDetails {}
+
+    impl prost::Name for ExampleIndexDetails {
+        const NAME: &'static str = "ExampleIndexDetails";
+        const PACKAGE: &'static str = "example.index";
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ConflictingIndexDetails {}
+
+    impl prost::Name for ConflictingIndexDetails {
+        const NAME: &'static str = "EXAMPLEIndexDetails";
+        const PACKAGE: &'static str = "another.index";
+    }
+
+    #[test]
+    fn test_external_registration_installs_name_and_details() {
+        let mut registrations = PluginRegistrations::default();
+        registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            .unwrap();
+        let mut registry = IndexPluginRegistry::with_builtin_plugins();
+        for install in registrations.freeze() {
+            install(&mut registry);
+        }
+        assert!(registry.get_plugin_by_name("EXAMPLE").is_ok());
+        let details = prost_types::Any::from_msg(&ExampleIndexDetails {}).unwrap();
+        assert!(registry.supports_details(&details));
+        assert!(registry.get_plugin_by_details(&details).is_ok());
+        assert!(registry.get_plugin_by_name("btree").is_ok());
+        assert!(!registry.supports_details(&prost_types::Any {
+            type_url: "/another.package.ExampleIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn test_external_registration_rejects_collisions() {
+        let mut registrations = PluginRegistrations::default();
+        let err = registrations
+            .register::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("already registered"));
+
+        registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            .unwrap();
+        let err = registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("already registered"));
+        let err = registrations
+            .register::<ConflictingIndexDetails, ZoneMapIndexPlugin>()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("already registered"));
+        assert_eq!(registrations.plugins.len(), 1);
+    }
+
+    #[test]
+    fn test_registration_racing_freeze_is_included_or_rejected() {
+        let registrations = Arc::new(Mutex::new(PluginRegistrations::default()));
+        let barrier = Arc::new(Barrier::new(2));
+        let register = std::thread::spawn({
+            let registrations = registrations.clone();
+            let barrier = barrier.clone();
+            move || {
+                barrier.wait();
+                registrations
+                    .lock()
+                    .unwrap()
+                    .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            }
+        });
+        barrier.wait();
+        let installers = registrations.lock().unwrap().freeze();
+        let result = register.join().unwrap();
+        assert_eq!(installers.len(), usize::from(result.is_ok()));
+        if let Err(err) = result {
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("before the first plugin registry"));
+        }
+    }
+
+    #[test]
+    fn test_external_registration_rejects_late_registration() {
+        let mut registrations = PluginRegistrations::default();
+        assert!(registrations.freeze().is_empty());
+        let err = registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>()
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("before the first plugin registry"));
+        assert!(registrations.plugins.is_empty());
+    }
 
     #[test]
     fn test_display_type_from_url() {

@@ -283,7 +283,6 @@ pub(crate) async fn load_fts_training_data(
     }
 }
 
-// TODO: Allow users to register their own plugins
 pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
     LazyLock::new(IndexPluginRegistry::with_default_plugins);
 

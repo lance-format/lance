@@ -200,15 +200,63 @@ impl ScalarIndexExec {
     ///
     /// This does not restrict the result mask. The consumer remains responsible for applying
     /// the exact fragment scope, deletion mask, and any required data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) -> ScalarIndexExec {
+    /// exec.with_fragment_scope([1, 2].into_iter().collect())
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
 
+    /// The fragment restriction used to select physical index segments.
+    ///
+    /// `None` means unrestricted; `Some` with an empty bitmap selects nothing.
+    /// Preserve this restriction when reconstructing or serializing the node.
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn inspect(exec: &ScalarIndexExec) {
+    /// let fragments = exec.fragment_scope();
+    /// # }
+    /// ```
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
     /// Restrict index loading to these physical scalar index segments.
-    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+    ///
+    /// This restricts loading, not the result mask. The consumer must still
+    /// apply the required row-level filtering.
+    ///
+    /// ```
+    /// # use std::{collections::HashSet, sync::Arc};
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn empty_segments(exec: ScalarIndexExec) -> ScalarIndexExec {
+    /// exec.with_segment_uuids(Arc::new(HashSet::new()))
+    /// # }
+    /// ```
+    pub fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);
         self
+    }
+
+    /// The physical segment restriction, or `None` when unrestricted.
+    ///
+    /// Preserve this restriction alongside [`Self::fragment_scope`] when
+    /// reconstructing or serializing the node.
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn inspect(exec: &ScalarIndexExec) {
+    /// let segments = exec.segment_uuids();
+    /// # }
+    /// ```
+    pub fn segment_uuids(&self) -> Option<&HashSet<uuid::Uuid>> {
+        self.segment_uuids.as_deref()
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
