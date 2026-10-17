@@ -23,10 +23,11 @@ use arrow_array::{
     RecordBatchOptions, StructArray,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
-use lance_core::datatypes::LANCE_FIELD_ID_KEY;
+use lance_core::datatypes::{BlobV2Layout, LANCE_FIELD_ID_KEY};
 use lance_core::{Error, Result};
 
 use super::TOMBSTONE;
+use crate::blob::{blob_v2_layout, logical_to_prepared_blob_field};
 
 /// The lance field id an Arrow field carries, if it carries one.
 ///
@@ -248,32 +249,7 @@ fn resolve_field(
     top_level: bool,
 ) -> Result<Source> {
     let name = field.name();
-    let by_id = field_id_of(field).and_then(|id| {
-        source_fields
-            .iter()
-            .position(|f| field_id_of(f) == Some(id))
-    });
-    // Ids first. The name fallback is asymmetric on purpose: it fires for a
-    // target field carrying no id, and for one whose id no source field has --
-    // an id-bearing target against an unstamped source still matches by name.
-    let by_name = || {
-        source_fields
-            .iter()
-            .position(|f| f.name() == name)
-            .filter(|i| !claimed[*i])
-    };
-    let index = match field_id_of(field) {
-        // The target names an identity: only that identity answers for it,
-        // unless the source has none to be matched on.
-        Some(_) => by_id.or_else(|| {
-            source_fields
-                .iter()
-                .all(|f| field_id_of(f).is_none())
-                .then(by_name)
-                .flatten()
-        }),
-        None => by_name(),
-    };
+    let index = source_index(field, source_fields, claimed);
 
     let Some(index) = index else {
         if top_level && name == TOMBSTONE {
@@ -310,6 +286,90 @@ fn resolve_field(
         source.data_type(),
         field.data_type()
     )))
+}
+
+/// The source field `field` resolves to.
+fn source_index(
+    field: &ArrowField,
+    source_fields: &arrow_schema::Fields,
+    claimed: &[bool],
+) -> Option<usize> {
+    let by_id = field_id_of(field).and_then(|id| {
+        source_fields
+            .iter()
+            .position(|f| field_id_of(f) == Some(id))
+    });
+    // Ids first. The name fallback is asymmetric on purpose: it fires for a
+    // target field carrying no id, and for one whose id no source field has --
+    // an id-bearing target against an unstamped source still matches by name.
+    let by_name = || {
+        source_fields
+            .iter()
+            .position(|f| f.name() == field.name())
+            .filter(|i| !claimed[*i])
+    };
+    match field_id_of(field) {
+        // The target names an identity: only that identity answers for it,
+        // unless the source has none to be matched on.
+        Some(_) => by_id.or_else(|| {
+            source_fields
+                .iter()
+                .all(|f| field_id_of(f).is_none())
+                .then(by_name)
+                .flatten()
+        }),
+        None => by_name(),
+    }
+}
+
+/// `target` with each blob v2 field the source holds writer-prepared, at any
+/// depth, typed prepared, so resolution keeps the reference it carries instead
+/// of rebuilding the declared logical layout. Fields pair up as resolution
+/// pairs them.
+pub(super) fn with_prepared_blobs_held(
+    source: &arrow_schema::Fields,
+    target: &arrow_schema::Fields,
+) -> Result<arrow_schema::Fields> {
+    let claimed = claimed_by_id(source, target);
+    target
+        .iter()
+        .map(|field| {
+            let Some(held) = source_index(field, source, &claimed).map(|i| &source[i]) else {
+                return Ok(Arc::clone(field));
+            };
+            if blob_v2_layout(field).is_some() {
+                return Ok(match blob_v2_layout(held) {
+                    Some(BlobV2Layout::Prepared) => {
+                        Arc::new(logical_to_prepared_blob_field(field)?)
+                    }
+                    _ => Arc::clone(field),
+                });
+            }
+            let (Some(held_children), Some(children)) = (
+                children_of(held.data_type()),
+                children_of(field.data_type()),
+            ) else {
+                return Ok(Arc::clone(field));
+            };
+            let children = with_prepared_blobs_held(&held_children, &children)?;
+            Ok(Arc::new(field.as_ref().clone().with_data_type(
+                with_children(field.data_type(), children),
+            )))
+        })
+        .collect()
+}
+
+/// `data_type` holding `children`, for a type [`children_of`] returns them for.
+fn with_children(data_type: &DataType, children: arrow_schema::Fields) -> DataType {
+    match data_type {
+        DataType::List(_) => DataType::List(Arc::clone(&children[0])),
+        DataType::LargeList(_) => DataType::LargeList(Arc::clone(&children[0])),
+        DataType::FixedSizeList(_, size) => {
+            DataType::FixedSizeList(Arc::clone(&children[0]), *size)
+        }
+        DataType::Map(_, sorted) => DataType::Map(Arc::clone(&children[0]), *sorted),
+        _ => DataType::Struct(children),
+    }
 }
 
 /// Whether this type carries its children inside its own type, so an array of
