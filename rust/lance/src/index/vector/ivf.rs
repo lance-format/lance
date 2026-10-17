@@ -5494,7 +5494,7 @@ mod tests {
     use lance_index::progress::noop_progress;
     use lance_index::scalar::OldIndexDataFilter;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_linalg::distance::l2_distance_batch;
+    use lance_linalg::distance::l2_distance_batch_into;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
@@ -5851,12 +5851,14 @@ mod tests {
                         // This will be true for the last item since we ignore comparison with self
                         continue;
                     }
-                    let distances = l2_distance_batch(
+                    let mut distances = vec![0.0; length / dim as usize];
+                    l2_distance_batch_into(
                         centroid,
                         &centroids.values()[offset..offset + length],
                         dim as usize,
+                        &mut distances,
                     );
-                    let min_distance = distances.min_by(|a, b| a.total_cmp(b)).unwrap();
+                    let min_distance = distances.into_iter().min_by(|a, b| a.total_cmp(b)).unwrap();
                     // In theory we could just replace this one vector but, out of laziness, we just retry all of them
                     if min_distance < distance_needed {
                         broken = true;

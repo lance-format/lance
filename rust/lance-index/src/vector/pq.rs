@@ -221,6 +221,7 @@ impl ProductQuantizer {
             }
             values
         } else {
+            let mut distances = vec![0.0; num_centroids];
             flatten_data
                 .values()
                 .chunks_exact(dim)
@@ -236,8 +237,8 @@ impl ProductQuantizer {
                                 sub_idx,
                             );
                             assume_eq!(centroids.len(), num_centroids * sub_dim);
-                            compute_partition(centroids, sub_vector, distance_type).unwrap_or(0)
-                                as u8
+                            compute_partition(centroids, sub_vector, distance_type, &mut distances)
+                                .unwrap_or(0) as u8
                         })
                         .collect();
                     if NUM_BITS == 4 {
@@ -658,7 +659,7 @@ mod tests {
     use arrow::datatypes::UInt8Type;
     use arrow_array::Float16Array;
     use half::f16;
-    use lance_linalg::distance::l2_distance_batch;
+    use lance_linalg::distance::{l2, l2_distance_batch_into};
     use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
@@ -714,15 +715,14 @@ mod tests {
             .map(|code| {
                 code.iter()
                     .enumerate()
-                    .flat_map(|(sub_idx, c)| {
+                    .map(|(sub_idx, c)| {
                         let subvec_centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
                         let subvec =
                             &query.values()[sub_idx * sub_vec_len..(sub_idx + 1) * sub_vec_len];
-                        l2_distance_batch(
+                        l2(
                             subvec,
                             &subvec_centroids
                                 [*c as usize * sub_vec_len..(*c as usize + 1) * sub_vec_len],
-                            sub_vec_len,
                         )
                     })
                     .sum::<f32>()
@@ -860,8 +860,9 @@ mod tests {
                     .enumerate()
                     .for_each(|(sub_idx, sub_vec)| {
                         let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
-                        let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
-                        let code = argmin(dists).unwrap() as u8;
+                        let mut dists = vec![0.0; centroids.len() / (DIM / 4)];
+                        l2_distance_batch_into(sub_vec, centroids, DIM / 4, &mut dists);
+                        let code = argmin(dists.iter().copied()).unwrap() as u8;
                         expected.push(code);
                     });
             });

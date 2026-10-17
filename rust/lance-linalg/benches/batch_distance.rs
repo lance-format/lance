@@ -17,27 +17,34 @@ fn bench_batch_distance(c: &mut Criterion) {
     let batch = (0..TOTAL_VALUES)
         .map(|index| (index % 31) as f32 * 0.03125 - 0.5)
         .collect::<Vec<_>>();
+    let mut output = vec![0.0; TOTAL_VALUES / DIMENSION];
 
     c.bench_function("Batch distance dot f32 dim 8", |b| {
         b.iter(|| {
-            black_box(
-                <f32 as Dot>::dot_batch(black_box(&key), black_box(&batch), DIMENSION).sum::<f32>(),
-            )
+            <f32 as Dot>::dot_batch_into(
+                black_box(&key),
+                black_box(&batch),
+                DIMENSION,
+                &mut output,
+            );
+            black_box(&mut output);
         })
     });
     c.bench_function("Batch distance l2 f32 dim 8", |b| {
         b.iter(|| {
-            black_box(
-                <f32 as L2>::l2_batch(black_box(&key), black_box(&batch), DIMENSION).sum::<f32>(),
-            )
+            <f32 as L2>::l2_batch_into(black_box(&key), black_box(&batch), DIMENSION, &mut output);
+            black_box(&mut output);
         })
     });
     c.bench_function("Batch distance cosine f32 dim 8", |b| {
         b.iter(|| {
-            black_box(
-                <f32 as Cosine>::cosine_batch(black_box(&key), black_box(&batch), DIMENSION)
-                    .sum::<f32>(),
-            )
+            <f32 as Cosine>::cosine_batch_into(
+                black_box(&key),
+                black_box(&batch),
+                DIMENSION,
+                &mut output,
+            );
+            black_box(&mut output);
         })
     });
 }

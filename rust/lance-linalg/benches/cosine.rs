@@ -9,7 +9,9 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, bfloat16::BFloat16Type};
-use lance_linalg::distance::cosine::{Cosine, cosine_distance_arrow_batch, cosine_distance_batch};
+use lance_linalg::distance::cosine::{
+    Cosine, cosine_distance_arrow_batch, cosine_distance_batch_into,
+};
 use lance_linalg::distance::cosine_u8::{cosine_u8, cosine_u8_scalar};
 use num_traits::Float;
 
@@ -55,11 +57,15 @@ where
     c.bench_function(
         format!("Cosine({}, auto-vectorized)", type_name).as_str(),
         |b| {
+            let mut distances = vec![0.0; TOTAL];
             b.iter(|| {
-                black_box(
-                    cosine_distance_batch(key.as_slice(), target.as_slice(), DIMENSION)
-                        .collect::<Vec<_>>(),
+                cosine_distance_batch_into(
+                    key.as_slice(),
+                    target.as_slice(),
+                    DIMENSION,
+                    &mut distances,
                 );
+                black_box(&mut distances);
             })
         },
     );
@@ -75,8 +81,10 @@ fn bench_distance(c: &mut Criterion) {
     let target = generate_random_array_with_seed::<Float32Type>(1024 * 1024 * 8, [42; 32]);
 
     c.bench_function("Cosine(simd,f32x8) rng seed", |b| {
+        let mut distances = vec![0.0; target.len() / 8];
         b.iter(|| {
-            black_box(cosine_distance_batch(key.values(), target.values(), 8).collect::<Vec<_>>())
+            cosine_distance_batch_into(key.values(), target.values(), 8, &mut distances);
+            black_box(&mut distances);
         })
     });
 

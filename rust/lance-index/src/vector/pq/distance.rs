@@ -5,7 +5,9 @@ use core::panic;
 
 use super::utils::get_sub_vector_centroids;
 use lance_core::assume_eq;
-use lance_linalg::distance::{Dot, L2, dot_distance_batch, l2::L2Prepared, l2_distance_batch};
+use lance_linalg::distance::{
+    Dot, L2, dot_distance_batch_into, l2::L2Prepared, l2_distance_batch_into,
+};
 use lance_linalg::simd::dist_table::{
     sum_4bit_dist_table_f32_row, sum_4bit_dist_table_f32_rows, sum_4bit_dist_table_f32_transposed,
 };
@@ -34,21 +36,17 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
     let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
-    let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
+    let mut result = vec![0.0; num_sub_vectors * num_centroids];
     // Legacy writers allowed non-divisible dimensions and truncated the tail.
     // Limit iteration to the sub-vectors that were persisted by those writers.
-    for (i, sub_vec) in query
+    for (i, (sub_vec, distances)) in query
         .chunks_exact(sub_vector_length)
-        .take(num_sub_vectors)
+        .zip(result.chunks_exact_mut(num_centroids))
         .enumerate()
     {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-        result.extend(l2_distance_batch(
-            sub_vec,
-            subvec_centroids,
-            sub_vector_length,
-        ));
+        l2_distance_batch_into(sub_vec, subvec_centroids, sub_vector_length, distances);
     }
     result
 }
@@ -98,21 +96,17 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
-    let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
+    let mut result = vec![0.0; num_sub_vectors * num_centroids];
     // Legacy writers allowed non-divisible dimensions and truncated the tail.
     // Limit iteration to the sub-vectors that were persisted by those writers.
-    for (i, sub_vec) in query
+    for (i, (sub_vec, distances)) in query
         .chunks_exact(sub_vector_length)
-        .take(num_sub_vectors)
+        .zip(result.chunks_exact_mut(num_centroids))
         .enumerate()
     {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-        result.extend(dot_distance_batch(
-            sub_vec,
-            subvec_centroids,
-            sub_vector_length,
-        ));
+        dot_distance_batch_into(sub_vec, subvec_centroids, sub_vector_length, distances);
     }
     result
 }

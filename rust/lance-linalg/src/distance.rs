@@ -17,7 +17,7 @@ use arrow_array::{
     Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray, PrimitiveArray,
 };
 use arrow_schema::{ArrowError, DataType};
-use lance_core::utils::cpu::{Kernel, SimdSupport};
+use lance_core::utils::cpu::SimdSupport;
 
 pub mod cosine;
 pub mod cosine_u8;
@@ -47,7 +47,7 @@ fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
     ))
 }
 
-// `#[track_caller]` on both helpers is load-bearing: without it a length-contract
+// `#[track_caller]` on these helpers is load-bearing: without it a length-contract
 // panic reports this file rather than the distance function the caller reached.
 // See #8863.
 #[inline]
@@ -74,6 +74,23 @@ fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
         batch_len % dimension,
         0,
         "distance batch length must be divisible by dimension: batch={batch_len}, dimension={dimension}"
+    );
+}
+
+/// [`assert_batch_layout`], plus one output slot per vector in the batch.
+#[inline]
+#[track_caller]
+fn assert_batch_output_layout(
+    vector_len: usize,
+    batch_len: usize,
+    dimension: usize,
+    output_len: usize,
+) {
+    assert_batch_layout(vector_len, batch_len, dimension);
+    assert_eq!(
+        output_len,
+        batch_len / dimension,
+        "distance output length must match the number of vectors in the batch: output={output_len}, batch={batch_len}, dimension={dimension}"
     );
 }
 
@@ -174,125 +191,6 @@ pub(crate) type PairKernel<T = f32> = unsafe fn(&[T], &[T]) -> f32;
 /// Writes the distance from `key` to each `dimension`-sized vector of `batch`
 /// into the matching element of `output`.
 pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
-
-/// Number of distances computed per call into a batch kernel.
-///
-/// Keeping a small output buffer amortizes the kernel call while avoiding the
-/// allocation and full-batch materialization that dominate the common
-/// dimension-8 case.
-const BATCH_BUFFER_SIZE: usize = 64;
-
-/// Allocation-free iterator over a [`BatchKernel`]'s output.
-pub(crate) struct BatchDistances<'a> {
-    key: &'a [f32],
-    batch: &'a [f32],
-    dimension: usize,
-    kernel: Kernel<BatchKernel>,
-    buffer: [f32; BATCH_BUFFER_SIZE],
-    buffer_index: usize,
-    buffer_len: usize,
-}
-
-impl<'a> BatchDistances<'a> {
-    /// The caller must have checked the layout with `assert_batch_layout`.
-    #[inline]
-    pub(crate) fn new(
-        key: &'a [f32],
-        batch: &'a [f32],
-        dimension: usize,
-        kernel: Kernel<BatchKernel>,
-    ) -> Self {
-        Self {
-            key,
-            batch,
-            dimension,
-            kernel,
-            buffer: [0.0; BATCH_BUFFER_SIZE],
-            buffer_index: 0,
-            buffer_len: 0,
-        }
-    }
-
-    #[inline]
-    fn refill(&mut self) -> bool {
-        let num_vectors = (self.batch.len() / self.dimension).min(BATCH_BUFFER_SIZE);
-        if num_vectors == 0 {
-            return false;
-        }
-
-        let (input, remaining) = self.batch.split_at(num_vectors * self.dimension);
-        self.kernel.call(
-            self.key,
-            input,
-            self.dimension,
-            &mut self.buffer[..num_vectors],
-        );
-        self.batch = remaining;
-        self.buffer_index = 0;
-        self.buffer_len = num_vectors;
-        true
-    }
-
-    /// Kept out of line so that `next`, which reaches this once per buffer,
-    /// stays a leaf when it is not inlined. Inlined, the kernel call made
-    /// every `next` save and restore registers, nearly doubling the cost of a
-    /// dimension-8 distance.
-    #[cold]
-    fn refill_and_next(&mut self) -> Option<f32> {
-        if !self.refill() {
-            return None;
-        }
-        self.buffer_index = 1;
-        Some(self.buffer[0])
-    }
-}
-
-impl Iterator for BatchDistances<'_> {
-    type Item = f32;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.buffer_index == self.buffer_len {
-            return self.refill_and_next();
-        }
-        let value = self.buffer[self.buffer_index];
-        self.buffer_index += 1;
-        Some(value)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.len();
-        (len, Some(len))
-    }
-
-    /// Folds each filled buffer directly so consumers such as `sum` do not pay
-    /// a refill check for every distance.
-    #[inline]
-    fn fold<B, F>(mut self, init: B, mut f: F) -> B
-    where
-        F: FnMut(B, Self::Item) -> B,
-    {
-        let mut accumulator = self.buffer[self.buffer_index..self.buffer_len]
-            .iter()
-            .copied()
-            .fold(init, &mut f);
-        while self.refill() {
-            accumulator = self.buffer[..self.buffer_len]
-                .iter()
-                .copied()
-                .fold(accumulator, &mut f);
-        }
-        accumulator
-    }
-}
-
-impl ExactSizeIterator for BatchDistances<'_> {
-    #[inline]
-    fn len(&self) -> usize {
-        self.buffer_len - self.buffer_index + self.batch.len() / self.dimension
-    }
-}
 
 pub use cosine::*;
 pub use dot::*;

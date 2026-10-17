@@ -212,14 +212,10 @@ pub trait FlatFloat: L2 + Dot {
 /// lance-linalg's batch kernels, one row at a time.
 fn batch_rows_kernel<T: L2 + Dot>(metric: DistanceType) -> RowsFn<T> {
     fn l2_rows<T: L2>(anchor: &[T], rows: &[T], out: &mut [f32]) {
-        for (out, l2) in out.iter_mut().zip(T::l2_batch(anchor, rows, anchor.len())) {
-            *out = l2;
-        }
+        T::l2_batch_into(anchor, rows, anchor.len(), out);
     }
     fn dot_rows<T: Dot>(anchor: &[T], rows: &[T], out: &mut [f32]) {
-        for (out, dot) in out.iter_mut().zip(T::dot_batch(anchor, rows, anchor.len())) {
-            *out = dot;
-        }
+        T::dot_batch_into(anchor, rows, anchor.len(), out);
     }
     if metric == DistanceType::Dot {
         dot_rows::<T>
