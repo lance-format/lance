@@ -19,8 +19,6 @@ use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
-#[cfg(target_arch = "x86_64")]
-use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
 #[cfg(feature = "fp16kernels")]
@@ -359,42 +357,42 @@ impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        l2_f64_simd(x, y)
+        L2_F64.get().call(x, y)
     }
 }
 
-/// L2 distance for f64, runtime-dispatched via `SIMD_SUPPORT` on x86_64
-/// (AVX-512 / AVX2+FMA / AVX+FMA / AVX / scalar). Non-x86 uses the SIMD
-/// primitives in `crate::simd::f64`, unconditionally backed by NEON / LSX-LASX.
-#[inline]
-fn l2_f64_simd(x: &[f64], y: &[f64]) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match *SIMD_SUPPORT {
-            SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe { x86::l2_f64_avx512(x, y) },
-            SimdSupport::Avx2 | SimdSupport::AvxFma => unsafe { x86::l2_f64_avx_fma(x, y) },
-            SimdSupport::Avx => unsafe { x86::l2_f64_avx(x, y) },
-            _ => l2_f64_scalar(x, y),
+lance_core::dispatch! {
+    static L2_F64: Dispatch<PairKernel<f64>> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::L2_F64_AVX512,
+                x86::L2_F64_AVX_FMA,
+                x86::L2_F64_AVX,
+                L2_F64_PORTABLE,
+            ]
         }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        l2_f64_simd_other(x, y)
-    }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[L2_F64_PORTABLE]
+        }
+    };
 }
 
-/// Portable scalar L2 distance for f64. Used as the x86_64 fallback when no
-/// AVX2 is detected, and exposed for cross-backend parity testing.
 #[cfg(target_arch = "x86_64")]
-#[inline]
-fn l2_f64_scalar(x: &[f64], y: &[f64]) -> f32 {
-    x.iter()
-        .zip(y.iter())
-        .map(|(&a, &b)| {
-            let diff = a - b;
-            diff * diff
-        })
-        .sum::<f64>() as f32
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_F64_PORTABLE: PairKernel<f64>)]
+    #[inline]
+    fn l2_f64_portable(x: &[f64], y: &[f64]) -> f32 {
+        x.iter()
+            .zip(y.iter())
+            .map(|(&a, &b)| {
+                let diff = a - b;
+                diff * diff
+            })
+            .sum::<f64>() as f32
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -463,98 +461,133 @@ mod x86 {
         }
     }
 
-    /// AVX-512 path for f64: 8-wide `__m512d` with `vsubpd` + `vfmadd231pd` per iteration.
-    #[target_feature(enable = "avx512f")]
-    pub unsafe fn l2_f64_avx512(x: &[f64], y: &[f64]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 8 * 8;
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) L2_F64_AVX512: PairKernel<f64>)]
+        /// 8-wide `__m512d` with `vsubpd` + `vfmadd231pd` per iteration.
+        #[inline]
+        pub(super) fn l2_f64_avx512(x: &[f64], y: &[f64]) -> f32 {
+            // See `l2_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 8 * 8;
 
-        let mut acc = _mm512_setzero_pd();
-        for i in (0..unrolled_len).step_by(8) {
-            let a = _mm512_loadu_pd(x.as_ptr().add(i));
-            let b = _mm512_loadu_pd(y.as_ptr().add(i));
-            let diff = _mm512_sub_pd(a, b);
-            acc = _mm512_fmadd_pd(diff, diff, acc);
+            let mut acc = _mm512_setzero_pd();
+            for i in (0..unrolled_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (a, b) = unsafe {
+                    (
+                        _mm512_loadu_pd(x.as_ptr().add(i)),
+                        _mm512_loadu_pd(y.as_ptr().add(i)),
+                    )
+                };
+                let diff = _mm512_sub_pd(a, b);
+                acc = _mm512_fmadd_pd(diff, diff, acc);
+            }
+
+            let tail: f64 = x[unrolled_len..]
+                .iter()
+                .zip(y[unrolled_len..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            (_mm512_reduce_add_pd(acc) + tail) as f32
         }
-
-        let tail: f64 = x[unrolled_len..]
-            .iter()
-            .zip(y[unrolled_len..].iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .sum();
-
-        (_mm512_reduce_add_pd(acc) + tail) as f32
     }
 
-    /// AVX + FMA path for f64. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
-    #[target_feature(enable = "avx,fma")]
-    pub unsafe fn l2_f64_avx_fma(x: &[f64], y: &[f64]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 8 * 8;
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) L2_F64_AVX_FMA: PairKernel<f64>)]
+        /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
+        #[inline]
+        pub(super) fn l2_f64_avx_fma(x: &[f64], y: &[f64]) -> f32 {
+            // See `l2_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 8 * 8;
 
-        let mut acc8 = f64x8::zeros();
-        for i in (0..unrolled_len).step_by(8) {
-            let a = f64x8::load_unaligned(x.as_ptr().add(i));
-            let b = f64x8::load_unaligned(y.as_ptr().add(i));
-            let diff = a - b;
-            acc8.multiply_add(diff, diff);
-        }
-
-        let aligned_len = dim / 4 * 4;
-        let mut acc4 = f64x4::zeros();
-        for i in (unrolled_len..aligned_len).step_by(4) {
-            let a = f64x4::load_unaligned(x.as_ptr().add(i));
-            let b = f64x4::load_unaligned(y.as_ptr().add(i));
-            let diff = a - b;
-            acc4.multiply_add(diff, diff);
-        }
-
-        let tail: f64 = x[aligned_len..]
-            .iter()
-            .zip(y[aligned_len..].iter())
-            .map(|(&a, &b)| {
+            let mut acc8 = f64x8::zeros();
+            for i in (0..unrolled_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (a, b) = unsafe {
+                    (
+                        f64x8::load_unaligned(x.as_ptr().add(i)),
+                        f64x8::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
                 let diff = a - b;
-                diff * diff
-            })
-            .sum();
+                acc8.multiply_add(diff, diff);
+            }
 
-        (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
+            let aligned_len = dim / 4 * 4;
+            let mut acc4 = f64x4::zeros();
+            for i in (unrolled_len..aligned_len).step_by(4) {
+                // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
+                let (a, b) = unsafe {
+                    (
+                        f64x4::load_unaligned(x.as_ptr().add(i)),
+                        f64x4::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
+                let diff = a - b;
+                acc4.multiply_add(diff, diff);
+            }
+
+            let tail: f64 = x[aligned_len..]
+                .iter()
+                .zip(y[aligned_len..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
+        }
     }
 
-    /// AVX-only path for f64 (no FMA): squared diff via `_mm256_mul_pd` + `_mm256_add_pd` for Sandy/Ivy Bridge.
-    #[target_feature(enable = "avx")]
-    pub unsafe fn l2_f64_avx(x: &[f64], y: &[f64]) -> f32 {
-        let dim = x.len();
-        let unrolled_len = dim / 4 * 4;
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) L2_F64_AVX: PairKernel<f64>)]
+        /// AVX-only path (no FMA): squared diff via `_mm256_mul_pd` + `_mm256_add_pd` for Sandy/Ivy Bridge.
+        #[inline]
+        pub(super) fn l2_f64_avx(x: &[f64], y: &[f64]) -> f32 {
+            // See `l2_f32_avx512` for `min`.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 4 * 4;
 
-        let mut acc = _mm256_setzero_pd();
-        for i in (0..unrolled_len).step_by(4) {
-            let a = _mm256_loadu_pd(x.as_ptr().add(i));
-            let b = _mm256_loadu_pd(y.as_ptr().add(i));
-            let diff = _mm256_sub_pd(a, b);
-            acc = _mm256_add_pd(acc, _mm256_mul_pd(diff, diff));
+            let mut acc = _mm256_setzero_pd();
+            for i in (0..unrolled_len).step_by(4) {
+                // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
+                let (a, b) = unsafe {
+                    (
+                        _mm256_loadu_pd(x.as_ptr().add(i)),
+                        _mm256_loadu_pd(y.as_ptr().add(i)),
+                    )
+                };
+                let diff = _mm256_sub_pd(a, b);
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(diff, diff));
+            }
+
+            // Horizontal sum of __m256d -> f64.
+            let lo = _mm256_castpd256_pd128(acc);
+            let hi = _mm256_extractf128_pd(acc, 1);
+            let sum128 = _mm_add_pd(lo, hi);
+            let sum64 = _mm_add_pd(sum128, _mm_unpackhi_pd(sum128, sum128));
+            let acc_sum = _mm_cvtsd_f64(sum64);
+
+            let tail: f64 = x[unrolled_len..]
+                .iter()
+                .zip(y[unrolled_len..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            (acc_sum + tail) as f32
         }
-
-        // Horizontal sum of __m256d -> f64.
-        let lo = _mm256_castpd256_pd128(acc);
-        let hi = _mm256_extractf128_pd(acc, 1);
-        let sum128 = _mm_add_pd(lo, hi);
-        let sum64 = _mm_add_pd(sum128, _mm_unpackhi_pd(sum128, sum128));
-        let acc_sum = _mm_cvtsd_f64(sum64);
-
-        let tail: f64 = x[unrolled_len..]
-            .iter()
-            .zip(y[unrolled_len..].iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .sum();
-
-        (acc_sum + tail) as f32
     }
 
     lance_core::target_kernel! {
@@ -667,45 +700,58 @@ mod x86 {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn l2_f64_simd_other(x: &[f64], y: &[f64]) -> f32 {
-    use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::{FloatSimd, SIMD};
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_F64_PORTABLE: PairKernel<f64>)]
+    /// `simd::f64` is backed by the baseline NEON or LSX on these architectures.
+    #[inline]
+    fn l2_f64_portable(x: &[f64], y: &[f64]) -> f32 {
+        use crate::simd::f64::{f64x4, f64x8};
+        use crate::simd::{FloatSimd, SIMD};
 
-    let dim = x.len();
-    let unrolled_len = dim / 8 * 8;
+        // Callers pass equal lengths; `min` keeps the unchecked loads in
+        // bounds for any input, as a safe function must.
+        let dim = x.len().min(y.len());
+        let unrolled_len = dim / 8 * 8;
 
-    let mut acc8 = f64x8::zeros();
-    for i in (0..unrolled_len).step_by(8) {
-        unsafe {
-            let a = f64x8::load_unaligned(x.as_ptr().add(i));
-            let b = f64x8::load_unaligned(y.as_ptr().add(i));
+        let mut acc8 = f64x8::zeros();
+        for i in (0..unrolled_len).step_by(8) {
+            // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+            let (a, b) = unsafe {
+                (
+                    f64x8::load_unaligned(x.as_ptr().add(i)),
+                    f64x8::load_unaligned(y.as_ptr().add(i)),
+                )
+            };
             let diff = a - b;
             acc8.multiply_add(diff, diff);
         }
-    }
 
-    let aligned_len = dim / 4 * 4;
-    let mut acc4 = f64x4::zeros();
-    for i in (unrolled_len..aligned_len).step_by(4) {
-        unsafe {
-            let a = f64x4::load_unaligned(x.as_ptr().add(i));
-            let b = f64x4::load_unaligned(y.as_ptr().add(i));
+        let aligned_len = dim / 4 * 4;
+        let mut acc4 = f64x4::zeros();
+        for i in (unrolled_len..aligned_len).step_by(4) {
+            // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
+            let (a, b) = unsafe {
+                (
+                    f64x4::load_unaligned(x.as_ptr().add(i)),
+                    f64x4::load_unaligned(y.as_ptr().add(i)),
+                )
+            };
             let diff = a - b;
             acc4.multiply_add(diff, diff);
         }
+
+        let tail: f64 = x[aligned_len..]
+            .iter()
+            .zip(y[aligned_len..].iter())
+            .map(|(&a, &b)| {
+                let diff = a - b;
+                diff * diff
+            })
+            .sum();
+
+        (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
     }
-
-    let tail: f64 = x[aligned_len..]
-        .iter()
-        .zip(y[aligned_len..].iter())
-        .map(|(&a, &b)| {
-            let diff = a - b;
-            diff * diff
-        })
-        .sum();
-
-    (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
 }
 
 /// Accumulate squared differences for one dimension into per-target results.
@@ -1138,6 +1184,29 @@ mod tests {
         });
     }
 
+    /// Every host-supported f64 kernel must agree with an f64 reference.
+    #[rstest::rstest]
+    fn test_l2_f64_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            let want = l2_distance_reference(&x, &y) as f32;
+            for candidate in L2_F64.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let got = kernel.call(&x, &y);
+                prop_assert!(
+                    approx::relative_eq!(got, want, max_relative = 1e-6),
+                    "{} at dim {}: {got} != {want}",
+                    candidate.name(),
+                    x.len()
+                );
+            }
+            Ok(())
+        });
+    }
+
     // Test L2 distance over different types.
     // * L2 is valid over the entire range of f16.
     // * L2 is valid over f32 and bf16 in the range of +-1e12.
@@ -1151,69 +1220,6 @@ mod tests {
         #[test]
         fn test_l2_distance_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
             do_l2_test(&x, &y)?;
-        }
-
-        /// Cross-backend parity: scalar fallback must match the dispatched
-        /// SIMD path within numerical tolerance. Exercises `l2_f64_scalar`
-        /// directly so the runtime fallback is exercised even on AVX2-capable
-        /// CI hosts.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            let scalar = l2_f64_scalar(&x, &y);
-            let simd = l2_f64_simd(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// AVX-512-direct parity: explicitly compares the scalar fallback
-        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts
-        /// (Skylake-X+, Ice Lake, Sapphire Rapids, Zen 4). Early-returns on
-        /// hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            let scalar = l2_f64_scalar(&x, &y);
-            let avx512 = unsafe { x86::l2_f64_avx512(&x, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-6));
-        }
-
-        /// AVX + FMA-direct parity for the f64 L2 kernel. Covers the AMD
-        /// Piledriver / Steamroller / FX-7500 tier. Early-returns on hosts
-        /// without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            let scalar = l2_f64_scalar(&x, &y);
-            let avx_fma = unsafe { x86::l2_f64_avx_fma(&x, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-6));
-        }
-
-        /// AVX-only-direct parity for the f64 L2 kernel. Covers the Intel
-        /// Sandy Bridge / Ivy Bridge tier. Early-returns on hosts without
-        /// AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            let scalar = l2_f64_scalar(&x, &y);
-            let avx = unsafe { x86::l2_f64_avx(&x, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-6));
         }
     }
 

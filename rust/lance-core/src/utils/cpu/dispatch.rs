@@ -82,6 +82,14 @@ impl<A: ?Sized, B: ?Sized, R> Kernel<unsafe fn(&A, &B) -> R> {
     }
 }
 
+impl<A: ?Sized, R> Kernel<unsafe fn(&A) -> R> {
+    #[inline(always)]
+    pub fn call(self, a: &A) -> R {
+        // SAFETY: see the two-argument `call`.
+        unsafe { (self.0)(a) }
+    }
+}
+
 impl<A: ?Sized, B: ?Sized, C, D: ?Sized, R> Kernel<unsafe fn(&A, &B, C, &mut D) -> R> {
     #[inline(always)]
     pub fn call(self, a: &A, b: &B, c: C, d: &mut D) -> R {
@@ -353,6 +361,25 @@ mod tests {
         let mut out = [0.0; 2];
         FILL.get().call(&[1.0], &[2.0, 3.0], 1, &mut out);
         assert_eq!(out, [3.0, 4.0]);
+    }
+
+    type NormFn = unsafe fn(&[f32]) -> f32;
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(PORTABLE_NORM: NormFn)]
+        fn portable_norm(x: &[f32]) -> f32 {
+            x.iter().map(|v| v * v).sum::<f32>().sqrt()
+        }
+    }
+
+    crate::dispatch! {
+        static NORM: Dispatch<NormFn> = &[PORTABLE_NORM];
+    }
+
+    #[test]
+    fn single_argument_kernel_is_callable() {
+        assert_eq!(NORM.get().call(&[3.0, 4.0]), 5.0);
     }
 
     type ScaledSumFn = unsafe fn(&[f32], f32, &[f32]) -> f32;

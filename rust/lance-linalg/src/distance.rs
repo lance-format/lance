@@ -169,7 +169,7 @@ fn x86_half_features() -> X86HalfFeatures {
 const U8_U32_ACCUMULATOR_MAX_LEN: usize = u32::MAX as usize / (u8::MAX as usize * u8::MAX as usize);
 
 /// Distance between two vectors of equal length.
-pub(crate) type PairKernel = unsafe fn(&[f32], &[f32]) -> f32;
+pub(crate) type PairKernel<T = f32> = unsafe fn(&[T], &[T]) -> f32;
 
 /// Writes the distance from `key` to each `dimension`-sized vector of `batch`
 /// into the matching element of `output`.

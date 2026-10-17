@@ -23,8 +23,11 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use super::HalfBackend;
 use super::{
     BatchDistances, BatchKernel, Dot, HALF_KERNELS_COMPILED, HalfType, Normalize,
-    assert_batch_layout, assert_equal_lengths, dot::dot, half_backend, int8_query_to_f32,
-    norm_l2::norm_l2, x86_half_features,
+    assert_batch_layout, assert_equal_lengths,
+    dot::dot,
+    half_backend, int8_query_to_f32,
+    norm_l2::{norm_l2, norm_l2_impl},
+    x86_half_features,
 };
 #[cfg(not(target_arch = "x86_64"))]
 use crate::simd::{
@@ -385,7 +388,7 @@ lance_core::target_kernel! {
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::{CosineKernel, CosineWithNormsKernel, dot, norm_l2};
+    use super::{CosineKernel, CosineWithNormsKernel, dot, norm_l2, norm_l2_impl};
     use crate::distance::BatchKernel;
     use crate::simd::f32::{f32x8, f32x16};
     use crate::simd::f64::{f64x4, f64x8};
@@ -604,8 +607,10 @@ mod x86 {
                 xy8.multiply_add(xv, yv);
                 y_norm8.multiply_add(yv, yv);
             }
-            let y_norm =
-                y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
+            // Inlined rather than the dispatched `norm_l2`, which is an
+            // indirect call unless the baseline covers its best candidate.
+            let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
+            let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
             let xy =
                 xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
             1.0 - xy / x_norm / y_norm.sqrt()
@@ -639,7 +644,9 @@ mod x86 {
             // SAFETY: AVX is enabled for this function.
             let (xy_main, yy_main) = unsafe { (hsum256_ps(acc_xy), hsum256_ps(acc_yy)) };
 
-            let y_norm = yy_main + norm_l2(&other[aligned_len..]).powi(2);
+            // See `cosine_f32_avx_fma` for `norm_l2_impl`.
+            let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
+            let y_norm = yy_main + tail_norm.powi(2);
             let xy = xy_main + dot(&x[aligned_len..], &other[aligned_len..]);
             1.0 - xy / x_norm / y_norm.sqrt()
         }
@@ -923,8 +930,8 @@ lance_core::target_kernel! {
             xy8.multiply_add(xv, yv);
             y_norm8.multiply_add(yv, yv);
         }
-        let y_norm =
-            y_norm16.reduce_sum() + y_norm8.reduce_sum() + norm_l2(&other[aligned_len..]).powi(2);
+        let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
+        let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
         let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
         1.0 - xy / x_norm / y_norm.sqrt()
     }
