@@ -585,23 +585,33 @@ mod tests {
         .unwrap()
     }
 
-    /// Distances from the batched kernel (where the CPU supports it) and from
-    /// the portable per-pair kernel, which must agree bit for bit.
+    /// Distances from the dispatched kernels. Every host-supported candidate
+    /// must agree bit for bit with the portable one.
     fn distances(kernel: &SQKernel, anchor: usize, candidates: Range<usize>) -> Vec<f32> {
-        let mut out = vec![f32::NAN; candidates.len()];
-        kernel.distances(anchor, candidates.clone(), &mut out);
-        let portable = SQKernel {
-            batched: false,
-            ..*kernel
+        let run = |kernel: &SQKernel| {
+            let mut out = vec![f32::NAN; candidates.len()];
+            kernel.distances(anchor, candidates.clone(), &mut out);
+            out.iter().map(|d| d.to_bits()).collect::<Vec<_>>()
         };
-        let mut expected = vec![f32::NAN; candidates.len()];
-        portable.distances(anchor, candidates, &mut expected);
-        assert_eq!(
-            out.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
-            expected.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
-            "batched and portable kernels disagree"
-        );
-        out
+        let expected = run(&SQKernel {
+            l2: SQ_L2.fallback(),
+            dot: SQ_DOT.fallback(),
+            ..*kernel
+        });
+        for (l2, dot) in SQ_L2.candidates().iter().zip(SQ_DOT.candidates()) {
+            let (Some(l2_kernel), Some(dot_kernel)) = (l2.kernel(), dot.kernel()) else {
+                continue;
+            };
+            let actual = run(&SQKernel {
+                l2: l2_kernel,
+                dot: dot_kernel,
+                ..*kernel
+            });
+            assert_eq!(actual, expected, "{} / {}", l2.name(), dot.name());
+        }
+        let out = run(kernel);
+        assert_eq!(out, expected, "dispatched");
+        out.into_iter().map(f32::from_bits).collect()
     }
 
     // Dimensions cover a tail-only row, whole 64-byte blocks, and blocks plus
