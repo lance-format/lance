@@ -284,21 +284,43 @@ impl<T: FlatFloat> FloatKernel<'_, T> {
 mod f32_rows {
     pub(super) const LANES: usize = 16;
 
+    /// Like [`super::RowsFn`], for the host-checked kernels below.
+    type RowsKernel = unsafe fn(anchor: &[f32], rows: &[f32], out: &mut [f32]);
+
+    lance_core::dispatch! {
+        pub(super) static L2_ROWS: Dispatch<RowsKernel> = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                &[x86::L2_AVX512, x86::L2_AVX, L2_PORTABLE]
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                &[L2_PORTABLE]
+            }
+        };
+    }
+
+    lance_core::dispatch! {
+        pub(super) static DOT_ROWS: Dispatch<RowsKernel> = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                &[x86::DOT_AVX512, x86::DOT_AVX, DOT_PORTABLE]
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                &[DOT_PORTABLE]
+            }
+        };
+    }
+
     pub(super) fn select(l2: bool) -> super::RowsFn<f32> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                return if l2 { x86::l2_avx512 } else { x86::dot_avx512 };
-            }
-            if std::arch::is_x86_feature_detected!("avx") {
-                return if l2 { x86::l2_avx } else { x86::dot_avx };
-            }
+        fn l2_rows(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
+            L2_ROWS.get().call(anchor, rows, out)
         }
-        if l2 {
-            portable::<true>
-        } else {
-            portable::<false>
+        fn dot_rows(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
+            DOT_ROWS.get().call(anchor, rows, out)
         }
+        if l2 { l2_rows } else { dot_rows }
     }
 
     #[inline(always)]
@@ -330,6 +352,7 @@ mod f32_rows {
     /// One row at a time, in lance-linalg's own loop shape. Autovectorized
     /// NEON already runs the 16 lanes as four independent chains, so blocking
     /// rows gains nothing there.
+    #[inline(always)]
     fn portable<const L2: bool>(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
         assert_eq!(rows.len(), anchor.len() * out.len());
         for (out, row) in out.iter_mut().zip(rows.chunks_exact(anchor.len())) {
@@ -345,11 +368,27 @@ mod f32_rows {
         }
     }
 
+    lance_core::target_kernel! {
+        #[target_features()]
+        #[candidate(L2_PORTABLE: RowsKernel)]
+        fn l2_portable(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
+            portable::<true>(anchor, rows, out)
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features()]
+        #[candidate(DOT_PORTABLE: RowsKernel)]
+        fn dot_portable(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
+            portable::<false>(anchor, rows, out)
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     mod x86 {
         use std::arch::x86_64::*;
 
-        use super::{LANES, finish};
+        use super::{LANES, RowsKernel, finish};
 
         /// Rows scored per pass over the anchor.
         const BLOCK: usize = 4;
@@ -376,26 +415,30 @@ mod f32_rows {
         }
 
         macro_rules! rows_kernel {
-            ($name:ident, $block:ident, $l2:literal) => {
-                pub(super) fn $name(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
-                    // SAFETY: `select` returns this kernel only when the CPU
-                    // supports `$block`'s target features.
-                    blocked(anchor, rows, out, |rows, out| unsafe {
-                        match out.len() {
-                            BLOCK => $block::<$l2, BLOCK>(anchor, rows, out),
-                            3 => $block::<$l2, 3>(anchor, rows, out),
-                            2 => $block::<$l2, 2>(anchor, rows, out),
-                            _ => $block::<$l2, 1>(anchor, rows, out),
-                        }
-                    });
+            ($candidate:ident = $name:ident, $block:ident($feature:literal), $l2:literal) => {
+                lance_core::target_kernel! {
+                    #[target_features($feature)]
+                    #[candidate(pub(super) $candidate: RowsKernel)]
+                    fn $name(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
+                        // SAFETY: `blocked` passes `$block` exactly `out.len()`
+                        // rows, and this kernel enables its target features.
+                        blocked(anchor, rows, out, |rows, out| unsafe {
+                            match out.len() {
+                                BLOCK => $block::<$l2, BLOCK>(anchor, rows, out),
+                                3 => $block::<$l2, 3>(anchor, rows, out),
+                                2 => $block::<$l2, 2>(anchor, rows, out),
+                                _ => $block::<$l2, 1>(anchor, rows, out),
+                            }
+                        });
+                    }
                 }
             };
         }
 
-        rows_kernel!(l2_avx512, block_avx512, true);
-        rows_kernel!(dot_avx512, block_avx512, false);
-        rows_kernel!(l2_avx, block_avx, true);
-        rows_kernel!(dot_avx, block_avx, false);
+        rows_kernel!(L2_AVX512 = l2_avx512, block_avx512("avx512f"), true);
+        rows_kernel!(DOT_AVX512 = dot_avx512, block_avx512("avx512f"), false);
+        rows_kernel!(L2_AVX = l2_avx, block_avx("avx"), true);
+        rows_kernel!(DOT_AVX = dot_avx, block_avx("avx"), false);
 
         /// Adds the terms of 16 dimensions at `x` and at `y` plus each row
         /// offset. Masked-off positions load zeros, whose term is `+0.0` and
@@ -724,7 +767,7 @@ mod tests {
     }
 
     /// The blocked f32 kernels reproduce lance-linalg's 16-lane kernels bit
-    /// for bit on every backend and for every block split of the rows.
+    /// for bit on every candidate the host supports and for every block split of the rows.
     #[rstest]
     fn test_f32_rows_bit_identical(
         #[values(17, 32, 35, 64, 100, 1536)] dim: usize,
