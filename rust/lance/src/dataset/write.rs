@@ -550,6 +550,14 @@ impl Default for AutoCleanupParams {
 /// Dataset Write Parameters
 #[derive(Debug, Clone)]
 pub struct WriteParams {
+    /// Collect zone write seeds (per-zone column statistics in the data file
+    /// footer) for every supported column, so a later index build or pruning
+    /// consumer can use them without rereading the column. `None` means the
+    /// default, which is on for v2 files; `Some(false)` opts a write out.
+    /// Indices that request seeds through their plugin still get them either
+    /// way. Ignored for legacy v1 files, which cannot hold seeds.
+    pub collect_write_seeds: Option<bool>,
+
     /// Max number of records per file.
     pub max_rows_per_file: usize,
 
@@ -707,6 +715,7 @@ pub struct WriteParams {
 impl Default for WriteParams {
     fn default() -> Self {
         Self {
+            collect_write_seeds: None,
             max_rows_per_file: 1024 * 1024, // 1 million
             max_rows_per_group: 1024,
             // object-store has a 100GB limit, so we should at least make sure
@@ -5933,6 +5942,7 @@ mod tests {
                 Some(&dataset),
                 dataset.schema(),
                 true,
+                false,
             )
             .await
             .unwrap()
@@ -6009,6 +6019,7 @@ mod tests {
             Some(&dataset),
             dataset.schema(),
             true,
+            false,
         )
         .await
         .unwrap();
@@ -6044,6 +6055,7 @@ mod tests {
             Some(&dataset),
             dataset.schema(),
             true,
+            false,
         )
         .await
         .unwrap();
