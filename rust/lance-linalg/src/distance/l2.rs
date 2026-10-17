@@ -13,13 +13,11 @@ use argminmax::ArgMinMax;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::utils::cpu::SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Num};
 
 use crate::distance::{
-    BatchKernel, HALF_KERNELS_COMPILED, HalfBackend, HalfType, PairKernel,
-    U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_output_layout, assert_equal_lengths, half_backend,
-    x86_half_features,
+    BatchKernel, PairKernel, U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_output_layout,
+    assert_equal_lengths,
 };
 
 /// Calculate the L2 distance between two vectors.
@@ -158,167 +156,209 @@ impl L2 for u8 {
     }
 }
 
-#[cfg(feature = "fp16kernels")]
-mod bf16_kernel {
-    use half::bf16;
-
-    // These are the `l2_bf16` function in bf16.c. Our build.rs script compiles
-    // a version of this file for each SIMD level with different suffixes.
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn l2_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
-        pub fn l2_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn l2_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn l2_bf16_lsx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn l2_bf16_lasx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-    }
-}
-
 impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::Bf16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                bf16_kernel::l2_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_bf16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                bf16_kernel::l2_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                bf16_kernel::l2_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                bf16_kernel::l2_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                bf16_kernel::l2_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the bf16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
-            _ => l2_scalar::<Self, f32, 16>(x, y),
-        }
+        L2_BF16.get().call(x, y)
     }
-}
-
-#[cfg(feature = "fp16kernels")]
-mod kernel {
-    use super::*;
-
-    // These are the `l2_f16` function in f16.c. Our build.rs script compiles
-    // a version of this file for each SIMD level with different suffixes.
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn l2_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
-        pub fn l2_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn l2_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn l2_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn l2_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-    }
-}
-
-fn f16_backend() -> HalfBackend {
-    half_backend(
-        *SIMD_SUPPORT,
-        HalfType::F16,
-        HALF_KERNELS_COMPILED,
-        cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
-        x86_half_features(),
-    )
 }
 
 impl L2 for f16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        l2_f16_with(f16_backend(), x, y)
+        L2_F16.get().call(x, y)
     }
 
     fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
-        // Selecting the backend reads several runtime feature flags, which
-        // costs as much as a dimension-8 distance, so select it once per batch.
-        // The scalar backend converts the query to f32 once, instead of once
-        // per vector, and gets its own loop so the scalar kernel inlines.
-        // Interim: f16 still selects through `half_backend`, not `Dispatch`;
-        // it moves onto `Dispatch` batch candidates later in #10083, which
-        // must keep the convert-the-query-once step.
-        let backend = f16_backend();
-        #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-        if backend == HalfBackend::Neon {
-            return l2_f16_batch_neon(x, batch, dimension, output);
-        }
-        if backend == HalfBackend::Scalar {
-            let x: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = l2_scalar_mixed::<f32, Self, f32, 16>(&x, y);
-            }
-        } else {
-            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                *distance = l2_f16_with(backend, x, y);
-            }
+        L2_F16_BATCH.get().call(x, batch, dimension, output);
+    }
+}
+
+lance_core::dispatch! {
+    static L2_F16: Dispatch<PairKernel<f16>> = &[
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        half_c::L2_F16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::L2_F16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::L2_F16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::L2_F16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::L2_F16_LSX,
+        L2_F16_SCALAR,
+    ];
+}
+
+lance_core::dispatch! {
+    /// Each batch candidate loops over its tier's `L2_F16` kernel. Selecting
+    /// once per batch matters: at dimension 8 a selection costs about as much
+    /// as a distance.
+    static L2_F16_BATCH: Dispatch<BatchKernel<f16>> = &[
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        half_c::L2_F16_BATCH_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::L2_F16_BATCH_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::L2_F16_BATCH_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::L2_F16_BATCH_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::L2_F16_BATCH_LSX,
+        L2_F16_BATCH_SCALAR,
+    ];
+}
+
+lance_core::dispatch! {
+    static L2_BF16: Dispatch<PairKernel<bf16>> = &[
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        half_c::L2_BF16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::L2_BF16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::L2_BF16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::L2_BF16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::L2_BF16_LSX,
+        L2_BF16_SCALAR,
+    ];
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_F16_SCALAR: PairKernel<f16>)]
+    fn l2_f16_scalar(x: &[f16], y: &[f16]) -> f32 {
+        l2_scalar::<f16, f32, 16>(x, y)
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_F16_BATCH_SCALAR: BatchKernel<f16>)]
+    /// Converts the query to f32 once instead of once per vector, with the
+    /// same results as `l2_f16_scalar`.
+    fn l2_batch_f16_scalar(x: &[f16], batch: &[f16], dimension: usize, output: &mut [f32]) {
+        let x: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = l2_scalar_mixed::<f32, f16, f32, 16>(&x, y);
         }
     }
 }
 
-/// Out of line so the loop gets registers of its own: inlined into
-/// `l2_batch_into`, LLVM spilled the batch pointer to the stack, which put a
-/// store-to-load round trip on every dimension-8 distance.
-#[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-#[inline(never)]
-fn l2_f16_batch_neon(x: &[f16], batch: &[f16], dimension: usize, output: &mut [f32]) {
-    for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-        *distance = l2_f16_with(HalfBackend::Neon, x, y);
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_BF16_SCALAR: PairKernel<bf16>)]
+    fn l2_bf16_scalar(x: &[bf16], y: &[bf16]) -> f32 {
+        l2_scalar::<bf16, f32, 16>(x, y)
     }
 }
 
-#[inline(always)]
-fn l2_f16_with(backend: HalfBackend, x: &[f16], y: &[f16]) -> f32 {
-    match backend {
-        #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-        HalfBackend::Neon => unsafe { kernel::l2_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32) },
-        #[cfg(all(
-            feature = "fp16kernels",
-            kernel_support = "avx512_f16",
-            target_arch = "x86_64"
-        ))]
-        HalfBackend::Avx512 => unsafe {
-            kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
-        },
-        #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-        HalfBackend::Avx2 => unsafe { kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32) },
-        #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-        HalfBackend::Lasx => unsafe { kernel::l2_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32) },
-        #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-        HalfBackend::Lsx => unsafe { kernel::l2_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32) },
-        // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
-        // route; this fallback only extends the tiers the C kernel already
-        // served to Avx512FP16 after checking F16C and FMA.
-        _ => l2_scalar::<f16, f32, 16>(x, y),
+/// The `l2_f16` and `l2_bf16` functions in f16.c and bf16.c. build.rs compiles
+/// each file once per SIMD level, suffixing the symbols with the level.
+#[cfg(kernel_support = "half")]
+mod half_c {
+    use half::{bf16, f16};
+
+    use crate::distance::{BatchKernel, PairKernel};
+
+    mod ffi {
+        use half::{bf16, f16};
+
+        unsafe extern "C" {
+            #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+            pub fn l2_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn l2_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn l2_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn l2_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn l2_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+
+            #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+            pub fn l2_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn l2_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn l2_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn l2_bf16_lasx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn l2_bf16_lsx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        }
+    }
+
+    half_c_kernels! {
+        fn (x: &[f16], y: &[f16]) -> f32 => (x.as_ptr(), y.as_ptr(), x.len().min(y.len()) as u32);
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        L2_F16_AVX512: PairKernel<f16> = l2_f16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        L2_F16_AVX2: PairKernel<f16> = l2_f16_avx2("avx2", "fma", "f16c");
+        #[cfg(target_arch = "aarch64")]
+        L2_F16_NEON: PairKernel<f16> = l2_f16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        L2_F16_LASX: PairKernel<f16> = l2_f16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        L2_F16_LSX: PairKernel<f16> = l2_f16_lsx("lsx");
+    }
+
+    /// Declares a batch candidate that loops over a pair kernel with the same
+    /// features.
+    macro_rules! batch_kernels {
+        ($(
+            $(#[$attr:meta])*
+            $candidate:ident = $name:ident($pair:ident; $($feature:literal),*);
+        )*) => {
+            $(
+                $(#[$attr])*
+                lance_core::target_kernel! {
+                    #[target_features($($feature),*)]
+                    #[candidate(pub(super) $candidate: BatchKernel<f16>)]
+                    /// Out of line so the loop gets registers of its own:
+                    /// inlined into `l2_batch_into`, LLVM spilled the batch
+                    /// pointer to the stack on aarch64, which put a
+                    /// store-to-load round trip on every dimension-8 distance.
+                    #[inline(never)]
+                    fn $name(x: &[f16], batch: &[f16], dimension: usize, output: &mut [f32]) {
+                        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                            *distance = $pair(x, y);
+                        }
+                    }
+                }
+            )*
+        };
+    }
+
+    batch_kernels! {
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        L2_F16_BATCH_AVX512 = l2_batch_f16_avx512(l2_f16_avx512; "avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        L2_F16_BATCH_AVX2 = l2_batch_f16_avx2(l2_f16_avx2; "avx2", "fma", "f16c");
+        #[cfg(target_arch = "aarch64")]
+        L2_F16_BATCH_NEON = l2_batch_f16_neon(l2_f16_neon; "neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        L2_F16_BATCH_LASX = l2_batch_f16_lasx(l2_f16_lasx; "lasx");
+        #[cfg(target_arch = "loongarch64")]
+        L2_F16_BATCH_LSX = l2_batch_f16_lsx(l2_f16_lsx; "lsx");
+    }
+
+    half_c_kernels! {
+        fn (x: &[bf16], y: &[bf16]) -> f32 => (x.as_ptr(), y.as_ptr(), x.len().min(y.len()) as u32);
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        L2_BF16_AVX512: PairKernel<bf16> = l2_bf16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        L2_BF16_AVX2: PairKernel<bf16> = l2_bf16_avx2("avx2", "fma");
+        #[cfg(target_arch = "aarch64")]
+        L2_BF16_NEON: PairKernel<bf16> = l2_bf16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        L2_BF16_LASX: PairKernel<bf16> = l2_bf16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        L2_BF16_LSX: PairKernel<bf16> = l2_bf16_lsx("lsx");
     }
 }
 
