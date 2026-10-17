@@ -94,6 +94,11 @@ impl SeedCollector {
         self.writers.is_empty()
     }
 
+    /// Whether any column of this write receives a seed.
+    pub(crate) fn has_writers(&self) -> bool {
+        !self.writers.is_empty()
+    }
+
     /// Feed one written batch to every seed writer whose column it contains.
     pub fn observe(&mut self, batch: &RecordBatch) -> Result<()> {
         for writer in self.writers.iter_mut() {
@@ -117,4 +122,43 @@ impl SeedCollector {
         }
         Ok(())
     }
+}
+
+/// Whether this transaction's data writes collected version 1 seeds, by the
+/// same rule the writers used: the commit must then carry the paired
+/// `FLAG_ZONE_WRITE_SEEDS` bits (sticky thereafter), so builds that cannot
+/// read version 1 seeds refuse the dataset instead of misreading them.
+///
+/// Mirrors `SeedCollector::for_write` over the dataset schema, which can only
+/// over-approximate the written schema: a transaction that happened not to
+/// touch the seeded column still sets the bits, which is safe (the flag
+/// promises nothing about any particular file). Overwrite discards every
+/// index, so its writes consulted none and collected nothing.
+pub async fn transaction_writes_v1_seeds(
+    dataset: Option<&Dataset>,
+    operation: &crate::dataset::transaction::Operation,
+) -> Result<bool> {
+    use crate::dataset::transaction::Operation;
+    let adds_data_files = matches!(
+        operation,
+        Operation::Append { .. }
+            | Operation::Update { .. }
+            | Operation::Merge { .. }
+            | Operation::DataReplacement { .. }
+    );
+    if !adds_data_files {
+        return Ok(false);
+    }
+    let Some(dataset) = dataset else {
+        return Ok(false);
+    };
+    let version = dataset.manifest.data_storage_format.lance_file_format();
+    if version == ConcreteFileVersion::V1 {
+        return Ok(false);
+    }
+    Ok(
+        SeedCollector::for_write(version, Some(dataset), dataset.schema(), true)
+            .await?
+            .has_writers(),
+    )
 }

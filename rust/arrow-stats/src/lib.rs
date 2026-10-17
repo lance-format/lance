@@ -50,14 +50,13 @@
 //! Structs are not currently supported.
 
 mod nan;
+pub use nan::{NanCounts, count_nans, count_nans_signed};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::{ArrowError, DataType};
 use lance_arrow_scalar::ArrowScalar;
-
-use nan::count_nans;
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -81,6 +80,9 @@ pub struct StatisticsAccumulator {
     null_count: u64,
     /// Count of NaN values. `Some` only for floating-point types (or lists of floats).
     nan_count: Option<u64>,
+    /// Count of NaN values with the sign bit set. `Some` exactly when
+    /// `nan_count` is; always `<= nan_count`.
+    negative_nan_count: Option<u64>,
     /// Number of null items within list entries. `Some` only for list types.
     item_nulls: Option<u64>,
     buffer_memory: u64,
@@ -94,6 +96,10 @@ pub struct Statistics {
     pub null_count: u64,
     /// Count of NaN values. `None` for non-floating-point types.
     pub nan_count: Option<u64>,
+    /// Count of NaN values with the sign bit set (negative NaNs sort below
+    /// negative infinity under Arrow Rust ordering). `None` exactly when
+    /// `nan_count` is; always `<= nan_count`.
+    pub negative_nan_count: Option<u64>,
     /// Number of null items within list entries. `None` for non-list types.
     pub item_nulls: Option<u64>,
     /// Total buffer memory in bytes across all arrays seen by this accumulator.
@@ -117,6 +123,7 @@ impl StatisticsAccumulator {
             min: None,
             max: None,
             null_count: 0,
+            negative_nan_count: nan_count,
             nan_count,
             item_nulls,
             buffer_memory: 0,
@@ -172,7 +179,11 @@ impl StatisticsAccumulator {
             }
             _ => {
                 if let Some(ref mut nan_count) = self.nan_count {
-                    *nan_count += count_nans(array);
+                    let counts = count_nans_signed(array);
+                    *nan_count += counts.total;
+                    if let Some(ref mut negative) = self.negative_nan_count {
+                        *negative += counts.negative;
+                    }
                 }
                 let (batch_min, batch_max) = find_min_max(array)?;
                 self.update_min(batch_min);
@@ -226,7 +237,11 @@ impl StatisticsAccumulator {
             }
             _ => {
                 if let Some(ref mut nan_count) = self.nan_count {
-                    *nan_count += count_nans(item_array);
+                    let counts = count_nans_signed(item_array);
+                    *nan_count += counts.total;
+                    if let Some(ref mut negative) = self.negative_nan_count {
+                        *negative += counts.negative;
+                    }
                 }
                 let (batch_min, batch_max) = find_min_max(item_array)?;
                 self.update_min(batch_min);
@@ -267,6 +282,9 @@ impl StatisticsAccumulator {
         if let (Some(a), Some(b)) = (&mut self.nan_count, other.nan_count) {
             *a += b;
         }
+        if let (Some(a), Some(b)) = (&mut self.negative_nan_count, other.negative_nan_count) {
+            *a += b;
+        }
         self.buffer_memory += other.buffer_memory;
 
         if let (Some(a), Some(b)) = (&mut self.item_nulls, other.item_nulls) {
@@ -297,6 +315,7 @@ impl StatisticsAccumulator {
             max: self.max,
             null_count: self.null_count,
             nan_count: self.nan_count,
+            negative_nan_count: self.negative_nan_count,
             item_nulls: self.item_nulls,
             buffer_memory: self.buffer_memory,
         }
@@ -309,6 +328,7 @@ impl StatisticsAccumulator {
             max: self.max.clone(),
             null_count: self.null_count,
             nan_count: self.nan_count,
+            negative_nan_count: self.negative_nan_count,
             item_nulls: self.item_nulls,
             buffer_memory: self.buffer_memory,
         }
@@ -321,6 +341,9 @@ impl StatisticsAccumulator {
         self.null_count = 0;
         if let Some(ref mut nan_count) = self.nan_count {
             *nan_count = 0;
+        }
+        if let Some(ref mut negative) = self.negative_nan_count {
+            *negative = 0;
         }
         if let Some(ref mut item_nulls) = self.item_nulls {
             *item_nulls = 0;
@@ -604,6 +627,57 @@ mod tests {
         assert_eq!(format!("{}", stats.min.unwrap()), "1.0");
         assert_eq!(format!("{}", stats.max.unwrap()), "3.0");
         assert_eq!(stats.nan_count, Some(1));
+        assert_eq!(stats.negative_nan_count, Some(0));
+    }
+
+    #[test]
+    fn test_nan_sign_split() {
+        let mut acc = StatisticsAccumulator::new(&DataType::Float64);
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(2.0),
+            Some(f64::NAN),
+            Some(-f64::NAN),
+            Some(-f64::NAN),
+            None,
+            Some(-7.0),
+        ]));
+        acc.update(&array).unwrap();
+        // A second batch, merged counting.
+        let more: ArrayRef = Arc::new(Float64Array::from(vec![-f64::NAN, 9.0]));
+        acc.update(&more).unwrap();
+        let stats = acc.finish();
+        // Bounds exclude NaNs of either sign.
+        assert_eq!(format!("{}", stats.min.unwrap()), "-7.0");
+        assert_eq!(format!("{}", stats.max.unwrap()), "9.0");
+        assert_eq!(stats.null_count, 1);
+        assert_eq!(stats.nan_count, Some(4));
+        assert_eq!(stats.negative_nan_count, Some(3));
+    }
+
+    #[test]
+    fn test_nan_sign_split_f32_and_merge_and_reset() {
+        let mut a = StatisticsAccumulator::new(&DataType::Float32);
+        let arr: ArrayRef = Arc::new(Float32Array::from(vec![f32::NAN, -f32::NAN, 1.0]));
+        a.update(&arr).unwrap();
+        let mut b = StatisticsAccumulator::new(&DataType::Float32);
+        let arr: ArrayRef = Arc::new(Float32Array::from(vec![-f32::NAN]));
+        b.update(&arr).unwrap();
+        a.merge(&b).unwrap();
+        let stats = a.statistics();
+        assert_eq!(stats.nan_count, Some(3));
+        assert_eq!(stats.negative_nan_count, Some(2));
+        a.reset();
+        let stats = a.statistics();
+        assert_eq!(stats.nan_count, Some(0));
+        assert_eq!(stats.negative_nan_count, Some(0));
+    }
+
+    #[test]
+    fn test_non_float_has_no_nan_split() {
+        let acc = StatisticsAccumulator::new(&DataType::Int64);
+        let stats = acc.finish();
+        assert_eq!(stats.nan_count, None);
+        assert_eq!(stats.negative_nan_count, None);
     }
 
     #[test]

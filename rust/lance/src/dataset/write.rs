@@ -2603,8 +2603,8 @@ mod tests {
     use std::path::{Component, Prefix};
 
     use arrow_array::{
-        Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
-        StringViewArray, StructArray,
+        Int32Array, Int64Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader,
+        StringArray, StringViewArray, StructArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
@@ -5815,6 +5815,89 @@ mod tests {
             .unwrap();
         let expected = RowAddrTreeMap::from_iter(null_rows.iter().copied());
         assert_eq!(result, SearchResult::exact(expected));
+    }
+
+    /// The first commit whose data files carry version 1 seeds sets the
+    /// paired FLAG_ZONE_WRITE_SEEDS bits; later commits keep them (sticky).
+    #[tokio::test]
+    async fn test_v1_seed_commit_sets_feature_flags() {
+        use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "val",
+            DataType::Int64,
+            false,
+        )]));
+        let make_batch = |start: i64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + 10))],
+            )
+            .unwrap()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(0))], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+
+        // Creating the index writes no data files, so no flag yet.
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+
+        // The first seeded append sets both bits.
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(10))], schema.clone()),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+
+        // Sticky across later commits.
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(make_batch(20))], schema),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+            0
+        );
     }
 
     /// Seed observers see the values the data file stores, so appending a

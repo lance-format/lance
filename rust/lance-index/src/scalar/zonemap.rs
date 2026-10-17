@@ -56,6 +56,11 @@ const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const SEED_NULL_BITMAP_META_KEY: &str = "seed_null_bitmap";
+/// Seed schema-metadata key carrying the seed format version. Absent on
+/// version 0 seeds (see `docs/src/format/index/scalar/zone_write_seeds.md`).
+const SEED_VERSION_META_KEY: &str = "version";
+/// The seed format version this writer emits.
+const SEED_FORMAT_VERSION: &str = "1";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
@@ -66,6 +71,11 @@ pub(crate) struct ZoneMapStatistics {
     null_count: u32,
     // only apply to float type
     nan_count: u32,
+    /// NaNs with the sign bit set (`<= nan_count`). `None` when the source
+    /// cannot split the sign: zones loaded from ZoneMap index files (the file
+    /// format has no column for it) and version 0 seeds. Version 1 seeds and
+    /// freshly computed zones carry `Some`.
+    negative_nan_count: Option<u32>,
     // Bound of this zone within the fragment. Persisted as three separate columns
     // (fragment_id, zone_start, zone_length) in the index file.
     bound: ZoneBound,
@@ -161,6 +171,35 @@ impl ZoneMapIndex {
         }
     }
 
+    fn scalar_is_negative_nan(value: &ScalarValue) -> bool {
+        match value {
+            ScalarValue::Float16(Some(value)) => value.is_nan() && value.is_sign_negative(),
+            ScalarValue::Float32(Some(value)) => value.is_nan() && value.is_sign_negative(),
+            ScalarValue::Float64(Some(value)) => value.is_nan() && value.is_sign_negative(),
+            _ => false,
+        }
+    }
+
+    /// Whether the zone may contain a positive NaN (sorts above positive
+    /// infinity under Arrow Rust ordering). Conservative `true` when the NaN
+    /// sign split is unknown.
+    fn zone_positive_nan_possible(zone: &ZoneMapStatistics) -> bool {
+        match zone.negative_nan_count {
+            Some(negative) => zone.nan_count > negative,
+            None => zone.nan_count > 0,
+        }
+    }
+
+    /// Whether the zone may contain a negative NaN (sorts below negative
+    /// infinity under Arrow Rust ordering). Conservative `true` when the NaN
+    /// sign split is unknown.
+    fn zone_negative_nan_possible(zone: &ZoneMapStatistics) -> bool {
+        match zone.negative_nan_count {
+            Some(negative) => negative > 0,
+            None => zone.nan_count > 0,
+        }
+    }
+
     /// Returns true if the zone has a non-null, non-NaN min value.
     fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
         !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
@@ -211,7 +250,11 @@ impl ZoneMapIndex {
                 if Self::zone_has_missing_extrema(zone) && Self::zone_has_comparable_values(zone) {
                     return None;
                 }
-                if Self::scalar_is_nan(&zone.max) {
+                // Any NaN breaks the fold: positive NaNs sort above every
+                // finite value and negative NaNs below, so no finite global
+                // range bounds a NaN-bearing zone. Legacy zones mark this with
+                // a NaN max; fresh zones keep finite bounds plus the counts.
+                if zone.nan_count > 0 || Self::scalar_is_nan(&zone.max) {
                     return None;
                 }
                 if Self::scalar_is_finite_bound(&zone.min)
@@ -290,7 +333,11 @@ impl ZoneMapIndex {
                 };
 
                 if is_nan {
-                    return Ok(zone.nan_count > 0);
+                    return Ok(if Self::scalar_is_negative_nan(target) {
+                        Self::zone_negative_nan_possible(zone)
+                    } else {
+                        Self::zone_positive_nan_possible(zone)
+                    });
                 }
 
                 if Self::zone_has_missing_extrema(zone) {
@@ -300,8 +347,58 @@ impl ZoneMapIndex {
                 Ok(target >= &zone.min && target <= &zone.max)
             }
             SargableQuery::Range(start, end) => {
-                // Zone overlaps with query range if there's any intersection between
-                // the zone's [min, max] and the query's range
+                // NaN range bounds resolve from the counts alone, so handle
+                // them before the missing-extrema fallback: an all-NaN zone
+                // has null bounds yet still answers `x <= -NaN` exactly.
+                // A NaN on one side makes that side's answer independent of
+                // the other bound (conservatively over-inclusive).
+                match start {
+                    Bound::Included(s) if Self::scalar_is_nan(s) => {
+                        return Ok(if Self::scalar_is_negative_nan(s) {
+                            // x >= -NaN: -NaN sorts below everything, so any
+                            // non-null value matches.
+                            Self::zone_negative_nan_possible(zone)
+                                || zone.bound.length as u64 > u64::from(zone.null_count)
+                        } else {
+                            // x >= +NaN: only positive NaNs sort there.
+                            Self::zone_positive_nan_possible(zone)
+                        });
+                    }
+                    Bound::Excluded(s) if Self::scalar_is_nan(s) => {
+                        return Ok(if Self::scalar_is_negative_nan(s) {
+                            // x > -NaN: every finite value and positive NaN.
+                            Self::zone_has_comparable_values(zone)
+                                || Self::zone_positive_nan_possible(zone)
+                        } else {
+                            // x > +NaN: nothing sorts above a positive NaN.
+                            false
+                        });
+                    }
+                    _ => {}
+                }
+                match end {
+                    Bound::Included(e) if Self::scalar_is_nan(e) => {
+                        return Ok(if Self::scalar_is_negative_nan(e) {
+                            // x <= -NaN: only negative NaNs sort there.
+                            Self::zone_negative_nan_possible(zone)
+                        } else {
+                            // x <= +NaN: any non-null value matches.
+                            zone.bound.length as u64 > u64::from(zone.null_count)
+                        });
+                    }
+                    Bound::Excluded(e) if Self::scalar_is_nan(e) => {
+                        return Ok(if Self::scalar_is_negative_nan(e) {
+                            // x < -NaN: nothing sorts below a negative NaN.
+                            false
+                        } else {
+                            // x < +NaN: every finite value and negative NaN.
+                            Self::zone_has_comparable_values(zone)
+                                || Self::zone_negative_nan_possible(zone)
+                        });
+                    }
+                    _ => {}
+                }
+
                 if Self::zone_has_missing_extrema(zone) {
                     return Ok(Self::zone_has_comparable_values(zone));
                 }
@@ -312,99 +409,27 @@ impl ZoneMapIndex {
                 let start_check = match start {
                     Bound::Unbounded => true,
                     Bound::Included(s) => {
-                        // Handle NaN in range bounds - NaN is greater than all finite values
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0);
-                            }
-                            _ => {}
-                        }
-                        // Handle the case where zone_max is NaN
-                        // If zone_max is NaN, the zone contains both finite values and NaN
-                        // Since we don't know the actual max, we'll be conservative and include the zone
-                        match zone_max {
-                            ScalarValue::Float16(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float32(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => true,
-                            _ => zone_max >= s,
-                        }
+                        // Positive NaNs sort above every finite value, so they
+                        // satisfy any finite lower bound. Legacy zones mark NaN
+                        // presence with a NaN max (not comparable); fresh zones
+                        // keep a finite max plus the counts.
+                        Self::zone_positive_nan_possible(zone)
+                            || (!Self::scalar_is_nan(zone_max) && zone_max >= s)
                     }
                     Bound::Excluded(s) => {
-                        // Handle NaN in range bounds
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(false); // Nothing is greater than NaN
-                            }
-                            _ => {}
-                        }
-                        zone_max > s
+                        Self::zone_positive_nan_possible(zone)
+                            || (!Self::scalar_is_nan(zone_max) && zone_max > s)
                     }
                 };
 
                 let end_check = match end {
                     Bound::Unbounded => true,
                     Bound::Included(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // NaN is included, so check if zone has NaN values or finite values
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0 || zone_min <= e);
-                            }
-                            _ => {}
-                        }
-                        zone_min <= e
+                        // Negative NaNs sort below every finite value, so they
+                        // satisfy any finite upper bound.
+                        Self::zone_negative_nan_possible(zone) || zone_min <= e
                     }
-                    Bound::Excluded(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // Everything is less than NaN, so include all finite values
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(true);
-                            }
-                            _ => {}
-                        }
-                        zone_min < e
-                    }
+                    Bound::Excluded(e) => Self::zone_negative_nan_possible(zone) || zone_min < e,
                 };
 
                 Ok(start_check && end_check)
@@ -418,7 +443,11 @@ impl ZoneMapIndex {
                         match value {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
-                                    zone.nan_count > 0
+                                    if f.is_sign_negative() {
+                                        Self::zone_negative_nan_possible(zone)
+                                    } else {
+                                        Self::zone_positive_nan_possible(zone)
+                                    }
                                 } else if Self::zone_has_missing_extrema(zone) {
                                     Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
@@ -429,7 +458,11 @@ impl ZoneMapIndex {
                             }
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
-                                    zone.nan_count > 0
+                                    if f.is_sign_negative() {
+                                        Self::zone_negative_nan_possible(zone)
+                                    } else {
+                                        Self::zone_positive_nan_possible(zone)
+                                    }
                                 } else if Self::zone_has_missing_extrema(zone) {
                                     Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
@@ -440,7 +473,11 @@ impl ZoneMapIndex {
                             }
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
-                                    zone.nan_count > 0
+                                    if f.is_sign_negative() {
+                                        Self::zone_negative_nan_possible(zone)
+                                    } else {
+                                        Self::zone_positive_nan_possible(zone)
+                                    }
                                 } else if Self::zone_has_missing_extrema(zone) {
                                     Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
@@ -672,6 +709,8 @@ impl ZoneMapIndex {
                 max,
                 null_count,
                 nan_count,
+                // The index file format has no sign-split column.
+                negative_nan_count: None,
                 bound: ZoneBound {
                     fragment_id: fragment_id_col.value(i),
                     start: zone_start_col.value(i),
@@ -1011,6 +1050,7 @@ fn remap_zone(
             max: zone.max.clone(),
             null_count,
             nan_count: zone.nan_count,
+            negative_nan_count: zone.negative_nan_count,
             bound: ZoneBound {
                 fragment_id: start >> 32,
                 start: start & u64::from(u32::MAX),
@@ -1214,9 +1254,23 @@ impl ZoneMapIndexBuilder {
                 ScalarValue::iter_to_array(std::iter::repeat_n(placeholder, self.maps.len()))?;
             (bounds.clone(), bounds)
         } else {
+            // The ZoneMap index file format predates the NaN sign split: it
+            // has no column for it, and released readers take a NaN max as
+            // the marker that the zone holds NaNs. Keep writing that marker
+            // here so existing readers stay conservative; fresh in-memory
+            // zones and version 1 seeds carry finite bounds plus the counts.
+            let legacy_max = |stat: &ZoneMapStatistics| {
+                if stat.nan_count > 0
+                    && let Some(nan) = nan_scalar(&self.items_type)
+                {
+                    nan
+                } else {
+                    stat.max.clone()
+                }
+            };
             (
                 ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?,
-                ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.max.clone()))?,
+                ScalarValue::iter_to_array(self.maps.iter().map(legacy_max))?,
             )
         };
         let null_counts =
@@ -1344,30 +1398,15 @@ impl ZoneMapProcessor {
             ))
         })
     }
+}
 
-    fn nan_scalar(data_type: &DataType) -> Option<ScalarValue> {
-        match data_type {
-            DataType::Float16 => Some(ScalarValue::Float16(Some(half::f16::NAN))),
-            DataType::Float32 => Some(ScalarValue::Float32(Some(f32::NAN))),
-            DataType::Float64 => Some(ScalarValue::Float64(Some(f64::NAN))),
-            _ => None,
-        }
-    }
-
-    fn max_value_from_stats(
-        value: Option<&ArrayRef>,
-        data_type: &DataType,
-        nan_count: u32,
-    ) -> Result<ScalarValue> {
-        if nan_count > 0
-            && let Some(nan) = Self::nan_scalar(data_type)
-        {
-            // DataFusion's max accumulator surfaced NaN as the zone max.  Keep
-            // that stored zonemap shape while using arrow_stats so existing
-            // range/equality pruning remains conservative around NaN.
-            return Ok(nan);
-        }
-        Self::scalar_value_from_stat(value, data_type)
+/// The positive-NaN scalar for a float type; `None` for everything else.
+fn nan_scalar(data_type: &DataType) -> Option<ScalarValue> {
+    match data_type {
+        DataType::Float16 => Some(ScalarValue::Float16(Some(half::f16::NAN))),
+        DataType::Float32 => Some(ScalarValue::Float32(Some(f32::NAN))),
+        DataType::Float64 => Some(ScalarValue::Float64(Some(f64::NAN))),
+        _ => None,
     }
 }
 
@@ -1400,6 +1439,7 @@ impl ZoneProcessor for ZoneMapProcessor {
                     max: ScalarValue::try_new_null(&self.data_type)?,
                     null_count: Self::stat_count_to_u32("null_count", *null_count)?,
                     nan_count: 0,
+                    negative_nan_count: Some(0),
                     bound,
                 });
             }
@@ -1407,18 +1447,26 @@ impl ZoneProcessor for ZoneMapProcessor {
         let null_count = Self::stat_count_to_u32("null_count", statistics.null_count)?;
 
         let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
+        let negative_nan_count = Self::stat_count_to_u32(
+            "negative_nan_count",
+            statistics.negative_nan_count.unwrap_or(0),
+        )?;
+        // Bounds exclude NaNs of either sign (the accumulator skips them);
+        // NaN presence lives in the exact counts. The legacy "NaN max" marker
+        // is applied only when serializing the ZoneMap INDEX file, whose
+        // format predates the sign split.
         Ok(ZoneMapStatistics {
             min: Self::scalar_value_from_stat(
                 statistics.min.as_ref().map(|scalar| scalar.as_array()),
                 &self.data_type,
             )?,
-            max: Self::max_value_from_stats(
+            max: Self::scalar_value_from_stat(
                 statistics.max.as_ref().map(|scalar| scalar.as_array()),
                 &self.data_type,
-                nan_count,
             )?,
             null_count,
             nan_count,
+            negative_nan_count: Some(negative_nan_count),
             bound,
         })
     }
@@ -1757,6 +1805,19 @@ impl ZoneMapSeedWriter {
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.null_count));
         let nan_counts =
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.nan_count));
+        let negative_nan_counts = arrow_array::UInt32Array::from_iter_values(
+            zones
+                .iter()
+                .map(|s| {
+                    s.negative_nan_count.ok_or_else(|| {
+                        lance_core::Error::invalid_input(
+                            "version 1 seeds require the exact NaN sign split; a zone \
+                             without one cannot be serialized as a seed",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<u32>>>()?,
+        );
         let zone_lengths =
             arrow_array::UInt64Array::from_iter_values(zones.iter().map(|s| s.bound.length as u64));
 
@@ -1765,6 +1826,7 @@ impl ZoneMapSeedWriter {
             Field::new("max", data_type.clone(), true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
+            Field::new("negative_nan_count", DataType::UInt32, false),
             Field::new("zone_length", DataType::UInt64, false),
         ]));
 
@@ -1773,6 +1835,7 @@ impl ZoneMapSeedWriter {
             maxs,
             Arc::new(null_counts) as ArrayRef,
             Arc::new(nan_counts) as ArrayRef,
+            Arc::new(negative_nan_counts) as ArrayRef,
             Arc::new(zone_lengths) as ArrayRef,
         ];
         Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
@@ -1819,6 +1882,25 @@ impl ZoneMapSeedWriter {
             None
         };
 
+        // Version dispatch: absence means version 0 (the original schema,
+        // whose max may carry the legacy +NaN marker and whose NaN sign split
+        // is unknown). Unknown future versions must not be misread as either.
+        let version = reader.schema().metadata.get(SEED_VERSION_META_KEY).cloned();
+        let is_v1 = match version.as_deref() {
+            None => false,
+            Some(SEED_FORMAT_VERSION) => true,
+            Some(other) => {
+                return Err(lance_core::Error::not_supported_source(
+                    format!(
+                        "zone map seed format version '{}' is not supported by this \
+                         build; please upgrade Lance",
+                        other
+                    )
+                    .into(),
+                ));
+            }
+        };
+
         let batch = match reader.next() {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => {
@@ -1860,21 +1942,62 @@ impl ZoneMapSeedWriter {
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| lance_core::Error::invalid_input("seed 'zone_length' is not UInt64"))?;
+        let negative_nan_count_col = if is_v1 {
+            Some(
+                batch
+                    .column_by_name("negative_nan_count")
+                    .ok_or_else(|| {
+                        lance_core::Error::invalid_input(
+                            "version 1 seed batch missing 'negative_nan_count' column",
+                        )
+                    })?
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .ok_or_else(|| {
+                        lance_core::Error::invalid_input("seed 'negative_nan_count' is not UInt32")
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let num_zones = batch.num_rows();
         let mut zones = Vec::with_capacity(num_zones);
         for i in 0..num_zones {
             let zone_start = i as u64 * rows_per_zone;
-            let zone_length = zone_length_col.value(i) as usize;
+            let zone_length = zone_length_col.value(i);
+            let null_count = null_count_col.value(i);
+            let nan_count = nan_count_col.value(i);
+            let negative_nan_count = negative_nan_count_col.map(|col| col.value(i));
+            if is_v1 {
+                // Validate per the format: exact counts that fit the zone,
+                // checked without overflow.
+                if u64::from(null_count) + u64::from(nan_count) > zone_length {
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "seed zone {} counts exceed zone_length: null_count={} nan_count={} \
+                         zone_length={}",
+                        i, null_count, nan_count, zone_length
+                    )));
+                }
+                if let Some(negative) = negative_nan_count
+                    && negative > nan_count
+                {
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "seed zone {} negative_nan_count {} exceeds nan_count {}",
+                        i, negative, nan_count
+                    )));
+                }
+            }
             zones.push(ZoneMapStatistics {
                 min: datafusion_common::ScalarValue::try_from_array(min_col, i)?,
                 max: datafusion_common::ScalarValue::try_from_array(max_col, i)?,
-                null_count: null_count_col.value(i),
-                nan_count: nan_count_col.value(i),
+                null_count,
+                nan_count,
+                negative_nan_count,
                 bound: ZoneBound {
                     fragment_id,
                     start: zone_start,
-                    length: zone_length,
+                    length: zone_length as usize,
                 },
             });
         }
@@ -1992,6 +2115,10 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
         };
         let mut schema = batch.schema().as_ref().clone();
         schema.metadata.insert(
+            SEED_VERSION_META_KEY.to_string(),
+            SEED_FORMAT_VERSION.to_string(),
+        );
+        schema.metadata.insert(
             SEED_NULL_BITMAP_META_KEY.to_string(),
             hex_encode(&bitmap_bytes),
         );
@@ -2059,8 +2186,12 @@ mod tests {
 
     use crate::scalar::zoned::ZoneBound;
     use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
-    use arrow::datatypes::{ArrowPrimitiveType, Decimal128Type, Float32Type, Int64Type};
-    use arrow_array::{Array, PrimitiveArray, RecordBatch, UInt64Array, record_batch};
+    use arrow::datatypes::{
+        ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int64Type,
+    };
+    use arrow_array::{
+        Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -2076,7 +2207,9 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
+    use std::ops::Bound;
 
+    use crate::scalar::seed::IndexSeedWriter;
     use crate::scalar::zoned::ZoneProcessor;
     use crate::scalar::{
         RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
@@ -2089,11 +2222,10 @@ mod tests {
     use arrow_array::Int32Array;
     use lance_core::Error;
 
-    // Add missing imports for the tests
-    use crate::Index; // Import Index trait to access calculate_included_frags
+    use crate::Index;
     use crate::metrics::NoOpMetricsCollector;
-    use roaring::RoaringBitmap; // Import RoaringBitmap for the test
-    use std::collections::{Bound, HashMap};
+    use roaring::RoaringBitmap;
+    use std::collections::HashMap;
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -2211,6 +2343,7 @@ mod tests {
             max: ScalarValue::Int64(Some(40)),
             null_count: 1,
             nan_count: 0,
+            negative_nan_count: Some(0),
             bound: ZoneBound {
                 fragment_id: 2,
                 start: 10,
@@ -2288,6 +2421,7 @@ mod tests {
             max: ScalarValue::Null,
             null_count: 2,
             nan_count: 0,
+            negative_nan_count: Some(0),
             bound: ZoneBound {
                 fragment_id: 0,
                 start: 0,
@@ -2820,9 +2954,11 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the first three zones since they contain values in the range [0, 250]
+        // The index file round trip loses the NaN sign split (negative_nan_count:
+        // None), so every NaN-bearing zone may hold NaNs on either side of the
+        // range and none of the five zones can be pruned.
         let mut expected = RowAddrTreeMap::new();
-        expected.insert_range(0..300);
+        expected.insert_range(0..500);
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsIn query with NaN and finite values
@@ -2997,6 +3133,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(99)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
@@ -3008,6 +3145,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(100)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 100,
@@ -3160,6 +3298,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(8191)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
@@ -3171,6 +3310,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16383)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 8192,
@@ -3182,6 +3322,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16425)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 16384,
@@ -3321,6 +3462,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(4999)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -3332,6 +3474,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 5000,
@@ -3343,6 +3486,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(13191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -3354,6 +3498,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 5000,
@@ -3365,6 +3510,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -3530,6 +3676,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -3541,6 +3688,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -3552,6 +3700,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -3606,6 +3755,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -3617,6 +3767,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -3628,6 +3779,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -3723,6 +3875,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("azz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 0,
                     start: 0,
@@ -3734,6 +3887,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("baz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 1,
                     start: 0,
@@ -3745,6 +3899,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("foz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 2,
                     start: 0,
@@ -3756,6 +3911,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("fzz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 3,
                     start: 0,
@@ -3767,6 +3923,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("foobar".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 4,
                     start: 0,
@@ -3778,6 +3935,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("gzz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 5,
                     start: 0,
@@ -3829,6 +3987,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("test".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 0,
                     start: 0,
@@ -3841,6 +4000,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("tf".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 1,
                     start: 0,
@@ -3853,6 +4013,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("def".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 2,
                     start: 0,
@@ -3912,6 +4073,7 @@ mod tests {
                 max: ScalarValue::LargeUtf8(Some("azz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 0,
                     start: 0,
@@ -3923,6 +4085,7 @@ mod tests {
                 max: ScalarValue::LargeUtf8(Some("foobar".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 1,
                     start: 0,
@@ -5428,5 +5591,261 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(index.value_range(), None);
+    }
+
+    fn f64_zone(
+        min: Option<f64>,
+        max: Option<f64>,
+        null_count: u32,
+        nan_count: u32,
+        negative_nan_count: Option<u32>,
+        length: usize,
+    ) -> ZoneMapStatistics {
+        ZoneMapStatistics {
+            min: ScalarValue::Float64(min),
+            max: ScalarValue::Float64(max),
+            null_count,
+            nan_count,
+            negative_nan_count,
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length,
+            },
+        }
+    }
+
+    fn range_q(start: Bound<f64>, end: Bound<f64>) -> SargableQuery {
+        let conv = |b: Bound<f64>| match b {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(v) => Bound::Included(ScalarValue::Float64(Some(v))),
+            Bound::Excluded(v) => Bound::Excluded(ScalarValue::Float64(Some(v))),
+        };
+        SargableQuery::Range(conv(start), conv(end))
+    }
+
+    /// The NaN sign split makes evaluation exact on both sides; an unknown
+    /// split stays conservative. The lower side was a live false negative
+    /// before the split existed.
+    #[tokio::test]
+    async fn test_eval_nan_sign_split() {
+        use std::ops::Bound;
+        let index = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let eval = |zone: &ZoneMapStatistics, q: &SargableQuery| {
+            index.evaluate_zone_against_query(zone, q).unwrap()
+        };
+
+        // Only negative NaNs besides the finite range [1, 5].
+        let neg = f64_zone(Some(1.0), Some(5.0), 0, 2, Some(2), 10);
+        // Only positive NaNs.
+        let pos = f64_zone(Some(1.0), Some(5.0), 0, 2, Some(0), 10);
+        // Split unknown (legacy / version 0 sources).
+        let unknown = f64_zone(Some(1.0), Some(5.0), 0, 2, None, 10);
+        // No NaNs at all.
+        let finite = f64_zone(Some(1.0), Some(5.0), 0, 0, Some(0), 10);
+
+        // Upper bounds: negative NaNs sort below every finite value.
+        let below = range_q(Bound::Unbounded, Bound::Included(0.0));
+        assert!(eval(&neg, &below), "negative NaNs match x <= 0");
+        assert!(!eval(&pos, &below), "positive NaNs sort above, no match");
+        assert!(eval(&unknown, &below), "unknown split stays conservative");
+        assert!(!eval(&finite, &below));
+
+        // Lower bounds: positive NaNs sort above every finite value.
+        let above = range_q(Bound::Included(10.0), Bound::Unbounded);
+        assert!(!eval(&neg, &above));
+        assert!(eval(&pos, &above));
+        assert!(eval(&unknown, &above));
+        assert!(!eval(&finite, &above));
+
+        // Equals and IsIn are sign-aware on NaN targets.
+        let eq_pos = SargableQuery::Equals(ScalarValue::Float64(Some(f64::NAN)));
+        let eq_neg = SargableQuery::Equals(ScalarValue::Float64(Some(-f64::NAN)));
+        assert!(!eval(&neg, &eq_pos));
+        assert!(eval(&neg, &eq_neg));
+        assert!(eval(&pos, &eq_pos));
+        assert!(!eval(&pos, &eq_neg));
+        assert!(eval(&unknown, &eq_pos) && eval(&unknown, &eq_neg));
+        let in_neg = SargableQuery::IsIn(vec![ScalarValue::Float64(Some(-f64::NAN))]);
+        assert!(eval(&neg, &in_neg));
+        assert!(!eval(&pos, &in_neg));
+    }
+
+    /// NaN range bounds resolve by sign, including on zones without usable
+    /// extrema (an all-NaN zone has null bounds).
+    #[tokio::test]
+    async fn test_eval_nan_range_bounds() {
+        use std::ops::Bound;
+        let index = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let eval = |zone: &ZoneMapStatistics, q: &SargableQuery| {
+            index.evaluate_zone_against_query(zone, q).unwrap()
+        };
+        let finite = f64_zone(Some(1.0), Some(5.0), 0, 0, Some(0), 10);
+        let all_neg_nan = f64_zone(None, None, 0, 2, Some(2), 2);
+
+        // x >= -NaN matches every non-null value (was: only NaN-bearing zones).
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Included(-f64::NAN), Bound::Unbounded)
+        ));
+        // x > -NaN matches every comparable value (was: nothing).
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Excluded(-f64::NAN), Bound::Unbounded)
+        ));
+        // x > +NaN matches nothing.
+        assert!(!eval(
+            &finite,
+            &range_q(Bound::Excluded(f64::NAN), Bound::Unbounded)
+        ));
+        // x <= +NaN matches every non-null value; x < +NaN excludes positive NaNs.
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Unbounded, Bound::Included(f64::NAN))
+        ));
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Unbounded, Bound::Excluded(f64::NAN))
+        ));
+        // x < -NaN matches nothing.
+        assert!(!eval(
+            &finite,
+            &range_q(Bound::Unbounded, Bound::Excluded(-f64::NAN))
+        ));
+
+        // All-NaN zone (null bounds): x <= -NaN still answers exactly.
+        assert!(eval(
+            &all_neg_nan,
+            &range_q(Bound::Unbounded, Bound::Included(-f64::NAN))
+        ));
+        assert!(!eval(
+            &all_neg_nan,
+            &range_q(Bound::Included(f64::NAN), Bound::Unbounded)
+        ));
+    }
+
+    /// Freshly built zones keep finite bounds plus exact counts; the index
+    /// FILE still carries the legacy +NaN max marker so released readers stay
+    /// conservative, and reloading it leaves the sign split unknown.
+    #[tokio::test]
+    async fn test_index_file_keeps_legacy_nan_max() {
+        let index = train_and_load::<Float64Type>(vec![vec![
+            Some(1.0),
+            Some(-f64::NAN),
+            Some(3.0),
+            Some(4.0),
+        ]])
+        .await;
+        // rows_per_zone = 2: zone 0 holds [1.0, -NaN], zone 1 holds [3.0, 4.0].
+        assert_eq!(index.zones[0].nan_count, 1);
+        // Round-tripped through the index file: marker max, split unknown.
+        assert!(ZoneMapIndex::scalar_is_nan(&index.zones[0].max));
+        assert_eq!(index.zones[0].negative_nan_count, None);
+        assert_eq!(index.zones[0].min, ScalarValue::Float64(Some(1.0)));
+        // Conservative on both sides without the split.
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &range_q(std::ops::Bound::Unbounded, std::ops::Bound::Included(0.0))
+                )
+                .unwrap()
+        );
+        // The finite zone is exact.
+        assert!(ZoneMapIndex::zone_has_finite_extrema(&index.zones[1]));
+        assert_eq!(index.zones[1].negative_nan_count, None);
+    }
+
+    /// Version 1 seed round trip: finite bounds, exact sign split, version
+    /// metadata; and the reader rejects unknown versions and invalid counts.
+    #[test]
+    fn test_seed_v1_round_trip_and_validation() {
+        let mut writer = ZoneMapSeedWriter::new("c", 4, DataType::Float64).unwrap();
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(-f64::NAN),
+            Some(f64::NAN),
+            Some(5.0),
+            Some(7.0),
+            None,
+        ]));
+        writer.observe_batch(&values).unwrap();
+        let bytes = writer.finish().unwrap().unwrap();
+
+        let (zones, _bitmap) = ZoneMapSeedWriter::deserialize_seed(3, &bytes, 4).unwrap();
+        assert_eq!(zones.len(), 2);
+        // Zone 0: [1.0, -NaN, +NaN, 5.0] -> finite bounds, exact split.
+        assert_eq!(zones[0].min, ScalarValue::Float64(Some(1.0)));
+        assert_eq!(zones[0].max, ScalarValue::Float64(Some(5.0)));
+        assert_eq!(zones[0].nan_count, 2);
+        assert_eq!(zones[0].negative_nan_count, Some(1));
+        assert_eq!(zones[0].bound.fragment_id, 3);
+        // Zone 1: [7.0, null].
+        assert_eq!(zones[1].null_count, 1);
+        assert_eq!(zones[1].negative_nan_count, Some(0));
+
+        // Tampered version metadata is refused.
+        let tampered = {
+            use arrow_ipc::reader::FileReader;
+            use arrow_ipc::writer::FileWriter;
+            use std::io::Cursor;
+            let mut reader = FileReader::try_new(Cursor::new(bytes.as_ref()), None).unwrap();
+            let batch = reader.next().unwrap().unwrap();
+            let mut schema = batch.schema().as_ref().clone();
+            schema
+                .metadata
+                .insert("version".to_string(), "2".to_string());
+            let batch =
+                RecordBatch::try_new(Arc::new(schema.clone()), batch.columns().to_vec()).unwrap();
+            let mut buf = Cursor::new(Vec::new());
+            {
+                let mut w = FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+                w.write(&batch).unwrap();
+                w.finish().unwrap();
+            }
+            bytes::Bytes::from(buf.into_inner())
+        };
+        let err = ZoneMapSeedWriter::deserialize_seed(0, &tampered, 4).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    /// Version 0 seeds (no version metadata) keep their legacy semantics:
+    /// split unknown, and a legacy +NaN max marker is preserved as data.
+    #[test]
+    fn test_seed_v0_read_back() {
+        use arrow_ipc::writer::FileWriter;
+        use std::io::Cursor;
+        // Hand-build a v0 seed batch: the old five-column schema, NaN max.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Float64, true),
+            Field::new("max", DataType::Float64, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float64Array::from(vec![Some(1.0)])),
+                Arc::new(Float64Array::from(vec![Some(f64::NAN)])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![2])),
+                Arc::new(UInt64Array::from(vec![4u64])),
+            ],
+        )
+        .unwrap();
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let bytes = bytes::Bytes::from(buf.into_inner());
+        let (zones, bitmap) = ZoneMapSeedWriter::deserialize_seed(1, &bytes, 4).unwrap();
+        assert!(bitmap.is_none());
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].negative_nan_count, None);
+        assert!(ZoneMapIndex::scalar_is_nan(&zones[0].max));
+        assert_eq!(zones[0].nan_count, 2);
     }
 }
