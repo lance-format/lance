@@ -32,7 +32,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::dot_f16::{
     PackedCentroidsF16, amx_fp16_available, amx_fp16_supported, dot_f16_batch_16,
 };
-use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
+use lance_linalg::distance::hamming::{hamming, hamming_distance_batch_into};
 use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch_into};
 use lance_linalg::kernels::{
     Normalizable, argmin_value_float, argmin_value_float_with_bias, normalize,
@@ -1959,7 +1959,11 @@ pub fn kmeans_find_partitions_binary(
     distance_type: DistanceType,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
     let dists: Vec<f32> = match distance_type {
-        DistanceType::Hamming => hamming_distance_batch(query, centroids, query.len()).collect(),
+        DistanceType::Hamming => {
+            let mut dists = vec![0.0; centroids.len() / query.len()];
+            hamming_distance_batch_into(query, centroids, query.len(), &mut dists);
+            dists
+        }
         _ => {
             panic!(
                 "KMeans::find_partitions: {} is not supported",
