@@ -22,9 +22,9 @@ use arrow_schema::{ArrowError, DataType};
 /// for each half-precision C kernel in the caller's `ffi` module.
 ///
 /// The listed features must cover the flags build.rs compiled that kernel's
-/// object with. The AVX-512 objects target Sapphire Rapids, so they require
-/// `avx512fp16`, which stands in for that CPU's features, including the
-/// `avx512bf16` that [`lance_core::utils::cpu::CpuFeatures`] does not track.
+/// object with; see `half_c_objects`. The AVX-512 objects target Sapphire
+/// Rapids, so they require `avx512fp16`, which stands in for that CPU's
+/// features, plus `avx512bf16` for the bf16 object.
 ///
 /// The C arguments must clamp lengths so the kernel only reads within the
 /// slices: the wrapper is safe to call on any host with the listed features.
@@ -51,6 +51,36 @@ macro_rules! half_c_kernels {
             }
         )*
     };
+}
+
+/// What build.rs compiles each half-precision C object for, as feature sets.
+/// Every `half_c` module checks its candidates against these at compile time.
+#[cfg(all(test, kernel_support = "half"))]
+mod half_c_objects {
+    use lance_core::utils::cpu::CpuFeatures;
+
+    pub const fn is(features: CpuFeatures, object: CpuFeatures) -> bool {
+        features.contains(object) && object.contains(features)
+    }
+
+    /// `-march=haswell`, less LZCNT and MOVBE, which `CpuFeatures` does not
+    /// track.
+    #[cfg(target_arch = "x86_64")]
+    pub const HASWELL: CpuFeatures =
+        CpuFeatures::from_target_features(&["avx2", "fma", "f16c", "bmi1", "bmi2"]);
+    /// `-march=sapphirerapids -mavx512fp16`.
+    #[cfg(target_arch = "x86_64")]
+    pub const SAPPHIRE_RAPIDS_F16: CpuFeatures = CpuFeatures::from_target_features(&["avx512fp16"]);
+    #[cfg(target_arch = "x86_64")]
+    pub const SAPPHIRE_RAPIDS_BF16: CpuFeatures =
+        CpuFeatures::from_target_features(&["avx512fp16", "avx512bf16"]);
+    /// `-march=armv8.2-a+fp16`, or an Apple CPU that has FP16.
+    #[cfg(target_arch = "aarch64")]
+    pub const ARMV8_2_FP16: CpuFeatures = CpuFeatures::from_target_features(&["neon", "fp16"]);
+    #[cfg(target_arch = "loongarch64")]
+    pub const LASX: CpuFeatures = CpuFeatures::from_target_features(&["lasx"]);
+    #[cfg(target_arch = "loongarch64")]
+    pub const LSX: CpuFeatures = CpuFeatures::from_target_features(&["lsx"]);
 }
 
 pub mod cosine;

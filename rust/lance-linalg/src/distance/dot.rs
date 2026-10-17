@@ -204,7 +204,7 @@ mod half_c {
         #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
         DOT_F16_AVX512: PairKernel<f16> = dot_f16_avx512("avx512fp16");
         #[cfg(target_arch = "x86_64")]
-        DOT_F16_AVX2: PairKernel<f16> = dot_f16_avx2("avx2", "fma", "f16c");
+        DOT_F16_AVX2: PairKernel<f16> = dot_f16_avx2("avx2", "fma", "f16c", "bmi1", "bmi2");
         #[cfg(target_arch = "aarch64")]
         DOT_F16_NEON: PairKernel<f16> = dot_f16_neon("neon", "fp16");
         #[cfg(target_arch = "loongarch64")]
@@ -216,9 +216,9 @@ mod half_c {
     half_c_kernels! {
         fn (x: &[bf16], y: &[bf16]) -> f32 => (x.as_ptr(), y.as_ptr(), x.len().min(y.len()) as u32);
         #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
-        DOT_BF16_AVX512: PairKernel<bf16> = dot_bf16_avx512("avx512fp16");
+        DOT_BF16_AVX512: PairKernel<bf16> = dot_bf16_avx512("avx512fp16", "avx512bf16");
         #[cfg(target_arch = "x86_64")]
-        DOT_BF16_AVX2: PairKernel<bf16> = dot_bf16_avx2("avx2", "fma");
+        DOT_BF16_AVX2: PairKernel<bf16> = dot_bf16_avx2("avx2", "fma", "f16c", "bmi1", "bmi2");
         #[cfg(target_arch = "aarch64")]
         DOT_BF16_NEON: PairKernel<bf16> = dot_bf16_neon("neon", "fp16");
         #[cfg(target_arch = "loongarch64")]
@@ -226,6 +226,38 @@ mod half_c {
         #[cfg(target_arch = "loongarch64")]
         DOT_BF16_LSX: PairKernel<bf16> = dot_bf16_lsx("lsx");
     }
+
+    // Each candidate must require what build.rs compiled its object for.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    const _: () = {
+        use crate::distance::half_c_objects::{HASWELL, is};
+        assert!(is(DOT_F16_AVX2.features(), HASWELL));
+        assert!(is(DOT_BF16_AVX2.features(), HASWELL));
+    };
+    #[cfg(all(test, target_arch = "x86_64", kernel_support = "avx512_f16"))]
+    const _: () = {
+        use crate::distance::half_c_objects::{SAPPHIRE_RAPIDS_F16, is};
+        assert!(is(DOT_F16_AVX512.features(), SAPPHIRE_RAPIDS_F16));
+    };
+    #[cfg(all(test, target_arch = "x86_64", kernel_support = "avx512_bf16"))]
+    const _: () = {
+        use crate::distance::half_c_objects::{SAPPHIRE_RAPIDS_BF16, is};
+        assert!(is(DOT_BF16_AVX512.features(), SAPPHIRE_RAPIDS_BF16));
+    };
+    #[cfg(all(test, target_arch = "aarch64"))]
+    const _: () = {
+        use crate::distance::half_c_objects::{ARMV8_2_FP16, is};
+        assert!(is(DOT_F16_NEON.features(), ARMV8_2_FP16));
+        assert!(is(DOT_BF16_NEON.features(), ARMV8_2_FP16));
+    };
+    #[cfg(all(test, target_arch = "loongarch64"))]
+    const _: () = {
+        use crate::distance::half_c_objects::{LASX, LSX, is};
+        assert!(is(DOT_F16_LASX.features(), LASX));
+        assert!(is(DOT_BF16_LASX.features(), LASX));
+        assert!(is(DOT_F16_LSX.features(), LSX));
+        assert!(is(DOT_BF16_LSX.features(), LSX));
+    };
 }
 
 impl Dot for f32 {
