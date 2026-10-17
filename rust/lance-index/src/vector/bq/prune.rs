@@ -36,7 +36,7 @@
 //!   caller re-checks surviving lanes against live values, so a stale
 //!   threshold can only over-select survivors, never wrongly prune.
 
-use std::sync::LazyLock;
+use lance_core::utils::cpu::Kernel;
 
 /// Rows classified per kernel invocation.
 pub const PRUNE_LANES: usize = 16;
@@ -64,12 +64,12 @@ pub type PruneMaskFn = fn(
 /// Resolve the unscaled prune-mask kernel, preserving the public kernel API.
 pub fn prune_mask_kernel() -> PruneMaskFn {
     |dists, scales, adds, errors, terms, upper, heap| {
-        scaled_prune_mask_kernel()(
+        scaled_prune_mask_kernel().call(
             dists,
             scales,
             adds,
             errors,
-            ScaledLowerBoundTerms {
+            &ScaledLowerBoundTerms {
                 half_sum_q: terms.half_sum_q,
                 add_factor_scale: 1.0,
                 add_factor_offset: 0.0,
@@ -108,72 +108,78 @@ pub(crate) struct ScaledLowerBoundTerms {
 /// `i` of `pruned_heap` is set when the row is not already pruned by the
 /// upper bound and `lower_bound[i] >= heap_threshold`. Surviving rows are the
 /// zero bits of the OR of both masks.
-pub(crate) type ScaledPruneMaskFn = fn(
+///
+/// The formula constants are passed by reference because `Kernel::call`
+/// only takes by-value parameters of types lance-core names.
+pub(crate) type ScaledPruneMaskFn = unsafe fn(
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
-    ScaledLowerBoundTerms,
+    &ScaledLowerBoundTerms,
     f32,
     Option<f32>,
 ) -> (u16, u16);
 
-/// Resolve the prune-mask kernel for the running CPU once; the result can be
-/// cached by the caller for per-partition use.
-pub(crate) fn scaled_prune_mask_kernel() -> ScaledPruneMaskFn {
-    static KERNEL: LazyLock<ScaledPruneMaskFn> = LazyLock::new(select_scaled_prune_mask_kernel);
-    *KERNEL
+lance_core::dispatch! {
+    static SCALED_PRUNE_MASKS: Dispatch<ScaledPruneMaskFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::PRUNE_MASKS_AVX512, x86::PRUNE_MASKS_AVX2, PRUNE_MASKS_PORTABLE]
+        }
+        // On aarch64 the plain 16-wide loop auto-vectorizes to NEON (part of
+        // the baseline), so no dedicated kernel is needed.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[PRUNE_MASKS_PORTABLE]
+        }
+    };
 }
 
-fn select_scaled_prune_mask_kernel() -> ScaledPruneMaskFn {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            return x86::prune_masks_avx512_dispatch;
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return x86::prune_masks_avx2_dispatch;
-        }
-    }
-    // On aarch64 the plain 16-wide loop auto-vectorizes to NEON (part of the
-    // baseline), so no dedicated kernel is needed.
-    prune_masks_portable
+/// The prune-mask kernel for the running CPU; the caller can keep it for
+/// per-partition use.
+pub(crate) fn scaled_prune_mask_kernel() -> Kernel<ScaledPruneMaskFn> {
+    SCALED_PRUNE_MASKS.get()
 }
 
-/// Portable implementation; also the reference for the SIMD kernels.
-fn prune_masks_portable(
-    dists: &[f32; PRUNE_LANES],
-    scale_factors: &[f32; PRUNE_LANES],
-    add_factors: &[f32; PRUNE_LANES],
-    error_factors: &[f32; PRUNE_LANES],
-    terms: ScaledLowerBoundTerms,
-    upper_bound: f32,
-    heap_threshold: Option<f32>,
-) -> (u16, u16) {
-    let mut lower_bounds = [0.0f32; PRUNE_LANES];
-    for lane in 0..PRUNE_LANES {
-        lower_bounds[lane] = ((dists[lane] - terms.half_sum_q) * scale_factors[lane]
-            + terms.add_factor_scale * (add_factors[lane] - terms.add_factor_offset)
-            + terms.query_factor)
-            - error_factors[lane] * terms.query_error;
-    }
-    let mut pruned_upper_bound = 0u16;
-    for (lane, lower_bound) in lower_bounds.iter().enumerate() {
-        pruned_upper_bound |= u16::from(*lower_bound >= upper_bound) << lane;
-    }
-    let mut pruned_heap = 0u16;
-    if let Some(threshold) = heap_threshold {
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(PRUNE_MASKS_PORTABLE: ScaledPruneMaskFn)]
+    /// Portable implementation; also the reference for the SIMD kernels.
+    fn prune_masks_portable(
+        dists: &[f32; PRUNE_LANES],
+        scale_factors: &[f32; PRUNE_LANES],
+        add_factors: &[f32; PRUNE_LANES],
+        error_factors: &[f32; PRUNE_LANES],
+        terms: &ScaledLowerBoundTerms,
+        upper_bound: f32,
+        heap_threshold: Option<f32>,
+    ) -> (u16, u16) {
+        let mut lower_bounds = [0.0f32; PRUNE_LANES];
+        for lane in 0..PRUNE_LANES {
+            lower_bounds[lane] = ((dists[lane] - terms.half_sum_q) * scale_factors[lane]
+                + terms.add_factor_scale * (add_factors[lane] - terms.add_factor_offset)
+                + terms.query_factor)
+                - error_factors[lane] * terms.query_error;
+        }
+        let mut pruned_upper_bound = 0u16;
         for (lane, lower_bound) in lower_bounds.iter().enumerate() {
-            pruned_heap |= u16::from(*lower_bound >= threshold) << lane;
+            pruned_upper_bound |= u16::from(*lower_bound >= upper_bound) << lane;
         }
-        pruned_heap &= !pruned_upper_bound;
+        let mut pruned_heap = 0u16;
+        if let Some(threshold) = heap_threshold {
+            for (lane, lower_bound) in lower_bounds.iter().enumerate() {
+                pruned_heap |= u16::from(*lower_bound >= threshold) << lane;
+            }
+            pruned_heap &= !pruned_upper_bound;
+        }
+        (pruned_upper_bound, pruned_heap)
     }
-    (pruned_upper_bound, pruned_heap)
 }
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{PRUNE_LANES, ScaledLowerBoundTerms};
+    use super::{PRUNE_LANES, ScaledLowerBoundTerms, ScaledPruneMaskFn};
     use std::arch::x86_64::*;
 
     /// Lower bounds for 8 lanes with the scalar operation order (no FMA).
@@ -213,147 +219,107 @@ mod x86 {
         (lo | (hi << 8)) as u16
     }
 
-    #[target_feature(enable = "avx2")]
-    unsafe fn prune_masks_avx2(
-        dists: &[f32; PRUNE_LANES],
-        scale_factors: &[f32; PRUNE_LANES],
-        add_factors: &[f32; PRUNE_LANES],
-        error_factors: &[f32; PRUNE_LANES],
-        terms: ScaledLowerBoundTerms,
-        upper_bound: f32,
-        heap_threshold: Option<f32>,
-    ) -> (u16, u16) {
-        let half_sum_q = _mm256_set1_ps(terms.half_sum_q);
-        let query_factor = _mm256_set1_ps(terms.query_factor);
-        let query_error = _mm256_set1_ps(terms.query_error);
-        // SAFETY: the array references guarantee 16 readable floats each.
-        let lower_bounds_lo = unsafe {
-            lower_bounds_avx(
-                _mm256_loadu_ps(dists.as_ptr()),
-                _mm256_loadu_ps(scale_factors.as_ptr()),
-                _mm256_loadu_ps(add_factors.as_ptr()),
-                _mm256_loadu_ps(error_factors.as_ptr()),
-                half_sum_q,
-                _mm256_set1_ps(terms.add_factor_scale),
-                _mm256_set1_ps(terms.add_factor_offset),
-                query_factor,
-                query_error,
-            )
-        };
-        let lower_bounds_hi = unsafe {
-            lower_bounds_avx(
-                _mm256_loadu_ps(dists.as_ptr().add(8)),
-                _mm256_loadu_ps(scale_factors.as_ptr().add(8)),
-                _mm256_loadu_ps(add_factors.as_ptr().add(8)),
-                _mm256_loadu_ps(error_factors.as_ptr().add(8)),
-                half_sum_q,
-                _mm256_set1_ps(terms.add_factor_scale),
-                _mm256_set1_ps(terms.add_factor_offset),
-                query_factor,
-                query_error,
-            )
-        };
-        let pruned_upper_bound = ge_mask_avx(lower_bounds_lo, lower_bounds_hi, upper_bound);
-        let pruned_heap = match heap_threshold {
-            Some(threshold) => {
-                ge_mask_avx(lower_bounds_lo, lower_bounds_hi, threshold) & !pruned_upper_bound
-            }
-            None => 0,
-        };
-        (pruned_upper_bound, pruned_heap)
-    }
-
-    pub(super) fn prune_masks_avx2_dispatch(
-        dists: &[f32; PRUNE_LANES],
-        scale_factors: &[f32; PRUNE_LANES],
-        add_factors: &[f32; PRUNE_LANES],
-        error_factors: &[f32; PRUNE_LANES],
-        terms: ScaledLowerBoundTerms,
-        upper_bound: f32,
-        heap_threshold: Option<f32>,
-    ) -> (u16, u16) {
-        // SAFETY: only selected when AVX2 was detected.
-        unsafe {
-            prune_masks_avx2(
-                dists,
-                scale_factors,
-                add_factors,
-                error_factors,
-                terms,
-                upper_bound,
-                heap_threshold,
-            )
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) PRUNE_MASKS_AVX2: ScaledPruneMaskFn)]
+        fn prune_masks_avx2(
+            dists: &[f32; PRUNE_LANES],
+            scale_factors: &[f32; PRUNE_LANES],
+            add_factors: &[f32; PRUNE_LANES],
+            error_factors: &[f32; PRUNE_LANES],
+            terms: &ScaledLowerBoundTerms,
+            upper_bound: f32,
+            heap_threshold: Option<f32>,
+        ) -> (u16, u16) {
+            let half_sum_q = _mm256_set1_ps(terms.half_sum_q);
+            let query_factor = _mm256_set1_ps(terms.query_factor);
+            let query_error = _mm256_set1_ps(terms.query_error);
+            // SAFETY: the array references guarantee 16 readable floats each.
+            let lower_bounds_lo = unsafe {
+                lower_bounds_avx(
+                    _mm256_loadu_ps(dists.as_ptr()),
+                    _mm256_loadu_ps(scale_factors.as_ptr()),
+                    _mm256_loadu_ps(add_factors.as_ptr()),
+                    _mm256_loadu_ps(error_factors.as_ptr()),
+                    half_sum_q,
+                    _mm256_set1_ps(terms.add_factor_scale),
+                    _mm256_set1_ps(terms.add_factor_offset),
+                    query_factor,
+                    query_error,
+                )
+            };
+            let lower_bounds_hi = unsafe {
+                lower_bounds_avx(
+                    _mm256_loadu_ps(dists.as_ptr().add(8)),
+                    _mm256_loadu_ps(scale_factors.as_ptr().add(8)),
+                    _mm256_loadu_ps(add_factors.as_ptr().add(8)),
+                    _mm256_loadu_ps(error_factors.as_ptr().add(8)),
+                    half_sum_q,
+                    _mm256_set1_ps(terms.add_factor_scale),
+                    _mm256_set1_ps(terms.add_factor_offset),
+                    query_factor,
+                    query_error,
+                )
+            };
+            let pruned_upper_bound = ge_mask_avx(lower_bounds_lo, lower_bounds_hi, upper_bound);
+            let pruned_heap = match heap_threshold {
+                Some(threshold) => {
+                    ge_mask_avx(lower_bounds_lo, lower_bounds_hi, threshold) & !pruned_upper_bound
+                }
+                None => 0,
+            };
+            (pruned_upper_bound, pruned_heap)
         }
     }
 
-    #[target_feature(enable = "avx512f")]
-    unsafe fn prune_masks_avx512(
-        dists: &[f32; PRUNE_LANES],
-        scale_factors: &[f32; PRUNE_LANES],
-        add_factors: &[f32; PRUNE_LANES],
-        error_factors: &[f32; PRUNE_LANES],
-        terms: ScaledLowerBoundTerms,
-        upper_bound: f32,
-        heap_threshold: Option<f32>,
-    ) -> (u16, u16) {
-        // SAFETY: the array references guarantee 16 readable floats each.
-        let (dists, scale_factors, add_factors, error_factors) = unsafe {
-            (
-                _mm512_loadu_ps(dists.as_ptr()),
-                _mm512_loadu_ps(scale_factors.as_ptr()),
-                _mm512_loadu_ps(add_factors.as_ptr()),
-                _mm512_loadu_ps(error_factors.as_ptr()),
-            )
-        };
-        let binary_distance = _mm512_add_ps(
-            _mm512_add_ps(
-                _mm512_mul_ps(
-                    _mm512_sub_ps(dists, _mm512_set1_ps(terms.half_sum_q)),
-                    scale_factors,
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) PRUNE_MASKS_AVX512: ScaledPruneMaskFn)]
+        fn prune_masks_avx512(
+            dists: &[f32; PRUNE_LANES],
+            scale_factors: &[f32; PRUNE_LANES],
+            add_factors: &[f32; PRUNE_LANES],
+            error_factors: &[f32; PRUNE_LANES],
+            terms: &ScaledLowerBoundTerms,
+            upper_bound: f32,
+            heap_threshold: Option<f32>,
+        ) -> (u16, u16) {
+            // SAFETY: the array references guarantee 16 readable floats each.
+            let (dists, scale_factors, add_factors, error_factors) = unsafe {
+                (
+                    _mm512_loadu_ps(dists.as_ptr()),
+                    _mm512_loadu_ps(scale_factors.as_ptr()),
+                    _mm512_loadu_ps(add_factors.as_ptr()),
+                    _mm512_loadu_ps(error_factors.as_ptr()),
+                )
+            };
+            let binary_distance = _mm512_add_ps(
+                _mm512_add_ps(
+                    _mm512_mul_ps(
+                        _mm512_sub_ps(dists, _mm512_set1_ps(terms.half_sum_q)),
+                        scale_factors,
+                    ),
+                    _mm512_mul_ps(
+                        _mm512_set1_ps(terms.add_factor_scale),
+                        _mm512_sub_ps(add_factors, _mm512_set1_ps(terms.add_factor_offset)),
+                    ),
                 ),
-                _mm512_mul_ps(
-                    _mm512_set1_ps(terms.add_factor_scale),
-                    _mm512_sub_ps(add_factors, _mm512_set1_ps(terms.add_factor_offset)),
-                ),
-            ),
-            _mm512_set1_ps(terms.query_factor),
-        );
-        let lower_bounds = _mm512_sub_ps(
-            binary_distance,
-            _mm512_mul_ps(error_factors, _mm512_set1_ps(terms.query_error)),
-        );
-        let pruned_upper_bound =
-            _mm512_cmp_ps_mask::<_CMP_GE_OQ>(lower_bounds, _mm512_set1_ps(upper_bound));
-        let pruned_heap = match heap_threshold {
-            Some(threshold) => {
-                _mm512_cmp_ps_mask::<_CMP_GE_OQ>(lower_bounds, _mm512_set1_ps(threshold))
-                    & !pruned_upper_bound
-            }
-            None => 0,
-        };
-        (pruned_upper_bound, pruned_heap)
-    }
-
-    pub(super) fn prune_masks_avx512_dispatch(
-        dists: &[f32; PRUNE_LANES],
-        scale_factors: &[f32; PRUNE_LANES],
-        add_factors: &[f32; PRUNE_LANES],
-        error_factors: &[f32; PRUNE_LANES],
-        terms: ScaledLowerBoundTerms,
-        upper_bound: f32,
-        heap_threshold: Option<f32>,
-    ) -> (u16, u16) {
-        // SAFETY: only selected when AVX-512F was detected.
-        unsafe {
-            prune_masks_avx512(
-                dists,
-                scale_factors,
-                add_factors,
-                error_factors,
-                terms,
-                upper_bound,
-                heap_threshold,
-            )
+                _mm512_set1_ps(terms.query_factor),
+            );
+            let lower_bounds = _mm512_sub_ps(
+                binary_distance,
+                _mm512_mul_ps(error_factors, _mm512_set1_ps(terms.query_error)),
+            );
+            let pruned_upper_bound =
+                _mm512_cmp_ps_mask::<_CMP_GE_OQ>(lower_bounds, _mm512_set1_ps(upper_bound));
+            let pruned_heap = match heap_threshold {
+                Some(threshold) => {
+                    _mm512_cmp_ps_mask::<_CMP_GE_OQ>(lower_bounds, _mm512_set1_ps(threshold))
+                        & !pruned_upper_bound
+                }
+                None => 0,
+            };
+            (pruned_upper_bound, pruned_heap)
         }
     }
 }
@@ -361,7 +327,6 @@ mod x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::utils::cpu::Kernel;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
@@ -425,7 +390,7 @@ mod tests {
                 scale_factors,
                 add_factors,
                 error_factors,
-                terms,
+                &terms,
                 upper_bound,
                 heap_threshold,
             );
@@ -444,7 +409,7 @@ mod tests {
                 &[0.0; PRUNE_LANES],
                 &[1.0; PRUNE_LANES],
                 &[0.0; PRUNE_LANES],
-                ScaledLowerBoundTerms {
+                &ScaledLowerBoundTerms {
                     half_sum_q: 0.0,
                     add_factor_scale,
                     add_factor_offset: 1.0,
@@ -538,7 +503,7 @@ mod tests {
             &scale_factors,
             &add_factors,
             &error_factors,
-            terms,
+            &terms,
             3.0,
             Some(1.0),
         );
@@ -610,7 +575,7 @@ mod tests {
             &scale_factors,
             &add_factors,
             &error_factors,
-            terms,
+            &terms,
             0.5,
             Some(0.0),
         );

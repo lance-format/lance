@@ -28,13 +28,14 @@
 //! is within the table's inherent quantization error.
 
 use std::mem::MaybeUninit;
-use std::sync::LazyLock;
 
 use super::storage::SEGMENT_NUM_CODES;
 
-type MinMaxFn = fn(&[f32]) -> (f32, f32);
-type QuantizeU8Fn = fn(&[f32], f32, f32, &mut [MaybeUninit<u8>]);
-type QuantizeU16Fn = fn(&[f32], f32, f32, &mut [MaybeUninit<u16>]);
+type MinMaxFn = unsafe fn(&[f32]) -> (f32, f32);
+/// Writes `round_ties_even((value - qmin) * factor)` per value; the slices
+/// must have equal lengths.
+type QuantizeU8Fn = unsafe fn(&[f32], f32, f32, &mut [MaybeUninit<u8>]);
+type QuantizeU16Fn = unsafe fn(&[f32], f32, f32, &mut [MaybeUninit<u16>]);
 
 /// How the caller reconstructs binary inner-product distances from the
 /// FastScan accumulator sums computed against the quantized LUT.
@@ -144,89 +145,77 @@ fn dequant_overflows(table_len: usize, qmin: f32, qmax: f32) -> bool {
         || !(num_tables * (qmax - qmin)).is_finite()
 }
 
+/// Declares a dispatch over one operation's AVX-512, AVX2 and portable kernels.
+macro_rules! x86_dispatch {
+    ($name:ident: $kernel_type:ty = $avx512:ident, $avx2:ident, $portable:ident) => {
+        lance_core::dispatch! {
+            static $name: Dispatch<$kernel_type> = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    &[x86::$avx512, x86::$avx2, $portable]
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    &[$portable]
+                }
+            };
+        }
+    };
+}
+
+x86_dispatch!(MIN_MAX: MinMaxFn = MIN_MAX_AVX512, MIN_MAX_AVX2, MIN_MAX_FOLD);
+x86_dispatch!(QUANTIZE_U8: QuantizeU8Fn = QUANTIZE_U8_AVX512, QUANTIZE_U8_AVX2, QUANTIZE_U8_SCALAR);
+x86_dispatch!(
+    QUANTIZE_U16: QuantizeU16Fn = QUANTIZE_U16_AVX512,
+    QUANTIZE_U16_AVX2,
+    QUANTIZE_U16_SCALAR
+);
+
 fn min_max(values: &[f32]) -> (f32, f32) {
-    static KERNEL: LazyLock<MinMaxFn> = LazyLock::new(select_min_max);
-    KERNEL(values)
+    MIN_MAX.get().call(values)
 }
 
 fn quantize_u8(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u8>]) {
-    static KERNEL: LazyLock<QuantizeU8Fn> = LazyLock::new(select_quantize_u8);
-    KERNEL(values, qmin, factor, out)
+    QUANTIZE_U8.get().call(values, qmin, factor, out)
 }
 
 fn quantize_u16(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u16>]) {
-    static KERNEL: LazyLock<QuantizeU16Fn> = LazyLock::new(select_quantize_u16);
-    KERNEL(values, qmin, factor, out)
-}
-
-fn select_min_max() -> MinMaxFn {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            return x86::min_max_avx512_dispatch;
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return x86::min_max_avx2_dispatch;
-        }
-    }
-    min_max_fold
-}
-
-fn select_quantize_u8() -> QuantizeU8Fn {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            return x86::quantize_u8_avx512_dispatch;
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return x86::quantize_u8_avx2_dispatch;
-        }
-    }
-    quantize_u8_scalar
-}
-
-fn select_quantize_u16() -> QuantizeU16Fn {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            return x86::quantize_u16_avx512_dispatch;
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return x86::quantize_u16_avx2_dispatch;
-        }
-    }
-    quantize_u16_scalar
+    QUANTIZE_U16.get().call(values, qmin, factor, out)
 }
 
 const FOLD_LANES: usize = 16;
 
-/// Portable 16-lane min/max fold; the scalar fallback and the aarch64 path.
-/// The `if` comparisons (rather than `f32::min`/`max`, which carry NaN
-/// bookkeeping) lower to lanewise min/max instructions on targets with
-/// baseline SIMD.
-fn min_max_fold(values: &[f32]) -> (f32, f32) {
-    let mut mins = [f32::INFINITY; FOLD_LANES];
-    let mut maxs = [f32::NEG_INFINITY; FOLD_LANES];
-    let (chunks, remainder) = values.as_chunks::<FOLD_LANES>();
-    for chunk in chunks {
-        for (i, &v) in chunk.iter().enumerate() {
-            mins[i] = if v < mins[i] { v } else { mins[i] };
-            maxs[i] = if v > maxs[i] { v } else { maxs[i] };
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(MIN_MAX_FOLD: MinMaxFn)]
+    /// Portable 16-lane min/max fold; the scalar fallback and the aarch64 path.
+    /// The `if` comparisons (rather than `f32::min`/`max`, which carry NaN
+    /// bookkeeping) lower to lanewise min/max instructions on targets with
+    /// baseline SIMD.
+    fn min_max_fold(values: &[f32]) -> (f32, f32) {
+        let mut mins = [f32::INFINITY; FOLD_LANES];
+        let mut maxs = [f32::NEG_INFINITY; FOLD_LANES];
+        let (chunks, remainder) = values.as_chunks::<FOLD_LANES>();
+        for chunk in chunks {
+            for (i, &v) in chunk.iter().enumerate() {
+                mins[i] = if v < mins[i] { v } else { mins[i] };
+                maxs[i] = if v > maxs[i] { v } else { maxs[i] };
+            }
         }
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        for v in mins {
+            min = if v < min { v } else { min };
+        }
+        for v in maxs {
+            max = if v > max { v } else { max };
+        }
+        for &v in remainder {
+            min = if v < min { v } else { min };
+            max = if v > max { v } else { max };
+        }
+        (min, max)
     }
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for v in mins {
-        min = if v < min { v } else { min };
-    }
-    for v in maxs {
-        max = if v > max { v } else { max };
-    }
-    for &v in remainder {
-        min = if v < min { v } else { min };
-        max = if v > max { v } else { max };
-    }
-    (min, max)
 }
 
 /// Round `x` to the nearest integer, ties to even — the same rule the SIMD
@@ -256,17 +245,25 @@ fn round_ties_even_fixed(x: f32) -> f32 {
     }
 }
 
-fn quantize_u8_scalar(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u8>]) {
-    debug_assert_eq!(values.len(), out.len());
-    for (quantized, &d) in out.iter_mut().zip(values) {
-        quantized.write(round_ties_even_fixed((d - qmin) * factor) as u8);
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(QUANTIZE_U8_SCALAR: QuantizeU8Fn)]
+    fn quantize_u8_scalar(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u8>]) {
+        debug_assert_eq!(values.len(), out.len());
+        for (quantized, &d) in out.iter_mut().zip(values) {
+            quantized.write(round_ties_even_fixed((d - qmin) * factor) as u8);
+        }
     }
 }
 
-fn quantize_u16_scalar(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u16>]) {
-    debug_assert_eq!(values.len(), out.len());
-    for (quantized, &d) in out.iter_mut().zip(values) {
-        quantized.write(round_ties_even_fixed((d - qmin) * factor) as u16);
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(QUANTIZE_U16_SCALAR: QuantizeU16Fn)]
+    fn quantize_u16_scalar(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u16>]) {
+        debug_assert_eq!(values.len(), out.len());
+        for (quantized, &d) in out.iter_mut().zip(values) {
+            quantized.write(round_ties_even_fixed((d - qmin) * factor) as u16);
+        }
     }
 }
 
@@ -275,76 +272,72 @@ mod x86 {
     use std::arch::x86_64::*;
     use std::mem::MaybeUninit;
 
-    use super::{quantize_u8_scalar, quantize_u16_scalar};
+    use super::{MinMaxFn, QuantizeU8Fn, QuantizeU16Fn, quantize_u8_scalar, quantize_u16_scalar};
 
-    pub(super) fn min_max_avx512_dispatch(values: &[f32]) -> (f32, f32) {
-        // SAFETY: only selected when AVX-512F was detected.
-        unsafe { min_max_avx512(values) }
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) MIN_MAX_AVX512: MinMaxFn)]
+        fn min_max_avx512(values: &[f32]) -> (f32, f32) {
+            // Two accumulators per direction break the lanewise min/max latency
+            // chain; they are reduced once at the end.
+            let mut min0 = _mm512_set1_ps(f32::INFINITY);
+            let mut min1 = min0;
+            let mut max0 = _mm512_set1_ps(f32::NEG_INFINITY);
+            let mut max1 = max0;
+            let (chunks, remainder) = values.as_chunks::<32>();
+            for chunk in chunks {
+                // SAFETY: the chunk holds 32 consecutive floats.
+                let (v0, v1) = unsafe {
+                    (
+                        _mm512_loadu_ps(chunk.as_ptr()),
+                        _mm512_loadu_ps(chunk.as_ptr().add(16)),
+                    )
+                };
+                min0 = _mm512_min_ps(min0, v0);
+                max0 = _mm512_max_ps(max0, v0);
+                min1 = _mm512_min_ps(min1, v1);
+                max1 = _mm512_max_ps(max1, v1);
+            }
+            let mut min = _mm512_reduce_min_ps(_mm512_min_ps(min0, min1));
+            let mut max = _mm512_reduce_max_ps(_mm512_max_ps(max0, max1));
+            for &v in remainder {
+                min = if v < min { v } else { min };
+                max = if v > max { v } else { max };
+            }
+            (min, max)
+        }
     }
 
-    #[target_feature(enable = "avx512f")]
-    unsafe fn min_max_avx512(values: &[f32]) -> (f32, f32) {
-        // Two accumulators per direction break the lanewise min/max latency
-        // chain; they are reduced once at the end.
-        let mut min0 = _mm512_set1_ps(f32::INFINITY);
-        let mut min1 = min0;
-        let mut max0 = _mm512_set1_ps(f32::NEG_INFINITY);
-        let mut max1 = max0;
-        let (chunks, remainder) = values.as_chunks::<32>();
-        for chunk in chunks {
-            // SAFETY: the chunk holds 32 consecutive floats.
-            let (v0, v1) = unsafe {
-                (
-                    _mm512_loadu_ps(chunk.as_ptr()),
-                    _mm512_loadu_ps(chunk.as_ptr().add(16)),
-                )
-            };
-            min0 = _mm512_min_ps(min0, v0);
-            max0 = _mm512_max_ps(max0, v0);
-            min1 = _mm512_min_ps(min1, v1);
-            max1 = _mm512_max_ps(max1, v1);
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) MIN_MAX_AVX2: MinMaxFn)]
+        fn min_max_avx2(values: &[f32]) -> (f32, f32) {
+            let mut min0 = _mm256_set1_ps(f32::INFINITY);
+            let mut min1 = min0;
+            let mut max0 = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut max1 = max0;
+            let (chunks, remainder) = values.as_chunks::<16>();
+            for chunk in chunks {
+                // SAFETY: the chunk holds 16 consecutive floats.
+                let (v0, v1) = unsafe {
+                    (
+                        _mm256_loadu_ps(chunk.as_ptr()),
+                        _mm256_loadu_ps(chunk.as_ptr().add(8)),
+                    )
+                };
+                min0 = _mm256_min_ps(min0, v0);
+                max0 = _mm256_max_ps(max0, v0);
+                min1 = _mm256_min_ps(min1, v1);
+                max1 = _mm256_max_ps(max1, v1);
+            }
+            let mut min = reduce_min_avx2(_mm256_min_ps(min0, min1));
+            let mut max = reduce_max_avx2(_mm256_max_ps(max0, max1));
+            for &v in remainder {
+                min = if v < min { v } else { min };
+                max = if v > max { v } else { max };
+            }
+            (min, max)
         }
-        let mut min = _mm512_reduce_min_ps(_mm512_min_ps(min0, min1));
-        let mut max = _mm512_reduce_max_ps(_mm512_max_ps(max0, max1));
-        for &v in remainder {
-            min = if v < min { v } else { min };
-            max = if v > max { v } else { max };
-        }
-        (min, max)
-    }
-
-    pub(super) fn min_max_avx2_dispatch(values: &[f32]) -> (f32, f32) {
-        // SAFETY: only selected when AVX2 was detected.
-        unsafe { min_max_avx2(values) }
-    }
-
-    #[target_feature(enable = "avx2")]
-    unsafe fn min_max_avx2(values: &[f32]) -> (f32, f32) {
-        let mut min0 = _mm256_set1_ps(f32::INFINITY);
-        let mut min1 = min0;
-        let mut max0 = _mm256_set1_ps(f32::NEG_INFINITY);
-        let mut max1 = max0;
-        let (chunks, remainder) = values.as_chunks::<16>();
-        for chunk in chunks {
-            // SAFETY: the chunk holds 16 consecutive floats.
-            let (v0, v1) = unsafe {
-                (
-                    _mm256_loadu_ps(chunk.as_ptr()),
-                    _mm256_loadu_ps(chunk.as_ptr().add(8)),
-                )
-            };
-            min0 = _mm256_min_ps(min0, v0);
-            max0 = _mm256_max_ps(max0, v0);
-            min1 = _mm256_min_ps(min1, v1);
-            max1 = _mm256_max_ps(max1, v1);
-        }
-        let mut min = reduce_min_avx2(_mm256_min_ps(min0, min1));
-        let mut max = reduce_max_avx2(_mm256_max_ps(max0, max1));
-        for &v in remainder {
-            min = if v < min { v } else { min };
-            max = if v > max { v } else { max };
-        }
-        (min, max)
     }
 
     #[inline]
@@ -378,72 +371,58 @@ mod x86 {
         _mm512_cvt_roundps_epi32::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(scaled)
     }
 
-    pub(super) fn quantize_u8_avx512_dispatch(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u8>],
-    ) {
-        // SAFETY: only selected when AVX-512F was detected.
-        unsafe { quantize_u8_avx512(values, qmin, factor, out) }
-    }
-
-    #[target_feature(enable = "avx512f")]
-    unsafe fn quantize_u8_avx512(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u8>],
-    ) {
-        debug_assert_eq!(values.len(), out.len());
-        let min = _mm512_set1_ps(qmin);
-        let factor_v = _mm512_set1_ps(factor);
-        let full = values.len() - values.len() % 16;
-        let src = values.as_ptr();
-        let dst = out.as_mut_ptr().cast::<u8>();
-        for i in (0..full).step_by(16) {
-            // SAFETY: `i + 16 <= values.len() == out.len()`.
-            unsafe {
-                let q = quantize16_epi32(src.add(i), min, factor_v);
-                // Unsigned-saturating i32 -> u8 narrow: lanes are in
-                // [0, 255] plus float epsilon, which saturation clips.
-                _mm_storeu_si128(dst.add(i).cast(), _mm512_cvtusepi32_epi8(q));
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) QUANTIZE_U8_AVX512: QuantizeU8Fn)]
+        fn quantize_u8_avx512(
+            values: &[f32],
+            qmin: f32,
+            factor: f32,
+            out: &mut [MaybeUninit<u8>],
+        ) {
+            assert_eq!(values.len(), out.len());
+            let min = _mm512_set1_ps(qmin);
+            let factor_v = _mm512_set1_ps(factor);
+            let full = values.len() - values.len() % 16;
+            let src = values.as_ptr();
+            let dst = out.as_mut_ptr().cast::<u8>();
+            for i in (0..full).step_by(16) {
+                // SAFETY: `i + 16 <= values.len() == out.len()`.
+                unsafe {
+                    let q = quantize16_epi32(src.add(i), min, factor_v);
+                    // Unsigned-saturating i32 -> u8 narrow: lanes are in
+                    // [0, 255] plus float epsilon, which saturation clips.
+                    _mm_storeu_si128(dst.add(i).cast(), _mm512_cvtusepi32_epi8(q));
+                }
             }
+            quantize_u8_scalar(&values[full..], qmin, factor, &mut out[full..]);
         }
-        quantize_u8_scalar(&values[full..], qmin, factor, &mut out[full..]);
     }
 
-    pub(super) fn quantize_u16_avx512_dispatch(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u16>],
-    ) {
-        // SAFETY: only selected when AVX-512F was detected.
-        unsafe { quantize_u16_avx512(values, qmin, factor, out) }
-    }
-
-    #[target_feature(enable = "avx512f")]
-    unsafe fn quantize_u16_avx512(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u16>],
-    ) {
-        debug_assert_eq!(values.len(), out.len());
-        let min = _mm512_set1_ps(qmin);
-        let factor_v = _mm512_set1_ps(factor);
-        let full = values.len() - values.len() % 16;
-        let src = values.as_ptr();
-        let dst = out.as_mut_ptr().cast::<u16>();
-        for i in (0..full).step_by(16) {
-            // SAFETY: `i + 16 <= values.len() == out.len()`.
-            unsafe {
-                let q = quantize16_epi32(src.add(i), min, factor_v);
-                _mm256_storeu_si256(dst.add(i).cast(), _mm512_cvtusepi32_epi16(q));
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) QUANTIZE_U16_AVX512: QuantizeU16Fn)]
+        fn quantize_u16_avx512(
+            values: &[f32],
+            qmin: f32,
+            factor: f32,
+            out: &mut [MaybeUninit<u16>],
+        ) {
+            assert_eq!(values.len(), out.len());
+            let min = _mm512_set1_ps(qmin);
+            let factor_v = _mm512_set1_ps(factor);
+            let full = values.len() - values.len() % 16;
+            let src = values.as_ptr();
+            let dst = out.as_mut_ptr().cast::<u16>();
+            for i in (0..full).step_by(16) {
+                // SAFETY: `i + 16 <= values.len() == out.len()`.
+                unsafe {
+                    let q = quantize16_epi32(src.add(i), min, factor_v);
+                    _mm256_storeu_si256(dst.add(i).cast(), _mm512_cvtusepi32_epi16(q));
+                }
             }
+            quantize_u16_scalar(&values[full..], qmin, factor, &mut out[full..]);
         }
-        quantize_u16_scalar(&values[full..], qmin, factor, &mut out[full..]);
     }
 
     /// Load 8 floats and affine-quantize them into `i32` lanes. AVX2 has no
@@ -462,87 +441,73 @@ mod x86 {
         _mm256_cvtps_epi32(rounded)
     }
 
-    pub(super) fn quantize_u8_avx2_dispatch(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u8>],
-    ) {
-        // SAFETY: only selected when AVX2 was detected.
-        unsafe { quantize_u8_avx2(values, qmin, factor, out) }
-    }
-
-    #[target_feature(enable = "avx2")]
-    unsafe fn quantize_u8_avx2(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u8>],
-    ) {
-        debug_assert_eq!(values.len(), out.len());
-        let min = _mm256_set1_ps(qmin);
-        let factor_v = _mm256_set1_ps(factor);
-        // The 32->16 and 16->8 packs interleave the two 128-bit lanes; this
-        // permutation of 32-bit groups restores natural order.
-        let restore = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        let full = values.len() - values.len() % 32;
-        let src = values.as_ptr();
-        let dst = out.as_mut_ptr().cast::<u8>();
-        for i in (0..full).step_by(32) {
-            // SAFETY: `i + 32 <= values.len() == out.len()`.
-            unsafe {
-                let q0 = quantize8_epi32(src.add(i), min, factor_v);
-                let q1 = quantize8_epi32(src.add(i + 8), min, factor_v);
-                let q2 = quantize8_epi32(src.add(i + 16), min, factor_v);
-                let q3 = quantize8_epi32(src.add(i + 24), min, factor_v);
-                // Unsigned-saturating i32 -> u16 -> u8 narrows: lanes are in
-                // [0, 255] plus float epsilon, which saturation clips.
-                let lo = _mm256_packus_epi32(q0, q1);
-                let hi = _mm256_packus_epi32(q2, q3);
-                let bytes = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(lo, hi), restore);
-                _mm256_storeu_si256(dst.add(i).cast(), bytes);
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) QUANTIZE_U8_AVX2: QuantizeU8Fn)]
+        fn quantize_u8_avx2(
+            values: &[f32],
+            qmin: f32,
+            factor: f32,
+            out: &mut [MaybeUninit<u8>],
+        ) {
+            assert_eq!(values.len(), out.len());
+            let min = _mm256_set1_ps(qmin);
+            let factor_v = _mm256_set1_ps(factor);
+            // The 32->16 and 16->8 packs interleave the two 128-bit lanes; this
+            // permutation of 32-bit groups restores natural order.
+            let restore = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            let full = values.len() - values.len() % 32;
+            let src = values.as_ptr();
+            let dst = out.as_mut_ptr().cast::<u8>();
+            for i in (0..full).step_by(32) {
+                // SAFETY: `i + 32 <= values.len() == out.len()`.
+                unsafe {
+                    let q0 = quantize8_epi32(src.add(i), min, factor_v);
+                    let q1 = quantize8_epi32(src.add(i + 8), min, factor_v);
+                    let q2 = quantize8_epi32(src.add(i + 16), min, factor_v);
+                    let q3 = quantize8_epi32(src.add(i + 24), min, factor_v);
+                    // Unsigned-saturating i32 -> u16 -> u8 narrows: lanes are in
+                    // [0, 255] plus float epsilon, which saturation clips.
+                    let lo = _mm256_packus_epi32(q0, q1);
+                    let hi = _mm256_packus_epi32(q2, q3);
+                    let bytes = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(lo, hi), restore);
+                    _mm256_storeu_si256(dst.add(i).cast(), bytes);
+                }
             }
+            quantize_u8_scalar(&values[full..], qmin, factor, &mut out[full..]);
         }
-        quantize_u8_scalar(&values[full..], qmin, factor, &mut out[full..]);
     }
 
-    pub(super) fn quantize_u16_avx2_dispatch(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u16>],
-    ) {
-        // SAFETY: only selected when AVX2 was detected.
-        unsafe { quantize_u16_avx2(values, qmin, factor, out) }
-    }
-
-    #[target_feature(enable = "avx2")]
-    unsafe fn quantize_u16_avx2(
-        values: &[f32],
-        qmin: f32,
-        factor: f32,
-        out: &mut [MaybeUninit<u16>],
-    ) {
-        debug_assert_eq!(values.len(), out.len());
-        let min = _mm256_set1_ps(qmin);
-        let factor_v = _mm256_set1_ps(factor);
-        let full = values.len() - values.len() % 16;
-        let src = values.as_ptr();
-        let dst = out.as_mut_ptr().cast::<u16>();
-        for i in (0..full).step_by(16) {
-            // SAFETY: `i + 16 <= values.len() == out.len()`.
-            unsafe {
-                let q0 = quantize8_epi32(src.add(i), min, factor_v);
-                let q1 = quantize8_epi32(src.add(i + 8), min, factor_v);
-                // The pack interleaves the 128-bit lanes as
-                // [q0_lo, q1_lo, q0_hi, q1_hi]; the 64-bit-lane permute
-                // restores [q0_lo, q0_hi, q1_lo, q1_hi].
-                let packed = _mm256_packus_epi32(q0, q1);
-                let words = _mm256_permute4x64_epi64::<0b11_01_10_00>(packed);
-                _mm256_storeu_si256(dst.add(i).cast(), words);
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) QUANTIZE_U16_AVX2: QuantizeU16Fn)]
+        fn quantize_u16_avx2(
+            values: &[f32],
+            qmin: f32,
+            factor: f32,
+            out: &mut [MaybeUninit<u16>],
+        ) {
+            assert_eq!(values.len(), out.len());
+            let min = _mm256_set1_ps(qmin);
+            let factor_v = _mm256_set1_ps(factor);
+            let full = values.len() - values.len() % 16;
+            let src = values.as_ptr();
+            let dst = out.as_mut_ptr().cast::<u16>();
+            for i in (0..full).step_by(16) {
+                // SAFETY: `i + 16 <= values.len() == out.len()`.
+                unsafe {
+                    let q0 = quantize8_epi32(src.add(i), min, factor_v);
+                    let q1 = quantize8_epi32(src.add(i + 8), min, factor_v);
+                    // The pack interleaves the 128-bit lanes as
+                    // [q0_lo, q1_lo, q0_hi, q1_hi]; the 64-bit-lane permute
+                    // restores [q0_lo, q0_hi, q1_lo, q1_hi].
+                    let packed = _mm256_packus_epi32(q0, q1);
+                    let words = _mm256_permute4x64_epi64::<0b11_01_10_00>(packed);
+                    _mm256_storeu_si256(dst.add(i).cast(), words);
+                }
             }
+            quantize_u16_scalar(&values[full..], qmin, factor, &mut out[full..]);
         }
-        quantize_u16_scalar(&values[full..], qmin, factor, &mut out[full..]);
     }
 }
 

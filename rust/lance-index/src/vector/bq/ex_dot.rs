@@ -40,6 +40,8 @@
 
 use std::sync::LazyLock;
 
+use lance_core::utils::cpu::{Dispatch, Kernel};
+
 /// Dims are packed in blocks of this size; the query is zero-padded to a
 /// whole number of blocks when the rotated dim is not already a multiple.
 pub const EX_DOT_BLOCK_DIMS: usize = 64;
@@ -296,75 +298,92 @@ pub(crate) fn unpack_blocked_row(codes: &[u8], ex_bits: u8, dim: usize, values: 
 /// as-is for aligned dims, otherwise zero-padded via [`pad_query_into`]);
 /// `codes` is the blocked row slice. Rows shorter than the padded query
 /// length are treated as zero-padded.
-pub type ExDotFn = fn(&[f32], &[u8]) -> f32;
+pub type ExDotFn = unsafe fn(&[f32], &[u8]) -> f32;
 
-/// Resolve the dot kernel for `ex_bits` once; the result can be cached by the
-/// caller for per-candidate use.
-pub fn ex_dot_kernel(ex_bits: u8) -> ExDotFn {
-    debug_assert!((1..=8).contains(&ex_bits));
-    static KERNELS: LazyLock<[ExDotFn; 8]> =
-        LazyLock::new(|| std::array::from_fn(|i| select_ex_dot_kernel(i as u8 + 1)));
-    KERNELS[usize::from(ex_bits) - 1]
+/// Declares one dispatch per `ex_bits`. On x86 the AVX-512 baseline kernels
+/// of the two- and six-bit widths stay listed behind their four-chain
+/// variants, which fall back to them for partial rows, so tests cover them on
+/// aligned rows too.
+macro_rules! ex_dot_dispatch {
+    ($($name:ident = x86[$($x86:ident),*], neon $neon:ident, $scalar:ident;)*) => {$(
+        lance_core::dispatch! {
+            static $name: Dispatch<ExDotFn> = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    &[$(x86::$x86,)* $scalar]
+                }
+                // NEON is part of the aarch64 baseline.
+                #[cfg(target_arch = "aarch64")]
+                {
+                    &[neon::$neon, $scalar]
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    &[$scalar]
+                }
+            };
+        }
+    )*};
 }
 
-/// Available native kernels for controlled profiling and parity tests.
-pub fn ex_dot_kernel_variants(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
-    // `mut` is only exercised on x86_64 where extra kernels may be pushed.
-    #[allow(unused_mut)]
-    let mut kernels = vec![
-        ("scalar", scalar_kernel(ex_bits)),
-        ("dispatched", ex_dot_kernel(ex_bits)),
-    ];
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-        {
-            kernels.push(("avx2", x86::avx2_kernel(ex_bits)));
-        }
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            kernels.push(("avx512", x86::avx512_baseline_kernel(ex_bits)));
-            if matches!(ex_bits, 2 | 6) {
-                kernels.push(("avx512_four_chain", x86::four_chain_kernel(ex_bits)));
-            }
-        }
-    }
-    kernels
+ex_dot_dispatch! {
+    EX_DOT_U1 = x86[EX_DOT_U1_AVX512, EX_DOT_U1_AVX2], neon EX_DOT_U1_NEON, EX_DOT_U1_SCALAR;
+    EX_DOT_U2 = x86[EX_DOT_U2_FOUR_CHAIN, EX_DOT_U2_AVX512, EX_DOT_U2_AVX2],
+        neon EX_DOT_U2_NEON, EX_DOT_U2_SCALAR;
+    EX_DOT_U3 = x86[EX_DOT_U3_AVX512, EX_DOT_U3_AVX2], neon EX_DOT_U3_NEON, EX_DOT_U3_SCALAR;
+    EX_DOT_U4 = x86[EX_DOT_U4_AVX512, EX_DOT_U4_AVX2], neon EX_DOT_U4_NEON, EX_DOT_U4_SCALAR;
+    EX_DOT_U5 = x86[EX_DOT_U5_AVX512, EX_DOT_U5_AVX2], neon EX_DOT_U5_NEON, EX_DOT_U5_SCALAR;
+    EX_DOT_U6 = x86[EX_DOT_U6_FOUR_CHAIN, EX_DOT_U6_AVX512, EX_DOT_U6_AVX2],
+        neon EX_DOT_U6_NEON, EX_DOT_U6_SCALAR;
+    EX_DOT_U7 = x86[EX_DOT_U7_AVX512, EX_DOT_U7_AVX2], neon EX_DOT_U7_NEON, EX_DOT_U7_SCALAR;
+    EX_DOT_U8 = x86[EX_DOT_U8_AVX512, EX_DOT_U8_AVX2], neon EX_DOT_U8_NEON, EX_DOT_U8_SCALAR;
 }
 
-fn select_ex_dot_kernel(ex_bits: u8) -> ExDotFn {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            return x86::avx512_kernel(ex_bits);
-        }
-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-        {
-            return x86::avx2_kernel(ex_bits);
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        // NEON is part of the aarch64 baseline.
-        return neon::kernel(ex_bits);
-    }
-    #[allow(unreachable_code)]
-    scalar_kernel(ex_bits)
-}
-
-fn scalar_kernel(ex_bits: u8) -> ExDotFn {
+fn ex_dot_dispatch(ex_bits: u8) -> &'static Dispatch<ExDotFn> {
     match ex_bits {
-        1 => ex_dot_scalar::<1>,
-        2 => ex_dot_scalar::<2>,
-        3 => ex_dot_scalar::<3>,
-        4 => ex_dot_scalar::<4>,
-        5 => ex_dot_scalar::<5>,
-        6 => ex_dot_scalar::<6>,
-        7 => ex_dot_scalar::<7>,
-        8 => ex_dot_scalar::<8>,
+        1 => &EX_DOT_U1,
+        2 => &EX_DOT_U2,
+        3 => &EX_DOT_U3,
+        4 => &EX_DOT_U4,
+        5 => &EX_DOT_U5,
+        6 => &EX_DOT_U6,
+        7 => &EX_DOT_U7,
+        8 => &EX_DOT_U8,
         _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
     }
 }
 
+/// The dot kernel for `ex_bits` on the running CPU; the caller can keep it
+/// for per-candidate use.
+pub fn ex_dot_kernel(ex_bits: u8) -> Kernel<ExDotFn> {
+    debug_assert!((1..=8).contains(&ex_bits));
+    ex_dot_dispatch(ex_bits).get()
+}
+
+macro_rules! scalar_kernels {
+    ($($candidate:ident = $name:ident::<$ex_bits:literal>;)*) => {$(
+        lance_core::target_kernel! {
+            #[target_features()]
+            #[candidate($candidate: ExDotFn)]
+            fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
+                ex_dot_scalar::<$ex_bits>(ex_query, codes)
+            }
+        }
+    )*};
+}
+
+scalar_kernels! {
+    EX_DOT_U1_SCALAR = ex_dot_u1_scalar::<1>;
+    EX_DOT_U2_SCALAR = ex_dot_u2_scalar::<2>;
+    EX_DOT_U3_SCALAR = ex_dot_u3_scalar::<3>;
+    EX_DOT_U4_SCALAR = ex_dot_u4_scalar::<4>;
+    EX_DOT_U5_SCALAR = ex_dot_u5_scalar::<5>;
+    EX_DOT_U6_SCALAR = ex_dot_u6_scalar::<6>;
+    EX_DOT_U7_SCALAR = ex_dot_u7_scalar::<7>;
+    EX_DOT_U8_SCALAR = ex_dot_u8_scalar::<8>;
+}
+
+#[inline(always)]
 fn ex_dot_scalar<const EX_BITS: u8>(ex_query: &[f32], codes: &[u8]) -> f32 {
     let group_dims = group_dims(EX_BITS);
     let bytes_per_group = group_bytes(EX_BITS);
@@ -594,41 +613,6 @@ mod x86 {
     use super::ExDotFn;
     use std::arch::x86_64::*;
 
-    pub(super) fn avx2_kernel(ex_bits: u8) -> ExDotFn {
-        match ex_bits {
-            1 => dot_u1_avx2_dispatch,
-            2 => dot_u2_avx2_dispatch,
-            3 => dot_u3_avx2_dispatch,
-            4 => dot_u4_avx2_dispatch,
-            5 => dot_u5_avx2_dispatch,
-            6 => dot_u6_avx2_dispatch,
-            7 => dot_u7_avx2_dispatch,
-            8 => dot_u8_avx2_dispatch,
-            _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
-        }
-    }
-
-    pub(super) fn avx512_kernel(ex_bits: u8) -> ExDotFn {
-        match ex_bits {
-            2 | 6 => four_chain_kernel(ex_bits),
-            _ => avx512_baseline_kernel(ex_bits),
-        }
-    }
-
-    pub(super) fn avx512_baseline_kernel(ex_bits: u8) -> ExDotFn {
-        match ex_bits {
-            1 => dot_u1_avx512_dispatch,
-            2 => dot_u2_avx512_dispatch,
-            3 => dot_u3_avx512_dispatch,
-            4 => dot_u4_avx512_dispatch,
-            5 => dot_u5_avx512_dispatch,
-            6 => dot_u6_avx512_dispatch,
-            7 => dot_u7_avx512_dispatch,
-            8 => dot_u8_avx512_dispatch,
-            _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
-        }
-    }
-
     /// Broadcast a byte to the 8 bytes of a `u64`.
     #[inline(always)]
     fn splat_byte(byte: u8) -> u64 {
@@ -792,183 +776,170 @@ mod x86 {
     }
 
     macro_rules! x86_dot_kernel {
-        ($name:ident, $dispatch:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
-            #[target_feature(enable = "avx2", enable = "fma")]
-            unsafe fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
-                const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
-                const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
-                debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
-                debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
+        ($name:ident, $candidate:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
+            lance_core::target_kernel! {
+                #[target_features("avx2", "fma")]
+                #[candidate(pub(super) $candidate: ExDotFn)]
+                fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
+                    const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
+                    const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
+                    debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
+                    debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
 
-                let groups = ex_query.len() / GROUP_DIMS;
-                let full_groups = (codes.len() / GROUP_BYTES).min(groups);
-                // Two accumulators per run position break the FMA latency
-                // chain; they are summed once at the end.
-                let mut acc = [_mm256_setzero_ps(); 2];
-                for group in 0..full_groups {
-                    // SAFETY: `group < full_groups` keeps both the code group
-                    // and the query run in bounds.
-                    let runs = unsafe { $unpack(codes.as_ptr().add(group * GROUP_BYTES)) };
-                    for (run, codes16) in runs.into_iter().enumerate() {
-                        unsafe {
-                            fma16_avx2(
-                                codes16,
-                                ex_query.as_ptr().add(group * GROUP_DIMS + run * 16),
-                                &mut acc,
-                            )
-                        };
+                    let groups = ex_query.len() / GROUP_DIMS;
+                    let full_groups = (codes.len() / GROUP_BYTES).min(groups);
+                    // Two accumulators per run position break the FMA latency
+                    // chain; they are summed once at the end.
+                    let mut acc = [_mm256_setzero_ps(); 2];
+                    for group in 0..full_groups {
+                        // SAFETY: `group < full_groups` keeps both the code group
+                        // and the query run in bounds.
+                        let runs = unsafe { $unpack(codes.as_ptr().add(group * GROUP_BYTES)) };
+                        for (run, codes16) in runs.into_iter().enumerate() {
+                            unsafe {
+                                fma16_avx2(
+                                    codes16,
+                                    ex_query.as_ptr().add(group * GROUP_DIMS + run * 16),
+                                    &mut acc,
+                                )
+                            };
+                        }
                     }
-                }
-                let consumed = full_groups * GROUP_BYTES;
-                if consumed < codes.len() && full_groups < groups {
-                    // Zero-pad the final partial code group on the stack.
-                    let mut padded = [0u8; GROUP_BYTES];
-                    padded[..codes.len() - consumed].copy_from_slice(&codes[consumed..]);
-                    let runs = unsafe { $unpack(padded.as_ptr()) };
-                    for (run, codes16) in runs.into_iter().enumerate() {
-                        unsafe {
-                            fma16_avx2(
-                                codes16,
-                                ex_query.as_ptr().add(full_groups * GROUP_DIMS + run * 16),
-                                &mut acc,
-                            )
-                        };
+                    let consumed = full_groups * GROUP_BYTES;
+                    if consumed < codes.len() && full_groups < groups {
+                        // Zero-pad the final partial code group on the stack.
+                        let mut padded = [0u8; GROUP_BYTES];
+                        padded[..codes.len() - consumed].copy_from_slice(&codes[consumed..]);
+                        let runs = unsafe { $unpack(padded.as_ptr()) };
+                        for (run, codes16) in runs.into_iter().enumerate() {
+                            unsafe {
+                                fma16_avx2(
+                                    codes16,
+                                    ex_query.as_ptr().add(full_groups * GROUP_DIMS + run * 16),
+                                    &mut acc,
+                                )
+                            };
+                        }
                     }
+                    unsafe { reduce_add_avx2(acc) }
                 }
-                unsafe { reduce_add_avx2(acc) }
-            }
-
-            fn $dispatch(ex_query: &[f32], codes: &[u8]) -> f32 {
-                // SAFETY: only selected when AVX2 and FMA were detected.
-                unsafe { $name(ex_query, codes) }
             }
         };
     }
 
     macro_rules! x86_dot_kernel_avx512 {
-        ($name:ident, $dispatch:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
-            #[target_feature(enable = "avx512f")]
-            unsafe fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
-                const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
-                const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
-                debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
-                debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
+        ($name:ident, $candidate:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
+            lance_core::target_kernel! {
+                #[target_features("avx512f")]
+                #[candidate(pub(super) $candidate: ExDotFn)]
+                fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
+                    const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
+                    const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
+                    debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
+                    debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
 
-                let groups = ex_query.len() / GROUP_DIMS;
-                let full_groups = (codes.len() / GROUP_BYTES).min(groups);
-                // Alternating by group as well as run keeps two independent
-                // FMA chains even for the single-run widths.
-                let mut acc = [_mm512_setzero_ps(); 2];
-                for group in 0..full_groups {
-                    // SAFETY: `group < full_groups` keeps both the code group
-                    // and the query run in bounds.
-                    let runs = unsafe { $unpack(codes.as_ptr().add(group * GROUP_BYTES)) };
-                    for (run, codes16) in runs.into_iter().enumerate() {
-                        unsafe {
-                            fma16_avx512(
-                                codes16,
-                                ex_query.as_ptr().add(group * GROUP_DIMS + run * 16),
-                                &mut acc[(group + run) % 2],
-                            )
-                        };
+                    let groups = ex_query.len() / GROUP_DIMS;
+                    let full_groups = (codes.len() / GROUP_BYTES).min(groups);
+                    // Alternating by group as well as run keeps two independent
+                    // FMA chains even for the single-run widths.
+                    let mut acc = [_mm512_setzero_ps(); 2];
+                    for group in 0..full_groups {
+                        // SAFETY: `group < full_groups` keeps both the code group
+                        // and the query run in bounds.
+                        let runs = unsafe { $unpack(codes.as_ptr().add(group * GROUP_BYTES)) };
+                        for (run, codes16) in runs.into_iter().enumerate() {
+                            unsafe {
+                                fma16_avx512(
+                                    codes16,
+                                    ex_query.as_ptr().add(group * GROUP_DIMS + run * 16),
+                                    &mut acc[(group + run) % 2],
+                                )
+                            };
+                        }
                     }
-                }
-                let consumed = full_groups * GROUP_BYTES;
-                if consumed < codes.len() && full_groups < groups {
-                    let mut padded = [0u8; GROUP_BYTES];
-                    padded[..codes.len() - consumed].copy_from_slice(&codes[consumed..]);
-                    let runs = unsafe { $unpack(padded.as_ptr()) };
-                    for (run, codes16) in runs.into_iter().enumerate() {
-                        unsafe {
-                            fma16_avx512(
-                                codes16,
-                                ex_query.as_ptr().add(full_groups * GROUP_DIMS + run * 16),
-                                &mut acc[(full_groups + run) % 2],
-                            )
-                        };
+                    let consumed = full_groups * GROUP_BYTES;
+                    if consumed < codes.len() && full_groups < groups {
+                        let mut padded = [0u8; GROUP_BYTES];
+                        padded[..codes.len() - consumed].copy_from_slice(&codes[consumed..]);
+                        let runs = unsafe { $unpack(padded.as_ptr()) };
+                        for (run, codes16) in runs.into_iter().enumerate() {
+                            unsafe {
+                                fma16_avx512(
+                                    codes16,
+                                    ex_query.as_ptr().add(full_groups * GROUP_DIMS + run * 16),
+                                    &mut acc[(full_groups + run) % 2],
+                                )
+                            };
+                        }
                     }
+                    _mm512_reduce_add_ps(_mm512_add_ps(acc[0], acc[1]))
                 }
-                _mm512_reduce_add_ps(_mm512_add_ps(acc[0], acc[1]))
-            }
-
-            fn $dispatch(ex_query: &[f32], codes: &[u8]) -> f32 {
-                // SAFETY: only selected when AVX-512F was detected.
-                unsafe { $name(ex_query, codes) }
             }
         };
     }
 
     macro_rules! four_chain_kernel {
-        ($name:ident, $dispatch:ident, $unpack:ident, $bits:expr, $fallback:ident) => {
-            #[target_feature(enable = "avx512f")]
-            unsafe fn $name(query: &[f32], codes: &[u8]) -> f32 {
-                if !query.len().is_multiple_of(64) || codes.len() != query.len() * $bits / 8 {
-                    return unsafe { $fallback(query, codes) };
-                }
-                let mut acc = [_mm512_setzero_ps(); 4];
-                for group in 0..query.len() / 64 {
-                    let runs = unsafe { $unpack(codes.as_ptr().add(group * 8 * $bits)) };
-                    for (run, bytes) in runs.into_iter().enumerate() {
-                        unsafe {
-                            fma16_avx512(
-                                bytes,
-                                query.as_ptr().add(group * 64 + run * 16),
-                                &mut acc[run],
-                            );
+        ($name:ident, $candidate:ident, $unpack:ident, $bits:expr, $fallback:ident) => {
+            lance_core::target_kernel! {
+                #[target_features("avx512f")]
+                #[candidate(pub(super) $candidate: ExDotFn)]
+                fn $name(query: &[f32], codes: &[u8]) -> f32 {
+                    if !query.len().is_multiple_of(64) || codes.len() != query.len() * $bits / 8 {
+                        return $fallback(query, codes);
+                    }
+                    let mut acc = [_mm512_setzero_ps(); 4];
+                    for group in 0..query.len() / 64 {
+                        let runs = unsafe { $unpack(codes.as_ptr().add(group * 8 * $bits)) };
+                        for (run, bytes) in runs.into_iter().enumerate() {
+                            unsafe {
+                                fma16_avx512(
+                                    bytes,
+                                    query.as_ptr().add(group * 64 + run * 16),
+                                    &mut acc[run],
+                                );
+                            }
                         }
                     }
+                    _mm512_reduce_add_ps(_mm512_add_ps(
+                        _mm512_add_ps(acc[0], acc[1]),
+                        _mm512_add_ps(acc[2], acc[3]),
+                    ))
                 }
-                _mm512_reduce_add_ps(_mm512_add_ps(
-                    _mm512_add_ps(acc[0], acc[1]),
-                    _mm512_add_ps(acc[2], acc[3]),
-                ))
-            }
-            fn $dispatch(query: &[f32], codes: &[u8]) -> f32 {
-                // SAFETY: the dispatcher checks AVX-512F first.
-                unsafe { $name(query, codes) }
             }
         };
     }
     four_chain_kernel!(
         dot_u2_four_chain,
-        dot_u2_four_chain_dispatch,
+        EX_DOT_U2_FOUR_CHAIN,
         unpack_u2,
         2,
         dot_u2_avx512
     );
     four_chain_kernel!(
         dot_u6_four_chain,
-        dot_u6_four_chain_dispatch,
+        EX_DOT_U6_FOUR_CHAIN,
         unpack_u6,
         6,
         dot_u6_avx512
     );
 
-    pub(super) fn four_chain_kernel(bits: u8) -> super::ExDotFn {
-        match bits {
-            2 => dot_u2_four_chain_dispatch,
-            6 => dot_u6_four_chain_dispatch,
-            _ => avx512_kernel(bits),
-        }
-    }
+    x86_dot_kernel!(dot_u1_avx2, EX_DOT_U1_AVX2, unpack_u1, 1, 1);
+    x86_dot_kernel!(dot_u2_avx2, EX_DOT_U2_AVX2, unpack_u2, 2, 4);
+    x86_dot_kernel!(dot_u3_avx2, EX_DOT_U3_AVX2, unpack_u3, 3, 4);
+    x86_dot_kernel!(dot_u4_avx2, EX_DOT_U4_AVX2, unpack_u4, 4, 1);
+    x86_dot_kernel!(dot_u5_avx2, EX_DOT_U5_AVX2, unpack_u5, 5, 4);
+    x86_dot_kernel!(dot_u6_avx2, EX_DOT_U6_AVX2, unpack_u6, 6, 4);
+    x86_dot_kernel!(dot_u7_avx2, EX_DOT_U7_AVX2, unpack_u7, 7, 4);
+    x86_dot_kernel!(dot_u8_avx2, EX_DOT_U8_AVX2, unpack_u8x16, 8, 1);
 
-    x86_dot_kernel!(dot_u1_avx2, dot_u1_avx2_dispatch, unpack_u1, 1, 1);
-    x86_dot_kernel!(dot_u2_avx2, dot_u2_avx2_dispatch, unpack_u2, 2, 4);
-    x86_dot_kernel!(dot_u3_avx2, dot_u3_avx2_dispatch, unpack_u3, 3, 4);
-    x86_dot_kernel!(dot_u4_avx2, dot_u4_avx2_dispatch, unpack_u4, 4, 1);
-    x86_dot_kernel!(dot_u5_avx2, dot_u5_avx2_dispatch, unpack_u5, 5, 4);
-    x86_dot_kernel!(dot_u6_avx2, dot_u6_avx2_dispatch, unpack_u6, 6, 4);
-    x86_dot_kernel!(dot_u7_avx2, dot_u7_avx2_dispatch, unpack_u7, 7, 4);
-    x86_dot_kernel!(dot_u8_avx2, dot_u8_avx2_dispatch, unpack_u8x16, 8, 1);
-
-    x86_dot_kernel_avx512!(dot_u1_avx512, dot_u1_avx512_dispatch, unpack_u1, 1, 1);
-    x86_dot_kernel_avx512!(dot_u2_avx512, dot_u2_avx512_dispatch, unpack_u2, 2, 4);
-    x86_dot_kernel_avx512!(dot_u3_avx512, dot_u3_avx512_dispatch, unpack_u3, 3, 4);
-    x86_dot_kernel_avx512!(dot_u4_avx512, dot_u4_avx512_dispatch, unpack_u4, 4, 1);
-    x86_dot_kernel_avx512!(dot_u5_avx512, dot_u5_avx512_dispatch, unpack_u5, 5, 4);
-    x86_dot_kernel_avx512!(dot_u6_avx512, dot_u6_avx512_dispatch, unpack_u6, 6, 4);
-    x86_dot_kernel_avx512!(dot_u7_avx512, dot_u7_avx512_dispatch, unpack_u7, 7, 4);
-    x86_dot_kernel_avx512!(dot_u8_avx512, dot_u8_avx512_dispatch, unpack_u8x16, 8, 1);
+    x86_dot_kernel_avx512!(dot_u1_avx512, EX_DOT_U1_AVX512, unpack_u1, 1, 1);
+    x86_dot_kernel_avx512!(dot_u2_avx512, EX_DOT_U2_AVX512, unpack_u2, 2, 4);
+    x86_dot_kernel_avx512!(dot_u3_avx512, EX_DOT_U3_AVX512, unpack_u3, 3, 4);
+    x86_dot_kernel_avx512!(dot_u4_avx512, EX_DOT_U4_AVX512, unpack_u4, 4, 1);
+    x86_dot_kernel_avx512!(dot_u5_avx512, EX_DOT_U5_AVX512, unpack_u5, 5, 4);
+    x86_dot_kernel_avx512!(dot_u6_avx512, EX_DOT_U6_AVX512, unpack_u6, 6, 4);
+    x86_dot_kernel_avx512!(dot_u7_avx512, EX_DOT_U7_AVX512, unpack_u7, 7, 4);
+    x86_dot_kernel_avx512!(dot_u8_avx512, EX_DOT_U8_AVX512, unpack_u8x16, 8, 1);
 
     /// 16 8-bit codes from one 16-dim group of two 4-bit planes, combined
     /// with scalar integer ops (runs on the scalar ports, overlapping the
@@ -1401,20 +1372,6 @@ mod neon {
     use super::ExDotFn;
     use std::arch::aarch64::*;
 
-    pub(super) fn kernel(ex_bits: u8) -> ExDotFn {
-        match ex_bits {
-            1 => dot_u1_neon_dispatch,
-            2 => dot_u2_neon_dispatch,
-            3 => dot_u3_neon_dispatch,
-            4 => dot_u4_neon_dispatch,
-            5 => dot_u5_neon_dispatch,
-            6 => dot_u6_neon_dispatch,
-            7 => dot_u7_neon_dispatch,
-            8 => dot_u8_neon_dispatch,
-            _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
-        }
-    }
-
     #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn unpack_u1(ptr: *const u8) -> [uint8x16_t; 1] {
@@ -1547,68 +1504,66 @@ mod neon {
     }
 
     macro_rules! neon_dot_kernel {
-        ($name:ident, $dispatch:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
-            #[target_feature(enable = "neon")]
-            unsafe fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
-                const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
-                const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
-                debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
-                debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
+        ($name:ident, $candidate:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
+            lance_core::target_kernel! {
+                #[target_features("neon")]
+                #[candidate(pub(super) $candidate: ExDotFn)]
+                fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
+                    const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
+                    const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
+                    debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
+                    debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
 
-                let groups = ex_query.len() / GROUP_DIMS;
-                let full_groups = (codes.len() / GROUP_BYTES).min(groups);
-                let mut acc = [vdupq_n_f32(0.0); 4];
-                for group in 0..full_groups {
-                    // SAFETY: `group < full_groups` keeps both the code group
-                    // and the query run in bounds.
-                    let runs = unsafe { $unpack(codes.as_ptr().add(group * GROUP_BYTES)) };
-                    for (run, codes16) in runs.into_iter().enumerate() {
-                        unsafe {
-                            fma16_neon(
-                                codes16,
-                                ex_query.as_ptr().add(group * GROUP_DIMS + run * 16),
-                                &mut acc,
-                            )
-                        };
+                    let groups = ex_query.len() / GROUP_DIMS;
+                    let full_groups = (codes.len() / GROUP_BYTES).min(groups);
+                    let mut acc = [vdupq_n_f32(0.0); 4];
+                    for group in 0..full_groups {
+                        // SAFETY: `group < full_groups` keeps both the code group
+                        // and the query run in bounds.
+                        let runs = unsafe { $unpack(codes.as_ptr().add(group * GROUP_BYTES)) };
+                        for (run, codes16) in runs.into_iter().enumerate() {
+                            unsafe {
+                                fma16_neon(
+                                    codes16,
+                                    ex_query.as_ptr().add(group * GROUP_DIMS + run * 16),
+                                    &mut acc,
+                                )
+                            };
+                        }
                     }
-                }
-                let consumed = full_groups * GROUP_BYTES;
-                if consumed < codes.len() && full_groups < groups {
-                    // Zero-pad the final partial code group on the stack.
-                    let mut padded = [0u8; GROUP_BYTES];
-                    padded[..codes.len() - consumed].copy_from_slice(&codes[consumed..]);
-                    let runs = unsafe { $unpack(padded.as_ptr()) };
-                    for (run, codes16) in runs.into_iter().enumerate() {
-                        unsafe {
-                            fma16_neon(
-                                codes16,
-                                ex_query.as_ptr().add(full_groups * GROUP_DIMS + run * 16),
-                                &mut acc,
-                            )
-                        };
+                    let consumed = full_groups * GROUP_BYTES;
+                    if consumed < codes.len() && full_groups < groups {
+                        // Zero-pad the final partial code group on the stack.
+                        let mut padded = [0u8; GROUP_BYTES];
+                        padded[..codes.len() - consumed].copy_from_slice(&codes[consumed..]);
+                        let runs = unsafe { $unpack(padded.as_ptr()) };
+                        for (run, codes16) in runs.into_iter().enumerate() {
+                            unsafe {
+                                fma16_neon(
+                                    codes16,
+                                    ex_query.as_ptr().add(full_groups * GROUP_DIMS + run * 16),
+                                    &mut acc,
+                                )
+                            };
+                        }
                     }
+                    vaddvq_f32(vaddq_f32(
+                        vaddq_f32(acc[0], acc[1]),
+                        vaddq_f32(acc[2], acc[3]),
+                    ))
                 }
-                vaddvq_f32(vaddq_f32(
-                    vaddq_f32(acc[0], acc[1]),
-                    vaddq_f32(acc[2], acc[3]),
-                ))
-            }
-
-            fn $dispatch(ex_query: &[f32], codes: &[u8]) -> f32 {
-                // SAFETY: NEON is part of the aarch64 baseline.
-                unsafe { $name(ex_query, codes) }
             }
         };
     }
 
-    neon_dot_kernel!(dot_u1_neon, dot_u1_neon_dispatch, unpack_u1, 1, 1);
-    neon_dot_kernel!(dot_u2_neon, dot_u2_neon_dispatch, unpack_u2, 2, 4);
-    neon_dot_kernel!(dot_u3_neon, dot_u3_neon_dispatch, unpack_u3, 3, 4);
-    neon_dot_kernel!(dot_u4_neon, dot_u4_neon_dispatch, unpack_u4, 4, 1);
-    neon_dot_kernel!(dot_u5_neon, dot_u5_neon_dispatch, unpack_u5, 5, 4);
-    neon_dot_kernel!(dot_u6_neon, dot_u6_neon_dispatch, unpack_u6, 6, 4);
-    neon_dot_kernel!(dot_u7_neon, dot_u7_neon_dispatch, unpack_u7, 7, 4);
-    neon_dot_kernel!(dot_u8_neon, dot_u8_neon_dispatch, unpack_u8x16, 8, 1);
+    neon_dot_kernel!(dot_u1_neon, EX_DOT_U1_NEON, unpack_u1, 1, 1);
+    neon_dot_kernel!(dot_u2_neon, EX_DOT_U2_NEON, unpack_u2, 2, 4);
+    neon_dot_kernel!(dot_u3_neon, EX_DOT_U3_NEON, unpack_u3, 3, 4);
+    neon_dot_kernel!(dot_u4_neon, EX_DOT_U4_NEON, unpack_u4, 4, 1);
+    neon_dot_kernel!(dot_u5_neon, EX_DOT_U5_NEON, unpack_u5, 5, 4);
+    neon_dot_kernel!(dot_u6_neon, EX_DOT_U6_NEON, unpack_u6, 6, 4);
+    neon_dot_kernel!(dot_u7_neon, EX_DOT_U7_NEON, unpack_u7, 7, 4);
+    neon_dot_kernel!(dot_u8_neon, EX_DOT_U8_NEON, unpack_u8x16, 8, 1);
 
     #[inline]
     #[target_feature(enable = "neon")]
@@ -1783,7 +1738,7 @@ mod tests {
         pack_blocked_row(&high, layout.high_bits, &mut hi);
         pack_blocked_row(&low, layout.low_bits, &mut lo);
         query.resize(padded_query_len(dim), 0.0);
-        let expected = ex_dot_kernel(bits - 1)(&query, &packed);
+        let expected = ex_dot_kernel(bits - 1).call(&query, &packed);
         for (name, kernel) in ex_dot_prefix_kernel_variants(bits) {
             assert_eq!(
                 kernel(&query, &hi, &lo),
@@ -1798,7 +1753,7 @@ mod tests {
         query.resize(padded_query_len(dim), 0.0);
         assert_eq!(
             ex_dot_prefix_kernel(bits)(&query, &hi, &lo).to_bits(),
-            ex_dot_kernel(bits - 1)(&query, &packed).to_bits(),
+            ex_dot_kernel(bits - 1).call(&query, &packed).to_bits(),
             "dispatched bits={bits}, dim={dim}"
         );
     }
@@ -1821,8 +1776,9 @@ mod tests {
                 }
             })
             .collect();
-        let expected = ex_dot_kernel(8)(&query, &full);
-        let two_pass = 16.0 * ex_dot_kernel(4)(&query, &hi) + ex_dot_kernel(4)(&query, &lo);
+        let expected = ex_dot_kernel(8).call(&query, &full);
+        let two_pass =
+            16.0 * ex_dot_kernel(4).call(&query, &hi) + ex_dot_kernel(4).call(&query, &lo);
         let tolerance = expected.abs().max(1.0) * 1e-4;
         assert!(
             (two_pass - expected).abs() <= tolerance,

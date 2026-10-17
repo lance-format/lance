@@ -45,69 +45,84 @@ fn fwht_in_place(values: &mut [f32]) {
     }
 }
 
-#[inline]
-fn flip_signs_scalar(values: &mut [f32], signs: &[u8]) {
-    // Apply a random diagonal matrix with +/-1 entries by toggling the f32 sign bit.
-    // One bit in `signs` controls one element in `values`.
-    for (byte_idx, &mask) in signs.iter().enumerate() {
-        let start = byte_idx * 8;
-        if start >= values.len() {
-            break;
+/// Applies a random diagonal matrix with +/-1 entries by toggling the f32
+/// sign bit: bit `i` of `signs` (LSB first) flips `values[i]`.
+type FlipSignsFn = unsafe fn(&mut [f32], &[u8]);
+
+lance_core::dispatch! {
+    static FLIP_SIGNS: Dispatch<FlipSignsFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::FLIP_SIGNS_AVX2, FLIP_SIGNS_SCALAR]
         }
-        let end = (start + 8).min(values.len());
-        for (bit_idx, value) in values[start..end].iter_mut().enumerate() {
-            let sign_mask = (((mask >> bit_idx) & 1) as u32) << 31;
-            *value = f32::from_bits(value.to_bits() ^ sign_mask);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[FLIP_SIGNS_SCALAR]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(FLIP_SIGNS_SCALAR: FlipSignsFn)]
+    #[inline]
+    fn flip_signs_scalar(values: &mut [f32], signs: &[u8]) {
+        for (byte_idx, &mask) in signs.iter().enumerate() {
+            let start = byte_idx * 8;
+            if start >= values.len() {
+                break;
+            }
+            let end = (start + 8).min(values.len());
+            for (bit_idx, value) in values[start..end].iter_mut().enumerate() {
+                let sign_mask = (((mask >> bit_idx) & 1) as u32) << 31;
+                *value = f32::from_bits(value.to_bits() ^ sign_mask);
+            }
         }
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")]
+mod x86 {
     use std::arch::x86_64::*;
 
-    // Vectorized variant of `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
-    // The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
-    let full_chunks = values.len() / 8;
-    let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
-    let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
+    use super::{FlipSignsFn, flip_signs_scalar};
 
-    for (chunk_idx, &mask) in signs.iter().take(full_chunks).enumerate() {
-        let mask = mask as i32;
-        let mask_bits = _mm256_set1_epi32(mask);
-        let test = _mm256_and_si256(mask_bits, bit_select);
-        let cmp = _mm256_cmpeq_epi32(test, bit_select);
-        let xor_mask = _mm256_and_si256(cmp, sign_flip);
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) FLIP_SIGNS_AVX2: FlipSignsFn)]
+        /// Vectorized `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
+        /// The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
+        fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
+            let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
+            let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
 
-        let ptr = unsafe { values.as_mut_ptr().add(chunk_idx * 8) };
-        let vec = unsafe { _mm256_loadu_ps(ptr) };
-        let out = _mm256_xor_ps(vec, _mm256_castsi256_ps(xor_mask));
-        unsafe { _mm256_storeu_ps(ptr, out) };
-    }
+            let (chunks, _) = values.as_chunks_mut::<8>();
+            let full_chunks = chunks.len();
+            for (chunk, &mask) in chunks.iter_mut().zip(signs) {
+                let mask_bits = _mm256_set1_epi32(mask as i32);
+                let test = _mm256_and_si256(mask_bits, bit_select);
+                let cmp = _mm256_cmpeq_epi32(test, bit_select);
+                let xor_mask = _mm256_and_si256(cmp, sign_flip);
 
-    if full_chunks * 8 < values.len() {
-        flip_signs_scalar(&mut values[full_chunks * 8..], &signs[full_chunks..]);
+                // SAFETY: `chunk` holds exactly 8 floats.
+                unsafe {
+                    let vec = _mm256_loadu_ps(chunk.as_ptr());
+                    let out = _mm256_xor_ps(vec, _mm256_castsi256_ps(xor_mask));
+                    _mm256_storeu_ps(chunk.as_mut_ptr(), out);
+                }
+            }
+
+            if full_chunks * 8 < values.len() && full_chunks < signs.len() {
+                flip_signs_scalar(&mut values[full_chunks * 8..], &signs[full_chunks..]);
+            }
+        }
     }
 }
 
 #[inline]
 fn flip_signs(values: &mut [f32], signs: &[u8]) {
     debug_assert!(signs.len() * 8 >= values.len());
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: guarded by runtime feature detection.
-            unsafe {
-                flip_signs_avx2(values, signs);
-            }
-            return;
-        }
-    }
-    flip_signs_scalar(values, signs);
+    FLIP_SIGNS.get().call(values, signs);
 }
 
 #[inline]
