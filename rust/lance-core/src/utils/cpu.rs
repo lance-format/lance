@@ -1,8 +1,345 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! CPU feature detection and runtime kernel selection.
+//!
+//! [`CpuFeatures`] is the set of features the host supports, detected once.
+//! Kernels declare the features they need with [`target_kernel!`](crate::target_kernel),
+//! and a [`Dispatch`] picks the first candidate the host supports.
+
 use std::fmt;
 use std::sync::LazyLock;
+
+mod dispatch;
+
+pub use dispatch::{Candidate, Dispatch, Kernel, Selection};
+
+/// A set of CPU features, named after rustc `target_feature`s.
+///
+/// Unlike [`SimdSupport`], this is not a ladder: a kernel can require any
+/// combination, such as AVX-512 without FMA or F16C on an AVX host.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CpuFeatures(u32);
+
+impl CpuFeatures {
+    pub const SSE2: Self = Self(1 << 0);
+    pub const SSE3: Self = Self(1 << 1);
+    pub const SSSE3: Self = Self(1 << 2);
+    pub const SSE4_1: Self = Self(1 << 3);
+    pub const SSE4_2: Self = Self(1 << 4);
+    pub const POPCNT: Self = Self(1 << 5);
+    pub const AVX: Self = Self(1 << 6);
+    pub const AVX2: Self = Self(1 << 7);
+    pub const FMA: Self = Self(1 << 8);
+    pub const F16C: Self = Self(1 << 9);
+    pub const BMI1: Self = Self(1 << 10);
+    pub const BMI2: Self = Self(1 << 11);
+    pub const AVX512F: Self = Self(1 << 12);
+    pub const AVX512BW: Self = Self(1 << 13);
+    pub const AVX512CD: Self = Self(1 << 14);
+    pub const AVX512DQ: Self = Self(1 << 15);
+    pub const AVX512VL: Self = Self(1 << 16);
+    pub const AVX512FP16: Self = Self(1 << 17);
+    pub const NEON: Self = Self(1 << 18);
+    pub const FP16: Self = Self(1 << 19);
+    pub const LSX: Self = Self(1 << 20);
+    pub const LASX: Self = Self(1 << 21);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether every feature in `other` is also in `self`.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Features supported by the host, detected once per process.
+    pub fn host() -> Self {
+        *HOST_FEATURES
+    }
+
+    /// Features the build enables for all code, e.g. via `-C target-cpu`.
+    ///
+    /// A kernel whose features are all in the baseline can be called directly
+    /// and inlined; see [`Dispatch`].
+    pub const fn baseline() -> Self {
+        BASELINE
+    }
+
+    /// The feature set for one rustc `target_feature` name, including the
+    /// features rustc enables along with it. `None` if the name is unknown.
+    ///
+    /// Implied features matter for soundness: `#[target_feature(enable =
+    /// "avx512f")]` also lets codegen use AVX2, FMA and F16C, so a kernel
+    /// declaring it must not run on a host that lacks any of them.
+    pub const fn from_target_feature(name: &str) -> Option<Self> {
+        let mut i = 0;
+        while i < FEATURE_TABLE.len() {
+            if str_eq(FEATURE_TABLE[i].name, name) {
+                return Some(FEATURE_TABLE[i].feature.with_implied());
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Union of [`Self::from_target_feature`] over `names`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a name is unknown. [`target_kernel!`](crate::target_kernel)
+    /// evaluates this in a `const`, so a typo is a compile error there.
+    pub const fn from_target_features(names: &[&str]) -> Self {
+        let mut features = Self::empty();
+        let mut i = 0;
+        while i < names.len() {
+            match Self::from_target_feature(names[i]) {
+                Some(feature) => features = features.union(feature),
+                None => panic!("unknown target feature; add it to CpuFeatures"),
+            }
+            i += 1;
+        }
+        features
+    }
+
+    /// Every known feature, one per set.
+    pub fn all() -> impl Iterator<Item = Self> {
+        FEATURE_TABLE.iter().map(|info| info.feature)
+    }
+
+    /// The `target_feature` names of the features in this set.
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        FEATURE_TABLE
+            .iter()
+            .filter(move |info| self.contains(info.feature))
+            .map(|info| info.name)
+    }
+
+    fn x86_names(self) -> impl Iterator<Item = &'static str> {
+        FEATURE_TABLE
+            .iter()
+            .filter(move |info| info.is_x86 && self.contains(info.feature))
+            .map(|info| info.name)
+    }
+
+    const fn with_implied(self) -> Self {
+        let mut features = self;
+        loop {
+            let mut expanded = features;
+            let mut i = 0;
+            while i < FEATURE_TABLE.len() {
+                if features.contains(FEATURE_TABLE[i].feature) {
+                    expanded = expanded.union(FEATURE_TABLE[i].implies);
+                }
+                i += 1;
+            }
+            if expanded.0 == features.0 {
+                return features;
+            }
+            features = expanded;
+        }
+    }
+}
+
+impl fmt::Debug for CpuFeatures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.names()).finish()
+    }
+}
+
+struct FeatureInfo {
+    feature: CpuFeatures,
+    name: &'static str,
+    is_x86: bool,
+    /// Features rustc enables along with this one. Transitive implications
+    /// are resolved by [`CpuFeatures::with_implied`].
+    implies: CpuFeatures,
+}
+
+const fn x86(feature: CpuFeatures, name: &'static str, implies: CpuFeatures) -> FeatureInfo {
+    FeatureInfo {
+        feature,
+        name,
+        is_x86: true,
+        implies,
+    }
+}
+
+const fn other(feature: CpuFeatures, name: &'static str, implies: CpuFeatures) -> FeatureInfo {
+    FeatureInfo {
+        feature,
+        name,
+        is_x86: false,
+        implies,
+    }
+}
+
+/// Ordered as [`SimdInfo::host_features`] reports them.
+const FEATURE_TABLE: &[FeatureInfo] = {
+    use CpuFeatures as F;
+    &[
+        x86(F::SSE2, "sse2", F::empty()),
+        x86(F::SSE3, "sse3", F::SSE2),
+        x86(F::SSSE3, "ssse3", F::SSE3),
+        x86(F::SSE4_1, "sse4.1", F::SSSE3),
+        x86(F::SSE4_2, "sse4.2", F::SSE4_1),
+        x86(F::POPCNT, "popcnt", F::empty()),
+        x86(F::AVX, "avx", F::SSE4_2),
+        x86(F::AVX2, "avx2", F::AVX),
+        x86(F::FMA, "fma", F::AVX),
+        x86(F::F16C, "f16c", F::AVX),
+        x86(F::BMI1, "bmi1", F::empty()),
+        x86(F::BMI2, "bmi2", F::empty()),
+        x86(F::AVX512F, "avx512f", F::AVX2.union(F::FMA).union(F::F16C)),
+        x86(F::AVX512BW, "avx512bw", F::AVX512F),
+        x86(F::AVX512CD, "avx512cd", F::AVX512F),
+        x86(F::AVX512DQ, "avx512dq", F::AVX512F),
+        x86(F::AVX512VL, "avx512vl", F::AVX512F),
+        x86(
+            F::AVX512FP16,
+            "avx512fp16",
+            F::AVX512BW.union(F::AVX512DQ).union(F::AVX512VL),
+        ),
+        other(F::NEON, "neon", F::empty()),
+        other(F::FP16, "fp16", F::NEON),
+        other(F::LSX, "lsx", F::empty()),
+        other(F::LASX, "lasx", F::LSX),
+    ]
+};
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const BASELINE: CpuFeatures = {
+    // `cfg!` needs a literal feature name, so this cannot loop over the table.
+    let enabled = [
+        (cfg!(target_feature = "sse2"), CpuFeatures::SSE2),
+        (cfg!(target_feature = "sse3"), CpuFeatures::SSE3),
+        (cfg!(target_feature = "ssse3"), CpuFeatures::SSSE3),
+        (cfg!(target_feature = "sse4.1"), CpuFeatures::SSE4_1),
+        (cfg!(target_feature = "sse4.2"), CpuFeatures::SSE4_2),
+        (cfg!(target_feature = "popcnt"), CpuFeatures::POPCNT),
+        (cfg!(target_feature = "avx"), CpuFeatures::AVX),
+        (cfg!(target_feature = "avx2"), CpuFeatures::AVX2),
+        (cfg!(target_feature = "fma"), CpuFeatures::FMA),
+        (cfg!(target_feature = "f16c"), CpuFeatures::F16C),
+        (cfg!(target_feature = "bmi1"), CpuFeatures::BMI1),
+        (cfg!(target_feature = "bmi2"), CpuFeatures::BMI2),
+        (cfg!(target_feature = "avx512f"), CpuFeatures::AVX512F),
+        (cfg!(target_feature = "avx512bw"), CpuFeatures::AVX512BW),
+        (cfg!(target_feature = "avx512cd"), CpuFeatures::AVX512CD),
+        (cfg!(target_feature = "avx512dq"), CpuFeatures::AVX512DQ),
+        (cfg!(target_feature = "avx512vl"), CpuFeatures::AVX512VL),
+        (cfg!(target_feature = "avx512fp16"), CpuFeatures::AVX512FP16),
+        (cfg!(target_feature = "neon"), CpuFeatures::NEON),
+        (cfg!(target_feature = "fp16"), CpuFeatures::FP16),
+        (cfg!(target_feature = "lsx"), CpuFeatures::LSX),
+        (cfg!(target_feature = "lasx"), CpuFeatures::LASX),
+    ];
+    let mut features = CpuFeatures::empty();
+    let mut i = 0;
+    while i < enabled.len() {
+        if enabled[i].0 {
+            features = features.union(enabled[i].1);
+        }
+        i += 1;
+    }
+    features
+};
+
+static HOST_FEATURES: LazyLock<CpuFeatures> =
+    LazyLock::new(|| detect_host_features().union(BASELINE));
+
+#[cfg(target_arch = "x86_64")]
+fn detect_host_features() -> CpuFeatures {
+    let mut features = CpuFeatures::empty();
+    let mut add = |is_detected: bool, feature: CpuFeatures| {
+        if is_detected {
+            features = features.union(feature);
+        }
+    };
+    // Each call must be inline: `is_x86_feature_detected!` does its own custom
+    // input parsing and rejects feature names received via a `macro_rules!`
+    // `:literal` metavariable on some toolchains.
+    add(is_x86_feature_detected!("sse2"), CpuFeatures::SSE2);
+    add(is_x86_feature_detected!("sse3"), CpuFeatures::SSE3);
+    add(is_x86_feature_detected!("ssse3"), CpuFeatures::SSSE3);
+    add(is_x86_feature_detected!("sse4.1"), CpuFeatures::SSE4_1);
+    add(is_x86_feature_detected!("sse4.2"), CpuFeatures::SSE4_2);
+    add(is_x86_feature_detected!("popcnt"), CpuFeatures::POPCNT);
+    add(is_x86_feature_detected!("avx"), CpuFeatures::AVX);
+    add(is_x86_feature_detected!("avx2"), CpuFeatures::AVX2);
+    add(is_x86_feature_detected!("fma"), CpuFeatures::FMA);
+    add(is_x86_feature_detected!("f16c"), CpuFeatures::F16C);
+    add(is_x86_feature_detected!("bmi1"), CpuFeatures::BMI1);
+    add(is_x86_feature_detected!("bmi2"), CpuFeatures::BMI2);
+    add(is_x86_feature_detected!("avx512f"), CpuFeatures::AVX512F);
+    add(is_x86_feature_detected!("avx512bw"), CpuFeatures::AVX512BW);
+    add(is_x86_feature_detected!("avx512cd"), CpuFeatures::AVX512CD);
+    add(is_x86_feature_detected!("avx512dq"), CpuFeatures::AVX512DQ);
+    add(is_x86_feature_detected!("avx512vl"), CpuFeatures::AVX512VL);
+    add(
+        is_x86_feature_detected!("avx512fp16"),
+        CpuFeatures::AVX512FP16,
+    );
+    features
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detect_host_features() -> CpuFeatures {
+    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+    let has_fp16 = true;
+    #[cfg(not(any(target_os = "ios", target_os = "tvos")))]
+    let has_fp16 = aarch64::has_neon_f16_support();
+
+    if has_fp16 {
+        CpuFeatures::NEON.union(CpuFeatures::FP16)
+    } else {
+        CpuFeatures::NEON
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn detect_host_features() -> CpuFeatures {
+    let mut features = CpuFeatures::empty();
+    if loongarch64::has_lsx_support() {
+        features = features.union(CpuFeatures::LSX);
+    }
+    if loongarch64::has_lasx_support() {
+        features = features.union(CpuFeatures::LASX);
+    }
+    features
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "loongarch64"
+)))]
+fn detect_host_features() -> CpuFeatures {
+    CpuFeatures::empty()
+}
 
 /// A level of SIMD support for some feature.
 ///
@@ -91,167 +428,45 @@ pub fn simd_info() -> SimdInfo {
     SimdInfo {
         tier: *SIMD_SUPPORT,
         target_arch: std::env::consts::ARCH,
-        host_features: detect_host_features(),
+        host_features: CpuFeatures::host().x86_names().collect(),
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn detect_host_features() -> Vec<&'static str> {
-    // Each call must be inline: `is_x86_feature_detected!` does its own custom
-    // input parsing and rejects feature names received via a `macro_rules!`
-    // `:literal` metavariable on some toolchains.
-    let mut features = Vec::with_capacity(17);
-    if is_x86_feature_detected!("sse2") {
-        features.push("sse2");
-    }
-    if is_x86_feature_detected!("sse3") {
-        features.push("sse3");
-    }
-    if is_x86_feature_detected!("ssse3") {
-        features.push("ssse3");
-    }
-    if is_x86_feature_detected!("sse4.1") {
-        features.push("sse4.1");
-    }
-    if is_x86_feature_detected!("sse4.2") {
-        features.push("sse4.2");
-    }
-    if is_x86_feature_detected!("popcnt") {
-        features.push("popcnt");
-    }
-    if is_x86_feature_detected!("avx") {
-        features.push("avx");
-    }
-    if is_x86_feature_detected!("avx2") {
-        features.push("avx2");
-    }
-    if is_x86_feature_detected!("fma") {
-        features.push("fma");
-    }
-    if is_x86_feature_detected!("f16c") {
-        features.push("f16c");
-    }
-    if is_x86_feature_detected!("bmi1") {
-        features.push("bmi1");
-    }
-    if is_x86_feature_detected!("bmi2") {
-        features.push("bmi2");
-    }
-    if is_x86_feature_detected!("avx512f") {
-        features.push("avx512f");
-    }
-    if is_x86_feature_detected!("avx512bw") {
-        features.push("avx512bw");
-    }
-    if is_x86_feature_detected!("avx512cd") {
-        features.push("avx512cd");
-    }
-    if is_x86_feature_detected!("avx512dq") {
-        features.push("avx512dq");
-    }
-    if is_x86_feature_detected!("avx512vl") {
-        features.push("avx512vl");
-    }
-    features
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn detect_host_features() -> Vec<&'static str> {
-    Vec::new()
-}
-
-/// Support for SIMD operations
-pub static SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
-    #[cfg(all(target_arch = "aarch64", any(target_os = "ios", target_os = "tvos")))]
-    {
-        // AArch64 iOS/tvOS has NEON; fp16 arithmetic is available on modern targets.
-        SimdSupport::Neon
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        not(any(target_os = "ios", target_os = "tvos"))
-    ))]
-    {
-        if aarch64::has_neon_f16_support() {
-            SimdSupport::Neon
-        } else {
-            SimdSupport::None
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if x86::has_avx512() {
-            if x86::has_avx512_f16_support() {
-                SimdSupport::Avx512FP16
+impl SimdSupport {
+    /// The tier lance reports for a feature set. Each architecture only sets
+    /// its own feature bits, so checking every architecture in turn is safe.
+    fn from_features(features: CpuFeatures) -> Self {
+        use CpuFeatures as F;
+        if features.contains(F::AVX512F) {
+            if features.contains(F::AVX512FP16) {
+                Self::Avx512FP16
             } else {
-                SimdSupport::Avx512
+                Self::Avx512
             }
-        } else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            // FMA is checked explicitly: every kernel selected for this tier is
-            // `#[target_feature(enable = "avx,fma")]`, and AVX2 does not imply
-            // FMA in the ISA. Every shipping AVX2 part has FMA, so this only
-            // guards against a host that would otherwise take an FMA kernel
-            // without FMA.
-            SimdSupport::Avx2
-        } else if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
+        } else if features.contains(F::AVX2.union(F::FMA)) {
+            Self::Avx2
+        } else if features.contains(F::AVX.union(F::FMA)) {
             // AMD Piledriver / Steamroller / FX-7500: 256-bit float ops + FMA but no AVX2.
-            SimdSupport::AvxFma
-        } else if is_x86_feature_detected!("avx") {
+            Self::AvxFma
+        } else if features.contains(F::AVX) {
             // This includes a possible AVX2 host without FMA because the Avx2
             // tier above requires both features.
-            SimdSupport::Avx
+            Self::Avx
+        } else if features.contains(F::FP16) {
+            Self::Neon
+        } else if features.contains(F::LASX) {
+            Self::Lasx
+        } else if features.contains(F::LSX) {
+            Self::Lsx
         } else {
-            SimdSupport::None
+            Self::None
         }
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        if loongarch64::has_lasx_support() {
-            SimdSupport::Lasx
-        } else if loongarch64::has_lsx_support() {
-            SimdSupport::Lsx
-        } else {
-            SimdSupport::None
-        }
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        target_arch = "x86_64",
-        target_arch = "loongarch64"
-    )))]
-    {
-        SimdSupport::None
-    }
-});
-
-#[cfg(target_arch = "x86_64")]
-mod x86 {
-    use core::arch::x86_64::__cpuid;
-
-    #[inline]
-    fn check_flag(x: usize, position: u32) -> bool {
-        x & (1 << position) != 0
-    }
-
-    pub fn has_avx512_f16_support() -> bool {
-        // this macro does many OS checks/etc. to determine if allowed to use AVX512
-        if !has_avx512() {
-            return false;
-        }
-
-        // EAX=7, ECX=0: Extended Features (includes AVX512)
-        // More info on calling CPUID can be found here (section 1.4)
-        // https://www.intel.com/content/dam/develop/external/us/en/documents/architecture-instruction-set-extensions-programming-reference.pdf
-        // __cpuid is safe in nightly but unsafe in stable, allow both
-        #[allow(unused_unsafe)]
-        let ext_cpuid_result = unsafe { __cpuid(7) };
-        check_flag(ext_cpuid_result.edx as usize, 23)
-    }
-
-    pub fn has_avx512() -> bool {
-        is_x86_feature_detected!("avx512f")
     }
 }
+
+/// Support for SIMD operations, derived from [`CpuFeatures::host`].
+pub static SIMD_SUPPORT: LazyLock<SimdSupport> =
+    LazyLock::new(|| SimdSupport::from_features(CpuFeatures::host()));
 
 // Inspired by https://github.com/RustCrypto/utils/blob/master/cpufeatures/src/aarch64.rs
 // aarch64 doesn't have userspace feature detection built in, so we have to call
@@ -335,8 +550,7 @@ mod tests {
     /// The `Avx2` and `AvxFma` tiers both dispatch to kernels declared
     /// `#[target_feature(enable = "avx,fma")]`, so neither may be selected on a
     /// host without FMA. AVX2 does not imply FMA in the ISA, so the detection
-    /// checks it explicitly. (`Avx512*` is excluded: its kernels declare
-    /// `avx512f`, which is what `has_avx512` verifies.)
+    /// checks it explicitly.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx_fma_tiers_are_only_selected_when_fma_is_detected() {
@@ -347,6 +561,60 @@ mod tests {
                 *SIMD_SUPPORT
             );
         }
+    }
+
+    #[test]
+    fn host_features_include_build_baseline() {
+        assert!(CpuFeatures::host().contains(CpuFeatures::baseline()));
+    }
+
+    /// The mask a kernel declares must cover every feature rustc enables for
+    /// it, including implied ones, or a host lacking an implied feature could
+    /// select a kernel that uses it.
+    #[rstest]
+    #[case::sse_chain("avx", CpuFeatures::SSE2.union(CpuFeatures::SSE4_2))]
+    #[case::fma_implies_avx("fma", CpuFeatures::AVX)]
+    #[case::avx512f(
+        "avx512f",
+        CpuFeatures::AVX2.union(CpuFeatures::FMA).union(CpuFeatures::F16C)
+    )]
+    #[case::avx512fp16("avx512fp16", CpuFeatures::AVX512BW.union(CpuFeatures::AVX512F))]
+    #[case::fp16("fp16", CpuFeatures::NEON)]
+    #[case::lasx("lasx", CpuFeatures::LSX)]
+    fn target_feature_mask_includes_implied_features(
+        #[case] name: &str,
+        #[case] implied: CpuFeatures,
+    ) {
+        let features = CpuFeatures::from_target_feature(name).unwrap();
+        assert!(
+            features.contains(implied),
+            "{name} -> {features:?} is missing {implied:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_target_feature_is_rejected() {
+        assert_eq!(CpuFeatures::from_target_feature("avx9000"), None);
+    }
+
+    #[rstest]
+    #[case::none(&[], SimdSupport::None)]
+    #[case::avx(&["avx"], SimdSupport::Avx)]
+    #[case::avx2_without_fma(&["avx2"], SimdSupport::Avx)]
+    #[case::avx_fma(&["fma"], SimdSupport::AvxFma)]
+    #[case::avx2(&["avx2", "fma"], SimdSupport::Avx2)]
+    #[case::avx512(&["avx512f"], SimdSupport::Avx512)]
+    #[case::avx512_fp16(&["avx512fp16"], SimdSupport::Avx512FP16)]
+    #[case::neon_without_fp16(&["neon"], SimdSupport::None)]
+    #[case::neon(&["fp16"], SimdSupport::Neon)]
+    #[case::lsx(&["lsx"], SimdSupport::Lsx)]
+    #[case::lasx(&["lasx"], SimdSupport::Lasx)]
+    fn simd_support_is_derived_from_features(
+        #[case] names: &[&str],
+        #[case] expected: SimdSupport,
+    ) {
+        let features = CpuFeatures::from_target_features(names);
+        assert_eq!(SimdSupport::from_features(features), expected);
     }
 
     #[rstest]
