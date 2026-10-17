@@ -758,7 +758,7 @@ mod tests {
     /// `-march=sapphirerapids`, so the compiler may use instructions from that
     /// baseline anywhere in the file — entering *any* function in it faults on
     /// an older CPU. Under `qemu -cpu Nehalem` that is a SIGILL, which is
-    /// exactly what the `pre-Haswell SIGILL check` in CI runs.
+    /// exactly what the `qemu-pre-haswell` CI job runs.
     #[cfg(all(
         kernel_support = "amx_fp16",
         target_arch = "x86_64",
