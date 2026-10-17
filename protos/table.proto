@@ -346,16 +346,25 @@ message IndexMetadata {
   // Index name. Must be unique within one dataset version.
   string name = 3;
 
-  // The version of the dataset this index was built from.
+  /* The segment's watermark: the segment reflects the data of every covered
+   * fragment, including row addresses, as of this dataset version.
+   *
+   * Overlays with a greater `committed_version` are not reflected. Fragment
+   * reuse index versions with a `dataset_version` greater than or equal to
+   * this value have not been applied to the segment's data. The value must
+   * not exceed the first such change to a covered fragment; any value at or
+   * below the version the data was read from is valid. See the index format
+   * specification for the full rules.
+   */
   uint64 dataset_version = 4;
 
-  /* A bitmap of the included fragment ids.
+  /* A bitmap of the fragment ids covered by this segment.
    *
-   * This may by used to determine how much of the dataset is covered by the
-   * index. This information can be retrieved from the dataset by looking at
-   * the dataset at `dataset_version`. However, since the old version may be
-   * deleted while the index is still in use, this information is also stored
-   * in the index.
+   * It may contain ids of deleted fragments. When the dataset has a fragment
+   * reuse index, compacted fragments may appear by their old or new ids;
+   * readers normalize the bitmap by mapping it through the fragment reuse
+   * index. It does not determine which address space the segment's data is
+   * in; `dataset_version` does.
    *
    * The bitmap is stored as a 32-bit Roaring bitmap.
    */
@@ -519,7 +528,10 @@ message FragmentReuseIndexDetails {
   }
 
   message Version {
-    // The dataset_version at the time the index adds this version entry
+    /* The dataset version immediately preceding the commit of the rewrite
+     * this entry records. An index segment whose dataset_version is less than
+     * or equal to this value has not had this entry applied to its data.
+     */
     uint64 dataset_version = 1;
 
     repeated Group groups = 3;

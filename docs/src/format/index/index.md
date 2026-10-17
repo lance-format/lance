@@ -78,6 +78,53 @@ Consider the example dataset in the figure above:
   Because it covers all fragments, queries using this index do not need to scan any fragments directly.
   They do, however, need to filter out the 10 deleted rows from fragment 1.
 
+## Segment Coverage and Freshness
+
+Two `IndexMetadata` fields describe what a segment covers and how fresh it is.
+
+`fragment_bitmap` records the fragments the segment covers.
+
+- It may contain ids of fragments that have since been deleted.
+- When the dataset has a [Fragment Reuse Index](system/frag_reuse.md) (FRI), it may record a
+  compacted fragment by its id before compaction or by its id after compaction. Writers may persist
+  either form, and readers must accept both.
+- Readers normalize the bitmap by mapping it through the FRI. Fragment ids are never reused, so
+  mapping an already-mapped bitmap has no effect.
+- For indices whose results are stable row ids, it records the fragments whose rows, identified by
+  stable row id, are represented in the segment.
+
+`dataset_version` is the segment's watermark. The segment reflects the data of every covered
+fragment as of this dataset version. For indices whose results are row addresses, that includes
+row addresses. A consequence is that the bitmap does not determine which address space the index
+data is in; `dataset_version` does, as follows:
+
+- An [overlay](../table/data_overlay_file.md) with `committed_version > dataset_version` is not
+  reflected in the segment.
+- An FRI version entry whose own `dataset_version` is greater than or equal to the segment's
+  `dataset_version` has not been applied to the segment's data. The segment's row addresses must
+  still be translated through it. An FRI version entry's `dataset_version` is the version that
+  immediately precedes the commit of the rewrite it records.
+
+Let B be the version whose data was read into a segment. Let W be the smallest of:
+
+- `committed_version - 1` of each overlay committed after B on an indexed field of a covered
+  fragment, and
+- the `dataset_version` of each FRI version entry added after B whose old or new fragments
+  intersect the segment's `fragment_bitmap`.
+
+If there are none, W is the current dataset version. A segment's `dataset_version` must never
+exceed W: a larger value hides changes the segment does not reflect, and lets a writer discard FRI
+entries the segment still needs. Any value at or below B is valid. A lower value may cause more
+rows to be treated as stale, but never yields wrong results.
+
+The **indexed fields** of a segment are the union of its `fields` and `covering_fields`, including
+all of their nested children.
+
+The **live coverage** of a segment is its normalized `fragment_bitmap` intersected with the
+fragments of the current dataset version. Under a tagged FRI history (FRI index version 1), live
+coverage is derived for the index as a whole, from the union of the bitmaps of all segments that
+share its name. Segments of an index must have disjoint `fragment_bitmap`s as stored.
+
 ## Index Storage
 
 The content of each index is stored at the `_indices/{UUID}` directory under the [base path](../table/layout.md#base-path-system).
@@ -105,6 +152,8 @@ Index segments are created and updated through a transactional process:
      that carries no extra columns. Declaring a column here does not by itself make it servable --
      see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
+   - `dataset_version`: The dataset version the index data was read from. See
+     [Segment Coverage and Freshness](#segment-coverage-and-freshness).
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
    - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
@@ -118,6 +167,49 @@ affected fragment IDs from the `fragment_bitmap` field of any index segment whos
 or `covering_fields` include that column. This marks those fragments as needing re-indexing
 without invalidating the entire segment and prevents invalid data from being read from the
 index.
+
+### Maintaining `fragment_bitmap` and `dataset_version`
+
+A writer that produces a segment, by building, merging, or remapping, chooses its
+`dataset_version` in one of two ways:
+
+- **Keep a conservative version.** Use a value no greater than the B of every source segment the
+  new segment's data came from.
+- **Stamp its read version R.** Before doing so, the writer must catch up every covered fragment
+  from each source's B through R:
+    - Each overlay on an indexed field is either folded into the index data or its fragment is
+      removed from the `fragment_bitmap`. Folding must be idempotent: applying an overlay the
+      index already reflects must leave the index unchanged.
+    - Each FRI version entry is applied to the index data.
+
+A writer must not change a segment's `dataset_version` when it rebases or retries a commit. The
+stamp must stay the version the segment's data was read from.
+
+Other operations update existing segments as follows:
+
+- **Delete** leaves `fragment_bitmap` and `dataset_version` unchanged. Deleted fragments are
+  filtered at read time.
+- **In-place updates** of an indexed field remove the modified fragments from the
+  `fragment_bitmap`, as described above.
+- **Updates that move rows to new fragments** may add the new fragments to the `fragment_bitmap`
+  of a segment whose results are stable row ids, if no indexed field changed. `dataset_version`
+  is unchanged.
+- **Compaction** is described in [Compaction and remapping](#compaction-and-remapping).
+- **Overwrite** removes all index segments.
+
+A new segment may be committed on a dataset version newer than its `dataset_version`, for example
+when it was built separately and committed later. The manifest at that `dataset_version` need not
+be an ancestor of the version the commit is built on, for example after a restore. Before
+committing such a segment, the writer must remove from its `fragment_bitmap`
+every fragment whose indexed fields, overlays, or lineage differ between the manifest at
+`dataset_version` and the version the commit is built on.
+
+A segment whose live coverage is empty may be removed if another segment of the same index still
+has non-empty live coverage. If every segment of an index has empty live coverage, the writer
+must keep the one with the earliest `created_at`, so that the index definition is not lost.
+Segments without `created_at` sort after those with one, and ties are broken by the lowest
+`dataset_version`.
+Under a tagged FRI history, a segment must not be removed based on its own derived coverage.
 
 ## Index Compatibility
 
@@ -230,6 +322,9 @@ The `IndexMetadata` message contains important information about the index segme
   [Serving carried columns](#serving-carried-columns) and the legacy interpretation under
   [Covering-field contracts](#covering-field-contracts).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
+- `dataset_version`: the segment's watermark. The manifest copy is authoritative over any copy an
+  index type stores in its own files. See
+  [Segment Coverage and Freshness](#segment-coverage-and-freshness).
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
 
@@ -257,6 +352,9 @@ or updated. These should be filtered out during query execution.
   completely deleted fragments, and updated fragments.
   </figcaption>
 </figure>
+
+Deletion files and fragment ids describe the current dataset version. When an FRI applies to the
+segment, its row addresses must be translated through the FRI before they are filtered.
 
 There are four situations to consider:
 
@@ -310,6 +408,22 @@ to existing row addresses. There are three ways to handle this:
    row addresses. This allows readers to remap the row addresses in memory upon reading
    the index segments. This approach adds some IO and computation overhead during query
    execution, but avoids write amplification during compaction.
+
+With option 2, the writer replaces the compacted fragment ids in the `fragment_bitmap` with their
+new ids and leaves `dataset_version` unchanged.
+
+With option 3, the segment's data and `dataset_version` are unchanged. The `fragment_bitmap` may
+keep the old fragment ids, or a later commit may persist it already mapped through the FRI; see
+[Segment Coverage and Freshness](#segment-coverage-and-freshness). A writer may later remap the
+segment's data through the FRI. It may then stamp its read version, following
+[Maintaining `fragment_bitmap` and `dataset_version`](#maintaining-fragment_bitmap-and-dataset_version).
+
+If compaction materializes an overlay on an indexed field that is newer than a segment's
+`dataset_version`, the overlay's values enter the base data and no overlay remains to exclude
+those rows. The writer must therefore do one of the following:
+
+- fold the overlay's values into the segment's data, or
+- remove from the segment's `fragment_bitmap` the compacted fragment, by both its old and new ids.
 
 ## Stable Row ID for Index
 
