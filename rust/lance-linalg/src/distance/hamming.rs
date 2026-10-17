@@ -720,6 +720,10 @@ fn process_row_range(
 ) -> PairwiseResult {
     let n = hashes.len();
     let mut result = PairwiseResult::new();
+    let kernel = HAMMING_BATCH_U64.get();
+    // Rows only get shorter, so the first row's buffer fits every later one,
+    // and the kernel overwrites each slot it is handed.
+    let mut distances = vec![0u32; n.saturating_sub(start_row + 1)];
 
     for i in start_row..end_row {
         let remaining = n - i - 1;
@@ -727,11 +731,11 @@ fn process_row_range(
             continue;
         }
 
-        let mut distances = vec![0u32; remaining];
-        hamming_batch_u64(hashes[i], &hashes[i + 1..], &mut distances);
+        let row_distances = &mut distances[..remaining];
+        kernel.call(hashes[i], &hashes[i + 1..], row_distances);
 
         let id_a = row_ids.map_or(i as u64, |ids| ids[i]);
-        for (j_offset, &dist) in distances.iter().enumerate() {
+        for (j_offset, &dist) in row_distances.iter().enumerate() {
             if dist <= threshold {
                 let j = i + 1 + j_offset;
                 let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
@@ -753,8 +757,11 @@ fn process_row_range_binary(
 ) -> PairwiseResult {
     let n = hashes.len();
     let mut result = PairwiseResult::new();
-    let mut distances = Vec::new();
-    let mut lane_distances = Vec::new();
+    let kernel = HAMMING_BATCH_U64.get();
+    // See `process_row_range`.
+    let max_remaining = n.saturating_sub(start_row + 1);
+    let mut distances = vec![0u32; max_remaining];
+    let mut lane_distances = vec![0u32; max_remaining];
 
     for i in start_row..end_row {
         let remaining = n - i - 1;
@@ -762,32 +769,21 @@ fn process_row_range_binary(
             continue;
         }
 
-        distances.clear();
-        distances.resize(remaining, 0);
-
+        let row_distances = &mut distances[..remaining];
         let first_lane = hashes.lane(0);
-        hamming_batch_u64(
-            first_lane[i],
-            &first_lane[i + 1..],
-            distances.as_mut_slice(),
-        );
+        kernel.call(first_lane[i], &first_lane[i + 1..], row_distances);
 
+        let row_lane_distances = &mut lane_distances[..remaining];
         for lane in 1..hashes.num_lanes() {
-            lane_distances.clear();
-            lane_distances.resize(remaining, 0);
             let lane_values = hashes.lane(lane);
-            hamming_batch_u64(
-                lane_values[i],
-                &lane_values[i + 1..],
-                lane_distances.as_mut_slice(),
-            );
-            for (distance, lane_distance) in distances.iter_mut().zip(&lane_distances) {
+            kernel.call(lane_values[i], &lane_values[i + 1..], row_lane_distances);
+            for (distance, lane_distance) in row_distances.iter_mut().zip(&*row_lane_distances) {
                 *distance += *lane_distance;
             }
         }
 
         let id_a = row_ids.map_or(i as u64, |ids| ids[i]);
-        for (j_offset, &dist) in distances.iter().enumerate() {
+        for (j_offset, &dist) in row_distances.iter().enumerate() {
             if dist <= threshold {
                 let j = i + 1 + j_offset;
                 let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
@@ -1526,19 +1522,31 @@ mod tests {
         assert_eq!(result_to_sorted_vec(&par), expected);
     }
 
-    #[test]
-    fn test_pairwise_binary_hashes_parallel_128_matches_sequential() {
-        let rows: Vec<(u64, u64)> = (0..80)
+    /// 160 rows is past the sequential cutoff, so this reaches
+    /// `process_row_range_binary`; 4 lanes reuse its lane buffer several
+    /// times per row.
+    #[rstest]
+    #[case::bits_128(2)]
+    #[case::bits_256(4)]
+    fn test_pairwise_binary_hashes_parallel_matches_sequential(#[case] num_lanes: usize) {
+        let rows: Vec<Vec<u64>> = (0..80)
             .flat_map(|i| {
-                let lo = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                let hi = !lo.rotate_left(17);
-                [(lo, hi), (lo ^ 1, hi)]
+                let lanes: Vec<u64> = (0..num_lanes)
+                    .map(|lane| {
+                        (i as u64 + 1)
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .rotate_left(17 * lane as u32)
+                    })
+                    .collect();
+                let mut near = lanes.clone();
+                near[num_lanes - 1] ^= 1;
+                [lanes, near]
             })
             .collect();
-        let mut lane_values = Vec::with_capacity(rows.len() * 2);
-        lane_values.extend(rows.iter().map(|(lo, _)| *lo));
-        lane_values.extend(rows.iter().map(|(_, hi)| *hi));
-        let hashes = BinaryHashValues::try_new(lane_values, rows.len(), 16).unwrap();
+        let lane_values: Vec<u64> = (0..num_lanes)
+            .flat_map(|lane| rows.iter().map(move |row| row[lane]))
+            .collect();
+        let hashes = BinaryHashValues::try_new(lane_values, rows.len(), num_lanes * 8).unwrap();
         let row_ids: Vec<u64> = (0..rows.len()).map(|i| 10_000 + i as u64).collect();
 
         let seq = pairwise_hamming_distance_binary(&hashes, Some(&row_ids), Some(1));
