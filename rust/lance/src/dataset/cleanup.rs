@@ -35,6 +35,7 @@
 
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
+use crate::dataset::files::scan::{ManifestScan, scan_manifests};
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
@@ -84,6 +85,228 @@ struct ReferencedFiles {
     /// fragment-reuse-index entries. Resolved from
     /// [`CleanupInspection::frag_reuse_entries`] before deletion decisions.
     frag_reuse_map_ids: HashSet<String>,
+}
+
+/// The set of storage paths a dataset's currently-present manifests still
+/// reference, for external orphan-cleanup drivers (e.g. a distributed cleanup
+/// that lists storage itself and needs an authoritative "keep set").
+///
+/// **Experimental.** This API is intended for external orphan-cleanup drivers
+/// and may change. It is only defined for datasets without branches, detached
+/// versions, external (multi-base) fragments, or managed blob storage;
+/// [`Dataset::referenced_files`] errors otherwise.
+///
+/// # How to use it safely
+///
+/// Do **not** hand-roll an anti-join like `listed_files - exact_paths`: that
+/// deletes blob sidecars, index files, tags, and staging manifests, none of
+/// which are enumerated verbatim. Instead, call
+/// [`is_referenced`](Self::is_referenced) for each listed file and delete only
+/// files it returns `false` for.
+///
+/// Only files in the *candidate subtrees* (`data/`, `_deletions/`,
+/// `_transactions/`, `_indices/`, and `_versions/*.manifest`) can be orphans.
+/// [`is_referenced`](Self::is_referenced) returns `true` for every other path,
+/// so listing the whole dataset root is safe. That covers `_refs/`
+/// (tags/branches), staging manifests (`_versions/.tmp*`), the version-hint
+/// file, `_mem_wal/`, `_blobs/` and `_fri/`, none of which this set describes.
+///
+/// The set is a point-in-time snapshot, so a file written just before its
+/// commit lands is referenced by no present manifest yet. Delete a file only if
+/// it was last modified more than a caller-chosen age threshold **before
+/// [`Dataset::referenced_files`] was called**, not before the deletion runs:
+/// a file committed after the call is not in the set however old it is by
+/// then.
+///
+/// Directory-marker objects (zero-byte keys like `data/{key}/` or
+/// `_indices/{uuid}/` that some tools create) are not referenced either — they
+/// name a directory, not a file this set tracks.
+///
+/// [`is_referenced`](Self::is_referenced) already encapsulates the blob v2
+/// sidecar rule (a sidecar `data/{key}/{blob_id}.blob` is referenced iff its
+/// parent `data/{key}.lance` is) and the index-prefix rule, so callers cannot
+/// get them wrong. The [`exact_paths`](Self::exact_paths) /
+/// [`index_prefixes`](Self::index_prefixes) accessors exist for serializing the
+/// set to distribute to workers, which then reconstruct it and match with
+/// [`is_referenced`](Self::is_referenced).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferencedFileSet {
+    /// Root-relative paths referenced exactly: data files (`data/{key}.lance`,
+    /// including data-overlay files), deletion files, transaction files, and
+    /// manifest files.
+    exact: HashSet<String>,
+    /// Root-relative `_indices/{uuid}` directory prefixes (sorted).
+    index_prefixes: Vec<String>,
+}
+
+impl ReferencedFileSet {
+    /// Reconstruct a set from its serialized parts (see the accessors). Use this
+    /// on a worker after distributing [`exact_paths`](Self::exact_paths) and
+    /// [`index_prefixes`](Self::index_prefixes) from the driver.
+    pub fn new(exact_paths: Vec<String>, index_prefixes: Vec<String>) -> Self {
+        // Normalize only path *shape* (leading/trailing delimiters, empty
+        // segments) — never percent-encoding. `Path::from` would percent-encode
+        // `%` itself (it is in object_store's INVALID set), so applying it to a
+        // string that is already in canonical form re-encodes it: `%25` becomes
+        // `%2525`. That is not idempotent, and both the producer's keys and the
+        // paths a caller lists from storage are already in canonical form, so
+        // re-encoding either side silently turns a live file into a
+        // false negative and the caller deletes it.
+        let mut index_prefixes: Vec<String> = index_prefixes
+            .into_iter()
+            .map(|p| normalize_path_shape(&p))
+            .collect();
+        index_prefixes.sort_unstable();
+        index_prefixes.dedup();
+        Self {
+            exact: exact_paths
+                .into_iter()
+                .map(|p| normalize_path_shape(&p))
+                .collect(),
+            index_prefixes,
+        }
+    }
+
+    /// Whether a root-relative path must be kept: it is referenced by a present
+    /// manifest, or it lies outside the candidate subtrees this set describes.
+    ///
+    /// Handles the three matching rules so callers don't have to: exact match,
+    /// `_indices/{uuid}/` prefix match, and the blob v2 sidecar rule (a file
+    /// under `data/{key}/` is referenced iff `data/{key}.lance` is). A file this
+    /// returns `false` for, and old enough by the rule on [`ReferencedFileSet`],
+    /// is an orphan.
+    ///
+    /// Leading/trailing slashes and empty path segments are normalized away, and
+    /// a percent-decoded spelling of a stored *exact* key is also accepted, so a
+    /// caller whose lister reports either form still matches. (Index prefixes are
+    /// `_indices/{uuid}` — hyphenated hex, so both spellings coincide.) Matching
+    /// errs toward "referenced": a false negative here would delete a live file.
+    pub fn is_referenced(&self, root_relative_path: &str) -> bool {
+        // Normalize path shape only (see `new`): percent-encoding is left alone
+        // so that a path listed from storage matches the key as stored.
+        let normalized = normalize_path_shape(root_relative_path);
+        let path = normalized.as_str();
+
+        if !is_orphan_candidate(path) {
+            return true;
+        }
+        if self.contains_exact(path) {
+            return true;
+        }
+        // Index artifact: any file under a referenced `_indices/{uuid}/`.
+        if self
+            .index_prefixes
+            .iter()
+            .any(|prefix| is_under_prefix(path, prefix))
+        {
+            return true;
+        }
+        // Blob v2 sidecar: `data/{key}/{blob_id}.blob` lives as long as its
+        // parent data file `data/{key}.lance`. Derive the parent from the
+        // directory name (not the sidecar file stem) and check membership.
+        let mut segments = path.split('/');
+        if segments.next() == Some("data")
+            && let Some(key) = segments.next()
+            // A third segment means the path is *inside* `data/{key}/`.
+            && segments.next().is_some()
+        {
+            // Only `data/{key}/{file}` (exactly 3 segments) is the known sidecar
+            // layout. A deeper path doesn't match today's layout, so keep it
+            // conservatively rather than derive a truncated (wrong) parent and
+            // risk deleting a live file.
+            if segments.next().is_some() {
+                return true;
+            }
+            return self.contains_exact(&format!("data/{key}.lance"));
+        }
+        false
+    }
+
+    /// Exact-set membership, accepting either the stored spelling of a path or a
+    /// percent-decoded one. Keys are stored in object-store canonical (encoded)
+    /// form; a caller that hands back a decoded path would otherwise miss, and a
+    /// miss deletes a live file. Extra matches only ever over-retain.
+    fn contains_exact(&self, path: &str) -> bool {
+        if self.exact.contains(path) {
+            return true;
+        }
+        // Only a path that `Path::from` would rewrite can have a second
+        // spelling. Skip the re-encode (two allocations plus a byte scan) for
+        // the ordinary case: this API's caller scans every listed object, and
+        // Lance-generated names are alphanumeric plus `.`, `-`, `_`. The test is
+        // an allowlist, so an unfamiliar byte falls through to the retry rather
+        // than silently skipping it.
+        let is_already_canonical = path.split('/').all(|segment| {
+            // `Path::from` rewrites a bare `.`/`..` segment to `%2E`/`%2E%2E`.
+            segment != "."
+                && segment != ".."
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        });
+        if is_already_canonical {
+            return false;
+        }
+        // Re-encode a possibly-decoded caller path and retry. `Path::from`
+        // percent-encodes per segment, which is exactly the producer's spelling.
+        let reencoded = Path::from(path).to_string();
+        reencoded != path && self.exact.contains(&reencoded)
+    }
+
+    /// Root-relative exact-match paths (data/deletion/transaction/manifest),
+    /// sorted. For serializing the set; use [`is_referenced`](Self::is_referenced)
+    /// to match a listed file.
+    pub fn exact_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.exact.iter().cloned().collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// Root-relative `_indices/{uuid}` directory prefixes, sorted. For
+    /// serializing the set; use [`is_referenced`](Self::is_referenced) to match.
+    pub fn index_prefixes(&self) -> &[String] {
+        &self.index_prefixes
+    }
+}
+
+/// Normalize a root-relative path's *shape* only: drop leading/trailing
+/// delimiters and empty segments (`a//b` → `a/b`), leaving every byte otherwise
+/// untouched.
+///
+/// Deliberately not [`object_store::path::Path::from`], which percent-encodes
+/// `%` and so is not idempotent: keys are already stored in canonical form, and
+/// re-encoding one side of a comparison would turn a live file into a false
+/// negative that the caller then deletes.
+fn normalize_path_shape(path: &str) -> String {
+    if !path.starts_with('/') && !path.ends_with('/') && !path.contains("//") {
+        return path.to_string();
+    }
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether `path`, root-relative and shape-normalized, lies in a subtree whose
+/// files [`ReferencedFileSet`] describes: `data/`, `_deletions/`,
+/// `_transactions/`, `_indices/`, or a committed `_versions/*.manifest`.
+/// Staging manifests (`_versions/.tmp*`) and the version hint are not
+/// committed manifests.
+fn is_orphan_candidate(path: &str) -> bool {
+    let Some((top, rest)) = path.split_once('/') else {
+        return false;
+    };
+    match top {
+        "data" | "_deletions" | "_transactions" | "_indices" => true,
+        "_versions" => !rest.contains('/') && !rest.starts_with('.') && rest.ends_with(".manifest"),
+        _ => false,
+    }
+}
+
+/// Whether `path` lies strictly inside the directory `prefix` (i.e. `prefix/…`).
+fn is_under_prefix(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2195,6 +2418,251 @@ pub async fn cleanup_old_versions(
     CleanupOperation::new(dataset, policy).execute().await
 }
 
+/// Collect every storage path still referenced by the dataset's currently-present
+/// manifests, for use by an external orphan-cleanup driver.
+///
+/// This is the read-only "keep set" a distributed cleanup needs: it lists the
+/// dataset's manifests and unions the files each one references, without listing
+/// the (potentially huge) `data/`, `_indices/`, or `_deletions/` trees. The
+/// caller lists storage itself and deletes whatever this set does not cover
+/// (subject to its own age/safety checks).
+///
+/// Unlike [`cleanup_old_versions`], this considers **all present manifests**
+/// (not just the latest), so a file referenced only by an older-but-not-yet-
+/// deleted version is included and will not be reported as an orphan.
+///
+/// # Safety scope
+///
+/// The returned set is only complete for datasets **without branches, detached
+/// versions, external (multi-base) fragments, or managed blob storage**; this
+/// returns an error if any of those is present, rather than silently returning
+/// an incomplete set a caller could act on:
+///
+/// * Branch lineage files (referenced across `base_id`/`base_paths`) are not
+///   traced, so a child branch's files could be reported as orphans.
+/// * Detached versions (`d{version}.manifest`) are skipped by manifest listing,
+///   so files reachable only from a detached version would be reported as orphans.
+/// * External-base fragment/index paths resolve outside this dataset's root, so
+///   they neither protect nor match files in another base.
+/// * Managed blob references live in the data, not the manifest. Compaction can
+///   adopt a blob v2 sidecar `data/{key}/{id}.blob` as a managed object that
+///   outlives `data/{key}.lance`, and only a scan of the blob columns finds it.
+///
+/// It refuses any present manifest whose reader or writer feature flags this
+/// build does not support, as cleanup does, since such a feature may record
+/// references this set does not read.
+///
+/// Branches and detached versions are checked again after the walk. It also
+/// returns a retryable [`Error::TooMuchWriteContention`] if, after the walk, a
+/// second manifest listing or the latest version names a version the walk did
+/// not read, since files only that version references could be missing. A
+/// retry succeeds once commits pause.
+///
+/// See [`ReferencedFileSet`] for how to interpret the result, including the
+/// blob v2 sidecar rule.
+pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
+    refuse_branches_and_detached_versions(dataset).await?;
+
+    // External (multi-base) fragments/indices live outside this dataset's root,
+    // so their paths neither protect nor match files here; refuse rather than
+    // return a set that omits them.
+    if !dataset.manifest.base_paths.is_empty() {
+        return Err(Error::not_supported_source(
+            "referenced_files is not supported on datasets with external base paths: \
+             files in another base cannot be represented in this dataset's keep set"
+                .into(),
+        ));
+    }
+
+    // Walk every present manifest on the shared scan, which bounds both read
+    // parallelism and the memory held by in-flight manifests. Consumed
+    // sequentially, so the sets below need no locking; dropping each
+    // `ScannedManifest` returns its share of the scan's memory budget.
+    //
+    // `min_version` is deliberately not set: a keep-set has to cover every
+    // present manifest, and skipping one would authorize deleting the files it
+    // is the last to reference.
+    let ManifestScan { stream, .. } = scan_manifests(dataset, None);
+    let mut stream = stream;
+
+    let mut exact: HashSet<String> = HashSet::new();
+    let mut index_uuids: HashSet<String> = HashSet::new();
+    let mut scanned_versions: HashSet<u64> = HashSet::new();
+    // Guard against a listing anomaly (e.g. an eventual-consistency blip or a
+    // concurrent cleanup that emptied `_versions/`) returning an empty keep-set:
+    // a raw anti-join against an empty set would treat every file as an orphan.
+    let mut manifest_count = 0usize;
+
+    let data_dir = dataset.data_dir();
+    let base = &dataset.base;
+
+    while let Some(scanned) = stream.next().await {
+        let scanned = scanned?;
+        manifest_count += 1;
+        scanned_versions.insert(scanned.manifest.version);
+
+        // A feature this build does not know can move references out of the
+        // fields read below, so refuse it the way cleanup does rather than
+        // return a set that omits them. The scan only decodes manifests.
+        ensure_can_read_manifest(&scanned.manifest)?;
+        ensure_can_write_manifest(&scanned.manifest)?;
+
+        // Checked on every present manifest, not only the latest: an older
+        // version that wrote managed blobs still holds them.
+        if scanned.manifest.has_managed_blobs() {
+            return Err(Error::not_supported_source(
+                "referenced_files is not supported on datasets with managed blob storage: \
+                 managed blob references live in the data and are not in the manifests"
+                    .into(),
+            ));
+        }
+
+        // The manifest file itself is referenced (it is a present version).
+        exact.insert(scanned.manifest_path.clone());
+
+        for fragment in scanned.manifest.fragments.iter() {
+            // A row-id or row-version sequence too large to inline spills to a
+            // hidden column of one of the fragment's own data files
+            // (`RowIdMeta::Column`, `RowDatasetVersionMeta::Column`), which
+            // `referenced_lance_files` below already reports. No separate
+            // artifact to account for.
+            //
+            // Base data files and data-overlay files share the
+            // `data/{key}.lance` namespace; both must be kept.
+            for file in fragment.referenced_lance_files() {
+                // External-base files resolve outside this root; the
+                // top-level `base_paths` guard only inspects the latest
+                // manifest, so re-check per fragment across all present
+                // versions rather than emit a bogus local path.
+                if file.base_id.is_some() {
+                    return Err(Error::not_supported_source(
+                        "referenced_files is not supported on datasets with external \
+                         base fragments: the file lives outside this dataset's root"
+                            .into(),
+                    ));
+                }
+                let full = data_dir.clone().join(file.path.as_str());
+                exact.insert(remove_prefix(&full, base).to_string());
+            }
+            if let Some(delfile) = fragment.deletion_file.as_ref() {
+                // Same external-base reasoning as data files above: a
+                // deletion file in another base resolves outside this
+                // root, so refuse rather than emit a phantom local path.
+                if delfile.base_id.is_some() {
+                    return Err(Error::not_supported_source(
+                        "referenced_files is not supported on datasets with external \
+                         base deletion files: the file lives outside this dataset's root"
+                            .into(),
+                    ));
+                }
+                let delpath = deletion_file_path(base, fragment.id, delfile);
+                exact.insert(remove_prefix(&delpath, base).to_string());
+            }
+        }
+
+        if let Some(relative_tx_path) = &scanned.manifest.transaction_file {
+            let tx_path = Path::parse(TRANSACTIONS_DIR)?.join(relative_tx_path.as_str());
+            exact.insert(tx_path.to_string());
+        }
+
+        for index in &scanned.indexes {
+            // An external-base index resolves outside this root, so its
+            // uuid would become a phantom local `_indices/` prefix. Same
+            // per-fragment reasoning as data and deletion files above:
+            // the top-level `base_paths` guard only sees the latest
+            // manifest, so re-check here across all present versions.
+            if index.base_id.is_some() {
+                return Err(Error::not_supported_source(
+                    "referenced_files is not supported on datasets with external \
+                     base indices: the index lives outside this dataset's root"
+                        .into(),
+                ));
+            }
+            index_uuids.insert(index.uuid.to_string());
+        }
+    }
+
+    if manifest_count == 0 {
+        // An opened dataset always has at least one present manifest; zero means
+        // a listing anomaly, not "nothing is referenced". Refuse rather than
+        // hand back an empty keep-set that would authorize deleting everything.
+        return Err(Error::not_supported_source(
+            "referenced_files found no manifests for an opened dataset; refusing to \
+             return an empty keep-set (a cleanup driver would treat every file as an orphan)"
+                .into(),
+        ));
+    }
+
+    // The listing is not a snapshot: a commit that lands after the lister has
+    // passed where its manifest sorts is missed, and it may be the only present
+    // manifest that still references files inherited from versions a
+    // concurrent cleanup removed during the walk. Listing order is the store's,
+    // not version order, so the missed version need not be the newest. On a
+    // strongly consistent store a second listing returns every manifest present
+    // throughout it, and a version committed after it started makes the latest
+    // one the walk did not read.
+    let missed = |version: u64| {
+        Error::too_much_write_contention(format!(
+            "referenced_files did not read version {version}, which the manifest listing \
+             missed; call it again"
+        ))
+    };
+    let mut relisted =
+        dataset
+            .commit_handler
+            .list_manifest_locations(&dataset.base, &dataset.object_store, false);
+    while let Some(location) = relisted.next().await {
+        let version = location?.version;
+        if !scanned_versions.contains(&version) {
+            return Err(missed(version));
+        }
+    }
+    let latest = dataset.latest_version_id().await?;
+    if !scanned_versions.contains(&latest) {
+        return Err(missed(latest));
+    }
+    refuse_branches_and_detached_versions(dataset).await?;
+
+    let indices_dir = dataset.indices_dir();
+    let index_prefixes: Vec<String> = index_uuids
+        .into_iter()
+        .map(|uuid| remove_prefix(&indices_dir.clone().join(uuid.as_str()), base).to_string())
+        .collect();
+
+    Ok(ReferencedFileSet::new(
+        exact.into_iter().collect(),
+        index_prefixes,
+    ))
+}
+
+/// Refuses the lineage [`referenced_files`] cannot trace. Run before the walk
+/// to fail fast and again after it, since a branch or detached version created
+/// mid-walk did not exist when the first check ran.
+async fn refuse_branches_and_detached_versions(dataset: &Dataset) -> Result<()> {
+    // Tracing branch lineage requires reading every referenced branch's
+    // manifests and resolving `base_id`; rather than silently under-report and
+    // let a caller delete a child branch's files, refuse and let them handle it.
+    if !dataset.branches().list().await?.is_empty() {
+        return Err(Error::not_supported_source(
+            "referenced_files is not supported on datasets with branches: \
+             a child branch may reference files this set would omit"
+                .into(),
+        ));
+    }
+
+    // Detached versions (`d{version}.manifest`) are skipped by the manifest
+    // listing, so a set built from it would omit their files; refuse if any
+    // exist rather than let a caller delete them.
+    if !dataset.list_detached_manifests().await?.is_empty() {
+        return Err(Error::not_supported_source(
+            "referenced_files is not supported on datasets with detached versions: \
+             files reachable only from a detached version would be reported as orphans"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// If the dataset config has `lance.auto_cleanup` parameters set,
 /// this function automatically calls `dataset.cleanup_old_versions`
 /// every `lance.auto_cleanup.interval` versions. This function calls
@@ -2405,6 +2873,7 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
+        dataset::write::{CommitBuilder, InsertBuilder},
         dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
@@ -7069,6 +7538,702 @@ mod tests {
         let mut remaining: Vec<u64> = store.rows.lock().unwrap().keys().copied().collect();
         remaining.sort();
         assert_eq!(remaining, vec![1, 2, 3]);
+    }
+
+    // Collect a fixture dataset's referenced_files, keyed for easy assertions.
+    async fn referenced_paths(fixture: &MockDatasetFixture) -> (HashSet<String>, Vec<String>) {
+        let db = fixture.open().await.unwrap();
+        let refs = db.referenced_files().await.unwrap();
+        (
+            refs.exact_paths().into_iter().collect(),
+            refs.index_prefixes().to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn referenced_files_keeps_older_present_version_data() {
+        // The heart of the contract: a file referenced ONLY by an
+        // older-but-not-yet-deleted version must be reported as referenced,
+        // otherwise an orphan-cleanup driver would delete it and break time
+        // travel. `overwrite` makes v1's data file unreferenced by v2 (latest)
+        // yet still present on disk.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+
+        let (exact, _) = referenced_paths(&fixture).await;
+
+        // Both versions' data files are present and must both be kept.
+        let data_files: Vec<_> = exact.iter().filter(|p| p.ends_with(".lance")).collect();
+        assert_eq!(
+            data_files.len(),
+            2,
+            "both the latest and the older-but-present version's data files must be referenced, got {exact:?}"
+        );
+
+        // Every present data file on disk must be covered by the reference set.
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (os, path) =
+            ObjectStore::from_uri_and_params(registry, &fixture.dataset_path, &fixture.os_params())
+                .await
+                .unwrap();
+        let mut stream = os.read_dir_all(&path, None);
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let rel = remove_prefix(&meta.location, &path).to_string();
+            if rel.ends_with(".lance") && rel.starts_with("data/") {
+                assert!(
+                    exact.contains(&rel),
+                    "present data file {rel} was not in referenced set {exact:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn referenced_files_reports_manifests_deletions_and_transactions() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let mut data_gen = BatchGenerator::new().col(Box::new(
+            IncrementingInt32::new().named("filter_me".to_owned()),
+        ));
+        fixture.create_with_data(data_gen.batch(16)).await.unwrap();
+        fixture.delete_data("filter_me < 5").await.unwrap();
+
+        let (exact, _) = referenced_paths(&fixture).await;
+
+        assert!(
+            exact.iter().any(|p| p.starts_with("_versions/")),
+            "manifest paths must be reported, got {exact:?}"
+        );
+        assert!(
+            exact.iter().any(|p| p.starts_with("_transactions/")),
+            "transaction paths must be reported, got {exact:?}"
+        );
+        assert!(
+            exact.iter().any(|p| p.starts_with("_deletions/")),
+            "deletion file paths must be reported, got {exact:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_files_reports_index_prefixes() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.create_some_index().await.unwrap();
+
+        let (_, index_prefixes) = referenced_paths(&fixture).await;
+
+        assert_eq!(index_prefixes.len(), 1, "expected one index prefix");
+        assert!(
+            index_prefixes[0].starts_with("_indices/"),
+            "index prefix must be under _indices/, got {index_prefixes:?}"
+        );
+        // The prefix is a directory (a uuid), not a specific file.
+        assert!(
+            !index_prefixes[0].ends_with(".idx"),
+            "index prefix must be the uuid dir, not a file, got {index_prefixes:?}"
+        );
+
+        // Every present index file on disk must be covered by a prefix + "/".
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (os, path) =
+            ObjectStore::from_uri_and_params(registry, &fixture.dataset_path, &fixture.os_params())
+                .await
+                .unwrap();
+        let mut stream = os.read_dir_all(&path, None);
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let rel = remove_prefix(&meta.location, &path).to_string();
+            if rel.starts_with("_indices/") {
+                assert!(
+                    index_prefixes
+                        .iter()
+                        .any(|prefix| rel.starts_with(&format!("{prefix}/"))),
+                    "present index file {rel} not covered by any prefix {index_prefixes:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn referenced_files_spans_multiple_fragments() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+
+        let (exact, _) = referenced_paths(&fixture).await;
+
+        // Three appends => three live data files, all referenced by the union.
+        let data_files = exact.iter().filter(|p| p.ends_with(".lance")).count();
+        assert_eq!(
+            data_files, 3,
+            "all three fragments' data files must be referenced, got {exact:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_files_keeps_blob_v2_parent_not_sidecar() {
+        // The sidecar contract: the parent data/{key}.lance is reported, and the
+        // .blob sidecar is NOT enumerated but IS covered by `is_referenced` (the
+        // matcher follows the parent).
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        Dataset::write(
+            blob_v2_batch(100 * 1024),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                mode: WriteMode::Create,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_gt!(fixture.count_blob_files().await.unwrap(), 0);
+
+        let db = fixture.open().await.unwrap();
+        let refs = db.referenced_files().await.unwrap();
+        let exact: HashSet<String> = refs.exact_paths().into_iter().collect();
+
+        // Parent data file present; no sidecar path enumerated verbatim.
+        assert!(
+            exact.iter().any(|p| p.ends_with(".lance")),
+            "parent data file must be referenced, got {exact:?}"
+        );
+        assert!(
+            !exact.iter().any(|p| p.ends_with(".blob")),
+            "sidecar .blob files must not be enumerated, got {exact:?}"
+        );
+
+        // Every present .blob sidecar must be covered by `is_referenced` via its
+        // parent, and its parent .lance must be enumerated.
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (os, path) =
+            ObjectStore::from_uri_and_params(registry, &fixture.dataset_path, &fixture.os_params())
+                .await
+                .unwrap();
+        let mut stream = os.read_dir_all(&path, None);
+        let mut saw_sidecar = false;
+        while let Some(meta) = stream.try_next().await.unwrap() {
+            let rel = remove_prefix(&meta.location, &path).to_string();
+            if rel.ends_with(".blob") {
+                saw_sidecar = true;
+                // rel = data/{key}/{blob_id}.blob ; parent = data/{key}.lance
+                let parts: Vec<&str> = rel.split('/').collect();
+                assert_eq!(parts.len(), 3, "unexpected sidecar layout: {rel}");
+                let parent = format!("{}/{}.lance", parts[0], parts[1]);
+                assert!(
+                    exact.contains(&parent),
+                    "sidecar {rel} parent {parent} must be in the referenced set {exact:?}"
+                );
+                // The matcher must keep the sidecar without the caller deriving
+                // the parent themselves.
+                assert!(
+                    refs.is_referenced(&rel),
+                    "is_referenced must cover sidecar {rel} via its parent"
+                );
+            }
+        }
+        assert!(saw_sidecar, "test must observe at least one .blob sidecar");
+    }
+
+    #[test]
+    fn referenced_file_set_matcher_rules() {
+        // Unit-test the matcher's three rules in isolation so the caller-facing
+        // contract is pinned independent of dataset plumbing.
+        let set = ReferencedFileSet::new(
+            vec![
+                "data/keep.lance".to_string(),
+                "_deletions/keep.arrow".to_string(),
+            ],
+            vec!["_indices/abc".to_string()],
+        );
+
+        // Exact match.
+        assert!(set.is_referenced("data/keep.lance"));
+        assert!(set.is_referenced("_deletions/keep.arrow"));
+        // Not referenced.
+        assert!(!set.is_referenced("data/gone.lance"));
+        assert!(!set.is_referenced("_transactions/gone.txn"));
+        assert!(!set.is_referenced("_versions/7.manifest"));
+        // Outside the candidate subtrees nothing is an orphan, so a caller that
+        // lists the whole root cannot delete what this set does not describe.
+        for kept in [
+            "_refs/tags/v1.json",
+            "_versions/latest_version_hint.json",
+            "_versions/.tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d",
+            "_blobs/9c100374-3298-4537-afc6-f5ee7913666d.blob",
+            "_fri/3/row_map.lance",
+            "_mem_wal/shard/wal.bin",
+            "unrelated.txt",
+        ] {
+            assert!(set.is_referenced(kept), "{kept} must never be an orphan");
+        }
+        // Index prefix: files under the dir match, the bare prefix / siblings do not.
+        assert!(set.is_referenced("_indices/abc/index.idx"));
+        assert!(set.is_referenced("_indices/abc/aux/part.bin"));
+        assert!(!set.is_referenced("_indices/abc")); // bare prefix, not "under" it
+        assert!(!set.is_referenced("_indices/abcdef/index.idx")); // sibling, not a prefix
+        // Blob sidecar: kept iff parent .lance is referenced.
+        assert!(set.is_referenced("data/keep/00000001.blob"));
+        assert!(!set.is_referenced("data/gone/00000001.blob"));
+
+        // A path shape the caller might list differently (leading slash) must
+        // still match — otherwise a live file would be reported as an orphan.
+        assert!(set.is_referenced("/data/keep.lance"));
+        assert!(set.is_referenced("data/keep.lance/")); // trailing slash tolerated
+        // Deeper-than-sidecar paths under data/ are kept conservatively (unknown
+        // layout) rather than deriving a truncated, possibly-wrong parent.
+        assert!(set.is_referenced("data/keep/sub/deeper.blob"));
+        assert!(set.is_referenced("data/gone/sub/deeper.blob"));
+
+        // Round-trip through the serialized accessors reproduces an equal set,
+        // even if a worker passes duplicate prefixes.
+        let round_tripped = ReferencedFileSet::new(
+            set.exact_paths(),
+            [set.index_prefixes(), set.index_prefixes()].concat(),
+        );
+        assert_eq!(set, round_tripped);
+        // Prefixes come back sorted and deduplicated whatever order a worker
+        // passes them in, so equal content compares equal.
+        let unordered = ReferencedFileSet::new(
+            vec![],
+            vec![
+                "_indices/b".to_string(),
+                "_indices/a/".to_string(),
+                "_indices/b".to_string(),
+            ],
+        );
+        assert_eq!(unordered.index_prefixes(), ["_indices/a", "_indices/b"]);
+
+        // A worker reconstructing the set with directory-style trailing slashes
+        // (a natural way to name `_indices/{uuid}/`) or leading slashes must
+        // still match live files — `new` normalizes its inputs symmetrically
+        // with the query side.
+        let reshaped = ReferencedFileSet::new(
+            vec!["/data/keep.lance".to_string()],
+            vec!["_indices/abc/".to_string()],
+        );
+        assert!(reshaped.is_referenced("data/keep.lance"));
+        assert!(reshaped.is_referenced("_indices/abc/index.idx"));
+
+        // Empty segments are normalized away too, so a caller that joins a
+        // prefix that already ends in `/` still matches.
+        assert!(set.is_referenced("data//keep.lance"));
+
+        // Percent-encoding must survive the distribute/reconstruct round trip.
+        // `Path::from` percent-encodes `%` itself, so normalizing with it would
+        // turn `%25` into `%2525` on every hop and a live object would look
+        // unreferenced to the worker that lists it.
+        let producer = ReferencedFileSet::new(vec!["data/live%25name.lance".to_string()], vec![]);
+        assert!(producer.is_referenced("data/live%25name.lance"));
+        let worker =
+            ReferencedFileSet::new(producer.exact_paths(), producer.index_prefixes().to_vec());
+        assert!(
+            worker.is_referenced("data/live%25name.lance"),
+            "worker-side reconstruction must match the producer's keys verbatim"
+        );
+        assert_eq!(producer, worker);
+        // The sidecar rule must survive the same round trip.
+        assert!(worker.is_referenced("data/live%25name/00000001.blob"));
+        // A caller whose lister reports the decoded spelling still matches:
+        // extra matches only over-retain, while a miss would delete a live file.
+        assert!(worker.is_referenced("data/live%name.lance"));
+    }
+
+    /// A version committed by a newer writer, with feature flags this build
+    /// does not support, is refused rather than read as if it had none.
+    #[rstest]
+    #[case::reader(true, false)]
+    #[case::writer(false, true)]
+    #[tokio::test]
+    async fn referenced_files_rejects_unsupported_manifest_features(
+        #[case] reader: bool,
+        #[case] writer: bool,
+    ) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let mut newer = dataset.manifest.as_ref().clone();
+        newer.version += 1;
+        if reader {
+            newer.reader_feature_flags |= lance_table::feature_flags::FLAG_UNKNOWN;
+        }
+        if writer {
+            newer.writer_feature_flags |= lance_table::feature_flags::FLAG_UNKNOWN;
+        }
+        dataset
+            .commit_handler
+            .commit(
+                &mut newer,
+                None,
+                &dataset.base,
+                &dataset.object_store,
+                lance_table::io::commit::write_manifest_file_to_path,
+                dataset.manifest_location.naming_scheme,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = dataset.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for unsupported feature flags, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("version of Lance"),
+            "error should say this build cannot handle the dataset, got {err}"
+        );
+    }
+
+    /// Managed blob references live in the data, not the manifests: compaction
+    /// can adopt a sidecar `data/{key}/{id}.blob` as a managed object that
+    /// outlives `data/{key}.lance`, so the sidecar rule would release it.
+    #[tokio::test]
+    async fn referenced_files_rejects_datasets_with_managed_blobs() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.has_managed_blobs());
+
+        let err = dataset.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for a dataset with managed blobs, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("managed blob"),
+            "error should mention managed blobs, got {err}"
+        );
+    }
+
+    /// Stands in for a commit that lands while the manifests are being listed,
+    /// after the lister has passed where its manifest sorts. With
+    /// `latest_ahead` set it reports one version past the newest one on
+    /// storage; `hide_from_next_listing` (0 for none) drops that version from
+    /// the next listing only; `hide_detached_once` hides detached versions from
+    /// the next detached listing, as if they were committed just after it.
+    #[derive(Debug, Default)]
+    struct RacyListing {
+        latest_ahead: std::sync::atomic::AtomicBool,
+        hide_from_next_listing: std::sync::atomic::AtomicU64,
+        hide_detached_once: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl lance_table::io::commit::CommitHandler for RacyListing {
+        async fn resolve_latest_location(
+            &self,
+            base_path: &Path,
+            object_store: &ObjectStore,
+        ) -> Result<ManifestLocation> {
+            let mut location = lance_table::io::commit::ConditionalPutCommitHandler
+                .resolve_latest_location(base_path, object_store)
+                .await?;
+            if self.latest_ahead.load(Ordering::SeqCst) {
+                location.version += 1;
+            }
+            Ok(location)
+        }
+
+        fn list_manifest_locations<'a>(
+            &self,
+            base_path: &Path,
+            object_store: &'a ObjectStore,
+            sorted_descending: bool,
+        ) -> futures::stream::BoxStream<'a, Result<ManifestLocation>> {
+            let hidden = self.hide_from_next_listing.swap(0, Ordering::SeqCst);
+            lance_table::io::commit::ConditionalPutCommitHandler
+                .list_manifest_locations(base_path, object_store, sorted_descending)
+                .try_filter(move |location| std::future::ready(location.version != hidden))
+                .boxed()
+        }
+
+        fn list_detached_manifest_locations<'a>(
+            &self,
+            base_path: &Path,
+            object_store: &'a ObjectStore,
+        ) -> futures::stream::BoxStream<'a, Result<ManifestLocation>> {
+            if self.hide_detached_once.swap(false, Ordering::SeqCst) {
+                return futures::stream::empty().boxed();
+            }
+            lance_table::io::commit::ConditionalPutCommitHandler
+                .list_detached_manifest_locations(base_path, object_store)
+        }
+
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: lance_table::io::commit::ManifestWriter,
+            naming_scheme: lance_table::io::commit::ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, lance_table::io::commit::CommitError> {
+            lance_table::io::commit::ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn referenced_files_rejects_a_scan_that_missed_a_version() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        let handler = Arc::new(RacyListing::default());
+        let dataset = DatasetBuilder::from_uri(&fixture.dataset_path)
+            .with_read_params(ReadParams {
+                store_options: Some(fixture.os_params()),
+                ..Default::default()
+            })
+            .with_commit_handler(handler.clone())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, 3);
+        dataset.referenced_files().await.unwrap();
+
+        let assert_retryable = |err: Error| {
+            assert!(
+                matches!(err, Error::TooMuchWriteContention { .. }),
+                "expected TooMuchWriteContention, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("call it again"),
+                "error should tell the caller to retry, got {err}"
+            );
+        };
+
+        // A version older than the newest, missed by the walk's listing only.
+        handler.hide_from_next_listing.store(2, Ordering::SeqCst);
+        assert_retryable(dataset.referenced_files().await.unwrap_err());
+
+        // A newest version that no listing has seen yet.
+        handler.latest_ahead.store(true, Ordering::SeqCst);
+        assert_retryable(dataset.referenced_files().await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn referenced_files_rejects_datasets_with_branches() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut db = fixture.open().await.unwrap();
+        fixture
+            .create_branch_and_load(&mut db, "dev", (None, None))
+            .await
+            .unwrap();
+
+        // Reload so the main dataset observes the newly-created branch.
+        let db = fixture.open().await.unwrap();
+        let err = db.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for a dataset with branches, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("branch"),
+            "error should mention branches, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_files_output_is_sorted_and_deterministic() {
+        // The accessors promise sorted output; a distributed caller may use the
+        // serialized set as a cache key, so equal content must compare equal.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.create_some_index().await.unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let first = db.referenced_files().await.unwrap();
+        let second = db.referenced_files().await.unwrap();
+
+        let first_exact = first.exact_paths();
+        assert!(
+            first_exact.windows(2).all(|w| w[0] <= w[1]),
+            "exact_paths must be sorted, got {first_exact:?}"
+        );
+        assert!(
+            first.index_prefixes().windows(2).all(|w| w[0] <= w[1]),
+            "index_prefixes must be sorted, got {:?}",
+            first.index_prefixes()
+        );
+        // Two calls on the same state must be equal (the set is order-independent
+        // and the accessors sort, so equality is meaningful).
+        assert_eq!(
+            first, second,
+            "referenced_files output must be deterministic"
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_files_rejects_datasets_with_detached_versions() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        // Create a detached version: a committed manifest that no normal version
+        // references, so a keep-set built by listing normal manifests would omit it.
+        let db = fixture.open().await.unwrap();
+        let batches: Vec<RecordBatch> = some_batch().map(|b| b.unwrap()).collect();
+        let transaction = InsertBuilder::new(Arc::new(db.as_ref().clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(batches)
+            .await
+            .unwrap();
+        CommitBuilder::new(Arc::new(db.as_ref().clone()))
+            .with_detached(true)
+            .execute(transaction)
+            .await
+            .unwrap();
+
+        let assert_refused = |err: Error| {
+            assert!(
+                matches!(err, Error::NotSupported { .. }),
+                "expected NotSupported for a dataset with detached versions, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("detached"),
+                "error should mention detached versions, got {err}"
+            );
+        };
+        let db = fixture.open().await.unwrap();
+        assert_refused(db.referenced_files().await.unwrap_err());
+
+        // A detached version committed during the walk is invisible to the
+        // check before it, so it must be caught by the one after.
+        let handler = Arc::new(RacyListing::default());
+        let db = DatasetBuilder::from_uri(&fixture.dataset_path)
+            .with_read_params(ReadParams {
+                store_options: Some(fixture.os_params()),
+                ..Default::default()
+            })
+            .with_commit_handler(handler.clone())
+            .load()
+            .await
+            .unwrap();
+        handler.hide_detached_once.store(true, Ordering::SeqCst);
+        assert_refused(db.referenced_files().await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn referenced_files_rejects_datasets_with_external_bases() {
+        use lance_table::format::BasePath;
+
+        let base_dir = TempStrDir::default();
+        let fixture = MockDatasetFixture::try_new().unwrap();
+
+        // Register an external base at create time so the manifest carries a
+        // non-empty base_paths map.
+        Dataset::write(
+            some_batch(),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    is_dataset_root: false,
+                    path: format!("file://{}", base_dir.as_str()),
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let err = db.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for a dataset with external bases, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("base"),
+            "error should mention external bases, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_files_keeps_overlay_data_files() {
+        use crate::dataset::transaction::DataOverlayGroup;
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+
+        // A data-overlay file lives only in `fragment.overlays[]`, never in
+        // `fragment.files`. It is a `data/{key}.lance` file, so an orphan-cleanup
+        // driver would delete it unless referenced_files reports it. This test is
+        // the tripwire: if the overlay collection is ever dropped, it fails. We
+        // attach the overlay as metadata (its bytes need not exist on disk for the
+        // reference-set computation, which reads only manifests).
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut db = fixture.open().await.unwrap();
+
+        let fragment_id = db.get_fragments()[0].id() as u64;
+        let field_id = db.schema().field("indexable").unwrap().id;
+        let overlay_name = format!("{}.lance", Uuid::new_v4());
+        let mut data_file = DataFile::new_unstarted(
+            overlay_name.clone(),
+            lance_file::version::ConcreteFileVersion::V2_0,
+        );
+        data_file.fields = vec![field_id].into();
+        data_file.column_indices = vec![0].into();
+
+        let transaction = Transaction::new(
+            db.manifest.version,
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id,
+                    overlays: vec![DataOverlayFile {
+                        data_file,
+                        coverage: OverlayCoverage::dense([0u32].into_iter().collect()),
+                        committed_version: 0,
+                    }],
+                }],
+            },
+            None,
+        );
+        db.apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let db = fixture.open().await.unwrap();
+        let refs = db.referenced_files().await.unwrap();
+        let overlay_rel = format!("data/{overlay_name}");
+        assert!(
+            refs.is_referenced(&overlay_rel),
+            "overlay data file {overlay_rel} must be referenced, got {:?}",
+            refs.exact_paths()
+        );
     }
 
     /// D-rows: `_fri/` row-map garbage collection.

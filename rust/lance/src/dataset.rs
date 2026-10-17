@@ -1587,6 +1587,56 @@ impl Dataset {
         CleanupOperation::new(self, policy)
     }
 
+    /// Collect every storage path still referenced by the dataset's currently-present
+    /// manifests, for use by an external orphan-cleanup driver.
+    ///
+    /// **Experimental.** Intended for external distributed orphan-cleanup; the shape
+    /// may change. It reads the dataset's manifests and unions the files each
+    /// references, without listing the (potentially huge) `data/`, `_indices/`, or
+    /// `_deletions/` trees. The caller lists storage itself and deletes a listed file
+    /// only if
+    /// [`ReferencedFileSet::is_referenced`](crate::dataset::cleanup::ReferencedFileSet::is_referenced)
+    /// returns `false` and it was last modified more than a caller-chosen age
+    /// threshold before this call. Do not hand-roll an anti-join against the raw
+    /// paths — see [`ReferencedFileSet`](crate::dataset::cleanup::ReferencedFileSet)
+    /// for the full contract (blob v2 sidecars, index prefixes, the subtrees that are
+    /// never candidates, and why the age is measured from this call).
+    ///
+    /// Unlike version cleanup, this considers **all present manifests** (not just the
+    /// latest), so a file referenced only by an older-but-present version is kept.
+    ///
+    /// Returns an error for datasets with branches, detached versions, external
+    /// (multi-base) fragments, managed blob storage, or feature flags this build
+    /// does not support, whose files this set cannot fully represent. It returns a
+    /// retryable error when, after the walk, a second manifest listing or the
+    /// latest version names a version the walk did not read; a retry succeeds once
+    /// commits pause.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use std::time::{Duration, SystemTime};
+    /// # async fn example(
+    /// #     dataset: &Dataset,
+    /// #     listed: Vec<(String, SystemTime)>,
+    /// #     threshold: Duration,
+    /// # ) -> Result<()> {
+    /// let started = SystemTime::now();
+    /// let referenced = dataset.referenced_files().await?;
+    /// for (path, last_modified) in listed {
+    ///     // Measure the age from before the call: a file committed afterwards is
+    ///     // not in the set however old it is by now.
+    ///     let old_enough = last_modified + threshold < started;
+    ///     if old_enough && !referenced.is_referenced(&path) {
+    ///         // safe to delete `path`
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn referenced_files(&self) -> Result<cleanup::ReferencedFileSet> {
+        cleanup::referenced_files(self).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn do_commit(
         base_uri: WriteDestination<'_>,
