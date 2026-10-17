@@ -1265,23 +1265,41 @@ mod tests {
         });
     }
 
-    /// Every host-supported f64 kernel must agree with an f64 reference.
+    /// Every host-supported f64 kernel, single-pair and batch, must agree with
+    /// an f64 reference. Each batch candidate must also reproduce its
+    /// same-tier pair candidate bit for bit, so batching never changes results.
     #[rstest::rstest]
     fn test_l2_f64_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
+        assert_eq!(L2_F64.candidates().len(), L2_F64_BATCH.candidates().len());
         run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            let dimension = x.len();
             let want = l2_distance_reference(&x, &y) as f32;
-            for candidate in L2_F64.candidates() {
+            // The second vector equals the key, so its distance is exactly 0.
+            let batch = [y.as_slice(), x.as_slice()].concat();
+            for (candidate, batch_candidate) in
+                L2_F64.candidates().iter().zip(L2_F64_BATCH.candidates())
+            {
                 let Some(kernel) = candidate.kernel() else {
                     continue;
                 };
                 let got = kernel.call(&x, &y);
                 prop_assert!(
                     approx::relative_eq!(got, want, max_relative = 1e-6),
-                    "{} at dim {}: {got} != {want}",
-                    candidate.name(),
-                    x.len()
+                    "{} at dim {dimension}: {got} != {want}",
+                    candidate.name()
+                );
+
+                let batch_kernel = batch_candidate
+                    .kernel()
+                    .expect("batch candidate needs the same features as its pair candidate");
+                let mut batch_got = [f32::NAN; 2];
+                batch_kernel.call(&x, &batch, dimension, &mut batch_got);
+                prop_assert!(
+                    batch_got[0].to_bits() == got.to_bits() && batch_got[1] == 0.0,
+                    "{} at dim {dimension}: {batch_got:?} != [{got}, 0]",
+                    batch_candidate.name()
                 );
             }
             Ok(())
