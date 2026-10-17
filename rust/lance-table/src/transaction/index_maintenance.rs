@@ -607,7 +607,7 @@ impl Transaction {
                     });
 
                 if non_empty_indices.is_empty() {
-                    // All indices are empty -- keep only the oldest definition.
+                    // All indices are empty -- keep only the earliest-created definition.
                     //
                     // An empty index definition is still correct: the scanner
                     // falls back to scanning unindexed fragments, and normal
@@ -616,8 +616,20 @@ impl Transaction {
                     // index whenever an operation replaces every fragment it
                     // covered (e.g. a full table rewrite), leaving the dataset
                     // without its declared index.
+                    //
+                    // `dataset_version` is a watermark, not a creation time:
+                    // merges take the minimum of their sources and remaps raise
+                    // it. Order by `created_at` instead, with segments that lack
+                    // one after those that have one, and break ties on the
+                    // lowest `dataset_version`.
                     let mut sorted_indices = empty_indices;
-                    sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version);
+                    sorted_indices.sort_by_key(|index: &&IndexMetadata| {
+                        (
+                            index.created_at.is_none(),
+                            index.created_at,
+                            index.dataset_version,
+                        )
+                    });
 
                     if let Some(oldest) = sorted_indices.first() {
                         uuids_to_keep.insert(oldest.uuid);
@@ -857,6 +869,7 @@ impl Transaction {
 mod tests {
     use super::*;
     use crate::transaction::test_support::overlay_with_field;
+    use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
     #[test]
@@ -1244,6 +1257,46 @@ mod tests {
         // definition survives.
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].dataset_version, 1);
+    }
+
+    #[test]
+    fn test_retain_multiple_empty_indices_keeps_earliest_created() {
+        let schema = create_test_schema(&[1]);
+        let fragments = vec![Fragment::new(1)];
+        let at = |secs| Some(Utc.timestamp_opt(secs, 0).unwrap());
+
+        // The lowest `dataset_version` is not the earliest-created segment
+        // (e.g. a merged segment that took the minimum version of its sources).
+        let mut indices = vec![
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 2, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::new()), false),
+        ];
+        indices[0].created_at = at(300);
+        indices[1].created_at = None;
+        indices[2].created_at = at(100);
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 3);
+        assert_eq!(indices[0].created_at, at(100));
+
+        // Segments without `created_at` sort after those with one, and ties
+        // go to the lowest `dataset_version`.
+        let mut indices = vec![
+            create_test_index("idx", 1, 1, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 5, Some(RoaringBitmap::new()), false),
+            create_test_index("idx", 1, 4, Some(RoaringBitmap::new()), false),
+        ];
+        indices[0].created_at = None;
+        indices[1].created_at = at(200);
+        indices[2].created_at = at(200);
+
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].dataset_version, 4);
     }
 
     #[test]
