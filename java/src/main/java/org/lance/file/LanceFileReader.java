@@ -14,6 +14,7 @@
 package org.lance.file;
 
 import org.lance.JniLoader;
+import org.lance.ipc.LanceArrowReaders;
 import org.lance.util.Range;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -164,7 +165,8 @@ public class LanceFileReader implements AutoCloseable {
           ranges,
           ffiArrowArrayStream.memoryAddress(),
           options.getBlobReadMode().getValue());
-      return Data.importArrayStream(allocator, ffiArrowArrayStream);
+      return LanceArrowReaders.importArrayStream(
+          allocator, ffiArrowArrayStream, "LanceFileReader.readAll");
     }
   }
 }
