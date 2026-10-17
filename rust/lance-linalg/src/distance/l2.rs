@@ -34,9 +34,9 @@ pub trait L2: Num {
     /// Writes the L2 distance from `x` to each `dimension`-sized vector in
     /// `batch` into the matching element of `output`.
     ///
-    /// The default calls [`L2::l2`] per vector. `f32` overrides it with one
-    /// batch kernel call, so the SIMD tier is chosen once for the whole batch
-    /// instead of once per vector.
+    /// The default calls [`L2::l2`] per vector. `f32` and `f64` override it
+    /// with one batch kernel call, so the SIMD tier is chosen once for the
+    /// whole batch instead of once per vector.
     ///
     /// # Panics
     ///
@@ -390,6 +390,11 @@ impl L2 for f64 {
         assert_equal_lengths(x.len(), y.len());
         L2_F64.get().call(x, y)
     }
+
+    fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        L2_F64_BATCH.get().call(x, batch, dimension, output);
+    }
 }
 
 lance_core::dispatch! {
@@ -408,6 +413,36 @@ lance_core::dispatch! {
             &[L2_F64_PORTABLE]
         }
     };
+}
+
+lance_core::dispatch! {
+    /// Each candidate runs the same-tier pair kernel per vector, so results
+    /// match [`L2_F64`] bit for bit while dispatch happens once per batch.
+    static L2_F64_BATCH: Dispatch<BatchKernel<f64>> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::L2_F64_BATCH_AVX512,
+                x86::L2_F64_BATCH_AVX_FMA,
+                x86::L2_F64_BATCH_AVX,
+                L2_F64_BATCH_PORTABLE,
+            ]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[L2_F64_BATCH_PORTABLE]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_F64_BATCH_PORTABLE: BatchKernel<f64>)]
+    fn l2_batch_f64_portable(x: &[f64], batch: &[f64], dimension: usize, output: &mut [f32]) {
+        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *distance = l2_f64_portable(x, y);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -508,6 +543,21 @@ mod x86 {
 
     lance_core::target_kernel! {
         #[target_features("avx512f")]
+        #[candidate(pub(super) L2_F64_BATCH_AVX512: BatchKernel<f64>)]
+        pub(super) fn l2_batch_f64_avx512(
+            x: &[f64],
+            batch: &[f64],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = l2_f64_avx512(x, y);
+            }
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
         #[candidate(pub(super) L2_F64_AVX512: PairKernel<f64>)]
         /// 8-wide `__m512d` with `vsubpd` + `vfmadd231pd` per iteration.
         #[inline]
@@ -539,6 +589,21 @@ mod x86 {
                 .sum();
 
             (_mm512_reduce_add_pd(acc) + tail) as f32
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) L2_F64_BATCH_AVX_FMA: BatchKernel<f64>)]
+        pub(super) fn l2_batch_f64_avx_fma(
+            x: &[f64],
+            batch: &[f64],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = l2_f64_avx_fma(x, y);
+            }
         }
     }
 
@@ -589,6 +654,21 @@ mod x86 {
                 .sum();
 
             (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) L2_F64_BATCH_AVX: BatchKernel<f64>)]
+        pub(super) fn l2_batch_f64_avx(
+            x: &[f64],
+            batch: &[f64],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *distance = l2_f64_avx(x, y);
+            }
         }
     }
 
@@ -1265,23 +1345,41 @@ mod tests {
         });
     }
 
-    /// Every host-supported f64 kernel must agree with an f64 reference.
+    /// Every host-supported f64 kernel, single-pair and batch, must agree with
+    /// an f64 reference. Each batch candidate must also reproduce its
+    /// same-tier pair candidate bit for bit, so batching never changes results.
     #[rstest::rstest]
     fn test_l2_f64_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
+        assert_eq!(L2_F64.candidates().len(), L2_F64_BATCH.candidates().len());
         run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            let dimension = x.len();
             let want = l2_distance_reference(&x, &y) as f32;
-            for candidate in L2_F64.candidates() {
+            // The second vector equals the key, so its distance is exactly 0.
+            let batch = [y.as_slice(), x.as_slice()].concat();
+            for (candidate, batch_candidate) in
+                L2_F64.candidates().iter().zip(L2_F64_BATCH.candidates())
+            {
                 let Some(kernel) = candidate.kernel() else {
                     continue;
                 };
                 let got = kernel.call(&x, &y);
                 prop_assert!(
                     approx::relative_eq!(got, want, max_relative = 1e-6),
-                    "{} at dim {}: {got} != {want}",
-                    candidate.name(),
-                    x.len()
+                    "{} at dim {dimension}: {got} != {want}",
+                    candidate.name()
+                );
+
+                let batch_kernel = batch_candidate
+                    .kernel()
+                    .expect("batch candidate needs the same features as its pair candidate");
+                let mut batch_got = [f32::NAN; 2];
+                batch_kernel.call(&x, &batch, dimension, &mut batch_got);
+                prop_assert!(
+                    batch_got[0].to_bits() == got.to_bits() && batch_got[1] == 0.0,
+                    "{} at dim {dimension}: {batch_got:?} != [{got}, 0]",
+                    batch_candidate.name()
                 );
             }
             Ok(())
@@ -1463,7 +1561,7 @@ mod tests {
     }
 
     /// `l2_batch_into` must agree with the per-vector `l2`, both for the f32
-    /// batch kernel and for the per-vector default that f64 uses.
+    /// and f64 batch kernels.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_12(12)]
