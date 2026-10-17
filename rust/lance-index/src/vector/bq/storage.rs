@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::cpu::Kernel;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
@@ -948,7 +949,7 @@ pub struct RabitDistCalculator<'a> {
     // the rotated query, zero-padded to a 64-dim multiple when needed; also
     // the source for the FastScan ex LUT on the legacy bypass path
     ex_query: Cow<'a, [f32]>,
-    ex_dot: Option<ExDotFn>,
+    ex_dot: Option<Kernel<ExDotFn>>,
     add_factors: &'a [f32],
     scale_factors: &'a [f32],
     error_factors: Option<&'a [f32]>,
@@ -1020,7 +1021,7 @@ impl<'a> RabitDistCalculator<'a> {
         let ex_dot = self
             .ex_dot
             .expect("raw-query multi-bit RQ requires an ex-dot kernel");
-        ex_dot(
+        ex_dot.call(
             self.ex_query.as_ref(),
             &ex_codes[id * self.ex_code_len..(id + 1) * self.ex_code_len],
         )
@@ -1578,12 +1579,12 @@ impl<'a> RabitDistCalculator<'a> {
             let heap_threshold = (res.len() >= ctx.k)
                 .then(|| max_dist.map(|max_dist| max_dist.0))
                 .flatten();
-            let (pruned_upper_bound, pruned_heap) = prune_masks(
+            let (pruned_upper_bound, pruned_heap) = prune_masks.call(
                 dist16,
                 scale16,
                 add16,
                 error16,
-                terms,
+                &terms,
                 ctx.query_upper_bound,
                 heap_threshold,
             );
@@ -4731,12 +4732,12 @@ mod tests {
         if perturbation > 0.0 {
             let threshold = (binary_distance as f64 - margin * 0.5) as f32;
             assert!(bound < threshold);
-            let masks = scaled_prune_mask_kernel()(
+            let masks = scaled_prune_mask_kernel().call(
                 &[binary_ip; PRUNE_LANES],
                 &[calc.scale_factors[0]; PRUNE_LANES],
                 &[calc.add_factors[0]; PRUNE_LANES],
                 &[calc.error_factors.unwrap()[0]; PRUNE_LANES],
-                ScaledLowerBoundTerms {
+                &ScaledLowerBoundTerms {
                     half_sum_q: 0.5 * calc.sum_q,
                     add_factor_scale: calc.add_factor_scale,
                     add_factor_offset: calc.add_factor_offset,

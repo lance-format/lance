@@ -20,6 +20,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::cpu::{Dispatch, Kernel};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, dot_u8::dot_u8_u64};
 
@@ -311,27 +312,72 @@ fn aligned<T: ArrowPrimitiveType>(values: &[T::Native]) -> PrimitiveArray<T> {
 /// Writes `Σ ōa·ōb` of one anchor row against consecutive candidate rows.
 /// Every backend computes the same exact integer and rounds it to f32 once,
 /// so all backends agree bit for bit.
-type SignDotsFn = fn(anchor: &[u64], candidates: &[u64], dim: usize, out: &mut [f32]);
+type SignDotsFn = unsafe fn(anchor: &[u64], candidates: &[u64], dim: usize, out: &mut [f32]);
 /// [`SignDotsFn`] for one integer code per dimension, given the staged code
 /// sums of the anchor and of each candidate, and `bias = 2^bits − 1`.
-type CodeDotsFn<T> =
-    fn(anchor: &[T], candidates: &[T], anchor_sum: u64, sums: &[u64], bias: i64, out: &mut [f32]);
+type CodeDotsFn<T> = unsafe fn(
+    anchor: &[T],
+    candidates: &[T],
+    anchor_sum: u64,
+    sums: &[u64],
+    bias: i64,
+    out: &mut [f32],
+);
+
+lance_core::dispatch! {
+    static SIGN_DOTS: Dispatch<SignDotsFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::SIGN_DOTS_AVX512_VPOPCNTDQ, SIGN_DOTS_PORTABLE]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[SIGN_DOTS_PORTABLE]
+        }
+    };
+}
+
+lance_core::dispatch! {
+    static U8_DOTS: Dispatch<CodeDotsFn<u8>> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::U8_DOTS_AVX512_VNNI, U8_DOTS_PORTABLE]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[U8_DOTS_PORTABLE]
+        }
+    };
+}
+
+lance_core::dispatch! {
+    static U16_DOTS: Dispatch<CodeDotsFn<u16>> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::U16_DOTS_AVX512_VNNI, U16_DOTS_PORTABLE]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[U16_DOTS_PORTABLE]
+        }
+    };
+}
 
 enum RQCodes<'a> {
     Signs {
         anchor: &'a [u64],
         candidates: &'a [u64],
-        dots: SignDotsFn,
+        dots: Kernel<SignDotsFn>,
     },
     U8 {
         anchor: &'a [u8],
         candidates: &'a [u8],
-        dots: CodeDotsFn<u8>,
+        dots: Kernel<CodeDotsFn<u8>>,
     },
     U16 {
         anchor: &'a [u16],
         candidates: &'a [u16],
-        dots: CodeDotsFn<u16>,
+        dots: Kernel<CodeDotsFn<u16>>,
     },
 }
 
@@ -348,17 +394,20 @@ impl<'a> RQCodes<'a> {
             1 => Self::Signs {
                 anchor: list_values::<UInt64Type>(anchor, CODES)?,
                 candidates: list_values::<UInt64Type>(candidates, CODES)?,
-                dots: select_sign_dots(simd),
+                dots: select(&SIGN_DOTS, simd),
             },
             2..=8 => Self::U8 {
                 anchor: list_values::<UInt8Type>(anchor, CODES)?,
                 candidates: list_values::<UInt8Type>(candidates, CODES)?,
-                dots: select_u8_dots(simd && centered_fits_i32(scorer.dim, scorer.bits)),
+                dots: select(&U8_DOTS, simd && centered_fits_i32(scorer.dim, scorer.bits)),
             },
             _ => Self::U16 {
                 anchor: list_values::<UInt16Type>(anchor, CODES)?,
                 candidates: list_values::<UInt16Type>(candidates, CODES)?,
-                dots: select_u16_dots(simd && centered_fits_i32(scorer.dim, scorer.bits)),
+                dots: select(
+                    &U16_DOTS,
+                    simd && centered_fits_i32(scorer.dim, scorer.bits),
+                ),
             },
         })
     }
@@ -373,51 +422,30 @@ fn centered_fits_i32(dim: usize, bits: u8) -> bool {
         .is_some_and(|bound| bound <= i32::MAX as u64)
 }
 
-fn select_sign_dots(simd: bool) -> SignDotsFn {
-    #[cfg(target_arch = "x86_64")]
-    if simd && *x86::HAS_AVX512_POPCNT {
-        // SAFETY: the required CPU features were detected.
-        return |anchor, candidates, dim, out| unsafe {
-            x86::sign_dots(anchor, candidates, dim, out)
-        };
+/// The best kernel of `dispatch`, or with `simd = false` its portable one.
+fn select<F: Copy>(dispatch: &Dispatch<F>, simd: bool) -> Kernel<F> {
+    if simd {
+        return dispatch.get();
     }
-    let _ = simd;
-    sign_dots_scalar
+    let portable = dispatch.candidates().last();
+    portable
+        .and_then(|candidate| candidate.kernel())
+        .expect("the last candidate needs no CPU features")
 }
 
-fn select_u8_dots(simd: bool) -> CodeDotsFn<u8> {
-    #[cfg(target_arch = "x86_64")]
-    if simd && *x86::HAS_AVX512_VNNI {
-        // SAFETY: the required CPU features were detected.
-        return |anchor, candidates, anchor_sum, sums, bias, out| unsafe {
-            x86::u8_dots(anchor, candidates, anchor_sum, sums, bias, out)
-        };
-    }
-    let _ = simd;
-    u8_dots_scalar
-}
-
-fn select_u16_dots(simd: bool) -> CodeDotsFn<u16> {
-    #[cfg(target_arch = "x86_64")]
-    if simd && *x86::HAS_AVX512_VNNI {
-        // SAFETY: the required CPU features were detected.
-        return |anchor, candidates, anchor_sum, sums, bias, out| unsafe {
-            x86::u16_dots(anchor, candidates, anchor_sum, sums, bias, out)
-        };
-    }
-    let _ = simd;
-    u16_dots_scalar
-}
-
-/// Sign codes center to `±1/2`: `Σ ōa·ōb = (dim − 2·popcount(a ⊕ b)) / 4`.
-fn sign_dots_scalar(anchor: &[u64], candidates: &[u64], dim: usize, out: &mut [f32]) {
-    for (out, y) in out.iter_mut().zip(candidates.chunks_exact(anchor.len())) {
-        let differences: u32 = anchor
-            .iter()
-            .zip(y)
-            .map(|(x, y)| (x ^ y).count_ones())
-            .sum();
-        *out = (dim as f32 - 2.0 * differences as f32) * 0.25;
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(SIGN_DOTS_PORTABLE: SignDotsFn)]
+    /// Sign codes center to `±1/2`: `Σ ōa·ōb = (dim − 2·popcount(a ⊕ b)) / 4`.
+    fn sign_dots_scalar(anchor: &[u64], candidates: &[u64], dim: usize, out: &mut [f32]) {
+        for (out, y) in out.iter_mut().zip(candidates.chunks_exact(anchor.len())) {
+            let differences: u32 = anchor
+                .iter()
+                .zip(y)
+                .map(|(x, y)| (x ^ y).count_ones())
+                .sum();
+            *out = (dim as f32 - 2.0 * differences as f32) * 0.25;
+        }
     }
 }
 
@@ -429,36 +457,44 @@ fn centered_from_product(product: u64, sums: u64, dim: usize, bias: i64) -> f32 
     centered as f32 * 0.25
 }
 
-fn u8_dots_scalar(
-    anchor: &[u8],
-    candidates: &[u8],
-    anchor_sum: u64,
-    sums: &[u64],
-    bias: i64,
-    out: &mut [f32],
-) {
-    let dim = anchor.len();
-    for ((out, y), &sum) in out.iter_mut().zip(candidates.chunks_exact(dim)).zip(sums) {
-        *out = centered_from_product(dot_u8_u64(anchor, y), anchor_sum + sum, dim, bias);
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(U8_DOTS_PORTABLE: CodeDotsFn<u8>)]
+    fn u8_dots_scalar(
+        anchor: &[u8],
+        candidates: &[u8],
+        anchor_sum: u64,
+        sums: &[u64],
+        bias: i64,
+        out: &mut [f32],
+    ) {
+        let dim = anchor.len();
+        for ((out, y), &sum) in out.iter_mut().zip(candidates.chunks_exact(dim)).zip(sums) {
+            *out = centered_from_product(dot_u8_u64(anchor, y), anchor_sum + sum, dim, bias);
+        }
     }
 }
 
-fn u16_dots_scalar(
-    anchor: &[u16],
-    candidates: &[u16],
-    anchor_sum: u64,
-    sums: &[u64],
-    bias: i64,
-    out: &mut [f32],
-) {
-    let dim = anchor.len();
-    for ((out, y), &sum) in out.iter_mut().zip(candidates.chunks_exact(dim)).zip(sums) {
-        let product = anchor
-            .iter()
-            .zip(y)
-            .map(|(&x, &y)| u64::from(x) * u64::from(y))
-            .sum();
-        *out = centered_from_product(product, anchor_sum + sum, dim, bias);
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(U16_DOTS_PORTABLE: CodeDotsFn<u16>)]
+    fn u16_dots_scalar(
+        anchor: &[u16],
+        candidates: &[u16],
+        anchor_sum: u64,
+        sums: &[u64],
+        bias: i64,
+        out: &mut [f32],
+    ) {
+        let dim = anchor.len();
+        for ((out, y), &sum) in out.iter_mut().zip(candidates.chunks_exact(dim)).zip(sums) {
+            let product = anchor
+                .iter()
+                .zip(y)
+                .map(|(&x, &y)| u64::from(x) * u64::from(y))
+                .sum();
+            *out = centered_from_product(product, anchor_sum + sum, dim, bias);
+        }
     }
 }
 
@@ -471,17 +507,8 @@ fn u16_dots_scalar(
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::*;
-    use std::sync::LazyLock;
 
-    pub(super) static HAS_AVX512_VNNI: LazyLock<bool> = LazyLock::new(|| {
-        is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-    });
-
-    pub(super) static HAS_AVX512_POPCNT: LazyLock<bool> = LazyLock::new(|| {
-        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vpopcntdq")
-    });
+    use super::{CodeDotsFn, SignDotsFn};
 
     /// Candidates per group, one accumulator register each.
     const GROUP: usize = 16;
@@ -598,51 +625,51 @@ mod x86 {
         };
     }
 
-    /// `Σ ōa·ōb` for u8 codes. VPDPBUSD takes the candidate as the unsigned
-    /// operand and the anchor biased to `a − 128` as the signed one, so
-    /// `r = Σ b·(a − 128)` and `Σab = r + 128·Σb`.
-    ///
-    /// # Safety
-    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-    pub(super) unsafe fn u8_dots(
-        anchor: &[u8],
-        candidates: &[u8],
-        anchor_sum: u64,
-        sums: &[u64],
-        bias: i64,
-        out: &mut [f32],
-    ) {
-        let dim = anchor.len();
-        let n = out.len();
-        assert!(
-            dim > 0 && candidates.len() >= n * dim && sums.len() >= n,
-            "RQ u8 kernel needs n={n} rows of dim={dim} > 0, got candidates.len()={} and sums.len()={}",
-            candidates.len(),
-            sums.len()
-        );
-        // 4Σab − 2·bias·(Σa + Σb) + dim·bias² = 4r + coef·Σb + offset.
-        let coef = 512 - 2 * bias;
-        let offset = dim as i64 * bias * bias - 2 * bias * anchor_sum as i64;
-        let mut first = 0;
-        while first < n {
-            let m = (n - first).min(GROUP);
-            let rows = &candidates[first * dim..(first + m) * dim];
-            // SAFETY: the caller guarantees this function's CPU features.
-            let acc = unsafe { group_by_width!(m, u8_group(anchor, rows)) };
-            // SAFETY: as above, and `sums` and `out` hold at least
-            // `n - first >= m` values from `first`.
-            unsafe {
-                store_centered(
-                    transpose_sum(&acc),
-                    coef,
-                    offset,
-                    &sums[first..],
-                    group_mask(m),
-                    &mut out[first..],
-                )
-            };
-            first += m;
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512bw", "avx512vnni")]
+        #[candidate(pub(super) U8_DOTS_AVX512_VNNI: CodeDotsFn<u8>)]
+        /// `Σ ōa·ōb` for u8 codes. VPDPBUSD takes the candidate as the unsigned
+        /// operand and the anchor biased to `a − 128` as the signed one, so
+        /// `r = Σ b·(a − 128)` and `Σab = r + 128·Σb`.
+        fn u8_dots(
+            anchor: &[u8],
+            candidates: &[u8],
+            anchor_sum: u64,
+            sums: &[u64],
+            bias: i64,
+            out: &mut [f32],
+        ) {
+            let dim = anchor.len();
+            let n = out.len();
+            assert!(
+                dim > 0 && candidates.len() >= n * dim && sums.len() >= n,
+                "RQ u8 kernel needs n={n} rows of dim={dim} > 0, got candidates.len()={} and sums.len()={}",
+                candidates.len(),
+                sums.len()
+            );
+            // 4Σab − 2·bias·(Σa + Σb) + dim·bias² = 4r + coef·Σb + offset.
+            let coef = 512 - 2 * bias;
+            let offset = dim as i64 * bias * bias - 2 * bias * anchor_sum as i64;
+            let mut first = 0;
+            while first < n {
+                let m = (n - first).min(GROUP);
+                let rows = &candidates[first * dim..(first + m) * dim];
+                // SAFETY: this kernel enables the group function's CPU features.
+                let acc = unsafe { group_by_width!(m, u8_group(anchor, rows)) };
+                // SAFETY: as above, and `sums` and `out` hold at least
+                // `n - first >= m` values from `first`.
+                unsafe {
+                    store_centered(
+                        transpose_sum(&acc),
+                        coef,
+                        offset,
+                        &sums[first..],
+                        group_mask(m),
+                        &mut out[first..],
+                    )
+                };
+                first += m;
+            }
         }
     }
 
@@ -686,49 +713,49 @@ mod x86 {
         acc
     }
 
-    /// `Σ ōa·ōb` for u16 codes below 2^15, which VPDPWSSD multiplies exactly
-    /// as signed words.
-    ///
-    /// # Safety
-    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-    pub(super) unsafe fn u16_dots(
-        anchor: &[u16],
-        candidates: &[u16],
-        anchor_sum: u64,
-        sums: &[u64],
-        bias: i64,
-        out: &mut [f32],
-    ) {
-        let dim = anchor.len();
-        let n = out.len();
-        assert!(
-            dim > 0 && candidates.len() >= n * dim && sums.len() >= n,
-            "RQ u16 kernel needs n={n} rows of dim={dim} > 0, got candidates.len()={} and sums.len()={}",
-            candidates.len(),
-            sums.len()
-        );
-        let coef = -2 * bias;
-        let offset = dim as i64 * bias * bias - 2 * bias * anchor_sum as i64;
-        let mut first = 0;
-        while first < n {
-            let m = (n - first).min(GROUP);
-            let rows = &candidates[first * dim..(first + m) * dim];
-            // SAFETY: the caller guarantees this function's CPU features.
-            let acc = unsafe { group_by_width!(m, u16_group(anchor, rows)) };
-            // SAFETY: as above, and `sums` and `out` hold at least
-            // `n - first >= m` values from `first`.
-            unsafe {
-                store_centered(
-                    transpose_sum(&acc),
-                    coef,
-                    offset,
-                    &sums[first..],
-                    group_mask(m),
-                    &mut out[first..],
-                )
-            };
-            first += m;
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512bw", "avx512vnni")]
+        #[candidate(pub(super) U16_DOTS_AVX512_VNNI: CodeDotsFn<u16>)]
+        /// `Σ ōa·ōb` for u16 codes below 2^15, which VPDPWSSD multiplies exactly
+        /// as signed words.
+        fn u16_dots(
+            anchor: &[u16],
+            candidates: &[u16],
+            anchor_sum: u64,
+            sums: &[u64],
+            bias: i64,
+            out: &mut [f32],
+        ) {
+            let dim = anchor.len();
+            let n = out.len();
+            assert!(
+                dim > 0 && candidates.len() >= n * dim && sums.len() >= n,
+                "RQ u16 kernel needs n={n} rows of dim={dim} > 0, got candidates.len()={} and sums.len()={}",
+                candidates.len(),
+                sums.len()
+            );
+            let coef = -2 * bias;
+            let offset = dim as i64 * bias * bias - 2 * bias * anchor_sum as i64;
+            let mut first = 0;
+            while first < n {
+                let m = (n - first).min(GROUP);
+                let rows = &candidates[first * dim..(first + m) * dim];
+                // SAFETY: this kernel enables the group function's CPU features.
+                let acc = unsafe { group_by_width!(m, u16_group(anchor, rows)) };
+                // SAFETY: as above, and `sums` and `out` hold at least
+                // `n - first >= m` values from `first`.
+                unsafe {
+                    store_centered(
+                        transpose_sum(&acc),
+                        coef,
+                        offset,
+                        &sums[first..],
+                        group_mask(m),
+                        &mut out[first..],
+                    )
+                };
+                first += m;
+            }
         }
     }
 
@@ -771,40 +798,40 @@ mod x86 {
         acc
     }
 
-    /// `(dim − 2·popcount(a ⊕ b)) / 4` for packed sign words.
-    ///
-    /// # Safety
-    /// The CPU supports AVX-512F and AVX-512 VPOPCNTDQ.
-    #[target_feature(enable = "avx512f,avx512vpopcntdq")]
-    pub(super) unsafe fn sign_dots(
-        anchor: &[u64],
-        candidates: &[u64],
-        dim: usize,
-        out: &mut [f32],
-    ) {
-        let words = anchor.len();
-        let n = out.len();
-        assert!(
-            words > 0 && candidates.len() >= n * words,
-            "RQ sign kernel needs n={n} rows of {words} > 0 words (dim={dim}), got candidates.len()={}",
-            candidates.len()
-        );
-        let dim = _mm512_set1_ps(dim as f32);
-        let mut first = 0;
-        while first < n {
-            let m = (n - first).min(GROUP);
-            let rows = &candidates[first * words..(first + m) * words];
-            // SAFETY: the caller guarantees this function's CPU features.
-            let acc = unsafe { group_by_width!(m, sign_group(anchor, rows)) };
-            let differences = _mm512_cvtepi32_ps(transpose_sum(&acc));
-            let values = _mm512_mul_ps(
-                _mm512_sub_ps(dim, _mm512_mul_ps(_mm512_set1_ps(2.0), differences)),
-                _mm512_set1_ps(0.25),
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512vpopcntdq")]
+        #[candidate(pub(super) SIGN_DOTS_AVX512_VPOPCNTDQ: SignDotsFn)]
+        /// `(dim − 2·popcount(a ⊕ b)) / 4` for packed sign words.
+        fn sign_dots(
+            anchor: &[u64],
+            candidates: &[u64],
+            dim: usize,
+            out: &mut [f32],
+        ) {
+            let words = anchor.len();
+            let n = out.len();
+            assert!(
+                words > 0 && candidates.len() >= n * words,
+                "RQ sign kernel needs n={n} rows of {words} > 0 words (dim={dim}), got candidates.len()={}",
+                candidates.len()
             );
-            // SAFETY: the masked store writes only the first `m` lanes, and
-            // `out` holds `n - first >= m` floats from `first`.
-            unsafe { _mm512_mask_storeu_ps(out[first..].as_mut_ptr(), group_mask(m), values) };
-            first += m;
+            let dim = _mm512_set1_ps(dim as f32);
+            let mut first = 0;
+            while first < n {
+                let m = (n - first).min(GROUP);
+                let rows = &candidates[first * words..(first + m) * words];
+                // SAFETY: this kernel enables the group function's CPU features.
+                let acc = unsafe { group_by_width!(m, sign_group(anchor, rows)) };
+                let differences = _mm512_cvtepi32_ps(transpose_sum(&acc));
+                let values = _mm512_mul_ps(
+                    _mm512_sub_ps(dim, _mm512_mul_ps(_mm512_set1_ps(2.0), differences)),
+                    _mm512_set1_ps(0.25),
+                );
+                // SAFETY: the masked store writes only the first `m` lanes, and
+                // `out` holds `n - first >= m` floats from `first`.
+                unsafe { _mm512_mask_storeu_ps(out[first..].as_mut_ptr(), group_mask(m), values) };
+                first += m;
+            }
         }
     }
 
@@ -917,7 +944,7 @@ impl<'a> RQKernel<'a> {
                 let words = self.scorer.words();
                 let x = &anchor[anchor_row * words..(anchor_row + 1) * words];
                 let y = &values[candidates.start * words..candidates.end * words];
-                dots(x, y, dim, out);
+                dots.call(x, y, dim, out);
             }
             RQCodes::U8 {
                 anchor,
@@ -927,7 +954,7 @@ impl<'a> RQKernel<'a> {
                 let x = &anchor[anchor_row * dim..(anchor_row + 1) * dim];
                 let y = &values[candidates.start * dim..candidates.end * dim];
                 let sums = &self.candidates.sums[candidates];
-                dots(x, y, self.anchor.sums[anchor_row], sums, bias, out);
+                dots.call(x, y, self.anchor.sums[anchor_row], sums, bias, out);
             }
             RQCodes::U16 {
                 anchor,
@@ -937,7 +964,7 @@ impl<'a> RQKernel<'a> {
                 let x = &anchor[anchor_row * dim..(anchor_row + 1) * dim];
                 let y = &values[candidates.start * dim..candidates.end * dim];
                 let sums = &self.candidates.sums[candidates];
-                dots(x, y, self.anchor.sums[anchor_row], sums, bias, out);
+                dots.call(x, y, self.anchor.sums[anchor_row], sums, bias, out);
             }
         }
     }

@@ -331,9 +331,6 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
-#[cfg(target_arch = "x86_64")]
-static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
-
 /// First index in `[pos, end)` where `docs[index] >= target` (scalar).
 #[inline]
 unsafe fn find_next_geq_scalar(docs: *const u32, mut pos: usize, end: usize, target: u32) -> usize {
@@ -380,25 +377,80 @@ unsafe fn find_next_geq_avx2(docs: *const u32, mut pos: usize, end: usize, targe
     }
 }
 
-#[inline]
-unsafe fn find_next_geq(docs: *const u32, pos: usize, end: usize, target: u32) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    if *HAS_AVX2 {
-        return unsafe { find_next_geq_avx2(docs, pos, end, target) };
-    }
-    unsafe { find_next_geq_scalar(docs, pos, end, target) }
+/// First index in `[pos, docs.len())` where `docs[index] >= target`, or
+/// `docs.len()` if there is none; `docs[pos..]` must be sorted.
+type FindNextGeqFn = unsafe fn(&[u32], usize, u32) -> usize;
+
+lance_core::dispatch! {
+    static FIND_NEXT_GEQ: Dispatch<FindNextGeqFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[FIND_NEXT_GEQ_AVX2, FIND_NEXT_GEQ_LINEAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[FIND_NEXT_GEQ_LINEAR]
+        }
+    };
 }
 
-/// Search a sorted posting block using AVX2 when available. Keep the binary
-/// search fallback because linear catch-up is slower on targets without AVX2.
+lance_core::dispatch! {
+    /// For a whole posting block. Without AVX2, a binary search beats the
+    /// linear catch-up.
+    static FIND_NEXT_GEQ_IN_BLOCK: Dispatch<FindNextGeqFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[FIND_NEXT_GEQ_AVX2, FIND_NEXT_GEQ_BINARY]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[FIND_NEXT_GEQ_BINARY]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(FIND_NEXT_GEQ_LINEAR: FindNextGeqFn)]
+    fn find_next_geq_linear(docs: &[u32], pos: usize, target: u32) -> usize {
+        // SAFETY: the scalar search reads only `docs[pos..docs.len()]`.
+        unsafe { find_next_geq_scalar(docs.as_ptr(), pos, docs.len(), target) }
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(FIND_NEXT_GEQ_BINARY: FindNextGeqFn)]
+    fn find_next_geq_binary(docs: &[u32], pos: usize, target: u32) -> usize {
+        pos + docs[pos..].partition_point(|&doc_id| doc_id < target)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(FIND_NEXT_GEQ_AVX2: FindNextGeqFn)]
+    fn find_next_geq_avx2_slice(docs: &[u32], pos: usize, target: u32) -> usize {
+        // SAFETY: the AVX2 search reads only `docs[pos..docs.len()]`.
+        unsafe { find_next_geq_avx2(docs.as_ptr(), pos, docs.len(), target) }
+    }
+}
+
+/// # Safety
+/// `docs` points at `end` readable values.
+#[inline]
+unsafe fn find_next_geq(docs: *const u32, pos: usize, end: usize, target: u32) -> usize {
+    // SAFETY: guaranteed by the caller.
+    let docs = unsafe { std::slice::from_raw_parts(docs, end) };
+    FIND_NEXT_GEQ.get().call(docs, pos, target)
+}
+
+/// Search a sorted posting block for the first doc at or after `pos` that is
+/// `>= target`.
 #[inline]
 fn find_next_geq_in_block(docs: &[u32], pos: usize, target: u32) -> usize {
     debug_assert!(pos <= docs.len());
-    #[cfg(target_arch = "x86_64")]
-    if *HAS_AVX2 {
-        return unsafe { find_next_geq_avx2(docs.as_ptr(), pos, docs.len(), target) };
-    }
-    pos + docs[pos..].partition_point(|&doc_id| doc_id < target)
+    FIND_NEXT_GEQ_IN_BLOCK.get().call(docs, pos, target)
 }
 
 #[inline]
@@ -4212,219 +4264,284 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // (doc length only shrinks a BM25 weight, and the last bucket holds
         // the clause sup), so every skipped doc would also fail the exact
         // per-candidate prune: results are unchanged, the work never happens.
+        // The kernels are safe functions, as `target_kernel!` requires, even
+        // though they read through `WindowList` pointers: that type is local
+        // to this method, which only builds it over live blocks.
         macro_rules! merge_kernels {
-            ($name2:ident, $name3:ident, $name_n:ident, $docs_name2:ident, $docs_name3:ident, $geq:ident $(, #[$feat:meta])?) => {
-                $(#[$feat])?
-                unsafe fn $name2(
-                    wins: &[WindowList],
-                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
-                    docs_out: &mut Vec<u32>,
-                    offs_out: &mut Vec<u8>,
-                ) {
-                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
-                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
-                    let f0 = wins[0].freqs;
-                    unsafe {
-                        while p0 < e0 {
-                            let doc = *d0.add(p0);
-                            let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                            if freq_cannot_beat[freq] {
-                                p0 += 1;
-                                continue;
-                            }
-                            p1 = $geq(d1, p1, e1, doc);
-                            if p1 >= e1 {
-                                return;
-                            }
-                            let second = *d1.add(p1);
-                            if second > doc {
-                                p0 = $geq(d0, p0 + 1, e0, second);
-                                continue;
-                            }
-                            docs_out.push(doc);
-                            offs_out.push(p0 as u8);
-                            offs_out.push(p1 as u8);
-                            p0 += 1;
-                        }
-                    }
-                }
-
-                $(#[$feat])?
-                unsafe fn $name3(
-                    wins: &[WindowList],
-                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
-                    docs_out: &mut Vec<u32>,
-                    offs_out: &mut Vec<u8>,
-                ) {
-                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
-                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
-                    let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
-                    let f0 = wins[0].freqs;
-                    unsafe {
-                        'outer: while p0 < e0 {
-                            let doc = *d0.add(p0);
-                            let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                            if freq_cannot_beat[freq] {
-                                p0 += 1;
-                                continue 'outer;
-                            }
-                            p1 = $geq(d1, p1, e1, doc);
-                            if p1 >= e1 {
-                                return;
-                            }
-                            let second = *d1.add(p1);
-                            if second > doc {
-                                p0 = $geq(d0, p0 + 1, e0, second);
-                                continue 'outer;
-                            }
-                            p2 = $geq(d2, p2, e2, doc);
-                            if p2 >= e2 {
-                                return;
-                            }
-                            let third = *d2.add(p2);
-                            if third > doc {
-                                p0 = $geq(d0, p0 + 1, e0, third);
-                                continue 'outer;
-                            }
-                            docs_out.push(doc);
-                            offs_out.push(p0 as u8);
-                            offs_out.push(p1 as u8);
-                            offs_out.push(p2 as u8);
-                            p0 += 1;
-                        }
-                    }
-                }
-
-                $(#[$feat])?
-                #[allow(clippy::too_many_arguments)]
-                unsafe fn $name_n(
-                    wins: &[WindowList],
-                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
-                    cursors: &mut Vec<usize>,
-                    docs_out: &mut Vec<u32>,
-                    offs_out: &mut Vec<u8>,
-                ) {
-                    cursors.clear();
-                    cursors.extend(wins.iter().map(|win| win.pos));
-                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
-                    let f0 = wins[0].freqs;
-                    unsafe {
-                        'outer: while p0 < e0 {
-                            let doc = *d0.add(p0);
-                            let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                            if freq_cannot_beat[freq] {
-                                p0 += 1;
-                                continue 'outer;
-                            }
-                            for j in 1..wins.len() {
-                                let win = wins.get_unchecked(j);
-                                let pos = $geq(win.docs, *cursors.get_unchecked(j), win.end, doc);
-                                *cursors.get_unchecked_mut(j) = pos;
-                                if pos >= win.end {
+            (
+                #[target_features($($feature:literal),*)]
+                $geq:ident,
+                $merge2:ident = $name2:ident,
+                $merge3:ident = $name3:ident,
+                $merge_n:ident = $name_n:ident,
+                $docs2:ident = $docs_name2:ident,
+                $docs3:ident = $docs_name3:ident $(,)?
+            ) => {
+                lance_core::target_kernel! {
+                    #[target_features($($feature),*)]
+                    #[candidate($merge2: MergeWindowFn)]
+                    fn $name2(
+                        wins: &[WindowList],
+                        freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+                        docs_out: &mut Vec<u32>,
+                        offs_out: &mut Vec<u8>,
+                    ) {
+                        let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                        let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                        let f0 = wins[0].freqs;
+                        unsafe {
+                            while p0 < e0 {
+                                let doc = *d0.add(p0);
+                                let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                                if freq_cannot_beat[freq] {
+                                    p0 += 1;
+                                    continue;
+                                }
+                                p1 = $geq(d1, p1, e1, doc);
+                                if p1 >= e1 {
                                     return;
                                 }
-                                let clause_doc = *win.docs.add(pos);
-                                if clause_doc > doc {
-                                    p0 = $geq(d0, p0 + 1, e0, clause_doc);
+                                let second = *d1.add(p1);
+                                if second > doc {
+                                    p0 = $geq(d0, p0 + 1, e0, second);
+                                    continue;
+                                }
+                                docs_out.push(doc);
+                                offs_out.push(p0 as u8);
+                                offs_out.push(p1 as u8);
+                                p0 += 1;
+                            }
+                        }
+                    }
+                }
+
+                lance_core::target_kernel! {
+                    #[target_features($($feature),*)]
+                    #[candidate($merge3: MergeWindowFn)]
+                    fn $name3(
+                        wins: &[WindowList],
+                        freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+                        docs_out: &mut Vec<u32>,
+                        offs_out: &mut Vec<u8>,
+                    ) {
+                        let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                        let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                        let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
+                        let f0 = wins[0].freqs;
+                        unsafe {
+                            'outer: while p0 < e0 {
+                                let doc = *d0.add(p0);
+                                let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                                if freq_cannot_beat[freq] {
+                                    p0 += 1;
                                     continue 'outer;
                                 }
+                                p1 = $geq(d1, p1, e1, doc);
+                                if p1 >= e1 {
+                                    return;
+                                }
+                                let second = *d1.add(p1);
+                                if second > doc {
+                                    p0 = $geq(d0, p0 + 1, e0, second);
+                                    continue 'outer;
+                                }
+                                p2 = $geq(d2, p2, e2, doc);
+                                if p2 >= e2 {
+                                    return;
+                                }
+                                let third = *d2.add(p2);
+                                if third > doc {
+                                    p0 = $geq(d0, p0 + 1, e0, third);
+                                    continue 'outer;
+                                }
+                                docs_out.push(doc);
+                                offs_out.push(p0 as u8);
+                                offs_out.push(p1 as u8);
+                                offs_out.push(p2 as u8);
+                                p0 += 1;
                             }
-                            docs_out.push(doc);
-                            offs_out.push(p0 as u8);
-                            for j in 1..wins.len() {
-                                offs_out.push(*cursors.get_unchecked(j) as u8);
-                            }
-                            p0 += 1;
                         }
                     }
                 }
 
-                $(#[$feat])?
-                unsafe fn $docs_name2(
-                    wins: &[WindowList],
-                    docs_out: &mut Vec<u32>,
-                    offs_out: &mut Vec<u8>,
-                ) {
-                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
-                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
-                    unsafe {
-                        while p0 < e0 {
-                            let doc = *d0.add(p0);
-                            p1 = $geq(d1, p1, e1, doc);
-                            if p1 >= e1 {
-                                return;
+                lance_core::target_kernel! {
+                    #[target_features($($feature),*)]
+                    #[candidate($merge_n: MergeWindowNFn)]
+                    fn $name_n(
+                        wins: &[WindowList],
+                        freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+                        cursors: &mut Vec<usize>,
+                        docs_out: &mut Vec<u32>,
+                        offs_out: &mut Vec<u8>,
+                    ) {
+                        cursors.clear();
+                        cursors.extend(wins.iter().map(|win| win.pos));
+                        let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                        let f0 = wins[0].freqs;
+                        unsafe {
+                            'outer: while p0 < e0 {
+                                let doc = *d0.add(p0);
+                                let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                                if freq_cannot_beat[freq] {
+                                    p0 += 1;
+                                    continue 'outer;
+                                }
+                                for j in 1..wins.len() {
+                                    let win = wins.get_unchecked(j);
+                                    let pos = $geq(win.docs, *cursors.get_unchecked(j), win.end, doc);
+                                    *cursors.get_unchecked_mut(j) = pos;
+                                    if pos >= win.end {
+                                        return;
+                                    }
+                                    let clause_doc = *win.docs.add(pos);
+                                    if clause_doc > doc {
+                                        p0 = $geq(d0, p0 + 1, e0, clause_doc);
+                                        continue 'outer;
+                                    }
+                                }
+                                docs_out.push(doc);
+                                offs_out.push(p0 as u8);
+                                for j in 1..wins.len() {
+                                    offs_out.push(*cursors.get_unchecked(j) as u8);
+                                }
+                                p0 += 1;
                             }
-                            let second = *d1.add(p1);
-                            if second > doc {
-                                p0 = $geq(d0, p0 + 1, e0, second);
-                                continue;
-                            }
-                            docs_out.push(doc);
-                            offs_out.push(p0 as u8);
-                            offs_out.push(p1 as u8);
-                            p0 += 1;
                         }
                     }
                 }
 
-                $(#[$feat])?
-                unsafe fn $docs_name3(
-                    wins: &[WindowList],
-                    docs_out: &mut Vec<u32>,
-                    offs_out: &mut Vec<u8>,
-                ) {
-                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
-                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
-                    let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
-                    unsafe {
-                        'outer: while p0 < e0 {
-                            let doc = *d0.add(p0);
-                            p1 = $geq(d1, p1, e1, doc);
-                            if p1 >= e1 {
-                                return;
+                lance_core::target_kernel! {
+                    #[target_features($($feature),*)]
+                    #[candidate($docs2: MergeWindowDocsFn)]
+                    fn $docs_name2(
+                        wins: &[WindowList],
+                        docs_out: &mut Vec<u32>,
+                        offs_out: &mut Vec<u8>,
+                    ) {
+                        let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                        let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                        unsafe {
+                            while p0 < e0 {
+                                let doc = *d0.add(p0);
+                                p1 = $geq(d1, p1, e1, doc);
+                                if p1 >= e1 {
+                                    return;
+                                }
+                                let second = *d1.add(p1);
+                                if second > doc {
+                                    p0 = $geq(d0, p0 + 1, e0, second);
+                                    continue;
+                                }
+                                docs_out.push(doc);
+                                offs_out.push(p0 as u8);
+                                offs_out.push(p1 as u8);
+                                p0 += 1;
                             }
-                            let second = *d1.add(p1);
-                            if second > doc {
-                                p0 = $geq(d0, p0 + 1, e0, second);
-                                continue 'outer;
+                        }
+                    }
+                }
+
+                lance_core::target_kernel! {
+                    #[target_features($($feature),*)]
+                    #[candidate($docs3: MergeWindowDocsFn)]
+                    fn $docs_name3(
+                        wins: &[WindowList],
+                        docs_out: &mut Vec<u32>,
+                        offs_out: &mut Vec<u8>,
+                    ) {
+                        let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                        let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                        let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
+                        unsafe {
+                            'outer: while p0 < e0 {
+                                let doc = *d0.add(p0);
+                                p1 = $geq(d1, p1, e1, doc);
+                                if p1 >= e1 {
+                                    return;
+                                }
+                                let second = *d1.add(p1);
+                                if second > doc {
+                                    p0 = $geq(d0, p0 + 1, e0, second);
+                                    continue 'outer;
+                                }
+                                p2 = $geq(d2, p2, e2, doc);
+                                if p2 >= e2 {
+                                    return;
+                                }
+                                let third = *d2.add(p2);
+                                if third > doc {
+                                    p0 = $geq(d0, p0 + 1, e0, third);
+                                    continue 'outer;
+                                }
+                                docs_out.push(doc);
+                                offs_out.push(p0 as u8);
+                                offs_out.push(p1 as u8);
+                                offs_out.push(p2 as u8);
+                                p0 += 1;
                             }
-                            p2 = $geq(d2, p2, e2, doc);
-                            if p2 >= e2 {
-                                return;
-                            }
-                            let third = *d2.add(p2);
-                            if third > doc {
-                                p0 = $geq(d0, p0 + 1, e0, third);
-                                continue 'outer;
-                            }
-                            docs_out.push(doc);
-                            offs_out.push(p0 as u8);
-                            offs_out.push(p1 as u8);
-                            offs_out.push(p2 as u8);
-                            p0 += 1;
                         }
                     }
                 }
             };
         }
         merge_kernels!(
-            merge_window_2,
-            merge_window_3,
-            merge_window_n,
-            merge_window_docs_2,
-            merge_window_docs_3,
-            find_next_geq_scalar
+            #[target_features()]
+            find_next_geq_scalar,
+            MERGE_WINDOW_2_PORTABLE = merge_window_2,
+            MERGE_WINDOW_3_PORTABLE = merge_window_3,
+            MERGE_WINDOW_N_PORTABLE = merge_window_n,
+            MERGE_WINDOW_DOCS_2_PORTABLE = merge_window_docs_2,
+            MERGE_WINDOW_DOCS_3_PORTABLE = merge_window_docs_3,
         );
         #[cfg(target_arch = "x86_64")]
         merge_kernels!(
-            merge_window_2_avx2,
-            merge_window_3_avx2,
-            merge_window_n_avx2,
-            merge_window_docs_2_avx2,
-            merge_window_docs_3_avx2,
+            #[target_features("avx2")]
             find_next_geq_avx2,
-            #[target_feature(enable = "avx2")]
+            MERGE_WINDOW_2_AVX2 = merge_window_2_avx2,
+            MERGE_WINDOW_3_AVX2 = merge_window_3_avx2,
+            MERGE_WINDOW_N_AVX2 = merge_window_n_avx2,
+            MERGE_WINDOW_DOCS_2_AVX2 = merge_window_docs_2_avx2,
+            MERGE_WINDOW_DOCS_3_AVX2 = merge_window_docs_3_avx2,
         );
+
+        type MergeWindowFn =
+            unsafe fn(&[WindowList], &[bool; FREQ_LUT_BUCKETS], &mut Vec<u32>, &mut Vec<u8>);
+        type MergeWindowNFn = unsafe fn(
+            &[WindowList],
+            &[bool; FREQ_LUT_BUCKETS],
+            &mut Vec<usize>,
+            &mut Vec<u32>,
+            &mut Vec<u8>,
+        );
+        type MergeWindowDocsFn = unsafe fn(&[WindowList], &mut Vec<u32>, &mut Vec<u8>);
+
+        // One dispatch per kernel, so each picks its AVX2 variant whenever
+        // the host has AVX2.
+        macro_rules! merge_dispatch {
+            ($($dispatch:ident: $kernel_type:ty = $avx2:ident, $portable:ident;)*) => {$(
+                lance_core::dispatch! {
+                    static $dispatch: Dispatch<$kernel_type> = {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            &[$avx2, $portable]
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            &[$portable]
+                        }
+                    };
+                }
+            )*};
+        }
+        merge_dispatch! {
+            MERGE_WINDOW_2: MergeWindowFn = MERGE_WINDOW_2_AVX2, MERGE_WINDOW_2_PORTABLE;
+            MERGE_WINDOW_3: MergeWindowFn = MERGE_WINDOW_3_AVX2, MERGE_WINDOW_3_PORTABLE;
+            MERGE_WINDOW_N: MergeWindowNFn = MERGE_WINDOW_N_AVX2, MERGE_WINDOW_N_PORTABLE;
+            MERGE_WINDOW_DOCS_2: MergeWindowDocsFn =
+                MERGE_WINDOW_DOCS_2_AVX2, MERGE_WINDOW_DOCS_2_PORTABLE;
+            MERGE_WINDOW_DOCS_3: MergeWindowDocsFn =
+                MERGE_WINDOW_DOCS_3_AVX2, MERGE_WINDOW_DOCS_3_PORTABLE;
+        }
 
         #[inline]
         fn merge_window_1(wins: &[WindowList], docs_out: &mut Vec<u32>, offs_out: &mut Vec<u8>) {
@@ -4764,27 +4881,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if freq_cannot_beat.iter().any(|&pruned| pruned) {
                     self.and_window_stats.windows_frequency_pruned += 1;
                 }
-                #[cfg(target_arch = "x86_64")]
-                let use_avx2 = *HAS_AVX2;
-                #[cfg(not(target_arch = "x86_64"))]
-                let use_avx2 = false;
-                match (num_lists, use_avx2, window_started_with_floor) {
-                    (1, _, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
-                    #[cfg(target_arch = "x86_64")]
-                    (2, true, false) => unsafe {
-                        merge_window_docs_2_avx2(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (3, true, false) => unsafe {
-                        merge_window_docs_3_avx2(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    (2, _, false) => unsafe {
-                        merge_window_docs_2(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    (3, _, false) => unsafe {
-                        merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    (_, _, false) if use_pairwise_intersection => {
+                match (num_lists, window_started_with_floor) {
+                    (1, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
+                    (2, false) => {
+                        MERGE_WINDOW_DOCS_2
+                            .get()
+                            .call(&wins, &mut batch_docs, &mut batch_offs)
+                    }
+                    (3, false) => {
+                        MERGE_WINDOW_DOCS_3
+                            .get()
+                            .call(&wins, &mut batch_docs, &mut batch_offs)
+                    }
+                    (_, false) if use_pairwise_intersection => {
                         #[cfg(test)]
                         {
                             self.and_window_stats.pairwise_intersections += 1;
@@ -4796,55 +4905,31 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             &mut batch_offs,
                         )
                     }
-                    (_, _, false) => merge_window_docs_n(
+                    (_, false) => merge_window_docs_n(
                         &wins,
                         &mut cursor_scratch,
                         &mut batch_docs,
                         &mut batch_offs,
                     ),
-                    #[cfg(target_arch = "x86_64")]
-                    (2, true, true) => unsafe {
-                        merge_window_2_avx2(
-                            &wins,
-                            &freq_cannot_beat,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (3, true, true) => unsafe {
-                        merge_window_3_avx2(
-                            &wins,
-                            &freq_cannot_beat,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
-                    },
-                    (2, _, true) => unsafe {
-                        merge_window_2(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
-                    },
-                    (3, _, true) => unsafe {
-                        merge_window_3(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (_, true, true) => unsafe {
-                        merge_window_n_avx2(
-                            &wins,
-                            &freq_cannot_beat,
-                            &mut cursor_scratch,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
-                    },
-                    (_, _, true) => unsafe {
-                        merge_window_n(
-                            &wins,
-                            &freq_cannot_beat,
-                            &mut cursor_scratch,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
-                    },
+                    (2, true) => MERGE_WINDOW_2.get().call(
+                        &wins,
+                        &freq_cannot_beat,
+                        &mut batch_docs,
+                        &mut batch_offs,
+                    ),
+                    (3, true) => MERGE_WINDOW_3.get().call(
+                        &wins,
+                        &freq_cannot_beat,
+                        &mut batch_docs,
+                        &mut batch_offs,
+                    ),
+                    (_, true) => MERGE_WINDOW_N.get().call(
+                        &wins,
+                        &freq_cannot_beat,
+                        &mut cursor_scratch,
+                        &mut batch_docs,
+                        &mut batch_offs,
+                    ),
                 }
 
                 if !batch_docs.is_empty() {
