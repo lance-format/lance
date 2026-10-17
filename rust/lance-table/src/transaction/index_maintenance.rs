@@ -486,9 +486,13 @@ impl Transaction {
     /// into the new fragment's base data. An index built *before* one of those
     /// overlays (`overlay.committed_version > index.dataset_version`) indexed the
     /// stale pre-overlay values -- and unlike a live overlay, the compacted
-    /// fragment no longer signals that staleness to the query path. Drop each
-    /// rewritten (new) fragment from the coverage of any index covering a field
-    /// such an overlay supplied, so those rows fall back to a flat scan.
+    /// fragment no longer signals that staleness to the query path. Drop the
+    /// group's fragments from the coverage of any index covering a field such
+    /// an overlay supplied, so those rows fall back to a flat scan.
+    ///
+    /// Both the old and the new ids are dropped: an eager remap has already
+    /// moved the bitmap to the new ids, while a deferred remap leaves the old
+    /// ids for the fragment reuse index to translate at load time.
     pub(super) fn prune_overlay_stale_fields_from_indices(
         indices: &mut [IndexMetadata],
         groups: &[RewriteGroup],
@@ -512,9 +516,10 @@ impl Transaction {
                 continue;
             }
 
-            let new_fragment_ids = group
-                .new_fragments
+            let fragment_ids = group
+                .old_fragments
                 .iter()
+                .chain(group.new_fragments.iter())
                 .map(|f| f.id as u32)
                 .collect::<Vec<_>>();
             for index in indices.iter_mut() {
@@ -524,8 +529,8 @@ impl Transaction {
                         .is_some_and(|&overlay_version| overlay_version > index.dataset_version)
                 });
                 if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    for new_id in &new_fragment_ids {
-                        fragment_bitmap.remove(*new_id);
+                    for id in &fragment_ids {
+                        fragment_bitmap.remove(*id);
                     }
                 }
             }
@@ -1498,6 +1503,14 @@ mod tests {
             create_test_index("fresh", 1, 5, covering(), false),
             // Unrelated: covers field 2, which the overlay never touched.
             create_test_index("unrelated", 2, 2, covering(), false),
+            // Stale, after a deferred remap: still covers the old fragment (0).
+            create_test_index(
+                "deferred",
+                1,
+                2,
+                Some(RoaringBitmap::from_iter([0u32])),
+                false,
+            ),
         ];
 
         Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups);
@@ -1513,6 +1526,10 @@ mod tests {
         assert!(
             indices[2].fragment_bitmap.as_ref().unwrap().contains(7),
             "an index on an un-overlaid field is unaffected"
+        );
+        assert!(
+            indices[3].fragment_bitmap.as_ref().unwrap().is_empty(),
+            "stale index must drop the old fragment when the remap is deferred"
         );
     }
 

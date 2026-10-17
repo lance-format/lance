@@ -14407,8 +14407,11 @@ mod tests {
         assert_eq!(values.get(&1), Some(&Some(1001)));
     }
 
+    #[rstest]
+    #[case::eager_remap(false)]
+    #[case::deferred_remap(true)]
     #[tokio::test]
-    async fn test_overlay_compaction_reconciles_stale_index() {
+    async fn test_overlay_compaction_reconciles_stale_index(#[case] defer_index_remap: bool) {
         let mut dataset = create_base_dataset("memory://").await;
         // Index `val` before any overlay -> the index is stale once val is overlaid.
         dataset
@@ -14442,12 +14445,16 @@ mod tests {
                 .contains(0)
         );
 
-        compact_files(&mut dataset, overlay_only_options(2), None)
-            .await
-            .unwrap();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..overlay_only_options(2)
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
 
         // The stale val index no longer covers the compacted fragment, so its
-        // rows fall back to a flat scan instead of serving stale values.
+        // rows fall back to a flat scan instead of serving stale values. A
+        // deferred remap leaves the old fragment id in the bitmap for the
+        // reuse index to translate later, so it must be gone too.
         let indices = dataset.load_indices().await.unwrap();
         let val_index = indices
             .iter()
@@ -14466,6 +14473,10 @@ mod tests {
                 .unwrap()
                 .contains(compacted_id),
             "stale index must drop the compacted fragment from its coverage"
+        );
+        assert!(
+            !val_index.fragment_bitmap.as_ref().unwrap().contains(0),
+            "stale index must drop the source fragment from its coverage"
         );
 
         // The indexed query is correct: the materialized value is found and the
