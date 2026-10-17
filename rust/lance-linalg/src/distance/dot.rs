@@ -83,9 +83,9 @@ pub trait Dot: Num {
     /// Writes the dot product of `x` with each `dimension`-sized vector in
     /// `batch` into the matching element of `output`.
     ///
-    /// The default calls [`Dot::dot`] per vector. `f32` overrides it with one
-    /// batch kernel call, so the SIMD tier is chosen once for the whole batch
-    /// instead of once per vector.
+    /// The default calls [`Dot::dot`] per vector. `f32` and `f64` override it
+    /// with one batch kernel call, so the SIMD tier is chosen once for the
+    /// whole batch instead of once per vector.
     ///
     /// # Panics
     ///
@@ -336,6 +336,11 @@ impl Dot for f64 {
         assert_equal_lengths(x.len(), y.len());
         DOT_F64.get().call(x, y)
     }
+
+    fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
+        assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
+        DOT_F64_BATCH.get().call(x, batch, dimension, output);
+    }
 }
 
 lance_core::dispatch! {
@@ -354,6 +359,36 @@ lance_core::dispatch! {
             &[DOT_F64_PORTABLE]
         }
     };
+}
+
+lance_core::dispatch! {
+    /// Each candidate runs the same-tier pair kernel per vector, so results
+    /// match [`DOT_F64`] bit for bit while dispatch happens once per batch.
+    static DOT_F64_BATCH: Dispatch<BatchKernel<f64>> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::DOT_F64_BATCH_AVX512,
+                x86::DOT_F64_BATCH_AVX_FMA,
+                x86::DOT_F64_BATCH_AVX,
+                DOT_F64_BATCH_PORTABLE,
+            ]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[DOT_F64_BATCH_PORTABLE]
+        }
+    };
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(DOT_F64_BATCH_PORTABLE: BatchKernel<f64>)]
+    fn dot_batch_f64_portable(x: &[f64], batch: &[f64], dimension: usize, output: &mut [f32]) {
+        for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+            *product = dot_f64_portable(x, y);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -434,6 +469,21 @@ mod x86 {
 
     lance_core::target_kernel! {
         #[target_features("avx512f")]
+        #[candidate(pub(super) DOT_F64_BATCH_AVX512: BatchKernel<f64>)]
+        pub(super) fn dot_batch_f64_avx512(
+            x: &[f64],
+            batch: &[f64],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *product = dot_f64_avx512(x, y);
+            }
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
         #[candidate(pub(super) DOT_F64_AVX512: PairKernel<f64>)]
         /// 8-wide `__m512d` with `vfmadd231pd` per iteration.
         #[inline]
@@ -461,6 +511,21 @@ mod x86 {
                 .sum();
 
             (_mm512_reduce_add_pd(acc) + tail) as f32
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx", "fma")]
+        #[candidate(pub(super) DOT_F64_BATCH_AVX_FMA: BatchKernel<f64>)]
+        pub(super) fn dot_batch_f64_avx_fma(
+            x: &[f64],
+            batch: &[f64],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *product = dot_f64_avx_fma(x, y);
+            }
         }
     }
 
@@ -506,6 +571,21 @@ mod x86 {
                 .sum();
 
             (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx")]
+        #[candidate(pub(super) DOT_F64_BATCH_AVX: BatchKernel<f64>)]
+        pub(super) fn dot_batch_f64_avx(
+            x: &[f64],
+            batch: &[f64],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            for (product, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
+                *product = dot_f64_avx(x, y);
+            }
         }
     }
 
@@ -1103,7 +1183,7 @@ mod tests {
     }
 
     /// `dot_batch_into` must agree with the per-vector `dot`, both for the
-    /// f32 batch kernel and for the per-vector default that f64 uses.
+    /// f32 and f64 batch kernels.
     #[rstest::rstest]
     #[case::dim_8(8)]
     #[case::dim_16(16)]
