@@ -424,31 +424,12 @@ pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(HAMMING_BATCH_U64_SCALAR: HammingBatchU64Kernel)]
-    /// Scalar fallback using count_ones() which compiles to POPCNT.
+    /// Portable kernel. A plain zip lets LLVM vectorize the popcount (NEON
+    /// `cnt` on aarch64) with no per-element bounds checks.
     #[inline]
     fn hamming_batch_scalar(query: u64, targets: &[u64], results: &mut [u32]) {
-        let n = targets.len().min(results.len());
-        let (targets, results) = (&targets[..n], &mut results[..n]);
-        // Unroll for better auto-vectorization
-        let chunks = n / 8;
-        let mut i = 0;
-
-        for _ in 0..chunks {
-            results[i] = (query ^ targets[i]).count_ones();
-            results[i + 1] = (query ^ targets[i + 1]).count_ones();
-            results[i + 2] = (query ^ targets[i + 2]).count_ones();
-            results[i + 3] = (query ^ targets[i + 3]).count_ones();
-            results[i + 4] = (query ^ targets[i + 4]).count_ones();
-            results[i + 5] = (query ^ targets[i + 5]).count_ones();
-            results[i + 6] = (query ^ targets[i + 6]).count_ones();
-            results[i + 7] = (query ^ targets[i + 7]).count_ones();
-            i += 8;
-        }
-
-        // Handle remainder
-        while i < n {
-            results[i] = (query ^ targets[i]).count_ones();
-            i += 1;
+        for (result, &target) in results.iter_mut().zip(targets) {
+            *result = (query ^ target).count_ones();
         }
     }
 }
@@ -1197,9 +1178,9 @@ mod tests {
     }
 
     /// Each candidate takes a fixed number of targets per chunk and finishes
-    /// the rest in a remainder loop: 8 for AVX-512 and the unrolled scalar
-    /// kernel, 4 for AVX2. The cases cover every residue of both widths, with
-    /// and without a chunk ahead of it.
+    /// the rest in a remainder loop: 8 for AVX-512 and the vectorized scalar
+    /// kernel on aarch64, 4 for AVX2. The cases cover every residue of both
+    /// widths, with and without a chunk ahead of it.
     #[rstest]
     #[case::one(1)]
     #[case::two(2)]
