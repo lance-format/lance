@@ -2717,6 +2717,7 @@ impl FileFragment {
             Some(self.dataset.as_ref()),
             &writer_schema,
             true,
+            true,
         )
         .await?;
         let mut writer = versions::open_update_writer(

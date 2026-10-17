@@ -170,9 +170,20 @@ pub async fn write_fragments(
             write::validate_blob_v2_write_schema(&schema)?;
         }
     }
-    // Overwrite drops every index, so its seeds would have no consumer.
+    // Overwrite drops every index, so index-driven seeds have no consumer;
+    // default collection still applies (the seeds serve indices created later).
     let consult_indices = !matches!(params.mode, WriteMode::Overwrite);
-    let seeds = SeedCollector::for_write(version, dataset, &schema, consult_indices).await?;
+    let collect_by_default = params
+        .collect_write_seeds
+        .unwrap_or(version != ConcreteFileVersion::V1);
+    let seeds = SeedCollector::for_write(
+        version,
+        dataset,
+        &schema,
+        consult_indices,
+        collect_by_default,
+    )
+    .await?;
     let fragments = write_fragments_direct(
         version,
         dataset,

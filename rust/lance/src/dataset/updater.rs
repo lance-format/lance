@@ -268,6 +268,7 @@ impl Updater {
                 Some(self.fragment.dataset()),
                 &write_schema,
                 true,
+                true,
             )
             .await?;
             self.writer = Some(self.new_writer(write_schema).await?);

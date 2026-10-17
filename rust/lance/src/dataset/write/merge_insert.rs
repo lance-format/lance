@@ -1960,6 +1960,7 @@ impl MergeInsertJob {
                         Some(&dataset),
                         &write_schema,
                         true,
+                        true,
                     )
                     .await?;
                     let mut writer =

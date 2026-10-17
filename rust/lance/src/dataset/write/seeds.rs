@@ -15,10 +15,50 @@ use lance_core::datatypes::Schema;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::scalar::seed::IndexSeedWriter;
 
+use arrow_schema::DataType;
+use lance_index::scalar::zonemap::ZoneMapSeedWriter;
+
 use super::GenericWriter;
 use crate::Dataset;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::index::{index_is_usable, load_all_indices};
+
+/// Zone size for seeds collected by default (no index asked for them).
+/// Matches the zone map plugin's default, so a later index build from these
+/// seeds sees the granularity it would have requested.
+pub const DEFAULT_SEED_ROWS_PER_ZONE: u64 = 8192;
+
+/// Whether a column of this type gets a seed when collection is on by
+/// default. Mirrors the types whose statistics carry usable bounds; columns
+/// outside it would pay the footer bytes for null-only records.
+fn column_gets_default_seed(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+    )
+}
 
 /// Collects write seeds for the columns of one data file.
 #[derive(Debug, Default)]
@@ -35,24 +75,53 @@ impl SeedCollector {
     /// Build the seed writers for the top-level columns of `write_schema`.
     ///
     /// A column gets a seed writer when an existing, usable index on it asks
-    /// for one through its plugin. `consult_indices` is false for writes that
-    /// discard the dataset's indices (overwrite), where seeds have no consumer.
+    /// for one through its plugin (`consult_indices` is false for writes that
+    /// discard the dataset's indices, where those seeds have no consumer), or
+    /// when `collect_by_default` is set, for every supported column type: the
+    /// seed then serves whatever index is created later, without rereading
+    /// the column.
     pub async fn for_write(
         version: ConcreteFileVersion,
         dataset: Option<&Dataset>,
         write_schema: &Schema,
         consult_indices: bool,
+        collect_by_default: bool,
     ) -> Result<Self> {
         // Legacy files have no global buffers to hold a seed.
-        if version == ConcreteFileVersion::V1 || !consult_indices {
+        if version == ConcreteFileVersion::V1 {
             return Ok(Self::disabled());
         }
-        let Some(dataset) = dataset else {
-            return Ok(Self::disabled());
-        };
-
-        let indices = load_all_indices(dataset).await?;
         let mut writers: Vec<Box<dyn IndexSeedWriter>> = Vec::new();
+        if let (Some(dataset), true) = (dataset, consult_indices) {
+            Self::index_driven_writers(dataset, write_schema, &mut writers).await?;
+        }
+        if collect_by_default {
+            for field in write_schema.fields.iter() {
+                if writers.iter().any(|w| w.column_name() == field.name) {
+                    continue;
+                }
+                let data_type = field.data_type();
+                if !column_gets_default_seed(&data_type) || field.is_blob_v2() {
+                    continue;
+                }
+                writers.push(Box::new(ZoneMapSeedWriter::new(
+                    &field.name,
+                    DEFAULT_SEED_ROWS_PER_ZONE,
+                    data_type,
+                )?));
+            }
+        }
+        Ok(Self { writers })
+    }
+
+    /// The index-driven writers: columns whose existing, usable index asks
+    /// for a seed through its plugin.
+    async fn index_driven_writers(
+        dataset: &Dataset,
+        write_schema: &Schema,
+        writers: &mut Vec<Box<dyn IndexSeedWriter>>,
+    ) -> Result<()> {
+        let indices = load_all_indices(dataset).await?;
         for index in indices.iter().filter(|index| index_is_usable(index)) {
             // A covered index lists its carried columns in `fields` too; the
             // seed writer keys on the single keyed column. System indices
@@ -80,7 +149,7 @@ impl SeedCollector {
                 writers.push(writer);
             }
         }
-        Ok(Self { writers })
+        Ok(())
     }
 
     /// Number of columns that will receive a seed.
@@ -132,8 +201,11 @@ impl SeedCollector {
 /// Mirrors `SeedCollector::for_write` over the dataset schema, which can only
 /// over-approximate the written schema: a transaction that happened not to
 /// touch the seeded column still sets the bits, which is safe (the flag
-/// promises nothing about any particular file). Overwrite discards every
-/// index, so its writes consulted none and collected nothing.
+/// promises nothing about any particular file). `collect_by_default` is true
+/// here even though a write can opt out through `WriteParams`: the commit
+/// cannot see the write's params, and over-approximating keeps the unsafe
+/// direction (seeded files without the flag) impossible. Overwrite discards
+/// every index, so its writes consulted none and collected nothing.
 pub async fn transaction_writes_v1_seeds(
     dataset: Option<&Dataset>,
     operation: &crate::dataset::transaction::Operation,
@@ -157,7 +229,7 @@ pub async fn transaction_writes_v1_seeds(
         return Ok(false);
     }
     Ok(
-        SeedCollector::for_write(version, Some(dataset), dataset.schema(), true)
+        SeedCollector::for_write(version, Some(dataset), dataset.schema(), true, true)
             .await?
             .has_writers(),
     )
