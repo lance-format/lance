@@ -501,14 +501,48 @@ mod tests {
         });
     }
 
+    /// Every host-supported f32 kernel must agree with an f64 reference.
     #[rstest::rstest]
-    fn test_l2_norm_f32_scalar_simd_parity(
+    fn test_norm_l2_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
-            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
-            let simd = <f32 as Normalize>::norm_l2(&data);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            let want = norm_l2_reference(&data.iter().map(|&v| v as f64).collect::<Vec<_>>());
+            for candidate in NORM_L2_F32.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let got = kernel.call(&data);
+                prop_assert!(
+                    approx::relative_eq!(got, want, max_relative = 1e-3),
+                    "{} at dim {}: {got} != {want}",
+                    candidate.name(),
+                    data.len()
+                );
+            }
+            Ok(())
+        });
+    }
+
+    /// Every host-supported f64 kernel must agree with an f64 reference.
+    #[rstest::rstest]
+    fn test_norm_l2_f64_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f64, dimension_shard(shard), |data| {
+            let want = norm_l2_reference(&data);
+            for candidate in NORM_L2_F64.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let got = kernel.call(&data);
+                prop_assert!(
+                    approx::relative_eq!(got, want, max_relative = 1e-6),
+                    "{} at dim {}: {got} != {want}",
+                    candidate.name(),
+                    data.len()
+                );
+            }
             Ok(())
         });
     }
@@ -522,119 +556,6 @@ mod tests {
         #[test]
         fn test_l2_norm_bf16(data in prop::collection::vec(arbitrary_bf16(), 4..4048)){
             do_norm_l2_test(&data)?;
-        }
-
-        /// Cross-backend parity: scalar fallback must match the dispatched
-        /// SIMD path within numerical tolerance. Exercises `norm_l2_f64_scalar`
-        /// directly so the runtime fallback is exercised even on AVX2-capable
-        /// CI hosts.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_norm_f64_scalar_simd_parity(
-            data in prop::collection::vec(arbitrary_f64(), 4..4048)
-        ) {
-            let scalar = norm_l2_f64_scalar(&data);
-            let simd = norm_l2_f64_simd(&data);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// AVX-512-direct parity: explicitly compares the scalar fallback
-        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts
-        /// (Skylake-X+, Ice Lake, Sapphire Rapids, Zen 4). Early-returns on
-        /// hosts without AVX-512F so the test stays portable; CI runners with
-        /// AVX-512F exercise the `_mm512_*` path.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_norm_f64_scalar_vs_avx512_parity(
-            data in prop::collection::vec(arbitrary_f64(), 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            let scalar = norm_l2_f64_scalar(&data);
-            let avx512 = unsafe { x86::norm_l2_f64_avx512(&data) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-6));
-        }
-
-        /// AVX + FMA-direct parity for the f64 L2-norm kernel. Covers the
-        /// AMD Piledriver / Steamroller / FX-7500 tier. Early-returns on
-        /// hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_norm_f64_scalar_vs_avx_fma_parity(
-            data in prop::collection::vec(arbitrary_f64(), 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            let scalar = norm_l2_f64_scalar(&data);
-            let avx_fma = unsafe { x86::norm_l2_f64_avx_fma(&data) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-6));
-        }
-
-        /// AVX-only-direct parity for the f64 L2-norm kernel. Covers the
-        /// Intel Sandy Bridge / Ivy Bridge tier (AVX without FMA).
-        /// Early-returns on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_norm_f64_scalar_vs_avx_parity(
-            data in prop::collection::vec(arbitrary_f64(), 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            let scalar = norm_l2_f64_scalar(&data);
-            let avx = unsafe { x86::norm_l2_f64_avx(&data) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-6));
-        }
-
-        /// AVX-512-direct parity for the f32 L2-norm kernel. Explicitly
-        /// compares the scalar fallback against the native AVX-512 inner
-        /// kernel on AVX-512F-capable hosts. Early-returns on hosts without
-        /// AVX-512F; CI runners with AVX-512F exercise the `_mm512_*` path.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_norm_l2_f32_scalar_vs_avx512_parity(
-            data in prop::collection::vec(arbitrary_f32(), 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            let scalar = norm_l2_f32_scalar(&data);
-            let avx512 = unsafe { x86::norm_l2_f32_avx512(&data) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-3));
-        }
-
-        /// AVX + FMA-direct parity for the f32 L2-norm kernel. Covers the
-        /// AMD Piledriver / Steamroller / FX-7500 tier. Early-returns on
-        /// hosts without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_norm_l2_f32_scalar_vs_avx_fma_parity(
-            data in prop::collection::vec(arbitrary_f32(), 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            let scalar = norm_l2_f32_scalar(&data);
-            let avx_fma = unsafe { x86::norm_l2_f32_avx_fma(&data) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-3));
-        }
-
-        /// AVX-only-direct parity for the f32 L2-norm kernel. Covers the
-        /// Intel Sandy Bridge / Ivy Bridge tier (AVX without FMA).
-        /// Early-returns on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_norm_l2_f32_scalar_vs_avx_parity(
-            data in prop::collection::vec(arbitrary_f32(), 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            let scalar = norm_l2_f32_scalar(&data);
-            let avx = unsafe { x86::norm_l2_f32_avx(&data) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-3));
         }
     }
 

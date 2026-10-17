@@ -1301,6 +1301,29 @@ mod tests {
         });
     }
 
+    /// Every host-supported f64 kernel must agree with an f64 reference.
+    #[rstest::rstest]
+    fn test_l2_f64_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            let want = l2_distance_reference(&x, &y) as f32;
+            for candidate in L2_F64.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let got = kernel.call(&x, &y);
+                prop_assert!(
+                    approx::relative_eq!(got, want, max_relative = 1e-6),
+                    "{} at dim {}: {got} != {want}",
+                    candidate.name(),
+                    x.len()
+                );
+            }
+            Ok(())
+        });
+    }
+
     // Test L2 distance over different types.
     // * L2 is valid over the entire range of f16.
     // * L2 is valid over f32 and bf16 in the range of +-1e12.
@@ -1314,69 +1337,6 @@ mod tests {
         #[test]
         fn test_l2_distance_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
             do_l2_test(&x, &y)?;
-        }
-
-        /// Cross-backend parity: scalar fallback must match the dispatched
-        /// SIMD path within numerical tolerance. Exercises `l2_f64_scalar`
-        /// directly so the runtime fallback is exercised even on AVX2-capable
-        /// CI hosts.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            let scalar = l2_f64_scalar(&x, &y);
-            let simd = l2_f64_simd(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// AVX-512-direct parity: explicitly compares the scalar fallback
-        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts
-        /// (Skylake-X+, Ice Lake, Sapphire Rapids, Zen 4). Early-returns on
-        /// hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
-            }
-            let scalar = l2_f64_scalar(&x, &y);
-            let avx512 = unsafe { x86::l2_f64_avx512(&x, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-6));
-        }
-
-        /// AVX + FMA-direct parity for the f64 L2 kernel. Covers the AMD
-        /// Piledriver / Steamroller / FX-7500 tier. Early-returns on hosts
-        /// without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
-            }
-            let scalar = l2_f64_scalar(&x, &y);
-            let avx_fma = unsafe { x86::l2_f64_avx_fma(&x, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-6));
-        }
-
-        /// AVX-only-direct parity for the f64 L2 kernel. Covers the Intel
-        /// Sandy Bridge / Ivy Bridge tier. Early-returns on hosts without
-        /// AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_f64_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
-            }
-            let scalar = l2_f64_scalar(&x, &y);
-            let avx = unsafe { x86::l2_f64_avx(&x, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-6));
         }
     }
 

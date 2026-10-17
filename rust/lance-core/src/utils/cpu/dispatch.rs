@@ -435,6 +435,25 @@ mod tests {
         assert_eq!(out, [3.0, 4.0]);
     }
 
+    type NormFn = unsafe fn(&[f32]) -> f32;
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(PORTABLE_NORM: NormFn)]
+        fn portable_norm(x: &[f32]) -> f32 {
+            x.iter().map(|v| v * v).sum::<f32>().sqrt()
+        }
+    }
+
+    crate::dispatch! {
+        static NORM: Dispatch<NormFn> = &[PORTABLE_NORM];
+    }
+
+    #[test]
+    fn single_argument_kernel_is_callable() {
+        assert_eq!(NORM.get().call(&[3.0, 4.0]), 5.0);
+    }
+
     type ScaledSumFn = unsafe fn(&[f32], f32, &[f32]) -> f32;
     type DoublyScaledSumFn = unsafe fn(&[f32], f32, f32, &[f32]) -> f32;
 
