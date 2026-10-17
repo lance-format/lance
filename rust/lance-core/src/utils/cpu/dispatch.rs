@@ -111,6 +111,7 @@ macro_rules! impl_call {
     };
 }
 
+impl_call!(<A: ?Sized> fn(a: &A));
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
 impl_call!(<A: ?Sized, C: ?Sized> fn(a: &A, b: f32, c: &C));
 impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
