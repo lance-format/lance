@@ -501,14 +501,48 @@ mod tests {
         });
     }
 
+    /// Every host-supported f32 kernel must agree with an f64 reference.
     #[rstest::rstest]
-    fn test_l2_norm_f32_scalar_simd_parity(
+    fn test_norm_l2_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
-            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
-            let simd = <f32 as Normalize>::norm_l2(&data);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            let want = norm_l2_reference(&data.iter().map(|&v| v as f64).collect::<Vec<_>>());
+            for candidate in NORM_L2_F32.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let got = kernel.call(&data);
+                prop_assert!(
+                    approx::relative_eq!(got, want, max_relative = 1e-3),
+                    "{} at dim {}: {got} != {want}",
+                    candidate.name(),
+                    data.len()
+                );
+            }
+            Ok(())
+        });
+    }
+
+    /// Every host-supported f64 kernel must agree with an f64 reference.
+    #[rstest::rstest]
+    fn test_norm_l2_f64_kernels_match_reference(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f64, dimension_shard(shard), |data| {
+            let want = norm_l2_reference(&data);
+            for candidate in NORM_L2_F64.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let got = kernel.call(&data);
+                prop_assert!(
+                    approx::relative_eq!(got, want, max_relative = 1e-6),
+                    "{} at dim {}: {got} != {want}",
+                    candidate.name(),
+                    data.len()
+                );
+            }
             Ok(())
         });
     }
@@ -522,59 +556,6 @@ mod tests {
         #[test]
         fn test_l2_norm_bf16(data in prop::collection::vec(arbitrary_bf16(), 4..4048)){
             do_norm_l2_test(&data)?;
-        }
-
-        /// Every f64 kernel the host supports, plus the runtime dispatch, must
-        /// match the scalar fallback. Calling `norm_l2_f64_scalar` directly
-        /// exercises the fallback even on AVX2-capable CI hosts.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_l2_norm_f64_kernels_match_scalar(
-            data in prop::collection::vec(arbitrary_f64(), 4..4048)
-        ) {
-            let scalar = norm_l2_f64_scalar(&data);
-            let mut results = vec![("dispatched", norm_l2_f64_simd(&data))];
-            if std::is_x86_feature_detected!("avx512f") {
-                results.push(("avx512", unsafe { x86::norm_l2_f64_avx512(&data) }));
-            }
-            if std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma") {
-                results.push(("avx_fma", unsafe { x86::norm_l2_f64_avx_fma(&data) }));
-            }
-            if std::is_x86_feature_detected!("avx") {
-                results.push(("avx", unsafe { x86::norm_l2_f64_avx(&data) }));
-            }
-            for (kernel, got) in results {
-                prop_assert!(
-                    approx::relative_eq!(scalar, got, max_relative = 1e-6),
-                    "{kernel}: {got} != scalar {scalar}"
-                );
-            }
-        }
-
-        /// Every f32 x86 kernel the host supports must match the scalar
-        /// fallback.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_norm_l2_f32_kernels_match_scalar(
-            data in prop::collection::vec(arbitrary_f32(), 4..4048)
-        ) {
-            let scalar = norm_l2_f32_scalar(&data);
-            let mut results = vec![];
-            if std::is_x86_feature_detected!("avx512f") {
-                results.push(("avx512", unsafe { x86::norm_l2_f32_avx512(&data) }));
-            }
-            if std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma") {
-                results.push(("avx_fma", unsafe { x86::norm_l2_f32_avx_fma(&data) }));
-            }
-            if std::is_x86_feature_detected!("avx") {
-                results.push(("avx", unsafe { x86::norm_l2_f32_avx(&data) }));
-            }
-            for (kernel, got) in results {
-                prop_assert!(
-                    approx::relative_eq!(scalar, got, max_relative = 1e-3),
-                    "{kernel}: {got} != scalar {scalar}"
-                );
-            }
         }
     }
 
