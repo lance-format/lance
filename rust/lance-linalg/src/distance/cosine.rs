@@ -17,17 +17,12 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-use lance_core::utils::cpu::SIMD_SUPPORT;
 
-#[cfg(feature = "fp16kernels")]
-use super::HalfBackend;
 use super::{
-    BatchKernel, Dot, HALF_KERNELS_COMPILED, HalfType, Normalize, assert_batch_output_layout,
-    assert_equal_lengths,
+    BatchKernel, Dot, Normalize, assert_batch_output_layout, assert_equal_lengths,
     dot::dot,
-    half_backend, int8_query_to_f32,
+    int8_query_to_f32,
     norm_l2::{norm_l2, norm_l2_impl},
-    x86_half_features,
 };
 #[cfg(not(target_arch = "x86_64"))]
 use crate::simd::{
@@ -84,145 +79,187 @@ impl Cosine for u8 {
     }
 }
 
-#[cfg(feature = "fp16kernels")]
-mod bf16_kernel {
-    use half::bf16;
-
-    // These are the `cosine_bf16` function in bf16.c. Our build.rs script compiles
-    // a version of this file for each SIMD level with different suffixes.
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn cosine_bf16_neon(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32)
-        -> f32;
-        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
-        pub fn cosine_bf16_avx512(
-            x: *const bf16,
-            x_norm: f32,
-            y: *const bf16,
-            dimension: u32,
-        ) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn cosine_bf16_avx2(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32)
-        -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn cosine_bf16_lsx(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn cosine_bf16_lasx(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32)
-        -> f32;
-    }
-}
-
-impl Cosine for bf16 {
-    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
-        assert_equal_lengths(x.len(), y.len());
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::Bf16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                bf16_kernel::cosine_bf16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_bf16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                bf16_kernel::cosine_bf16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                bf16_kernel::cosine_bf16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                bf16_kernel::cosine_bf16_lasx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                bf16_kernel::cosine_bf16_lsx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the bf16 C kernels in `bf16_kernel::*` are compiled with
-            // `-march=haswell` minimum (which requires AVX2), so they cannot
-            // run on AVX-only or AVX+FMA hosts. Scalar is the correct route.
-            _ => cosine_scalar(x, x_norm, y),
-        }
-    }
-}
-
-#[cfg(feature = "fp16kernels")]
-mod kernel {
-    use super::*;
-
-    // These are the `cosine_f16` function in f16.c. Our build.rs script compiles
-    // a version of this file for each SIMD level with different suffixes.
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn cosine_f16_neon(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
-        pub fn cosine_f16_avx512(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn cosine_f16_avx2(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn cosine_f16_lsx(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn cosine_f16_lasx(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
-    }
-}
-
-impl Cosine for f16 {
-    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
-        assert_equal_lengths(x.len(), y.len());
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::F16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_f16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                kernel::cosine_f16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                kernel::cosine_f16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                kernel::cosine_f16_lasx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                kernel::cosine_f16_lsx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
-            // route; this fallback only extends the tiers the C kernel already
-            // served to Avx512FP16 after checking F16C and FMA.
-            _ => cosine_scalar(x, x_norm, y),
-        }
-    }
-}
-
 /// Cosine distance from `x`, whose L2 norm is `x_norm`, to `y`.
 type CosineKernel<T> = unsafe fn(&[T], f32, &[T]) -> f32;
 
 /// Cosine distance between `x` and `y` given both L2 norms, in the argument
 /// order of [`Cosine::cosine_with_norms`].
 type CosineWithNormsKernel = unsafe fn(&[f32], f32, f32, &[f32]) -> f32;
+
+impl Cosine for bf16 {
+    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
+        COSINE_BF16.get().call(x, x_norm, y)
+    }
+}
+
+impl Cosine for f16 {
+    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
+        COSINE_F16.get().call(x, x_norm, y)
+    }
+}
+
+lance_core::dispatch! {
+    static COSINE_F16: Dispatch<CosineKernel<f16>> = &[
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        half_c::COSINE_F16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::COSINE_F16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::COSINE_F16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::COSINE_F16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::COSINE_F16_LSX,
+        COSINE_F16_SCALAR,
+    ];
+}
+
+lance_core::dispatch! {
+    static COSINE_BF16: Dispatch<CosineKernel<bf16>> = &[
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        half_c::COSINE_BF16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::COSINE_BF16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::COSINE_BF16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::COSINE_BF16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::COSINE_BF16_LSX,
+        COSINE_BF16_SCALAR,
+    ];
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_F16_SCALAR: CosineKernel<f16>)]
+    fn cosine_f16_scalar(x: &[f16], x_norm: f32, y: &[f16]) -> f32 {
+        cosine_scalar(x, x_norm, y)
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(COSINE_BF16_SCALAR: CosineKernel<bf16>)]
+    fn cosine_bf16_scalar(x: &[bf16], x_norm: f32, y: &[bf16]) -> f32 {
+        cosine_scalar(x, x_norm, y)
+    }
+}
+
+/// The `cosine_f16` and `cosine_bf16` functions in f16.c and bf16.c. build.rs
+/// compiles each file once per SIMD level, suffixing the symbols with the level.
+#[cfg(kernel_support = "half")]
+mod half_c {
+    use half::{bf16, f16};
+
+    use super::CosineKernel;
+
+    mod ffi {
+        use half::{bf16, f16};
+
+        unsafe extern "C" {
+            #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+            pub fn cosine_f16_avx512(
+                x: *const f16,
+                x_norm: f32,
+                y: *const f16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn cosine_f16_avx2(
+                x: *const f16,
+                x_norm: f32,
+                y: *const f16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn cosine_f16_neon(
+                x: *const f16,
+                x_norm: f32,
+                y: *const f16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn cosine_f16_lasx(
+                x: *const f16,
+                x_norm: f32,
+                y: *const f16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn cosine_f16_lsx(x: *const f16, x_norm: f32, y: *const f16, dimension: u32)
+            -> f32;
+
+            #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+            pub fn cosine_bf16_avx512(
+                x: *const bf16,
+                x_norm: f32,
+                y: *const bf16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn cosine_bf16_avx2(
+                x: *const bf16,
+                x_norm: f32,
+                y: *const bf16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn cosine_bf16_neon(
+                x: *const bf16,
+                x_norm: f32,
+                y: *const bf16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn cosine_bf16_lasx(
+                x: *const bf16,
+                x_norm: f32,
+                y: *const bf16,
+                dimension: u32,
+            ) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn cosine_bf16_lsx(
+                x: *const bf16,
+                x_norm: f32,
+                y: *const bf16,
+                dimension: u32,
+            ) -> f32;
+        }
+    }
+
+    half_c_kernels! {
+        fn (x: &[f16], x_norm: f32, y: &[f16]) -> f32
+            => (x.as_ptr(), x_norm, y.as_ptr(), x.len().min(y.len()) as u32);
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        COSINE_F16_AVX512: CosineKernel<f16> = cosine_f16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        COSINE_F16_AVX2: CosineKernel<f16> = cosine_f16_avx2("avx2", "fma", "f16c");
+        #[cfg(target_arch = "aarch64")]
+        COSINE_F16_NEON: CosineKernel<f16> = cosine_f16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        COSINE_F16_LASX: CosineKernel<f16> = cosine_f16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        COSINE_F16_LSX: CosineKernel<f16> = cosine_f16_lsx("lsx");
+    }
+
+    half_c_kernels! {
+        fn (x: &[bf16], x_norm: f32, y: &[bf16]) -> f32
+            => (x.as_ptr(), x_norm, y.as_ptr(), x.len().min(y.len()) as u32);
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        COSINE_BF16_AVX512: CosineKernel<bf16> = cosine_bf16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        COSINE_BF16_AVX2: CosineKernel<bf16> = cosine_bf16_avx2("avx2", "fma");
+        #[cfg(target_arch = "aarch64")]
+        COSINE_BF16_NEON: CosineKernel<bf16> = cosine_bf16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        COSINE_BF16_LASX: CosineKernel<bf16> = cosine_bf16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        COSINE_BF16_LSX: CosineKernel<bf16> = cosine_bf16_lsx("lsx");
+    }
+}
 
 impl Cosine for f32 {
     #[inline]

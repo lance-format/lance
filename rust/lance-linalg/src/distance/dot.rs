@@ -13,16 +13,11 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, cast::AsArray, types:
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
-#[allow(unused_imports)]
-use lance_core::utils::cpu::SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
-#[cfg(feature = "fp16kernels")]
-use crate::distance::HalfBackend;
 use crate::distance::{
-    BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel, assert_batch_output_layout,
-    assert_equal_lengths, half_backend, int8_query_to_f32, x86_half_features,
+    BatchKernel, PairKernel, assert_batch_output_layout, assert_equal_lengths, int8_query_to_f32,
 };
 
 /// Default implementation of dot product.
@@ -104,86 +99,11 @@ pub trait Dot: Num {
     }
 }
 
-#[cfg(feature = "fp16kernels")]
-mod bf16_kernel {
-    use half::bf16;
-
-    // These are the `dot_bf16` function in bf16.c. Our build.rs script compiles
-    // a version of this file for each SIMD level with different suffixes.
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn dot_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
-        pub fn dot_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn dot_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn dot_bf16_lsx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn dot_bf16_lasx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-    }
-}
-
 impl Dot for bf16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::Bf16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                bf16_kernel::dot_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_bf16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                bf16_kernel::dot_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                bf16_kernel::dot_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                bf16_kernel::dot_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                bf16_kernel::dot_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the bf16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
-            _ => dot_scalar::<Self, f32, 32>(x, y),
-        }
-    }
-}
-
-#[cfg(feature = "fp16kernels")]
-mod kernel {
-    use super::*;
-
-    // These are the `dot_f16` function in f16.c. Our build.rs script compiles
-    // a version of this file for each SIMD level with different suffixes.
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
-        pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn dot_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn dot_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        DOT_BF16.get().call(x, y)
     }
 }
 
@@ -191,42 +111,120 @@ impl Dot for f16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         assert_equal_lengths(x.len(), y.len());
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::F16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_f16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                kernel::dot_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                kernel::dot_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                kernel::dot_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
-            // route; this fallback only extends the tiers the C kernel already
-            // served to Avx512FP16 after checking F16C and FMA.
-            _ => dot_scalar::<Self, f32, 32>(x, y),
+        DOT_F16.get().call(x, y)
+    }
+}
+
+lance_core::dispatch! {
+    static DOT_F16: Dispatch<PairKernel<f16>> = &[
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        half_c::DOT_F16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::DOT_F16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::DOT_F16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::DOT_F16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::DOT_F16_LSX,
+        DOT_F16_SCALAR,
+    ];
+}
+
+lance_core::dispatch! {
+    static DOT_BF16: Dispatch<PairKernel<bf16>> = &[
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        half_c::DOT_BF16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::DOT_BF16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::DOT_BF16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::DOT_BF16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::DOT_BF16_LSX,
+        DOT_BF16_SCALAR,
+    ];
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(DOT_F16_SCALAR: PairKernel<f16>)]
+    fn dot_f16_scalar(x: &[f16], y: &[f16]) -> f32 {
+        dot_scalar::<f16, f32, 32>(x, y)
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(DOT_BF16_SCALAR: PairKernel<bf16>)]
+    fn dot_bf16_scalar(x: &[bf16], y: &[bf16]) -> f32 {
+        dot_scalar::<bf16, f32, 32>(x, y)
+    }
+}
+
+/// The `dot_f16` and `dot_bf16` functions in f16.c and bf16.c. build.rs compiles
+/// each file once per SIMD level, suffixing the symbols with the level.
+#[cfg(kernel_support = "half")]
+mod half_c {
+    use half::{bf16, f16};
+
+    use crate::distance::PairKernel;
+
+    mod ffi {
+        use half::{bf16, f16};
+
+        unsafe extern "C" {
+            #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+            pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn dot_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn dot_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+
+            #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+            pub fn dot_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn dot_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn dot_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn dot_bf16_lasx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn dot_bf16_lsx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
         }
+    }
+
+    half_c_kernels! {
+        fn (x: &[f16], y: &[f16]) -> f32 => (x.as_ptr(), y.as_ptr(), x.len().min(y.len()) as u32);
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        DOT_F16_AVX512: PairKernel<f16> = dot_f16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        DOT_F16_AVX2: PairKernel<f16> = dot_f16_avx2("avx2", "fma", "f16c");
+        #[cfg(target_arch = "aarch64")]
+        DOT_F16_NEON: PairKernel<f16> = dot_f16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        DOT_F16_LASX: PairKernel<f16> = dot_f16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        DOT_F16_LSX: PairKernel<f16> = dot_f16_lsx("lsx");
+    }
+
+    half_c_kernels! {
+        fn (x: &[bf16], y: &[bf16]) -> f32 => (x.as_ptr(), y.as_ptr(), x.len().min(y.len()) as u32);
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        DOT_BF16_AVX512: PairKernel<bf16> = dot_bf16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        DOT_BF16_AVX2: PairKernel<bf16> = dot_bf16_avx2("avx2", "fma");
+        #[cfg(target_arch = "aarch64")]
+        DOT_BF16_NEON: PairKernel<bf16> = dot_bf16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        DOT_BF16_LASX: PairKernel<bf16> = dot_bf16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        DOT_BF16_LSX: PairKernel<bf16> = dot_bf16_lsx("lsx");
     }
 }
 

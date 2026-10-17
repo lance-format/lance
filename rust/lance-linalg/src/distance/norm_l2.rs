@@ -8,37 +8,12 @@ use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{FixedSizeListArray, Float32Array};
 use arrow_schema::{ArrowError, DataType};
 use half::{bf16, f16};
-use lance_core::utils::cpu::SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Float, Num};
-
-#[cfg(feature = "fp16kernels")]
-use super::HalfBackend;
-use super::{HALF_KERNELS_COMPILED, HalfType, half_backend, x86_half_features};
 
 /// L2 normalization
 pub trait Normalize: Num {
     /// L2 Normalization over a Vector.
     fn norm_l2(vector: &[Self]) -> f32;
-}
-
-#[cfg(feature = "fp16kernels")]
-mod kernel {
-    use super::*;
-
-    // These are the `norm_l2_f16` function in f16.c. Our build.rs script compiles
-    // a version of this file for each SIMD level with different suffixes.
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
-        pub fn norm_l2_f16_avx512(ptr: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn norm_l2_f16_avx2(ptr: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn norm_l2_f16_lsx(ptr: *const f16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn norm_l2_f16_lasx(ptr: *const f16, len: u32) -> f32;
-    }
 }
 
 impl Normalize for u8 {
@@ -48,110 +23,136 @@ impl Normalize for u8 {
     }
 }
 
+/// L2 norm of one vector.
+type NormKernel<T> = unsafe fn(&[T]) -> f32;
+
 impl Normalize for f16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::F16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                kernel::norm_l2_f16_neon(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_f16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                kernel::norm_l2_f16_avx512(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                kernel::norm_l2_f16_lasx(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                kernel::norm_l2_f16_lsx(vector.as_ptr(), vector.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
-            // route; this fallback only extends the tiers the C kernel already
-            // served to Avx512FP16 after checking F16C and FMA.
-            _ => norm_l2_impl::<Self, f32, 32>(vector),
-        }
-    }
-}
-
-#[cfg(feature = "fp16kernels")]
-mod bf16_kernel {
-    use half::bf16;
-
-    unsafe extern "C" {
-        #[cfg(target_arch = "aarch64")]
-        pub fn norm_l2_bf16_neon(ptr: *const bf16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
-        pub fn norm_l2_bf16_avx512(ptr: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "x86_64")]
-        pub fn norm_l2_bf16_avx2(ptr: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn norm_l2_bf16_lsx(ptr: *const bf16, len: u32) -> f32;
-        #[cfg(target_arch = "loongarch64")]
-        pub fn norm_l2_bf16_lasx(ptr: *const bf16, len: u32) -> f32;
+        NORM_L2_F16.get().call(vector)
     }
 }
 
 impl Normalize for bf16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        match half_backend(
-            *SIMD_SUPPORT,
-            HalfType::Bf16,
-            HALF_KERNELS_COMPILED,
-            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
-            x86_half_features(),
-        ) {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            HalfBackend::Neon => unsafe {
-                bf16_kernel::norm_l2_bf16_neon(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512_bf16",
-                target_arch = "x86_64"
-            ))]
-            HalfBackend::Avx512 => unsafe {
-                bf16_kernel::norm_l2_bf16_avx512(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            HalfBackend::Avx2 => unsafe {
-                bf16_kernel::norm_l2_bf16_avx2(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lasx => unsafe {
-                bf16_kernel::norm_l2_bf16_lasx(vector.as_ptr(), vector.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            HalfBackend::Lsx => unsafe {
-                bf16_kernel::norm_l2_bf16_lsx(vector.as_ptr(), vector.len() as u32)
-            },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the bf16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
-            _ => norm_l2_impl::<Self, f32, 32>(vector),
-        }
+        NORM_L2_BF16.get().call(vector)
     }
 }
 
-/// L2 norm of one vector.
-type NormKernel<T> = unsafe fn(&[T]) -> f32;
+lance_core::dispatch! {
+    static NORM_L2_F16: Dispatch<NormKernel<f16>> = &[
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        half_c::NORM_L2_F16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::NORM_L2_F16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::NORM_L2_F16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::NORM_L2_F16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::NORM_L2_F16_LSX,
+        NORM_L2_F16_SCALAR,
+    ];
+}
+
+lance_core::dispatch! {
+    static NORM_L2_BF16: Dispatch<NormKernel<bf16>> = &[
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        half_c::NORM_L2_BF16_AVX512,
+        #[cfg(all(kernel_support = "half", target_arch = "x86_64"))]
+        half_c::NORM_L2_BF16_AVX2,
+        #[cfg(all(kernel_support = "half", target_arch = "aarch64"))]
+        half_c::NORM_L2_BF16_NEON,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::NORM_L2_BF16_LASX,
+        #[cfg(all(kernel_support = "half", target_arch = "loongarch64"))]
+        half_c::NORM_L2_BF16_LSX,
+        NORM_L2_BF16_SCALAR,
+    ];
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(NORM_L2_F16_SCALAR: NormKernel<f16>)]
+    fn norm_l2_f16_scalar(vector: &[f16]) -> f32 {
+        norm_l2_impl::<f16, f32, 32>(vector)
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(NORM_L2_BF16_SCALAR: NormKernel<bf16>)]
+    fn norm_l2_bf16_scalar(vector: &[bf16]) -> f32 {
+        norm_l2_impl::<bf16, f32, 32>(vector)
+    }
+}
+
+/// The `norm_l2_f16` and `norm_l2_bf16` functions in f16.c and bf16.c.
+/// build.rs compiles each file once per SIMD level, suffixing the symbols with
+/// the level.
+#[cfg(kernel_support = "half")]
+mod half_c {
+    use half::{bf16, f16};
+
+    use super::NormKernel;
+
+    mod ffi {
+        use half::{bf16, f16};
+
+        unsafe extern "C" {
+            #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+            pub fn norm_l2_f16_avx512(ptr: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn norm_l2_f16_avx2(ptr: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn norm_l2_f16_lasx(ptr: *const f16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn norm_l2_f16_lsx(ptr: *const f16, len: u32) -> f32;
+
+            #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+            pub fn norm_l2_bf16_avx512(ptr: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "x86_64")]
+            pub fn norm_l2_bf16_avx2(ptr: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "aarch64")]
+            pub fn norm_l2_bf16_neon(ptr: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn norm_l2_bf16_lasx(ptr: *const bf16, len: u32) -> f32;
+            #[cfg(target_arch = "loongarch64")]
+            pub fn norm_l2_bf16_lsx(ptr: *const bf16, len: u32) -> f32;
+        }
+    }
+
+    half_c_kernels! {
+        fn (vector: &[f16]) -> f32 => (vector.as_ptr(), vector.len() as u32);
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
+        NORM_L2_F16_AVX512: NormKernel<f16> = norm_l2_f16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        NORM_L2_F16_AVX2: NormKernel<f16> = norm_l2_f16_avx2("avx2", "fma", "f16c");
+        #[cfg(target_arch = "aarch64")]
+        NORM_L2_F16_NEON: NormKernel<f16> = norm_l2_f16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        NORM_L2_F16_LASX: NormKernel<f16> = norm_l2_f16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        NORM_L2_F16_LSX: NormKernel<f16> = norm_l2_f16_lsx("lsx");
+    }
+
+    half_c_kernels! {
+        fn (vector: &[bf16]) -> f32 => (vector.as_ptr(), vector.len() as u32);
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
+        NORM_L2_BF16_AVX512: NormKernel<bf16> = norm_l2_bf16_avx512("avx512fp16");
+        #[cfg(target_arch = "x86_64")]
+        NORM_L2_BF16_AVX2: NormKernel<bf16> = norm_l2_bf16_avx2("avx2", "fma");
+        #[cfg(target_arch = "aarch64")]
+        NORM_L2_BF16_NEON: NormKernel<bf16> = norm_l2_bf16_neon("neon", "fp16");
+        #[cfg(target_arch = "loongarch64")]
+        NORM_L2_BF16_LASX: NormKernel<bf16> = norm_l2_bf16_lasx("lasx");
+        #[cfg(target_arch = "loongarch64")]
+        NORM_L2_BF16_LSX: NormKernel<bf16> = norm_l2_bf16_lsx("lsx");
+    }
+}
 
 impl Normalize for f32 {
     #[inline]

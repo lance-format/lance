@@ -17,7 +17,7 @@ fn main() -> Result<(), String> {
 
     // Let clippy know about our custom cfg attribute
     println!(
-        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
+        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"half\", \"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
     );
     println!("cargo::rustc-check-cfg=cfg(simd_fallback)");
 
@@ -152,6 +152,12 @@ fn main() -> Result<(), String> {
         if env::var("CARGO_FEATURE_FP16KERNELS").is_ok() {
             return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
         }
+        return Ok(());
+    }
+    if cfg!(feature = "fp16kernels") {
+        // Every branch above that reaches here built the f16 and bf16 objects
+        // for this target.
+        println!("cargo:rustc-cfg=kernel_support=\"half\"");
     }
     Ok(())
 }
