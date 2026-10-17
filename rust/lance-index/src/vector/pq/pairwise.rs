@@ -16,6 +16,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::cpu::{Candidate, Dispatch};
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 
@@ -38,10 +39,10 @@ pub struct PQPairScorer {
     /// partition centroid that residual codes are relative to.
     squared_norms: Vec<f64>,
     /// Resolved once per scorer; it also fixes the table layout.
-    backend: LookupBackend,
+    lookup: &'static Candidate<LookupFn>,
 }
 
-/// The codeword distance table in the layout its lookup backend reads.
+/// The codeword distance table in the layout its lookup kernel reads.
 enum CodewordTable {
     /// `[sub][code_a][code_b]` f32 entries.
     Rows(Vec<f32>),
@@ -52,10 +53,10 @@ enum CodewordTable {
 }
 
 impl CodewordTable {
-    fn new(rows: Vec<f32>, backend: LookupBackend) -> Self {
-        match backend {
+    fn new(rows: Vec<f32>, lookup: &Candidate<LookupFn>) -> Self {
+        match lookup.name() {
             #[cfg(target_arch = "x86_64")]
-            LookupBackend::Avx512Vbmi => Self::BytePlanes(
+            name if name == x86::LOOKUP8_AVX512_VBMI.name() => Self::BytePlanes(
                 rows.as_chunks::<256>()
                     .0
                     .iter()
@@ -72,7 +73,7 @@ impl CodewordTable {
         match self {
             Self::Rows(rows) => rows,
             #[cfg(target_arch = "x86_64")]
-            Self::BytePlanes(_) => unreachable!("the lookup backend reads byte planes"),
+            Self::BytePlanes(_) => unreachable!("the lookup kernel reads byte planes"),
         }
     }
 
@@ -80,7 +81,7 @@ impl CodewordTable {
     fn byte_planes(&self) -> &[u8] {
         match self {
             Self::BytePlanes(planes) => planes,
-            Self::Rows(_) => unreachable!("the lookup backend reads f32 rows"),
+            Self::Rows(_) => unreachable!("the lookup kernel reads f32 rows"),
         }
     }
 }
@@ -91,16 +92,20 @@ impl PQPairScorer {
         centroid: &ArrayRef,
         metric: DistanceType,
     ) -> Result<Self> {
-        Self::with_backend(pq, centroid, metric, LookupBackend::best(pq.num_bits))
+        Self::with_lookup(
+            pq,
+            centroid,
+            metric,
+            lookup_dispatch(pq.num_bits).selected(),
+        )
     }
 
-    fn with_backend(
+    fn with_lookup(
         pq: &ProductQuantizer,
         centroid: &ArrayRef,
         metric: DistanceType,
-        backend: LookupBackend,
+        lookup: &'static Candidate<LookupFn>,
     ) -> Result<Self> {
-        debug_assert!(LookupBackend::supported(pq.num_bits).contains(&backend));
         let num_sub_vectors = pq.num_sub_vectors;
         let code_bytes = match pq.num_bits {
             8 => num_sub_vectors,
@@ -158,9 +163,9 @@ impl PQPairScorer {
             num_sub_vectors,
             code_bytes,
             metric,
-            table: CodewordTable::new(table, backend),
+            table: CodewordTable::new(table, lookup),
             squared_norms,
-            backend,
+            lookup,
         })
     }
 
@@ -324,45 +329,53 @@ impl<'a> PQKernel<'a> {
     }
 }
 
-// The scalar backends apply one code byte per pass: the compiler vectorizes
+// The scalar kernels apply one code byte per pass: the compiler vectorizes
 // each pass over the candidates, which is faster than grouping bytes per
 // candidate on both x86 and aarch64.
 
-fn lookup8_scalar(
-    kernel: &PQKernel<'_>,
-    anchor_row: usize,
-    candidates: Range<usize>,
-    out: &mut [f32],
-) {
-    out.fill(0.0);
-    for byte in 0..kernel.scorer.code_bytes {
-        let row: &[f32; 256] = kernel.table_row(byte, kernel.anchor_code(byte, anchor_row));
-        for (out, &code) in out
-            .iter_mut()
-            .zip(kernel.candidate_codes(byte, &candidates))
-        {
-            *out += row[usize::from(code)];
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(LOOKUP8_SCALAR: LookupFn)]
+    fn lookup8_scalar(
+        kernel: &PQKernel<'_>,
+        anchor_row: usize,
+        candidates: Range<usize>,
+        out: &mut [f32],
+    ) {
+        out.fill(0.0);
+        for byte in 0..kernel.scorer.code_bytes {
+            let row: &[f32; 256] = kernel.table_row(byte, kernel.anchor_code(byte, anchor_row));
+            for (out, &code) in out
+                .iter_mut()
+                .zip(kernel.candidate_codes(byte, &candidates))
+            {
+                *out += row[usize::from(code)];
+            }
         }
     }
 }
 
-fn lookup4_scalar(
-    kernel: &PQKernel<'_>,
-    anchor_row: usize,
-    candidates: Range<usize>,
-    out: &mut [f32],
-) {
-    out.fill(0.0);
-    for byte in 0..kernel.scorer.code_bytes {
-        let code = kernel.anchor_code(byte, anchor_row);
-        let low: &[f32; 16] = kernel.table_row(2 * byte, code & 0x0f);
-        let high: &[f32; 16] = kernel.table_row(2 * byte + 1, code >> 4);
-        for (out, &code) in out
-            .iter_mut()
-            .zip(kernel.candidate_codes(byte, &candidates))
-        {
-            *out += low[usize::from(code & 0x0f)];
-            *out += high[usize::from(code >> 4)];
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(LOOKUP4_SCALAR: LookupFn)]
+    fn lookup4_scalar(
+        kernel: &PQKernel<'_>,
+        anchor_row: usize,
+        candidates: Range<usize>,
+        out: &mut [f32],
+    ) {
+        out.fill(0.0);
+        for byte in 0..kernel.scorer.code_bytes {
+            let code = kernel.anchor_code(byte, anchor_row);
+            let low: &[f32; 16] = kernel.table_row(2 * byte, code & 0x0f);
+            let high: &[f32; 16] = kernel.table_row(2 * byte + 1, code >> 4);
+            for (out, &code) in out
+                .iter_mut()
+                .zip(kernel.candidate_codes(byte, &candidates))
+            {
+                *out += low[usize::from(code & 0x0f)];
+                *out += high[usize::from(code >> 4)];
+            }
         }
     }
 }
@@ -372,7 +385,7 @@ mod x86 {
     use std::arch::x86_64::*;
     use std::ops::Range;
 
-    use super::PQKernel;
+    use super::{LookupFn, PQKernel};
 
     const LANES: usize = 16;
 
@@ -451,46 +464,49 @@ mod x86 {
         _mm512_cvtepu8_epi32(unsafe { _mm_loadu_si128(codes.as_ptr().cast()) })
     }
 
-    /// Looks 16 candidates' nibbles up per instruction in 16-float rows held
-    /// in registers.
-    #[target_feature(enable = "avx512f")]
-    pub(super) fn lookup4_avx512(
-        kernel: &PQKernel<'_>,
-        anchor_row: usize,
-        candidates: Range<usize>,
-        out: &mut [f32],
-    ) {
-        out.fill(0.0);
-        let n = out.len();
-        for_byte_groups!(kernel.scorer.code_bytes, |first, G| {
-            let (rows, codes) = rows4::<G>(kernel, first, anchor_row, &candidates);
-            let codes = codes.map(|codes| &codes[..n]);
-            // SAFETY: each row holds exactly 16 floats.
-            let tables = rows.map(|(low, high)| unsafe {
-                (
-                    _mm512_loadu_ps(low.as_ptr()),
-                    _mm512_loadu_ps(high.as_ptr()),
-                )
-            });
-            let mut c = 0;
-            while c + LANES <= n {
-                let out = &mut out[c..c + LANES];
-                // SAFETY: `out` holds exactly 16 floats.
-                let mut sum = unsafe { _mm512_loadu_ps(out.as_ptr()) };
-                for ((low, high), codes) in tables.iter().zip(&codes) {
-                    // `vpermps` reads only the low 4 bits of each index, so
-                    // the low nibble needs no mask.
-                    let code = load_codes(codes, c);
-                    sum = _mm512_add_ps(sum, _mm512_permutexvar_ps(code, *low));
-                    let code = _mm512_srli_epi32::<4>(code);
-                    sum = _mm512_add_ps(sum, _mm512_permutexvar_ps(code, *high));
+    lance_core::target_kernel! {
+        #[target_features("avx512f")]
+        #[candidate(pub(super) LOOKUP4_AVX512: LookupFn)]
+        /// Looks 16 candidates' nibbles up per instruction in 16-float rows held
+        /// in registers.
+        fn lookup4_avx512(
+            kernel: &PQKernel<'_>,
+            anchor_row: usize,
+            candidates: Range<usize>,
+            out: &mut [f32],
+        ) {
+            out.fill(0.0);
+            let n = out.len();
+            for_byte_groups!(kernel.scorer.code_bytes, |first, G| {
+                let (rows, codes) = rows4::<G>(kernel, first, anchor_row, &candidates);
+                let codes = codes.map(|codes| &codes[..n]);
+                // SAFETY: each row holds exactly 16 floats.
+                let tables = rows.map(|(low, high)| unsafe {
+                    (
+                        _mm512_loadu_ps(low.as_ptr()),
+                        _mm512_loadu_ps(high.as_ptr()),
+                    )
+                });
+                let mut c = 0;
+                while c + LANES <= n {
+                    let out = &mut out[c..c + LANES];
+                    // SAFETY: `out` holds exactly 16 floats.
+                    let mut sum = unsafe { _mm512_loadu_ps(out.as_ptr()) };
+                    for ((low, high), codes) in tables.iter().zip(&codes) {
+                        // `vpermps` reads only the low 4 bits of each index, so
+                        // the low nibble needs no mask.
+                        let code = load_codes(codes, c);
+                        sum = _mm512_add_ps(sum, _mm512_permutexvar_ps(code, *low));
+                        let code = _mm512_srli_epi32::<4>(code);
+                        sum = _mm512_add_ps(sum, _mm512_permutexvar_ps(code, *high));
+                    }
+                    // SAFETY: as above.
+                    unsafe { _mm512_storeu_ps(out.as_mut_ptr(), sum) };
+                    c += LANES;
                 }
-                // SAFETY: as above.
-                unsafe { _mm512_storeu_ps(out.as_mut_ptr(), sum) };
-                c += LANES;
-            }
-            add_entries4(&rows, &codes, out, c);
-        });
+                add_entries4(&rows, &codes, out, c);
+            });
+        }
     }
 
     /// Entries of 8 nibbles (the low 4 bits of each u32 lane; higher bits are
@@ -504,56 +520,59 @@ mod x86 {
         _mm256_blendv_ps(from_lower, from_upper, upper)
     }
 
-    /// The AVX2 variant of [`lookup4_avx512`]: 8 candidates per step, with
-    /// each 16-float row split across two registers.
-    #[target_feature(enable = "avx2")]
-    pub(super) fn lookup4_avx2(
-        kernel: &PQKernel<'_>,
-        anchor_row: usize,
-        candidates: Range<usize>,
-        out: &mut [f32],
-    ) {
-        const LANES: usize = 8;
-        out.fill(0.0);
-        let n = out.len();
-        for_byte_groups!(kernel.scorer.code_bytes, |first, G| {
-            let (rows, codes) = rows4::<G>(kernel, first, anchor_row, &candidates);
-            let codes = codes.map(|codes| &codes[..n]);
-            let halves = rows.map(|(low, high)| {
-                // SAFETY: each row holds exactly 16 floats.
-                unsafe {
-                    (
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) LOOKUP4_AVX2: LookupFn)]
+        /// The AVX2 variant of [`lookup4_avx512`]: 8 candidates per step, with
+        /// each 16-float row split across two registers.
+        fn lookup4_avx2(
+            kernel: &PQKernel<'_>,
+            anchor_row: usize,
+            candidates: Range<usize>,
+            out: &mut [f32],
+        ) {
+            const LANES: usize = 8;
+            out.fill(0.0);
+            let n = out.len();
+            for_byte_groups!(kernel.scorer.code_bytes, |first, G| {
+                let (rows, codes) = rows4::<G>(kernel, first, anchor_row, &candidates);
+                let codes = codes.map(|codes| &codes[..n]);
+                let halves = rows.map(|(low, high)| {
+                    // SAFETY: each row holds exactly 16 floats.
+                    unsafe {
                         (
-                            _mm256_loadu_ps(low.as_ptr()),
-                            _mm256_loadu_ps(low[8..].as_ptr()),
-                        ),
-                        (
-                            _mm256_loadu_ps(high.as_ptr()),
-                            _mm256_loadu_ps(high[8..].as_ptr()),
-                        ),
-                    )
+                            (
+                                _mm256_loadu_ps(low.as_ptr()),
+                                _mm256_loadu_ps(low[8..].as_ptr()),
+                            ),
+                            (
+                                _mm256_loadu_ps(high.as_ptr()),
+                                _mm256_loadu_ps(high[8..].as_ptr()),
+                            ),
+                        )
+                    }
+                });
+                let mut c = 0;
+                while c + LANES <= n {
+                    let out = &mut out[c..c + LANES];
+                    // SAFETY: `out` holds exactly 8 floats.
+                    let mut sum = unsafe { _mm256_loadu_ps(out.as_ptr()) };
+                    for ((low, high), codes) in halves.iter().zip(&codes) {
+                        let code = &codes[c..c + LANES];
+                        // SAFETY: `code` holds exactly 8 bytes.
+                        let code = unsafe { _mm_loadl_epi64(code.as_ptr().cast()) };
+                        let code = _mm256_cvtepu8_epi32(code);
+                        sum = _mm256_add_ps(sum, lookup16_avx2(code, *low));
+                        let code = _mm256_srli_epi32::<4>(code);
+                        sum = _mm256_add_ps(sum, lookup16_avx2(code, *high));
+                    }
+                    // SAFETY: as above.
+                    unsafe { _mm256_storeu_ps(out.as_mut_ptr(), sum) };
+                    c += LANES;
                 }
+                add_entries4(&rows, &codes, out, c);
             });
-            let mut c = 0;
-            while c + LANES <= n {
-                let out = &mut out[c..c + LANES];
-                // SAFETY: `out` holds exactly 8 floats.
-                let mut sum = unsafe { _mm256_loadu_ps(out.as_ptr()) };
-                for ((low, high), codes) in halves.iter().zip(&codes) {
-                    let code = &codes[c..c + LANES];
-                    // SAFETY: `code` holds exactly 8 bytes.
-                    let code = unsafe { _mm_loadl_epi64(code.as_ptr().cast()) };
-                    let code = _mm256_cvtepu8_epi32(code);
-                    sum = _mm256_add_ps(sum, lookup16_avx2(code, *low));
-                    let code = _mm256_srli_epi32::<4>(code);
-                    sum = _mm256_add_ps(sum, lookup16_avx2(code, *high));
-                }
-                // SAFETY: as above.
-                unsafe { _mm256_storeu_ps(out.as_mut_ptr(), sum) };
-                c += LANES;
-            }
-            add_entries4(&rows, &codes, out, c);
-        });
+        }
     }
 
     /// Byte `p` of the reordered codes holds candidate
@@ -595,135 +614,129 @@ mod x86 {
         ]
     }
 
-    /// Looks 64 candidates' codes up per step with byte shuffles over the
-    /// anchor's table row, held in registers as byte planes. One code byte
-    /// per pass keeps the 16 row registers live across all candidates.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
-    pub(super) fn lookup8_avx512_vbmi(
-        kernel: &PQKernel<'_>,
-        anchor_row: usize,
-        candidates: Range<usize>,
-        out: &mut [f32],
-    ) {
-        const BLOCK: usize = 64;
-        out.fill(0.0);
-        let n = out.len();
-        let planes = kernel.scorer.table.byte_planes();
-        // SAFETY: `UNPACK_ORDER` holds exactly 64 bytes.
-        let order = unsafe { _mm512_loadu_si512(UNPACK_ORDER.as_ptr().cast()) };
-        let code_bytes = kernel.scorer.code_bytes;
-        let row_start =
-            |byte: usize| (byte * 256 + usize::from(kernel.anchor_code(byte, anchor_row))) * 1024;
-        for byte in 0..code_bytes {
-            let start = row_start(byte);
-            let row: &[u8; 1024] = planes[start..start + 1024]
-                .try_into()
-                .expect("a byte-plane row holds 1024 bytes");
-            // An anchor's rows are spread over the whole table, which exceeds
-            // L2, so fetch the next row while this one is applied.
-            if byte + 1 < code_bytes {
-                let next = row_start(byte + 1);
-                for line in planes[next..next + 1024].as_chunks::<64>().0 {
-                    // `_mm_prefetch` is safe in newer toolchains but unsafe at
-                    // the 1.91 MSRV, so allow both.
-                    // SAFETY: prefetching an in-bounds address has no side effects.
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        _mm_prefetch::<_MM_HINT_T0>(line.as_ptr().cast())
-                    };
-                }
-            }
-            // SAFETY: each register loads 64 of the row's 1024 bytes.
-            let row: [__m512i; 16] = std::array::from_fn(|i| unsafe {
-                _mm512_loadu_si512(row[BLOCK * i..].as_ptr().cast())
-            });
-            let codes = &kernel.candidate_codes(byte, &candidates)[..n];
-            let mut c = 0;
-            while c + BLOCK <= n {
-                // SAFETY: the slice holds exactly 64 bytes.
-                let block = unsafe { _mm512_loadu_si512(codes[c..c + BLOCK].as_ptr().cast()) };
-                let entries = lookup64(&row, block, order);
-                for (out, entry) in out[c..c + BLOCK]
-                    .as_chunks_mut::<LANES>()
-                    .0
-                    .iter_mut()
-                    .zip(entries)
-                {
-                    // SAFETY: `out` holds exactly 16 floats.
-                    unsafe {
-                        let sum = _mm512_add_ps(_mm512_loadu_ps(out.as_ptr()), entry);
-                        _mm512_storeu_ps(out.as_mut_ptr(), sum);
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512bw", "avx512vbmi")]
+        #[candidate(pub(super) LOOKUP8_AVX512_VBMI: LookupFn)]
+        /// Looks 64 candidates' codes up per step with byte shuffles over the
+        /// anchor's table row, held in registers as byte planes. One code byte
+        /// per pass keeps the 16 row registers live across all candidates.
+        fn lookup8_avx512_vbmi(
+            kernel: &PQKernel<'_>,
+            anchor_row: usize,
+            candidates: Range<usize>,
+            out: &mut [f32],
+        ) {
+            const BLOCK: usize = 64;
+            out.fill(0.0);
+            let n = out.len();
+            let planes = kernel.scorer.table.byte_planes();
+            // SAFETY: `UNPACK_ORDER` holds exactly 64 bytes.
+            let order = unsafe { _mm512_loadu_si512(UNPACK_ORDER.as_ptr().cast()) };
+            let code_bytes = kernel.scorer.code_bytes;
+            let row_start =
+                |byte: usize| (byte * 256 + usize::from(kernel.anchor_code(byte, anchor_row))) * 1024;
+            for byte in 0..code_bytes {
+                let start = row_start(byte);
+                let row: &[u8; 1024] = planes[start..start + 1024]
+                    .try_into()
+                    .expect("a byte-plane row holds 1024 bytes");
+                // An anchor's rows are spread over the whole table, which exceeds
+                // L2, so fetch the next row while this one is applied.
+                if byte + 1 < code_bytes {
+                    let next = row_start(byte + 1);
+                    for line in planes[next..next + 1024].as_chunks::<64>().0 {
+                        // `_mm_prefetch` is safe in newer toolchains but unsafe at
+                        // the 1.91 MSRV, so allow both.
+                        // SAFETY: prefetching an in-bounds address has no side effects.
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            _mm_prefetch::<_MM_HINT_T0>(line.as_ptr().cast())
+                        };
                     }
                 }
-                c += BLOCK;
-            }
-            if c < n {
-                let mut block = [0u8; BLOCK];
-                block[..n - c].copy_from_slice(&codes[c..]);
-                // SAFETY: `block` holds exactly 64 bytes.
-                let block = unsafe { _mm512_loadu_si512(block.as_ptr().cast()) };
-                let mut entries = [0.0f32; BLOCK];
-                for (values, entry) in entries
-                    .as_chunks_mut::<LANES>()
-                    .0
-                    .iter_mut()
-                    .zip(lookup64(&row, block, order))
-                {
-                    // SAFETY: `values` holds exactly 16 floats.
-                    unsafe { _mm512_storeu_ps(values.as_mut_ptr(), entry) };
+                // SAFETY: each register loads 64 of the row's 1024 bytes.
+                let row: [__m512i; 16] = std::array::from_fn(|i| unsafe {
+                    _mm512_loadu_si512(row[BLOCK * i..].as_ptr().cast())
+                });
+                let codes = &kernel.candidate_codes(byte, &candidates)[..n];
+                let mut c = 0;
+                while c + BLOCK <= n {
+                    // SAFETY: the slice holds exactly 64 bytes.
+                    let block = unsafe { _mm512_loadu_si512(codes[c..c + BLOCK].as_ptr().cast()) };
+                    let entries = lookup64(&row, block, order);
+                    for (out, entry) in out[c..c + BLOCK]
+                        .as_chunks_mut::<LANES>()
+                        .0
+                        .iter_mut()
+                        .zip(entries)
+                    {
+                        // SAFETY: `out` holds exactly 16 floats.
+                        unsafe {
+                            let sum = _mm512_add_ps(_mm512_loadu_ps(out.as_ptr()), entry);
+                            _mm512_storeu_ps(out.as_mut_ptr(), sum);
+                        }
+                    }
+                    c += BLOCK;
                 }
-                for (out, entry) in out[c..].iter_mut().zip(entries) {
-                    *out += entry;
+                if c < n {
+                    let mut block = [0u8; BLOCK];
+                    block[..n - c].copy_from_slice(&codes[c..]);
+                    // SAFETY: `block` holds exactly 64 bytes.
+                    let block = unsafe { _mm512_loadu_si512(block.as_ptr().cast()) };
+                    let mut entries = [0.0f32; BLOCK];
+                    for (values, entry) in entries
+                        .as_chunks_mut::<LANES>()
+                        .0
+                        .iter_mut()
+                        .zip(lookup64(&row, block, order))
+                    {
+                        // SAFETY: `values` holds exactly 16 floats.
+                        unsafe { _mm512_storeu_ps(values.as_mut_ptr(), entry) };
+                    }
+                    for (out, entry) in out[c..].iter_mut().zip(entries) {
+                        *out += entry;
+                    }
                 }
             }
         }
     }
 }
 
-/// How [`PQKernel`] looks codeword distances up; resolved once per scorer
-/// from the host's CPU features. Every backend sums each candidate's
-/// sub-vectors in order starting from zero, without fused operations, so all
-/// backends give bit-identical distances for any candidate range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LookupBackend {
-    Scalar,
-    /// 4-bit only: nibble permutes over 16-float rows in registers.
-    #[cfg(target_arch = "x86_64")]
-    Avx512,
-    /// 4-bit only: the 256-bit variant of `Avx512`.
-    #[cfg(target_arch = "x86_64")]
-    Avx2,
-    /// 8-bit only: byte shuffles over byte-plane rows in registers.
-    #[cfg(target_arch = "x86_64")]
-    Avx512Vbmi,
-}
+/// Codeword-distance sums from the anchor to each candidate in a range.
+/// Every kernel sums each candidate's sub-vectors in order starting from
+/// zero, without fused operations, so all kernels give bit-identical
+/// distances for any candidate range.
+type LookupFn = unsafe fn(&PQKernel<'_>, usize, Range<usize>, &mut [f32]);
 
-impl LookupBackend {
-    /// Backends this host supports for `num_bits` codes, fastest first.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
-    fn supported(num_bits: u32) -> Vec<Self> {
-        let mut backends = Vec::with_capacity(3);
+lance_core::dispatch! {
+    static LOOKUP4: Dispatch<LookupFn> = {
         #[cfg(target_arch = "x86_64")]
-        if num_bits == 4 {
-            if is_x86_feature_detected!("avx512f") {
-                backends.push(Self::Avx512);
-            }
-            if is_x86_feature_detected!("avx2") {
-                backends.push(Self::Avx2);
-            }
-        } else if is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vbmi")
         {
-            backends.push(Self::Avx512Vbmi);
+            &[x86::LOOKUP4_AVX512, x86::LOOKUP4_AVX2, LOOKUP4_SCALAR]
         }
-        backends.push(Self::Scalar);
-        backends
-    }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[LOOKUP4_SCALAR]
+        }
+    };
+}
 
-    fn best(num_bits: u32) -> Self {
-        Self::supported(num_bits)[0]
-    }
+lance_core::dispatch! {
+    /// The VBMI kernel reads the table as byte planes, see [`CodewordTable`].
+    static LOOKUP8: Dispatch<LookupFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::LOOKUP8_AVX512_VBMI, LOOKUP8_SCALAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[LOOKUP8_SCALAR]
+        }
+    };
+}
+
+fn lookup_dispatch(num_bits: u32) -> &'static Dispatch<LookupFn> {
+    if num_bits == 4 { &LOOKUP4 } else { &LOOKUP8 }
 }
 
 impl PairKernel for PQKernel<'_> {
@@ -731,22 +744,16 @@ impl PairKernel for PQKernel<'_> {
         let scorer = self.scorer;
         assert_eq!(out.len(), candidates.len());
         let range = candidates.clone();
-        match scorer.backend {
-            LookupBackend::Scalar if scorer.num_bits == 8 => {
-                lookup8_scalar(self, anchor_row, range, out)
-            }
-            LookupBackend::Scalar => lookup4_scalar(self, anchor_row, range, out),
-            // SAFETY: `LookupBackend::supported` detected the CPU features of
-            // each x86 backend, for this code width.
-            #[cfg(target_arch = "x86_64")]
-            LookupBackend::Avx512 => unsafe { x86::lookup4_avx512(self, anchor_row, range, out) },
-            #[cfg(target_arch = "x86_64")]
-            LookupBackend::Avx2 => unsafe { x86::lookup4_avx2(self, anchor_row, range, out) },
-            #[cfg(target_arch = "x86_64")]
-            LookupBackend::Avx512Vbmi => unsafe {
-                x86::lookup8_avx512_vbmi(self, anchor_row, range, out)
-            },
-        }
+        let lookup = scorer
+            .lookup
+            .kernel()
+            .expect("the scorer's lookup kernel was supported when selected");
+        // SAFETY: the host supports the kernel's target features, since the
+        // pointer came from a `Kernel`. The lookup kernels are safe functions
+        // with no other preconditions: they bounds-check `range` against the
+        // staged codes and write only `out`. (`call` cannot name the
+        // `PQKernel` lifetime, hence the raw pointer.)
+        unsafe { lookup.as_fn()(self, anchor_row, range, out) };
         match scorer.metric {
             DistanceType::Dot => {
                 // Each sub-vector contributed `1 - dot`; keep a single `1 -`.
@@ -771,6 +778,14 @@ mod tests {
     use arrow_schema::Schema;
     use lance_core::ROW_ID;
     use rstest::rstest;
+
+    /// The lookup kernels this host supports for `num_bits` codes.
+    fn supported_lookups(num_bits: u32) -> impl Iterator<Item = &'static Candidate<LookupFn>> {
+        lookup_dispatch(num_bits)
+            .candidates()
+            .iter()
+            .filter(|candidate| candidate.kernel().is_some())
+    }
 
     /// Dimension 6 with 3 sub-vectors of width 2; codewords are small
     /// integers so the f64 oracle and the f32 table agree closely.
