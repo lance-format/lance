@@ -9,7 +9,7 @@
 //! drop the index. Getting this wrong does not fail the commit -- it silently
 //! returns stale rows from the index -- so each rule here is paired with a test.
 
-use crate::format::overlay::staleness::collect_overlay_stale_frags;
+use crate::format::overlay::staleness::{collect_overlay_stale_frags, field_affects_index};
 use crate::format::{Fragment, IndexMetadata};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::lineage::TaggedLineage;
@@ -150,8 +150,10 @@ impl Transaction {
     /// physical column while an index on `s.x` records the child's id) and
     /// the coverage is withdrawn along the lineage
     /// ([`Self::withdraw_rewritten_coverage`]). Without a tagged history the
-    /// rewritten fragments are pruned from the covering indices by id, the
-    /// ordinary rule, exactly as before.
+    /// rewritten fragments are pruned from every index that depends on a
+    /// rewritten field: the field itself, a field nested under it, or a field
+    /// containing it ([`field_affects_index`]), so a rewrite reported against
+    /// a struct `s` withdraws coverage from an index on `s.x` here too.
     pub fn withdraw_in_place_rewrites(
         indices: &mut Vec<IndexMetadata>,
         rewrites: Vec<(u64, Vec<u32>)>,
@@ -169,14 +171,31 @@ impl Transaction {
             }
             None => {
                 for (fragment, fields) in rewrites {
-                    Self::prune_updated_fields_from_indices(
-                        indices,
-                        &[Fragment::new(fragment)],
-                        &fields,
-                    );
+                    let Ok(fragment) = u32::try_from(fragment) else {
+                        continue;
+                    };
+                    for index in indices.iter_mut() {
+                        if Self::index_depends_on_any(index, &fields, schema)
+                            && let Some(fragment_bitmap) = &mut index.fragment_bitmap
+                        {
+                            fragment_bitmap.remove(fragment);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Whether `index` depends on any of `field_ids`: one of its fields, a
+    /// field nested under one of them, or a field containing one of them.
+    /// Index maintenance must decide dependency on whole subtrees, never by
+    /// exact id, or a change reported against a struct (or one of its
+    /// children) misses an index on a related nested field.
+    fn index_depends_on_any(index: &IndexMetadata, field_ids: &[u32], schema: &Schema) -> bool {
+        field_ids.iter().any(|field_id| {
+            i32::try_from(*field_id)
+                .is_ok_and(|field_id| field_affects_index(field_id, &index.fields, schema))
+        })
     }
 
     /// Expand every rewritten field id in `rewrites` to the field and all
@@ -488,10 +507,12 @@ impl Transaction {
     /// stale pre-overlay values -- and unlike a live overlay, the compacted
     /// fragment no longer signals that staleness to the query path. Drop each
     /// rewritten (new) fragment from the coverage of any index covering a field
-    /// such an overlay supplied, so those rows fall back to a flat scan.
+    /// such an overlay supplied (or a field nested under or containing one,
+    /// see [`field_affects_index`]), so those rows fall back to a flat scan.
     pub(super) fn prune_overlay_stale_fields_from_indices(
         indices: &mut [IndexMetadata],
         groups: &[RewriteGroup],
+        schema: &Schema,
     ) {
         for group in groups {
             // field id -> newest overlay committed_version supplying that field
@@ -518,11 +539,13 @@ impl Transaction {
                 .map(|f| f.id as u32)
                 .collect::<Vec<_>>();
             for index in indices.iter_mut() {
-                let is_stale = index.fields.iter().any(|field_id| {
+                let is_stale =
                     overlaid_field_versions
-                        .get(field_id)
-                        .is_some_and(|&overlay_version| overlay_version > index.dataset_version)
-                });
+                        .iter()
+                        .any(|(&field_id, &overlay_version)| {
+                            overlay_version > index.dataset_version
+                                && field_affects_index(field_id, &index.fields, schema)
+                        });
                 if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                     for new_id in &new_fragment_ids {
                         fragment_bitmap.remove(*new_id);
@@ -1500,7 +1523,11 @@ mod tests {
             create_test_index("unrelated", 2, 2, covering(), false),
         ];
 
-        Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups);
+        Transaction::prune_overlay_stale_fields_from_indices(
+            &mut indices,
+            &groups,
+            &create_test_schema(&[1, 2]),
+        );
 
         assert!(
             !indices[0].fragment_bitmap.as_ref().unwrap().contains(7),
@@ -1513,6 +1540,116 @@ mod tests {
         assert!(
             indices[2].fragment_bitmap.as_ref().unwrap().contains(7),
             "an index on an un-overlaid field is unaffected"
+        );
+    }
+
+    /// `s: struct<x: int32, y: int32>, b: int32`, ids assigned pre-order:
+    /// `s` = 0, `s.x` = 1, `s.y` = 2, `b` = 3.
+    fn create_nested_test_schema() -> Schema {
+        use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("x", DataType::Int32, true),
+                    ArrowField::new("y", DataType::Int32, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("b", DataType::Int32, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(schema.field_by_id(0).unwrap().name, "s");
+        assert_eq!(schema.field_by_id(1).unwrap().name, "x");
+        assert_eq!(schema.field_by_id(2).unwrap().name, "y");
+        assert_eq!(schema.field_by_id(3).unwrap().name, "b");
+        schema
+    }
+
+    #[test]
+    fn test_prune_overlay_stale_fields_matches_nested_fields() {
+        let schema = create_nested_test_schema();
+        // Fragment 0 carried an overlay on the struct `s` (id 0) and fragment
+        // 1 one on `s.y` (id 2), both committed at v5; both were compacted
+        // into new fragments.
+        let mut on_parent = Fragment::new(0);
+        on_parent.overlays = vec![overlay_with_field(0, 5)];
+        let mut on_child = Fragment::new(1);
+        on_child.overlays = vec![overlay_with_field(2, 5)];
+        let groups = vec![
+            RewriteGroup {
+                old_fragments: vec![on_parent],
+                new_fragments: vec![Fragment::new(7)],
+            },
+            RewriteGroup {
+                old_fragments: vec![on_child],
+                new_fragments: vec![Fragment::new(8)],
+            },
+        ];
+
+        let covering = || Some(RoaringBitmap::from_iter([7u32, 8]));
+        let mut indices = vec![
+            // On `s.x`: the overlay on its parent `s` supplied it.
+            create_test_index("child", 1, 2, covering(), false),
+            // On `s`: the overlay on its child `s.y` changed part of it.
+            create_test_index("parent", 0, 2, covering(), false),
+            // On `b`: unrelated to either overlay.
+            create_test_index("unrelated", 3, 2, covering(), false),
+        ];
+
+        Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups, &schema);
+
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([8u32]),
+            "an overlay on a struct makes an index on its child stale"
+        );
+        assert!(
+            indices[1].fragment_bitmap.as_ref().unwrap().is_empty(),
+            "overlays on a struct or its child make an index on the struct stale"
+        );
+        assert_eq!(
+            indices[2].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([7u32, 8]),
+            "an index on an unrelated field is unaffected"
+        );
+    }
+
+    #[test]
+    fn test_untagged_in_place_rewrite_withdraws_nested_fields() {
+        let schema = create_nested_test_schema();
+        let covering = || Some(RoaringBitmap::from_iter([4u32, 5]));
+        let mut indices = vec![
+            create_test_index("child", 1, 2, covering(), false),
+            create_test_index("parent", 0, 2, covering(), false),
+            create_test_index("unrelated", 3, 2, covering(), false),
+        ];
+        let live = RoaringBitmap::from_iter([4u32, 5]);
+
+        // Fragment 4 rewrote the packed struct `s` in place (reported by the
+        // parent id); fragment 5 rewrote only `s.y`.
+        Transaction::withdraw_in_place_rewrites(
+            &mut indices,
+            vec![(4, vec![0]), (5, vec![2])],
+            &schema,
+            &live,
+            None,
+        );
+
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([5u32]),
+            "a rewrite of a struct withdraws coverage from an index on its child"
+        );
+        assert!(
+            indices[1].fragment_bitmap.as_ref().unwrap().is_empty(),
+            "a rewrite of a struct or its child withdraws coverage from an index on the struct"
+        );
+        assert_eq!(
+            indices[2].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([4u32, 5]),
+            "an index on an unrelated field is unaffected"
         );
     }
 
