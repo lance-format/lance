@@ -301,30 +301,6 @@ mod f32_rows {
         }
     }
 
-    /// Every kernel this CPU can run, named.
-    #[cfg(test)]
-    pub(super) fn backends(l2: bool) -> Vec<(&'static str, super::RowsFn<f32>)> {
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut backends: Vec<(&'static str, super::RowsFn<f32>)> = vec![(
-            "portable",
-            if l2 {
-                portable::<true>
-            } else {
-                portable::<false>
-            },
-        )];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                backends.push(("avx512", if l2 { x86::l2_avx512 } else { x86::dot_avx512 }));
-            }
-            if std::arch::is_x86_feature_detected!("avx") {
-                backends.push(("avx", if l2 { x86::l2_avx } else { x86::dot_avx }));
-            }
-        }
-        backends
-    }
-
     #[inline(always)]
     fn term<const L2: bool>(anchor: f32, row: f32) -> f32 {
         if L2 {
@@ -805,11 +781,20 @@ mod tests {
             let anchor = &anchor[anchor_offset..];
             let rows = shifted(&rows, rows_offset);
             let rows = &rows[rows_offset..];
-            for (name, kernel) in f32_rows::backends(l2) {
+            let dispatch = if l2 {
+                &f32_rows::L2_ROWS
+            } else {
+                &f32_rows::DOT_ROWS
+            };
+            for candidate in dispatch.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let name = candidate.name();
                 for start in 0..num_rows {
                     for end in start + 1..=num_rows {
                         let mut out = vec![0.0; end - start];
-                        kernel(anchor, &rows[start * dim..end * dim], &mut out);
+                        kernel.call(anchor, &rows[start * dim..end * dim], &mut out);
                         assert_same_bits(
                             &out,
                             &expected[start..end],
