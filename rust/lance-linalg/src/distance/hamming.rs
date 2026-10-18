@@ -114,6 +114,7 @@ lance_core::target_kernel! {
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(HAMMING_BATCH_PORTABLE: BatchKernel<u8>)]
+    #[inline]
     fn hamming_into_portable(from: &[u8], to: &[u8], dimension: usize, output: &mut [f32]) {
         hamming_rows(from, to, dimension, output, hamming_words);
     }
@@ -165,6 +166,7 @@ mod aarch64 {
     lance_core::target_kernel! {
         #[target_features("neon")]
         #[candidate(pub(super) HAMMING_BATCH_NEON: BatchKernel<u8>)]
+        #[inline]
         pub(super) fn hamming_into_neon(
             from: &[u8],
             to: &[u8],
