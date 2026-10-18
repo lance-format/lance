@@ -904,6 +904,32 @@ fn compute_balanced_chunks(n: usize, target_pairs_per_chunk: usize) -> Vec<(usiz
     chunks
 }
 
+/// Calls `on_match(offset, distance)` for each distance at most `threshold`.
+#[inline]
+fn for_each_within(distances: &[u32], threshold: u32, mut on_match: impl FnMut(usize, u32)) {
+    // Matches are rare, so test 16 distances at a time without branching,
+    // which LLVM vectorizes, and only walk the chunks that hold one.
+    let (chunks, tail) = distances.as_chunks::<16>();
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        if chunk
+            .iter()
+            .fold(false, |any, &dist| any | (dist <= threshold))
+        {
+            for (k, &dist) in chunk.iter().enumerate() {
+                if dist <= threshold {
+                    on_match(chunk_index * 16 + k, dist);
+                }
+            }
+        }
+    }
+    let tail_start = chunks.len() * 16;
+    for (k, &dist) in tail.iter().enumerate() {
+        if dist <= threshold {
+            on_match(tail_start + k, dist);
+        }
+    }
+}
+
 /// Process a range of rows for pairwise comparison using SIMD.
 fn process_row_range(
     hashes: &[u64],
@@ -929,13 +955,11 @@ fn process_row_range(
         kernel.call(hashes[i], &hashes[i + 1..], row_distances);
 
         let id_a = row_ids.map_or(i as u64, |ids| ids[i]);
-        for (j_offset, &dist) in row_distances.iter().enumerate() {
-            if dist <= threshold {
-                let j = i + 1 + j_offset;
-                let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
-                result.push(id_a, id_b, dist);
-            }
-        }
+        for_each_within(row_distances, threshold, |j_offset, dist| {
+            let j = i + 1 + j_offset;
+            let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
+            result.push(id_a, id_b, dist);
+        });
     }
 
     result
@@ -977,13 +1001,11 @@ fn process_row_range_binary(
         }
 
         let id_a = row_ids.map_or(i as u64, |ids| ids[i]);
-        for (j_offset, &dist) in row_distances.iter().enumerate() {
-            if dist <= threshold {
-                let j = i + 1 + j_offset;
-                let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
-                result.push(id_a, id_b, dist);
-            }
-        }
+        for_each_within(row_distances, threshold, |j_offset, dist| {
+            let j = i + 1 + j_offset;
+            let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
+            result.push(id_a, id_b, dist);
+        });
     }
 
     result
