@@ -709,7 +709,7 @@ mod x86 {
 
     use crate::distance::{BatchKernel, PairKernel};
     use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::x86::hsum256_ps;
+    use crate::simd::x86::{fixed_width_rows, hsum256_ps};
     use crate::simd::{FloatSimd, SIMD};
 
     lance_core::target_kernel! {
@@ -717,7 +717,9 @@ mod x86 {
         #[candidate(pub(super) L2_F32_BATCH_AVX_FMA: BatchKernel)]
         /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
         /// to its remainder loop, so the explicit AVX kernel wins; above that
-        /// the auto-vectorized scalar kernel is as good or better.
+        /// the auto-vectorized scalar kernel is as good or better. That is
+        /// `l2_scalar` itself: LLVM declines to inline the `#[inline]`
+        /// `l2_f32_scalar` wrapper into this many loops.
         pub(super) fn l2_batch_f32_avx_fma(
             x: &[f32],
             batch: &[f32],
@@ -735,24 +737,14 @@ mod x86 {
             } else if dimension == 16
                 && let Ok(key) = <&[f32; 16]>::try_from(x)
             {
-                // Same sums as `l2_f32_avx_fma`, whose first FMA adds to zero,
-                // with the key loaded once per batch.
-                let (key_lo, key_hi) =
-                    unsafe { (_mm256_loadu_ps(key.as_ptr()), _mm256_loadu_ps(key.as_ptr().add(8))) };
-                for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
-                    let (y_lo, y_hi) =
-                        unsafe { (_mm256_loadu_ps(y.as_ptr()), _mm256_loadu_ps(y.as_ptr().add(8))) };
-                    let (diff_lo, diff_hi) = (_mm256_sub_ps(key_lo, y_lo), _mm256_sub_ps(key_hi, y_hi));
-                    let sum = _mm256_fmadd_ps(diff_hi, diff_hi, _mm256_mul_ps(diff_lo, diff_lo));
-                    *distance = unsafe { hsum256_ps(sum) };
-                }
+                fixed_width_rows(key, batch, output, |x, y| l2_f32_avx_fma(x, y));
             } else if dimension <= 16 {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                     *distance = l2_f32_avx_fma(x, y);
                 }
             } else {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                    *distance = super::l2_f32_scalar(x, y);
+                    *distance = super::l2_scalar::<f32, f32, 16>(x, y);
                 }
             }
         }
@@ -775,6 +767,10 @@ mod x86 {
                     let diff = _mm256_sub_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     *distance = unsafe { hsum256_ps(_mm256_mul_ps(diff, diff)) };
                 }
+            } else if dimension == 16
+                && let Ok(key) = <&[f32; 16]>::try_from(x)
+            {
+                fixed_width_rows(key, batch, output, |x, y| l2_f32_avx(x, y));
             } else {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                     *distance = l2_f32_avx(x, y);

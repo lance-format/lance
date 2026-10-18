@@ -700,7 +700,7 @@ mod x86 {
 
     use crate::distance::{BatchKernel, PairKernel};
     use crate::simd::f64::{f64x4, f64x8};
-    use crate::simd::x86::hsum256_ps;
+    use crate::simd::x86::{fixed_width_rows, hsum256_ps};
     use crate::simd::{FloatSimd, SIMD};
 
     lance_core::target_kernel! {
@@ -708,11 +708,9 @@ mod x86 {
         #[candidate(pub(super) DOT_F32_BATCH_AVX_FMA: BatchKernel)]
         /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
         /// to its remainder loop, so the explicit AVX kernel wins; above that
-        /// the auto-vectorized scalar kernel is as good or better.
-        ///
-        /// Unlike `l2_batch_f32_avx_fma` there is no dimension-16 fast path:
-        /// that one closed a Haswell regression in PQ L2 tables, while dot at
-        /// dimension 16 was already faster than before `Dispatch`.
+        /// the auto-vectorized scalar kernel is as good or better. That is
+        /// `dot_scalar` itself: LLVM declines to inline the `#[inline]`
+        /// `dot_f32_scalar` wrapper into this many loops.
         pub(super) fn dot_batch_f32_avx_fma(
             x: &[f32],
             batch: &[f32],
@@ -727,13 +725,17 @@ mod x86 {
                     let product = _mm256_mul_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     *distance = unsafe { hsum256_ps(product) };
                 }
+            } else if dimension == 16
+                && let Ok(key) = <&[f32; 16]>::try_from(x)
+            {
+                fixed_width_rows(key, batch, output, |x, y| dot_f32_avx_fma(x, y));
             } else if dimension <= 16 {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                     *distance = dot_f32_avx_fma(x, y);
                 }
             } else {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                    *distance = super::dot_f32_scalar(x, y);
+                    *distance = super::dot_scalar::<f32, f32, 16>(x, y);
                 }
             }
         }
@@ -756,6 +758,10 @@ mod x86 {
                     let product = _mm256_mul_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     *distance = unsafe { hsum256_ps(product) };
                 }
+            } else if dimension == 16
+                && let Ok(key) = <&[f32; 16]>::try_from(x)
+            {
+                fixed_width_rows(key, batch, output, |x, y| dot_f32_avx(x, y));
             } else {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
                     *distance = dot_f32_avx(x, y);

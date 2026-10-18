@@ -6,7 +6,8 @@
 //! Each distance kernel accumulates into a 256-bit register and folds it down
 //! to a scalar once, after the main loop. The fold is identical across
 //! `cosine`, `dot`, `l2` and `norm_l2`, so it lives here instead of being
-//! copied into each kernel's private `mod x86`.
+//! copied into each kernel's private `mod x86`. So do the batch loops that
+//! the `dot` and `l2` batch kernels share.
 //!
 //! The module itself is `pub(crate)`, which is what keeps these helpers off the
 //! public API; the items are `pub` rather than `pub(crate)` only because
@@ -54,6 +55,26 @@ pub unsafe fn hsum256_pd(v: __m256d) -> f64 {
     let sum128 = _mm_add_pd(lo, hi);
     let sum64 = _mm_add_pd(sum128, _mm_unpackhi_pd(sum128, sum128));
     _mm_cvtsd_f64(sum64)
+}
+
+/// Writes `pair(key, y)` for each `D`-wide vector `y` of `batch` into the
+/// matching element of `output`.
+///
+/// Batch kernels call this once per batch for each common PQ sub-vector
+/// width. With `D` constant, `pair` inlines fully unrolled with no tail, and
+/// each width gets a loop, and a register allocation, of its own: sharing one
+/// loop across widths left its invariants spilled to the stack (#10083).
+/// `pair` is the generic-width kernel, so the result is unchanged.
+#[inline(always)]
+pub fn fixed_width_rows<const D: usize>(
+    key: &[f32; D],
+    batch: &[f32],
+    output: &mut [f32],
+    pair: impl Fn(&[f32], &[f32]) -> f32,
+) {
+    for (distance, y) in output.iter_mut().zip(batch.as_chunks::<D>().0) {
+        *distance = pair(key, y);
+    }
 }
 
 #[cfg(test)]
