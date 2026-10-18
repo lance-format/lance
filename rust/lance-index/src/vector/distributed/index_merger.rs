@@ -555,6 +555,9 @@ struct ShardInfo {
     partition_offsets: Vec<usize>,
     total_rows: usize,
     row_filter: Option<Arc<OldIndexDataFilter>>,
+    // fork(vamana): a Vamana scalar-code shard's own metadata, and how its codes are re-encoded.
+    scalar_metadata: Option<ScalarQuantizationMetadata>,
+    recode: Option<crate::vector::vamana::shards::ScalarRecode>,
 }
 
 #[derive(Debug)]
@@ -800,7 +803,8 @@ async fn read_shard_window_partitions(
     Ok(per_partition_batches)
 }
 
-fn filter_batch_to_owned_rows(
+// fork(vamana): crate-visible for the re-encoding of Vamana's scalar codes.
+pub(crate) fn filter_batch_to_owned_rows(
     batch: &RecordBatch,
     row_filter: &OldIndexDataFilter,
 ) -> Result<RecordBatch> {
@@ -824,6 +828,10 @@ fn filter_batch_to_owned_rows(
 /// IVF_HNSW_SQ storage types. For PQ and SQ, this assumes all selected source
 /// segments share the same quantizer/codebook and distance type; it reuses the
 /// first encountered metadata.
+///
+/// fork(vamana): IVF_VAMANA_* storage merges too. Its product codes stay
+/// row-major, and the codes of IVF_VAMANA_SQ shards, which each train their
+/// own bounds, are re-encoded to bounds the shards share.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],
@@ -973,6 +981,9 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
                     "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                     "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
+                    "IVF_VAMANA_FLAT" => SupportedIvfIndexType::IvfVamanaFlat, // fork(vamana)
+                    "IVF_VAMANA_PQ" => SupportedIvfIndexType::IvfVamanaPq,
+                    "IVF_VAMANA_SQ" => SupportedIvfIndexType::IvfVamanaSq,
                     other => {
                         return Err(Error::index(format!(
                             "Unsupported index type in shard index.idx: {}",
@@ -1044,6 +1055,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
         // Preserve the historical fallback while keeping the writer boundary exact.
         let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
+        let mut scalar_metadata = None; // fork(vamana)
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -1339,7 +1351,8 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     v2w_opt = Some(w);
                 }
             }
-            SupportedIvfIndexType::IvfHnswFlat => {
+            SupportedIvfIndexType::IvfHnswFlat | SupportedIvfIndexType::IvfVamanaFlat => {
+                // fork(vamana)
                 // Treat HNSW_FLAT storage the same as FLAT and preserve the actual flat item dtype.
                 let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
                 let Some(flat_field) = schema_arrow
@@ -1372,7 +1385,8 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     v2w_opt = Some(w);
                 }
             }
-            SupportedIvfIndexType::IvfHnswPq => {
+            SupportedIvfIndexType::IvfHnswPq | SupportedIvfIndexType::IvfVamanaPq => {
+                // fork(vamana)
                 // Treat HNSW_PQ storage the same as PQ: reuse PQ metadata and schema creation
                 let pm_json = if let Some(pm_json) =
                     reader.metadata().file_schema.metadata.get(PQ_METADATA_KEY)
@@ -1463,12 +1477,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
+                    // fork(vamana): Vamana keeps product codes row-major.
+                    pm_for_unified.transposed &= idx_type != SupportedIvfIndexType::IvfVamanaPq;
                     let w =
                         init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
                     v2w_opt = Some(w);
                 }
             }
-            SupportedIvfIndexType::IvfHnswSq => {
+            SupportedIvfIndexType::IvfHnswSq | SupportedIvfIndexType::IvfVamanaSq => {
+                // fork(vamana)
                 // Treat HNSW_SQ storage the same as SQ: reuse SQ metadata and schema creation
                 let sq_json = if let Some(sq_json) =
                     reader.metadata().file_schema.metadata.get(SQ_METADATA_KEY)
@@ -1519,6 +1536,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                         init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
                 }
+                scalar_metadata = Some(sq_meta_parsed); // fork(vamana)
             }
         }
 
@@ -1542,6 +1560,8 @@ async fn merge_partial_vector_auxiliary_files_inner(
             partition_offsets,
             total_rows: running_offset,
             row_filter: row_filters.map(|filters| Arc::new(filters[idx].clone())),
+            scalar_metadata, // fork(vamana)
+            recode: None,
         });
         progress
             .stage_progress("read_shard_metadata", idx as u64 + 1)
@@ -1559,6 +1579,39 @@ async fn merge_partial_vector_auxiliary_files_inner(
     let nlist = nlist_opt.ok_or_else(|| Error::index("Missing IVF partition count".to_string()))?;
     let idx_type_final = detected_index_type
         .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
+    // fork(vamana): each shard trained its own scalar bounds; all are re-encoded to bounds they share.
+    if idx_type_final == SupportedIvfIndexType::IvfVamanaSq {
+        let mut shards = Vec::with_capacity(shard_infos.len());
+        for shard in &shard_infos {
+            let metadata = shard.scalar_metadata.clone().ok_or_else(|| {
+                Error::index("SQ metadata missing from an IVF_VAMANA_SQ shard".to_string())
+            })?;
+            let kept = crate::vector::vamana::shards::keeps_rows(
+                shard.reader.as_ref(),
+                shard.total_rows,
+                shard.row_filter.as_deref(),
+            )
+            .await?;
+            shards.push((metadata, kept));
+        }
+        if let Some((shared, recodes)) = crate::vector::vamana::shards::ScalarRecode::plan(&shards)?
+        {
+            let writer = v2w_opt
+                .as_mut()
+                .ok_or_else(|| Error::index("Failed to initialize unified writer".to_string()))?;
+            let dt = distance_type
+                .ok_or_else(|| Error::index(format!("Missing {} in shard", DISTANCE_TYPE_KEY)))?;
+            init_writer_for_storage(
+                writer,
+                dt,
+                &serde_json::to_string(&shared)?,
+                SQ_METADATA_KEY,
+            )?;
+            for (shard, recode) in shard_infos.iter_mut().zip(recodes) {
+                shard.recode = recode;
+            }
+        }
+    }
 
     let total_rows = accumulated_lengths
         .iter()
@@ -1571,9 +1624,13 @@ async fn merge_partial_vector_auxiliary_files_inner(
     let mut merged_lengths = vec![0u32; nlist];
 
     match idx_type_final {
-        SupportedIvfIndexType::IvfPq | SupportedIvfIndexType::IvfHnswPq => {
+        SupportedIvfIndexType::IvfPq
+        | SupportedIvfIndexType::IvfHnswPq
+        | SupportedIvfIndexType::IvfVamanaPq => {
+            // fork(vamana)
             // For PQ-backed indices, transpose PQ codes while merging partitions
-            // so that the unified file stores column-major PQ codes.
+            // so that the unified file stores column-major PQ codes; IVF_VAMANA_PQ
+            // keeps them row-major.
             let partition_window_size = *PARTITION_WINDOW_SIZE;
             let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
             let mut shard_merge_reader = ShardMergeReader::new(
@@ -1592,7 +1649,11 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 let schema = batches[0].schema();
                 let partition_batch = concat_batches(&schema, batches.iter())?;
                 if let Some(w) = v2w_opt.as_mut() {
-                    write_partition_rows_pq_transposed(w, partition_batch).await?;
+                    if idx_type_final == SupportedIvfIndexType::IvfVamanaPq {
+                        w.write_batch(&partition_batch).await?; // fork(vamana): row-major
+                    } else {
+                        write_partition_rows_pq_transposed(w, partition_batch).await?;
+                    }
                 }
                 merged_lengths[pid] = u32::try_from(partition_len).map_err(|_| {
                     Error::index(format!("Merged partition {pid} exceeds u32 row capacity"))
@@ -1667,7 +1728,17 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     let writer = v2w_opt.as_mut().ok_or_else(|| {
                         Error::index("Failed to initialize unified writer".to_string())
                     })?;
-                    let written = if let Some(row_filter) = shard.row_filter.as_deref() {
+                    let written = if let Some(recode) = shard.recode.as_ref() {
+                        // fork(vamana)
+                        crate::vector::vamana::shards::write_recoded_partition_rows(
+                            shard.reader.as_ref(),
+                            writer,
+                            offset..offset + source_len,
+                            shard.row_filter.as_deref(),
+                            recode,
+                        )
+                        .await?
+                    } else if let Some(row_filter) = shard.row_filter.as_deref() {
                         write_filtered_partition_rows(
                             shard.reader.as_ref(),
                             writer,

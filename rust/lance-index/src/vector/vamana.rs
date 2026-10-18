@@ -21,6 +21,7 @@ pub mod insert;
 pub mod params;
 pub mod remap;
 pub mod search;
+pub(crate) mod shards;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod walk;

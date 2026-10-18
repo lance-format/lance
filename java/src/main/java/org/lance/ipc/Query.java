@@ -382,7 +382,8 @@ public class Query {
 
     /**
      * Sets the number of candidates to reserve while searching. This is an optional parameter for
-     * HNSW related index types. Defaults to {@code 1.5 * k * refineFactor}, floored at 256.
+     * HNSW related index types, and the candidates the walk of an IVF_VAMANA_* index keeps. For
+     * HNSW it defaults to {@code 1.5 * k * refineFactor}, floored at 256.
      *
      * @param ef The number of candidates to reserve.
      * @return The Builder instance for method chaining.

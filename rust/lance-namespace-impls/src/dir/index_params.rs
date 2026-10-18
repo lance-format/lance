@@ -68,6 +68,9 @@ impl DirectoryNamespace {
             "IVF_HNSW_FLAT" => Ok(IndexType::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(IndexType::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(IndexType::IvfHnswPq),
+            "IVF_VAMANA_FLAT" => Ok(IndexType::IvfVamanaFlat), // fork(vamana)
+            "IVF_VAMANA_SQ" => Ok(IndexType::IvfVamanaSq),     // fork(vamana)
+            "IVF_VAMANA_PQ" => Ok(IndexType::IvfVamanaPq),     // fork(vamana)
             other => Err(NamespaceError::InvalidInput {
                 message: format!("Unsupported index_type '{}'", other),
             }
@@ -227,6 +230,34 @@ impl DirectoryNamespace {
                     Self::parse_metric_type(request.distance_type.as_deref())?,
                     IvfBuildParams::default(),
                     HnswBuildParams::default(),
+                    PQBuildParams::default(),
+                ),
+            },
+            // fork(vamana): like the HNSW arms, these read only the distance from
+            // the request, and every build parameter keeps its default.
+            IndexType::IvfVamanaFlat => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::ivf_vamana(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    lance_index::vector::vamana::VamanaBuildParams::default(),
+                ),
+            },
+            IndexType::IvfVamanaSq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_vamana_sq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    lance_index::vector::vamana::VamanaBuildParams::default(),
+                    SQBuildParams::default(),
+                ),
+            },
+            IndexType::IvfVamanaPq => DirectoryIndexParams::Vector {
+                index_type,
+                params: VectorIndexParams::with_ivf_vamana_pq_params(
+                    Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
+                    lance_index::vector::vamana::VamanaBuildParams::default(),
                     PQBuildParams::default(),
                 ),
             },

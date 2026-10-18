@@ -288,6 +288,10 @@ impl<'a> CreateIndexBuilder<'a> {
             .map(|resolved| resolved.canonical_path.as_str())
             .unwrap_or(quoted_column.as_str());
 
+        // fork(vamana): refuse unbuildable IVF_VAMANA_* parameters before a row is read.
+        if let Some(params) = self.params.as_any().downcast_ref::<VectorIndexParams>() {
+            super::vector::vamana::check_params(self.dataset, column, params)?;
+        }
         // A fragment list naming the whole table is a whole-table build, not a
         // subset: `effective_vector_fragments` normalizes it to `None` so a
         // retrain gets the same row floor as a create.
@@ -295,6 +299,12 @@ impl<'a> CreateIndexBuilder<'a> {
             is_builtin_vector_index(self.index_type, self.params)
                 .then(|| effective_vector_fragments(self.dataset, self.fragments.as_deref()))
                 .flatten();
+        // fork(vamana): a Vamana shard over every fragment is still a shard.
+        let vector_fragments_for_validation = super::vector::vamana::shard_fragments(
+            self.params.as_any().downcast_ref::<VectorIndexParams>(),
+            self.fragments.as_deref(),
+            vector_fragments_for_validation,
+        );
         let quantizer_minimum_rows = self
             .params
             .as_any()
@@ -537,7 +547,10 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq,
+                | IndexType::IvfHnswSq
+                | IndexType::IvfVamanaFlat // fork(vamana)
+                | IndexType::IvfVamanaPq
+                | IndexType::IvfVamanaSq,
                 LANCE_VECTOR_INDEX,
             ) => {
                 // Vector index params.
@@ -552,6 +565,12 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
+                // fork(vamana): a Vamana shard over every fragment is still a shard.
+                let effective_fragments = super::vector::vamana::shard_fragments(
+                    Some(vec_params),
+                    self.fragments.as_deref(),
+                    effective_fragments,
+                );
                 let (files, built_target) = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
@@ -1012,6 +1031,9 @@ fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> b
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
+                | IndexType::IvfVamanaFlat // fork(vamana)
+                | IndexType::IvfVamanaPq
+                | IndexType::IvfVamanaSq
         )
         && params.as_any().is::<VectorIndexParams>()
 }

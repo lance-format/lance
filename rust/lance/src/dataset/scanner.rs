@@ -7331,7 +7331,9 @@ impl Scanner {
                 .map(|details| {
                     let index_type =
                         crate::index::vector::details::derive_vector_index_type(details);
-                    index_type.starts_with("IVF_") && !index_type.contains("HNSW")
+                    index_type.starts_with("IVF_")
+                        && !index_type.contains("HNSW")
+                        && !index_type.contains("VAMANA") // fork(vamana)
                 })
                 .unwrap_or(false)
         });

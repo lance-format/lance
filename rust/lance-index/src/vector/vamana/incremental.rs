@@ -72,7 +72,7 @@ pub fn build_incremental(
     }
     let dead = base_row_ids.len() - matched;
     let added = num_rows - matched;
-    if matched == 0 || dead * 2 > base_row_ids.len() || added > matched * 2 {
+    if !may_extend(base_row_ids.len(), matched, num_rows) {
         return Vamana::index_vectors(storage, params);
     }
 
@@ -139,6 +139,16 @@ pub fn build_incremental(
     }
     let entry_points = train_entry_points(storage, VAMANA_SEED)?;
     Vamana::from_graph(&graph, medoid, entry_points, params)
+}
+
+/// Whether [`build_incremental`] may extend a base graph of `vertices`
+/// vertices into a merged partition of `num_rows` rows whose first `matched`
+/// rows are vertices of the base, rather than build the partition anew: some
+/// rows matched, at most half of the base dead, and at most twice as many new
+/// rows as matched ones. More matched rows or fewer merged ones never turn it
+/// false, so that a bound on each tells a merge it need not read the base.
+pub(super) fn may_extend(vertices: usize, matched: usize, num_rows: usize) -> bool {
+    matched > 0 && 2 * matched >= vertices && num_rows <= 3 * matched
 }
 
 #[cfg(test)]
@@ -302,6 +312,38 @@ mod tests {
             build_incremental(&base, &merged, kept_rows as usize, merge_params.clone()).unwrap();
         let fresh = Vamana::index_vectors(&merged, merge_params).unwrap();
         assert_eq!(result.to_batch().unwrap(), fresh.to_batch().unwrap());
+    }
+
+    /// A merge leaves out a base graph that the most rows that could match it,
+    /// among the fewest the merged partition could hold, would not extend.
+    /// That is sound only if more matched rows or fewer merged ones never turn
+    /// an extension into a rebuild.
+    #[test]
+    fn more_matched_or_fewer_merged_rows_never_turn_an_extension_into_a_rebuild() {
+        for vertices in 0..20 {
+            for matched in 0..20 {
+                for num_rows in 0..70 {
+                    if may_extend(vertices, matched, num_rows) {
+                        assert!(
+                            may_extend(vertices, matched + 1, num_rows),
+                            "{vertices} vertices, {matched} matched, {num_rows} rows"
+                        );
+                        assert!(
+                            num_rows == 0 || may_extend(vertices, matched, num_rows - 1),
+                            "{vertices} vertices, {matched} matched, {num_rows} rows"
+                        );
+                    }
+                }
+            }
+        }
+        // Half the base dead, or twice as many new rows as matched ones, still
+        // extends; one row more of either does not.
+        assert!(may_extend(10, 5, 15));
+        assert!(!may_extend(10, 4, 12));
+        assert!(!may_extend(10, 5, 16));
+        assert!(may_extend(9, 5, 15));
+        assert!(!may_extend(9, 4, 12));
+        assert!(!may_extend(0, 0, 0));
     }
 
     /// The last ten base rows were updated under stable row ids: gone from

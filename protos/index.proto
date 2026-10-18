@@ -230,6 +230,23 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+
+  /* fork(vamana): set on an IVF_VAMANA_* index, whose partitions each hold a
+   * Vamana graph; absent on every other vector index.
+   */
+  optional VamanaParameters vamana_index_config = 100;
+}
+
+/* fork(vamana): how the Vamana (DiskANN) graph of each IVF partition was
+ * built.
+ */
+message VamanaParameters {
+  // R: the most out-edges a vertex keeps.
+  uint32 max_degree = 1;
+  // L: the candidates each build-time search keeps.
+  uint32 search_list_size = 2;
+  // The pruning slack of the second build pass, at least 1.
+  float alpha = 3;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

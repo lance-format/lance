@@ -1079,6 +1079,26 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?
         }
+        (SubIndexType::Vamana, quantization_type) => {
+            // fork(vamana)
+            super::vamana::optimize(
+                dataset,
+                unindexed,
+                vector_column,
+                index_dir,
+                distance_type,
+                shuffler,
+                ivf_model,
+                quantizer,
+                quantization_type,
+                reference_index.as_ref(),
+                &existing_indices,
+                frag_reuse_index,
+                options,
+                target_partition_size,
+            )
+            .await?
+        }
         (sub_index_type, quantization_type) => {
             unimplemented!(
                 "unsupported index type: {}, {}",
@@ -2420,6 +2440,18 @@ pub(crate) async fn remap_index_file_v3(
             )
             .await
         }
+        (SubIndexType::Vamana, quantization_type) => {
+            // fork(vamana)
+            super::vamana::remap(
+                dataset,
+                column,
+                index_dir,
+                index,
+                mapping,
+                quantization_type,
+            )
+            .await
+        }
     }
 }
 
@@ -2835,6 +2867,7 @@ async fn merge_segments_inner(
     if segments.len() == 1 {
         return Ok(segments.into_iter().next().unwrap());
     }
+    super::vamana::segments::check_mergeable(object_store, indices_dir, &segments).await?; // fork(vamana)
 
     let mut merged_segment = segments[0].clone();
     let mut fragment_bitmap = RoaringBitmap::new();
@@ -3070,6 +3103,19 @@ async fn write_root_vector_index_from_auxiliary(
                 distance_type: dt,
             }
         };
+    if idx_meta.index_type.starts_with("IVF_VAMANA") {
+        // fork(vamana): each partition's graph is drawn over its merged rows.
+        return super::vamana::segments::write_merged_root(
+            object_store,
+            index_dir,
+            aux_reader,
+            &ivf_model,
+            &idx_meta,
+            centroid_source_index_paths,
+            progress,
+        )
+        .await;
+    }
     if let Some(source_hnsw_index_metadata) =
         read_hnsw_index_metadata_from_sources(object_store, &scheduler, centroid_source_index_paths)
             .await?

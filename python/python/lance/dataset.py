@@ -4222,6 +4222,10 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
             "IVF_RQ",
+            # fork(vamana)
+            "IVF_VAMANA_FLAT",
+            "IVF_VAMANA_PQ",
+            "IVF_VAMANA_SQ",
         ]
         if index_type not in valid_index_types:
             raise NotImplementedError(
@@ -4700,6 +4704,18 @@ class LanceDataset(pa.dataset.Dataset):
                 Int, the number of edges per node in the graph.
             ef_construction
                 Int, the number of nodes to examine during the construction.
+
+        Optional parameters for `IVF_VAMANA_*`, which support the l2 and cosine
+        metrics only:
+            max_degree
+                Int, the most out-edges a vertex of a partition's graph keeps.
+                Default is 64.
+            search_list_size
+                Int, the candidates each search keeps while the graph is built.
+                Default is 100.
+            alpha
+                Float of at least 1.0, the pruning slack of the second build pass.
+                Default is 1.2.
 
         Examples
         --------
@@ -8831,8 +8847,9 @@ def _build_vector_search_query(
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
-        Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
-        floored at 256.
+        Beam width for HNSW search, and the search list of an
+        ``IVF_VAMANA_*`` index's walk. For HNSW it defaults to
+        ``1.5 * k * refine_factor``, floored at 256.
     query_parallelism: int, optional
         Maximum partition-search concurrency for a single vector query.
         The default is 0. Value 0 uses the automatic policy, which currently

@@ -27,6 +27,7 @@ public class VectorIndexParams {
   private final Optional<HnswBuildParams> hnswParams;
   private final Optional<SQBuildParams> sqParams;
   private final Optional<RQBuildParams> rqParams;
+  private final Optional<VamanaBuildParams> vamanaParams; // fork(vamana)
 
   private VectorIndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
@@ -35,6 +36,7 @@ public class VectorIndexParams {
     this.hnswParams = builder.hnswParams;
     this.sqParams = builder.sqParams;
     this.rqParams = builder.rqParams;
+    this.vamanaParams = builder.vamanaParams; // fork(vamana)
     validate();
   }
 
@@ -44,6 +46,10 @@ public class VectorIndexParams {
             + (rqParams.isPresent() ? 1 : 0)
         > 1) {
       throw new IllegalArgumentException("Only one of PQ, SQ, or RQ can be specified at a time.");
+    }
+    // fork(vamana)
+    if (hnswParams.isPresent() && vamanaParams.isPresent()) {
+      throw new IllegalArgumentException("Only one of HNSW or Vamana can be specified at a time.");
     }
     if (hnswParams.isPresent() && !pqParams.isPresent() && !sqParams.isPresent()) {
       throw new IllegalArgumentException("HNSW must be combined with either PQ or SQ");
@@ -172,6 +178,62 @@ public class VectorIndexParams {
         .build();
   }
 
+  // fork(vamana)
+  /**
+   * Create a new IVF_VAMANA_FLAT index. The dataset is partitioned into IVF partitions, and each
+   * partition builds a Vamana graph over its vectors as they are. Supports the l2 and cosine
+   * distances only.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param ivf the IVF build parameters
+   * @param vamana the Vamana build parameters
+   * @return the VectorIndexParams
+   */
+  public static VectorIndexParams ivfVamana(
+      DistanceType distanceType, IvfBuildParams ivf, VamanaBuildParams vamana) {
+    return new Builder(ivf).setDistanceType(distanceType).setVamanaParams(vamana).build();
+  }
+
+  /**
+   * Create a new IVF_VAMANA_SQ index. The dataset is partitioned into IVF partitions, and each
+   * partition builds a Vamana graph over, and walks it with, 8-bit scalar-quantized codes. Supports
+   * the l2 and cosine distances only.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param ivf the IVF build parameters
+   * @param vamana the Vamana build parameters
+   * @param sq the SQ build parameters
+   * @return the VectorIndexParams
+   */
+  public static VectorIndexParams withIvfVamanaSqParams(
+      DistanceType distanceType, IvfBuildParams ivf, VamanaBuildParams vamana, SQBuildParams sq) {
+    return new Builder(ivf)
+        .setDistanceType(distanceType)
+        .setVamanaParams(vamana)
+        .setSqParams(sq)
+        .build();
+  }
+
+  /**
+   * Create a new IVF_VAMANA_PQ index. The dataset is partitioned into IVF partitions, and each
+   * partition builds a Vamana graph over, and walks it with, product-quantized codes. Supports the
+   * l2 and cosine distances only.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param ivf the IVF build parameters
+   * @param vamana the Vamana build parameters
+   * @param pq the PQ build parameters
+   * @return the VectorIndexParams
+   */
+  public static VectorIndexParams withIvfVamanaPqParams(
+      DistanceType distanceType, IvfBuildParams ivf, VamanaBuildParams vamana, PQBuildParams pq) {
+    return new Builder(ivf)
+        .setDistanceType(distanceType)
+        .setVamanaParams(vamana)
+        .setPqParams(pq)
+        .build();
+  }
+
   public static class Builder {
     private DistanceType distanceType = DistanceType.L2;
     private final IvfBuildParams ivfParams;
@@ -179,6 +241,7 @@ public class VectorIndexParams {
     private Optional<HnswBuildParams> hnswParams = Optional.empty();
     private Optional<SQBuildParams> sqParams = Optional.empty();
     private Optional<RQBuildParams> rqParams = Optional.empty();
+    private Optional<VamanaBuildParams> vamanaParams = Optional.empty(); // fork(vamana)
 
     /**
      * Create a new builder to create a vector index.
@@ -235,6 +298,17 @@ public class VectorIndexParams {
       return this;
     }
 
+    // fork(vamana)
+    /**
+     * @param vamanaParams the Vamana build parameters for building the Vamana graph for each IVF
+     *     partition. Combines with no quantizer, with SQ or with PQ, and excludes HNSW
+     * @return Builder
+     */
+    public Builder setVamanaParams(VamanaBuildParams vamanaParams) {
+      this.vamanaParams = Optional.of(vamanaParams);
+      return this;
+    }
+
     public VectorIndexParams build() {
       return new VectorIndexParams(this);
     }
@@ -268,6 +342,10 @@ public class VectorIndexParams {
     return rqParams;
   }
 
+  public Optional<VamanaBuildParams> getVamanaParams() { // fork(vamana)
+    return vamanaParams;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -277,6 +355,7 @@ public class VectorIndexParams {
         .add("hnswParams", hnswParams.orElse(null))
         .add("sqParams", sqParams.orElse(null))
         .add("rqParams", rqParams.orElse(null))
+        .add("vamanaParams", vamanaParams.orElse(null)) // fork(vamana)
         .toString();
   }
 }

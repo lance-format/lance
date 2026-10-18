@@ -17,6 +17,7 @@ use lance_linalg::distance::DistanceType;
 use super::build::build_partition;
 use super::entry_points::train_entry_points;
 use super::graph::{Adjacency, LoadedGraph, PartitionGraph, neighbor_item_field};
+use super::incremental::{self, build_incremental};
 use super::params::{VAMANA_FORMAT_VERSION, VamanaBuildParams, VamanaMetadata, VamanaQueryParams};
 use super::search::{Comparisons, StopRule};
 use super::walk::{Admission, WalkParams, Walked, walk, with_scratch};
@@ -484,6 +485,19 @@ impl IvfSubIndex for Vamana {
         let built = build_partition(storage, &params, VAMANA_SEED, &Comparisons::default())?;
         let entry_points = train_entry_points(storage, VAMANA_SEED)?;
         Self::from_graph(&built.graph, built.medoid, entry_points, params)
+    }
+
+    fn may_extend(vertices: usize, matched: usize, num_rows: usize) -> bool {
+        incremental::may_extend(vertices, matched, num_rows)
+    }
+
+    fn index_vectors_incremental(
+        base: &Self,
+        storage: &impl VectorStore,
+        base_rows: usize,
+        params: Self::BuildParams,
+    ) -> Result<Self> {
+        build_incremental(base, storage, base_rows, params)
     }
 
     fn remap(&self, mapping: &RowAddrRemap, store: &impl VectorStore) -> Result<Self> {

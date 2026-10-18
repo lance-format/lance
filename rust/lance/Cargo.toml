@@ -98,6 +98,10 @@ semver.workspace = true
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 
+# fork(vamana): IVF_VAMANA re-scores read local data files with preadv2.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { workspace = true, optional = true }

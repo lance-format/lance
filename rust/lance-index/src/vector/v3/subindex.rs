@@ -129,6 +129,37 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     where
         Self: Sized;
 
+    // fork(vamana)
+    /// Whether [`Self::index_vectors_incremental`] may extend a base of
+    /// `vertices` rows into a merged partition of `num_rows` rows whose first
+    /// `matched` rows are the base's; `false` when it builds the partition
+    /// anew whatever the base holds. More matched rows or fewer merged ones
+    /// never turn it false, so that a merge holding a bound on each need not
+    /// read a base it would not extend. By default nothing is extended.
+    fn may_extend(_vertices: usize, _matched: usize, _num_rows: usize) -> bool {
+        false
+    }
+
+    /// Build the sub index of `storage`, a partition an index merge assembled
+    /// from the rows `base` was built over and new rows, by extending `base`.
+    ///
+    /// The first `base_rows` positions of `storage` are rows of `base`'s
+    /// partition, in their order there, some of them filtered out. Past them a
+    /// row id proves nothing: a rewritten row comes back with a new vector under
+    /// its old stable row id, or at its old address when rewritten in place.
+    /// By default the sub index is built anew.
+    fn index_vectors_incremental(
+        _base: &Self,
+        storage: &impl VectorStore,
+        _base_rows: usize,
+        params: Self::BuildParams,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::index_vectors(storage, params)
+    }
+
     fn remap(&self, mapping: &RowAddrRemap, store: &impl VectorStore) -> Result<Self>
     where
         Self: Sized;
@@ -141,6 +172,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 pub enum SubIndexType {
     Flat,
     Hnsw,
+    Vamana, // fork(vamana)
 }
 
 impl std::fmt::Display for SubIndexType {
@@ -148,6 +180,7 @@ impl std::fmt::Display for SubIndexType {
         match self {
             Self::Flat => write!(f, "{}", flat::index::FlatIndex::name()),
             Self::Hnsw => write!(f, "{}", hnsw::builder::HNSW::name()),
+            Self::Vamana => write!(f, "{}", crate::vector::vamana::Vamana::name()), // fork(vamana)
         }
     }
 }
@@ -159,6 +192,7 @@ impl TryFrom<&str> for SubIndexType {
         match value {
             "FLAT" => Ok(Self::Flat),
             "HNSW" => Ok(Self::Hnsw),
+            "VAMANA" => Ok(Self::Vamana), // fork(vamana)
             _ => Err(Error::index(format!("unknown sub index type {}", value))),
         }
     }

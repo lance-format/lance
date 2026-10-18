@@ -2655,6 +2655,7 @@ impl Dataset {
             "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
+            "IVF_VAMANA_FLAT" | "IVF_VAMANA_PQ" | "IVF_VAMANA_SQ" => IndexType::Vector, // fork(vamana)
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -5431,6 +5432,14 @@ fn prepare_vector_index_params(
             hnsw_params,
             sq_params,
         ))),
+
+        // fork(vamana)
+        "IVF_VAMANA_FLAT" | "IVF_VAMANA_PQ" | "IVF_VAMANA_SQ" => {
+            crate::vamana::vector_index_params(
+                index_type, m_type, ivf_params, pq_params, sq_params, kwargs,
+            )
+            .map(Box::new)
+        }
 
         _ => Err(PyValueError::new_err(format!(
             "Index type '{index_type}' is not supported."

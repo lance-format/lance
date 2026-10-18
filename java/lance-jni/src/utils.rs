@@ -467,6 +467,9 @@ pub fn get_vector_index_params(
                 stages.push(StageParams::Hnsw(hnsw_params));
             }
 
+            // fork(vamana)
+            stages.extend(crate::vamana::stage(env, &vector_index_params_obj)?);
+
             // Parse PQBuildParams
             let pq_params = env.get_optional_from_method(
                 &vector_index_params_obj,
