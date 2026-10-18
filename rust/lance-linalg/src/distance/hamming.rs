@@ -17,7 +17,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
 
-use crate::distance::assert_batch_output_layout;
+use crate::distance::{BatchKernel, assert_batch_output_layout};
 use crate::{Error, Result};
 
 /// Schema of a Hamming distance-pair batch.
@@ -55,9 +55,37 @@ lance_core::dispatch! {
         {
             &[aarch64::HAMMING_NEON, HAMMING_PORTABLE]
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        // No AVX-512 candidate: it would make Haswell builds, whose baseline
+        // already covers AVX2, select at runtime on every pair. The batch
+        // kernels below select once per batch and do list it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::HAMMING_AVX2, HAMMING_PORTABLE]
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             &[HAMMING_PORTABLE]
+        }
+    };
+}
+
+lance_core::dispatch! {
+    static HAMMING_BATCH: Dispatch<BatchKernel<u8>> = {
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[aarch64::HAMMING_BATCH_NEON, HAMMING_BATCH_PORTABLE]
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[
+                x86::HAMMING_BATCH_AVX512,
+                x86::HAMMING_BATCH_AVX2,
+                HAMMING_BATCH_PORTABLE,
+            ]
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            &[HAMMING_BATCH_PORTABLE]
         }
     };
 }
@@ -79,7 +107,51 @@ lance_core::target_kernel! {
     #[candidate(HAMMING_PORTABLE: HammingKernel)]
     #[inline]
     fn hamming_portable(x: &[u8], y: &[u8]) -> f32 {
-        hamming_autovec::<64>(x, y)
+        hamming_words(x, y)
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(HAMMING_BATCH_PORTABLE: BatchKernel<u8>)]
+    fn hamming_into_portable(from: &[u8], to: &[u8], dimension: usize, output: &mut [f32]) {
+        hamming_rows(from, to, dimension, output, hamming_words);
+    }
+}
+
+/// Hamming distance over 8-byte words, which LLVM vectorizes to the widest
+/// popcount the enclosing kernel's target features allow.
+#[inline(always)]
+fn hamming_words(x: &[u8], y: &[u8]) -> f32 {
+    let n = x.len().min(y.len());
+    let (x_words, x_tail) = x[..n].as_chunks::<8>();
+    let (y_words, y_tail) = y[..n].as_chunks::<8>();
+    // Summing in u64 lets LLVM accumulate `vpsadbw`/`vpopcntq` results
+    // directly instead of narrowing each one to u32.
+    let words = x_words
+        .iter()
+        .zip(y_words)
+        .map(|(a, b)| (u64::from_ne_bytes(*a) ^ u64::from_ne_bytes(*b)).count_ones() as u64)
+        .sum::<u64>();
+    let tail = x_tail
+        .iter()
+        .zip(y_tail)
+        .map(|(&a, &b)| (a ^ b).count_ones() as u64)
+        .sum::<u64>();
+    (words + tail) as f32
+}
+
+/// Writes `pair(from, vector)` for each `dimension`-sized vector of `to`.
+#[inline(always)]
+fn hamming_rows(
+    from: &[u8],
+    to: &[u8],
+    dimension: usize,
+    output: &mut [f32],
+    pair: impl Fn(&[u8], &[u8]) -> f32,
+) {
+    for (distance, vector) in output.iter_mut().zip(to.chunks_exact(dimension)) {
+        *distance = pair(from, vector);
     }
 }
 
@@ -87,13 +159,27 @@ lance_core::target_kernel! {
 mod aarch64 {
     use std::arch::aarch64::*;
 
-    use super::{HAMMING_NEON_FLUSH_BYTES, HammingKernel};
+    use super::{HAMMING_NEON_FLUSH_BYTES, HammingKernel, hamming_rows};
+    use crate::distance::BatchKernel;
+
+    lance_core::target_kernel! {
+        #[target_features("neon")]
+        #[candidate(pub(super) HAMMING_BATCH_NEON: BatchKernel<u8>)]
+        pub(super) fn hamming_into_neon(
+            from: &[u8],
+            to: &[u8],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            hamming_rows(from, to, dimension, output, |x, y| hamming_neon(x, y));
+        }
+    }
 
     lance_core::target_kernel! {
         #[target_features("neon")]
         #[candidate(pub(super) HAMMING_NEON: HammingKernel)]
-        /// Sums per-byte popcounts in 16-bit lanes and reduces once per
-        /// block, where the portable kernel reduces every 64 bytes.
+        /// Sums per-byte popcounts in 16-bit lanes and reduces them once per
+        /// block.
         #[inline]
         pub(super) fn hamming_neon(x: &[u8], y: &[u8]) -> f32 {
             let n = x.len().min(y.len());
@@ -145,27 +231,6 @@ mod aarch64 {
     }
 }
 
-#[inline]
-fn hamming_autovec<const L: usize>(x: &[u8], y: &[u8]) -> f32 {
-    let (x_chunks, x_remainder) = x.as_chunks::<L>();
-    let (y_chunks, y_remainder) = y.as_chunks::<L>();
-    let sum = x_remainder
-        .iter()
-        .zip(y_remainder)
-        .map(|(&a, &b)| (a ^ b).count_ones())
-        .sum::<u32>();
-    (sum + x_chunks
-        .iter()
-        .zip(y_chunks)
-        .map(|(x, y)| {
-            x.iter()
-                .zip(y.iter())
-                .map(|(&a, &b)| (a ^ b).count_ones())
-                .sum::<u32>()
-        })
-        .sum::<u32>()) as f32
-}
-
 /// Scalar version of hamming distance. Used for benchmarks.
 #[inline]
 pub fn hamming_scalar(x: &[u8], y: &[u8]) -> f32 {
@@ -197,9 +262,7 @@ pub fn hamming_scalar(x: &[u8], y: &[u8]) -> f32 {
 /// `output` does not have one slot per vector.
 pub fn hamming_distance_batch_into(from: &[u8], to: &[u8], dimension: usize, output: &mut [f32]) {
     assert_batch_output_layout(from.len(), to.len(), dimension, output.len());
-    for (distance, vector) in output.iter_mut().zip(to.chunks_exact(dimension)) {
-        *distance = hamming(from, vector);
-    }
+    HAMMING_BATCH.get().call(from, to, dimension, output);
 }
 
 /// Compute Hamming distances with the validation of [`super::DistanceType::batch`].
@@ -531,7 +594,45 @@ lance_core::target_kernel! {
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::HammingBatchU64Kernel;
+    use super::{HammingBatchU64Kernel, HammingKernel, hamming_rows, hamming_words};
+    use crate::distance::BatchKernel;
+
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) HAMMING_AVX2: HammingKernel)]
+        /// PSHUFB nibble-lookup popcount, generated by LLVM.
+        #[inline]
+        pub(super) fn hamming_avx2(x: &[u8], y: &[u8]) -> f32 {
+            hamming_words(x, y)
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx2")]
+        #[candidate(pub(super) HAMMING_BATCH_AVX2: BatchKernel<u8>)]
+        pub(super) fn hamming_into_avx2(
+            from: &[u8],
+            to: &[u8],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            hamming_rows(from, to, dimension, output, hamming_words);
+        }
+    }
+
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512vpopcntdq")]
+        #[candidate(pub(super) HAMMING_BATCH_AVX512: BatchKernel<u8>)]
+        /// `vpopcntq` over 64-byte vectors, generated by LLVM.
+        pub(super) fn hamming_into_avx512(
+            from: &[u8],
+            to: &[u8],
+            dimension: usize,
+            output: &mut [f32],
+        ) {
+            hamming_rows(from, to, dimension, output, hamming_words);
+        }
+    }
 
     lance_core::target_kernel! {
         #[target_features("avx512f", "avx512vpopcntdq")]
