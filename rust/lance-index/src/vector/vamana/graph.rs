@@ -115,9 +115,45 @@ impl PartitionGraph {
         check_adjacency(vertex, neighbors, num_vertices, self.max_degree)?;
         let width = self.max_degree as usize;
         let start = vertex as usize * width;
-        self.slots[start..start + neighbors.len()].copy_from_slice(neighbors);
-        self.slots[start + neighbors.len()..start + width].fill(NO_NEIGHBOR);
+        write_row(&mut self.slots[start..start + width], neighbors);
         Ok(())
+    }
+
+    /// The rows of `vertices`, which must ascend strictly, each writable apart
+    /// from the others: what lets a batch rewrite them all at once.
+    pub(crate) fn rows_mut(&mut self, vertices: &[u32]) -> Result<Vec<RowMut<'_>>> {
+        let num_vertices = self.row_ids.len();
+        let width = self.max_degree as usize;
+        let mut rows = Vec::with_capacity(vertices.len());
+        let mut rest = self.slots.as_mut_slice();
+        let mut first_in_rest = 0usize;
+        let mut previous = None;
+        for vertex in vertices {
+            let position = *vertex as usize;
+            if position >= num_vertices {
+                return Err(Error::invalid_input(format!(
+                    "Vamana vertex {vertex} is outside a graph of {num_vertices} vertices"
+                )));
+            }
+            if let Some(previous) = previous.filter(|previous| *previous >= *vertex) {
+                return Err(Error::invalid_input(format!(
+                    "Vamana rows must be taken in strictly ascending order, got vertex \
+                     {vertex} after vertex {previous}"
+                )));
+            }
+            previous = Some(*vertex);
+            let (_, from_row) = rest.split_at_mut((position - first_in_rest) * width);
+            let (slots, after_row) = from_row.split_at_mut(width);
+            rest = after_row;
+            first_in_rest = position + 1;
+            rows.push(RowMut {
+                vertex: *vertex,
+                num_vertices,
+                max_degree: self.max_degree,
+                slots,
+            });
+        }
+        Ok(rows)
     }
 
     /// The out-edge lists as an Arrow list column, without the padding.
@@ -144,13 +180,45 @@ impl Adjacency for PartitionGraph {
 
     fn neighbors(&self, vertex: u32) -> &[u32] {
         let width = self.max_degree as usize;
-        let slots = &self.slots[vertex as usize * width..][..width];
-        let degree = slots
-            .iter()
-            .position(|neighbor| *neighbor == NO_NEIGHBOR)
-            .unwrap_or(width);
-        &slots[..degree]
+        row_neighbors(&self.slots[vertex as usize * width..][..width])
     }
+}
+
+/// One vertex's row of a [`PartitionGraph`], writable apart from the others.
+pub(crate) struct RowMut<'a> {
+    vertex: u32,
+    num_vertices: usize,
+    max_degree: u32,
+    slots: &'a mut [u32],
+}
+
+impl RowMut<'_> {
+    pub(crate) fn neighbors(&self) -> &[u32] {
+        row_neighbors(self.slots)
+    }
+
+    /// Replace the row's out-edges, refusing what
+    /// [`PartitionGraph::set_neighbors`] refuses.
+    pub(crate) fn set(&mut self, neighbors: &[u32]) -> Result<()> {
+        check_adjacency(self.vertex, neighbors, self.num_vertices, self.max_degree)?;
+        write_row(self.slots, neighbors);
+        Ok(())
+    }
+}
+
+/// A row's out-edges: its slots up to the first padding.
+fn row_neighbors(slots: &[u32]) -> &[u32] {
+    let degree = slots
+        .iter()
+        .position(|neighbor| *neighbor == NO_NEIGHBOR)
+        .unwrap_or(slots.len());
+    &slots[..degree]
+}
+
+/// Write checked out-edges into a row's slots, padding the rest.
+fn write_row(slots: &mut [u32], neighbors: &[u32]) {
+    slots[..neighbors.len()].copy_from_slice(neighbors);
+    slots[neighbors.len()..].fill(NO_NEIGHBOR);
 }
 
 /// A graph read back from an index file: views over the Arrow buffers it was
@@ -387,6 +455,45 @@ mod tests {
         assert!(graph.set_neighbors(4, &[1]).is_err());
         assert!(PartitionGraph::edgeless(0, vec![1]).is_err());
         assert!(PartitionGraph::edgeless(MAX_DEGREE + 1, vec![1]).is_err());
+    }
+
+    #[test]
+    fn rows_are_taken_apart_and_written_like_set_neighbors() {
+        let mut graph = sample_graph(3);
+        let mut rows = graph.rows_mut(&[0, 2, 3]).unwrap();
+        assert_eq!(rows[0].neighbors(), &[1, 2]);
+        assert_eq!(rows[1].neighbors(), &[] as &[u32]);
+        rows[1].set(&[3, 0, 1]).unwrap();
+        rows[2].set(&[1]).unwrap();
+        assert!(rows[0].set(&[0]).is_err(), "a row may not point at itself");
+        assert!(
+            rows[0].set(&[1, 1]).is_err(),
+            "a row may not repeat an edge"
+        );
+        assert!(
+            rows[0].set(&[1, 2, 3, 0]).is_err(),
+            "a row holds max_degree"
+        );
+        assert!(rows[0].set(&[4]).is_err(), "a row may not leave the graph");
+        let mut expected = sample_graph(3);
+        expected.set_neighbors(2, &[3, 0, 1]).unwrap();
+        expected.set_neighbors(3, &[1]).unwrap();
+        assert_eq!(graph, expected);
+
+        for (vertices, message) in [
+            (&[2u32, 2][..], "strictly ascending"),
+            (&[3, 1], "strictly ascending"),
+            (&[4], "outside a graph of 4 vertices"),
+        ] {
+            let Err(error) = graph.rows_mut(vertices) else {
+                panic!("{vertices:?} was carved");
+            };
+            assert!(
+                matches!(error, Error::InvalidInput { .. }) && error.to_string().contains(message),
+                "{vertices:?}: {error}"
+            );
+        }
+        assert!(graph.rows_mut(&[]).unwrap().is_empty());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
 use super::VAMANA_SEED;
-use super::build::{Admission, BUILD_PREFETCH_AHEAD, BUILD_PREFETCH_LINES, admit, prune};
+use super::build::{Admission, BUILD_PREFETCH_AHEAD, BUILD_PREFETCH_LINES, Pruned, admit, prune};
 use super::graph::{Adjacency, PartitionGraph, reached};
 use super::params::VamanaBuildParams;
 use super::search::{Comparisons, LeadingLines, SearchScratch, greedy_search_with_lookahead};
@@ -74,7 +74,7 @@ impl ResidentVectors {
 /// Buffers reused across a run of insertions.
 pub(crate) struct InsertScratch {
     search: SearchScratch,
-    edges: Vec<u32>,
+    list: OpenList,
     /// Whether each vertex's out-edges are still exactly what a prune without
     /// its coincident fill returned, the one kind of list [`admit`] can take a
     /// back-edge into. Such a list holds at the alpha it was pruned at and any
@@ -86,10 +86,14 @@ impl InsertScratch {
     pub(crate) fn new(num_vertices: usize, max_degree: u32) -> Self {
         Self {
             search: SearchScratch::new(num_vertices),
-            // A full list holds the contender too before the prune decides.
-            edges: Vec::with_capacity(max_degree as usize + 1),
+            list: OpenList::new(max_degree),
             is_prune_output: vec![false; num_vertices],
         }
+    }
+
+    /// Each vertex's flag, for a run of insertions that links in batches.
+    pub(crate) fn prune_outputs_mut(&mut self) -> &mut [bool] {
+        &mut self.is_prune_output
     }
 
     /// Make every full list go through the prune, as if none were a prune's
@@ -97,6 +101,130 @@ impl InsertScratch {
     #[cfg(test)]
     pub(crate) fn forget_prune_outputs(&mut self) {
         self.is_prune_output.fill(false);
+    }
+}
+
+/// One vertex's out-edges, taken out of the graph to be offered back-edges.
+pub(crate) struct OpenList {
+    owner: u32,
+    edges: Vec<u32>,
+    /// What [`InsertScratch`] keeps for the vertex: whether `edges` is still
+    /// exactly a prune's output.
+    is_prune_output: bool,
+}
+
+/// What [`OpenList::offer`] did with a newcomer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Offered {
+    /// The list already held it.
+    Present,
+    /// The list had room.
+    Appended,
+    /// [`admit`] found that the prune would keep the list as it stands.
+    Refused,
+    /// [`admit`] found the list the prune would return.
+    Admitted,
+    /// [`admit`] could not decide, and the prune did.
+    Undecided,
+    /// The list was not a prune's output, and the prune decided.
+    Repruned,
+}
+
+impl Offered {
+    /// Whether the list must be written back: every outcome but the two that
+    /// leave the list and its flag as they were opened. A prune may hand back
+    /// the list it was given, which is written back all the same.
+    pub(crate) fn changed(self) -> bool {
+        matches!(
+            self,
+            Self::Appended | Self::Admitted | Self::Undecided | Self::Repruned
+        )
+    }
+}
+
+impl OpenList {
+    pub(crate) fn new(max_degree: u32) -> Self {
+        Self {
+            owner: 0,
+            edges: Vec::with_capacity(max_degree as usize),
+            is_prune_output: false,
+        }
+    }
+
+    /// Start offering to `owner`, whose out-edges are `edges`.
+    pub(crate) fn open(&mut self, owner: u32, edges: &[u32], is_prune_output: bool) {
+        self.owner = owner;
+        self.edges.clear();
+        self.edges.extend_from_slice(edges);
+        self.is_prune_output = is_prune_output;
+    }
+
+    pub(crate) fn edges(&self) -> &[u32] {
+        &self.edges
+    }
+
+    pub(crate) fn is_prune_output(&self) -> bool {
+        self.is_prune_output
+    }
+
+    /// Give the owner an edge to `newcomer`: added outright while the list
+    /// has room, and fought for through the prune when it does not. A full
+    /// list that is still a prune's output decides through [`admit`] instead,
+    /// with the same answer.
+    pub(crate) fn offer<S: VectorStore>(
+        &mut self,
+        store: &S,
+        newcomer: u32,
+        alpha: f32,
+        max_degree: usize,
+        comparisons: &Comparisons,
+    ) -> Result<Offered> {
+        if self.edges.contains(&newcomer) {
+            return Ok(Offered::Present);
+        }
+        if self.edges.len() < max_degree {
+            self.edges.push(newcomer);
+            self.is_prune_output = false;
+            return Ok(Offered::Appended);
+        }
+        let mut offered = Offered::Repruned;
+        if self.is_prune_output {
+            match admit(
+                store,
+                self.owner,
+                &self.edges,
+                newcomer,
+                alpha,
+                max_degree,
+                comparisons,
+            )? {
+                Admission::Refused => return Ok(Offered::Refused),
+                Admission::Admitted(admitted) => {
+                    self.edges = admitted;
+                    return Ok(Offered::Admitted);
+                }
+                Admission::Undecided => offered = Offered::Undecided,
+            }
+        }
+        let from_owner = store.dist_calculator_from_id(self.owner);
+        comparisons.record(self.edges.len() as u64 + 1);
+        let contenders = self
+            .edges
+            .iter()
+            .chain(std::iter::once(&newcomer))
+            .map(|id| OrderedNode::new(*id, OrderedFloat(from_owner.distance(*id))))
+            .collect();
+        let repruned = prune(
+            store,
+            self.owner,
+            contenders,
+            alpha,
+            max_degree,
+            comparisons,
+        )?;
+        self.edges = repruned.neighbors;
+        self.is_prune_output = !repruned.has_coincident_fill;
+        Ok(offered)
     }
 }
 
@@ -116,6 +244,49 @@ pub(crate) fn insert_point<S: VectorStore>(
     comparisons: &Comparisons,
 ) -> Result<()> {
     let max_degree = graph.max_degree() as usize;
+    let selected = choose_out_edges(
+        graph,
+        store,
+        &mut scratch.search,
+        linking,
+        point,
+        entry_point,
+        comparisons,
+    )?;
+    graph.set_neighbors(point, &selected.neighbors)?;
+    scratch.is_prune_output[point as usize] = !selected.has_coincident_fill;
+
+    for neighbor in &selected.neighbors {
+        let neighbor = *neighbor;
+        scratch.list.open(
+            neighbor,
+            graph.neighbors(neighbor),
+            scratch.is_prune_output[neighbor as usize],
+        );
+        let offered = scratch
+            .list
+            .offer(store, point, linking.alpha, max_degree, comparisons)?;
+        if offered.changed() {
+            graph.set_neighbors(neighbor, scratch.list.edges())?;
+        }
+        scratch.is_prune_output[neighbor as usize] = scratch.list.is_prune_output();
+    }
+    Ok(())
+}
+
+/// Search `graph` from `entry_point` for `point`, and prune what the search
+/// visited, together with `point`'s current out-edges, into its new out-edges.
+///
+/// Writes nothing, so a batch of points can choose against one graph at once.
+pub(crate) fn choose_out_edges<S: VectorStore>(
+    graph: &PartitionGraph,
+    store: &S,
+    search: &mut SearchScratch,
+    linking: &Linking,
+    point: u32,
+    entry_point: u32,
+    comparisons: &Comparisons,
+) -> Result<Pruned> {
     let from_point = store.dist_calculator_from_id(point);
     let found = match linking.vectors {
         Some(resident) => greedy_search_with_lookahead(
@@ -129,7 +300,7 @@ pub(crate) fn insert_point<S: VectorStore>(
             entry_point,
             linking.search_list_size,
             BUILD_PREFETCH_AHEAD,
-            &mut scratch.search,
+            search,
             comparisons,
         ),
         None => greedy_search_with_lookahead(
@@ -138,83 +309,28 @@ pub(crate) fn insert_point<S: VectorStore>(
             entry_point,
             linking.search_list_size,
             BUILD_PREFETCH_AHEAD,
-            &mut scratch.search,
+            search,
             comparisons,
         ),
     };
     let mut candidates = found?.visited;
     // The paper folds the current out-edges into the candidates inside the
     // prune; doing it here keeps the prune ignorant of the graph, so the
-    // back-edge case below can reuse it.
+    // back-edge case can reuse it.
     comparisons.record(graph.neighbors(point).len() as u64);
     candidates.extend(
         graph.neighbors(point).iter().map(|neighbor| {
             OrderedNode::new(*neighbor, OrderedFloat(from_point.distance(*neighbor)))
         }),
     );
-
-    let selected = prune(
+    prune(
         store,
         point,
         candidates,
         linking.alpha,
-        max_degree,
+        graph.max_degree() as usize,
         comparisons,
-    )?;
-    graph.set_neighbors(point, &selected.neighbors)?;
-    scratch.is_prune_output[point as usize] = !selected.has_coincident_fill;
-
-    for neighbor in &selected.neighbors {
-        let neighbor = *neighbor;
-        scratch.edges.clear();
-        scratch.edges.extend_from_slice(graph.neighbors(neighbor));
-        if scratch.edges.contains(&point) {
-            continue;
-        }
-        if scratch.edges.len() < max_degree {
-            scratch.edges.push(point);
-            graph.set_neighbors(neighbor, &scratch.edges)?;
-            scratch.is_prune_output[neighbor as usize] = false;
-            continue;
-        }
-        if scratch.is_prune_output[neighbor as usize] {
-            match admit(
-                store,
-                neighbor,
-                &scratch.edges,
-                point,
-                linking.alpha,
-                max_degree,
-                comparisons,
-            )? {
-                Admission::Refused => continue,
-                Admission::Admitted(admitted) => {
-                    graph.set_neighbors(neighbor, &admitted)?;
-                    continue;
-                }
-                Admission::Undecided => {}
-            }
-        }
-        let from_neighbor = store.dist_calculator_from_id(neighbor);
-        comparisons.record(scratch.edges.len() as u64 + 1);
-        let contenders = scratch
-            .edges
-            .iter()
-            .chain(std::iter::once(&point))
-            .map(|id| OrderedNode::new(*id, OrderedFloat(from_neighbor.distance(*id))))
-            .collect();
-        let repruned = prune(
-            store,
-            neighbor,
-            contenders,
-            linking.alpha,
-            max_degree,
-            comparisons,
-        )?;
-        graph.set_neighbors(neighbor, &repruned.neighbors)?;
-        scratch.is_prune_output[neighbor as usize] = !repruned.has_coincident_fill;
-    }
-    Ok(())
+    )
 }
 
 /// Link vertices `first_new..` of `graph` into the graph before them.
@@ -373,16 +489,13 @@ pub(crate) fn reached_survivors(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Float32Array};
     use lance_linalg::distance::DistanceType;
 
     use super::*;
     use crate::vector::vamana::build::build_partition;
     use crate::vector::vamana::graph::reachable;
-    use crate::vector::vamana::search::SearchScratch;
-    use crate::vector::vamana::testing::{flat_storage, scattered_values};
+    use crate::vector::vamana::testing::{flat_storage, scattered_values, walk_recall_at_ten};
 
     const DIMENSION: usize = 8;
 
@@ -460,37 +573,15 @@ mod tests {
         let (grown, medoid) = grown(&store, 750);
         let whole = build_partition(&store, &params(), 42, &Comparisons::default()).unwrap();
         let recall_of = |graph: &PartitionGraph, start: u32| {
-            let mut hits = 0;
-            for query in values[ROWS * DIMENSION..].as_chunks::<DIMENSION>().0 {
-                let query = Arc::new(Float32Array::from(query.to_vec())) as ArrayRef;
-                let calculator = store.dist_calculator(query, 0.0);
-                let mut exact = (0..ROWS as u32)
-                    .map(|id| (calculator.distance(id), id))
-                    .collect::<Vec<_>>();
-                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let exact = exact
-                    .iter()
-                    .take(10)
-                    .map(|(_, id)| *id)
-                    .collect::<HashSet<_>>();
-                let found = greedy_search_with_lookahead(
-                    graph,
-                    &calculator,
-                    start,
-                    32,
-                    0,
-                    &mut SearchScratch::new(ROWS),
-                    &Comparisons::default(),
-                )
-                .unwrap();
-                hits += found
-                    .candidates
-                    .iter()
-                    .take(10)
-                    .filter(|node| exact.contains(&node.id))
-                    .count();
-            }
-            hits as f64 / 500.0
+            walk_recall_at_ten(
+                &store,
+                graph,
+                start,
+                &values[ROWS * DIMENSION..],
+                DIMENSION,
+                32,
+            )
+            .0
         };
         let grown_recall = recall_of(&grown, medoid);
         let whole_recall = recall_of(&whole.graph, whole.medoid);

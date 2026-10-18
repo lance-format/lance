@@ -4,6 +4,7 @@
 //! Building a partition's graph.
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -14,6 +15,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 
+use super::batch::{Batches, link_in_batches};
 use super::graph::{MAX_VERTICES, PartitionGraph};
 use super::insert::{InsertScratch, Linking, ResidentVectors, insert_point};
 use super::params::VamanaBuildParams;
@@ -33,6 +35,38 @@ pub const BUILD_PREFETCH_LINES: usize = 8;
 /// How many vertices a store without float vectors samples for its medoid.
 const MEDOID_SAMPLE: usize = 256;
 
+/// From this many vertices up, a partition's sweeps link vertices in batches,
+/// in parallel. A smaller partition keeps the graph a vertex-at-a-time sweep
+/// gives, which batches give up a little of because the vertices of a batch do
+/// not see one another; and an index of small partitions has many of them,
+/// which Lance already builds side by side.
+pub(crate) const BATCHED_FROM_VERTICES: usize = 100_000;
+
+/// The share of a partition one batch holds at most, as a divisor: ParlayANN's
+/// 2%, past which too many vertices would search a graph that does not hold
+/// one another yet.
+const MAX_BATCH_DIVISOR: usize = 50;
+
+/// How a build's sweeps link the vertices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    /// One vertex at a time, each searching the graph its predecessors left.
+    Sequential,
+    /// At most `max_batch` vertices at a time, each searching the graph as it
+    /// stood when its batch began; see [`super::batch`].
+    Batched { max_batch: NonZeroUsize },
+}
+
+impl Sweep {
+    /// The sweep a build over `num_vertices` vertices takes.
+    pub(crate) fn for_vertices(num_vertices: usize) -> Self {
+        match NonZeroUsize::new(num_vertices / MAX_BATCH_DIVISOR) {
+            Some(max_batch) if num_vertices >= BATCHED_FROM_VERTICES => Self::Batched { max_batch },
+            _ => Self::Sequential,
+        }
+    }
+}
+
 /// A partition's graph and the vertex a search of it should start from.
 #[derive(Debug)]
 pub struct BuiltPartition {
@@ -47,11 +81,29 @@ pub struct BuiltPartition {
 /// as it stands, prune the visited set into its out-edges and add the
 /// back-edges. The sweep runs twice, at `alpha = 1` and then at `params.alpha`:
 /// the second pass works on a graph that is already navigable and can afford
-/// to keep the shorter edges the first one dropped.
+/// to keep the shorter edges the first one dropped. A large partition sweeps
+/// in batches; see [`Sweep::for_vertices`].
 pub(crate) fn build_partition<S: VectorStore>(
     store: &S,
     params: &VamanaBuildParams,
     seed: u64,
+    comparisons: &Comparisons,
+) -> Result<BuiltPartition> {
+    build_partition_by(
+        store,
+        params,
+        seed,
+        Sweep::for_vertices(store.len()),
+        comparisons,
+    )
+}
+
+/// [`build_partition`] with the sweep chosen by the caller.
+pub(crate) fn build_partition_by<S: VectorStore>(
+    store: &S,
+    params: &VamanaBuildParams,
+    seed: u64,
+    sweep: Sweep,
     comparisons: &Comparisons,
 ) -> Result<BuiltPartition> {
     params.validate()?;
@@ -81,16 +133,32 @@ pub(crate) fn build_partition<S: VectorStore>(
             vectors: resident.as_ref(),
         };
         order.shuffle(&mut rng);
-        for point in &order {
-            insert_point(
+        match sweep {
+            Sweep::Sequential => {
+                for point in &order {
+                    insert_point(
+                        &mut graph,
+                        store,
+                        &mut scratch,
+                        &linking,
+                        *point,
+                        medoid,
+                        comparisons,
+                    )?;
+                }
+            }
+            Sweep::Batched { max_batch } => link_in_batches(
                 &mut graph,
                 store,
-                &mut scratch,
+                scratch.prune_outputs_mut(),
                 &linking,
-                *point,
-                medoid,
+                &Batches {
+                    order: &order,
+                    entry_point: medoid,
+                    max_batch,
+                },
                 comparisons,
-            )?;
+            )?,
         }
     }
 
@@ -110,7 +178,7 @@ pub(crate) fn addressable_len(num_vertices: usize) -> Result<u32> {
 
 /// Give every vertex `min(R, n - 1)` random out-edges, so the first pass has
 /// somewhere to walk.
-fn randomize(graph: &mut PartitionGraph, rng: &mut SmallRng) -> Result<()> {
+pub(crate) fn randomize(graph: &mut PartitionGraph, rng: &mut SmallRng) -> Result<()> {
     let num_vertices = graph.len();
     let degree = (graph.max_degree() as usize).min(num_vertices.saturating_sub(1));
     if degree == 0 {
@@ -514,13 +582,10 @@ mod tests {
 
     use super::*;
     use crate::vector::flat::storage::FlatFloatStorage;
-    use crate::vector::pq::storage::ProductQuantizationStorage;
-    use crate::vector::sq::storage::ScalarQuantizationStorage;
     use crate::vector::vamana::graph::{Adjacency, MAX_DEGREE, reachable};
-    use crate::vector::vamana::search::{SearchScratch, greedy_search_with_lookahead};
     use crate::vector::vamana::testing::{
-        flat_storage, flat_storage_with_row_ids, pq_storage, scattered_values, sq_storage,
-        vectors_of,
+        Store, flat_storage, flat_storage_with_row_ids, pq_storage, scattered_values, sq_storage,
+        vectors_of, walk_recall_at_ten,
     };
 
     fn storage_of(
@@ -557,6 +622,20 @@ mod tests {
 
     fn build(storage: &FlatFloatStorage, params: &VamanaBuildParams) -> BuiltPartition {
         build_partition(storage, params, 42, &Comparisons::default()).unwrap()
+    }
+
+    /// Batches small enough that a fixture of a few hundred vertices is cut
+    /// into many, each searching a graph its predecessors left.
+    const BATCHED: Sweep = Sweep::Batched {
+        max_batch: NonZeroUsize::new(16).unwrap(),
+    };
+
+    fn build_by(
+        storage: &FlatFloatStorage,
+        params: &VamanaBuildParams,
+        sweep: Sweep,
+    ) -> Result<BuiltPartition> {
+        build_partition_by(storage, params, 42, sweep, &Comparisons::default())
     }
 
     fn all_candidates(storage: &FlatFloatStorage, point: u32) -> Vec<OrderedNode> {
@@ -758,7 +837,6 @@ mod tests {
     fn recall_at_ten_beats_the_bar(#[case] distance_type: DistanceType) {
         const VERTICES: usize = 1200;
         const QUERIES: usize = 50;
-        const K: usize = 10;
         let values = scattered_values((VERTICES + QUERIES) * 8)
             .into_iter()
             .map(|value| value - 0.5)
@@ -768,43 +846,18 @@ mod tests {
         let params = small_params();
         let built = build(&indexed, &params);
 
-        let mut scratch = SearchScratch::new(VERTICES);
-        let searching = Comparisons::default();
-        let mut hits = 0;
-        for query in queries.as_chunks::<8>().0 {
-            let calculator =
-                indexed.dist_calculator(Arc::new(Float32Array::from(query.to_vec())), 0.0);
-            let mut exact = (0..VERTICES as u32)
-                .map(|id| OrderedNode::new(id, OrderedFloat(calculator.distance(id))))
-                .collect::<Vec<_>>();
-            exact.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
-            let exact = exact
-                .iter()
-                .take(K)
-                .map(|node| node.id)
-                .collect::<HashSet<_>>();
-            let found = greedy_search_with_lookahead(
-                &built.graph,
-                &calculator,
-                built.medoid,
-                params.search_list_size,
-                0,
-                &mut scratch,
-                &searching,
-            )
-            .unwrap();
-            hits += found
-                .candidates
-                .iter()
-                .take(K)
-                .filter(|node| exact.contains(&node.id))
-                .count();
-        }
-        let recall = hits as f64 / (QUERIES * K) as f64;
-        let scanned = searching.get() as f64 / QUERIES as f64;
+        let (recall, walked) = walk_recall_at_ten(
+            &indexed,
+            &built.graph,
+            built.medoid,
+            queries,
+            8,
+            params.search_list_size,
+        );
+        let scanned = walked as f64 / QUERIES as f64;
         assert!(
             recall >= 0.95,
-            "{distance_type}: recall@{K} fell to {recall:.4}"
+            "{distance_type}: recall@10 fell to {recall:.4}"
         );
         assert!(
             scanned < 0.25 * VERTICES as f64,
@@ -819,7 +872,10 @@ mod tests {
     #[rstest]
     #[case::l2(DistanceType::L2)]
     #[case::cosine(DistanceType::Cosine)]
-    fn a_partition_of_duplicates_keeps_its_edges(#[case] distance_type: DistanceType) {
+    fn a_partition_of_duplicates_keeps_its_edges(
+        #[case] distance_type: DistanceType,
+        #[values(Sweep::Sequential, BATCHED)] sweep: Sweep,
+    ) {
         const VERTICES: usize = 400;
         const DIMENSION: usize = 8;
         let params = small_params();
@@ -838,7 +894,12 @@ mod tests {
             } else {
                 vectors
             };
-            let built = build(&FlatFloatStorage::new(vectors, distance_type), &params);
+            let built = build_by(
+                &FlatFloatStorage::new(vectors, distance_type),
+                &params,
+                sweep,
+            )
+            .unwrap();
             for vertex in 0..VERTICES as u32 {
                 assert_eq!(
                     built.graph.neighbors(vertex).len(),
@@ -850,73 +911,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_same_seed_builds_the_same_graph() {
+    #[rstest]
+    fn the_same_seed_builds_the_same_graph(#[values(Sweep::Sequential, BATCHED)] sweep: Sweep) {
         let storage = scattered_storage(300, 6);
         let params = small_params();
-        let first = build(&storage, &params);
-        let second = build(&storage, &params);
+        let first = build_by(&storage, &params, sweep).unwrap();
+        let second = build_by(&storage, &params, sweep).unwrap();
         assert_eq!(first.graph, second.graph);
         assert_eq!(first.medoid, second.medoid);
-        let other = build_partition(&storage, &params, 43, &Comparisons::default()).unwrap();
+        let other =
+            build_partition_by(&storage, &params, 43, sweep, &Comparisons::default()).unwrap();
         assert_ne!(
             other.graph, first.graph,
             "the seed does not reach the build"
         );
 
-        let plain = build(
+        let plain = build_by(
             &storage,
             &VamanaBuildParams {
                 alpha: 1.0,
                 ..params
             },
-        );
+            sweep,
+        )
+        .unwrap();
         assert_ne!(plain.graph, first.graph, "alpha does not reach the build");
     }
 
-    #[test]
-    fn a_partition_smaller_than_the_degree_bound_builds() {
+    #[rstest]
+    fn a_partition_smaller_than_the_degree_bound_builds(
+        #[values(Sweep::Sequential, BATCHED)] sweep: Sweep,
+    ) {
         for vertices in [1usize, 2, 3, 17] {
-            let built = build(&scattered_storage(vertices, 4), &small_params());
+            let built = build_by(&scattered_storage(vertices, 4), &small_params(), sweep).unwrap();
             assert_eq!(built.graph.len(), vertices);
             assert_eq!(reachable(&built.graph, built.medoid, |_| true), vertices);
         }
-        assert!(
-            build_partition(
-                &scattered_storage(0, 4),
-                &small_params(),
-                42,
-                &Comparisons::default()
-            )
-            .is_err()
-        );
+        assert!(build_by(&scattered_storage(0, 4), &small_params(), sweep).is_err());
         let wide = VamanaBuildParams {
             max_degree: MAX_DEGREE,
             ..small_params()
         };
-        build(&scattered_storage(8, 2), &wide);
+        build_by(&scattered_storage(8, 2), &wide, sweep).unwrap();
         let too_wide = VamanaBuildParams {
             max_degree: MAX_DEGREE + 1,
             ..small_params()
         };
-        assert!(
-            build_partition(
-                &scattered_storage(8, 2),
-                &too_wide,
-                42,
-                &Comparisons::default()
-            )
-            .is_err()
-        );
+        assert!(build_by(&scattered_storage(8, 2), &too_wide, sweep).is_err());
     }
 
-    #[test]
-    fn a_build_over_non_finite_vectors_stops() {
+    #[rstest]
+    fn a_build_over_non_finite_vectors_stops(#[values(Sweep::Sequential, BATCHED)] sweep: Sweep) {
         let mut values = scattered_values(20 * 2);
         values[7] = f32::NAN;
         let storage = storage_of(values, 2, DistanceType::L2);
-        let error =
-            build_partition(&storage, &small_params(), 42, &Comparisons::default()).unwrap_err();
+        let error = build_by(&storage, &small_params(), sweep).unwrap_err();
         assert!(
             error.to_string().contains("no comparison can order"),
             "{error}"
@@ -1004,13 +1053,6 @@ mod tests {
             }
         }
         graph
-    }
-
-    /// A store of each kind a graph is built over.
-    enum Store {
-        Flat(FlatFloatStorage),
-        Scalar(ScalarQuantizationStorage),
-        Product(ProductQuantizationStorage),
     }
 
     fn assert_pair_distances_are_the_calculators<S: VectorStore>(storage: &S) {

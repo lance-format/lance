@@ -11,6 +11,7 @@
 //!
 //! This module exists only in the Vamana fork of Lance.
 
+pub(crate) mod batch;
 pub mod build;
 pub mod consolidate;
 pub mod entry_points;

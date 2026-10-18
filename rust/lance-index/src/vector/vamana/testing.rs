@@ -3,6 +3,7 @@
 
 //! Fixtures shared by the Vamana tests.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -15,9 +16,10 @@ use lance_core::{ROW_ID, ROW_ID_FIELD, Result};
 use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrMask;
 
-use super::graph::PartitionGraph;
+use super::graph::{Adjacency, PartitionGraph};
 use super::index::Vamana;
 use super::params::VamanaBuildParams;
+use super::search::{Comparisons, SearchScratch, greedy_search_with_lookahead};
 use crate::prefilter::PreFilter;
 use crate::vector::SQ_CODE_COLUMN;
 use crate::vector::bq::storage::{
@@ -28,12 +30,85 @@ use crate::vector::bq::transform::{
 };
 use crate::vector::flat::index::FlatMetadata;
 use crate::vector::flat::storage::{FLAT_COLUMN, FlatFloatStorage};
+use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::vector::pq::ProductQuantizer;
 use crate::vector::pq::storage::ProductQuantizationStorage;
 use crate::vector::quantizer::{Quantization, QuantizerStorage};
 use crate::vector::sq::ScalarQuantizer;
 use crate::vector::sq::storage::ScalarQuantizationStorage;
 use crate::vector::storage::{DistCalculator, StorageBuilder, VectorStore};
+
+/// recall@10 of walks from `start` through `graph`, one per query of `queries`
+/// (row-major, `dimension` wide), against brute force over `storage`, and the
+/// distances the walks measured.
+pub fn walk_recall_at_ten(
+    storage: &impl VectorStore,
+    graph: &impl Adjacency,
+    start: u32,
+    queries: &[f32],
+    dimension: usize,
+    search_list_size: usize,
+) -> (f64, u64) {
+    const K: usize = 10;
+    let mut scratch = SearchScratch::new(storage.len());
+    let walked = Comparisons::default();
+    let mut hits = 0;
+    let mut expected = 0;
+    for query in queries.chunks_exact(dimension) {
+        let calculator = storage.dist_calculator(Arc::new(Float32Array::from(query.to_vec())), 0.0);
+        let mut exact = (0..storage.len() as u32)
+            .map(|id| OrderedNode::new(id, OrderedFloat(calculator.distance(id))))
+            .collect::<Vec<_>>();
+        exact.sort_unstable_by(|a, b| a.dist.cmp(&b.dist).then(a.id.cmp(&b.id)));
+        let exact = exact
+            .iter()
+            .take(K)
+            .map(|node| node.id)
+            .collect::<HashSet<_>>();
+        let found = greedy_search_with_lookahead(
+            graph,
+            &calculator,
+            start,
+            search_list_size,
+            0,
+            &mut scratch,
+            &walked,
+        )
+        .unwrap();
+        hits += found
+            .candidates
+            .iter()
+            .take(K)
+            .filter(|node| exact.contains(&node.id))
+            .count();
+        expected += K;
+    }
+    (hits as f64 / expected as f64, walked.get())
+}
+
+/// An FNV-1a hash of every out-edge list of `graph`, in vertex order.
+pub fn graph_fingerprint(graph: &PartitionGraph) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |value: u32| {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for vertex in 0..graph.len() as u32 {
+        let neighbors = graph.neighbors(vertex);
+        eat(neighbors.len() as u32);
+        neighbors.iter().for_each(|neighbor| eat(*neighbor));
+    }
+    hash
+}
+
+/// A store of each kind a graph is built over.
+pub enum Store {
+    Flat(FlatFloatStorage),
+    Scalar(ScalarQuantizationStorage),
+    Product(ProductQuantizationStorage),
+}
 
 /// A fixed multiplicative congruential sequence in `[0, 1)`, so every run sees
 /// the same points.
