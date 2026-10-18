@@ -1234,6 +1234,39 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::one(1)]
+    #[case::eight(8)]
+    #[case::sixteen(16)]
+    #[case::thirty_one(31)]
+    #[case::sixty_four(64)]
+    #[case::two_hundred(200)]
+    fn test_hamming_batch_kernels_match_reference(#[case] dimension: usize) {
+        const NUM_VECTORS: usize = 5;
+        let bytes: Vec<u8> = (0..(NUM_VECTORS + 1) * dimension)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8)
+            .collect();
+        let (query, vectors) = bytes.split_at(dimension);
+        let want: Vec<f32> = vectors
+            .chunks_exact(dimension)
+            .map(|vector| hamming_scalar(query, vector))
+            .collect();
+        for candidate in HAMMING_BATCH.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut got = vec![f32::NAN; NUM_VECTORS];
+            kernel.call(query, vectors, dimension, &mut got);
+            assert_eq!(got, want, "{} dimension={dimension}", candidate.name());
+        }
+        let mut got = vec![f32::NAN; NUM_VECTORS];
+        hamming_distance_batch_into(query, vectors, dimension, &mut got);
+        assert_eq!(
+            got, want,
+            "hamming_distance_batch_into dimension={dimension}"
+        );
+    }
+
     #[test]
     fn test_hamming_distance_batch_into() {
         let query = [0, u8::MAX];
@@ -1752,6 +1785,30 @@ mod tests {
                 j
             );
         }
+    }
+
+    /// Groups of four hashes one or two bits apart, so matches cluster within
+    /// rows and the threshold separates them from the ~32-bit background.
+    /// 200 hashes is past the sequential cutoff.
+    #[rstest]
+    #[case::exact_only(0)]
+    #[case::one_bit(1)]
+    #[case::two_bits(2)]
+    #[case::half(32)]
+    #[case::all_pairs(u32::MAX)]
+    fn test_pairwise_parallel_threshold_matches_reference(#[case] threshold: u32) {
+        let hashes: Vec<u64> = (0u64..200)
+            .map(|i| {
+                let base = (i / 4 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                base ^ ((1 << (i % 4)) >> 1)
+            })
+            .collect();
+        let want: Vec<(u64, u64, u32)> = reference_pairwise(&hashes, Some(threshold))
+            .into_iter()
+            .map(|(i, j, dist)| (i as u64, j as u64, dist))
+            .collect();
+        let got = pairwise_hamming_distance_parallel(&hashes, None, Some(threshold));
+        assert_eq!(result_to_sorted_vec(&got), want);
     }
 
     #[test]
