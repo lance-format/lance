@@ -136,7 +136,15 @@ impl_call!(
 );
 impl_call!(
     <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized>
+    fn(a: &A, b: &B, c: &C, d: &D, e: &mut E)
+);
+impl_call!(
+    <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized>
     fn(a: &A, b: &B, c: &C, d: &D, e: &E, f: f32, g: Option<f32>)
+);
+impl_call!(
+    <A: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized, G: ?Sized>
+    fn(a: &A, b: u64, c: &C, d: &D, e: &E, f: f32, g: &mut G)
 );
 
 /// One operation's kernels, best first, with the host's choice made once.
@@ -204,6 +212,13 @@ impl<F: Copy> Dispatch<F> {
             return Kernel(self.candidates[0].kernel);
         }
         Kernel(*self.selected.0.get_or_init(|| self.selected().kernel))
+    }
+
+    /// The last candidate, which every host supports.
+    pub fn fallback(&self) -> Kernel<F> {
+        let fallback = self.candidates[self.candidates.len() - 1];
+        debug_assert!(fallback.features.is_empty());
+        Kernel(fallback.kernel)
     }
 
     /// The candidate [`Self::get`] returns.
