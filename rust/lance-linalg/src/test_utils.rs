@@ -219,3 +219,42 @@ pub mod u8_inputs {
             .collect()
     }
 }
+
+/// Checks that each host-supported batch kernel scores a vector the same, bit
+/// for bit, wherever it sits in the batch. A kernel may reduce a block of
+/// vectors together and the rest one at a time; the two must agree.
+///
+/// The batch is nine rotations of `y`: one block of eight plus one left over.
+pub fn check_batch_position_independent(
+    batch: &Dispatch<BatchKernel>,
+    x: &[f32],
+    y: &[f32],
+) -> TestCaseResult {
+    let vectors = (0..9)
+        .flat_map(|shift| {
+            let mut v = y.to_vec();
+            v.rotate_left(shift % y.len());
+            v
+        })
+        .collect::<Vec<_>>();
+    for candidate in batch.candidates() {
+        let Some(kernel) = candidate.kernel() else {
+            continue;
+        };
+        let mut together = [f32::NAN; 9];
+        kernel.call(x, &vectors, x.len(), &mut together);
+        for (i, v) in vectors.chunks_exact(x.len()).enumerate() {
+            let mut alone = [f32::NAN];
+            kernel.call(x, v, x.len(), &mut alone);
+            prop_assert!(
+                together[i].to_bits() == alone[0].to_bits(),
+                "{} at dim {}: vector {i} scored {} in the batch, {} alone",
+                candidate.name(),
+                x.len(),
+                together[i],
+                alone[0]
+            );
+        }
+    }
+    Ok(())
+}

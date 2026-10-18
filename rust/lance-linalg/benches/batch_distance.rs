@@ -11,7 +11,8 @@ const TOTAL_VALUES: usize = 1024 * 1024;
 
 fn bench_batch_distance(c: &mut Criterion) {
     // 8 and 16 are common PQ sub-vector widths, 128 a common IVF centroid
-    // width. Cosine is measured at 8 only.
+    // width. Cosine keeps only its original dimension-8 row; the other
+    // widths track the l2 and dot kernels.
     for dimension in [8, 16, 32, 128] {
         let key = (0..dimension)
             .map(|index| index as f32 * 0.125 + 0.25)
