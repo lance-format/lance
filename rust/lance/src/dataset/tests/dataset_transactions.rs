@@ -3616,6 +3616,66 @@ mod composite {
         );
     }
 
+    /// One commit adds a column, fills it in every committed fragment, and
+    /// indexes it, naming the field by the token it has until the commit lands.
+    ///
+    /// The transaction layer accepts this, but no index builder can write the
+    /// segment's files for it: a builder reads the column through the committed
+    /// schema, which does not have it yet. The segment below records coverage
+    /// only.
+    #[tokio::test]
+    async fn test_one_commit_adds_fills_and_indexes_a_field() {
+        let mut dataset = test_dataset(false).await;
+        let params = ScalarIndexParams::default();
+        let error = dataset
+            .create_index_builder(&["b"], IndexType::BTree, &params)
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("column 'b' does not exist"),
+            "{error}"
+        );
+
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: int32_field("b"),
+        })];
+        let mut covered = Vec::new();
+        for (index, fragment) in dataset.fragments().iter().enumerate() {
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(&dataset, index),
+                field_ids: vec![Ref::Local(0)],
+                data_change: true,
+            }));
+            covered.push(Ref::Committed(fragment.id));
+        }
+        actions.push(Action::AddIndexSegment(AddIndexSegment {
+            fields: vec![Ref::Local(0)],
+            ..index_segment("by_b", covered)
+        }));
+        let dataset = commit(dataset, actions).await;
+
+        let b = dataset.schema().field("b").expect("field b was added").id;
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == "by_b").unwrap();
+        assert_eq!(segment.fields, vec![b]);
+        assert_eq!(index_coverage(&dataset, "by_b").await, vec![0, 1]);
+        let values = dataset
+            .scan()
+            .project(&["b"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            values.column(0).as_ref(),
+            &Int32Array::from_iter_values(0..10) as &dyn arrow_array::Array
+        );
+    }
+
     #[tokio::test]
     async fn test_one_commit_replaces_an_index_segment() {
         let dataset = test_dataset(false).await;
