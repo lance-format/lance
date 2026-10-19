@@ -21,6 +21,11 @@ use lance_core::deepsize::DeepSizeOf;
 /// The id counters are not reset. A field or fragment added after the reset gets
 /// a fresh id, so a stale file naming an old id can never be mistaken for the
 /// new table's data.
+///
+/// Actions before it in the same operation are allowed, and it discards their
+/// changes to the schema, fragments, and indices. After it, a committed
+/// reference to a fragment from before it is rejected as naming a fragment
+/// that does not exist.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
 pub struct ResetTable;
 
@@ -136,6 +141,58 @@ mod tests {
         assert_eq!(next.fragments.len(), 1);
         assert_ne!(next.fragments[0].id, 0);
         assert_eq!(next.fragments[0].files[0].fields.as_ref(), &[field.id]);
+    }
+
+    #[test]
+    fn test_reset_discards_what_earlier_actions_in_the_operation_did() {
+        let mint_fragment = |token| {
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(token),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            })
+        };
+        let write = |token, path: &str| {
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(token),
+                file: DataFile::new_unstarted(path, ConcreteFileVersion::V2_0),
+                field_ids: vec![Ref::Local(token)],
+                data_change: true,
+            })
+        };
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("early"),
+                }),
+                mint_fragment(0),
+                write(0, "data/early.lance"),
+                reset(),
+                Action::AddField(AddField {
+                    local: 1,
+                    parent: None,
+                    def: added_field("fresh"),
+                }),
+                mint_fragment(1),
+                write(1, "data/fresh.lance"),
+            ],
+        )
+        .unwrap();
+
+        let names: Vec<_> = next.schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["fresh"]);
+        let paths: Vec<_> = next
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.files.iter().map(|file| file.path.as_str()))
+            .collect();
+        assert_eq!(paths, vec!["data/fresh.lance"]);
     }
 
     #[test]

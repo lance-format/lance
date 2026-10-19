@@ -646,8 +646,8 @@ mod tests {
         added_field, apply, apply_with_indices, backed_manifest,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, CompositeOperation, TombstoneFieldData,
-        UserStep,
+        Action, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation, DropField,
+        RemoveFragment, ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{DataReplacementGroup, Operation};
@@ -891,5 +891,184 @@ mod tests {
         .unwrap();
 
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
+    }
+
+    fn apply_steps(manifest: &Manifest, steps: Vec<Vec<Action>>) -> Result<Manifest> {
+        let steps = steps
+            .into_iter()
+            .enumerate()
+            .map(|(index, actions)| UserStep::new(format!("step {index}"), actions))
+            .collect();
+        Transaction::new(
+            manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(steps)),
+            None,
+        )
+        .build_manifest(
+            Some(manifest),
+            Vec::new(),
+            "tx.txn",
+            &default_build_config(),
+        )
+        .map(|(manifest, _)| manifest)
+    }
+
+    fn mint_fragment(token: u32) -> Action {
+        Action::AddFragment(AddFragment {
+            id: Ref::Local(token),
+            physical_rows: 10,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    fn write_data(fragment: Ref, field: Ref) -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment,
+            file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+            field_ids: vec![field],
+            data_change: true,
+        })
+    }
+
+    fn mint_field(token: u32, name: &str, parent: Option<Ref>) -> Action {
+        Action::AddField(AddField {
+            local: token,
+            parent,
+            def: added_field(name),
+        })
+    }
+
+    fn remove_fragment_zero() -> Action {
+        Action::RemoveFragment(RemoveFragment {
+            fragment: Ref::Committed(0),
+            data_change: true,
+        })
+    }
+
+    fn drop_field_zero() -> Action {
+        Action::DropField(DropField {
+            field: Ref::Committed(0),
+        })
+    }
+
+    /// Actions apply in order, across steps as within one, so a reference is
+    /// only valid between what mints it and what removes it. `expected_error`
+    /// is a fragment of the rejection, or `None` for a sequence that applies.
+    #[rstest]
+    #[case::use_before_mint(
+        vec![vec![write_data(Ref::Local(0), Ref::Committed(0)), mint_fragment(0)]],
+        Some("references local fragment token 0, which no earlier action in this operation minted"),
+    )]
+    #[case::child_before_its_local_parent(
+        vec![vec![mint_field(1, "child", Some(Ref::Local(0))), mint_field(0, "parent", None)]],
+        Some("references local field token 0, which no earlier action in this operation minted"),
+    )]
+    #[case::data_file_after_remove(
+        vec![vec![remove_fragment_zero(), write_data(Ref::Committed(0), Ref::Committed(0))]],
+        Some("AddDataFile targets fragment 0, which does not exist"),
+    )]
+    #[case::deletion_file_after_remove(
+        vec![vec![
+            remove_fragment_zero(),
+            Action::SetDeletionFile(SetDeletionFile {
+                fragment: 0,
+                deletion_file: None,
+                data_change: true,
+            }),
+        ]],
+        Some("SetDeletionFile targets fragment 0, which does not exist"),
+    )]
+    #[case::tombstone_after_remove(
+        vec![vec![
+            remove_fragment_zero(),
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+        ]],
+        Some("TombstoneFieldData targets fragment 0, which does not exist"),
+    )]
+    #[case::alter_after_drop(
+        vec![vec![
+            drop_field_zero(),
+            Action::AlterField(AlterField {
+                field: Ref::Committed(0),
+                name: Some("renamed".into()),
+                logical_type: None,
+                nullable: None,
+            }),
+        ]],
+        Some("AlterField names field 0, which does not exist"),
+    )]
+    #[case::child_after_its_parent_is_dropped(
+        vec![vec![drop_field_zero(), mint_field(0, "child", Some(Ref::Committed(0)))]],
+        Some("AddField names parent field 0, which does not exist"),
+    )]
+    #[case::double_remove(
+        vec![vec![remove_fragment_zero(), remove_fragment_zero()]],
+        Some("RemoveFragment targets fragment 0, which does not exist"),
+    )]
+    #[case::double_drop(
+        vec![vec![drop_field_zero(), drop_field_zero()]],
+        Some("DropField names field 0, which does not exist"),
+    )]
+    #[case::token_used_a_step_before_it_is_minted(
+        vec![
+            vec![write_data(Ref::Local(0), Ref::Committed(0))],
+            vec![mint_fragment(0)],
+        ],
+        Some("references local fragment token 0, which no earlier action in this operation minted"),
+    )]
+    #[case::token_minted_in_two_steps(
+        vec![
+            vec![mint_fragment(0), write_data(Ref::Local(0), Ref::Committed(0))],
+            vec![mint_fragment(0), write_data(Ref::Local(0), Ref::Committed(0))],
+        ],
+        Some("local fragment token 0 is minted more than once in this operation"),
+    )]
+    #[case::committed_ref_to_a_fragment_from_before_a_reset(
+        vec![vec![
+            Action::ResetTable(ResetTable),
+            mint_field(0, "x", None),
+            write_data(Ref::Committed(0), Ref::Local(0)),
+        ]],
+        Some("AddDataFile targets fragment 0, which does not exist"),
+    )]
+    #[case::token_minted_a_step_before_it_is_used(
+        vec![
+            vec![mint_fragment(0)],
+            vec![write_data(Ref::Local(0), Ref::Committed(0))],
+        ],
+        None,
+    )]
+    #[case::actions_before_a_reset(
+        vec![vec![
+            mint_fragment(0),
+            write_data(Ref::Local(0), Ref::Committed(0)),
+            Action::ResetTable(ResetTable),
+            mint_field(1, "x", None),
+            mint_fragment(1),
+            write_data(Ref::Local(1), Ref::Local(1)),
+        ]],
+        None,
+    )]
+    fn test_an_action_sequence_is_checked_in_order(
+        #[case] steps: Vec<Vec<Action>>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let result = apply_steps(&backed_manifest(), steps);
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(expected) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(expected), "unexpected error: {error}");
+            }
+        }
     }
 }
