@@ -38,9 +38,11 @@ pub enum Coordinate {
     /// The schema new rows are written in. Every set that adds rows requires
     /// it, because a writer prepares rows against the schema it read: a row
     /// minted later carries no value for a non-nullable column added in
-    /// between. A set that adds such a column writes it. No concurrent writer
-    /// can name the added field, so the field's own coordinates cannot say
-    /// this.
+    /// between. A set that adds such a column, or makes a column required,
+    /// writes it. So does one that adds a child under a committed parent, which
+    /// a stale writer may write packed without the child. A stale writer
+    /// cannot name a field it does not write, so the field's own coordinates
+    /// cannot say this.
     NewRowSchema,
     /// A field's name. Names only have to be unique among siblings, but a
     /// footprint has no schema to place a field among its siblings, so a name
@@ -188,7 +190,9 @@ fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
 /// way around; that order is covered by the claims the later set makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Precondition {
-    /// No values were written for this field, in any fragment.
+    /// No values were written for this field, in any fragment. An added row
+    /// counts as writing every field, since it holds a value -- if only a null
+    /// -- for each.
     NoValuesWritten(i32),
     /// No fragment was added.
     NoRowsAdded,
@@ -309,7 +313,9 @@ impl Footprint {
         self.preconditions
             .iter()
             .any(|precondition| match precondition {
-                Precondition::NoValuesWritten(field) => committed.values_written.contains(field),
+                Precondition::NoValuesWritten(field) => {
+                    committed.rows_added || committed.values_written.contains(field)
+                }
                 Precondition::NoRowsAdded => committed.rows_added,
             })
     }
@@ -393,9 +399,10 @@ impl Footprint {
         self.require(Coordinate::NewRowSchema);
     }
 
-    /// Record that this set adds a column that rows must carry a value for.
-    /// Rows a stale writer adds afterwards would not, and rows already added
-    /// are not covered by the data this set wrote.
+    /// Record that this set adds a column that rows must carry a value for, or
+    /// makes an existing one required. Rows a stale writer adds afterwards
+    /// would not carry one, and rows already added are not covered by what
+    /// this set read or wrote.
     pub(super) fn add_required_column(&mut self) {
         self.write(Coordinate::NewRowSchema);
         self.preconditions.push(Precondition::NoRowsAdded);
@@ -409,11 +416,6 @@ impl Footprint {
             self.preconditions
                 .push(Precondition::NoValuesWritten(field));
         }
-    }
-
-    /// Record that this set only holds if no rows were added since it read.
-    pub(super) fn require_no_rows_added(&mut self) {
-        self.preconditions.push(Precondition::NoRowsAdded);
     }
 
     /// A field's entry in the schema.
