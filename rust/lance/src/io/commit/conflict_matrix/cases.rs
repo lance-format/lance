@@ -4,7 +4,7 @@
 //! The ordered-pair matrix, the runner that executes one cell, and the cells
 //! deliberately left out of it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use futures::future::BoxFuture;
@@ -28,10 +28,10 @@ use crate::{Dataset, Error};
 /// legacy parity: each cell must be at least as permissive as the strictest
 /// cell among its legacy analogues' pairs (see [`Scenario::analogues`] and
 /// [`legacy_bar`]). A cell suffixed `*` is a known parity gap, stricter than
-/// that bar; the suffix is checked, so closing a gap means dropping it. Today
-/// every action set against a legacy operation fails closed in
-/// `check_action_txn`, so those cells are retryable and every one where legacy
-/// does better is a gap.
+/// that bar, and must have a reason in [`PARITY_GAPS`]; the suffix is checked,
+/// so closing a gap means dropping it. Today every action set against a legacy
+/// operation fails closed in `check_action_txn`, so those cells are retryable
+/// and every one where legacy does better is a gap.
 ///
 /// This grid is the expectation table, not a rendering of one: it is parsed at
 /// run time, so there is a single place to read and a single place to change.
@@ -188,6 +188,30 @@ pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str
         .map(|(_, _, reason)| *reason)
 }
 
+/// Why an action set's `*` cells in [`MATRIX`] fall short of [`legacy_bar`],
+/// keyed by the action scenario on either side of the pair.
+///
+/// Keyed by scenario rather than by cell because a gap comes from how the
+/// resolver treats a kind of action set, not from one particular pairing. When
+/// the last `*` cell involving a scenario is closed, its entry goes too.
+const PARITY_GAPS: &[(Scenario, &str)] = &[
+    (Scenario::ActionAppend, MIXED_PAIRS_FAIL_CLOSED),
+    (Scenario::ActionUpdateConfig, MIXED_PAIRS_FAIL_CLOSED),
+    (Scenario::ActionAppendAndConfig, MIXED_PAIRS_FAIL_CLOSED),
+];
+
+const MIXED_PAIRS_FAIL_CLOSED: &str = "check_action_txn fails every mixed pair closed; \
+     conflict parity 1/5 (Append + ConfigUpdate) gives legacy operations footprints";
+
+fn parity_gap_reason(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
+    [ours, theirs].into_iter().find_map(|scenario| {
+        PARITY_GAPS
+            .iter()
+            .find(|(gap, _)| *gap == scenario)
+            .map(|(_, reason)| *reason)
+    })
+}
+
 fn expectation(ours: Scenario, theirs: Scenario) -> Option<Outcome> {
     MATRIX_CELLS
         .get(&(ours, theirs))
@@ -319,9 +343,14 @@ async fn matrix_row(#[case] ours: Scenario) {
         });
         let context = format!("({} over {})", ours.name(), theirs.name());
         let (outcome, landed) = run(ours, theirs, Placement::Same).await;
+        let gap = MATRIX_CELLS[&(ours, theirs)]
+            .filter(|cell| cell.parity_gap)
+            .and_then(|_| parity_gap_reason(ours, theirs))
+            .map(|reason| format!(" (a known parity gap: {reason})"))
+            .unwrap_or_default();
         assert_eq!(
             outcome, expected,
-            "{context}: expected {expected:?} but observed {outcome:?}",
+            "{context}: expected {expected:?}{gap} but observed {outcome:?}",
         );
         if let Some((before, after)) = landed {
             invariants::check_all(&before, &after, ours, &context).await;
@@ -421,17 +450,28 @@ fn matrix_is_total() {
 }
 
 /// Every cell must be at least as permissive as its [`legacy_bar`], unless it
-/// is marked `*` as a known gap, and every `*` must still be a gap.
+/// is marked `*` as a known gap with a reason in [`PARITY_GAPS`], and every `*`
+/// must still be a gap.
 ///
 /// Reads the grid rather than running anything: `matrix_row` already holds each
 /// cell to what the code does.
 #[test]
 fn matrix_is_at_legacy_parity() {
+    let mut explained = HashSet::new();
     for ours in Scenario::ALL {
         for theirs in Scenario::ALL {
             let Some(Some(cell)) = MATRIX_CELLS.get(&(ours, theirs)).copied() else {
                 continue;
             };
+            if cell.parity_gap {
+                assert!(
+                    parity_gap_reason(ours, theirs).is_some(),
+                    "({} over {}) is marked `*` but neither side has a reason in PARITY_GAPS",
+                    ours.name(),
+                    theirs.name(),
+                );
+                explained.extend([ours, theirs]);
+            }
             let stricter = stricter_than_legacy(ours, theirs, cell.outcome, expectation);
             let bar = legacy_bar(ours, theirs, expectation);
             assert!(
@@ -451,6 +491,13 @@ fn matrix_is_at_legacy_parity() {
                 cell.outcome,
             );
         }
+    }
+    for (scenario, _) in PARITY_GAPS {
+        assert!(
+            explained.contains(scenario),
+            "PARITY_GAPS explains {} but no `*` cell involves it any more; drop the entry",
+            scenario.name(),
+        );
     }
 }
 
