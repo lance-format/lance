@@ -632,7 +632,8 @@ pub fn validate_detached_non_reusable_field_ids(
                 .any(|action| matches!(action, Action::AddField(_))) =>
         {
             Err(Error::invalid_input(
-                "Detached commits cannot AddField after non-reusable field IDs are activated",
+                "Detached commits cannot AddField after non-reusable field IDs are activated; \
+                 reserving field ids on the main line is the planned path",
             ))
         }
         _ => Ok(()),
