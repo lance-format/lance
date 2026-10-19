@@ -403,7 +403,7 @@ mod tests {
     };
     use crate::transaction::action::{
         Action, AddField, AddFragment, AlterField, CompositeOperation, DropField, Footprint,
-        RemoveFragment, TombstoneFieldData, UserAction,
+        RemoveFragment, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
@@ -472,7 +472,7 @@ mod tests {
 
         let transaction = Transaction::new(
             read_version,
-            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "step",
                 vec![Action::AddIndexSegment(segment(
                     "by_a",
@@ -504,7 +504,7 @@ mod tests {
 
         let transaction = Transaction::new(
             read_version,
-            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "step",
                 vec![Action::AddIndexSegment(AddIndexSegment {
                     dataset_version: Some(read_version + 1),

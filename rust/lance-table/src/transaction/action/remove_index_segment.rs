@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::action::{
-        Action, AddIndexSegment, CompositeOperation, Footprint, Ref, UserAction,
+        Action, AddIndexSegment, CompositeOperation, Footprint, Ref, UserStep,
     };
     use crate::transaction::test_support::sample_index_metadata;
 
@@ -196,7 +196,7 @@ mod tests {
         // normal shape of index maintenance; the index ends up with the new
         // segment and without the old one either way round.
         let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
                 "step", actions,
             )]))
         };
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn test_two_writers_removing_the_same_segment_conflict() {
         let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
                 "step", actions,
             )]))
         };
