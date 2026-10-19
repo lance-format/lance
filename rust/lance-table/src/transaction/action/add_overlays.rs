@@ -174,9 +174,11 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
-    use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
+    use crate::transaction::action::test_support::{
+        added_field, apply, backed_manifest, footprint,
+    };
     use crate::transaction::action::{
-        Action, AddFragment, AddIndexSegment, AlterField, DropField, RemoveFragment,
+        Action, AddField, AddFragment, AddIndexSegment, AlterField, DropField, RemoveFragment,
         SetDeletionFile, TombstoneFieldData,
     };
     use lance_file::version::ConcreteFileVersion;
@@ -478,16 +480,25 @@ mod tests {
     /// not the fragment it lands in is one this operation minted: a stale append
     /// carrying an overlay for a field a concurrent set dropped would leave
     /// values for a field the schema no longer has.
+    ///
+    /// Landing second, a drop tombstones the field out of the new fragment, but
+    /// a replacement (a cast) is only valid against the rows it read.
     #[rstest::rstest]
-    #[case::cast(Action::AlterField(AlterField {
-        field: Ref::Committed(0),
-        name: None,
-        logical_type: Some("int64".into()),
-        nullable: None,
-    }))]
-    #[case::drop(Action::DropField(DropField { field: Ref::Committed(0) }))]
+    #[case::replacement(
+        vec![
+            Action::DropField(DropField { field: Ref::Committed(0) }),
+            Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: added_field("id"),
+            }),
+        ],
+        true,
+    )]
+    #[case::drop(vec![Action::DropField(DropField { field: Ref::Committed(0) })], false)]
     fn test_an_overlay_on_a_minted_fragment_needs_its_field_defined_as_it_was(
-        #[case] schema_change: Action,
+        #[case] schema_change: Vec<Action>,
+        #[case] schema_change_conflicts_landing_second: bool,
     ) {
         let overlaid = footprint(vec![
             Action::AddFragment(AddFragment {
@@ -500,10 +511,13 @@ mod tests {
             }),
             add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
         ]);
-        let schema_change = footprint(vec![schema_change]);
+        let schema_change = footprint(schema_change);
 
         assert!(overlaid.conflicts_with(&schema_change));
-        assert!(!schema_change.conflicts_with(&overlaid));
+        assert_eq!(
+            schema_change.conflicts_with(&overlaid),
+            schema_change_conflicts_landing_second
+        );
     }
 
     /// A concurrent row-moving update deletes rows from the fragment and
