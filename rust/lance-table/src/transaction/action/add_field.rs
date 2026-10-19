@@ -78,6 +78,11 @@ impl AddField {
     /// A non-nullable field is also a promise about rows: each must carry a
     /// value for it. Its data only covers the fragments the writer saw, so
     /// rows added by a concurrent writer, in either order, would break it.
+    ///
+    /// A child under a committed parent changes the shape of the parent's
+    /// rows, and a stale writer may write the parent packed without the child,
+    /// so it fences new rows too. This is coarse: it does not ask whether the
+    /// parent is packed.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write(Coordinate::FieldName(self.def.name.clone()));
         if !self.def.nullable {
@@ -85,6 +90,9 @@ impl AddField {
         }
         if let Some(parent) = self.parent {
             footprint.require_field_definition(parent);
+            if parent.committed().is_some() {
+                footprint.write(Coordinate::NewRowSchema);
+            }
         }
     }
 }

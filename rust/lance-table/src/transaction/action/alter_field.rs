@@ -86,13 +86,15 @@ impl AlterField {
     ///
     /// Tightening to non-nullable is only valid against the values it read,
     /// and applying it does not look at any. Values written since, or rows
-    /// added that leave the field unset, may hold nulls. Landing first, the
-    /// tightening is caught by the writer's requirement on the definition.
+    /// added that leave the field unset, may hold nulls. Landing first, it
+    /// makes the field required like a non-nullable add does, which fences a
+    /// stale append whether or not that append names the field -- including a
+    /// field minted in this set, which no other writer can name.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write_field_definition(self.field);
         if self.nullable == Some(false) {
             footprint.require_no_values_written(self.field);
-            footprint.require_no_rows_added();
+            footprint.add_required_column();
         }
         if let Some(name) = &self.name {
             footprint.write(Coordinate::FieldName(name.clone()));
