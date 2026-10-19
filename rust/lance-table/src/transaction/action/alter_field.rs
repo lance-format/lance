@@ -132,8 +132,10 @@ impl TryFrom<pb_transaction::AlterField> for AlterField {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::action::Action;
-    use crate::transaction::action::test_support::{apply, apply_with_indices, backed_manifest};
+    use crate::transaction::action::test_support::{
+        added_field, apply, apply_with_indices, backed_manifest,
+    };
+    use crate::transaction::action::{Action, AddField};
     use crate::transaction::test_support::sample_index_metadata;
 
     #[test]
@@ -199,9 +201,6 @@ mod tests {
 
     #[test]
     fn test_alter_field_rejects_renaming_onto_a_sibling() {
-        use crate::transaction::action::AddField;
-        use crate::transaction::action::test_support::added_field;
-
         let taken = Action::AddField(AddField {
             local: 0,
             parent: None,
@@ -232,9 +231,6 @@ mod tests {
     fn test_alter_field_can_name_a_field_minted_in_the_same_operation() {
         // A squash of "add column" and "rename column" lowers to exactly this,
         // and has no committed id to name the field by.
-        use crate::transaction::action::AddField;
-        use crate::transaction::action::test_support::added_field;
-
         let next = apply(
             &backed_manifest(),
             vec![

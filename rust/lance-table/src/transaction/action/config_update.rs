@@ -273,7 +273,7 @@ mod tests {
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint,
     };
-    use crate::transaction::action::{Action, AddField};
+    use crate::transaction::action::{Action, AddField, DropField};
     use crate::transaction::update_map::UpdateMapEntry;
 
     fn merge(entries: &[(&str, Option<&str>)]) -> UpdateMap {
@@ -491,8 +491,6 @@ mod tests {
 
     #[test]
     fn test_dropping_a_field_collides_with_updating_its_metadata() {
-        use crate::transaction::action::DropField;
-
         let metadata = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
             field_metadata: vec![FieldMetadataUpdate {
                 field: Ref::Committed(1),

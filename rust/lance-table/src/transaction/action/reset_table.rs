@@ -67,9 +67,11 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::transaction::action::test_support::{
-        added_field, apply, apply_with_indices, backed_manifest,
+        added_field, apply, apply_with_indices, backed_manifest, footprint,
     };
-    use crate::transaction::action::{Action, AddDataFile, AddField, AddFragment, Ref};
+    use crate::transaction::action::{
+        Action, AddDataFile, AddField, AddFragment, Ref, ReserveFragmentIds,
+    };
     use crate::transaction::test_support::sample_index_metadata;
     use lance_file::version::ConcreteFileVersion;
 
@@ -197,9 +199,6 @@ mod tests {
 
     #[test]
     fn test_reset_conflicts_with_everything() {
-        use crate::transaction::action::ReserveFragmentIds;
-        use crate::transaction::action::test_support::footprint;
-
         let reset = footprint(vec![reset()]);
         // Even a pure append, which writes no committed coordinate at all, is
         // preempted: its rows would either vanish or survive the reset

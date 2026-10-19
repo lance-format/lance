@@ -112,8 +112,10 @@ impl TryFrom<pb_transaction::TombstoneFieldData> for TombstoneFieldData {
 mod tests {
     use super::*;
     use crate::format::DataFile;
-    use crate::transaction::action::Action;
-    use crate::transaction::action::test_support::{apply, apply_with_indices, backed_manifest};
+    use crate::transaction::action::test_support::{
+        added_field, apply, apply_with_indices, backed_manifest,
+    };
+    use crate::transaction::action::{Action, AddDataFile, AddField};
     use crate::transaction::test_support::sample_index_metadata;
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
@@ -189,9 +191,6 @@ mod tests {
     fn test_tombstone_field_data_can_name_a_field_minted_in_the_same_operation() {
         // A squash of "add column with data" and "re-encode that column" lowers
         // to exactly this, and has no committed id to name the field by.
-        use crate::transaction::action::test_support::added_field;
-        use crate::transaction::action::{AddDataFile, AddField};
-
         let next = apply(
             &backed_manifest(),
             vec![
