@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     // code, but it also stops prost from generating that package, hence one
     // pass per package.
     let mut prost_build = new_config();
-    prost_build.extern_path(".lance.transaction", "crate::format::pb_transaction");
+    prost_build.extern_path(".lance.transaction", "crate::format::pb_actions");
     // Inline row id sequences are ~98% of a large manifest. Decoding them as
     // `Bytes` slices the fetched buffer instead of copying into a `Vec<u8>`.
     prost_build.bytes([".lance.table.DataFragment.inline_row_ids"]);
