@@ -416,9 +416,14 @@ mod tests {
 
     /// Overlaid cells have changed since the version a consumer last read, so
     /// the rows' last-updated versions have to say so, leaving every row the
-    /// overlay does not cover at the version it already had.
-    #[test]
-    fn test_overlaid_rows_are_restamped_with_the_version_the_commit_produces() {
+    /// overlay does not cover at the version it already had. A fragment with no
+    /// sequence, such as one migrated to stable row ids, reads as version 1.
+    #[rstest::rstest]
+    #[case::with_a_sequence(true)]
+    #[case::without_a_sequence(false)]
+    fn test_overlaid_rows_are_restamped_with_the_version_the_commit_produces(
+        #[case] has_sequence: bool,
+    ) {
         use crate::format::RowIdMeta;
         use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
         use crate::rowids::{RowIdSequence, write_row_ids};
@@ -428,7 +433,9 @@ mod tests {
         fragment.physical_rows = Some(3);
         let ids = RowIdSequence::from([0u64, 1, 2].as_slice());
         fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&ids).into()));
-        refresh_row_latest_update_meta_for_full_frag_rewrite_cols(&mut fragment, 1).unwrap();
+        if has_sequence {
+            refresh_row_latest_update_meta_for_full_frag_rewrite_cols(&mut fragment, 1).unwrap();
+        }
         let manifest = make_stable_row_id_manifest(vec![fragment]);
         let expected = manifest.version + 1;
 
