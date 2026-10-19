@@ -172,8 +172,10 @@ impl TryFrom<pb_transaction::AddOverlays> for AddOverlays {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::format::{DataFile, RowIdMeta};
+    use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
+    use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint,
     };
@@ -181,6 +183,7 @@ mod tests {
         Action, AddField, AddFragment, AddIndexSegment, AlterField, DropField, RemoveFragment,
         SetDeletionFile, TombstoneFieldData,
     };
+    use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use std::sync::Arc;
@@ -424,11 +427,6 @@ mod tests {
     fn test_overlaid_rows_are_restamped_with_the_version_the_commit_produces(
         #[case] has_sequence: bool,
     ) {
-        use crate::format::RowIdMeta;
-        use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
-        use crate::rowids::{RowIdSequence, write_row_ids};
-        use crate::transaction::test_support::make_stable_row_id_manifest;
-
         let mut fragment = backed_manifest().fragments[0].clone();
         fragment.physical_rows = Some(3);
         let ids = RowIdSequence::from([0u64, 1, 2].as_slice());

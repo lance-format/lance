@@ -12,7 +12,7 @@
 //! The wire format and the reasoning behind it live in
 //! `protos/transaction/actions.proto`; the two definitions must stay in step.
 //! Every action the specification defines is implemented here, so the two
-//! vocabularies now coincide -- an action a newer Lance writes is rejected on
+//! vocabularies coincide -- an action a newer Lance writes is rejected on
 //! load rather than skipped.
 //!
 //! Each action lives in its own module and owns everything about itself: its
