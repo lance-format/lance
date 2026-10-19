@@ -852,7 +852,7 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
-    use crate::transaction::action::{Action, AddFragment, Ref, UserAction};
+    use crate::transaction::action::{Action, AddFragment, Ref, UserStep};
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
@@ -958,19 +958,17 @@ mod tests {
         let transaction = Transaction {
             read_version: 4,
             uuid: uuid.clone(),
-            operation: Operation::CompositeOperation(CompositeOperation::new(vec![
-                UserAction::new(
-                    "append batch",
-                    vec![Action::AddFragment(AddFragment {
-                        id: Ref::Local(0),
-                        physical_rows: 1,
-                        row_id_meta: None,
-                        last_updated_at_version_meta: None,
-                        created_at_version_meta: None,
-                        data_change: true,
-                    })],
-                ),
-            ])),
+            operation: Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "append batch",
+                vec![Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 1,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                })],
+            )])),
             tag: None,
             transaction_properties: None,
         };
