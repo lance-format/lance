@@ -852,7 +852,13 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
-    use crate::transaction::action::{Action, AddFragment, Ref, UserStep};
+    use crate::transaction::action::{
+        Action, AddDataFile, AddFragment, Ref, RemoveFragment, UserStep,
+    };
+    use crate::transaction::operation::RewriteGroup;
+    use lance_file::version::ConcreteFileVersion;
+    use prost::Message;
+    use rstest::rstest;
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
@@ -1026,6 +1032,116 @@ mod tests {
         assert!(
             matches!(err, Error::NotSupported { .. }),
             "expected NotSupported, got: {err:?}"
+        );
+    }
+
+    const WIDE_COLUMNS: i32 = 200;
+
+    fn wide_data_file(index: usize, fields: Vec<i32>) -> DataFile {
+        DataFile::new(
+            format!("data/{:032x}.lance", index),
+            fields,
+            (0..WIDE_COLUMNS).collect(),
+            ConcreteFileVersion::V2_0,
+            std::num::NonZero::new(64 << 20),
+            None,
+        )
+    }
+
+    fn wide_fragment(id: u64) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment.physical_rows = Some(1_000_000);
+        fragment.files = vec![wide_data_file(id as usize, (0..WIDE_COLUMNS).collect())];
+        fragment
+    }
+
+    /// The composite spelling of minting `count` wide fragments, the way the
+    /// wire format describes it today: `file.fields` unset (-1) per column and
+    /// `field_ids` the authority.
+    fn mint_wide_fragments(count: usize, data_change: bool) -> Vec<Action> {
+        (0..count)
+            .flat_map(|index| {
+                let token = index as u32;
+                [
+                    Action::AddFragment(AddFragment {
+                        id: Ref::Local(token),
+                        physical_rows: 1_000_000,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change,
+                    }),
+                    Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Local(token),
+                        file: wide_data_file(index, vec![-1; WIDE_COLUMNS as usize]),
+                        field_ids: (0..WIDE_COLUMNS)
+                            .map(|field| Ref::Committed(field as u64))
+                            .collect(),
+                        data_change,
+                    }),
+                ]
+            })
+            .collect()
+    }
+
+    fn encoded_len(operation: Operation) -> usize {
+        let transaction = Transaction::new(1, operation, None);
+        pb::Transaction::try_from(&transaction)
+            .unwrap()
+            .encoded_len()
+    }
+
+    fn composite(actions: Vec<Action>) -> Operation {
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "step", actions,
+        )]))
+    }
+
+    /// A wide table makes the per-column cost of an action set visible: 100
+    /// fragments of 200 columns each, appended, and compacted 10 to 1.
+    ///
+    /// The bound is what the format costs today, so it only catches growth.
+    /// Tighten it once the shape of `AddDataFile.file.fields` is settled; the
+    /// -1 placeholders are most of the append's overhead.
+    #[rstest]
+    #[case::append(
+        Operation::Append { fragments: (0..100).map(wide_fragment).collect() },
+        composite(mint_wide_fragments(100, true)),
+        5.5,
+    )]
+    #[case::compaction(
+        Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: (0..100).map(wide_fragment).collect(),
+                new_fragments: (100..110).map(wide_fragment).collect(),
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        },
+        composite(
+            (0..100)
+                .map(|id| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(id),
+                        data_change: false,
+                    })
+                })
+                .chain(mint_wide_fragments(10, false))
+                .collect(),
+        ),
+        0.6,
+    )]
+    fn test_a_wide_action_set_stays_within_a_bound_of_the_legacy_size(
+        #[case] legacy: Operation,
+        #[case] actions: Operation,
+        #[case] max_ratio: f64,
+    ) {
+        let legacy = encoded_len(legacy);
+        let actions = encoded_len(actions);
+        assert!(
+            actions as f64 <= legacy as f64 * max_ratio,
+            "the action set encodes to {actions} bytes, more than {max_ratio}x the legacy \
+             operation's {legacy}"
         );
     }
 }
