@@ -4466,10 +4466,22 @@ mod composite {
     }
 
     /// Incremental consumers find changed rows through the last-updated
-    /// versions, so an overlay has to restamp the rows it covers.
+    /// versions, so an overlay has to restamp the rows it covers -- including
+    /// on a fragment migrated to stable row ids, which has no sequence yet.
+    #[rstest::rstest]
+    #[case::stable_from_creation(false)]
+    #[case::migrated(true)]
     #[tokio::test]
-    async fn test_overlaid_rows_are_reported_as_updated() {
-        let dataset = test_dataset(true).await;
+    async fn test_overlaid_rows_are_reported_as_updated(#[case] migrated: bool) {
+        let mut dataset = test_dataset(!migrated).await;
+        if migrated {
+            dataset.migrate_to_stable_row_ids().await.unwrap();
+            assert!(
+                dataset.fragments()[0]
+                    .last_updated_at_version_meta
+                    .is_none()
+            );
+        }
         let fragment = dataset.fragments()[0].id;
         let before = dataset.version().version;
         let actions = vec![overlay_action(&dataset, fragment)];
