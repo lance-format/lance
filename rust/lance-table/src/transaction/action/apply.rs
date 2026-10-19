@@ -1004,6 +1004,10 @@ mod tests {
         ]],
         Some("AlterField names field 0, which does not exist"),
     )]
+    #[case::data_file_after_drop(
+        vec![vec![drop_field_zero(), write_data(Ref::Committed(0), Ref::Committed(0))]],
+        Some("AddDataFile for fragment 0 names field 0, which does not exist"),
+    )]
     #[case::child_after_its_parent_is_dropped(
         vec![vec![drop_field_zero(), mint_field(0, "child", Some(Ref::Committed(0)))]],
         Some("AddField names parent field 0, which does not exist"),
