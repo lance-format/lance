@@ -960,7 +960,7 @@ mod tests {
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb_transaction::CompositeOperation {
-                    actions: vec![pb_transaction::UserAction {
+                    actions: vec![pb_transaction::UserStep {
                         description: "append batch".to_string(),
                         actions: vec![pb_transaction::Action {
                             action: Some(pb_transaction::action::Action::AddFragment(

@@ -647,7 +647,7 @@ than a description of intent.
 
 </details>
 
-A `CompositeOperation` holds `UserAction`s, each a human-recognizable step with
+A `CompositeOperation` holds `UserStep`s, each a human-recognizable step with
 a description, which in turn hold the granular `Action`s applied to the
 manifest. The two levels exist so the transaction history stays readable when
 several operations are squashed into one: the descriptions survive, while the
