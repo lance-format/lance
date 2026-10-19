@@ -580,6 +580,15 @@ mod tests {
         })
     }
 
+    fn tighten_local_field(local: u32) -> Action {
+        Action::AlterField(AlterField {
+            field: Ref::Local(local),
+            name: None,
+            logical_type: None,
+            nullable: Some(false),
+        })
+    }
+
     fn append(field: i32) -> Vec<Action> {
         vec![
             add_fragment(Ref::Local(0)),
@@ -877,9 +886,16 @@ mod tests {
         vec![add_data_file(Ref::Committed(7), &[1])],
         true,
     )]
-    #[case::a_replacement_landing_after_an_append_to_another_field(
+    // An added row counts as writing every field, so the replaced field's
+    // value in it -- null -- was never part of the replacement's data.
+    #[case::a_replacement_landing_after_an_append_omitting_the_field(
         vec![drop_field(1), add_field(0, "a", None)],
         append(2),
+        true,
+    )]
+    #[case::a_replacement_landing_after_a_rewrite_of_another_field(
+        vec![drop_field(1), add_field(0, "a", None)],
+        vec![add_data_file(Ref::Committed(7), &[2])],
         false,
     )]
     // The reverse order is already caught: the append requires the definition
@@ -939,6 +955,25 @@ mod tests {
         vec![set_nullability(1, false)],
         true,
     )]
+    // The append cannot name a field it does not write, so the tightening has
+    // to fence the schema new rows are written in.
+    #[case::an_append_omitting_the_field_landing_after_a_tightening(
+        append(2),
+        vec![set_nullability(1, false)],
+        true,
+    )]
+    // Adding a nullable field and tightening it in the same set is a
+    // non-nullable add by another name.
+    #[case::an_append_landing_after_a_local_field_is_added_and_tightened(
+        append(1),
+        vec![add_field(0, "c", None), tighten_local_field(0)],
+        true,
+    )]
+    #[case::a_local_field_added_and_tightened_landing_after_an_append(
+        vec![add_field(0, "c", None), tighten_local_field(0)],
+        append(1),
+        true,
+    )]
     #[case::a_relaxation_landing_after_an_append(
         vec![set_nullability(1, true)],
         append(1),
@@ -974,6 +1009,20 @@ mod tests {
     #[case::a_parent_dropped_after_a_child_was_added(
         vec![drop_field(1)],
         vec![add_field(0, "child", Some(Ref::Committed(1)))],
+        false,
+    )]
+    // A stale append may write the parent packed, without the new child.
+    #[case::an_append_landing_after_a_child_was_added_under_a_committed_parent(
+        append(2),
+        vec![add_field(0, "child", Some(Ref::Committed(1)))],
+        true,
+    )]
+    #[case::an_append_landing_after_a_child_was_added_under_a_local_parent(
+        append(2),
+        vec![
+            add_field(0, "parent", None),
+            add_field(1, "child", Some(Ref::Local(0))),
+        ],
         false,
     )]
     fn test_directional_conflicts(

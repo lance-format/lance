@@ -3323,6 +3323,94 @@ mod composite {
             .await;
     }
 
+    /// Adding a nullable field and tightening it in one set promises a value in
+    /// every row, which a stale append cannot keep.
+    #[rstest::rstest]
+    #[case::add_and_tighten_first(false)]
+    #[case::append_first(true)]
+    #[tokio::test]
+    async fn test_adding_then_tightening_a_local_field_conflicts_with_a_stale_append(
+        #[case] append_first: bool,
+    ) {
+        let original = test_dataset(false).await;
+        let read_version = original.version().version;
+        let mut add_and_tighten = vec![
+            Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: int32_field("b"),
+            }),
+            Action::AlterField(AlterField {
+                field: Ref::Local(0),
+                name: None,
+                logical_type: None,
+                nullable: Some(false),
+            }),
+        ];
+        for (index, fragment) in original.fragments().iter().enumerate() {
+            add_and_tighten.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(&original, index),
+                field_ids: vec![Ref::Local(0)],
+                data_change: true,
+            }));
+        }
+        let append = append_with_field_zero(&original);
+        let (first, stale) = if append_first {
+            (append, add_and_tighten)
+        } else {
+            (add_and_tighten, append)
+        };
+        let current = commit(original, first).await;
+        commit_expecting_conflict(&current, read_version, stale).await;
+    }
+
+    /// A stale append that never names the tightened field still leaves it null
+    /// in every row it adds.
+    #[rstest::rstest]
+    #[case::tightening_first(false)]
+    #[case::append_first(true)]
+    #[tokio::test]
+    async fn test_tightening_conflicts_with_an_append_omitting_the_field(
+        #[case] append_first: bool,
+    ) {
+        let nullable = nullable_test_dataset().await;
+        let with_b = commit(
+            nullable,
+            vec![Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: int32_field("b"),
+            })],
+        )
+        .await;
+        let read_version = with_b.version().version;
+        let b = with_b.schema().field("b").unwrap().id;
+        let append_only_b = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(&with_b, 0),
+                field_ids: vec![Ref::Committed(b as u64)],
+                data_change: true,
+            }),
+        ];
+        let (first, stale) = if append_first {
+            (append_only_b, tighten_field_zero())
+        } else {
+            (tighten_field_zero(), append_only_b)
+        };
+        let current = commit(with_b, first).await;
+        commit_expecting_conflict(&current, read_version, stale).await;
+    }
+
     #[tokio::test]
     async fn test_alter_field_rejects_a_retype() {
         let dataset = test_dataset(false).await;
