@@ -14,8 +14,8 @@ package lance.transaction;
  * Action-based transactions (Transaction V2) — EXPERIMENTAL.
  *
  * A `CompositeOperation` replaces the legacy `Operation` (see
- * transaction.proto) with an ordered list of `Action`s committing
- * atomically as one manifest change. This is an experimental feature under
+ * transaction.proto) with an ordered list of `UserStep`s, each expanding to
+ * an ordered list of `Action`s, committing atomically as one manifest change. This is an experimental feature under
  * the process in docs/src/community/voting.md: the field numbers are not a
  * stable contract, may change without a separate vote, and are removed if
  * the stabilization vote does not pass. Support here is read-side
@@ -57,9 +57,9 @@ package lance.transaction;
  * id) that may not be committed yet.
  *
  * `committed` is an already-assigned id. `local` is a placeholder token minted
- * by an `Add*` action earlier in the same `CompositeOperation`; it resolves to a
- * freshly-allocated committed id at apply, and re-resolves against the target's
- * counters on merge/rebase. `local` tokens are scoped to a single
+ * by an `AddFragment`, `AddField`, or `AddBase` action earlier in the same
+ * `CompositeOperation`; it resolves to a freshly-allocated committed id at
+ * apply, and re-resolves against the target's counters on merge/rebase. `local` tokens are scoped to a single
  * `CompositeOperation` and must be distinct within it (validated by the writer once
  * the write path exists).
  */
@@ -76,17 +76,18 @@ message Ref {
  */
 message CompositeOperation {
   // The ordered list of user steps applied by this operation.
-  repeated UserStep actions = 1;
+  repeated UserStep steps = 1;
 }
 
 /*
  * A single user-recognizable step within a CompositeOperation (e.g. "append batch",
  * "rebuild index").
  *
- * The description keeps the transaction history human-readable. When a range of
- * transactions is squashed, each original CompositeOperation collapses into one
- * UserStep so the readable sequence survives; the action lists are flattened
- * when applied to the manifest.
+ * The description keeps the transaction history human-readable. The intent is
+ * that squashing a range of transactions concatenates their steps, so the
+ * readable sequence survives; the exact squash behavior is up to the
+ * implementing system. The action lists are flattened when applied to the
+ * manifest.
  */
 message UserStep {
   // Human-readable description of this step.
@@ -215,7 +216,8 @@ message AddField {
   uint32 local = 1;
   /*
    * The parent field: Committed to reparent under an existing field, Local for
-   * a sibling minted in the same operation. Absent => top-level column.
+   * a parent minted by an earlier AddField in the same operation. Absent =>
+   * top-level column.
    */
   optional Ref parent = 2;
   // Field definition; its `id` and `parent_id` are ignored (see `local`, `parent`).
@@ -305,10 +307,14 @@ message ConfigUpdate {
 /*
  * Append overlay files to fragments (see DataOverlayFile in table.proto).
  *
- * Reference-stable: overlays target committed fragments/offsets/fields and are
+ * Reference-stable: overlays target fixed fragments/offsets/fields and are
  * appended, never replacing existing overlays.
  */
 message AddOverlays {
+  /* A Ref (Local allowed) on purpose: an overlay is an ordinary DataFile with a
+   * writer-chosen path, so unlike SetDeletionFile nothing in it depends on the
+   * fragment id.
+   */
   Ref fragment = 1;
   repeated lance.table.DataOverlayFile overlays = 2;
   // Data-change marker; see AddFragment.data_change.
@@ -334,7 +340,7 @@ message UpdateCompactedSsTables {
 
 /*
  * Remove a field from the schema (and, at apply, prune any data file left with
- * no live fields). References an existing committed field id.
+ * no live fields).
  */
 message DropField {
   Ref field = 1;
@@ -346,16 +352,14 @@ message DropField {
  * Each facet is optional: present means "change this facet", absent means
  * "leave unchanged". New facets are added as optional fields.
  *
- * `logical_type` is reserved and rejected at apply: a field id is durable
- * identity, so a cast may not keep it. A cast is a DropField, an AddField with
- * the same name and the new type, and AddDataFile for the new field's data.
+ * There is no type facet: a field id is durable identity, so a cast may not
+ * keep it. A cast is a DropField, an AddField with the same name and the new
+ * type, and AddDataFile for the new field's data.
  */
 message AlterField {
   Ref field = 1;
   optional string name = 2;
-  // Reserved; rejected at apply. See the message comment.
-  optional string logical_type = 3;
-  optional bool nullable = 4;
+  optional bool nullable = 3;
 }
 
 /*

@@ -54,8 +54,9 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
 }
 
-/// Protobuf definitions for Lance transactions
-pub mod pb_transaction {
+/// The `lance.transaction` package: the V2 action vocabulary and the building blocks it
+/// shares with legacy operations in `pb::transaction`.
+pub mod pb_actions {
     #![allow(clippy::all)]
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]

@@ -84,7 +84,7 @@ impl From<pb::Transaction> for Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::pb_transaction;
+    use crate::format::pb_actions;
     use prost::Message;
 
     /// The classification that must never depend on payload size. A MemWAL
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn field_metadata_updates_change_schema() {
         let mut update = pb::transaction::UpdateConfig {
-            config_updates: Some(pb_transaction::UpdateMap::default()),
+            config_updates: Some(pb_actions::UpdateMap::default()),
             ..Default::default()
         };
         let config_only = pb::Transaction {
@@ -137,7 +137,7 @@ mod tests {
 
         update
             .field_metadata_updates
-            .insert(0, pb_transaction::UpdateMap::default());
+            .insert(0, pb_actions::UpdateMap::default());
         let field_update = pb::Transaction {
             operation: Some(pb::transaction::Operation::UpdateConfig(update)),
             ..Default::default()

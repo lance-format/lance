@@ -10,7 +10,7 @@
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
@@ -413,8 +413,8 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::CompositeOperation(_)) => {
                 // Action-based transactions (Transaction V2) are an experimental
-                // wire format (OSS-1530). This version of Lance recognizes the message
-                // but has no support for it: reject on load, fail-closed. Because
+                // wire format (discussion #5960). This version of Lance recognizes
+                // the message but has no support for it: reject on load, fail-closed. Because
                 // load_and_sort_new_transactions collects transactions with
                 // try_collect, a concurrent V2 commit in the conflict window
                 // aborts the whole commit rather than being silently skipped.
@@ -678,17 +678,17 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                config_updates: config_updates.as_ref().map(pb_transaction::UpdateMap::from),
+                config_updates: config_updates.as_ref().map(pb_actions::UpdateMap::from),
                 table_metadata_updates: table_metadata_updates
                     .as_ref()
-                    .map(pb_transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 schema_metadata_updates: schema_metadata_updates
                     .as_ref()
-                    .map(pb_transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 field_metadata_updates: field_metadata_updates
                     .iter()
                     .map(|(field_id, update_map)| {
-                        (*field_id, pb_transaction::UpdateMap::from(update_map))
+                        (*field_id, pb_actions::UpdateMap::from(update_map))
                     })
                     .collect(),
                 // Leave old fields empty - we only write new-style fields
@@ -803,13 +803,13 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
     }
 }
 
-impl From<&UpdateMap> for pb_transaction::UpdateMap {
+impl From<&UpdateMap> for pb_actions::UpdateMap {
     fn from(update_map: &UpdateMap) -> Self {
         Self {
             update_entries: update_map
                 .update_entries
                 .iter()
-                .map(|entry| pb_transaction::UpdateMapEntry {
+                .map(|entry| pb_actions::UpdateMapEntry {
                     key: entry.key.clone(),
                     value: entry.value.clone(),
                 })
@@ -819,8 +819,8 @@ impl From<&UpdateMap> for pb_transaction::UpdateMap {
     }
 }
 
-impl From<&pb_transaction::UpdateMap> for UpdateMap {
-    fn from(pb_update_map: &pb_transaction::UpdateMap) -> Self {
+impl From<&pb_actions::UpdateMap> for UpdateMap {
+    fn from(pb_update_map: &pb_actions::UpdateMap) -> Self {
         Self {
             update_entries: pb_update_map
                 .update_entries
@@ -959,14 +959,14 @@ mod tests {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
-                pb_transaction::CompositeOperation {
-                    actions: vec![pb_transaction::UserStep {
+                pb_actions::CompositeOperation {
+                    steps: vec![pb_actions::UserStep {
                         description: "append batch".to_string(),
-                        actions: vec![pb_transaction::Action {
-                            action: Some(pb_transaction::action::Action::AddFragment(
-                                pb_transaction::AddFragment {
-                                    id: Some(pb_transaction::Ref {
-                                        kind: Some(pb_transaction::r#ref::Kind::Local(0)),
+                        actions: vec![pb_actions::Action {
+                            action: Some(pb_actions::action::Action::AddFragment(
+                                pb_actions::AddFragment {
+                                    id: Some(pb_actions::Ref {
+                                        kind: Some(pb_actions::r#ref::Kind::Local(0)),
                                     }),
                                     physical_rows: 1,
                                     data_change: Some(true),
