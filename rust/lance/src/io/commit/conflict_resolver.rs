@@ -6509,9 +6509,9 @@ mod tests {
         schema_metadata_updates: None,
         field_metadata_updates: HashMap::new(),
     })]
-    // The two operations whose checkers answer Ok without inspecting the other
-    // side: UpdateBases matched with a wildcard, and Clone has no checker at
-    // all. Both used to pass here while the mirror direction conflicted.
+    // The two operations whose checkers would otherwise answer Ok without
+    // inspecting the other side: UpdateBases, which treats every named operation
+    // as compatible, and Clone, which has no checker of its own.
     #[case::update_bases(Operation::UpdateBases {
         new_bases: vec![lance_table::format::BasePath {
             id: 1,
