@@ -33,6 +33,17 @@ impl AddDataFile {
             .iter()
             .map(|field| state.resolve_field(*field))
             .collect::<Result<Vec<_>>>()?;
+        // A column for a field the schema does not have is data no reader can
+        // see, such as one dropped earlier in the same operation.
+        if let Some(missing) = field_ids
+            .iter()
+            .find(|id| state.schema().field_by_id(**id).is_none())
+        {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment_id} names field {missing}, which does not \
+                 exist (field ids {field_ids:?})"
+            )));
+        }
 
         let mut file = self.file.clone();
         if !file.column_indices.is_empty() && file.column_indices.len() != field_ids.len() {
