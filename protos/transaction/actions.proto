@@ -268,8 +268,11 @@ message RemoveFragment {
  */
 message SetDeletionFile {
   /* The fragment, by committed id: unlike the sibling fragment actions this
-   * takes no Ref, because a fragment minted in the same operation has no rows
-   * to delete yet (see AddFragment).
+   * takes no Ref, because the deletion file's path embeds the fragment id
+   * (`_deletions/{fragment_id}-{read_version}-{id}.{ext}`) and apply does no
+   * IO, so it cannot rename the file once a minted id is known. Deleting from
+   * a fragment minted in the same operation needs a ReserveFragmentIds commit
+   * first.
    */
   uint64 fragment = 1;
   lance.table.DeletionFile deletion_file = 2;
@@ -341,15 +344,16 @@ message DropField {
  * Alter facets of an existing field in place, preserving its identity (id).
  *
  * Each facet is optional: present means "change this facet", absent means
- * "leave unchanged". Keying conflict on (field id, facet) lets independent
- * facet changes to the same field commute (e.g. a cast concurrent with a
- * nullability change). A cast additionally needs TombstoneFieldData plus a new
- * AddDataFile to rewrite the data. New facets are added as optional fields.
+ * "leave unchanged". New facets are added as optional fields.
+ *
+ * `logical_type` is reserved and rejected at apply: a field id is durable
+ * identity, so a cast may not keep it. A cast is a DropField, an AddField with
+ * the same name and the new type, and AddDataFile for the new field's data.
  */
 message AlterField {
   Ref field = 1;
   optional string name = 2;
-  // New Arrow logical type (see Field.logical_type). The cast.
+  // Reserved; rejected at apply. See the message comment.
   optional string logical_type = 3;
   optional bool nullable = 4;
 }
@@ -424,11 +428,13 @@ message AddIndexSegment {
    * The dataset version whose data this segment reflects.
    *
    * This is a correctness gate, not provenance: an overlay committed at or
-   * before it is treated as already folded into the index. A segment merged
-   * from several older ones reflects only as much as its oldest input, so this
-   * is genuinely below the version the operation reads and cannot be derived
-   * from it. Absent means the version the operation reads, which is what a
-   * freshly built segment reflects. It may never exceed that version.
+   * before it is treated as already folded into the index. Absent means the
+   * version the operation reads, which is what a freshly built segment
+   * reflects. For now an explicit value must equal that version: nothing
+   * would catch data rewritten between an older build and the read, so a
+   * segment built from an older snapshot must be composed against that
+   * snapshot. The field stays for the overlay gate and for future commit-time
+   * pruning of stale coverage, which would admit older segments.
    */
   optional uint64 dataset_version = 11;
 }
@@ -492,6 +498,10 @@ message AdjustIndexCoverage {
  * ConfigUpdate / AddBase in the same operation). Its write footprint spans the
  * whole schema, all fragments, and all indices, so it conflicts with any
  * concurrent change to them (DROP TABLE-style exclusivity).
+ *
+ * Actions before it in the same operation are allowed; it discards their
+ * changes to the schema, fragments, and indices. A committed reference after
+ * it to a fragment from before it is rejected.
  */
 message ResetTable {}
 
