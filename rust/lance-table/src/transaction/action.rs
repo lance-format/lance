@@ -165,7 +165,7 @@ impl Ref {
     }
 }
 
-/// A composable transaction: an ordered list of user actions that commit
+/// A composable transaction: an ordered list of user steps that commit
 /// atomically as a single manifest change.
 ///
 /// The `uuid` and `read_version` carried on the wire mirror the enclosing
@@ -182,11 +182,11 @@ impl Ref {
 /// # use lance_file::version::ConcreteFileVersion;
 /// # use lance_table::format::DataFile;
 /// use lance_table::transaction::action::{
-///     Action, AddDataFile, AddFragment, CompositeOperation, Ref, UserAction,
+///     Action, AddDataFile, AddFragment, CompositeOperation, Ref, UserStep,
 /// };
 ///
 /// let operation = CompositeOperation::new(vec![
-///     UserAction::new(
+///     UserStep::new(
 ///         "add a fragment",
 ///         vec![Action::AddFragment(AddFragment {
 ///             id: Ref::Local(0),
@@ -197,7 +197,7 @@ impl Ref {
 ///             data_change: true,
 ///         })],
 ///     ),
-///     UserAction::new(
+///     UserStep::new(
 ///         "back its one column",
 ///         vec![Action::AddDataFile(AddDataFile {
 ///             fragment: Ref::Local(0),
@@ -220,11 +220,11 @@ impl Ref {
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
 pub struct CompositeOperation {
     /// The ordered steps this operation applies.
-    pub actions: Vec<UserAction>,
+    pub actions: Vec<UserStep>,
 }
 
 impl CompositeOperation {
-    pub fn new(actions: Vec<UserAction>) -> Self {
+    pub fn new(actions: Vec<UserStep>) -> Self {
         Self { actions }
     }
 
@@ -241,12 +241,12 @@ impl CompositeOperation {
 /// is squashed, each original operation collapses into one step, so the sequence
 /// a user performed survives even though the deltas are flattened when applied.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct UserAction {
+pub struct UserStep {
     pub description: String,
     pub actions: Vec<Action>,
 }
 
-impl UserAction {
+impl UserStep {
     pub fn new(description: impl Into<String>, actions: Vec<Action>) -> Self {
         Self {
             description: description.into(),
@@ -344,14 +344,14 @@ mod tests {
     #[test]
     fn test_iter_actions_flattens_steps_in_order() {
         let operation = CompositeOperation::new(vec![
-            UserAction::new(
+            UserStep::new(
                 "first",
                 vec![Action::RemoveFragment(RemoveFragment {
                     fragment: Ref::Committed(1),
                     data_change: true,
                 })],
             ),
-            UserAction::new(
+            UserStep::new(
                 "second",
                 vec![Action::RemoveFragment(RemoveFragment {
                     fragment: Ref::Committed(2),

@@ -3,7 +3,7 @@
 
 //! Fixtures shared by the per-action test modules.
 
-use super::{Action, CompositeOperation, Footprint, UserAction};
+use super::{Action, CompositeOperation, Footprint, UserStep};
 use crate::format::{DataFile, Fragment, IndexMetadata, Manifest};
 use crate::transaction::test_support::{default_build_config, sample_manifest};
 use crate::transaction::{Operation, Transaction};
@@ -24,7 +24,7 @@ pub(super) fn apply_with_indices(
 ) -> Result<(Manifest, Vec<IndexMetadata>)> {
     let transaction = Transaction::new(
         manifest.version,
-        Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
             "step", actions,
         )])),
         None,
@@ -36,7 +36,7 @@ pub(super) fn apply_with_indices(
 /// action modules builds its two sides with this, so a pair reads as two lists
 /// of actions and an expected answer.
 pub(super) fn footprint(actions: Vec<Action>) -> Footprint {
-    Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+    Footprint::from(&CompositeOperation::new(vec![UserStep::new(
         "step", actions,
     )]))
 }
