@@ -55,11 +55,7 @@ impl AddOverlays {
         // consumers find through the rows' last-updated versions. A fragment
         // this operation minted takes its lineage from the `AddFragment` that
         // minted it.
-        //
-        // Skipped for a fragment with no last-updated sequence: the refresh
-        // would fill the uncovered rows with a version they never had, as the
-        // legacy path avoids.
-        if !refreshes_lineage || fragment.last_updated_at_version_meta.is_none() {
+        if !refreshes_lineage {
             return Ok(());
         }
         let mut covered = RoaringBitmap::new();
@@ -85,7 +81,9 @@ impl AddOverlays {
             fragment,
             &offsets,
             committed_version,
-            // Never read: a fragment with no sequence was skipped above.
+            // A fragment with no sequence, such as one migrated to stable row
+            // ids, gets one. Scans read missing lineage as version 1, so that
+            // keeps every uncovered row where it was, as the legacy path does.
             1,
             spilled,
         )
