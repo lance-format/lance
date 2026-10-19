@@ -4,7 +4,7 @@
 //! The envelope around the per-action protobuf encodings.
 //!
 //! Each action encodes itself, in its own module; this module carries the
-//! [`Ref`], [`CompositeOperation`], and [`UserAction`] wrappers, the dispatch over
+//! [`Ref`], [`CompositeOperation`], and [`UserStep`] wrappers, the dispatch over
 //! the `oneof`, and the helpers the per-action conversions share.
 //!
 //! Reading is fail-closed: an action this build does not implement is an error,
@@ -12,7 +12,7 @@
 //! transactions with `try_collect`, so a transaction carrying an unknown action
 //! must abort the commit rather than be treated as a no-op.
 
-use super::{Action, CompositeOperation, Ref, UserAction};
+use super::{Action, CompositeOperation, Ref, UserStep};
 use crate::format::pb_transaction;
 use lance_core::{Error, Result};
 
@@ -60,7 +60,7 @@ impl From<&CompositeOperation> for pb_transaction::CompositeOperation {
             actions: value
                 .actions
                 .iter()
-                .map(pb_transaction::UserAction::from)
+                .map(pb_transaction::UserStep::from)
                 .collect(),
         }
     }
@@ -74,14 +74,14 @@ impl TryFrom<pb_transaction::CompositeOperation> for CompositeOperation {
             actions: message
                 .actions
                 .into_iter()
-                .map(UserAction::try_from)
+                .map(UserStep::try_from)
                 .collect::<Result<Vec<_>>>()?,
         })
     }
 }
 
-impl From<&UserAction> for pb_transaction::UserAction {
-    fn from(value: &UserAction) -> Self {
+impl From<&UserStep> for pb_transaction::UserStep {
+    fn from(value: &UserStep) -> Self {
         Self {
             description: value.description.clone(),
             actions: value
@@ -93,10 +93,10 @@ impl From<&UserAction> for pb_transaction::UserAction {
     }
 }
 
-impl TryFrom<pb_transaction::UserAction> for UserAction {
+impl TryFrom<pb_transaction::UserStep> for UserStep {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::UserAction) -> Result<Self> {
+    fn try_from(message: pb_transaction::UserStep) -> Result<Self> {
         Ok(Self {
             description: message.description,
             actions: message
@@ -250,8 +250,8 @@ mod tests {
     #[test]
     fn test_composite_operation_round_trips() {
         let operation = CompositeOperation::new(vec![
-            UserAction::new("everything", all_actions()),
-            UserAction::new("nothing", vec![]),
+            UserStep::new("everything", all_actions()),
+            UserStep::new("nothing", vec![]),
         ]);
 
         let message = pb_transaction::CompositeOperation::from(&operation);

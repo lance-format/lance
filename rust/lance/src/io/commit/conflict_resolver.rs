@@ -3704,7 +3704,7 @@ mod tests {
     use lance_table::format::{InlineRowIds, RowIdMeta};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
     use lance_table::transaction::action::{
-        Action as TxnAction, CompositeOperation, Ref as ActionRef, TombstoneFieldData, UserAction,
+        Action as TxnAction, CompositeOperation, Ref as ActionRef, TombstoneFieldData, UserStep,
     };
 
     use super::*;
@@ -6449,7 +6449,7 @@ mod tests {
     fn action_txn(actions: Vec<TxnAction>) -> Transaction {
         Transaction::new_from_version(
             1,
-            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "step", actions,
             )])),
         )

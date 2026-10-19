@@ -647,7 +647,7 @@ mod tests {
     };
     use crate::transaction::action::{
         Action, AddDataFile, AddField, AddFragment, CompositeOperation, TombstoneFieldData,
-        UserAction,
+        UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{DataReplacementGroup, Operation};
@@ -707,7 +707,7 @@ mod tests {
             None,
         );
         let operation = if via_actions {
-            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "replace field 0",
                 vec![
                     Action::TombstoneFieldData(TombstoneFieldData {
