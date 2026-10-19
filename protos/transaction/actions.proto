@@ -71,12 +71,12 @@ message Ref {
 }
 
 /*
- * A user-facing, composable transaction: an ordered list of user actions that
+ * A user-facing, composable transaction: an ordered list of user steps that
  * commit atomically as a single manifest change.
  */
 message CompositeOperation {
-  // The ordered list of user actions applied by this operation.
-  repeated UserAction actions = 1;
+  // The ordered list of user steps applied by this operation.
+  repeated UserStep actions = 1;
 }
 
 /*
@@ -85,10 +85,10 @@ message CompositeOperation {
  *
  * The description keeps the transaction history human-readable. When a range of
  * transactions is squashed, each original CompositeOperation collapses into one
- * UserAction so the readable sequence survives; the action lists are flattened
+ * UserStep so the readable sequence survives; the action lists are flattened
  * when applied to the manifest.
  */
-message UserAction {
+message UserStep {
   // Human-readable description of this step.
   string description = 1;
   // The granular manifest changes this step expands to.
