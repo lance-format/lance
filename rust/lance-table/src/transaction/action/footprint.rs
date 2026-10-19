@@ -366,8 +366,6 @@ impl Footprint {
         if self.anchors_removed_by(committed) || committed.anchors_removed_by(self) {
             return true;
         }
-        // Index claims are not coordinates and are compared on their own terms,
-        // symmetrically.
         self.index_claims.iter().any(|ours| {
             committed
                 .index_claims
