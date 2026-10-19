@@ -3856,8 +3856,8 @@ mod composite {
     /// Apply-time pruning only discharges that obligation when the rewrite is
     /// the later commit, as the control above shows. A segment built before the
     /// rewrite but committed after it carries no rebind of its own, so nothing
-    /// prunes it -- and its footprint records only an index claim, which is
-    /// never compared against the `FieldData` coordinates the rewrite writes.
+    /// prunes it. Its footprint has to catch it instead: the segment requires
+    /// the `FieldData` coordinates the rewrite writes.
     #[tokio::test]
     async fn test_an_index_segment_staged_before_a_rewrite_does_not_cover_it() {
         let dataset = test_dataset(false).await;
