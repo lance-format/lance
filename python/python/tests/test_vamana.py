@@ -6,6 +6,8 @@
 # and their keyword arguments, the errors Lance raises for what it refuses,
 # search through the scanner, optimize, and segments built apart.
 
+import re
+
 import lance
 import numpy as np
 import pyarrow as pa
@@ -228,3 +230,39 @@ def test_segments_built_apart_are_merged_and_searched(tmp_path):
     assert stats["num_segments"] == 1
     assert stats["num_indexed_rows"] == ROWS
     assert recall(dataset, vectors, "l2") >= 0.95
+
+
+def test_a_stop_margin_reaches_the_walk(tmp_path):
+    """`stop_margin` reaches the scanner, which stops each walk by it: with
+    `ef` far above `k`, a margin of zero measures fewer distances than the
+    same cap without one, and the answer still holds `k` rows at their exact
+    distances. A margin no walk can stop by is refused by Lance, which alone
+    checks it."""
+    vectors = np.random.default_rng(3).random((ROWS, DIM), dtype=np.float32)
+    dataset = write(tmp_path / "ds.lance", vectors)
+    dataset.create_index(
+        "vector", "IVF_VAMANA_SQ", **index_options("IVF_VAMANA_SQ", "l2")
+    )
+    query = vectors[17]
+
+    def comparisons(**options):
+        nearest = {"column": "vector", "q": query, "k": K, "nprobes": 2, "ef": 200}
+        plan = dataset.scanner(nearest={**nearest, **options}).analyze_plan()
+        return sum(int(n) for n in re.findall(r"index_comparisons=(\d+)", plan))
+
+    unruled = comparisons()
+    assert 0 < comparisons(stop_margin=0.0) < unruled
+
+    result = search(dataset, query, "l2", ef=200, stop_margin=0.0)
+    ids = result["id"].to_numpy()
+    assert len(ids) == K and ids[0] == 17
+    np.testing.assert_allclose(
+        result["_distance"].to_numpy(),
+        exact_distances(vectors, query, "l2")[ids],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    for margin in [-0.1, float("nan"), float("inf")]:
+        with pytest.raises(ValueError, match="finite fraction"):
+            search(dataset, query, "l2", stop_margin=margin)

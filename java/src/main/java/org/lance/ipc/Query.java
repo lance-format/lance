@@ -37,6 +37,7 @@ public class Query {
   private final boolean useIndex;
   private final int queryParallelism;
   private final ApproxMode approxMode;
+  private final Optional<Float> stopMargin; // fork(vamana)
 
   private Query(Builder builder) {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
@@ -69,6 +70,7 @@ public class Query {
     this.useIndex = builder.useIndex;
     this.queryParallelism = builder.queryParallelism;
     this.approxMode = builder.approxMode;
+    this.stopMargin = builder.stopMargin; // fork(vamana)
   }
 
   public String getColumn() {
@@ -166,6 +168,11 @@ public class Query {
     return approxMode.toRustString();
   }
 
+  // fork(vamana)
+  public Optional<Float> getStopMargin() {
+    return stopMargin;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -184,6 +191,7 @@ public class Query {
         .add("useIndex", useIndex)
         .add("queryParallelism", queryParallelism)
         .add("approxMode", approxMode)
+        .add("stopMargin", stopMargin.orElse(null)) // fork(vamana)
         .toString();
   }
 
@@ -204,6 +212,7 @@ public class Query {
     private boolean useIndex = true;
     private int queryParallelism = 0;
     private ApproxMode approxMode = ApproxMode.NORMAL;
+    private Optional<Float> stopMargin = Optional.empty(); // fork(vamana)
 
     /**
      * Sets the column to be searched.
@@ -458,6 +467,30 @@ public class Query {
      */
     public Builder setApproxMode(ApproxMode approxMode) {
       this.approxMode = Preconditions.checkNotNull(approxMode, "ApproxMode must not be null");
+      return this;
+    }
+
+    // fork(vamana)
+    /**
+     * Stops each walk of an IVF_VAMANA_* index once none of its unexpanded candidates is among the
+     * {@code k} nearest or nearer than {@code 1 + stopMargin} times the length to the {@code k}-th:
+     * a query whose neighbors stand clear stops soon after finding them, and a crowded one walks
+     * further.
+     *
+     * <p>The margin is a finite fraction of at least zero; at zero a walk expands its {@code k}
+     * nearest and stops. {@link #setEf(int)} stays the most candidates a walk keeps and becomes a
+     * cap, so set it to a length no walk reaches, such as 2048, for the margin to decide where each
+     * walk stops. Under a filter or a distance range, a walk the margin leaves without enough rows
+     * is walked again without it, up to that cap. Other index types ignore the margin. The Rust
+     * core validates it when the scan is created, and refuses one no walk can stop by with an
+     * {@link IllegalArgumentException}.
+     *
+     * @param stopMargin How far past the {@code k}-th candidate a walk goes on, as a fraction of
+     *     that candidate's length.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setStopMargin(float stopMargin) {
+      this.stopMargin = Optional.of(stopMargin);
       return this;
     }
 

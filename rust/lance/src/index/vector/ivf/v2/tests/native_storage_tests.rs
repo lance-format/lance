@@ -36,6 +36,7 @@ pub(super) fn lazy_test_query(key: ArrayRef, k: usize, nprobes: usize) -> Query 
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Normal,
+        adaptive_stop: None, // fork(vamana)
     }
 }
 

@@ -28,7 +28,7 @@ pub(crate) mod testing;
 pub mod walk;
 
 pub use index::Vamana;
-pub use params::{VamanaBuildParams, VamanaMetadata, VamanaQueryParams};
+pub use params::{AdaptiveStop, VamanaBuildParams, VamanaMetadata, VamanaQueryParams};
 
 pub const VAMANA_TYPE: &str = "VAMANA";
 pub const VAMANA_METADATA_KEY: &str = "lance:vamana";

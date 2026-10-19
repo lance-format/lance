@@ -62,6 +62,62 @@ impl VamanaBuildParams {
     }
 }
 
+/// How far past its `rank`-th nearest candidate a query's walk goes on
+/// expanding, as a fraction of that candidate's length: the `gamma` of
+/// adaptive beam search (Al-Jazzazi et al., NeurIPS 2025).
+///
+/// A walk stops once none of its unexpanded candidates is among its `rank`
+/// nearest or nearer than `1 + margin` times the length to the `rank`-th. The
+/// distances a walk measures are squared lengths, so the bar is
+/// `(1 + margin)^2` times the `rank`-th's distance. A query whose neighbors
+/// stand clear of everything else stops soon after finding them; one crowded
+/// by near-equals walks further. At zero a walk expands its `rank` nearest and
+/// stops.
+///
+/// Each walk still keeps every candidate its partition answers with, whatever
+/// their distance. Its list length `ef` becomes a cap: a walk meant to follow
+/// the margin wants one it never reaches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdaptiveStop {
+    /// `gamma`: at least zero, with a finite `(1 + margin)^2`.
+    pub margin: f32,
+    /// The `k` the query asked for. Carried here because a partition is asked
+    /// for more candidates than that whenever they are scored again.
+    pub rank: usize,
+}
+
+impl AdaptiveStop {
+    /// Refuse a margin no walk can stop by, and a rank other than `k`, the
+    /// query's own, which must be at least one.
+    pub fn validate(&self, k: usize) -> Result<()> {
+        // A square that overflows would make the bar over a zero distance not
+        // a number.
+        let widened = 1.0 + self.margin;
+        if !(self.margin >= 0.0 && (widened * widened).is_finite()) {
+            return Err(Error::invalid_input(format!(
+                "stop_margin {} is not a finite fraction of at least zero with a finite \
+                 (1 + stop_margin)^2, so it cannot say how far past its k-th candidate a walk \
+                 goes on",
+                self.margin
+            )));
+        }
+        if k == 0 {
+            return Err(Error::invalid_input(
+                "stop_margin hangs its bar off the query's k-th candidate, but k is zero"
+                    .to_string(),
+            ));
+        }
+        if self.rank != k {
+            return Err(Error::invalid_input(format!(
+                "stop_margin hangs its bar off the query's k-th candidate, but carries rank {} \
+                 for a query of k {k}",
+                self.rank
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// How a query searches one partition's graph.
 #[derive(Debug, Clone, Copy)]
 pub struct VamanaQueryParams {
@@ -70,6 +126,9 @@ pub struct VamanaQueryParams {
     pub lower_bound: Option<f32>,
     pub upper_bound: Option<f32>,
     pub dist_q_c: f32,
+    /// When the walk stops with candidates still unexpanded; `None` walks
+    /// until nothing in its list is left to expand.
+    pub stop: Option<AdaptiveStop>,
 }
 
 impl From<&Query> for VamanaQueryParams {
@@ -80,6 +139,7 @@ impl From<&Query> for VamanaQueryParams {
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
             dist_q_c: query.dist_q_c,
+            stop: query.adaptive_stop,
         }
     }
 }

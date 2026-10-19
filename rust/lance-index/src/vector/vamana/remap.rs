@@ -172,6 +172,7 @@ mod tests {
                 lower_bound: None,
                 upper_bound: None,
                 dist_q_c: 0.0,
+                stop: None,
             };
             let found = index
                 .search(

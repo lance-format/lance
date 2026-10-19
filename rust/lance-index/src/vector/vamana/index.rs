@@ -206,7 +206,19 @@ impl Vamana {
     /// short of them, and its passing rows are then scored directly too. A
     /// walk whose list reached past the upper bound has already measured
     /// every row in range it could, and is neither repeated nor followed by
-    /// scoring. `stop` applies to an unfiltered walk only.
+    /// scoring.
+    ///
+    /// `params.stop` rules the first walk, which keeps its nearest `keep`
+    /// whatever their distance. A ruled walk stops with candidates left
+    /// unexpanded, which the fallbacks above cannot tell from a walk that ran
+    /// to its end, so filtered or bounded it answers only when it admitted
+    /// `keep` rows and at least half its list passed, or when its list reached
+    /// past the upper bound from a `rank`-th candidate already past it: it
+    /// expands every candidate before the `rank`-th, and stops only at one past
+    /// the bar. Otherwise the search runs as it would without the rule, and
+    /// pays for the ruled walk on top. The rule reaches filtered walks at all
+    /// because deleted rows arrive as a prefilter, which would otherwise turn
+    /// the margin off.
     pub fn search_nodes(
         &self,
         query: ArrayRef,
@@ -214,7 +226,6 @@ impl Vamana {
         params: &VamanaQueryParams,
         storage: &impl VectorStore,
         prefilter: &dyn PreFilter,
-        stop: Option<StopRule>,
     ) -> Result<Searched> {
         if keep == 0 {
             return Ok(Searched::default());
@@ -244,9 +255,20 @@ impl Vamana {
 
         let calculator = storage.dist_calculator(query.clone(), params.dist_q_c);
         let mut walk_params = WalkParams::new(params.ef.max(keep));
+        let rule = params.stop.map(|stop| StopRule {
+            margin: stop.margin,
+            rank: stop.rank,
+            keep,
+        });
         if prefilter.is_empty() && !bounded {
-            walk_params.stop = stop;
-            let walked = self.walk(&calculator, &walk_params, None)?;
+            let walked = self.walk(
+                &calculator,
+                &WalkParams {
+                    stop: rule,
+                    ..walk_params
+                },
+                None,
+            )?;
             let mut nodes = walked.list;
             nodes.truncate(keep);
             return Ok(Searched {
@@ -262,7 +284,43 @@ impl Vamana {
                     .as_ref()
                     .is_none_or(|mask| mask.selected(storage.row_id(position)))
         };
-        let walked = self.walk(
+        // A list whose back reached the upper bound holds every vertex below
+        // it that the walk measured, so a wider walk would find no more.
+        let reaches_upper =
+            |list: &[OrderedNode]| list.last().is_some_and(|last| last.dist >= upper);
+        let mut spent = 0;
+        if let Some(rule) = rule {
+            let ruled = self.walk(
+                &calculator,
+                &WalkParams {
+                    stop: Some(rule),
+                    ..walk_params
+                },
+                Some(Admission {
+                    keep,
+                    accept: &mut accept,
+                }),
+            )?;
+            let passing_in_list = ruled
+                .list
+                .iter()
+                .filter(|node| accept(node.id, node.dist.0))
+                .count();
+            let ranked_past_upper = ruled
+                .list
+                .get(rule.rank - 1)
+                .is_none_or(|node| node.dist >= upper);
+            if ruled.admitted.len() >= keep && passing_in_list * 2 >= ruled.list.len()
+                || ranked_past_upper && reaches_upper(&ruled.list)
+            {
+                return Ok(Searched {
+                    nodes: ruled.admitted,
+                    comparisons: ruled.comparisons,
+                });
+            }
+            spent = ruled.comparisons;
+        }
+        let mut walked = self.walk(
             &calculator,
             &walk_params,
             Some(Admission {
@@ -270,15 +328,12 @@ impl Vamana {
                 accept: &mut accept,
             }),
         )?;
+        walked.comparisons += spent;
         let passing_in_list = walked
             .list
             .iter()
             .filter(|node| accept(node.id, node.dist.0))
             .count();
-        // A list whose back reached the upper bound holds every vertex below
-        // it that the walk measured, so a wider walk would find no more.
-        let reaches_upper =
-            |list: &[OrderedNode]| list.last().is_some_and(|last| last.dist >= upper);
         if walked.admitted.len() >= keep && passing_in_list * 2 >= walked.list.len()
             || reaches_upper(&walked.list)
         {
@@ -459,7 +514,7 @@ impl IvfSubIndex for Vamana {
                 "ef must be greater than or equal to k".to_string(),
             ));
         }
-        let searched = self.search_nodes(query, k, &params, storage, prefilter.as_ref(), None)?;
+        let searched = self.search_nodes(query, k, &params, storage, prefilter.as_ref())?;
         metrics.record_comparisons(searched.comparisons as usize);
         let (row_ids, distances): (Vec<_>, Vec<_>) = searched
             .nodes
@@ -521,9 +576,10 @@ mod tests {
     use crate::prefilter::NoFilter;
     use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
     use crate::vector::vamana::incremental::build_incremental;
+    use crate::vector::vamana::params::AdaptiveStop;
     use crate::vector::vamana::testing::{
-        MaskFilter, exact_nearest, flat_storage_with_row_ids, recall, rq_storage, scattered_values,
-        sq_storage, vectors_of,
+        MaskFilter, exact_nearest, flat_storage, flat_storage_with_row_ids, recall, rq_storage,
+        scattered_values, sq_storage, vectors_of,
     };
 
     const DIMENSION: usize = 8;
@@ -573,6 +629,16 @@ mod tests {
             lower_bound: None,
             upper_bound: None,
             dist_q_c: 0.0,
+            stop: None,
+        }
+    }
+
+    /// [`query_params`] with a stop rule at `margin` hanging off the
+    /// `rank`-th candidate.
+    fn stopped_params(ef: usize, margin: f32, rank: usize) -> VamanaQueryParams {
+        VamanaQueryParams {
+            stop: Some(AdaptiveStop { margin, rank }),
+            ..query_params(ef)
         }
     }
 
@@ -881,14 +947,7 @@ mod tests {
         for query in &queries {
             let search_nodes = |prefilter: &dyn PreFilter| {
                 index
-                    .search_nodes(
-                        query.clone(),
-                        10,
-                        &query_params(10),
-                        &storage,
-                        prefilter,
-                        None,
-                    )
+                    .search_nodes(query.clone(), 10, &query_params(10), &storage, prefilter)
                     .unwrap()
             };
             let unfiltered = search_nodes(&NoFilter);
@@ -966,7 +1025,7 @@ mod tests {
         for query in &queries {
             let search_nodes = |params: &VamanaQueryParams, prefilter: &dyn PreFilter| {
                 index
-                    .search_nodes(query.clone(), 20, params, &storage, prefilter, None)
+                    .search_nodes(query.clone(), 20, params, &storage, prefilter)
                     .unwrap()
             };
             let unbounded = search_nodes(&query_params(40), &NoFilter);
@@ -1008,14 +1067,7 @@ mod tests {
         for query in &queries {
             let walk = |ef: usize| {
                 index
-                    .search_nodes(
-                        query.clone(),
-                        ef,
-                        &query_params(ef),
-                        &storage,
-                        &NoFilter,
-                        None,
-                    )
+                    .search_nodes(query.clone(), ef, &query_params(ef), &storage, &NoFilter)
                     .unwrap()
             };
             let (narrow, wide) = (walk(40), walk(80));
@@ -1032,7 +1084,7 @@ mod tests {
                 ..query_params(40)
             };
             let masked = index
-                .search_nodes(query.clone(), 40, &bounded, &storage, evens.as_ref(), None)
+                .search_nodes(query.clone(), 40, &bounded, &storage, evens.as_ref())
                 .unwrap();
             assert_eq!(masked.comparisons, narrow.comparisons + wide.comparisons);
             let found = masked
@@ -1042,6 +1094,289 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(found, expected);
         }
+    }
+
+    /// At a margin of zero, keeping only `rank` candidates, a walk expands its
+    /// `rank` nearest and stops: it is the walk whose list is `rank` long,
+    /// down to the last distance, unfiltered, through a prefilter of deleted
+    /// rows and under a bound alike. The cap is twenty times `rank`, so that a
+    /// walk ignoring the margin would walk much further, and that is checked
+    /// too.
+    #[test]
+    fn a_margin_of_zero_is_the_walk_at_k_filtered_or_not() {
+        let (storage, queries) = flat_fixture(1000, 20);
+        let index = Vamana::index_vectors(&storage, params()).unwrap();
+        // A few deleted rows, far between, as a prefilter brings them.
+        let live = mask_filter(RowAddrMask::from_allowed(
+            storage
+                .row_ids()
+                .copied()
+                .filter(|row_id| (row_id - 3) / 10 % 50 != 7)
+                .collect::<RowAddrTreeMap>(),
+        ));
+        let cases: [(&str, &dyn PreFilter, Option<f32>); 3] = [
+            ("unfiltered", &NoFilter, None),
+            ("live rows", live.as_ref(), None),
+            ("bounded", &NoFilter, Some(f32::MAX)),
+        ];
+        let mut further = [0usize; 3];
+        for query in &queries {
+            for (case, (what, prefilter, upper_bound)) in cases.iter().enumerate() {
+                let search = |params: VamanaQueryParams| {
+                    let params = VamanaQueryParams {
+                        upper_bound: *upper_bound,
+                        ..params
+                    };
+                    index
+                        .search_nodes(query.clone(), 10, &params, &storage, *prefilter)
+                        .unwrap()
+                };
+                let at_k = search(query_params(10));
+                let ruled = search(stopped_params(200, 0.0, 10));
+                assert_eq!(ruled.nodes, at_k.nodes, "{what}");
+                assert_eq!(ruled.comparisons, at_k.comparisons, "{what}");
+                further[case] +=
+                    usize::from(search(query_params(200)).comparisons > at_k.comparisons);
+            }
+        }
+        assert!(
+            further.iter().all(|count| *count > 0),
+            "the cap never let a walk without the margin go further than L = k: {further:?}"
+        );
+    }
+
+    /// The rule hangs its bar off the `rank`-th candidate and keeps every
+    /// candidate the walk is asked for: at a margin of zero, a walk asked for
+    /// twenty at a rank of ten measures what the walk at ten does, and
+    /// answers with twenty, the first ten of them the same.
+    #[test]
+    fn a_margin_hangs_off_its_rank_and_keeps_what_the_walk_is_asked_for() {
+        let (storage, queries) = flat_fixture(1000, 20);
+        let index = Vamana::index_vectors(&storage, params()).unwrap();
+        let mut wider = 0;
+        for query in &queries {
+            let search = |keep: usize, params: &VamanaQueryParams| {
+                index
+                    .search_nodes(query.clone(), keep, params, &storage, &NoFilter)
+                    .unwrap()
+            };
+            let at_rank = search(10, &query_params(10));
+            let ruled = search(20, &stopped_params(200, 0.0, 10));
+            assert_eq!(ruled.comparisons, at_rank.comparisons);
+            assert_eq!(ruled.nodes.len(), 20);
+            assert_eq!(ruled.nodes[..10], at_rank.nodes[..]);
+            wider += usize::from(search(20, &query_params(20)).comparisons > at_rank.comparisons);
+        }
+        assert!(
+            wider > 0,
+            "the walk at twenty never measured more than the walk at ten, so a bar off the \
+             twentieth candidate would pass for one off the tenth"
+        );
+    }
+
+    /// A filtered ruled walk that admitted too few rows answers nothing by
+    /// itself: the search then runs exactly as it would without the margin,
+    /// and pays for the ruled walk on top. So it returns the plain search's
+    /// rows, at the ruled walk's distances plus the plain search's. With a
+    /// fifth of the rows passing, most ruled lists hold too few of them.
+    #[test]
+    fn a_filtered_ruled_walk_short_of_passing_rows_falls_back_to_the_plain_search() {
+        let (storage, queries) = flat_fixture(1000, 20);
+        let index = Vamana::index_vectors(&storage, params()).unwrap();
+        let chosen = |row_id: u64| ((row_id - 3) / 10).is_multiple_of(5);
+        let prefilter = mask_filter(RowAddrMask::from_allowed(
+            storage
+                .row_ids()
+                .copied()
+                .filter(|row_id| chosen(*row_id))
+                .collect::<RowAddrTreeMap>(),
+        ));
+        let rule = StopRule {
+            margin: 0.0,
+            rank: 10,
+            keep: 10,
+        };
+        let (mut fell_back, mut mostly_blocked) = (0, 0);
+        for query in &queries {
+            let search = |params: &VamanaQueryParams| {
+                index
+                    .search_nodes(query.clone(), 10, params, &storage, prefilter.as_ref())
+                    .unwrap()
+            };
+            let plain = search(&query_params(40));
+            let ruled = search(&stopped_params(40, 0.0, 10));
+            // The ruled walk the search starts with, steering by every row.
+            let mut accept = |position: u32, _: f32| chosen(storage.row_id(position));
+            let first = index
+                .walk(
+                    &storage.dist_calculator(query.clone(), 0.0),
+                    &WalkParams {
+                        stop: Some(rule),
+                        ..WalkParams::new(40)
+                    },
+                    Some(Admission {
+                        keep: 10,
+                        accept: &mut accept,
+                    }),
+                )
+                .unwrap();
+            let passing = first
+                .list
+                .iter()
+                .filter(|node| chosen(storage.row_id(node.id)))
+                .count();
+            mostly_blocked +=
+                usize::from(first.admitted.len() >= 10 && passing * 2 < first.list.len());
+            if first.admitted.len() >= 10 && passing * 2 >= first.list.len() {
+                assert_eq!(ruled.nodes, first.admitted);
+                assert_eq!(ruled.comparisons, first.comparisons);
+            } else {
+                assert_eq!(ruled.nodes, plain.nodes);
+                assert_eq!(ruled.comparisons, first.comparisons + plain.comparisons);
+                fell_back += 1;
+            }
+        }
+        assert!(
+            fell_back * 2 >= queries.len() && mostly_blocked > 0,
+            "{fell_back} of {} ruled walks fell back to the plain search, {mostly_blocked} of them \
+             with enough rows admitted from a mostly blocked list",
+            queries.len()
+        );
+    }
+
+    /// A walk on a path from `query` at 0, over rows at the `values` given:
+    /// each row's only out-edge leads to the next, and the walk starts at the
+    /// first.
+    fn path_partition(values: Vec<f32>, adjacency: &[Vec<u32>]) -> (Vamana, FlatFloatStorage) {
+        let storage = flat_storage(values, 1, DistanceType::L2);
+        let row_ids = (0..adjacency.len() as u64).collect();
+        let graph = PartitionGraph::try_new(2, row_ids, adjacency).unwrap();
+        (
+            Vamana::from_graph(&graph, 0, vec![], params()).unwrap(),
+            storage,
+        )
+    }
+
+    /// A ruled walk that admits too few rows proves nothing about the rows it
+    /// did not reach, so a bounded search that cannot answer from it searches
+    /// as it would without the margin. Here the margin stops the walk before
+    /// the one row past the lower bound, in a partition shorter than the
+    /// list, where a walk that had run to its end would have seen every row.
+    #[test]
+    fn a_ruled_walk_short_of_a_lower_bound_does_not_answer_alone() {
+        // Distances 1, 4 and 9 from the query, along s -> a -> c.
+        let (index, storage) = path_partition(vec![1.0, 2.0, 3.0], &[vec![1], vec![2], vec![]]);
+        let query = Arc::new(Float32Array::from(vec![0.0])) as ArrayRef;
+        let bounded = |params: VamanaQueryParams| VamanaQueryParams {
+            lower_bound: Some(5.0),
+            ..params
+        };
+        let search = |params: VamanaQueryParams| {
+            index
+                .search_nodes(query.clone(), 1, &bounded(params), &storage, &NoFilter)
+                .unwrap()
+        };
+        let plain = search(query_params(10));
+        assert_eq!(
+            plain.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [2]
+        );
+        let ruled = search(stopped_params(10, 0.0, 1));
+        assert_eq!(ruled.nodes, plain.nodes);
+        // The ruled walk measured s and a; the plain one s, a and c.
+        assert_eq!((ruled.comparisons, plain.comparisons), (5, 3));
+    }
+
+    /// A ruled walk keeping more than it ranks stops with the tail of its
+    /// list unexpanded, so a back past the upper bound does not show that it
+    /// measured every row below the bound. Here the start is deleted, the
+    /// nearer of its two neighbors leads to the one live row in range, and
+    /// the margin stops the walk before following it. Without the deletion
+    /// the ruled list passes half its rows, but admits one of the two asked
+    /// for, which is no more an answer.
+    #[test]
+    fn a_ruled_walk_short_of_an_upper_bound_does_not_answer_alone() {
+        // s at 1 -> {a at 3, b at 10}, a -> c at 2: squared lengths of the
+        // values below.
+        let (index, storage) = path_partition(
+            vec![1.0, 3f32.sqrt(), 10f32.sqrt(), 2f32.sqrt()],
+            &[vec![1, 2], vec![3], vec![], vec![]],
+        );
+        let query = Arc::new(Float32Array::from(vec![0.0])) as ArrayRef;
+        let live = mask_filter(RowAddrMask::from_allowed(
+            [1u64, 2, 3].into_iter().collect::<RowAddrTreeMap>(),
+        ));
+        let search = |params: VamanaQueryParams, prefilter: &dyn PreFilter| {
+            let params = VamanaQueryParams {
+                upper_bound: Some(2.5),
+                ..params
+            };
+            index
+                .search_nodes(query.clone(), 2, &params, &storage, prefilter)
+                .unwrap()
+        };
+        let cases: [(&dyn PreFilter, Vec<u32>); 2] =
+            [(live.as_ref(), vec![3]), (&NoFilter, vec![0, 3])];
+        for (prefilter, expected) in cases {
+            let plain = search(query_params(3), prefilter);
+            assert_eq!(
+                plain.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+                expected
+            );
+            let ruled = search(stopped_params(3, 0.0, 1), prefilter);
+            assert_eq!(ruled.nodes, plain.nodes);
+            // The ruled walk measured s, a and b; the plain one s, a, b and c.
+            assert_eq!((ruled.comparisons, plain.comparisons), (7, 4));
+        }
+    }
+
+    /// A ruled walk whose `rank`-th candidate lies past the upper bound has
+    /// expanded every candidate below it, as one that stops only past the bar
+    /// must, so a list reaching past the bound answers as a plain walk's does.
+    /// Along s -> a -> c -> d -> e, two asked for and one of them in range,
+    /// the ruled walk stops at c where the plain one walks to e. A list
+    /// shorter than the rank never had a bar, so its walk ran to the end.
+    #[test]
+    fn a_ruled_walk_ranked_past_its_upper_bound_answers_alone() {
+        fn search(
+            index: &Vamana,
+            storage: &FlatFloatStorage,
+            keep: usize,
+            params: VamanaQueryParams,
+        ) -> Searched {
+            let params = VamanaQueryParams {
+                upper_bound: Some(3.0),
+                ..params
+            };
+            let query = Arc::new(Float32Array::from(vec![0.0])) as ArrayRef;
+            index
+                .search_nodes(query, keep, &params, storage, &NoFilter)
+                .unwrap()
+        }
+        // Distances 1, 4, 9, 16 and 25 from the query.
+        let (index, storage) = path_partition(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            &[vec![1], vec![2], vec![3], vec![4], vec![]],
+        );
+        let plain = search(&index, &storage, 2, query_params(10));
+        assert_eq!(
+            plain.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [0]
+        );
+        let ruled = search(&index, &storage, 2, stopped_params(10, 0.0, 2));
+        assert_eq!(ruled.nodes, plain.nodes);
+        assert_eq!((ruled.comparisons, plain.comparisons), (3, 5));
+
+        // s -> a, three asked for.
+        let (index, storage) = path_partition(vec![1.0, 2.0], &[vec![1], vec![]]);
+        let plain = search(&index, &storage, 3, query_params(10));
+        assert_eq!(
+            plain.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [0]
+        );
+        let ruled = search(&index, &storage, 3, stopped_params(10, 0.0, 3));
+        assert_eq!(ruled.nodes, plain.nodes);
+        assert_eq!((ruled.comparisons, plain.comparisons), (2, 2));
     }
 
     /// Stores a graph cannot be built over are refused by every path that

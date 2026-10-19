@@ -7442,6 +7442,7 @@ class ScannerBuilder:
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
+        stop_margin: Optional[float] = None,  # fork(vamana)
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7489,6 +7490,18 @@ class ScannerBuilder:
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
             recall and may increase latency.
+        stop_margin: float, optional
+            Stop each walk of an IVF_VAMANA_* index once none of its unexpanded
+            candidates is among the ``k`` nearest or nearer than
+            ``1 + stop_margin`` times the length to the ``k``-th: a query whose
+            neighbors stand clear stops soon after finding them, and a crowded
+            one walks further. A finite fraction of at least zero; at zero a
+            walk expands its ``k`` nearest and stops. ``ef`` stays the most
+            candidates a walk keeps and becomes a cap, so set it to a length no
+            walk reaches, such as 2048, for the margin to decide where each walk
+            stops. Under a filter or a distance range, a walk the margin leaves
+            without enough rows is walked again without it, up to that cap.
+            Other index types ignore it. None walks each list to its end.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7506,6 +7519,7 @@ class ScannerBuilder:
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
+            stop_margin=stop_margin,  # fork(vamana)
         )
         return self
 
@@ -8814,6 +8828,7 @@ def _build_vector_search_query(
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     search_effort: Optional[float] = None,
+    stop_margin: Optional[float] = None,  # fork(vamana)
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8877,6 +8892,10 @@ def _build_vector_search_query(
         Both bounds are optional. The lower bound is inclusive and the upper
         bound is exclusive, so (0.0, 1.0) keeps distances d where
         0.0 <= d < 1.0, (None, 0.5) keeps d < 0.5, and (0.5, None) keeps d >= 0.5.
+    stop_margin: float, optional
+        How far past its ``k``-th candidate a walk of an IVF_VAMANA_* index
+        goes on expanding, as a fraction of that candidate's length; see
+        :meth:`ScannerBuilder.nearest`. Validated by the scanner.
 
     Returns
     -------
@@ -8964,6 +8983,7 @@ def _build_vector_search_query(
         "approx_mode": approx_mode,
         "search_effort": search_effort,
         "distance_range": distance_range,
+        "stop_margin": stop_margin,  # fork(vamana)
     }
 
 

@@ -322,6 +322,31 @@ public class VamanaIndexTest {
     }
   }
 
+  /**
+   * A stop margin reaches Lance's scanner, which alone checks it: one no walk can stop by is
+   * refused there, and a query with a valid one answers. Whether the walks stop by it is tested in
+   * Rust and Python, which can count their distances.
+   */
+  @Test
+  public void testAStopMarginReachesTheScanner(@TempDir Path tempDir) throws Exception {
+    float[][] vectors = vectors(ROWS, DIM);
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            write(allocator, uri(tempDir), vectors, 0, null, WriteParams.WriteMode.CREATE)) {
+      dataset.createIndex(indexOptions(IndexType.IVF_VAMANA_SQ, DistanceType.L2, GRAPH));
+      Map<Long, Float> found = search(dataset, vectors[17], DistanceType.L2, 200, 0.05f);
+      assertEquals(K, found.size());
+      assertEquals(17L, found.keySet().iterator().next());
+      for (float margin : new float[] {-0.1f, Float.NaN, Float.POSITIVE_INFINITY}) {
+        IllegalArgumentException failure =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> search(dataset, vectors[17], DistanceType.L2, 200, margin));
+        assertTrue(failure.getMessage().contains("finite fraction"), failure.getMessage());
+      }
+    }
+  }
+
   private static VamanaBuildParams.Builder graph() {
     return new VamanaBuildParams.Builder()
         .setMaxDegree(MAX_DEGREE)
@@ -565,15 +590,25 @@ public class VamanaIndexTest {
   /** The ids of the `K` rows nearest to `query`, nearest first, with their distances. */
   private static Map<Long, Float> search(
       Dataset dataset, float[] query, DistanceType metric, int ef) throws Exception {
-    Query nearest =
+    return search(dataset, query, metric, ef, null);
+  }
+
+  /** {@link #search(Dataset, float[], DistanceType, int)} with a stop margin, unless null. */
+  private static Map<Long, Float> search(
+      Dataset dataset, float[] query, DistanceType metric, int ef, Float stopMargin)
+      throws Exception {
+    Query.Builder builder =
         new Query.Builder()
             .setColumn(COLUMN)
             .setKey(query)
             .setK(K)
             .setNprobes(2)
             .setEf(ef)
-            .setDistanceType(metric)
-            .build();
+            .setDistanceType(metric);
+    if (stopMargin != null) {
+      builder.setStopMargin(stopMargin);
+    }
+    Query nearest = builder.build();
     ScanOptions options =
         new ScanOptions.Builder().columns(List.of("id", "_distance")).nearest(nearest).build();
     Map<Long, Float> found = new LinkedHashMap<>();

@@ -601,6 +601,7 @@ mod tests {
     use arrow_array::types::Float32Type;
     use lance_linalg::distance::DistanceType;
     use rand::rngs::SmallRng;
+    use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
 
     use super::*;
@@ -771,41 +772,355 @@ mod tests {
         assert!(list.would_keep(2.5));
     }
 
-    /// A plain list: the nearest `size` offers, first of equals kept.
-    fn plain_front(offers: &[(u32, f32)], size: usize) -> Vec<u32> {
-        let mut sorted = offers.to_vec();
-        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
-        sorted.into_iter().take(size).map(|(id, _)| id).collect()
+    /// [`SearchList`] without a stop rule, a cursor or a turn-away at the
+    /// back: a binary search on every offer and a scan from the front on
+    /// every expansion.
+    struct PlainList {
+        list: Vec<(OrderedNode, bool)>,
+        size: usize,
     }
 
+    impl PlainList {
+        fn new(size: usize) -> Self {
+            Self {
+                list: Vec::new(),
+                size,
+            }
+        }
+
+        fn offer(&mut self, id: u32, distance: f32) {
+            let distance = OrderedFloat(distance);
+            let at = self.list.partition_point(|(node, _)| node.dist <= distance);
+            if at >= self.size {
+                return;
+            }
+            self.list
+                .insert(at, (OrderedNode::new(id, distance), false));
+            self.list.truncate(self.size);
+        }
+
+        fn next_unexpanded(&mut self) -> Option<OrderedNode> {
+            let position = self.list.iter().position(|(_, expanded)| !expanded)?;
+            self.list[position].1 = true;
+            Some(self.list[position].0.clone())
+        }
+    }
+
+    /// A node down to the bits of its distance: `OrderedFloat` derives its
+    /// equality, under which a NaN is not equal to itself.
+    fn bits(node: OrderedNode) -> (u32, u32) {
+        (node.id, node.dist.0.to_bits())
+    }
+
+    fn held(list: &SearchList) -> Vec<(u32, u32, bool)> {
+        list.list
+            .iter()
+            .map(|entry| (entry.node.id, entry.node.dist.0.to_bits(), entry.expanded))
+            .collect()
+    }
+
+    fn plainly_held(list: &PlainList) -> Vec<(u32, u32, bool)> {
+        list.list
+            .iter()
+            .map(|(node, expanded)| (node.id, node.dist.0.to_bits(), *expanded))
+            .collect()
+    }
+
+    /// [`PlainList`] ruled by a [`StopRule`] straight from its definition:
+    /// nothing is thrown away, and the rule is consulted only when a vertex is
+    /// asked for - expand the nearest unexpanded one if it is among the `rank`
+    /// nearest or nearer than `(1 + margin)^2` times the `rank`-th's distance.
+    struct RuledList {
+        plain: PlainList,
+        rank: usize,
+        keep: usize,
+        factor: f32,
+    }
+
+    impl RuledList {
+        fn new(size: usize, stop: StopRule) -> Self {
+            Self {
+                plain: PlainList::new(size),
+                rank: stop.rank,
+                keep: stop.keep,
+                factor: (1.0 + stop.margin).powi(2),
+            }
+        }
+
+        fn offer(&mut self, id: u32, distance: f32) {
+            self.plain.offer(id, distance);
+        }
+
+        fn bar(&self) -> Option<OrderedFloat> {
+            self.plain
+                .list
+                .get(self.rank - 1)
+                .map(|(node, _)| OrderedFloat(self.factor * node.dist.0))
+        }
+
+        fn next_unexpanded(&mut self) -> Option<OrderedNode> {
+            let position = self.plain.list.iter().position(|(_, expanded)| !expanded)?;
+            let beyond = self
+                .bar()
+                .is_some_and(|bar| bar <= self.plain.list[position].0.dist);
+            if position >= self.rank && beyond {
+                return None;
+            }
+            self.plain.list[position].1 = true;
+            Some(self.plain.list[position].0.clone())
+        }
+
+        /// What the rule has any use for: the nearest `keep`, and after them
+        /// whatever is nearer than the bar.
+        fn kept(&self) -> Vec<(u32, u32, bool)> {
+            let held = plainly_held(&self.plain);
+            let cut = match self.bar() {
+                Some(bar) if held.len() > self.keep => {
+                    self.keep
+                        + self.plain.list[self.keep..]
+                            .iter()
+                            .take_while(|(node, _)| node.dist < bar)
+                            .count()
+                }
+                _ => held.len(),
+            };
+            held[..cut].to_vec()
+        }
+    }
+
+    /// A list with a stop rule keeps the front of what the ruled plain list
+    /// holds, and expands exactly what the rule allows, after every offer and
+    /// every expansion.
+    ///
+    /// The front and not the whole: a list may throw away what the rule has no
+    /// use for, and what it keeps has to be exactly the rest, or a candidate
+    /// the re-score is owed - or one the walk should still expand - went
+    /// missing. At a margin of zero it also expands exactly what the plain list
+    /// of length `rank` does, whatever it keeps, and at `rank == keep` it is
+    /// that list entry for entry: the walk as it was.
+    ///
+    /// The distances are chosen so that bars of 1.5625, 2.25 and 4 times one of
+    /// them land exactly on another, and so exercise the strict side of every
+    /// comparison. They are finite, as every distance a walk measures is.
     #[test]
     fn a_list_with_a_stop_rule_is_the_front_of_the_list_it_rules() {
-        let mut rng = SmallRng::seed_from_u64(7);
-        for _ in 0..200 {
-            let size = rng.random_range(4..20);
-            let keep = rng.random_range(1..=size);
-            let rank = rng.random_range(1..=keep);
-            let stop = StopRule {
-                margin: rng.random_range(0.0..0.5),
-                rank,
-                keep,
-            };
-            let mut ruled = SearchList::with_margin(size, 100, stop);
-            let mut offers = Vec::new();
-            for id in 0..rng.random_range(1..60u32) {
-                let distance = rng.random_range(0.0..10.0f32);
-                ruled.offer(id, distance);
-                offers.push((id, distance));
+        const DISTANCES: [f32; 12] = [
+            -1.0, 0.0, 0.5, 1.0, 2.0, 2.25, 4.0, 4.5, 6.25, 9.0, 16.0, 25.0,
+        ];
+        let mut rng = SmallRng::seed_from_u64(13);
+        // Where each half of the rule acted in the list itself: a stop with
+        // unexpanded entries still held, and an insert that did not lengthen a
+        // list the cap had room in. A fixture that never reached one of them
+        // would pass the comparisons below without testing it.
+        let (mut stopped, mut cut) = (0usize, 0usize);
+        for (rank, keep) in [(1, 1), (1, 3), (2, 5), (3, 3), (5, 16), (16, 16)] {
+            for size in [keep, keep + 1, 64, usize::MAX] {
+                for margin in [0.0f32, 0.25, 0.5, 1.0] {
+                    let stop = StopRule { margin, rank, keep };
+                    for sequence in 0..20 {
+                        let mut list = SearchList::with_margin(size, 256, stop);
+                        let mut ruled = RuledList::new(size, stop);
+                        let mut plain = (margin == 0.0).then(|| PlainList::new(rank));
+                        for step in 0..100 {
+                            let context = || {
+                                format!(
+                                    "rank {rank}, keep {keep}, L = {size}, margin {margin}, \
+                                     sequence {sequence}, step {step}"
+                                )
+                            };
+                            if rng.random_bool(0.7) {
+                                let id = rng.random_range(0..256);
+                                let distance = DISTANCES[rng.random_range(0..DISTANCES.len())];
+                                let before = held(&list);
+                                list.offer(id, distance);
+                                let after = held(&list);
+                                cut += usize::from(
+                                    after != before
+                                        && after.len() <= before.len()
+                                        && before.len() < size,
+                                );
+                                ruled.offer(id, distance);
+                                if let Some(plain) = plain.as_mut() {
+                                    plain.offer(id, distance);
+                                }
+                            } else {
+                                let expansions = if rng.random_bool(0.25) { 4 } else { 1 };
+                                for _ in 0..expansions {
+                                    let expected = ruled.next_unexpanded().map(bits);
+                                    let expanded = list.next_unexpanded().map(bits);
+                                    stopped += usize::from(
+                                        expanded.is_none()
+                                            && list.list.iter().any(|entry| !entry.expanded),
+                                    );
+                                    assert_eq!(
+                                        expanded,
+                                        expected,
+                                        "{}: the lists expanded different vertices",
+                                        context()
+                                    );
+                                    if let Some(plain) = plain.as_mut() {
+                                        assert_eq!(
+                                            plain.next_unexpanded().map(bits),
+                                            expected,
+                                            "{}: a margin of zero expanded what the list of \
+                                             length rank does not",
+                                            context()
+                                        );
+                                    }
+                                }
+                            }
+                            let kept = ruled.kept();
+                            assert_eq!(
+                                held(&list),
+                                kept,
+                                "{}: the lists hold different entries",
+                                context()
+                            );
+                            if let Some(plain) = plain.as_ref().filter(|_| rank == keep) {
+                                assert_eq!(
+                                    plainly_held(plain),
+                                    kept,
+                                    "{}: a margin of zero kept what the list of that length \
+                                     does not",
+                                    context()
+                                );
+                            }
+                        }
+                    }
+                }
             }
-            let ruled = ruled
-                .into_candidates()
-                .iter()
-                .map(|node| node.id)
-                .collect::<Vec<_>>();
-            let plain = plain_front(&offers, size);
-            assert!(ruled.len() >= keep.min(offers.len()));
-            assert_eq!(ruled[..], plain[..ruled.len()]);
         }
+        assert!(
+            stopped > 0 && cut > 0,
+            "the list stopped {stopped} walks with entries left and cut {cut} times, so one half \
+             of the rule was never exercised"
+        );
+    }
+
+    /// A calculator that reads every distance off a table.
+    struct Table(Vec<f32>);
+
+    impl DistCalculator for Table {
+        fn distance(&self, id: u32) -> f32 {
+            self.0[id as usize]
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            self.0.clone()
+        }
+    }
+
+    /// A graph the write path accepts, chosen at random: out-edges distinct,
+    /// none a self-edge, degrees anywhere from zero to `max_degree`.
+    fn random_graph(num_vertices: usize, max_degree: usize, rng: &mut SmallRng) -> PartitionGraph {
+        let adjacency = (0..num_vertices as u32)
+            .map(|vertex| {
+                let mut others = (0..num_vertices as u32)
+                    .filter(|other| *other != vertex)
+                    .collect::<Vec<_>>();
+                others.shuffle(rng);
+                others.truncate(rng.random_range(0..=max_degree));
+                others
+            })
+            .collect::<Vec<_>>();
+        PartitionGraph::try_new(
+            max_degree as u32,
+            (0..num_vertices as u64).collect(),
+            &adjacency,
+        )
+        .unwrap()
+    }
+
+    /// Algorithm 1 with a stop rule, one vertex at a time.
+    fn ruled_walk(
+        graph: &PartitionGraph,
+        table: &Table,
+        entry_point: u32,
+        stop: StopRule,
+        search_list_size: usize,
+    ) -> (Vec<u32>, u64) {
+        let mut scratch = SearchScratch::new(graph.len());
+        scratch.begin();
+        scratch.mark(entry_point);
+        let mut list = SearchList::with_margin(search_list_size, graph.len(), stop);
+        list.offer(entry_point, table.distance(entry_point));
+        let mut comparisons = 1;
+        let mut expanded = Vec::new();
+        while let Some(node) = list.next_unexpanded() {
+            expanded.push(node.id);
+            for neighbor in graph.neighbors(node.id) {
+                if scratch.mark(*neighbor) {
+                    comparisons += 1;
+                    list.offer(*neighbor, table.distance(*neighbor));
+                }
+            }
+        }
+        (expanded, comparisons)
+    }
+
+    /// A wider margin walks on from where a narrower one stopped: the same
+    /// vertices expanded in the same order, then more, and never fewer
+    /// distances.
+    ///
+    /// This is what makes a sweep over the margin a sweep over one walk's
+    /// stopping points rather than over different walks, so that recall and
+    /// work move one way along it. It holds for one vertex a hop, under any cap
+    /// both walks share - one just past `keep` binds all the time here - and for
+    /// distances of at least zero: below zero a wider margin puts the bar lower,
+    /// not higher. A hop of four can take vertices a narrower margin left, and
+    /// the two walks then part.
+    #[test]
+    fn a_wider_margin_walks_on_from_where_a_narrower_one_stopped() {
+        const DISTANCES: [f32; 6] = [0.0, 1.0, 1.0, 2.0, 3.0, 5.0];
+        let mut rng = SmallRng::seed_from_u64(17);
+        let mut further = 0usize;
+        for num_vertices in [2, 17, 64, 200] {
+            for _ in 0..24 {
+                let graph = random_graph(num_vertices, 4, &mut rng);
+                let table = Table(
+                    (0..num_vertices)
+                        .map(|_| DISTANCES[rng.random_range(0..DISTANCES.len())])
+                        .collect(),
+                );
+                let entry_point = rng.random_range(0..num_vertices as u32);
+                for (rank, keep) in [(1, 1), (2, 4), (5, 5)] {
+                    for size in [keep + 1, usize::MAX] {
+                        let mut narrower: Option<(Vec<u32>, u64)> = None;
+                        for margin in [0.0f32, 0.25, 1.0, 4.0] {
+                            let walked = ruled_walk(
+                                &graph,
+                                &table,
+                                entry_point,
+                                StopRule { margin, rank, keep },
+                                size,
+                            );
+                            if let Some((expanded, comparisons)) = &narrower {
+                                assert!(
+                                    walked.0.starts_with(expanded),
+                                    "over {num_vertices} vertices at rank {rank}, L = {size}, \
+                                     margin {margin} expanded {:?} where a narrower margin \
+                                     expanded {expanded:?}",
+                                    walked.0
+                                );
+                                assert!(
+                                    walked.1 >= *comparisons,
+                                    "margin {margin} measured {} distances against \
+                                     {comparisons} for a narrower one",
+                                    walked.1
+                                );
+                                further += usize::from(walked.0.len() > expanded.len());
+                            }
+                            narrower = Some(walked);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            further > 0,
+            "no wider margin ever expanded more than a narrower one, so the fixture never let the \
+             margin decide anything"
+        );
     }
 
     #[test]

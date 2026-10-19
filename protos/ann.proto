@@ -73,6 +73,12 @@ message VectorQueryProto {
    * subject to caller bounds. Later candidate-count expansion is unchanged.
    */
   optional double search_effort = 16;
+  /* fork(vamana): how far past its k-th candidate an IVF_VAMANA_* walk goes on
+   * expanding, as a fraction of that candidate's length (adaptive beam
+   * search). Absent, each partition's walk runs its list of ef candidates to
+   * the end. Other index types ignore it.
+   */
+  optional float stop_margin = 100;
 }
 
 /* Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

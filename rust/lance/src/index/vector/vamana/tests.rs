@@ -42,7 +42,7 @@ use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::vector::vamana::graph::Adjacency;
-use lance_index::vector::vamana::{Vamana, VamanaBuildParams};
+use lance_index::vector::vamana::{AdaptiveStop, Vamana, VamanaBuildParams};
 use lance_index::vector::{
     DEFAULT_QUERY_PARALLELISM, DIST_COL, PQ_CODE_COLUMN, PartitionSearchControl, Query,
     SQ_CODE_COLUMN, VectorIndex,
@@ -66,7 +66,7 @@ use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::index::{HnswMemIndexPlugin, MemIndexPlugin, ResolveContext};
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::scanner::Scanner;
+use crate::dataset::scanner::{QueryFilter, Scanner};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, Dataset, WriteMode, WriteParams};
 use crate::index::vector::builder::{ExistingIndex, index_type_string};
@@ -868,6 +868,7 @@ async fn partitions_answer_together_unless_a_control_steps_through_them() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        adaptive_stop: None,
     };
     let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();
     assert_eq!(partitions.len(), 4);
@@ -1018,6 +1019,202 @@ async fn a_query_scores_twice_k_of_the_walk_again(#[values(1, 2)] num_partitions
         refined_otherwise.iter().all(|queries| *queries > 0),
         "queries refines of factor 1 and 3 answer otherwise for: {refined_otherwise:?}"
     );
+}
+
+/// A margin hangs its bar off the query's own `k`-th candidate, however many
+/// candidates each partition is asked for: at zero, over scalar codes scored
+/// again (each partition answering with `2k`), over flat codes, and under a
+/// refine of three, a walk measures exactly what the walk at `L = k` does.
+/// That walk is a refine of one with `ef` at `k`: without a refine a walk
+/// keeps at least `2k`. The same cap walks further without the margin.
+#[rstest]
+#[case::scalar_codes_scored_again(Codes::Sq, None)]
+#[case::flat_codes(Codes::Flat, None)]
+#[case::refined(Codes::Sq, Some(3))]
+#[tokio::test]
+async fn a_margin_of_zero_measures_what_the_walk_at_k_does(
+    #[case] codes: Codes,
+    #[case] refine_factor: Option<u32>,
+) {
+    let dir = TempStrDir::default();
+    let dataset = indexed(dir.as_str(), codes, DistanceType::L2).await;
+    let capped = |margin: Option<f32>| {
+        move |scan: &mut Scanner| {
+            scan.ef(200);
+            if let Some(factor) = refine_factor {
+                scan.refine(factor);
+            }
+            if let Some(margin) = margin {
+                scan.stop_margin(margin).unwrap();
+            }
+        }
+    };
+    let mut further = 0;
+    for query in queries_of(codes.dimension()) {
+        let (at_k, at_k_counts) = search(&dataset, &query, 10, None, |scan| {
+            scan.refine(1).ef(10);
+        })
+        .await;
+        let (ruled, ruled_counts) = search(&dataset, &query, 10, None, capped(Some(0.0))).await;
+        assert_eq!(
+            ruled_counts.index_comparisons,
+            at_k_counts.index_comparisons
+        );
+        // Flat codes are exact, so their walks answer with the same rows.
+        if matches!(codes, Codes::Flat) {
+            let rows = |found: &[(u64, f32)]| {
+                found
+                    .iter()
+                    .map(|(row_id, _)| *row_id)
+                    .collect::<HashSet<_>>()
+            };
+            assert_eq!(rows(&ruled), rows(&at_k));
+        }
+        let (_, unruled_counts) = search(&dataset, &query, 10, None, capped(None)).await;
+        further += usize::from(unruled_counts.index_comparisons > at_k_counts.index_comparisons);
+    }
+    assert!(
+        further > 0,
+        "the cap never let a walk without the margin go further than L = k, so nothing showed that \
+         the margin was what stopped it"
+    );
+}
+
+/// A wider margin walks further, which is what makes the margin a knob: over
+/// the queries together the distances never fall from one margin to the
+/// next, and some query measures more at the widest than at zero. Query by
+/// query this need not hold, as a hop of four can take vertices a narrower
+/// margin left and part from its walk (`lance-index` checks it a vertex a
+/// hop). Partitions along the diagonal, so that the index is the same on
+/// every build.
+#[tokio::test]
+async fn a_wider_margin_walks_further_over_the_queries() {
+    let dir = TempStrDir::default();
+    let dataset = indexed_along_the_diagonal(dir.as_str(), Codes::Sq, ROWS, false).await;
+    let margins = [0.0f32, 0.05, 0.15, 0.4];
+    let mut totals = [0; 4];
+    let mut grew = 0;
+    for query in queries() {
+        let mut counts = [0; 4];
+        for (count, margin) in counts.iter_mut().zip(margins) {
+            let (_, found) = search(&dataset, &query, 10, None, |scan| {
+                scan.ef(400).stop_margin(margin).unwrap();
+            })
+            .await;
+            *count = found.index_comparisons;
+        }
+        for (total, count) in totals.iter_mut().zip(counts) {
+            *total += count;
+        }
+        grew += usize::from(counts[3] > counts[0]);
+    }
+    assert!(
+        totals.windows(2).all(|pair| pair[0] <= pair[1]),
+        "margins {margins:?} measured {totals:?} distances, and a wider one fewer"
+    );
+    assert!(
+        grew > 0,
+        "no query measured more at a margin of 0.4 than at 0"
+    );
+}
+
+/// Deleted rows reach the partitions as a prefilter, and a margin still stops
+/// the walks through it: fewer distances than the same cap without one, and
+/// only live rows among the answers.
+#[tokio::test]
+async fn a_margin_stops_the_walks_through_deleted_rows() {
+    let dir = TempStrDir::default();
+    let mut dataset = indexed_along_the_diagonal(dir.as_str(), Codes::Sq, ROWS, false).await;
+    dataset.delete("id % 7 = 0").await.unwrap();
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().deletion_file.is_some())
+    );
+    let live = ids_by_row_id(&dataset).await;
+    for query in queries() {
+        let capped = |margin: Option<f32>| {
+            move |scan: &mut Scanner| {
+                scan.ef(200);
+                if let Some(margin) = margin {
+                    scan.stop_margin(margin).unwrap();
+                }
+            }
+        };
+        let (found, ruled) = search(&dataset, &query, 10, None, capped(Some(0.05))).await;
+        let (_, unruled) = search(&dataset, &query, 10, None, capped(None)).await;
+        assert!(
+            ruled.index_comparisons < unruled.index_comparisons,
+            "a margin of 0.05 measured {} distances, the cap without it {}",
+            ruled.index_comparisons,
+            unruled.index_comparisons
+        );
+        assert_eq!(found.len(), 10);
+        assert!(
+            found.iter().all(|(row_id, _)| live.contains_key(row_id)),
+            "{found:?}"
+        );
+    }
+}
+
+/// A margin no walk can stop by is refused as invalid input when it is set,
+/// and so is one set before the query it would stop; zero is a margin. A
+/// vector query given as a filter is the caller's own, so its margin, and
+/// the rank that must be its k, are checked when the scan is planned: first,
+/// before this filter-only scan is refused for wanting a full-text query.
+#[tokio::test]
+async fn a_margin_no_walk_can_stop_by_is_refused() {
+    let dir = TempStrDir::default();
+    let dataset = two_fragments(dir.as_str()).await;
+    let key = queries().swap_remove(0);
+    let refused = |error: Error, reason: &str| {
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(reason), "{error}");
+    };
+    let mut scan = dataset.scan();
+    refused(
+        scan.stop_margin(0.1).err().unwrap(),
+        "stop_margin requires nearest to be called first",
+    );
+    scan.nearest("vec", &key, 10).unwrap();
+    for margin in [-0.1, f32::NAN, f32::INFINITY, 1e20] {
+        refused(scan.stop_margin(margin).err().unwrap(), "finite fraction");
+    }
+    scan.stop_margin(0.0).unwrap();
+
+    let mut filter = Query {
+        column: "vec".to_string(),
+        key: Arc::new(key),
+        k: 10,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: 1,
+        maximum_nprobes: None,
+        search_effort: 0.5,
+        ef: None,
+        refine_factor: None,
+        metric_type: None,
+        use_index: true,
+        query_parallelism: DEFAULT_QUERY_PARALLELISM,
+        dist_q_c: 0.0,
+        approx_mode: Default::default(),
+        adaptive_stop: None,
+    };
+    for (margin, rank, reason) in [
+        (-0.1, 10, "finite fraction"),
+        (0.05, 7, "carries rank 7 for a query of k 10"),
+    ] {
+        filter.adaptive_stop = Some(AdaptiveStop { margin, rank });
+        let error = dataset
+            .scan()
+            .filter_query(QueryFilter::Vector(filter.clone()))
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap_err();
+        refused(error, reason);
+    }
 }
 
 /// A range query keeps the rows whose exact distances lie within its bounds,

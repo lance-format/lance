@@ -3751,6 +3751,7 @@ mod tests {
             query_parallelism: 0,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            adaptive_stop: None, // fork(vamana)
         }
     }
 

@@ -343,6 +343,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            // fork(vamana): only the scanner reads a stop margin; this parse
+            // serves JniTestHelper.
+            adaptive_stop: None,
         };
         query.validate_search_effort()?;
         Ok(query)

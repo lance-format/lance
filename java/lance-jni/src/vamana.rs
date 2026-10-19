@@ -29,6 +29,14 @@ pub fn stage(env: &mut JNIEnv, vector_index_params: &JObject) -> Result<Option<S
     })
 }
 
+/// The stop margin of a Java `Query`, when it has one. Lance validates it
+/// when the scanner takes it.
+pub fn stop_margin(env: &mut JNIEnv, query: &JObject) -> Result<Option<f32>> {
+    env.get_optional_from_method(query, "getStopMargin", |env, margin| {
+        Ok(env.call_method(&margin, "floatValue", "()F", &[])?.f()?)
+    })
+}
+
 fn non_negative(name: &str, value: i32) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| Error::input_error(format!("Vamana {name} must not be negative, got {value}")))

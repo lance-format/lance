@@ -225,6 +225,12 @@ pub struct Query {
     /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
     /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
+
+    // fork(vamana)
+    /// How far past its `k`-th candidate an IVF_VAMANA_* walk goes on
+    /// expanding; see [`vamana::AdaptiveStop`]. `None` walks each partition's
+    /// list of `ef` candidates to its end. Other index types ignore it.
+    pub adaptive_stop: Option<vamana::AdaptiveStop>,
 }
 
 impl Query {

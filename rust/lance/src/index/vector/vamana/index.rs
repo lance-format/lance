@@ -559,6 +559,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            adaptive_stop: None,
         }
     }
 
