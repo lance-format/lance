@@ -83,9 +83,7 @@ mod tests {
         MemWalIndexDetails, load_mem_wal_index_details, new_mem_wal_index_meta,
     };
     use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
-    use crate::transaction::action::{
-        Action, AddIndexSegment, CompositeOperation, Ref, UserAction,
-    };
+    use crate::transaction::action::{Action, AddIndexSegment, CompositeOperation, Ref, UserStep};
     use crate::transaction::test_support::sample_index_metadata;
     use uuid::Uuid;
 
@@ -214,7 +212,7 @@ mod tests {
     #[test]
     fn test_two_writers_recording_progress_conflict() {
         let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
                 "step", actions,
             )]))
         };
@@ -231,7 +229,7 @@ mod tests {
         // with a concurrent writer replacing that entry -- unlike a regular
         // index, where two writers may hold disjoint segments.
         let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
                 "step", actions,
             )]))
         };

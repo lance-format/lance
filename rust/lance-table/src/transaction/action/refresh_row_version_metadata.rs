@@ -87,7 +87,7 @@ mod tests {
     use crate::format::{DataFile, Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{Action, CompositeOperation, UserAction};
+    use crate::transaction::action::{Action, CompositeOperation, UserStep};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn test_two_writers_refreshing_the_same_fragment_conflict() {
         let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
                 "step", actions,
             )]))
         };
