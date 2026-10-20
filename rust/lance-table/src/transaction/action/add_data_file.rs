@@ -105,8 +105,8 @@ impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::action::Action;
-    use crate::transaction::action::test_support::apply;
+    use crate::transaction::action::test_support::{apply, backed_manifest};
+    use crate::transaction::action::{Action, TombstoneFieldData};
     use crate::transaction::test_support::sample_manifest;
     use lance_file::version::ConcreteFileVersion;
 
@@ -169,5 +169,49 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("fragment 7"), "{error}");
+    }
+
+    fn add_file_for_field_zero() -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment: Ref::Committed(0),
+            file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+            field_ids: vec![Ref::Committed(0)],
+            data_change: true,
+        })
+    }
+
+    #[test]
+    fn test_add_data_file_rejects_a_field_another_file_already_backs() {
+        let error = apply(&backed_manifest(), vec![add_file_for_field_zero()]).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("already backed by data/0.lance"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_add_data_file_may_back_a_field_tombstoned_earlier_in_the_set() {
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(0),
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: false,
+                }),
+                add_file_for_field_zero(),
+            ],
+        )
+        .unwrap();
+
+        let backing: Vec<&str> = next.fragments[0]
+            .files
+            .iter()
+            .filter(|file| file.fields.contains(&0))
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(backing, ["data/new.lance"]);
     }
 }
