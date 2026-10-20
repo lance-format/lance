@@ -397,6 +397,7 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
     use crate::transaction::action::test_support::{
         added_field, apply_with_indices, backed_manifest, footprint,
     };
@@ -798,7 +799,7 @@ mod tests {
     fn test_unrecorded_coverage_is_not_the_same_as_covering_nothing() {
         let unknown = AddIndexSegment {
             covered_fragments: None,
-            ..segment("system", vec![])
+            ..segment(MEM_WAL_INDEX_NAME, vec![])
         };
         let empty = AddIndexSegment {
             covered_fragments: Some(Vec::new()),
@@ -823,8 +824,29 @@ mod tests {
                 .fragment_bitmap
                 .clone()
         };
-        assert_eq!(bitmap_of("system"), None);
+        assert_eq!(bitmap_of(MEM_WAL_INDEX_NAME), None);
         assert_eq!(bitmap_of("empty"), Some(RoaringBitmap::new()));
+    }
+
+    /// Only the system indices go without recorded coverage. A user index
+    /// segment that does not say which fragments it describes would be served
+    /// for every fragment, including ones it has no entries for.
+    #[test]
+    fn test_a_user_index_segment_must_record_its_coverage() {
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                covered_fragments: None,
+                ..segment("by_a", vec![Ref::Committed(0)])
+            })],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("by_a"), "{message}");
+        assert!(message.contains("covered_fragments"), "{message}");
     }
 
     #[test]
