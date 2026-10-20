@@ -25,6 +25,7 @@ use lance_core::{Error, Result};
 /// nothing to restamp.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct RefreshRowVersionMetadata {
+    /// Committed fragment ids, every row of which is restamped.
     pub fragment_ids: Vec<u64>,
 }
 
@@ -56,6 +57,12 @@ impl RefreshRowVersionMetadata {
     /// same fragment collide even when the column rewrites that prompted them
     /// touched different fields. Over-strict, and cheap: the alternative is a
     /// sequence that records which columns each row's version speaks for.
+    ///
+    /// An [`AddOverlays`](super::AddOverlays) restamps the same sequence
+    /// without claiming it, so the two do not collide: the overlay sets only
+    /// the rows it covers and keeps whatever the rest hold when it applies,
+    /// which composes with a refresh in either order. A refresh replaces the
+    /// sequence whole, and two replacements of one coordinate never commute.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for fragment_id in &self.fragment_ids {
             footprint.write(Coordinate::FragmentRowVersions(*fragment_id));
@@ -86,8 +93,8 @@ mod tests {
     use super::*;
     use crate::format::{DataFile, Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
-    use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{Action, CompositeOperation, UserStep};
+    use crate::transaction::action::Action;
+    use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
@@ -187,12 +194,6 @@ mod tests {
 
     #[test]
     fn test_two_writers_refreshing_the_same_fragment_conflict() {
-        let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
-                "step", actions,
-            )]))
-        };
-
         let ours = footprint(vec![refresh(vec![0])]);
         let same = footprint(vec![refresh(vec![0, 1])]);
         let other = footprint(vec![refresh(vec![1])]);

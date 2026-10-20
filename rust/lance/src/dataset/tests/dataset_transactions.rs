@@ -4422,7 +4422,7 @@ mod composite {
     }
 
     #[tokio::test]
-    async fn test_a_commit_carrying_a_key_assertion_changes_nothing_itself() {
+    async fn test_a_key_assertion_commits_alongside_the_insert_it_guards() {
         let dataset = test_dataset(false).await;
         let file = existing_data_file(&dataset, 0);
         let before = dataset.fragments().len();
@@ -4593,6 +4593,8 @@ mod composite {
             .await
             .unwrap();
         let read_version = dataset.version().version;
+        // The base file is declared for `b` alone, so the conflict with dropping
+        // `a` comes from the overlay, whose file carries `a`.
         let stale_append = vec![
             Action::AddFragment(AddFragment {
                 id: Ref::Local(0),
