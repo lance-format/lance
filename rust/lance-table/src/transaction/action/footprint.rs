@@ -840,7 +840,16 @@ impl Footprint {
     }
 
     /// Record a precondition that no concurrent commit inserted a colliding key.
+    ///
+    /// Only an assertion whose key columns are all committed is recorded. A
+    /// local key field names a column this operation mints, which no
+    /// concurrent writer can insert into, so the assertion has nothing to
+    /// guard against. Nor could it be matched: assertions are matched by key
+    /// columns, and a local token means a different column in each operation.
     pub(super) fn assert_unique_keys(&mut self, key_fields: Vec<Ref>, filter: KeyExistenceFilter) {
+        if key_fields.iter().any(|field| field.committed().is_none()) {
+            return;
+        }
         self.key_assertions
             .push(KeyAssertion { key_fields, filter });
     }
