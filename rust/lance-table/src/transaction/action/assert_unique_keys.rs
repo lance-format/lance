@@ -109,9 +109,16 @@ impl TryFrom<pb_actions::AssertUniqueKeys> for AssertUniqueKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::DataFile;
     use crate::format::key_existence::FilterType;
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
-    use crate::transaction::action::{Action, AddFragment, RemoveFragment, TombstoneFieldData};
+    use crate::transaction::action::{
+        Action, AddFragment, AddOverlays, RemoveFragment, TombstoneFieldData,
+    };
+    use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
+    use std::sync::Arc;
 
     fn assertion(key_fields: Vec<Ref>, hashes: &[u64]) -> Action {
         Action::AssertUniqueKeys(AssertUniqueKeys {
@@ -274,6 +281,61 @@ mod tests {
         assert!(ours.conflicts_with(&rewrite(0)));
         assert!(rewrite(0).conflicts_with(&ours));
         assert!(!ours.conflicts_with(&rewrite(1)));
+    }
+
+    /// An overlay writes only some cells of a key column, but those cells can
+    /// hold any key, just as a full rewrite's can.
+    #[test]
+    fn test_an_assertion_conflicts_with_an_overlay_of_its_key_column() {
+        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
+        let overlay = |field: i32| {
+            footprint(vec![Action::AddOverlays(AddOverlays {
+                fragment: Ref::Committed(0),
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new(
+                        "overlay.lance",
+                        vec![field],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    ),
+                    coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from([0]))),
+                    committed_version: 0,
+                }],
+                data_change: true,
+            })])
+        };
+
+        assert!(ours.conflicts_with(&overlay(0)));
+        assert!(overlay(0).conflicts_with(&ours));
+        assert!(!ours.conflicts_with(&overlay(1)));
+        assert!(!overlay(1).conflicts_with(&ours));
+    }
+
+    /// Bloom filters built for different sizes or error rates cannot be
+    /// intersected, so neither can clear the other's keys.
+    #[test]
+    fn test_assertions_with_incomparable_filters_conflict() {
+        let bloom = |number_of_items: u64| {
+            Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![Ref::Committed(0)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::Bloom {
+                        bitmap: vec![0; 32],
+                        num_bits: 256,
+                        number_of_items,
+                        probability: 0.01,
+                    },
+                },
+            })
+        };
+        let ours = footprint(vec![append(0), bloom(100)]);
+        let theirs = footprint(vec![append(0), bloom(200)]);
+
+        assert!(ours.conflicts_with(&theirs));
+        assert!(theirs.conflicts_with(&ours));
     }
 
     #[test]
