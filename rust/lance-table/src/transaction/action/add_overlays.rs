@@ -131,7 +131,7 @@ impl AddOverlays {
     /// those rows are lost whichever commits first. A plain delete conflicts
     /// too, because the footprint cannot tell it from a row-moving update.
     ///
-    /// TODO(https://github.com/lance-format/lance/pull/8646): that is an
+    /// TODO(https://github.com/lance-format/lance/issues/10189): that is an
     /// over-conflict next to the legacy resolver's row-level check of moved
     /// rows against overlay coverage; restore it as part of conflict parity.
     ///
