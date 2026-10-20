@@ -18,11 +18,13 @@ use uuid::Uuid;
 /// index is what makes the index disappear.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoveIndexSegment {
+    /// The segment to remove.
     pub uuid: Uuid,
     /// The logical index the segment belongs to. Not needed to find the
     /// segment, which the uuid names outright; carried so apply can reject a
     /// removal that was planned against a different set of segments.
     pub name: String,
+    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
     pub data_change: bool,
 }
 
