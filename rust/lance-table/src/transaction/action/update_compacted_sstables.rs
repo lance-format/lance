@@ -24,6 +24,8 @@ use lance_core::{Error, Result};
 /// [`AddIndexSegment`](super::AddIndexSegment) could express as a delta.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct UpdateCompactedSsTables {
+    /// The generation each shard has been compacted through. A shard's
+    /// generation must not go backwards.
     pub compacted_sstables: Vec<CompactedSsTable>,
 }
 
@@ -82,8 +84,10 @@ mod tests {
     use crate::system_index::mem_wal::{
         MemWalIndexDetails, load_mem_wal_index_details, new_mem_wal_index_meta,
     };
-    use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
-    use crate::transaction::action::{Action, AddIndexSegment, CompositeOperation, Ref, UserStep};
+    use crate::transaction::action::test_support::{
+        apply_with_indices, backed_manifest, footprint,
+    };
+    use crate::transaction::action::{Action, AddIndexSegment, Ref};
     use crate::transaction::test_support::sample_index_metadata;
     use uuid::Uuid;
 
@@ -211,12 +215,6 @@ mod tests {
 
     #[test]
     fn test_two_writers_recording_progress_conflict() {
-        let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
-                "step", actions,
-            )]))
-        };
-
         let ours = footprint(vec![update(vec![(1, 3)])]);
         let theirs = footprint(vec![update(vec![(2, 5)])]);
 
@@ -228,12 +226,6 @@ mod tests {
         // Recording progress rewrites the whole MemWAL entry, so it collides
         // with a concurrent writer replacing that entry -- unlike a regular
         // index, where two writers may hold disjoint segments.
-        let footprint = |actions| {
-            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
-                "step", actions,
-            )]))
-        };
-
         let progress = footprint(vec![update(vec![(1, 3)])]);
         let rebuild = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
             uuid: Uuid::from_u128(20),

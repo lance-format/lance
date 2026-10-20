@@ -152,6 +152,12 @@ enum Mode {
     /// is the case: new values for a subset of one field's cells in one
     /// fragment. Two of these commute -- both land, the newer wins where they
     /// overlap -- which is what sets it apart from a full write.
+    ///
+    /// It also serves as a conflict marker on a coordinate the set does not
+    /// change at all, where it needs exactly this row and column of the table:
+    /// collide with a full write, commute with other markers. An overlay's
+    /// claim on its fragment's deletions is the case; see
+    /// [`Footprint::write_part_of_deletions`].
     WritesPart,
     /// Replaces how the coordinate is stored without changing its values: a
     /// re-encode with `data_change` false. It collides with any write, as a
@@ -290,8 +296,9 @@ pub struct Footprint {
     ///
     /// Not a `Requires` claim on the region, because the check is symmetric: a
     /// removal that lands second destroys the cells just as surely as one that
-    /// lands first. And not a `WritesPart`, because it must not collide with a
-    /// concurrent write to some other coordinate in the same fragment.
+    /// lands first. And not a write of either strength (`Writes` or
+    /// `WritesPart`), because it must not collide with a concurrent write to
+    /// some other coordinate in the same fragment.
     required_fragments: HashSet<u64>,
     /// Facts about the table this set is valid only against. See
     /// [`Precondition`].
@@ -447,8 +454,11 @@ impl Footprint {
         // second direction would let a plain append land a duplicate of a key
         // a committed merge-insert asserted was absent -- correct if the
         // assertion is a precondition on that commit, wrong if it is an
-        // invariant on the table. Until that is settled, keep the stricter
-        // reading.
+        // invariant on the table.
+        //
+        // TODO(https://github.com/lance-format/lance/pull/8646): decide which
+        // reading holds as part of conflict parity with the legacy resolver;
+        // until then, keep the stricter one.
         if self.key_assertion_violated_by(committed) || committed.key_assertion_violated_by(self) {
             return true;
         }
@@ -598,7 +608,7 @@ impl Footprint {
 
     /// Record that this set writes some of `coordinate`, leaving the rest as
     /// it was. See [`Mode::WritesPart`].
-    pub(super) fn write_part(&mut self, coordinate: Coordinate) {
+    fn write_part(&mut self, coordinate: Coordinate) {
         self.claim(coordinate, Mode::WritesPart);
     }
 
@@ -701,9 +711,14 @@ impl Footprint {
         }
     }
 
-    /// Record that this set writes part of `fragment`'s deletions, so it
-    /// commutes with another such set but not with one that replaces them. See
-    /// [`Mode::WritesPart`].
+    /// Mark `fragment`'s deletions as a conflict point without changing them.
+    ///
+    /// Not a write: the set leaves the deletions as they were. The claim is a
+    /// [`Mode::WritesPart`] marker because that mode has exactly the pairing
+    /// needed -- it collides with any set that replaces the fragment's
+    /// deletions, in either order, and commutes with other markers. See
+    /// [`AddOverlays`](super::AddOverlays)'s footprint for why an overlay
+    /// needs it.
     pub(super) fn write_part_of_deletions(&mut self, fragment: u64) {
         self.write_part(Coordinate::FragmentDeletions(fragment));
     }
