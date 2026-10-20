@@ -363,7 +363,9 @@ impl Footprint {
         {
             return true;
         }
-        if self.anchors_removed_by(committed) || committed.anchors_removed_by(self) {
+        if self.required_fragment_removed_by(committed)
+            || committed.required_fragment_removed_by(self)
+        {
             return true;
         }
         self.index_claims.iter().any(|ours| {
