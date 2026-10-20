@@ -414,7 +414,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
                 // Action-based transactions (Transaction V2) are an experimental
-                // wire format (OSS-1530). Parsing is fail-closed: an action this build
+                // wire format (discussion #5960). Parsing is fail-closed: an action this build
                 // does not implement is an error, never a skipped element.
                 // load_and_sort_new_transactions collects concurrent transactions
                 // with try_collect, so such a transaction aborts the commit rather
@@ -741,7 +741,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
             }
             Operation::CompositeOperation(composite_operation) => {
                 pb::transaction::Operation::CompositeOperation(
-                    pb_transaction::CompositeOperation::from(composite_operation),
+                    pb_actions::CompositeOperation::from(composite_operation),
                 )
             }
         };
@@ -987,7 +987,7 @@ mod tests {
         match &message.operation {
             Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
                 let descriptions: Vec<&str> = composite_operation
-                    .actions
+                    .steps
                     .iter()
                     .map(|step| step.description.as_str())
                     .collect();
@@ -1010,17 +1010,15 @@ mod tests {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
-                pb_transaction::CompositeOperation {
-                    actions: vec![pb_transaction::UserStep {
+                pb_actions::CompositeOperation {
+                    steps: vec![pb_actions::UserStep {
                         description: "refresh row versions".to_string(),
-                        actions: vec![pb_transaction::Action {
-                            action: Some(
-                                pb_transaction::action::Action::RefreshRowVersionMetadata(
-                                    pb_transaction::RefreshRowVersionMetadata {
-                                        fragment_ids: vec![1],
-                                    },
-                                ),
-                            ),
+                        actions: vec![pb_actions::Action {
+                            action: Some(pb_actions::action::Action::RefreshRowVersionMetadata(
+                                pb_actions::RefreshRowVersionMetadata {
+                                    fragment_ids: vec![1],
+                                },
+                            )),
                         }],
                     }],
                 },

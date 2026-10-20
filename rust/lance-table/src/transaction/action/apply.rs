@@ -998,7 +998,6 @@ mod tests {
             Action::AlterField(AlterField {
                 field: Ref::Committed(0),
                 name: Some("renamed".into()),
-                logical_type: None,
                 nullable: None,
             }),
         ]],
