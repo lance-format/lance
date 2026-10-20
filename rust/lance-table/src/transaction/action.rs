@@ -450,6 +450,43 @@ mod tests {
             data_change: true,
         });
         assert!(remove.is_data_change());
+
+        // An index segment is derived state unless the writer says otherwise,
+        // as the MemWAL index does for the rows it holds.
+        for data_change in [false, true] {
+            let add = Action::AddIndexSegment(AddIndexSegment {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                fields: vec![Ref::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change,
+            });
+            assert_eq!(add.is_data_change(), data_change);
+            let remove = Action::RemoveIndexSegment(RemoveIndexSegment {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                data_change,
+            });
+            assert_eq!(remove.is_data_change(), data_change);
+        }
+
+        let adjust = Action::AdjustIndexCoverage(AdjustIndexCoverage {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "by_a".into(),
+            add_fragments: vec![Ref::Committed(1)],
+            remove_fragments: vec![0],
+        });
+        assert!(
+            !adjust.is_data_change(),
+            "coverage changes no row a reader sees"
+        );
     }
 
     #[test]

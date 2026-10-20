@@ -182,6 +182,8 @@ mod tests {
     };
     use crate::transaction::action::{Action, AddFragment, AddIndexSegment, RemoveFragment};
     use crate::transaction::test_support::sample_index_metadata;
+    use rstest::rstest;
+    use std::sync::Arc;
 
     fn covering(name: &str, fragments: impl IntoIterator<Item = u32>) -> IndexMetadata {
         IndexMetadata {
@@ -264,6 +266,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(indices[0].fragment_bitmap, Some([0].into_iter().collect()));
+    }
+
+    /// Widening is held to the same rule as adding a segment: two segments of
+    /// one index may not describe the same fragment.
+    #[test]
+    fn test_widening_onto_a_fragment_a_sibling_segment_covers_is_rejected() {
+        let mut manifest = backed_manifest();
+        let mut second = manifest.fragments[0].clone();
+        second.id = 1;
+        second.files[0].path = "data/1.lance".into();
+        manifest.fragments = Arc::new(vec![manifest.fragments[0].clone(), second]);
+        let widened = covering("by_a", [0]);
+        let sibling = covering("by_a", [1]);
+        let error = apply_with_indices(
+            &manifest,
+            vec![adjust(
+                widened.uuid,
+                "by_a",
+                vec![Ref::Committed(1)],
+                vec![],
+            )],
+            vec![widened, sibling],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("fragment 1"), "{message}");
+        assert!(message.contains("counted twice"), "{message}");
+    }
+
+    #[rstest]
+    #[case::added(vec![Ref::Committed(u64::from(u32::MAX) + 1)], vec![])]
+    #[case::removed(vec![], vec![u64::from(u32::MAX) + 1])]
+    fn test_a_fragment_id_an_index_cannot_record_is_rejected(
+        #[case] add: Vec<Ref>,
+        #[case] remove: Vec<u64>,
+    ) {
+        let segment = covering("by_a", [0]);
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![adjust(segment.uuid, "by_a", add, remove)],
+            vec![segment],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("largest fragment id"), "{error}");
     }
 
     #[test]

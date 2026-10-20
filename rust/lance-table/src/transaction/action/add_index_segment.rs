@@ -423,8 +423,9 @@ mod tests {
         added_field, apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, CompositeOperation, DropField,
-        Footprint, RemoveFragment, TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AdjustIndexCoverage,
+        CompositeOperation, DropField, Footprint, RemoveFragment, RemoveIndexSegment, ResetTable,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
@@ -763,6 +764,182 @@ mod tests {
                 assert!(message.contains(reason), "{message}");
             }
         }
+    }
+
+    /// Two segments added by one operation are checked against each other just
+    /// as a segment is checked against one already committed.
+    #[rstest]
+    #[case::overlapping_coverage(
+        |second: &mut AddIndexSegment| second.covered_fragments = Some(vec![Ref::Committed(0)]),
+        "fragment 0"
+    )]
+    #[case::different_index_type(
+        |second: &mut AddIndexSegment| second.index_details = type_url("bitmap.Details"),
+        "type"
+    )]
+    fn test_two_segments_added_by_one_operation_must_agree(
+        #[case] change: fn(&mut AddIndexSegment),
+        #[case] rejected_for: &str,
+    ) {
+        let first = AddIndexSegment {
+            index_details: type_url("btree.Details"),
+            ..segment("shared", vec![Ref::Committed(0)])
+        };
+        let mut second = AddIndexSegment {
+            index_details: type_url("btree.Details"),
+            covered_fragments: Some(vec![Ref::Committed(1)]),
+            ..segment("shared", vec![Ref::Committed(0)])
+        };
+        change(&mut second);
+
+        let error = apply_with_indices(
+            &two_fragment_manifest(),
+            vec![
+                Action::AddIndexSegment(first),
+                Action::AddIndexSegment(second),
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(rejected_for), "{error}");
+    }
+
+    /// An operation is only answerable for the indices it adds to or adjusts.
+    /// Removing a segment leaves the rest of the index as it was, so it does
+    /// not count.
+    #[test]
+    fn test_only_indices_the_operation_adds_to_or_adjusts_are_validated() {
+        let mut manifest = two_fragment_manifest();
+        let mut third = manifest.fragments[1].clone();
+        third.id = 2;
+        third.files[0].path = "data/2.lance".into();
+        manifest.fragments = Arc::new(manifest.fragments.iter().cloned().chain([third]).collect());
+        let inconsistent = |details: &str, fragment: u32| IndexMetadata {
+            index_details: type_url(details),
+            fragment_bitmap: Some([fragment].into_iter().collect()),
+            ..sample_index_metadata("mixed")
+        };
+        let existing = vec![
+            inconsistent("btree.Details", 0),
+            inconsistent("bitmap.Details", 1),
+            inconsistent("inverted.Details", 2),
+        ];
+        let removed = existing[0].uuid;
+        let adjusted = existing[1].uuid;
+
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![
+                Action::AddIndexSegment(segment("other", vec![Ref::Committed(0)])),
+                Action::RemoveIndexSegment(RemoveIndexSegment {
+                    uuid: removed,
+                    name: "mixed".into(),
+                    data_change: false,
+                }),
+            ],
+            existing.clone(),
+        )
+        .unwrap();
+        assert_eq!(indices.len(), 3);
+
+        let error = apply_with_indices(
+            &manifest,
+            vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid: adjusted,
+                name: "mixed".into(),
+                add_fragments: Vec::new(),
+                remove_fragments: Vec::new(),
+            })],
+            existing,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("mixed"), "{error}");
+    }
+
+    /// A reset discards the segments that were there and the ones added before
+    /// it; a segment added after it describes the new table.
+    #[test]
+    fn test_a_reset_keeps_only_segments_added_after_it() {
+        let (next, indices) = apply_with_indices(
+            &backed_manifest(),
+            vec![
+                Action::AddIndexSegment(segment("early", vec![Ref::Committed(0)])),
+                Action::ResetTable(ResetTable),
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("fresh"),
+                }),
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 4,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
+                    field_ids: vec![Ref::Local(0)],
+                    data_change: true,
+                }),
+                Action::AddIndexSegment(AddIndexSegment {
+                    covered_fragments: Some(vec![Ref::Local(0)]),
+                    ..segment("fresh", vec![Ref::Local(0)])
+                }),
+            ],
+            vec![sample_index_metadata("old")],
+        )
+        .unwrap();
+
+        let field = next.schema.field("fresh").unwrap().id;
+        let fragment = next.fragments[0].id as u32;
+        assert_eq!(indices.len(), 1, "{indices:?}");
+        assert_eq!(indices[0].name, "fresh");
+        assert_eq!(indices[0].fields, vec![field]);
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some([fragment].into_iter().collect())
+        );
+    }
+
+    #[test]
+    fn test_a_fragment_id_an_index_cannot_record_is_rejected() {
+        let beyond = u64::from(u32::MAX) + 1;
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                covered_fragments: Some(vec![Ref::Committed(beyond)]),
+                ..segment("by_a", vec![Ref::Committed(0)])
+            })],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(&beyond.to_string()), "{error}");
+    }
+
+    #[rstest]
+    #[case::beyond_chrono(i64::MAX as u64)]
+    #[case::beyond_i64(u64::MAX)]
+    fn test_an_unrepresentable_created_at_is_rejected(#[case] millis: u64) {
+        let message = pb_actions::AddIndexSegment {
+            created_at: Some(millis),
+            ..pb_actions::AddIndexSegment::from(&segment("by_a", vec![Ref::Committed(0)]))
+        };
+
+        let error = AddIndexSegment::try_from(message).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("AddIndexSegment.created_at"),
+            "{error}"
+        );
     }
 
     /// `Local(0)` is a different field in each operation that mints one, so the
