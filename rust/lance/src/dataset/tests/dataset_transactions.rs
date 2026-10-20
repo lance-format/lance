@@ -4340,6 +4340,11 @@ mod composite {
             vec![
                 // Rewriting a column in place leaves the rows where they are, so
                 // nothing else in the commit says when they last changed.
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(rewritten),
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(rewritten),
                     file,
