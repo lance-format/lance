@@ -23,6 +23,7 @@
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
+use super::query_contract::QueryContract;
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::{apply_index_object_metadata_flag, inherit_sticky_feature_flags};
 use crate::format::overlay::staleness::field_affects_index;
@@ -1125,8 +1126,10 @@ fn display_mark(mark: Option<u64>) -> String {
 ///
 /// The query path unions a logical index's segments, so they must agree on
 /// what the index is: the same keyed and carried fields, resolved to ids (a
-/// `Local` token means a different field in each operation that mints one), and
-/// the same index type. And they must not describe a fragment twice, which
+/// `Local` token means a different field in each operation that mints one), the
+/// same index type, and the same [`QueryContract`] -- a vector segment under
+/// another metric would mix incomparable distances into one answer. And they
+/// must not describe a fragment twice, which
 /// would double-count its rows. The check runs on the final set rather than the
 /// actions, so a segment added by an earlier commit is compared too. This is the
 /// same rule `build_index_metadata_from_segments` holds a staged build to.
@@ -1148,6 +1151,7 @@ fn validate_index_segment_sets(
                 .as_ref()
                 .map(|details| details.type_url.clone())
         };
+        let contract = |index: &IndexMetadata| QueryContract::of(index.index_details.as_deref());
         let mut covered = first.fragment_bitmap.clone().unwrap_or_default();
         for segment in segments {
             if segment.fields != first.fields || segment.covering_fields != first.covering_fields {
@@ -1170,6 +1174,20 @@ fn validate_index_segment_sets(
                     type_url(segment),
                     first.uuid,
                     type_url(first)
+                )));
+            }
+            if let (Some(ours), Some(theirs)) = (contract(segment), contract(first))
+                && let Some(mismatch) = ours.mismatch(&theirs)
+            {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} with {} {} beside segment {} with {} {}; the \
+                     segments of one index must answer the same queries",
+                    segment.uuid,
+                    mismatch.facet,
+                    mismatch.ours,
+                    first.uuid,
+                    mismatch.facet,
+                    mismatch.theirs
                 )));
             }
             let Some(bitmap) = &segment.fragment_bitmap else {
