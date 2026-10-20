@@ -93,8 +93,8 @@ mod tests {
     use super::*;
     use crate::format::{DataFile, Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
-    use crate::transaction::action::Action;
     use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
+    use crate::transaction::action::{Action, Ref, RemoveFragment};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
@@ -200,5 +200,23 @@ mod tests {
 
         assert!(ours.conflicts_with(&same));
         assert!(!ours.conflicts_with(&other));
+    }
+
+    /// The version sequence lives in the fragment, so a concurrent removal of
+    /// it leaves nothing to restamp, in either order.
+    #[test]
+    fn test_refreshing_a_fragment_a_concurrent_writer_removes_conflicts() {
+        let ours = footprint(vec![refresh(vec![0])]);
+        let removal = |fragment: u64| {
+            footprint(vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(fragment),
+                data_change: true,
+            })])
+        };
+
+        assert!(ours.conflicts_with(&removal(0)));
+        assert!(removal(0).conflicts_with(&ours));
+        assert!(!ours.conflicts_with(&removal(1)));
+        assert!(!removal(1).conflicts_with(&ours));
     }
 }
