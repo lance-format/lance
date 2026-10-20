@@ -3,8 +3,8 @@
 
 //! Applying an action set to produce the next manifest.
 //!
-//! Each action is applied in order against a working copy of the read-version
-//! state. Minting actions allocate an id from the target's counters as they are
+//! Each action is applied in order against a working copy of the version being
+//! committed on top of. Minting actions allocate an id from the target's counters as they are
 //! reached and record it against their local token, so every later reference to
 //! that token -- in this same operation -- resolves to the id this apply chose.
 //! Replaying the same action set against a different version therefore produces
@@ -88,15 +88,17 @@ impl Transaction {
     }
 }
 
-/// The read-version state an action set is applied against, plus the id
+/// The state of the version being committed on top of, plus the id
 /// allocations made so far.
 pub(super) struct ApplyState<'a> {
-    /// The read version this delta applies to.
+    /// The version being committed on top of: the read version on a first
+    /// attempt, the latest committed version on a retry.
     current_manifest: &'a Manifest,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
-    /// base paths, which the manifest assembly inherits from the read version.
+    /// base paths, which the manifest assembly inherits from the version being
+    /// committed on top of.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
@@ -358,7 +360,7 @@ impl<'a> ApplyState<'a> {
         self.reset = true;
     }
 
-    /// The base paths this apply can see: the read version's, plus the ones
+    /// The base paths this apply can see: the current manifest's, plus the ones
     /// earlier actions in this operation minted.
     pub(super) fn bases(&self) -> impl Iterator<Item = &BasePath> {
         self.existing_base_paths
@@ -602,13 +604,13 @@ impl<'a> ApplyState<'a> {
 ///
 /// Rebinding a field also invalidates an index on any field it contains or is
 /// nested in: a packed struct is stored under the parent's id while an index may
-/// be keyed on a child. Ancestry is read from `read_schema`, the schema the
-/// actions were prepared against, because a field this operation drops or moves
-/// has already left the schema being built.
+/// be keyed on a child. Ancestry is read from `base_schema`, the schema of the
+/// version being committed on top of, because a field this operation drops or
+/// moves has already left the schema being built.
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
     rebound: &HashMap<u64, HashSet<i32>>,
-    read_schema: &Schema,
+    base_schema: &Schema,
 ) {
     if rebound.is_empty() {
         return;
@@ -620,7 +622,7 @@ fn prune_rebound_fields_from_indices(
         for (fragment_id, fields) in rebound {
             if fields
                 .iter()
-                .any(|field| field_affects_index(*field, &index.fields, read_schema))
+                .any(|field| field_affects_index(*field, &index.fields, base_schema))
                 && let Ok(fragment_id) = u32::try_from(*fragment_id)
             {
                 bitmap.remove(fragment_id);

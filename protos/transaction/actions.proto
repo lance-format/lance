@@ -78,8 +78,8 @@ package lance.transaction;
  * by an `AddFragment` or `AddBase` action earlier in the same
  * `CompositeOperation`; it resolves to a freshly-allocated committed id at
  * apply, and re-resolves against the target's counters on merge/rebase. `local` tokens are scoped to a single
- * `CompositeOperation` and must be distinct within it (validated by the writer once
- * the write path exists).
+ * `CompositeOperation` and must be distinct within it per id space; apply
+ * rejects a token minted twice.
  *
  * A `committed` id must exist at the operation's read version: apply rejects
  * one above the read version's high-water mark for its id space, because a

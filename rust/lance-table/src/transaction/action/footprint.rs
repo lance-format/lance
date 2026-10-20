@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! The set of coordinates an action set writes.
+//! What an action set writes and what it requires of the version it lands on.
 //!
 //! Two concurrent action sets can both commit when neither writes anything the
 //! other writes. This is a structural test over coordinates rather than a
@@ -198,7 +198,9 @@ enum Precondition {
     NoRowsAdded,
 }
 
-/// Everything an action set writes, in one set.
+/// Everything an action set writes, and everything it requires to still hold
+/// when it lands: definitions it depends on, fragments that must survive, and
+/// preconditions on what a concurrent set may have written.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Footprint {
     /// Every coordinate this set touches, with the strongest [`Mode`] it
@@ -270,7 +272,7 @@ impl Footprint {
         if self.claims_conflict_with(committed) || self.preconditions_violated_by(committed) {
             return true;
         }
-        self.anchors_removed_by(committed) || committed.anchors_removed_by(self)
+        self.required_fragment_removed_by(committed) || committed.required_fragment_removed_by(self)
     }
 
     /// Whether any coordinate touched by both sets, directly or through a
@@ -321,7 +323,7 @@ impl Footprint {
     }
 
     /// Whether `other` removes a fragment this set needs to still be there.
-    fn anchors_removed_by(&self, other: &Self) -> bool {
+    fn required_fragment_removed_by(&self, other: &Self) -> bool {
         self.required_fragments
             .iter()
             .any(|fragment| other.regions.contains_key(&Region::Fragment(*fragment)))
@@ -466,17 +468,6 @@ impl Footprint {
     /// concurrent set whatsoever.
     pub(super) fn take_exclusive(&mut self) {
         self.exclusive = true;
-    }
-
-    /// Record that this set drops `field` from the schema.
-    ///
-    /// Only the definition is written, and only the named field's: a footprint
-    /// has no schema to expand a struct with. A concurrent write to a child of
-    /// a dropped struct requires the child's definition, which this does not
-    /// write, so it is not caught here and fails when it is applied against the
-    /// version where the child no longer exists.
-    pub(super) fn remove_field(&mut self, field: Ref) {
-        self.write_field_definition(field);
     }
 }
 

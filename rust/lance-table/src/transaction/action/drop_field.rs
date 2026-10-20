@@ -76,10 +76,18 @@ impl DropField {
         true
     }
 
-    /// The field's definition and all of its data, which cannot be enumerated,
-    /// so the removal is recorded as such and matched by field id.
+    /// The field's definition, and nothing else. Anything that depends on the
+    /// field -- data written for it, its metadata, a child added under it --
+    /// requires that definition, so it collides with the drop as `Requires`
+    /// against `Writes`.
+    ///
+    /// Only the named field's definition is written: a footprint has no schema
+    /// to expand a struct with. A concurrent write to a child of a dropped
+    /// struct requires the child's definition, which this does not write, so
+    /// it is not caught here and fails when it is applied against the version
+    /// where the child no longer exists.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.remove_field(self.field);
+        footprint.write_field_definition(self.field);
     }
 }
 

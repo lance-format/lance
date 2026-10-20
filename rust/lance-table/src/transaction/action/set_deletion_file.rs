@@ -13,9 +13,12 @@ use lance_core::{Error, Result};
 /// Set (replace) a fragment's deletion file.
 ///
 /// This is reference-stable rather than a delta: the fragment id is committed
-/// and physical row offsets never move, so the post-image is unambiguous. The
-/// newly-deleted rows -- the delta rebase and conflict detection need -- are
-/// derived by diffing against the read version rather than serialized.
+/// and physical row offsets never move, so the post-image is unambiguous.
+///
+/// TODO: derive the newly-deleted rows by diffing against the read version, so
+/// rebase and conflict detection can merge two deletes on one fragment. Until
+/// then the whole fragment's deletions are one coordinate, and two deletes on
+/// the same fragment always conflict.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct SetDeletionFile {
     /// The fragment, by committed id.
