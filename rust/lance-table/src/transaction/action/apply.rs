@@ -205,10 +205,6 @@ pub(super) struct ApplyState<'a> {
     /// adjusted, whose segment sets are validated once the operation has run.
     touched_index_names: BTreeSet<String>,
 
-    /// Fields whose backing data changed, per fragment. An index covering such
-    /// a field no longer describes that fragment's contents.
-    rebound_fields: HashMap<u64, HashSet<i32>>,
-
     /// Every field a [`TombstoneFieldData`](super::TombstoneFieldData) freed,
     /// by fragment and field, so a re-encode can be checked to re-bind what it
     /// tombstoned.
@@ -258,7 +254,6 @@ impl<'a> ApplyState<'a> {
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
             touched_index_names: BTreeSet::new(),
-            rebound_fields: HashMap::new(),
             tombstoned_fields: HashMap::new(),
         }
     }
@@ -291,7 +286,6 @@ impl<'a> ApplyState<'a> {
             mut indices,
             touched_index_names,
             new_bases,
-            rebound_fields,
             fragment_high_water,
             field_high_water,
             config: dataset_config,
@@ -299,7 +293,6 @@ impl<'a> ApplyState<'a> {
             ..
         } = self;
 
-        prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema)?;
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
         validate_index_segment_sets(&indices, &touched_index_names)?;
 
@@ -530,7 +523,6 @@ impl<'a> ApplyState<'a> {
             return false;
         }
         self.new_fragments.remove(&fragment_id);
-        self.rebound_fields.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
         true
@@ -545,7 +537,6 @@ impl<'a> ApplyState<'a> {
         self.fragments.clear();
         self.indices.clear();
         self.new_fragments.clear();
-        self.rebound_fields.clear();
         self.tombstoned_fields.clear();
     }
 
@@ -772,15 +763,22 @@ impl<'a> ApplyState<'a> {
 
     /// Record that these fields' data in this fragment no longer matches what
     /// an index built over them recorded.
+    ///
+    /// Prunes the segments present now rather than at assembly: a segment an
+    /// later action in this operation adds was built over the new data, so the
+    /// rebind does not invalidate it.
     pub(super) fn rebind_fields(
         &mut self,
         fragment_id: u64,
         fields: impl IntoIterator<Item = i32>,
-    ) {
-        self.rebound_fields
-            .entry(fragment_id)
-            .or_default()
-            .extend(fields);
+    ) -> Result<()> {
+        let fields: Vec<i32> = fields.into_iter().collect();
+        prune_rebound_fields_from_indices(
+            &mut self.indices,
+            fragment_id,
+            &fields,
+            &self.current_manifest.schema,
+        )
     }
 
     /// Record that a [`TombstoneFieldData`](super::TombstoneFieldData) freed
@@ -1075,22 +1073,21 @@ fn required_field_ids(schema: &Schema) -> HashSet<i32> {
 /// design and are keyed on no column, so a rewrite never affects them.
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
-    rebound: &HashMap<u64, HashSet<i32>>,
+    fragment_id: u64,
+    fields: &[i32],
     base_schema: &Schema,
 ) -> Result<()> {
-    if rebound.is_empty() {
+    let Ok(fragment_id) = u32::try_from(fragment_id) else {
         return Ok(());
-    }
+    };
     for index in indices.iter_mut() {
-        let affected_field = |fields: &HashSet<i32>| {
-            fields
-                .iter()
-                .copied()
-                .find(|field| field_affects_index(*field, &index.fields, base_schema))
-        };
+        let affected_field = fields
+            .iter()
+            .copied()
+            .find(|field| field_affects_index(*field, &index.fields, base_schema));
         let Some(bitmap) = index.fragment_bitmap.as_mut() else {
             if !is_system_index(index)
-                && let Some(field) = rebound.values().find_map(affected_field)
+                && let Some(field) = affected_field
             {
                 return Err(Error::invalid_input(format!(
                     "index '{}' has unknown coverage; migrate or rebuild it before rewriting \
@@ -1100,12 +1097,8 @@ fn prune_rebound_fields_from_indices(
             }
             continue;
         };
-        for (fragment_id, fields) in rebound {
-            if affected_field(fields).is_some()
-                && let Ok(fragment_id) = u32::try_from(*fragment_id)
-            {
-                bitmap.remove(fragment_id);
-            }
+        if affected_field.is_some() {
+            bitmap.remove(fragment_id);
         }
     }
     Ok(())
