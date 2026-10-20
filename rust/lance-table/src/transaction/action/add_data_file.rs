@@ -54,12 +54,39 @@ impl AddDataFile {
                 file.column_indices.len()
             )));
         }
+        // A field's values live in exactly one file, so a second file for the
+        // same field is ambiguous. A struct's own id is the exception: a file
+        // adding a child under a committed struct lists the parent too, and the
+        // parent holds no values of its own unless it is packed. Re-encoding a
+        // column goes through TombstoneFieldData first, which frees the slot.
+        let exclusive_fields: Vec<i32> = field_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                state
+                    .schema()
+                    .field_by_id(*id)
+                    .is_some_and(|field| field.children.is_empty() || field.is_packed_struct())
+            })
+            .collect();
         file.fields = field_ids.into();
 
-        state
-            .fragment_mut(fragment_id, "AddDataFile")?
-            .files
-            .push(file);
+        let fragment = state.fragment_mut(fragment_id, "AddDataFile")?;
+        for field_id in exclusive_fields {
+            if let Some(existing) = fragment
+                .files
+                .iter()
+                .find(|existing| existing.fields.contains(&field_id))
+            {
+                return Err(Error::invalid_input(format!(
+                    "AddDataFile for fragment {fragment_id} backs field {field_id}, which is \
+                     already backed by {}; tombstone the field's data with TombstoneFieldData \
+                     first to replace it",
+                    existing.path
+                )));
+            }
+        }
+        fragment.files.push(file);
         Ok(())
     }
 
