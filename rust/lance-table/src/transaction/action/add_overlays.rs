@@ -173,7 +173,7 @@ impl TryFrom<pb_actions::AddOverlays> for AddOverlays {
 mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
-    use crate::format::{DataFile, RowIdMeta};
+    use crate::format::{DataFile, Manifest, RowIdMeta};
     use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::action::test_support::{
@@ -212,6 +212,31 @@ mod tests {
             overlays,
             data_change: true,
         })
+    }
+
+    fn mint(physical_rows: u64) -> Action {
+        Action::AddFragment(AddFragment {
+            id: Ref::Local(0),
+            physical_rows,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    /// A stable-row-id manifest whose one fragment holds three rows, with or
+    /// without a last-updated sequence (a fragment migrated to stable row ids
+    /// has none).
+    fn stable_row_id_manifest(has_sequence: bool) -> Manifest {
+        let mut fragment = backed_manifest().fragments[0].clone();
+        fragment.physical_rows = Some(3);
+        let ids = RowIdSequence::from([0u64, 1, 2].as_slice());
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&ids).into()));
+        if has_sequence {
+            refresh_row_latest_update_meta_for_full_frag_rewrite_cols(&mut fragment, 1).unwrap();
+        }
+        make_stable_row_id_manifest(vec![fragment])
     }
 
     #[test]
@@ -427,14 +452,7 @@ mod tests {
     fn test_overlaid_rows_are_restamped_with_the_version_the_commit_produces(
         #[case] has_sequence: bool,
     ) {
-        let mut fragment = backed_manifest().fragments[0].clone();
-        fragment.physical_rows = Some(3);
-        let ids = RowIdSequence::from([0u64, 1, 2].as_slice());
-        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&ids).into()));
-        if has_sequence {
-            refresh_row_latest_update_meta_for_full_frag_rewrite_cols(&mut fragment, 1).unwrap();
-        }
-        let manifest = make_stable_row_id_manifest(vec![fragment]);
+        let manifest = stable_row_id_manifest(has_sequence);
         let expected = manifest.version + 1;
 
         let out = apply(
@@ -452,6 +470,35 @@ mod tests {
         assert_eq!(
             versions.versions().collect::<Vec<_>>(),
             vec![expected, 1, 1]
+        );
+    }
+
+    /// An overlay covering a row past the end of its fragment supplies values
+    /// for a row that does not exist, whatever the dataset and whether the
+    /// fragment is committed or minted in the same operation.
+    #[rstest::rstest]
+    #[case::without_stable_row_ids(backed_manifest(), Ref::Committed(0), 10)]
+    #[case::with_stable_row_ids(stable_row_id_manifest(true), Ref::Committed(0), 3)]
+    #[case::minted_fragment(backed_manifest(), Ref::Local(0), 4)]
+    fn test_an_overlay_past_the_end_of_its_fragment_is_rejected(
+        #[case] manifest: Manifest,
+        #[case] fragment: Ref,
+        #[case] offset: u32,
+    ) {
+        let mut actions = Vec::new();
+        if fragment.committed().is_none() {
+            actions.push(mint(4));
+        }
+        actions.push(add(fragment, vec![overlay("a.lance", &[0, offset])]));
+
+        let error = apply(&manifest, actions).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("covers row offset {offset}")),
+            "{error}"
         );
     }
 
