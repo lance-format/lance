@@ -209,7 +209,7 @@ impl Ref {
 /// ]);
 ///
 /// // The steps are what a user did; the actions are the deltas they became.
-/// assert_eq!(operation.actions.len(), 2);
+/// assert_eq!(operation.steps.len(), 2);
 /// assert_eq!(operation.iter_actions().count(), 2);
 /// ```
 ///
@@ -220,17 +220,17 @@ impl Ref {
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
 pub struct CompositeOperation {
     /// The ordered steps this operation applies.
-    pub actions: Vec<UserStep>,
+    pub steps: Vec<UserStep>,
 }
 
 impl CompositeOperation {
-    pub fn new(actions: Vec<UserStep>) -> Self {
-        Self { actions }
+    pub fn new(steps: Vec<UserStep>) -> Self {
+        Self { steps }
     }
 
     /// Every action in every step, in application order.
     pub fn iter_actions(&self) -> impl Iterator<Item = &Action> {
-        self.actions.iter().flat_map(|step| step.actions.iter())
+        self.steps.iter().flat_map(|step| step.actions.iter())
     }
 }
 
