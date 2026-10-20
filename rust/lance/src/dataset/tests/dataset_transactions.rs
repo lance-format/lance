@@ -4026,6 +4026,8 @@ mod composite {
         assert!(error.to_string().contains("build snapshot"), "{error}");
     }
 
+    /// A segment committed through the action path lands as the builder staged
+    /// it, and the query path can open and use it.
     #[tokio::test]
     async fn test_a_segment_built_at_the_version_read_commits() {
         let mut dataset = test_dataset(false).await;
@@ -4036,8 +4038,67 @@ mod composite {
             .await
             .unwrap();
 
-        let dataset = commit(dataset, vec![add_built_segment(staged)]).await;
+        let dataset = commit(dataset, vec![add_built_segment(staged.clone())]).await;
 
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let committed = indices.iter().find(|index| index.name == "shared").unwrap();
+        assert_eq!(committed, &staged);
+
+        let mut scan = dataset.scan();
+        scan.filter("a = 3").unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["a"].as_ref(),
+            &Int32Array::from(vec![3]) as &dyn arrow_array::Array
+        );
+    }
+
+    /// A built segment states the version it was built from, which is the
+    /// version its writer read. Losing the race to an unrelated append does
+    /// not change that, so the retry still commits.
+    #[tokio::test]
+    async fn test_a_built_segment_commits_after_an_unrelated_append() {
+        let mut dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+        let staged = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("shared".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let stale = Arc::new(dataset.clone());
+        let file = existing_data_file(&dataset, 0);
+
+        commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        let dataset = commit_from_stale(stale, vec![add_built_segment(staged)])
+            .await
+            .expect("an append does not touch what the segment describes");
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == "shared").unwrap();
+        assert_eq!(segment.dataset_version, read_version);
         assert_eq!(index_coverage(&dataset, "shared").await, vec![0, 1]);
     }
 }
