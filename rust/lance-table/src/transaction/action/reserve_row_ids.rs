@@ -72,6 +72,7 @@ mod tests {
     use crate::transaction::action::test_support::{apply, backed_manifest};
     use crate::transaction::action::{Action, AddFragment, Ref};
     use crate::transaction::test_support::make_stable_row_id_manifest;
+    use rstest::rstest;
 
     fn reserve(count: u64) -> Action {
         Action::ReserveRowIds(ReserveRowIds { count })
@@ -208,5 +209,15 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("stable row ids"), "{error}");
+    }
+
+    #[rstest]
+    #[case::one_reservation_past_the_counter(vec![reserve(u64::MAX)])]
+    #[case::reservations_that_overflow_together(vec![reserve(u64::MAX), reserve(u64::MAX)])]
+    fn test_reserving_past_the_row_id_counter_is_rejected(#[case] actions: Vec<Action>) {
+        let error = apply(&stable_manifest(), actions).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("overflows"), "{error}");
     }
 }
