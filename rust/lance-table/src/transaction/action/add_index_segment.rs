@@ -412,13 +412,13 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::DataFile;
+    use crate::format::{BasePath, DataFile};
     use crate::transaction::action::test_support::{
         added_field, apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, CompositeOperation, DropField, Footprint,
-        RemoveFragment, TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, CompositeOperation, DropField,
+        Footprint, RemoveFragment, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
@@ -789,6 +789,70 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("fields"), "{error}");
+    }
+
+    #[test]
+    fn test_a_segment_base_resolves_to_a_committed_or_minted_base() {
+        let mut manifest = backed_manifest();
+        manifest.base_paths = [(
+            3,
+            BasePath::new(3, "s3://bucket/committed".into(), None, false),
+        )]
+        .into_iter()
+        .collect();
+        let (next, indices) = apply_with_indices(
+            &manifest,
+            vec![
+                Action::AddBase(AddBase {
+                    local: 0,
+                    base: BasePath::new(0, "s3://bucket/minted".into(), None, false),
+                }),
+                Action::AddIndexSegment(AddIndexSegment {
+                    base: Some(Ref::Committed(3)),
+                    ..segment("committed", vec![Ref::Committed(0)])
+                }),
+                Action::AddIndexSegment(AddIndexSegment {
+                    base: Some(Ref::Local(0)),
+                    ..segment("minted", vec![Ref::Committed(0)])
+                }),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let base_of = |name: &str| {
+            indices
+                .iter()
+                .find(|index| index.name == name)
+                .unwrap()
+                .base_id
+        };
+        let minted = next
+            .base_paths
+            .values()
+            .find(|base| base.path == "s3://bucket/minted")
+            .unwrap()
+            .id;
+        assert_eq!(base_of("committed"), Some(3));
+        assert_eq!(base_of("minted"), Some(minted));
+    }
+
+    #[rstest]
+    #[case::unbound_local_token(Ref::Local(0), "local base token 0")]
+    #[case::committed_id_the_manifest_lacks(Ref::Committed(3), "base id 3")]
+    fn test_a_segment_base_must_exist(#[case] base: Ref, #[case] expected: &str) {
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                base: Some(base),
+                ..segment("by_a", vec![Ref::Committed(0)])
+            })],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(expected), "{error}");
     }
 
     #[test]
