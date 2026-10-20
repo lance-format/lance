@@ -61,8 +61,10 @@ impl RefreshRowVersionMetadata {
     /// An [`AddOverlays`](super::AddOverlays) restamps the same sequence
     /// without claiming it, so the two do not collide: the overlay sets only
     /// the rows it covers and keeps whatever the rest hold when it applies,
-    /// which composes with a refresh in either order. A refresh replaces the
-    /// sequence whole, and two replacements of one coordinate never commute.
+    /// which composes with a refresh in either order. Two refreshes would
+    /// compose too -- each stamps every row, and the later version wins -- so
+    /// their conflict is part of the same over-strictness, tracked in
+    /// <https://github.com/lance-format/lance/issues/10189>.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for fragment_id in &self.fragment_ids {
             footprint.write(Coordinate::FragmentRowVersions(*fragment_id));
