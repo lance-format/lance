@@ -44,6 +44,24 @@ impl AddOverlays {
         let refreshes_lineage = state.uses_stable_row_ids() && self.fragment.committed().is_some();
         let spilled = state.spilled_row_lineage();
         let fragment = state.fragment_mut(fragment_id, "AddOverlays")?;
+
+        let mut covered = RoaringBitmap::new();
+        for overlay in &self.overlays {
+            for position in 0..overlay.data_file.fields.len() {
+                covered |= overlay.coverage_for_field(position)?.as_ref();
+            }
+        }
+        // Only checkable when the fragment records its row count, which
+        // fragments written by older Lance versions may not.
+        if let (Some(max_offset), Some(physical_rows)) = (covered.max(), fragment.physical_rows)
+            && max_offset as usize >= physical_rows
+        {
+            return Err(Error::invalid_input(format!(
+                "AddOverlays covers row offset {max_offset} of fragment {fragment_id}, which has \
+                 {physical_rows} rows"
+            )));
+        }
+
         fragment
             .overlays
             .extend(self.overlays.iter().cloned().map(|mut overlay| {
@@ -57,21 +75,6 @@ impl AddOverlays {
         // minted it.
         if !refreshes_lineage {
             return Ok(());
-        }
-        let mut covered = RoaringBitmap::new();
-        for overlay in &self.overlays {
-            for position in 0..overlay.data_file.fields.len() {
-                covered |= overlay.coverage_for_field(position)?.as_ref();
-            }
-        }
-        let physical_rows = fragment.physical_rows;
-        if let (Some(max_offset), Some(physical_rows)) = (covered.max(), physical_rows)
-            && max_offset as usize >= physical_rows
-        {
-            return Err(Error::invalid_input(format!(
-                "AddOverlays covers row offset {max_offset} of fragment {fragment_id}, which has \
-                 {physical_rows} rows"
-            )));
         }
         let offsets = covered
             .iter()
