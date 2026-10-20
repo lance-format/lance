@@ -57,11 +57,7 @@ impl TryFrom<pb_actions::Ref> for Ref {
 impl From<&CompositeOperation> for pb_actions::CompositeOperation {
     fn from(value: &CompositeOperation) -> Self {
         Self {
-            steps: value
-                .actions
-                .iter()
-                .map(pb_actions::UserStep::from)
-                .collect(),
+            steps: value.steps.iter().map(pb_actions::UserStep::from).collect(),
         }
     }
 }
@@ -71,7 +67,7 @@ impl TryFrom<pb_actions::CompositeOperation> for CompositeOperation {
 
     fn try_from(message: pb_actions::CompositeOperation) -> Result<Self> {
         Ok(Self {
-            actions: message
+            steps: message
                 .steps
                 .into_iter()
                 .map(UserStep::try_from)
