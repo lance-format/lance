@@ -4101,4 +4101,84 @@ mod composite {
         assert_eq!(segment.dataset_version, read_version);
         assert_eq!(index_coverage(&dataset, "shared").await, vec![0, 1]);
     }
+
+    /// Two vector segments under one name are unioned by the query path, so
+    /// they must answer the same query contract. An L2 segment beside a Dot
+    /// segment would rank one half of the dataset by the wrong distance.
+    /// Independently trained models are fine; the metric is not.
+    #[tokio::test]
+    async fn test_vector_segments_with_different_metrics_cannot_share_an_index() {
+        use crate::index::vector::VectorIndexParams;
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_linalg::distance::DistanceType;
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0, 100.0, 0.0, 101.0, 0.0, 102.0, 0.0, 103.0,
+                0.0,
+            ]),
+            2,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let mut segments = Vec::new();
+        for (fragment, metric) in [(0, DistanceType::L2), (1, DistanceType::Dot)] {
+            let params = VectorIndexParams::ivf_flat(1, metric);
+            let segment = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name("shared".into())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(segment);
+        }
+        let dot = segments.pop().unwrap();
+        let l2 = segments.pop().unwrap();
+
+        // The legacy segment commit rejects the pair; the action path must too.
+        let error = dataset
+            .commit_existing_index_segments("shared", "vector", vec![l2.clone(), dot.clone()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("metric"), "{error}");
+
+        // Concurrently: both writers read the same version.
+        let stale = Arc::new(dataset.clone());
+        let dataset = commit(dataset, vec![add_built_segment(l2)]).await;
+        let error = commit_from_stale(stale, vec![add_built_segment(dot.clone())])
+            .await
+            .expect_err("a Dot segment cannot join an L2 index");
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+
+        // Sequentially: the second writer read the version with the L2 segment.
+        let error = try_commit(dataset, vec![add_built_segment(dot)])
+            .await
+            .expect_err("a Dot segment cannot join an L2 index");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("metric"), "{error}");
+    }
 }
