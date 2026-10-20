@@ -17,16 +17,21 @@ use roaring::RoaringBitmap;
 /// Append overlay files to one fragment, supplying new values for a subset of
 /// its `(row offset, field)` cells without rewriting its base data files.
 ///
-/// Overlays are appended rather than replaced, so overlays a concurrent writer
-/// added survive. Within the fragment they are ordered newest-last, which is
-/// what appending at the version this commit produces gives.
+/// Overlays are appended after the ones already on the fragment rather than
+/// replacing them, so overlays a concurrent writer added survive, and later
+/// entries take precedence.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddOverlays {
+    /// The fragment to overlay: committed, or one minted earlier in the same
+    /// operation.
     pub fragment: Ref,
-    /// The overlays to append, oldest first. Each one's `committed_version` is
-    /// ignored and stamped with the version this commit produces, so replaying
-    /// the action onto a newer version re-stamps rather than backdates.
+    /// The overlays to append, in precedence order: where two cover the same
+    /// cell, the later one wins. Each one's `committed_version` is ignored and
+    /// stamped with the version this commit produces, so replaying the action
+    /// onto a newer version re-stamps rather than backdates.
     pub overlays: Vec<DataOverlayFile>,
+    /// Must be `true`; `false` is rejected at apply, since an overlay always
+    /// changes values. See [`AddFragment::data_change`](super::AddFragment::data_change).
     pub data_change: bool,
 }
 
@@ -117,22 +122,33 @@ impl AddOverlays {
     /// no longer has. A fragment this operation mints still requires it, since
     /// the overlay may supply a field the fragment's base files do not.
     ///
-    /// The deletions are written, in part, because a concurrent row-moving
-    /// update deletes rows from the fragment and re-creates them in another
-    /// from the base the overlay never touched, losing the overlay's values for
-    /// them. Not a requirement: the update landing second is the lossy order,
-    /// and the footprint cannot tell a move from a plain delete. So an overlay
-    /// also conflicts with a plain delete of the fragment, which is stricter
-    /// than legacy; the row-level comparison of moved rows against overlay
-    /// coverage comes with the conflict-parity follow-ups.
+    /// The overlay leaves the fragment's deletions alone, but marks them as a
+    /// conflict point (see [`Footprint::write_part_of_deletions`]): the marker
+    /// collides with any full deletion write on the fragment, in either order,
+    /// and commutes with other overlays. It exists for the row-moving update
+    /// race. An update deletes rows from the fragment and re-adds them in a new
+    /// fragment built from the pre-overlay base, so the overlay's values for
+    /// those rows are lost whichever commits first. A plain delete conflicts
+    /// too, because the footprint cannot tell it from a row-moving update.
+    ///
+    /// TODO(https://github.com/lance-format/lance/pull/8646): that is an
+    /// over-conflict next to the legacy resolver's row-level check of moved
+    /// rows against overlay coverage; restore it as part of conflict parity.
     ///
     /// A fragment this operation mints has no cells or deletions a concurrent
     /// writer can name.
+    ///
+    /// The rows' last-updated versions are restamped without a claim on
+    /// [`Coordinate::FragmentRowVersions`](super::Coordinate::FragmentRowVersions);
+    /// see [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)'s
+    /// footprint for why.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         let fields = self
             .overlays
             .iter()
             .flat_map(|overlay| overlay.data_file.fields.iter().copied())
+            // A negative id marks a tombstoned column in the overlay's file,
+            // which holds no values a reader sees.
             .filter(|field| *field >= 0)
             .map(|field| Ref::Committed(field as u64));
         footprint.write_partial_field_data(self.fragment, fields);
