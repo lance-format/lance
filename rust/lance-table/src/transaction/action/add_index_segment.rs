@@ -1027,21 +1027,25 @@ mod tests {
         covering("by_a", Some(vec![2])),
         true,
     )]
-    #[case::disagreeing_about_the_index_config(
+    #[case::disagreeing_about_the_index_type(
+        AddIndexSegment { index_details: type_url("btree.Details"), ..covering("by_a", Some(vec![0])) },
+        AddIndexSegment { index_details: type_url("bitmap.Details"), ..covering("by_a", Some(vec![2])) },
+        true,
+    )]
+    // Same rule as the legacy resolver and the apply-time segment check: the
+    // details payload and the index version may differ between segments of
+    // one index, for instance across a library upgrade.
+    #[case::differing_only_in_index_version_and_details_payload(
         AddIndexSegment {
+            index_version: 2,
             index_details: Some(Arc::new(prost_types::Any {
-                type_url: "type.googleapis.com/lance.index.pb.VectorIndexDetails".into(),
+                type_url: "btree.Details".into(),
                 value: vec![1, 2, 3],
             })),
             ..covering("by_a", Some(vec![0]))
         },
-        covering("by_a", Some(vec![2])),
-        true,
-    )]
-    #[case::disagreeing_about_the_index_version(
-        AddIndexSegment { index_version: 2, ..covering("by_a", Some(vec![0])) },
-        covering("by_a", Some(vec![2])),
-        true,
+        AddIndexSegment { index_details: type_url("btree.Details"), ..covering("by_a", Some(vec![2])) },
+        false,
     )]
     fn test_two_writers_extending_one_index(
         #[case] ours: AddIndexSegment,
