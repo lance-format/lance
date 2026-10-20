@@ -237,9 +237,10 @@ impl CompositeOperation {
 /// A single user-recognizable step within a [`CompositeOperation`], e.g. "append
 /// batch" or "rebuild index".
 ///
-/// The description keeps transaction history readable: when a range of versions
-/// is squashed, each original operation collapses into one step, so the sequence
-/// a user performed survives even though the deltas are flattened when applied.
+/// The description keeps transaction history readable. The intent is that
+/// squashing a range of versions concatenates their steps, so the sequence a
+/// user performed survives even though the deltas are flattened when applied;
+/// the exact squash behavior is up to the implementing system.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct UserStep {
     pub description: String,
