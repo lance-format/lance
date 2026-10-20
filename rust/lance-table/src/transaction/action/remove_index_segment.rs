@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::{Coordinate, Footprint};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use uuid::Uuid;
@@ -54,7 +54,7 @@ impl DeepSizeOf for RemoveIndexSegment {
     }
 }
 
-impl From<&RemoveIndexSegment> for pb_transaction::RemoveIndexSegment {
+impl From<&RemoveIndexSegment> for pb_actions::RemoveIndexSegment {
     fn from(value: &RemoveIndexSegment) -> Self {
         Self {
             uuid: Some((&value.uuid).into()),
@@ -64,10 +64,10 @@ impl From<&RemoveIndexSegment> for pb_transaction::RemoveIndexSegment {
     }
 }
 
-impl TryFrom<pb_transaction::RemoveIndexSegment> for RemoveIndexSegment {
+impl TryFrom<pb_actions::RemoveIndexSegment> for RemoveIndexSegment {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::RemoveIndexSegment) -> Result<Self> {
+    fn try_from(message: pb_actions::RemoveIndexSegment) -> Result<Self> {
         Ok(Self {
             uuid: Uuid::try_from(&required(message.uuid, "RemoveIndexSegment.uuid")?)?,
             name: non_empty(message.name, "RemoveIndexSegment.name")?,

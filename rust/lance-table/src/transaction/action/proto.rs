@@ -41,7 +41,7 @@ pub(super) fn non_empty(value: String, what: &str) -> Result<String> {
     Ok(value)
 }
 
-impl From<Ref> for pb_transaction::Ref {
+impl From<Ref> for pb_actions::Ref {
     fn from(value: Ref) -> Self {
         let kind = match value {
             Ref::Committed(id) => pb_actions::r#ref::Kind::Committed(id),
@@ -366,22 +366,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::addition(pb_transaction::Action {
-        action: Some(pb_transaction::action::Action::AddIndexSegment(pb_transaction::AddIndexSegment {
+    #[case::addition(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AddIndexSegment(pb_actions::AddIndexSegment {
             uuid: Some((&Uuid::from_u128(1)).into()),
             name: String::new(),
             ..Default::default()
         })),
     }, "AddIndexSegment.name")]
-    #[case::removal(pb_transaction::Action {
-        action: Some(pb_transaction::action::Action::RemoveIndexSegment(pb_transaction::RemoveIndexSegment {
+    #[case::removal(pb_actions::Action {
+        action: Some(pb_actions::action::Action::RemoveIndexSegment(pb_actions::RemoveIndexSegment {
             uuid: Some((&Uuid::from_u128(1)).into()),
             name: String::new(),
             data_change: None,
         })),
     }, "RemoveIndexSegment.name")]
-    #[case::coverage(pb_transaction::Action {
-        action: Some(pb_transaction::action::Action::AdjustIndexCoverage(pb_transaction::AdjustIndexCoverage {
+    #[case::coverage(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AdjustIndexCoverage(pb_actions::AdjustIndexCoverage {
             uuid: Some((&Uuid::from_u128(1)).into()),
             name: String::new(),
             add_fragments: Vec::new(),
@@ -389,7 +389,7 @@ mod tests {
         })),
     }, "AdjustIndexCoverage.name")]
     fn test_an_index_action_without_a_name_is_rejected(
-        #[case] message: pb_transaction::Action,
+        #[case] message: pb_actions::Action,
         #[case] expected: &str,
     ) {
         // Protobuf cannot tell an unset string from an empty one, and an index

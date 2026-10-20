@@ -7,7 +7,7 @@ use super::apply::ApplyState;
 use super::footprint::IndexIdentity;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::{Footprint, Ref};
-use crate::format::{IndexFile, IndexMetadata, pb, pb_transaction};
+use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
@@ -258,12 +258,9 @@ impl AddIndexSegment {
             .chain(self.covering_fields.iter())
             .copied()
             .collect();
-        // The segment describes values in the type the schema named when it
-        // was built. A cast landing first would leave it describing values as
-        // something they are not, and a drop would leave it over a field the
-        // manifest no longer has; both write the definition. Landing second,
-        // either prunes or discards the segment as it applies, so this is only
-        // required, not written.
+        // A drop landing first would leave the segment over a field the
+        // manifest no longer has. Landing second, it discards the segment as it
+        // applies, so the definition is only required, not written.
         for field in dependencies.iter().copied() {
             footprint.require_field_definition(field);
         }
@@ -297,7 +294,7 @@ impl DeepSizeOf for AddIndexSegment {
     }
 }
 
-impl From<&AddIndexSegment> for pb_transaction::AddIndexSegment {
+impl From<&AddIndexSegment> for pb_actions::AddIndexSegment {
     fn from(value: &AddIndexSegment) -> Self {
         Self {
             uuid: Some((&value.uuid).into()),
@@ -314,7 +311,7 @@ impl From<&AddIndexSegment> for pb_transaction::AddIndexSegment {
                 .map(|details| details.as_ref().clone()),
             index_version: Some(value.index_version),
             covered_fragments: value.covered_fragments.as_ref().map(|fragments| {
-                pb_transaction::FragmentCoverage {
+                pb_actions::FragmentCoverage {
                     fragments: fragments.iter().map(|id| (*id).into()).collect(),
                 }
             }),
@@ -328,7 +325,7 @@ impl From<&AddIndexSegment> for pb_transaction::AddIndexSegment {
                 })
                 .collect(),
             data_change: data_change_to_wire(value.data_change),
-            base: value.base.map(pb_transaction::Ref::from),
+            base: value.base.map(pb_actions::Ref::from),
             created_at: value
                 .created_at
                 .map(|created_at| created_at.timestamp_millis() as u64),
@@ -337,10 +334,10 @@ impl From<&AddIndexSegment> for pb_transaction::AddIndexSegment {
     }
 }
 
-impl TryFrom<pb_transaction::AddIndexSegment> for AddIndexSegment {
+impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::AddIndexSegment) -> Result<Self> {
+    fn try_from(message: pb_actions::AddIndexSegment) -> Result<Self> {
         let created_at = message
             .created_at
             .map(|millis| {
@@ -402,8 +399,8 @@ mod tests {
         added_field, apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, AlterField, CompositeOperation, DropField, Footprint,
-        RemoveFragment, TombstoneFieldData, UserStep,
+        Action, AddField, AddFragment, CompositeOperation, DropField, Footprint, RemoveFragment,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
@@ -953,26 +950,22 @@ mod tests {
         assert!(build.conflicts_with(&rewrite));
     }
 
-    /// A cast landing first leaves the segment describing values in a type the
-    /// schema no longer names; a cast landing second rebinds the field in every
-    /// fragment and prunes the segment's coverage as it applies. Same shape as
-    /// the rewrite case above, one level up: the definition rather than the
-    /// data.
+    /// A drop landing first leaves the segment over a field the manifest no
+    /// longer has; a drop landing second discards the segment as it applies.
+    /// Same shape as the rewrite case above, one level up: the definition
+    /// rather than the data.
     #[test]
-    fn test_a_build_loses_to_a_committed_cast_but_not_the_reverse() {
+    fn test_a_build_loses_to_a_committed_drop_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let cast = footprint(vec![Action::AlterField(AlterField {
+        let drop = footprint(vec![Action::DropField(DropField {
             field: Ref::Committed(0),
-            name: None,
-            logical_type: Some("int64".into()),
-            nullable: None,
         })]);
 
-        assert!(build.conflicts_with(&cast));
-        assert!(!cast.conflicts_with(&build));
+        assert!(build.conflicts_with(&drop));
+        assert!(!drop.conflicts_with(&build));
 
         // A segment of unstated reach depends on the definition just the same.
-        assert!(index_footprint(covering("by_a", None)).conflicts_with(&cast));
+        assert!(index_footprint(covering("by_a", None)).conflicts_with(&drop));
     }
 
     /// A segment requires the data of the fragments it covers, and that data

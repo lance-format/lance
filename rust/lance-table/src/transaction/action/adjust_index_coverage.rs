@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::{non_empty, required};
 use super::{Coordinate, Footprint, Ref};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use uuid::Uuid;
@@ -140,7 +140,7 @@ impl DeepSizeOf for AdjustIndexCoverage {
     }
 }
 
-impl From<&AdjustIndexCoverage> for pb_transaction::AdjustIndexCoverage {
+impl From<&AdjustIndexCoverage> for pb_actions::AdjustIndexCoverage {
     fn from(value: &AdjustIndexCoverage) -> Self {
         Self {
             uuid: Some((&value.uuid).into()),
@@ -155,10 +155,10 @@ impl From<&AdjustIndexCoverage> for pb_transaction::AdjustIndexCoverage {
     }
 }
 
-impl TryFrom<pb_transaction::AdjustIndexCoverage> for AdjustIndexCoverage {
+impl TryFrom<pb_actions::AdjustIndexCoverage> for AdjustIndexCoverage {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::AdjustIndexCoverage) -> Result<Self> {
+    fn try_from(message: pb_actions::AdjustIndexCoverage) -> Result<Self> {
         Ok(Self {
             uuid: Uuid::try_from(&required(message.uuid, "AdjustIndexCoverage.uuid")?)?,
             name: non_empty(message.name, "AdjustIndexCoverage.name")?,
