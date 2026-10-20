@@ -8,6 +8,8 @@ use super::footprint::IndexIdentity;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::{Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
@@ -52,9 +54,13 @@ pub struct AddIndexSegment {
     /// Index-type-specific metadata, opaque to the transaction layer.
     pub index_details: Option<Arc<prost_types::Any>>,
     pub index_version: i32,
-    /// The fragments this segment covers, or `None` when the coverage was not
-    /// recorded -- what the system indices carry. An empty list is the
-    /// different statement that the segment covers nothing.
+    /// The fragments this segment covers. An empty list says the segment
+    /// covers nothing.
+    ///
+    /// `None` says no coverage is recorded, which only the system indices
+    /// (`__lance_mem_wal`, `__lance_frag_reuse`) may say: they are not served
+    /// per fragment. A user index segment must state its coverage, and `apply`
+    /// rejects one that does not.
     pub covered_fragments: Option<Vec<Ref>>,
     /// The segment's files and their sizes, empty when the writer did not
     /// record them.
@@ -84,6 +90,15 @@ impl AddIndexSegment {
             .iter()
             .map(|field| state.resolve_field(*field))
             .collect::<Result<Vec<_>>>()?;
+        let is_system_index = self.name == MEM_WAL_INDEX_NAME || self.name == FRAG_REUSE_INDEX_NAME;
+        if self.covered_fragments.is_none() && !is_system_index {
+            return Err(Error::invalid_input(format!(
+                "AddIndexSegment for index '{}' leaves covered_fragments unset; only the system \
+                 indices '{MEM_WAL_INDEX_NAME}' and '{FRAG_REUSE_INDEX_NAME}' may omit their \
+                 coverage",
+                self.name
+            )));
+        }
         let fragment_bitmap = self
             .covered_fragments
             .as_ref()
@@ -397,7 +412,6 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
     use crate::transaction::action::test_support::{
         added_field, apply_with_indices, backed_manifest, footprint,
     };
