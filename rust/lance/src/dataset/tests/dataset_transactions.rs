@@ -4421,41 +4421,74 @@ mod composite {
         assert_eq!(dataset.fragments().len(), 2);
     }
 
+    /// An append of five rows, asserting the hashes of their keys over `a`
+    /// when `key_hashes` is given.
+    fn keyed_append(dataset: &Dataset, key_hashes: Option<&[u64]>) -> Vec<Action> {
+        let mut actions = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+        ];
+        if let Some(key_hashes) = key_hashes {
+            actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![Ref::Committed(0)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet(key_hashes.iter().copied().collect()),
+                },
+            }));
+        }
+        actions
+    }
+
     #[tokio::test]
     async fn test_a_key_assertion_commits_alongside_the_insert_it_guards() {
         let dataset = test_dataset(false).await;
-        let file = existing_data_file(&dataset, 0);
         let before = dataset.fragments().len();
+        let actions = keyed_append(&dataset, Some(&[11, 12]));
 
-        let dataset = commit(
-            dataset,
-            vec![
-                Action::AddFragment(AddFragment {
-                    id: Ref::Local(0),
-                    physical_rows: 5,
-                    row_id_meta: None,
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                    data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file,
-                    field_ids: vec![Ref::Committed(0)],
-                    data_change: true,
-                }),
-                Action::AssertUniqueKeys(AssertUniqueKeys {
-                    key_fields: vec![Ref::Committed(0)],
-                    filter: KeyExistenceFilter {
-                        field_ids: Vec::new(),
-                        filter: FilterType::ExactSet([11u64, 12].into_iter().collect()),
-                    },
-                }),
-            ],
-        )
-        .await;
+        let dataset = commit(dataset, actions).await;
 
         assert_eq!(dataset.fragments().len(), before + 1);
+    }
+
+    /// The assertion travels through the transaction file and is compared by
+    /// the commit path's conflict check, not just by footprints in memory.
+    #[rstest::rstest]
+    #[case::overlapping_keys(Some(&[2, 3][..]), true)]
+    #[case::disjoint_keys(Some(&[3, 4][..]), false)]
+    #[case::unqualified_append(None, true)]
+    #[tokio::test]
+    async fn test_a_concurrent_insert_is_checked_against_a_key_assertion(
+        #[case] stale_key_hashes: Option<&'static [u64]>,
+        #[case] is_conflict: bool,
+    ) {
+        let dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+        let committed = commit(dataset.clone(), keyed_append(&dataset, Some(&[1, 2]))).await;
+        let stale = keyed_append(&dataset, stale_key_hashes);
+
+        if is_conflict {
+            commit_expecting_conflict(&committed, read_version, stale).await;
+        } else {
+            let landed = CommitBuilder::new(Arc::new(committed.clone()))
+                .with_experimental_composite_operations(true)
+                .execute(composite_txn(read_version, stale))
+                .await
+                .unwrap();
+            assert_eq!(landed.fragments().len(), committed.fragments().len() + 1);
+        }
     }
 
     fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {
