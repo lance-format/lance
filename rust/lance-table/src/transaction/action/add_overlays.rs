@@ -8,7 +8,7 @@ use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Footprint, Ref};
 use crate::format::overlay::DataOverlayFile;
 use crate::format::pb;
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use crate::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -139,7 +139,7 @@ impl AddOverlays {
     }
 }
 
-impl From<&AddOverlays> for pb_transaction::AddOverlays {
+impl From<&AddOverlays> for pb_actions::AddOverlays {
     fn from(value: &AddOverlays) -> Self {
         Self {
             fragment: Some(value.fragment.into()),
@@ -153,10 +153,10 @@ impl From<&AddOverlays> for pb_transaction::AddOverlays {
     }
 }
 
-impl TryFrom<pb_transaction::AddOverlays> for AddOverlays {
+impl TryFrom<pb_actions::AddOverlays> for AddOverlays {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::AddOverlays) -> Result<Self> {
+    fn try_from(message: pb_actions::AddOverlays) -> Result<Self> {
         Ok(Self {
             fragment: required(message.fragment, "AddOverlays.fragment")?.try_into()?,
             overlays: message
@@ -339,25 +339,25 @@ mod tests {
         assert!(!rewrite(1).conflicts_with(&overlaid));
     }
 
-    /// An overlay landing after its field was cast or dropped would carry
-    /// values in a type the schema no longer names, or for a field that is
-    /// gone. Landing first, the cast rebinds the field everywhere and the drop
-    /// tombstones the overlay, so those orders are fine.
+    /// An overlay landing after its field was altered or dropped would carry
+    /// values checked against a definition the schema no longer holds, or for
+    /// a field that is gone. Landing first, the alter covers the overlay's
+    /// values like any others and the drop tombstones the overlay, so those
+    /// orders are fine.
     #[test]
     fn test_an_overlay_needs_its_field_defined_as_it_was() {
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let cast = footprint(vec![Action::AlterField(AlterField {
+        let altered = footprint(vec![Action::AlterField(AlterField {
             field: Ref::Committed(0),
-            name: None,
-            logical_type: Some("int64".into()),
+            name: Some("renamed".into()),
             nullable: None,
         })]);
         let dropped = footprint(vec![Action::DropField(DropField {
             field: Ref::Committed(0),
         })]);
 
-        assert!(overlaid.conflicts_with(&cast));
-        assert!(!cast.conflicts_with(&overlaid));
+        assert!(overlaid.conflicts_with(&altered));
+        assert!(!altered.conflicts_with(&overlaid));
         assert!(overlaid.conflicts_with(&dropped));
         assert!(!dropped.conflicts_with(&overlaid));
     }
@@ -586,7 +586,6 @@ mod tests {
         let tighten = footprint(vec![Action::AlterField(AlterField {
             field: Ref::Committed(0),
             name: None,
-            logical_type: None,
             nullable: Some(false),
         })]);
 

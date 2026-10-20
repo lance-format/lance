@@ -6,7 +6,7 @@
 use super::Footprint;
 use super::apply::ApplyState;
 use crate::format::pb;
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use crate::system_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -50,7 +50,7 @@ impl UpdateCompactedSsTables {
     }
 }
 
-impl From<&UpdateCompactedSsTables> for pb_transaction::UpdateCompactedSsTables {
+impl From<&UpdateCompactedSsTables> for pb_actions::UpdateCompactedSsTables {
     fn from(value: &UpdateCompactedSsTables) -> Self {
         Self {
             compacted_sstables: value
@@ -62,10 +62,10 @@ impl From<&UpdateCompactedSsTables> for pb_transaction::UpdateCompactedSsTables 
     }
 }
 
-impl TryFrom<pb_transaction::UpdateCompactedSsTables> for UpdateCompactedSsTables {
+impl TryFrom<pb_actions::UpdateCompactedSsTables> for UpdateCompactedSsTables {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::UpdateCompactedSsTables) -> Result<Self> {
+    fn try_from(message: pb_actions::UpdateCompactedSsTables) -> Result<Self> {
         Ok(Self {
             compacted_sstables: message
                 .compacted_sstables
