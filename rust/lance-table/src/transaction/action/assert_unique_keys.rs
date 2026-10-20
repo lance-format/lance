@@ -30,12 +30,18 @@ use lance_core::{Error, Result};
 /// keys squashed into one operation cannot each assert only their own rows,
 /// because the other's rows carry values in those columns too. Conflict
 /// detection matches assertions by key column set on that assumption.
+///
+/// An assertion over a column the same operation mints ([`Ref::Local`]) guards
+/// nothing concurrent: no other writer can insert into that column, so conflict
+/// detection ignores it.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AssertUniqueKeys {
     /// The key columns, in order. This is the authoritative list; the field ids
-    /// the filter carries are an artifact of the shared filter type and are left
-    /// empty here.
+    /// the filter carries are an artifact of the shared filter type, ignored
+    /// here and cleared on encode.
     pub key_fields: Vec<Ref>,
+    /// Hashes of the key values of every row this operation inserts, over
+    /// `key_fields`.
     pub filter: KeyExistenceFilter,
 }
 
