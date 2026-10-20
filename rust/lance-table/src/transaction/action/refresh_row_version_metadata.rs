@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::{Coordinate, Footprint};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -63,7 +63,7 @@ impl RefreshRowVersionMetadata {
     }
 }
 
-impl From<&RefreshRowVersionMetadata> for pb_transaction::RefreshRowVersionMetadata {
+impl From<&RefreshRowVersionMetadata> for pb_actions::RefreshRowVersionMetadata {
     fn from(value: &RefreshRowVersionMetadata) -> Self {
         Self {
             fragment_ids: value.fragment_ids.clone(),
@@ -71,10 +71,10 @@ impl From<&RefreshRowVersionMetadata> for pb_transaction::RefreshRowVersionMetad
     }
 }
 
-impl TryFrom<pb_transaction::RefreshRowVersionMetadata> for RefreshRowVersionMetadata {
+impl TryFrom<pb_actions::RefreshRowVersionMetadata> for RefreshRowVersionMetadata {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::RefreshRowVersionMetadata) -> Result<Self> {
+    fn try_from(message: pb_actions::RefreshRowVersionMetadata) -> Result<Self> {
         Ok(Self {
             fragment_ids: message.fragment_ids,
         })

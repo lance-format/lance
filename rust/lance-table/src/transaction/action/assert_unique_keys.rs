@@ -7,7 +7,7 @@ use super::apply::ApplyState;
 use super::proto::required;
 use super::{Footprint, Ref};
 use crate::format::key_existence::KeyExistenceFilter;
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -71,9 +71,9 @@ impl AssertUniqueKeys {
     }
 }
 
-impl From<&AssertUniqueKeys> for pb_transaction::AssertUniqueKeys {
+impl From<&AssertUniqueKeys> for pb_actions::AssertUniqueKeys {
     fn from(value: &AssertUniqueKeys) -> Self {
-        let mut filter = pb_transaction::KeyExistenceFilter::from(&value.filter);
+        let mut filter = pb_actions::KeyExistenceFilter::from(&value.filter);
         // `key_fields` is the authoritative list; the filter's own copy is an
         // artifact of the type it shares with the legacy Update operation.
         filter.field_ids.clear();
@@ -84,10 +84,10 @@ impl From<&AssertUniqueKeys> for pb_transaction::AssertUniqueKeys {
     }
 }
 
-impl TryFrom<pb_transaction::AssertUniqueKeys> for AssertUniqueKeys {
+impl TryFrom<pb_actions::AssertUniqueKeys> for AssertUniqueKeys {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::AssertUniqueKeys) -> Result<Self> {
+    fn try_from(message: pb_actions::AssertUniqueKeys) -> Result<Self> {
         let filter = required(message.filter, "AssertUniqueKeys.filter")?;
         Ok(Self {
             key_fields: message
