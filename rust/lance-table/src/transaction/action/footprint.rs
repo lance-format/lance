@@ -597,7 +597,7 @@ impl Footprint {
 
     /// Record that this set adds a segment to `name`, defining the index as
     /// `identity` and describing `coverage`.
-    pub(super) fn build_index(
+    pub(super) fn claim_index_segment(
         &mut self,
         name: String,
         identity: IndexIdentity,

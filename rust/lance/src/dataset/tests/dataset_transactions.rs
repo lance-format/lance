@@ -3859,7 +3859,7 @@ mod composite {
     /// prunes it. Its footprint has to catch it instead: the segment requires
     /// the `FieldData` coordinates the rewrite writes.
     #[tokio::test]
-    async fn test_an_index_segment_staged_before_a_rewrite_does_not_cover_it() {
+    async fn test_an_index_segment_staged_before_a_rewrite_conflicts_with_it() {
         let dataset = test_dataset(false).await;
         let stale = Arc::new(dataset.clone());
         let file = existing_data_file(&dataset, 0);

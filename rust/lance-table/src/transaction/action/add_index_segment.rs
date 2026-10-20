@@ -53,6 +53,8 @@ pub struct AddIndexSegment {
     pub covering_fields: Vec<Ref>,
     /// Index-type-specific metadata, opaque to the transaction layer.
     pub index_details: Option<Arc<prost_types::Any>>,
+    /// The version of the index type's on-disk format the segment was written
+    /// in, as [`IndexMetadata::index_version`] records it.
     pub index_version: i32,
     /// The fragments this segment covers. An empty list says the segment
     /// covers nothing.
@@ -77,9 +79,13 @@ pub struct AddIndexSegment {
     ///
     /// When present it must equal the version the operation reads: a segment
     /// built from an older snapshot is rejected, because nothing would catch a
-    /// rewrite between that snapshot and the read. The overlay version gate
-    /// reads the field, which is why it stays on the wire.
+    /// rewrite between that snapshot and the read.
+    ///
+    /// The field stays on the wire, although today it can only restate the
+    /// read version, so that accepting a segment built from an older snapshot
+    /// later needs no format change -- see the TODO on `reflected_version`.
     pub dataset_version: Option<u64>,
+    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
     pub data_change: bool,
 }
 
@@ -185,8 +191,8 @@ impl AddIndexSegment {
     ///
     /// TODO: a segment built elsewhere, from an older snapshot, could be
     /// accepted by pruning its coverage at commit time with
-    /// `prune_stale_segment_coverage`, replaying the fragment reuse index. No
-    /// format change is needed for that, which is why the field stays on the wire.
+    /// `prune_stale_segment_coverage`, replaying the fragment reuse index. The
+    /// `dataset_version` field is kept on the wire for this.
     fn reflected_version(&self, read_version: u64) -> Result<u64> {
         let Some(version) = self.dataset_version else {
             return Ok(read_version);
@@ -253,7 +259,7 @@ impl AddIndexSegment {
     /// earned. Deletions and overlays are excluded on purpose: both leave a
     /// trace a reader can act on, so both may still run alongside a build.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.build_index(
+        footprint.claim_index_segment(
             self.name.clone(),
             IndexIdentity {
                 fields: self.fields.clone(),

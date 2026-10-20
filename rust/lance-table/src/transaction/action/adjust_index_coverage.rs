@@ -39,6 +39,7 @@ use uuid::Uuid;
 /// widening an existing one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdjustIndexCoverage {
+    /// The segment whose coverage changes.
     pub uuid: Uuid,
     /// The logical index the segment belongs to. Conflict detection compares
     /// coverage across the segments of one index, so it needs the index and not
