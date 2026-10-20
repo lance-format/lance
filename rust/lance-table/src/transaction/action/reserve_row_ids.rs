@@ -29,8 +29,7 @@ pub struct ReserveRowIds {
 
 impl ReserveRowIds {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        state.reserve_row_ids(self.count);
-        Ok(())
+        state.reserve_row_ids(self.count)
     }
 
     /// A reserved id backs no row until something is written against it.

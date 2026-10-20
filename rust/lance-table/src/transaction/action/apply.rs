@@ -427,8 +427,15 @@ impl<'a> ApplyState<'a> {
 
     /// Set `count` row ids aside for a later writer, on top of any this
     /// operation already reserved.
-    pub(super) fn reserve_row_ids(&mut self, count: u64) {
-        self.reserved_row_ids += count;
+    pub(super) fn reserve_row_ids(&mut self, count: u64) -> Result<()> {
+        self.reserved_row_ids = self.reserved_row_ids.checked_add(count).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "reserving {count} more row ids on top of {} already reserved in this operation \
+                 overflows the row id counter",
+                self.reserved_row_ids
+            ))
+        })?;
+        Ok(())
     }
 
     pub(super) fn mint_field(&mut self, token: u32) -> Result<i32> {
