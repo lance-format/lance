@@ -637,6 +637,7 @@ fn duplicate_token_err(space: &str, token: u32) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::{FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS};
     use crate::format::DataFile;
     use crate::system_index::mem_wal::{
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
@@ -1073,5 +1074,64 @@ mod tests {
                 assert!(error.contains(expected), "unexpected error: {error}");
             }
         }
+    }
+
+    fn rename_field_zero() -> Action {
+        Action::AlterField(AlterField {
+            field: Ref::Committed(0),
+            name: Some("renamed".into()),
+            nullable: None,
+        })
+    }
+
+    #[test]
+    fn test_an_action_set_keeps_sticky_feature_flags() {
+        let mut manifest = backed_manifest();
+        manifest.reader_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.writer_feature_flags |= FLAG_MIXED_DATA_FILE_VERSIONS;
+        manifest.activate_non_reusable_field_ids();
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+
+        let next = apply(&manifest, vec![rename_field_zero()]).unwrap();
+
+        assert_ne!(next.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS, 0);
+        assert_ne!(next.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS, 0);
+        assert_ne!(next.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
+        assert_eq!(next.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
+    }
+
+    /// The sticky bits are copied forward, so a source whose flags are
+    /// inconsistent has to be rejected rather than masked into a valid-looking
+    /// manifest, as the legacy path does.
+    #[rstest]
+    #[case::sticky_flag_on_the_reader_side_only(FLAG_MIXED_DATA_FILE_VERSIONS, 0, false)]
+    #[case::non_reusable_field_ids_on_the_reader_side(
+        FLAG_NON_REUSABLE_FIELD_IDS,
+        FLAG_NON_REUSABLE_FIELD_IDS,
+        true
+    )]
+    #[case::non_reusable_field_ids_without_its_high_water_mark(
+        0,
+        FLAG_NON_REUSABLE_FIELD_IDS,
+        false
+    )]
+    fn test_an_action_set_rejects_inconsistent_sticky_flags(
+        #[case] reader_flags: u64,
+        #[case] writer_flags: u64,
+        #[case] has_high_water_mark: bool,
+    ) {
+        let mut manifest = backed_manifest();
+        manifest.reader_feature_flags |= reader_flags;
+        manifest.writer_feature_flags |= writer_flags;
+        if has_high_water_mark {
+            manifest.activate_non_reusable_field_ids();
+        }
+
+        let error = apply(&manifest, vec![rename_field_zero()]).unwrap_err();
+
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 }
