@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Footprint, Ref};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -43,7 +43,7 @@ impl RemoveFragment {
     }
 }
 
-impl From<&RemoveFragment> for pb_transaction::RemoveFragment {
+impl From<&RemoveFragment> for pb_actions::RemoveFragment {
     fn from(value: &RemoveFragment) -> Self {
         Self {
             fragment: Some(value.fragment.into()),
@@ -52,10 +52,10 @@ impl From<&RemoveFragment> for pb_transaction::RemoveFragment {
     }
 }
 
-impl TryFrom<pb_transaction::RemoveFragment> for RemoveFragment {
+impl TryFrom<pb_actions::RemoveFragment> for RemoveFragment {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::RemoveFragment) -> Result<Self> {
+    fn try_from(message: pb_actions::RemoveFragment) -> Result<Self> {
         Ok(Self {
             fragment: required(message.fragment, "RemoveFragment.fragment")?.try_into()?,
             data_change: data_change_from_wire(message.data_change),

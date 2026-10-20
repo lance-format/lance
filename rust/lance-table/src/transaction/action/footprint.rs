@@ -494,8 +494,8 @@ impl From<&CompositeOperation> for Footprint {
         }
 
         // Dropping a field and adding one by the same name is how a cast is
-        // spelled, now that [`AlterField`](super::AlterField) cannot retype in
-        // place: the new field's data is rewritten from the dropped field's
+        // spelled, since [`AlterField`](super::AlterField) has no type facet:
+        // the new field's data is rewritten from the dropped field's
         // values as they were read. A footprint has no schema to match the
         // names, so any drop alongside any add is treated as a replacement. The
         // cost is a spurious conflict for an unrelated drop and add in one set.
@@ -523,7 +523,7 @@ mod tests {
         SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
-    use lance_core::datatypes::{Field, LogicalType};
+    use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
@@ -577,7 +577,6 @@ mod tests {
         Action::AlterField(AlterField {
             field: Ref::Committed(field as u64),
             name: None,
-            logical_type: None,
             nullable: Some(nullable),
         })
     }
@@ -586,7 +585,6 @@ mod tests {
         Action::AlterField(AlterField {
             field: Ref::Local(local),
             name: None,
-            logical_type: None,
             nullable: Some(false),
         })
     }
@@ -610,16 +608,6 @@ mod tests {
         Action::AlterField(AlterField {
             field: Ref::Committed(field as u64),
             name: Some(name.into()),
-            logical_type: None,
-            nullable: None,
-        })
-    }
-
-    fn cast_field(field: i32) -> Action {
-        Action::AlterField(AlterField {
-            field: Ref::Committed(field as u64),
-            name: None,
-            logical_type: Some(LogicalType::from("int64")),
             nullable: None,
         })
     }
@@ -736,17 +724,17 @@ mod tests {
     )]
     #[case::same_field_definition(
         vec![rename_field(1, "a")],
-        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, nullable: Some(true) })],
         true,
     )]
     #[case::different_field_definitions(
-        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: None })],
-        vec![Action::AlterField(AlterField { field: Ref::Committed(2), name: None, logical_type: None, nullable: None })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, nullable: None })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(2), name: None, nullable: None })],
         false,
     )]
     #[case::dropping_a_field_collides_with_altering_it(
         vec![drop_field(1)],
-        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, nullable: Some(true) })],
         true,
     )]
     #[case::dropping_a_field_leaves_other_fields_alone(
@@ -761,12 +749,6 @@ mod tests {
     )]
     #[case::dropping_a_field_a_concurrent_append_does_not_write(
         vec![drop_field(1)],
-        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
-        false,
-    )]
-    // A retype and data for an unrelated field never interact, in either order.
-    #[case::casting_a_field_a_concurrent_append_does_not_write(
-        vec![cast_field(1)],
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
         false,
     )]
@@ -864,16 +846,6 @@ mod tests {
     /// set that is valid only against the values it read -- a replacement, a
     /// tightening -- is not: it carries a precondition instead.
     #[rstest]
-    #[case::an_append_landing_after_a_cast(
-        append(1),
-        vec![cast_field(1)],
-        true,
-    )]
-    #[case::a_rewrite_landing_after_a_cast(
-        vec![add_data_file(Ref::Committed(7), &[1])],
-        vec![cast_field(1)],
-        true,
-    )]
     // A cast is a drop, an add under the same name, and the data. The footprint
     // has no schema to match the name, so any drop paired with an add counts as
     // a replacement, and the replacement's data would miss a value a concurrent

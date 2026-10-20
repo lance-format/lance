@@ -7,7 +7,7 @@ use super::apply::ApplyState;
 use super::footprint::UnenforcedKey;
 use super::proto::required;
 use super::{ConfigMap, Coordinate, Footprint, Ref};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use crate::transaction::UpdateMap;
 use crate::transaction::update_map::apply_update_map;
 use lance_core::datatypes::{
@@ -217,34 +217,34 @@ fn reject_reserved_key_change(
     Ok(())
 }
 
-impl From<&ConfigUpdate> for pb_transaction::ConfigUpdate {
+impl From<&ConfigUpdate> for pb_actions::ConfigUpdate {
     fn from(value: &ConfigUpdate) -> Self {
         Self {
-            config: value.config.as_ref().map(pb_transaction::UpdateMap::from),
+            config: value.config.as_ref().map(pb_actions::UpdateMap::from),
             table_metadata: value
                 .table_metadata
                 .as_ref()
-                .map(pb_transaction::UpdateMap::from),
+                .map(pb_actions::UpdateMap::from),
             schema_metadata: value
                 .schema_metadata
                 .as_ref()
-                .map(pb_transaction::UpdateMap::from),
+                .map(pb_actions::UpdateMap::from),
             field_metadata: value
                 .field_metadata
                 .iter()
-                .map(|update| pb_transaction::config_update::FieldMetadata {
+                .map(|update| pb_actions::config_update::FieldMetadata {
                     field: Some(update.field.into()),
-                    updates: Some(pb_transaction::UpdateMap::from(&update.updates)),
+                    updates: Some(pb_actions::UpdateMap::from(&update.updates)),
                 })
                 .collect(),
         }
     }
 }
 
-impl TryFrom<pb_transaction::ConfigUpdate> for ConfigUpdate {
+impl TryFrom<pb_actions::ConfigUpdate> for ConfigUpdate {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::ConfigUpdate) -> Result<Self> {
+    fn try_from(message: pb_actions::ConfigUpdate) -> Result<Self> {
         Ok(Self {
             config: message.config.as_ref().map(UpdateMap::from),
             table_metadata: message.table_metadata.as_ref().map(UpdateMap::from),

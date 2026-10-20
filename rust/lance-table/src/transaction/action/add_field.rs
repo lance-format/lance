@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::required;
 use super::{Coordinate, Footprint, Ref};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -97,7 +97,7 @@ impl AddField {
     }
 }
 
-impl From<&AddField> for pb_transaction::AddField {
+impl From<&AddField> for pb_actions::AddField {
     fn from(value: &AddField) -> Self {
         Self {
             local: value.local,
@@ -107,10 +107,10 @@ impl From<&AddField> for pb_transaction::AddField {
     }
 }
 
-impl TryFrom<pb_transaction::AddField> for AddField {
+impl TryFrom<pb_actions::AddField> for AddField {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::AddField) -> Result<Self> {
+    fn try_from(message: pb_actions::AddField) -> Result<Self> {
         Ok(Self {
             local: message.local,
             parent: message.parent.map(Ref::try_from).transpose()?,

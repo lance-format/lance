@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire};
 use super::{Coordinate, Footprint};
-use crate::format::{DeletionFile, pb, pb_transaction};
+use crate::format::{DeletionFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -51,7 +51,7 @@ impl SetDeletionFile {
     }
 }
 
-impl From<&SetDeletionFile> for pb_transaction::SetDeletionFile {
+impl From<&SetDeletionFile> for pb_actions::SetDeletionFile {
     fn from(value: &SetDeletionFile) -> Self {
         Self {
             fragment: value.fragment,
@@ -61,10 +61,10 @@ impl From<&SetDeletionFile> for pb_transaction::SetDeletionFile {
     }
 }
 
-impl TryFrom<pb_transaction::SetDeletionFile> for SetDeletionFile {
+impl TryFrom<pb_actions::SetDeletionFile> for SetDeletionFile {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::SetDeletionFile) -> Result<Self> {
+    fn try_from(message: pb_actions::SetDeletionFile) -> Result<Self> {
         Ok(Self {
             fragment: message.fragment,
             deletion_file: message

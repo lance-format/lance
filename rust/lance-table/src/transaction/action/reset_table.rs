@@ -5,7 +5,7 @@
 
 use super::Footprint;
 use super::apply::ApplyState;
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 
@@ -48,16 +48,16 @@ impl ResetTable {
     }
 }
 
-impl From<&ResetTable> for pb_transaction::ResetTable {
+impl From<&ResetTable> for pb_actions::ResetTable {
     fn from(_value: &ResetTable) -> Self {
         Self {}
     }
 }
 
-impl TryFrom<pb_transaction::ResetTable> for ResetTable {
+impl TryFrom<pb_actions::ResetTable> for ResetTable {
     type Error = lance_core::Error;
 
-    fn try_from(_message: pb_transaction::ResetTable) -> Result<Self> {
+    fn try_from(_message: pb_actions::ResetTable) -> Result<Self> {
         Ok(Self)
     }
 }

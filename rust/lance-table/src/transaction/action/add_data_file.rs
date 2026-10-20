@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Footprint, Ref};
-use crate::format::{DataFile, pb, pb_transaction};
+use crate::format::{DataFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -74,7 +74,7 @@ impl AddDataFile {
     }
 }
 
-impl From<&AddDataFile> for pb_transaction::AddDataFile {
+impl From<&AddDataFile> for pb_actions::AddDataFile {
     fn from(value: &AddDataFile) -> Self {
         Self {
             fragment: Some(value.fragment.into()),
@@ -85,10 +85,10 @@ impl From<&AddDataFile> for pb_transaction::AddDataFile {
     }
 }
 
-impl TryFrom<pb_transaction::AddDataFile> for AddDataFile {
+impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::AddDataFile) -> Result<Self> {
+    fn try_from(message: pb_actions::AddDataFile) -> Result<Self> {
         Ok(Self {
             fragment: required(message.fragment, "AddDataFile.fragment")?.try_into()?,
             file: DataFile::try_from(required(message.file, "AddDataFile.file")?)?,

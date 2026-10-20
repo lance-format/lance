@@ -6,7 +6,7 @@
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
 use super::proto::required;
 use super::{Footprint, Ref};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -102,7 +102,7 @@ fn remove_field(fields: &mut Vec<Field>, field_id: i32) {
     }
 }
 
-impl From<&DropField> for pb_transaction::DropField {
+impl From<&DropField> for pb_actions::DropField {
     fn from(value: &DropField) -> Self {
         Self {
             field: Some(value.field.into()),
@@ -110,10 +110,10 @@ impl From<&DropField> for pb_transaction::DropField {
     }
 }
 
-impl TryFrom<pb_transaction::DropField> for DropField {
+impl TryFrom<pb_actions::DropField> for DropField {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::DropField) -> Result<Self> {
+    fn try_from(message: pb_actions::DropField) -> Result<Self> {
         Ok(Self {
             field: required(message.field, "DropField.field")?.try_into()?,
         })

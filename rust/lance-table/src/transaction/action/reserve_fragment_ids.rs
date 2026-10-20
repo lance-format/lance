@@ -5,7 +5,7 @@
 
 use super::Footprint;
 use super::apply::ApplyState;
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -47,16 +47,16 @@ impl ReserveFragmentIds {
     pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
 }
 
-impl From<&ReserveFragmentIds> for pb_transaction::ReserveFragmentIds {
+impl From<&ReserveFragmentIds> for pb_actions::ReserveFragmentIds {
     fn from(value: &ReserveFragmentIds) -> Self {
         Self { count: value.count }
     }
 }
 
-impl TryFrom<pb_transaction::ReserveFragmentIds> for ReserveFragmentIds {
+impl TryFrom<pb_actions::ReserveFragmentIds> for ReserveFragmentIds {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::ReserveFragmentIds) -> Result<Self> {
+    fn try_from(message: pb_actions::ReserveFragmentIds) -> Result<Self> {
         Ok(Self {
             count: message.count,
         })
