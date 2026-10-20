@@ -456,7 +456,7 @@ impl Footprint {
         // assertion is a precondition on that commit, wrong if it is an
         // invariant on the table.
         //
-        // TODO(https://github.com/lance-format/lance/pull/8646): decide which
+        // TODO(https://github.com/lance-format/lance/issues/10189): decide which
         // reading holds as part of conflict parity with the legacy resolver;
         // until then, keep the stricter one.
         if self.key_assertion_violated_by(committed) || committed.key_assertion_violated_by(self) {
