@@ -364,7 +364,10 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
         let created_at = message
             .created_at
             .map(|millis| {
-                chrono::DateTime::from_timestamp_millis(millis as i64).ok_or_else(|| {
+                i64::try_from(millis)
+                    .ok()
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .ok_or_else(|| {
                     Error::invalid_input(format!(
                         "AddIndexSegment.created_at is {millis}ms since the epoch, which is not a \
                          representable timestamp"
