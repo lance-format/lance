@@ -20,7 +20,6 @@ use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::transaction::UpdateMap;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// One thing an action set writes.
@@ -299,17 +298,18 @@ struct IndexClaim {
 /// What an index is, for the purpose of deciding whether two writers are
 /// building the same one.
 ///
-/// `details` is compared as the opaque blob it is. Two segments of one index
-/// built by the same writer serialize identical config, so equality is the
-/// right test until index config is lifted out of the per-segment details.
+/// The same rule the apply-time segment check and the legacy conflict resolver
+/// use: keyed fields, carried fields, and the index type. The details payload
+/// and the index version are left out, because segments of one index may
+/// legitimately differ in both -- a segment built by a newer library, say.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct IndexIdentity {
     pub fields: Vec<Ref>,
     /// Which of `fields` are merely carried: two writers that disagree about
     /// this disagree about what the index answers for, not just what it holds.
     pub covering_fields: Vec<Ref>,
-    pub details: Option<Arc<prost_types::Any>>,
-    pub index_version: i32,
+    /// The type url of the segment's index details, or `None` when it has none.
+    pub type_url: Option<String>,
 }
 
 impl IndexClaim {

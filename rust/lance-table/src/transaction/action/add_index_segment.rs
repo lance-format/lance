@@ -243,8 +243,10 @@ impl AddIndexSegment {
             IndexIdentity {
                 fields: self.fields.clone(),
                 covering_fields: self.covering_fields.clone(),
-                details: self.index_details.clone(),
-                index_version: self.index_version,
+                type_url: self
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.clone()),
             },
             self.covered_fragments.clone(),
         );
