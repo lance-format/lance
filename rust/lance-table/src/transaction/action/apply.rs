@@ -19,6 +19,7 @@
 //! own module.
 
 use super::{CompositeOperation, Ref};
+use crate::feature_flags::inherit_sticky_feature_flags;
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
 use crate::rowids::read_row_ids;
@@ -227,6 +228,7 @@ impl<'a> ApplyState<'a> {
             false,
             config,
         )?;
+        inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
 
         for base in new_bases {
             manifest.base_paths.insert(base.id, base);
