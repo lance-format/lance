@@ -192,6 +192,24 @@ mod tests {
         assert!(theirs.conflicts_with(&ours));
     }
 
+    /// A local key field names a column the operation mints, which no
+    /// concurrent writer can insert into, so the assertion has nothing to
+    /// guard. Two operations' `Local(3)` also name different columns, so
+    /// matching them would compare hashes of unrelated values.
+    #[test]
+    fn test_an_assertion_over_a_minted_key_column_does_not_conflict() {
+        let over = |key_field: Ref, hashes: &[u64]| {
+            footprint(vec![append(0), assertion(vec![key_field], hashes)])
+        };
+        let plain_append = footprint(vec![append(0)]);
+
+        assert!(!over(Ref::Local(3), &[1, 2]).conflicts_with(&over(Ref::Local(3), &[2, 3])));
+        assert!(!over(Ref::Local(3), &[1, 2]).conflicts_with(&plain_append));
+        assert!(!plain_append.conflicts_with(&over(Ref::Local(3), &[1, 2])));
+        // The same overlap over a committed column is a collision.
+        assert!(over(Ref::Committed(3), &[1, 2]).conflicts_with(&over(Ref::Committed(3), &[2, 3])));
+    }
+
     #[test]
     fn test_assertions_over_different_key_columns_conflict() {
         // Two filters over different columns hash different values, so neither
