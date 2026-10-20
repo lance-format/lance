@@ -412,15 +412,17 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::DataFile;
     use crate::transaction::action::test_support::{
         added_field, apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, CompositeOperation, DropField, Footprint, RemoveFragment,
-        TombstoneFieldData, UserStep,
+        Action, AddDataFile, AddField, AddFragment, CompositeOperation, DropField, Footprint,
+        RemoveFragment, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
+    use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
     fn segment(name: &str, fields: Vec<Ref>) -> AddIndexSegment {
@@ -911,6 +913,41 @@ mod tests {
 
         let field = next.schema.field("added").unwrap();
         assert_eq!(indices[0].fields, vec![field.id]);
+    }
+
+    /// A rewrite prunes the segments that were there when it ran. One added
+    /// after it, in the same operation, was built over the rewritten data and
+    /// keeps its coverage; one added before it describes the replaced values.
+    #[rstest]
+    #[case::segment_after_the_rewrite(true, Some([0].into_iter().collect()))]
+    #[case::segment_before_the_rewrite(false, Some(RoaringBitmap::new()))]
+    fn test_a_rewrite_prunes_only_segments_added_before_it(
+        #[case] segment_after_rewrite: bool,
+        #[case] expected_bitmap: Option<RoaringBitmap>,
+    ) {
+        let rewrite = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(0),
+                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                field_ids: vec![Ref::Committed(0)],
+                data_change: true,
+            }),
+        ];
+        let build = Action::AddIndexSegment(segment("by_a", vec![Ref::Committed(0)]));
+        let actions = if segment_after_rewrite {
+            rewrite.into_iter().chain([build]).collect()
+        } else {
+            [build].into_iter().chain(rewrite).collect()
+        };
+
+        let (_, indices) = apply_with_indices(&backed_manifest(), actions, Vec::new()).unwrap();
+
+        assert_eq!(indices[0].fragment_bitmap, expected_bitmap);
     }
 
     #[test]
