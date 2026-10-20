@@ -6,7 +6,7 @@
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Footprint, Ref};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -82,7 +82,7 @@ impl TombstoneFieldData {
     }
 }
 
-impl From<&TombstoneFieldData> for pb_transaction::TombstoneFieldData {
+impl From<&TombstoneFieldData> for pb_actions::TombstoneFieldData {
     fn from(value: &TombstoneFieldData) -> Self {
         Self {
             fragment: Some(value.fragment.into()),
@@ -92,10 +92,10 @@ impl From<&TombstoneFieldData> for pb_transaction::TombstoneFieldData {
     }
 }
 
-impl TryFrom<pb_transaction::TombstoneFieldData> for TombstoneFieldData {
+impl TryFrom<pb_actions::TombstoneFieldData> for TombstoneFieldData {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::TombstoneFieldData) -> Result<Self> {
+    fn try_from(message: pb_actions::TombstoneFieldData) -> Result<Self> {
         Ok(Self {
             fragment: required(message.fragment, "TombstoneFieldData.fragment")?.try_into()?,
             field_ids: message

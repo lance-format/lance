@@ -329,7 +329,6 @@ mod tests {
         let alter = Action::AlterField(AlterField {
             field: Ref::Committed(1),
             name: Some("renamed".into()),
-            logical_type: None,
             nullable: None,
         });
         assert!(!alter.is_data_change(), "a rename changes no row values");

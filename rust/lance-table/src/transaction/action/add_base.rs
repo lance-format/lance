@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::required;
 use super::{Coordinate, Footprint};
-use crate::format::{BasePath, pb, pb_transaction};
+use crate::format::{BasePath, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -66,7 +66,7 @@ impl AddBase {
     }
 }
 
-impl From<&AddBase> for pb_transaction::AddBase {
+impl From<&AddBase> for pb_actions::AddBase {
     fn from(value: &AddBase) -> Self {
         Self {
             local: value.local,
@@ -75,10 +75,10 @@ impl From<&AddBase> for pb_transaction::AddBase {
     }
 }
 
-impl TryFrom<pb_transaction::AddBase> for AddBase {
+impl TryFrom<pb_actions::AddBase> for AddBase {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::AddBase) -> Result<Self> {
+    fn try_from(message: pb_actions::AddBase) -> Result<Self> {
         Ok(Self {
             local: message.local,
             base: BasePath::from(required(message.base, "AddBase.base")?),

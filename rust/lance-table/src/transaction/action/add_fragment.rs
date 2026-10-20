@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Coordinate, Footprint, Ref};
-use crate::format::{Fragment, RowIdMeta, pb, pb_transaction};
+use crate::format::{Fragment, RowIdMeta, pb, pb_actions};
 use crate::rowids::version::RowDatasetVersionMeta;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
@@ -87,16 +87,16 @@ impl AddFragment {
     }
 }
 
-impl From<&AddFragment> for pb_transaction::AddFragment {
+impl From<&AddFragment> for pb_actions::AddFragment {
     fn from(value: &AddFragment) -> Self {
         Self {
             id: Some(value.id.into()),
             physical_rows: value.physical_rows,
             row_id_sequence: value.row_id_meta.as_ref().map(|meta| match meta {
                 RowIdMeta::Inline(data) => {
-                    pb_transaction::add_fragment::RowIdSequence::InlineRowIds(data.to_vec())
+                    pb_actions::add_fragment::RowIdSequence::InlineRowIds(data.to_vec())
                 }
-                RowIdMeta::Column => pb_transaction::add_fragment::RowIdSequence::ColumnRowIds(
+                RowIdMeta::Column => pb_actions::add_fragment::RowIdSequence::ColumnRowIds(
                     pb::RowLineageColumn {},
                 ),
             }),
@@ -105,12 +105,12 @@ impl From<&AddFragment> for pb_transaction::AddFragment {
                 .as_ref()
                 .map(|meta| match meta {
                     RowDatasetVersionMeta::Inline(data) => {
-                        pb_transaction::add_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
+                        pb_actions::add_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
                             data.to_vec(),
                         )
                     }
                     RowDatasetVersionMeta::Column => {
-                        pb_transaction::add_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
+                        pb_actions::add_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
                             pb::RowLineageColumn {},
                         )
                     }
@@ -120,12 +120,12 @@ impl From<&AddFragment> for pb_transaction::AddFragment {
                 .as_ref()
                 .map(|meta| match meta {
                     RowDatasetVersionMeta::Inline(data) => {
-                        pb_transaction::add_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(
+                        pb_actions::add_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(
                             data.to_vec(),
                         )
                     }
                     RowDatasetVersionMeta::Column => {
-                        pb_transaction::add_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(
+                        pb_actions::add_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(
                             pb::RowLineageColumn {},
                         )
                     }
@@ -135,26 +135,26 @@ impl From<&AddFragment> for pb_transaction::AddFragment {
     }
 }
 
-impl TryFrom<pb_transaction::AddFragment> for AddFragment {
+impl TryFrom<pb_actions::AddFragment> for AddFragment {
     type Error = lance_core::Error;
 
-    fn try_from(message: pb_transaction::AddFragment) -> Result<Self> {
+    fn try_from(message: pb_actions::AddFragment) -> Result<Self> {
         Ok(Self {
             id: required(message.id, "AddFragment.id")?.try_into()?,
             physical_rows: message.physical_rows,
             row_id_meta: message.row_id_sequence.map(|sequence| match sequence {
-                pb_transaction::add_fragment::RowIdSequence::InlineRowIds(data) => {
+                pb_actions::add_fragment::RowIdSequence::InlineRowIds(data) => {
                     RowIdMeta::Inline(data.into())
                 }
-                pb_transaction::add_fragment::RowIdSequence::ColumnRowIds(_) => RowIdMeta::Column,
+                pb_actions::add_fragment::RowIdSequence::ColumnRowIds(_) => RowIdMeta::Column,
             }),
             last_updated_at_version_meta: message.last_updated_at_version_sequence.map(
                 |sequence| {
                     match sequence {
-                    pb_transaction::add_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
+                    pb_actions::add_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
                         data,
                     ) => RowDatasetVersionMeta::Inline(data.into()),
-                    pb_transaction::add_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
+                    pb_actions::add_fragment::LastUpdatedAtVersionSequence::ColumnLastUpdatedAtVersions(
                         _,
                     ) => RowDatasetVersionMeta::Column,
                 }
@@ -162,10 +162,10 @@ impl TryFrom<pb_transaction::AddFragment> for AddFragment {
             ),
             created_at_version_meta: message.created_at_version_sequence.map(|sequence| {
                 match sequence {
-                    pb_transaction::add_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
+                    pb_actions::add_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
                         RowDatasetVersionMeta::Inline(data.into())
                     }
-                    pb_transaction::add_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(_) => {
+                    pb_actions::add_fragment::CreatedAtVersionSequence::ColumnCreatedAtVersions(_) => {
                         RowDatasetVersionMeta::Column
                     }
                 }

@@ -13,7 +13,7 @@
 //! must abort the commit rather than be treated as a no-op.
 
 use super::{Action, CompositeOperation, Ref, UserStep};
-use crate::format::pb_transaction;
+use crate::format::pb_actions;
 use lance_core::{Error, Result};
 
 /// `data_change` is absent-means-true on the wire, so only the `false` case is
@@ -30,23 +30,23 @@ pub(super) fn required<T>(value: Option<T>, what: &str) -> Result<T> {
     value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
 }
 
-impl From<Ref> for pb_transaction::Ref {
+impl From<Ref> for pb_actions::Ref {
     fn from(value: Ref) -> Self {
         let kind = match value {
-            Ref::Committed(id) => pb_transaction::r#ref::Kind::Committed(id),
-            Ref::Local(token) => pb_transaction::r#ref::Kind::Local(token),
+            Ref::Committed(id) => pb_actions::r#ref::Kind::Committed(id),
+            Ref::Local(token) => pb_actions::r#ref::Kind::Local(token),
         };
         Self { kind: Some(kind) }
     }
 }
 
-impl TryFrom<pb_transaction::Ref> for Ref {
+impl TryFrom<pb_actions::Ref> for Ref {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::Ref) -> Result<Self> {
+    fn try_from(message: pb_actions::Ref) -> Result<Self> {
         match message.kind {
-            Some(pb_transaction::r#ref::Kind::Committed(id)) => Ok(Self::Committed(id)),
-            Some(pb_transaction::r#ref::Kind::Local(token)) => Ok(Self::Local(token)),
+            Some(pb_actions::r#ref::Kind::Committed(id)) => Ok(Self::Committed(id)),
+            Some(pb_actions::r#ref::Kind::Local(token)) => Ok(Self::Local(token)),
             None => Err(Error::invalid_input(
                 "a Ref in an action was empty; it must be either committed or local",
             )),
@@ -54,25 +54,25 @@ impl TryFrom<pb_transaction::Ref> for Ref {
     }
 }
 
-impl From<&CompositeOperation> for pb_transaction::CompositeOperation {
+impl From<&CompositeOperation> for pb_actions::CompositeOperation {
     fn from(value: &CompositeOperation) -> Self {
         Self {
-            actions: value
+            steps: value
                 .actions
                 .iter()
-                .map(pb_transaction::UserStep::from)
+                .map(pb_actions::UserStep::from)
                 .collect(),
         }
     }
 }
 
-impl TryFrom<pb_transaction::CompositeOperation> for CompositeOperation {
+impl TryFrom<pb_actions::CompositeOperation> for CompositeOperation {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::CompositeOperation) -> Result<Self> {
+    fn try_from(message: pb_actions::CompositeOperation) -> Result<Self> {
         Ok(Self {
             actions: message
-                .actions
+                .steps
                 .into_iter()
                 .map(UserStep::try_from)
                 .collect::<Result<Vec<_>>>()?,
@@ -80,23 +80,19 @@ impl TryFrom<pb_transaction::CompositeOperation> for CompositeOperation {
     }
 }
 
-impl From<&UserStep> for pb_transaction::UserStep {
+impl From<&UserStep> for pb_actions::UserStep {
     fn from(value: &UserStep) -> Self {
         Self {
             description: value.description.clone(),
-            actions: value
-                .actions
-                .iter()
-                .map(pb_transaction::Action::from)
-                .collect(),
+            actions: value.actions.iter().map(pb_actions::Action::from).collect(),
         }
     }
 }
 
-impl TryFrom<pb_transaction::UserStep> for UserStep {
+impl TryFrom<pb_actions::UserStep> for UserStep {
     type Error = Error;
 
-    fn try_from(message: pb_transaction::UserStep) -> Result<Self> {
+    fn try_from(message: pb_actions::UserStep) -> Result<Self> {
         Ok(Self {
             description: message.description,
             actions: message
@@ -110,10 +106,10 @@ impl TryFrom<pb_transaction::UserStep> for UserStep {
 
 macro_rules! define_action_proto {
     ($($variant:ident,)*) => {
-        impl From<&Action> for pb_transaction::Action {
+        impl From<&Action> for pb_actions::Action {
             fn from(value: &Action) -> Self {
                 let action = match value {
-                    $(Action::$variant(action) => pb_transaction::action::Action::$variant(action.into()),)*
+                    $(Action::$variant(action) => pb_actions::action::Action::$variant(action.into()),)*
                 };
                 Self {
                     action: Some(action),
@@ -121,12 +117,12 @@ macro_rules! define_action_proto {
             }
         }
 
-        impl TryFrom<pb_transaction::Action> for Action {
+        impl TryFrom<pb_actions::Action> for Action {
             type Error = Error;
 
-            fn try_from(message: pb_transaction::Action) -> Result<Self> {
+            fn try_from(message: pb_actions::Action) -> Result<Self> {
                 match message.action {
-                    $(Some(pb_transaction::action::Action::$variant(action)) => {
+                    $(Some(pb_actions::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
                     // The specified vocabulary is larger than what is implemented.
@@ -217,7 +213,6 @@ mod tests {
             Action::AlterField(AlterField {
                 field: Ref::Committed(2),
                 name: Some("renamed".into()),
-                logical_type: Some("int64".into()),
                 nullable: Some(false),
             }),
             Action::DropField(DropField {
@@ -254,7 +249,7 @@ mod tests {
             UserStep::new("nothing", vec![]),
         ]);
 
-        let message = pb_transaction::CompositeOperation::from(&operation);
+        let message = pb_actions::CompositeOperation::from(&operation);
         let round_tripped = CompositeOperation::try_from(message).unwrap();
 
         assert_eq!(round_tripped, operation);
@@ -264,7 +259,7 @@ mod tests {
     fn test_data_change_is_absent_when_true() {
         // Absent means "real change" on the wire, so the common case costs no
         // bytes and an old field-less writer is read correctly.
-        let message = pb_transaction::RemoveFragment::from(&RemoveFragment {
+        let message = pb_actions::RemoveFragment::from(&RemoveFragment {
             fragment: Ref::Committed(1),
             data_change: true,
         });
@@ -274,9 +269,9 @@ mod tests {
 
     #[test]
     fn test_unimplemented_action_is_rejected() {
-        let message = pb_transaction::Action {
-            action: Some(pb_transaction::action::Action::RefreshRowVersionMetadata(
-                pb_transaction::RefreshRowVersionMetadata {
+        let message = pb_actions::Action {
+            action: Some(pb_actions::action::Action::RefreshRowVersionMetadata(
+                pb_actions::RefreshRowVersionMetadata {
                     fragment_ids: vec![1],
                 },
             )),
@@ -294,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_empty_action_is_rejected() {
-        let error = Action::try_from(pb_transaction::Action { action: None }).unwrap_err();
+        let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
         assert!(
             error.to_string().contains("was empty"),
             "unexpected message: {error}"
@@ -303,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_empty_ref_is_rejected() {
-        let error = Ref::try_from(pb_transaction::Ref { kind: None }).unwrap_err();
+        let error = Ref::try_from(pb_actions::Ref { kind: None }).unwrap_err();
         assert!(
             error.to_string().contains("committed or local"),
             "unexpected message: {error}"
