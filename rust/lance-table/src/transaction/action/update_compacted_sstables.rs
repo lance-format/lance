@@ -245,4 +245,26 @@ mod tests {
         assert!(progress.conflicts_with(&rebuild));
         assert!(rebuild.conflicts_with(&progress));
     }
+
+    #[test]
+    fn test_recording_progress_does_not_conflict_with_an_ordinary_index() {
+        let progress = footprint(vec![update(vec![(1, 3)])]);
+        let segment = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
+            uuid: Uuid::from_u128(21),
+            name: "by_a".into(),
+            fields: vec![Ref::Committed(0)],
+            covering_fields: Vec::new(),
+            index_details: None,
+            index_version: 1,
+            covered_fragments: Some(vec![Ref::Committed(0)]),
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        })]);
+
+        assert!(!progress.conflicts_with(&segment));
+        assert!(!segment.conflicts_with(&progress));
+    }
 }

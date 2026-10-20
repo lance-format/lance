@@ -192,17 +192,21 @@ impl TryFrom<pb_actions::AddOverlays> for AddOverlays {
 mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
-    use crate::format::{DataFile, Manifest, RowIdMeta};
-    use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
+    use crate::format::{DataFile, Manifest, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowIdMeta};
+    use crate::rowids::version::{
+        LoadedRowLineage, RowDatasetVersionMeta, RowDatasetVersionSequence, SpilledRowLineage,
+        refresh_row_latest_update_meta_for_full_frag_rewrite_cols,
+    };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, AddIndexSegment, AlterField, DropField, RemoveFragment,
-        SetDeletionFile, TombstoneFieldData,
+        Action, AddField, AddFragment, AddIndexSegment, AlterField, CompositeOperation, DropField,
+        RemoveFragment, SetDeletionFile, TombstoneFieldData, UserStep,
     };
-    use crate::transaction::test_support::make_stable_row_id_manifest;
+    use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
+    use crate::transaction::{Operation, Transaction};
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use std::sync::Arc;
@@ -490,6 +494,139 @@ mod tests {
             versions.versions().collect::<Vec<_>>(),
             vec![expected, 1, 1]
         );
+    }
+
+    #[test]
+    fn test_an_overlay_leaves_lineage_alone_without_stable_row_ids() {
+        let out = apply(
+            &backed_manifest(),
+            vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])],
+        )
+        .unwrap();
+
+        assert_eq!(out.fragments[0].last_updated_at_version_meta, None);
+    }
+
+    /// A fragment this operation mints takes its lineage from the
+    /// `AddFragment` that minted it, which may carry versions from before this
+    /// commit -- an update's rewritten rows do. An overlay in the same
+    /// operation leaves that alone.
+    #[test]
+    fn test_an_overlay_keeps_the_lineage_a_minted_fragment_was_given() {
+        let minted_with =
+            RowDatasetVersionMeta::from_sequence(&RowDatasetVersionSequence::from_versions(&[
+                2, 2, 2,
+            ]))
+            .unwrap();
+        let Action::AddFragment(mut minted) = mint(3) else {
+            unreachable!()
+        };
+        minted.last_updated_at_version_meta = Some(minted_with.clone());
+        minted.created_at_version_meta = Some(minted_with.clone());
+
+        let out = apply(
+            &stable_row_id_manifest(true),
+            vec![
+                Action::AddFragment(minted),
+                add(Ref::Local(0), vec![overlay("a.lance", &[0])]),
+            ],
+        )
+        .unwrap();
+
+        let minted = out.fragments.iter().find(|f| f.id != 0).unwrap();
+        assert_eq!(minted.last_updated_at_version_meta, Some(minted_with));
+    }
+
+    /// A fragment whose last-updated versions are spilled to a data file has
+    /// them read ahead of the commit; the restamp keeps the loaded versions of
+    /// the rows it does not cover. Without them it refuses rather than
+    /// guessing.
+    #[rstest::rstest]
+    #[case::loaded(true)]
+    #[case::not_loaded(false)]
+    fn test_an_overlay_restamps_lineage_spilled_out_of_the_manifest(#[case] is_loaded: bool) {
+        let mut manifest = stable_row_id_manifest(false);
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column);
+        fragment.files.push(DataFile::new(
+            "lineage.lance",
+            vec![ROW_LAST_UPDATED_AT_VERSION_FIELD_ID],
+            vec![1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
+        manifest.fragments = Arc::new(vec![fragment]);
+        let expected = manifest.version + 1;
+        let mut config = default_build_config();
+        if is_loaded {
+            let loaded = LoadedRowLineage {
+                last_updated_at: Some(Arc::new(RowDatasetVersionSequence::from_versions(&[
+                    2, 3, 4,
+                ]))),
+                ..Default::default()
+            };
+            config.spilled_row_lineage = Arc::new(SpilledRowLineage::from([(0, loaded)]));
+        }
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step",
+                vec![add(Ref::Committed(0), vec![overlay("new.lance", &[0])])],
+            )])),
+            None,
+        );
+
+        let result = transaction.build_manifest(Some(&manifest), Vec::new(), "tx.txn", &config);
+
+        if is_loaded {
+            let (out, _) = result.unwrap();
+            let versions = out.fragments[0]
+                .last_updated_at_version_meta
+                .as_ref()
+                .unwrap()
+                .load_sequence()
+                .unwrap();
+            assert_eq!(
+                versions.versions().collect::<Vec<_>>(),
+                vec![expected, 3, 4]
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("not loaded ahead of the commit"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A negative id marks a tombstoned column in the overlay's file. It holds
+    /// nothing a reader sees, so it claims nothing: only the live column
+    /// collides with a rewrite.
+    #[test]
+    fn test_a_tombstoned_column_in_an_overlay_claims_nothing() {
+        let mut partly_tombstoned = overlay("a.lance", &[0]);
+        partly_tombstoned.data_file.fields = vec![-1, 1].into();
+        partly_tombstoned.data_file.column_indices = vec![0, 1].into();
+        let overlaid = footprint(vec![add(Ref::Committed(0), vec![partly_tombstoned])]);
+        let rewrite = |field: u64| {
+            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![Ref::Committed(field)],
+                data_change: true,
+            })])
+        };
+        let drop_field_zero = footprint(vec![Action::DropField(DropField {
+            field: Ref::Committed(0),
+        })]);
+
+        assert!(overlaid.conflicts_with(&rewrite(1)));
+        assert!(rewrite(1).conflicts_with(&overlaid));
+        for other in [rewrite(0), drop_field_zero] {
+            assert!(!overlaid.conflicts_with(&other));
+            assert!(!other.conflicts_with(&overlaid));
+        }
     }
 
     /// An overlay covering a row past the end of its fragment supplies values
