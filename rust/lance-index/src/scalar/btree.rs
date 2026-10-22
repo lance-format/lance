@@ -51,16 +51,16 @@ use arrow_array::{
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::{
-    ExecutionPlan, SendableRecordBatchStream,
-    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec,
-};
 use datafusion_common::hash_utils::{RandomState, with_hashes};
 use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
+};
+use datafusion_physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream,
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec,
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use hashbrown::{HashTable, hash_table::Entry};
@@ -77,7 +77,7 @@ use lance_core::{
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
 };
-use lance_datafusion::{
+use lance_datafusion_exec::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
@@ -4140,19 +4140,19 @@ mod tests {
         new_empty_array, new_null_array, record_batch,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::{
-        execution::{SendableRecordBatchStream, TaskContext},
-        physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
-    };
     use datafusion_common::{DataFusionError, ScalarValue};
+    use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
+    use datafusion_physical_plan::{
+        ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter,
+    };
     use futures::TryStreamExt;
     use futures::stream;
     use lance_core::cache::LanceCache;
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
+    use lance_datafusion_exec::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use lance_select::{RowAddrTreeMap, RowSetOps};

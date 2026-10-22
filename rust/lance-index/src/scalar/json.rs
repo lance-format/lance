@@ -11,24 +11,22 @@ use std::{
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::{
-    execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
-};
 use datafusion_common::{DataFusionError, ScalarValue, config::ConfigOptions};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
+use datafusion_physical_plan::{
+    ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec,
+    stream::RecordBatchStreamAdapter,
+};
 use futures::{StreamExt, stream::BoxStream};
 use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
-use lance_datafusion::exec::{
-    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
-};
-use lance_datafusion::udf::json::JsonbType;
+use lance_datafusion_exec::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
+use lance_datafusion_exec::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -606,7 +604,7 @@ impl JsonIndexPlugin {
             Vec::with_capacity(input_schema.fields().len());
         exprs.push((
             Arc::new(ScalarFunctionExpr::try_new(
-                Arc::new(lance_datafusion::udf::json::json_extract_with_type_udf()),
+                Arc::new(lance_datafusion_exec::udf::json::json_extract_with_type_udf()),
                 vec![
                     Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
                     Arc::new(Literal::new(ScalarValue::Utf8(Some(path)))),
@@ -626,8 +624,9 @@ impl JsonIndexPlugin {
         }
 
         let project = ProjectionExec::try_new(exprs, input)?;
-        let ctx = get_session_context(&LanceExecutionOptions::default());
-        project.execute(0, ctx.task_ctx()).map_err(Into::into)
+        project
+            .execute(0, Arc::new(TaskContext::default()))
+            .map_err(Into::into)
     }
 
     fn infer_type_from_batch(batch: &RecordBatch, path: &str) -> Result<Option<DataType>> {
@@ -1232,7 +1231,6 @@ mod tests {
     use crate::scalar::{SargableQuery, TextQuery};
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, record_batch};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
@@ -1465,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn test_json_extract_with_type_info() {
         use arrow_array::{LargeBinaryArray, UInt64Array};
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
         use futures::stream;
 
         // Create test JSONB data

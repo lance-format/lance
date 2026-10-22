@@ -73,8 +73,8 @@ use lance_index::IndexCriteria;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
+use lance_index::scalar::expression::create_filter_plan;
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator,
     PhraseQuery, fill_fts_query_column,
@@ -3511,7 +3511,9 @@ impl Scanner {
 
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
-            let expr = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
+            let expr = planner.optimize_expr(
+                filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?,
+            )?;
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
@@ -3520,8 +3522,7 @@ impl Scanner {
                 }
                 None => self.dataset.scalar_index_info().await?,
             };
-            let filter_plan =
-                planner.create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
+            let filter_plan = create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
 
             // This tests if any of the fragments are missing the physical_rows property (old style)
             // If they are then we cannot use scalar indices
@@ -3541,8 +3542,7 @@ impl Scanner {
                 if has_missing_row_count {
                     // We need row counts to use scalar indices.  If we don't have them then
                     // fallback to a non-indexed filter
-                    let filter_plan =
-                        planner.create_filter_plan(expr.clone(), &index_info, false)?;
+                    let filter_plan = create_filter_plan(expr.clone(), &index_info, false)?;
                     FilterPlan::new(query_filter.clone(), filter_plan)
                 } else {
                     FilterPlan::new(query_filter.clone(), filter_plan)

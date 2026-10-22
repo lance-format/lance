@@ -35,8 +35,8 @@ use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
 use arrow_schema::{DataType, Field};
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
+use datafusion_execution::SendableRecordBatchStream;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::{collections::HashMap, sync::Arc};
 
@@ -2584,16 +2584,16 @@ mod tests {
         Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{
         ROW_ADDR,
         cache::{LanceCache, WeakLanceCache},
     };
-    use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion_exec::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;

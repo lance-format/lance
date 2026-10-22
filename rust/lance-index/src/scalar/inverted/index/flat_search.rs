@@ -1025,7 +1025,7 @@ pub async fn flat_bm25_search_stream_with_metrics(
 ///
 /// ```no_run
 /// # async fn example(
-/// #     input: datafusion::execution::SendableRecordBatchStream,
+/// #     input: datafusion_execution::SendableRecordBatchStream,
 /// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// use lance_index::scalar::inverted::{
 ///     flat_bm25_search_stream_with_metrics_and_operator, query::Operator, InvertedIndexParams,

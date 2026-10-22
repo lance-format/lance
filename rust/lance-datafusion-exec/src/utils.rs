@@ -8,17 +8,15 @@ use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use async_trait::async_trait;
 use background_iterator::BackgroundIterator;
-use datafusion::{
-    execution::RecordBatchStream,
-    physical_plan::{
-        SendableRecordBatchStream,
-        metrics::{
-            Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet, Time,
-        },
-        stream::RecordBatchStreamAdapter,
-    },
-};
 use datafusion_common::DataFusionError;
+use datafusion_execution::RecordBatchStream;
+use datafusion_physical_plan::{
+    SendableRecordBatchStream,
+    metrics::{
+        Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet, Time,
+    },
+    stream::RecordBatchStreamAdapter,
+};
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::Result;
 use lance_core::datatypes::Schema;
