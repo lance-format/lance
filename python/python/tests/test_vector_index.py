@@ -20,7 +20,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance import LanceDataset, LanceFragment
+from lance import LanceDataset
 from lance.dataset import VectorIndexReader, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
@@ -626,10 +626,11 @@ def test_batch_vector_search_rejects_dataset_query_index_column(tmp_path):
         )
 
 
-def test_flat_1d_query_length_multiple_of_dim_is_rejected(dataset):
+@pytest.mark.parametrize("has_fragments", [False, True])
+def test_flat_1d_query_length_multiple_of_dim_is_rejected(dataset, has_fragments):
     q = np.random.randn(256).astype(np.float32)
     with pytest.raises(ValueError, match=r"256.*128"):
-        dataset.to_table(
+        dataset.scanner(
             columns=["id"],
             nearest={
                 "column": "vector",
@@ -637,7 +638,8 @@ def test_flat_1d_query_length_multiple_of_dim_is_rejected(dataset):
                 "k": 5,
                 "use_index": False,
             },
-        )
+            fragments=dataset.get_fragments() if has_fragments else None,
+        ).to_table()
 
 
 def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset):
@@ -1908,6 +1910,97 @@ def test_multivec_search_paths(tmp_path: Path):
         np.testing.assert_allclose(result["_distance"].to_numpy(), [0.0, 0.0, 1.0, 2.0])
 
 
+@pytest.mark.parametrize(
+    "mode",
+    ["mixed", "fast", "flat", "postfilter", "prefilter", "nullable", "optimized"],
+)
+def test_multivec_fragment_search_paths(tmp_path, mode):
+    query = np.eye(2, dtype=np.float32)
+    rows = [
+        [[np.cos(angle), np.sin(angle)], [-np.sin(angle), np.cos(angle)]]
+        for angle in np.arange(8) * 0.1
+    ]
+    if mode == "nullable":
+        rows[3], rows[4], rows[7] = None, [], None
+    table = pa.table(
+        {
+            "id": pa.array(range(8), type=pa.int32()),
+            "vector": pa.array(rows, type=pa.list_(pa.list_(pa.float32(), 2))),
+        }
+    )
+    dataset = lance.write_dataset(
+        table.slice(0, 6), tmp_path / "multivec_fragments", max_rows_per_file=2
+    )
+    segments = _build_segments(
+        dataset,
+        "vector",
+        "IVF_FLAT",
+        [[0, 1], [2]],
+        metric="cosine",
+        num_partitions=1,
+        ivf_centroids=np.array([[1, 0]], dtype=np.float32),
+    )
+    dataset = dataset.commit_existing_index_segments("vector_idx", "vector", segments)
+    dataset = lance.write_dataset(table.slice(6), dataset.uri, mode="append")
+    segment_ids = [str(segments[0].uuid)]
+    if mode == "optimized":
+        dataset.optimize.optimize_indices()
+        segment_ids = [
+            str(segment.uuid)
+            for index in dataset.describe_indices()
+            for segment in index.segments
+        ]
+    options = dict(
+        columns=["id"],
+        fragments=dataset.get_fragments()[1:],
+        index_segments=segment_ids,
+        fast_search=mode == "fast",
+        prefilter=mode == "prefilter",
+    )
+    if mode in ("postfilter", "prefilter"):
+        options["filter"] = "id % 2 = 1"
+    # All sub-vectors fit in the candidate budget, so IVF_FLAT must be exact.
+    scanner = dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 80,
+            "nprobes": 1,
+            "metric": "cosine",
+            "use_index": mode != "flat",
+        },
+        **options,
+    )
+    plan = scanner.explain_plan()
+    assert ("MultivectorScoring" in plan) == (mode != "flat"), plan
+    assert ("UnionExec" in plan) == (mode not in ("fast", "flat", "optimized")), plan
+    source = dataset.scanner(
+        columns=["id", "vector"], fragments=dataset.get_fragments()[1:]
+    ).to_table()
+    expected = []
+    for row in source.to_pylist():
+        if not row["vector"] or (mode == "fast" and row["id"] >= 4):
+            continue
+        vectors = np.asarray(row["vector"], dtype=np.float64)
+        similarities = query @ (vectors / np.linalg.norm(vectors, axis=1)[:, None]).T
+        distance = np.sum(np.min(1 - similarities, axis=1))
+        if mode not in ("postfilter", "prefilter") or row["id"] % 2 == 1:
+            expected.append((row["id"], distance))
+    expected.sort(key=lambda row: row[1])
+    result = scanner.to_table()
+    assert "query_index" not in result.column_names
+    actual_ids = result["id"].to_pylist()
+    assert actual_ids == [row[0] for row in expected], plan
+    assert len(set(actual_ids)) == len(actual_ids)
+    assert len(set(actual_ids) & {row[0] for row in expected}) / len(expected) == 1.0
+    np.testing.assert_allclose(
+        result["_distance"].to_numpy(),
+        [row[1] for row in expected],
+        atol=1e-5,
+        rtol=1e-6,
+    )
+
+
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
     dataset_with_index = dataset.create_index(
@@ -2556,66 +2649,554 @@ def test_index_cast_centroids(tmp_path):
     )
 
 
-def test_fragment_scan_disallowed_on_ann(dataset):
-    q = np.random.randn(128)
-    with pytest.raises(
-        ValueError, match="This operation is not supported for fragment scan"
-    ):
-        scanner = dataset.scanner(
-            columns=["id"],
-            nearest={
-                "column": "vector",
-                "q": q,
-            },
-            fragments=[LanceFragment(dataset, 0)],
+@pytest.fixture
+def fragment_vector_dataset(tmp_path):
+    # F0 is closest but excluded from fragment searches. F1/F2/F3 interleave,
+    # forcing even a small mixed top-k to include ANN and flat candidates.
+    vectors = np.zeros((64, 4), dtype=np.float32)
+    vectors[:16, 0] = 1 + np.arange(16)
+    for fragment_id in range(1, 4):
+        vectors[16 * fragment_id : 16 * (fragment_id + 1), 0] = (
+            100 + 3 * np.arange(16) + fragment_id - 1
         )
-        scanner.explain_plan(True)
+    table = pa.table(
+        {
+            "id": pa.array(np.arange(64), type=pa.int32()),
+            "vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 4),
+        }
+    )
+    dataset = lance.write_dataset(
+        table.slice(0, 48),
+        tmp_path / "fragment_vectors",
+        max_rows_per_file=16,
+        data_storage_version="stable",
+        enable_stable_row_ids=False,
+    )
+    segments = _build_segments(
+        dataset,
+        "vector",
+        "IVF_FLAT",
+        [[0, 1], [2]],
+        metric="l2",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+    )
+    dataset = dataset.commit_existing_index_segments("vector_idx", "vector", segments)
+    dataset = lance.write_dataset(table.slice(48), dataset.uri, mode="append")
+    assert [f.fragment_id for f in dataset.get_fragments()] == [0, 1, 2, 3]
+    assert [f.count_rows() for f in dataset.get_fragments()] == [16] * 4
+    indices = dataset.describe_indices()
+    assert len(indices) == 1
+    assert indices[0].index_type == "IVF_FLAT"
+    assert len(indices[0].segments) == 2
+    actual = {
+        str(segment.uuid): segment.fragment_ids for segment in indices[0].segments
+    }
+    segment_ids = [str(segment.uuid) for segment in segments]
+    assert actual == {segment_ids[0]: {0, 1}, segment_ids[1]: {2}}
+    return dataset, segment_ids
 
 
-def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
-    q = np.random.randn(128)
+def _assert_fragment_vector_result(
+    dataset,
+    scanner,
+    fragment_ids,
+    k,
+    *,
+    filter=None,
+    prefilter=False,
+    ann_segments=0,
+    flat=False,
+    query=None,
+    distance_range=None,
+):
+    # Scan stored vectors independently of nearest and index coverage selection.
+    source = dataset.scanner(
+        columns=["id", "vector"],
+        fragments=[dataset.get_fragment(i) for i in fragment_ids],
+    ).to_table()
+    source = source.filter(pc.is_valid(source["vector"]))
+    ids = source["id"].to_numpy()
+    vectors = np.asarray(source["vector"].to_pylist(), dtype=np.float64).reshape(-1, 4)
+    query = (
+        np.zeros(4, dtype=np.float64)
+        if query is None
+        else np.asarray(query, dtype=np.float64)
+    )
+    distances = np.sum((vectors - query) ** 2, axis=1)
+    order = np.argsort(distances)
+    assert np.all(np.diff(distances[order]) > 0)
+    if distance_range is not None:
+        lower, upper = distance_range
+        if lower is not None:
+            order = order[distances[order] >= lower]
+        if upper is not None:
+            order = order[distances[order] < upper]
+    if filter is not None:
+        matching_ids = dataset.scanner(
+            columns=["id"], filter=filter, use_scalar_index=False
+        ).to_table()["id"]
+        matches = np.isin(ids, matching_ids.to_numpy())
+        if prefilter:
+            order = order[matches[order]]
+    order = order[:k]
+    if filter is not None and not prefilter:
+        order = order[matches[order]]
+    expected_ids = ids[order].tolist()
+
+    plan = scanner.explain_plan()
+    result = scanner.to_table()
+    assert result.column_names == ["id", "_distance"]
+    assert all(column.null_count == 0 for column in result.columns)
+    actual_ids = result["id"].to_pylist()
+    assert len(set(actual_ids)) == len(actual_ids), plan
+    if expected_ids:
+        recall = len(set(actual_ids) & set(expected_ids)) / len(expected_ids)
+        assert recall == 1.0, plan
+    assert actual_ids == expected_ids, plan
+    np.testing.assert_allclose(
+        result["_distance"].to_numpy(), distances[order], atol=1e-5, rtol=1e-6
+    )
+    if ann_segments:
+        assert (
+            f"ANNSubIndex: name=vector_idx, k={k}, deltas={ann_segments}, metric=L2"
+            in plan
+        ), plan
+    else:
+        assert "ANNSubIndex" not in plan, plan
+    # An empty fragment scan may retain a distance node over zero input fragments.
+    if fragment_ids:
+        assert ("KNNVectorDistance" in plan) == flat, plan
+    assert ("UnionExec" in plan) == (bool(ann_segments) and flat), plan
+    return actual_ids
+
+
+@pytest.mark.parametrize(
+    "distance_range,fast_search,use_index,filter",
+    [
+        pytest.param((10404.0, None), False, True, None, id="lower-inclusive"),
+        pytest.param((None, 10816.0), False, True, None, id="upper-exclusive"),
+        pytest.param((10000.0, 10816.0), False, True, None, id="both"),
+        pytest.param((1.0, 4.0), False, True, None, id="empty"),
+        pytest.param((10000.0, 12100.0), True, True, None, id="fast"),
+        pytest.param((10000.0, 10816.0), False, False, None, id="flat"),
+        pytest.param((10000.0, 12100.0), False, True, "id % 2 = 1", id="postfilter"),
+    ],
+)
+def test_fragment_scan_distance_range(
+    fragment_vector_dataset, distance_range, fast_search, use_index, filter
+):
+    dataset, segments = fragment_vector_dataset
     scanner = dataset.scanner(
-        prefilter=True,
-        filter="id>0",
         columns=["id"],
         nearest={
             "column": "vector",
-            "q": q,
+            "q": np.zeros(4),
+            "k": 5,
+            "nprobes": 1,
+            "use_index": use_index,
+            "distance_range": distance_range,
         },
-        fragments=[LanceFragment(dataset, 0)],
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[segments[0]],
+        prefilter=False,
+        fast_search=fast_search,
+        filter=filter,
     )
-    scanner.explain_plan(True)
+    _assert_fragment_vector_result(
+        dataset,
+        scanner,
+        [1] if fast_search else [1, 2, 3],
+        5,
+        filter=filter,
+        distance_range=distance_range,
+        ann_segments=int(use_index),
+        flat=not fast_search,
+    )
 
 
-def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
-    tbl = create_table()
-    dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_file=250)
-    dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+@pytest.mark.parametrize(
+    "prefilter,fast_search,distance_range",
+    [
+        pytest.param(False, False, None, id="mixed-postfilter"),
+        pytest.param(True, False, None, id="mixed-prefilter"),
+        pytest.param(False, True, None, id="fast-postfilter"),
+        pytest.param(False, False, (1.0, 12100.0), id="distance-range"),
+    ],
+)
+def test_fragment_scan_batch_postfilter(
+    fragment_vector_dataset, prefilter, fast_search, distance_range
+):
+    dataset, segments = fragment_vector_dataset
+    queries = np.array([[0, 0, 0, 0], [139.25, 0, 0, 0]], dtype=np.float32)
+    nearest = {"column": "vector", "k": 5, "nprobes": 1}
+    if distance_range is not None:
+        nearest["distance_range"] = distance_range
+    options = dict(
+        columns=["id"],
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[segments[0]],
+        filter="id % 2 = 1",
+        prefilter=prefilter,
+        fast_search=fast_search,
     )
+    scanner = dataset.scanner(nearest={**nearest, "q": queries}, **options)
+    plan = scanner.explain_plan()
+    assert ("ANNIvfBatch" in plan) == fast_search, plan
+    batch = scanner.to_table()
+    assert batch.schema.field(0) == pa.field("query_index", pa.int32(), nullable=False)
+    assert batch["query_index"].null_count == 0
+    assert batch["query_index"].to_pylist() == sorted(batch["query_index"].to_pylist())
+    assert set(batch["query_index"].to_pylist()) <= {0, 1}
+    for i, query in enumerate(queries):
+        single = dataset.scanner(nearest={**nearest, "q": query}, **options)
+        expected_ids = _assert_fragment_vector_result(
+            dataset,
+            single,
+            [1] if fast_search else [1, 2, 3],
+            5,
+            query=query,
+            filter="id % 2 = 1",
+            prefilter=prefilter,
+            distance_range=distance_range,
+            ann_segments=1,
+            flat=not fast_search,
+        )
+        actual = batch.filter(pc.equal(batch["query_index"], i))
+        assert actual["id"].to_pylist() == expected_ids
+        np.testing.assert_allclose(
+            actual["_distance"].to_numpy(),
+            single.to_table()["_distance"].to_numpy(),
+            atol=1e-5,
+            rtol=1e-6,
+        )
+        if not prefilter:
+            assert actual.num_rows < 5
+
+
+@pytest.mark.parametrize(
+    "mode", ["nullable", "null-fragment", "all-null", "empty", "deleted"]
+)
+@pytest.mark.parametrize("use_index", [False, True])
+def test_fragment_scan_nullable_vectors(tmp_path, mode, use_index):
+    vectors = [[float(i + 1), 0.0, 0.0, 0.0] if i % 2 == 0 else None for i in range(12)]
+    if mode == "all-null":
+        vectors = [None] * 12
+    elif mode == "empty":
+        vectors = []
+    elif mode == "null-fragment":
+        vectors[4:8] = [None] * 4
+    table = pa.table(
+        {
+            "id": pa.array(range(len(vectors)), type=pa.int32()),
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 4)),
+        }
+    )
+    dataset = lance.write_dataset(
+        table.slice(0, 8), tmp_path / "nullable", max_rows_per_file=4
+    )
+    if use_index:
+        dataset = dataset.create_index(
+            "vector",
+            "IVF_FLAT",
+            num_partitions=1,
+            ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+        )
+    if len(vectors) > 8:
+        dataset = lance.write_dataset(table.slice(8), dataset.uri, mode="append")
+    if mode == "deleted":
+        dataset.delete("true")
+    fragments = dataset.get_fragments()
+    selected = fragments[1:] if mode in ("nullable", "null-fragment") else fragments
+    segment_ids = [
+        str(segment.uuid)
+        for index in dataset.describe_indices()
+        for segment in index.segments
+    ]
+    options = dict(columns=["id"], fragments=selected, prefilter=False)
+    if segment_ids:
+        options["index_segments"] = segment_ids
+    nearest = {"column": "vector", "q": np.zeros(4), "k": 20, "nprobes": 1}
+    scanner = dataset.scanner(nearest=nearest, **options)
+    result = scanner.to_table()
+    source = dataset.scanner(columns=["id", "vector"], fragments=selected).to_table()
+    expected = sorted(
+        (int(row["id"]), sum(float(v) ** 2 for v in row["vector"]))
+        for row in source.to_pylist()
+        if row["vector"] is not None
+    )
+    assert result["id"].to_pylist() == [row[0] for row in expected]
+    assert len(set(result["id"].to_pylist())) == len(expected)
+    np.testing.assert_allclose(
+        result["_distance"].to_numpy(),
+        [row[1] for row in expected],
+        atol=1e-5,
+        rtol=1e-6,
+    )
+    assert all(column.null_count == 0 for column in result.columns)
+    if expected:
+        assert (
+            len(set(result["id"].to_pylist()) & {row[0] for row in expected})
+            / len(expected)
+            == 1.0
+        )
+    else:
+        batch = dataset.scanner(
+            nearest={**nearest, "q": np.zeros((2, 4))}, **options
+        ).to_table()
+        assert batch.num_rows == 0
+        assert batch.schema.field(0) == pa.field(
+            "query_index", pa.int32(), nullable=False
+        )
+    if mode == "nullable" and use_index:
+        plan = scanner.explain_plan()
+        assert "ANNSubIndex" in plan and "UnionExec" in plan, plan
+
+
+@pytest.mark.parametrize("mode", ["mixed", "fast", "refined-postfilter"])
+def test_fragment_scan_approximate_recall(tmp_path, mode):
+    rng = np.random.default_rng(42)
+    # Close excluded rows expose scope leaks; the three allowed fragments interleave.
+    vectors = rng.normal(0, 0.01, (64, 8)).astype(np.float32)
+    vectors[:16, 0] = np.arange(16) * 0.01
+    for fragment in range(1, 4):
+        vectors[16 * fragment : 16 * (fragment + 1), 0] = (
+            1 + 0.03 * np.arange(16) + 0.01 * (fragment - 1)
+        )
+    table = pa.table(
+        {
+            "id": pa.array(range(64), type=pa.int32()),
+            "vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 8),
+        }
+    )
+    dataset = lance.write_dataset(
+        table.slice(0, 48), tmp_path / "approximate", max_rows_per_file=16
+    )
+    segments = _build_segments(
+        dataset,
+        "vector",
+        "IVF_HNSW_SQ",
+        [[0, 1], [2]],
+        metric="l2",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 8), dtype=np.float32),
+    )
+    dataset = dataset.commit_existing_index_segments("vector_idx", "vector", segments)
+    dataset = lance.write_dataset(table.slice(48), dataset.uri, mode="append")
+    nearest = {"column": "vector", "q": np.zeros(8), "k": 5, "nprobes": 1, "ef": 64}
+    is_filtered = mode == "refined-postfilter"
+    if is_filtered:
+        nearest["refine_factor"] = 2
+    scanner = dataset.scanner(
+        columns=["id"],
+        nearest=nearest,
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[str(segments[0].uuid)],
+        fast_search=mode == "fast",
+        prefilter=False,
+        filter="id % 2 = 1" if is_filtered else None,
+    )
+    plan = scanner.explain_plan()
+    assert "ANNSubIndex" in plan and "ANNIvfBatch" not in plan, plan
+    assert ("UnionExec" in plan) == (mode != "fast"), plan
+    result = scanner.to_table()
+    assert result.column_names == ["id", "_distance"]
+    assert all(column.null_count == 0 for column in result.columns)
+    if not is_filtered:
+        assert result.num_rows == 5
+    allowed = np.arange(16, 32 if mode == "fast" else 64)
+    distances = np.sum(vectors.astype(np.float64) ** 2, axis=1)
+    expected = allowed[np.argsort(distances[allowed])][:5]
+    if is_filtered:
+        expected = expected[expected % 2 == 1]
+    actual = result["id"].to_pylist()
+    assert set(actual) <= set(allowed)
+    assert len(actual) == len(set(actual))
+    recall = len(set(actual) & set(expected)) / len(expected)
+    assert recall >= 0.5, (mode, recall, actual, expected.tolist(), plan)
+    assert any(16 <= row < 32 for row in actual), actual
+    if mode == "mixed":
+        assert any(row >= 32 for row in actual), actual
+    if is_filtered:
+        assert all(row % 2 == 1 for row in actual)
+        assert len(actual) < 5
+    actual_distances = result["_distance"].to_numpy()
+    assert np.all(np.isfinite(actual_distances))
+    assert np.all(np.diff(actual_distances) >= 0)
+    if mode != "fast":
+        np.testing.assert_allclose(
+            actual_distances, distances[actual], atol=1e-5, rtol=1e-6
+        )
+
+
+@pytest.mark.parametrize("k", [5, 80])
+@pytest.mark.parametrize("fast_search", [False, True])
+@pytest.mark.parametrize(
+    "mode,fragment_ids,ann_fragments,ann_segments",
+    [
+        pytest.param("selected", [1, 2, 3], [1], 1, id="mixed-string"),
+        pytest.param("uuid", [1, 2, 3], [1], 1, id="mixed-uuid"),
+        pytest.param("implicit", [1, 2, 3], [1, 2], 2, id="implicit-segments"),
+        pytest.param("selected", [1], [1], 1, id="within-segment"),
+        pytest.param("selected", [2, 3], [], 0, id="disjoint-segment"),
+        pytest.param("selected", [], [], 0, id="empty-fragments"),
+        pytest.param("unindexed", [1, 2, 3], [], 0, id="unindexed"),
+        pytest.param("disabled", [1, 2, 3], [], 0, id="disabled-index"),
+    ],
+)
+def test_fragment_scan_vector_search(
+    fragment_vector_dataset,
+    mode,
+    fragment_ids,
+    ann_fragments,
+    ann_segments,
+    fast_search,
+    k,
+):
+    dataset, segments = fragment_vector_dataset
+    if mode == "unindexed":
+        dataset.drop_index("vector_idx")
+        assert dataset.describe_indices() == []
+    selected = None if mode in ("implicit", "unindexed") else [segments[0]]
+    if mode == "uuid":
+        selected = [uuid.UUID(segments[0])]
+    scanner = dataset.scanner(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": np.zeros(4, dtype=np.float32),
+            "k": k,
+            "metric": "l2",
+            "nprobes": 1,
+            "use_index": mode != "disabled",
+        },
+        fragments=[dataset.get_fragment(i) for i in fragment_ids],
+        index_segments=selected,
+        fast_search=fast_search,
+    )
+    ids = _assert_fragment_vector_result(
+        dataset,
+        scanner,
+        ann_fragments if fast_search else fragment_ids,
+        k,
+        ann_segments=ann_segments,
+        flat=not fast_search and len(fragment_ids) > len(ann_fragments),
+    )
+    if mode in ("selected", "uuid") and fragment_ids == [1, 2, 3] and k == 5:
+        assert ids == ([16, 17, 18, 19, 20] if fast_search else [16, 32, 48, 17, 33])
+
+
+@pytest.mark.parametrize("k", [5, 80])
+@pytest.mark.parametrize("fast_search", [False, True])
+def test_index_segments_without_fragments(fragment_vector_dataset, fast_search, k):
+    dataset, segments = fragment_vector_dataset
+    scanner = dataset.scanner(
+        columns=["id"],
+        nearest={"column": "vector", "q": np.zeros(4), "k": k, "nprobes": 1},
+        index_segments=[segments[0]],
+        fast_search=fast_search,
+    )
+    _assert_fragment_vector_result(dataset, scanner, [0, 1], k, ann_segments=1)
+
+
+@pytest.mark.parametrize("k", [5, 80])
+@pytest.mark.parametrize("fast_search", [False, True])
+@pytest.mark.parametrize("prefilter", [False, True])
+def test_fragment_scan_filter_phase(fragment_vector_dataset, prefilter, fast_search, k):
+    dataset, segments = fragment_vector_dataset
+    predicate = "id % 2 = 1"
+    scanner = dataset.scanner(
+        columns=["id"],
+        nearest={"column": "vector", "q": np.zeros(4), "k": k, "nprobes": 1},
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[segments[0]],
+        filter=predicate,
+        prefilter=prefilter,
+        fast_search=fast_search,
+    )
+    ids = _assert_fragment_vector_result(
+        dataset,
+        scanner,
+        [1] if fast_search else [1, 2, 3],
+        k,
+        filter=predicate,
+        prefilter=prefilter,
+        ann_segments=1,
+        flat=not fast_search,
+    )
+    if k == 5:
+        expected = {
+            (False, False): [17, 33],
+            (False, True): [17, 33, 49, 19, 35],
+            (True, False): [17, 19],
+            (True, True): [17, 19, 21, 23, 25],
+        }
+        assert ids == expected[fast_search, prefilter]
+
+
+@pytest.mark.parametrize("is_indexed", [False, True])
+def test_fragment_scan_default_filter_and_fast_search(
+    fragment_vector_dataset, is_indexed
+):
+    dataset, segments = fragment_vector_dataset
+    if not is_indexed:
+        dataset.drop_index("vector_idx")
+    # Omitting both options must retain postfilter and include flat candidates.
+    scanner = dataset.scanner(
+        columns=["id"],
+        nearest={"column": "vector", "q": np.zeros(4), "k": 5, "nprobes": 1},
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[segments[0]] if is_indexed else None,
+        filter="id % 2 = 1",
+    )
+    ids = _assert_fragment_vector_result(
+        dataset,
+        scanner,
+        [1, 2, 3],
+        5,
+        filter="id % 2 = 1",
+        ann_segments=int(is_indexed),
+        flat=True,
+    )
+    assert ids == [17, 33]
+
+
+@pytest.mark.parametrize("k", [5, 80])
+def test_fragment_scan_ann_with_file_scan_prefilter(fragment_vector_dataset, k):
+    dataset, _ = fragment_vector_dataset
+    scanner = dataset.scanner(
+        prefilter=True,
+        filter="id > 18",
+        columns=["id"],
+        nearest={"column": "vector", "q": np.zeros(4), "k": k, "nprobes": 1},
+        fragments=[dataset.get_fragment(1)],
+    )
+    assert "LanceRead" in scanner.explain_plan()
+    _assert_fragment_vector_result(
+        dataset, scanner, [1], k, filter="id > 18", prefilter=True, ann_segments=1
+    )
+
+
+@pytest.mark.parametrize("k", [5, 80])
+@pytest.mark.parametrize("use_scalar_index", [False, True])
+def test_fragment_scan_ann_with_scalar_index_prefilter(
+    fragment_vector_dataset, use_scalar_index, k
+):
+    dataset, _ = fragment_vector_dataset
     dataset.create_scalar_index("id", index_type="BTREE")
-
-    assert len(dataset.get_fragments()) == 4
-
-    q = np.random.randn(128)
-    results = dataset.scanner(
+    scanner = dataset.scanner(
         prefilter=True,
-        filter="id > 50",
+        filter="id > 18",
         columns=["id"],
-        nearest={"column": "vector", "q": q, "use_index": True},
+        nearest={"column": "vector", "q": np.zeros(4), "k": k, "nprobes": 1},
         fragments=[dataset.get_fragment(1)],
-    ).to_table()
-
-    results_no_scalar_index = dataset.scanner(
-        prefilter=True,
-        filter="id > 50",
-        columns=["id"],
-        nearest={"column": "vector", "q": q, "use_index": True},
-        fragments=[dataset.get_fragment(1)],
-        use_scalar_index=False,
-    ).to_table()
-
-    assert results == results_no_scalar_index
+        use_scalar_index=use_scalar_index,
+    )
+    plan = scanner.explain_plan()
+    assert ("ScalarIndexQuery" in plan) == use_scalar_index, plan
+    _assert_fragment_vector_result(
+        dataset, scanner, [1], k, filter="id > 18", prefilter=True, ann_segments=1
+    )
 
 
 def test_describe_indices(dataset):
@@ -3489,21 +4070,105 @@ def test_prewarm_index(tmp_path):
     run(dataset, q=np.array(q), assert_func=func)
 
 
-def test_scanner_rejects_unknown_index_segments(tmp_path):
-    tbl = create_table()
-    dataset = lance.write_dataset(tbl, tmp_path)
-    dataset = dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
-
+@pytest.mark.parametrize("has_fragments", [False, True])
+@pytest.mark.parametrize("as_string", [False, True])
+def test_scanner_rejects_unknown_index_segments(
+    fragment_vector_dataset, has_fragments, as_string
+):
+    dataset, _ = fragment_vector_dataset
+    unknown = uuid.UUID(int=0)
     with pytest.raises(
-        ValueError, match="with_index_segments referenced unknown index segments"
+        ValueError,
+        match=f"with_index_segments referenced unknown index segments.*{unknown}",
     ):
         dataset.scanner(
             nearest={
                 "column": "vector",
-                "q": np.random.randn(128).astype(np.float32),
-                "k": 10,
+                "q": np.zeros(4),
+                "k": 5,
             },
-            index_segments=[uuid.uuid4()],
+            fragments=dataset.get_fragments()[1:] if has_fragments else None,
+            index_segments=[str(unknown) if as_string else unknown],
+        ).to_table()
+
+
+@pytest.mark.parametrize("has_fragments", [False, True])
+@pytest.mark.parametrize(
+    "segments,nearest_options,message",
+    [
+        pytest.param(
+            ["not-a-uuid"],
+            {},
+            "invalid index segment uuid 'not-a-uuid'",
+            id="invalid-uuid",
+        ),
+        pytest.param(
+            [],
+            {},
+            "with_index_segments does not accept an empty segment list",
+            id="empty-segments",
+        ),
+        pytest.param(
+            "selected",
+            {"metric": "dot"},
+            "with_index_segments requested metric Dot.*selected index segments use L2",
+            id="metric-mismatch",
+        ),
+        pytest.param(
+            "selected",
+            None,
+            "with_index_segments is only supported for vector search",
+            id="without-nearest",
+        ),
+        pytest.param(
+            "selected", {"k": 0}, "Nearest-K must be > 0 but got 0", id="zero-k"
+        ),
+        pytest.param(
+            "selected",
+            {"q": np.zeros(3)},
+            "Query vector size 3 does not match index column size 4",
+            id="wrong-dimension",
+        ),
+    ],
+)
+def test_fragment_scan_rejects_invalid_parameters(
+    fragment_vector_dataset, has_fragments, segments, nearest_options, message
+):
+    dataset, segment_ids = fragment_vector_dataset
+    nearest = (
+        {"column": "vector", "q": np.zeros(4), "k": 5, **nearest_options}
+        if nearest_options is not None
+        else None
+    )
+    with pytest.raises(ValueError, match=message):
+        dataset.scanner(
+            nearest=nearest,
+            index_segments=[segment_ids[0]] if segments == "selected" else segments,
+            fragments=dataset.get_fragments()[1:] if has_fragments else None,
+        ).to_table()
+
+
+@pytest.mark.parametrize("has_fragments", [False, True])
+@pytest.mark.parametrize(
+    "segments",
+    [
+        pytest.param(str(uuid.UUID(int=0)), id="single-string"),
+        pytest.param(uuid.UUID(int=0), id="single-uuid"),
+        pytest.param([123], id="integer-element"),
+        pytest.param([None], id="none-element"),
+    ],
+)
+def test_fragment_scan_rejects_index_segment_types(
+    fragment_vector_dataset, has_fragments, segments
+):
+    dataset, _ = fragment_vector_dataset
+    with pytest.raises(
+        TypeError, match="index_segments must be an iterable of str or uuid.UUID"
+    ):
+        dataset.scanner(
+            nearest={"column": "vector", "q": np.zeros(4), "k": 5},
+            index_segments=segments,
+            fragments=dataset.get_fragments()[1:] if has_fragments else None,
         ).to_table()
 
 
