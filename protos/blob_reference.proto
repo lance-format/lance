@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.blob.reference;
+
+/* Execution-only protocol for transporting lazy blob values. This is not a
+ * persisted Lance format. See docs/src/guide/blob_references.md for invariants.
+ * All messages require protocol_version = 1; unknown versions must fail.
+ */
+message SourceContext {
+  uint32 protocol_version = 1;
+  // Required capabilities: 1 = object-range transport, 2 = immutable external objects.
+  repeated uint32 required_capabilities = 2;
+  // Caller-supplied canonical table identity, including its catalog/storage authority.
+  string table_identity = 3;
+  // Absolute, normalized URI of the table root, without a branch suffix.
+  string table_uri = 4;
+  // Absent means the main branch. Tags and unresolved branch heads are not accepted.
+  optional string branch = 5;
+  uint64 version = 6;
+  // Exact resolved manifest object path in the source object store.
+  string manifest_path = 7;
+  /* Original manifest protobuf bytes, including registered base mappings.
+   * Never re-encode these bytes when forwarding a context: protobuf map order
+   * is not canonical. Their BLAKE3 digest identifies the observed manifest.
+   */
+  bytes manifest = 8;
+  /* Optional authoritative commit-store record identity. Absent means the
+   * manifest bytes provide snapshot identity; an ETag is not a substitute.
+   */
+  optional string manifest_identity = 9;
+  /* Portable key to an authenticated worker context that resolves storage
+   * configuration, credentials, and per-base routing. It must work in every
+   * participating process; a driver-local cache key or pointer is insufficient.
+   */
+  string access_context_key = 10;
+}
+
+/* Lance-owned locator encoding. Engines transport these bytes opaquely.
+ * The source fingerprint is BLAKE3 of the encoded, validated SourceContext.
+ */
+message ObjectLocator {
+  uint32 protocol_version = 1;
+  bytes source_id = 2;
+  string object_uri = 3;
+  uint64 offset = 4;
+  /* Absent means an unknown-length whole external object, requiring offset = 0.
+   * Present zero means a valid empty blob.
+   */
+  optional uint64 length = 5;
+  Origin origin = 6;
+
+  enum Origin {
+    UNSPECIFIED = 0;
+    // Object contents are immutable under Lance's storage contract.
+    LANCE = 1;
+    // Requires capability 2 and the application's external immutability assumption.
+    EXTERNAL_IMMUTABLE = 2;
+  }
+}
+
+/* One self-contained exchange/spill message. arrow_ipc is one Arrow IPC stream
+ * containing exactly one batch and one lance.blob.ref extension column.
+ * source_context is a batch-local slot, not a persistent table identifier.
+ */
+message ReferenceBatch {
+  uint32 protocol_version = 1;
+  repeated SourceContext contexts = 2;
+  bytes arrow_ipc = 3;
+}
