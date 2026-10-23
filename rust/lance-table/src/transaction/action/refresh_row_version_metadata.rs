@@ -49,6 +49,7 @@ impl RefreshRowVersionMetadata {
             let fragment_id = state.resolve_fragment(Ref::Committed(*fragment_id))?;
             let fragment = state.fragment_mut(fragment_id, "RefreshRowVersionMetadata")?;
             refresh_row_latest_update_meta_for_full_frag_rewrite_cols(fragment, new_version)?;
+            state.note_refreshed(fragment_id);
         }
         Ok(())
     }
