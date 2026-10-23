@@ -181,6 +181,8 @@ impl<'a> ApplyState<'a> {
         let current_manifest = self.current_manifest;
         let new_version = current_manifest.version + 1;
 
+        self.check_spilled_lineage_is_bound()?;
+
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
             .then_some(current_manifest.next_row_id);
@@ -503,6 +505,26 @@ impl<'a> ApplyState<'a> {
         }
     }
 
+    /// Resolve a reference that has to name a schema field. Only
+    /// [`AddDataFile`](super::AddDataFile) binds the reserved ids, which name a
+    /// column of one data file rather than a field.
+    pub(super) fn resolve_schema_field(&self, reference: FieldRef, action: &str) -> Result<i32> {
+        let id = self.resolve_field(reference)?;
+        if !id.is_schema() {
+            return Err(Error::invalid_input(format!(
+                "{action} names reserved field id {id}, which is not a schema field; only \
+                 AddDataFile binds a reserved id, for a row lineage column"
+            )));
+        }
+        Ok(id.get())
+    }
+
+    /// Whether this operation added the fragment, as opposed to finding it in
+    /// the version being committed on top of.
+    pub(super) fn is_new_fragment(&self, fragment_id: u64) -> bool {
+        self.new_fragments.contains(&fragment_id)
+    }
+
     /// Record that these fields' data in this fragment no longer matches what
     /// an index built over them recorded.
     pub(super) fn rebind_fields(
@@ -514,6 +536,41 @@ impl<'a> ApplyState<'a> {
             .entry(fragment_id)
             .or_default()
             .extend(fields);
+    }
+
+    /// Every row lineage sequence a fragment added here spills has to be bound
+    /// by exactly one of its data files, or the sequence has no column to be
+    /// read from. Checked once the operation has run, because the
+    /// [`AddDataFile`](super::AddDataFile) carrying it follows the
+    /// [`AddFragment`](super::AddFragment) that declares it.
+    fn check_spilled_lineage_is_bound(&self) -> Result<()> {
+        for fragment in &self.fragments {
+            if !self.new_fragments.contains(&fragment.id) {
+                continue;
+            }
+            for field_id in fragment.spilled_row_lineage_field_ids() {
+                let carriers = fragment
+                    .files
+                    .iter()
+                    .filter(|file| file.fields.contains(&field_id))
+                    .count();
+                if carriers == 0 {
+                    return Err(Error::invalid_input(format!(
+                        "fragment {} spills row lineage field {field_id} but no AddDataFile \
+                         binds it",
+                        fragment.id
+                    )));
+                }
+                if carriers > 1 {
+                    return Err(Error::invalid_input(format!(
+                        "fragment {} binds row lineage field {field_id} in more than one data \
+                         file",
+                        fragment.id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stamp row ids and version metadata onto the fragments this operation

@@ -112,8 +112,10 @@ pub use set_deletion_file::SetDeletionFile;
 pub use tombstone_field_data::TombstoneFieldData;
 
 use apply::ApplyState;
-use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::{
+    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, Result,
+};
 
 /// A reference to a counter-allocated fragment id or base id that may not have
 /// been assigned yet. Field ids use [`FieldRef`].
@@ -218,6 +220,21 @@ pub(super) struct FieldId(i32);
 impl FieldId {
     pub(super) fn get(self) -> i32 {
         self.0
+    }
+
+    /// A field of the dataset schema, as opposed to a reserved id.
+    pub(super) fn is_schema(self) -> bool {
+        self.0 >= 0
+    }
+
+    /// One of the hidden row lineage columns a spilled sequence lives in.
+    pub(super) fn is_row_lineage(self) -> bool {
+        matches!(
+            self.0,
+            ROW_ID_FIELD_ID
+                | ROW_CREATED_AT_VERSION_FIELD_ID
+                | ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+        )
     }
 }
 
@@ -388,6 +405,24 @@ mod tests {
         assert_eq!(Ref::Local(2).committed(), None);
         assert_eq!(FieldRef::Committed(-3).committed(), Some(-3));
         assert_eq!(FieldRef::Local(2).local(), Some(2));
+    }
+
+    #[test]
+    fn test_field_id_kinds() {
+        assert!(FieldId(0).is_schema());
+        assert!(!FieldId(0).is_row_lineage());
+        for reserved in [
+            ROW_ID_FIELD_ID,
+            ROW_CREATED_AT_VERSION_FIELD_ID,
+            ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        ] {
+            assert!(FieldId(reserved).is_row_lineage());
+            assert!(!FieldId(reserved).is_schema());
+        }
+        for sentinel in [-1, -2, -6] {
+            assert!(!FieldId(sentinel).is_schema());
+            assert!(!FieldId(sentinel).is_row_lineage());
+        }
     }
 
     #[test]

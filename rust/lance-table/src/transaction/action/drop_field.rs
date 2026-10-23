@@ -24,7 +24,7 @@ pub struct DropField {
 
 impl DropField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let field_id = state.resolve_field(self.field)?.get();
+        let field_id = state.resolve_schema_field(self.field, "DropField")?;
         let field = state.schema().field_by_id(field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "DropField names field {field_id}, which does not exist"

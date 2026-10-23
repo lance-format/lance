@@ -36,7 +36,7 @@ impl TombstoneFieldData {
         let field_ids = self
             .field_ids
             .iter()
-            .map(|field| state.resolve_field(*field).map(|id| id.get()))
+            .map(|field| state.resolve_schema_field(*field, "TombstoneFieldData"))
             .collect::<Result<Vec<_>>>()?;
         let fragment = state.fragment_mut(fragment_id, "TombstoneFieldData")?;
 
