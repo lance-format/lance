@@ -9,6 +9,7 @@ use super::{FieldRef, Footprint, Ref};
 use crate::format::{DataFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
+use std::collections::HashMap;
 
 /// Add a data file to a fragment.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -93,6 +94,11 @@ impl AddDataFile {
                 file.column_indices.len()
             )));
         }
+        reject_repeat(fragment_id, "field", &field_ids, |_| true)?;
+        // -1 marks a field with no top-level column of its own, so it may repeat.
+        reject_repeat(fragment_id, "column", &file.column_indices, |column| {
+            *column >= 0
+        })?;
         // A field's values live in exactly one file, so a second file for the
         // same field is ambiguous. A struct's own id is the exception: a file
         // adding a child under a committed struct lists the parent too, and the
@@ -138,6 +144,29 @@ impl AddDataFile {
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write_field_data(self.fragment, self.field_ids.iter().copied());
     }
+}
+
+/// Reject a value that appears twice among the `values` that `counts`, naming
+/// both positions so the writer can find the pair.
+fn reject_repeat(
+    fragment_id: u64,
+    what: &str,
+    values: &[i32],
+    counts: impl Fn(&i32) -> bool,
+) -> Result<()> {
+    let mut first_seen = HashMap::with_capacity(values.len());
+    for (position, value) in values.iter().enumerate() {
+        if !counts(value) {
+            continue;
+        }
+        if let Some(first) = first_seen.insert(*value, position) {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment_id} binds {what} {value} at positions {first} \
+                 and {position}; each {what} is bound at most once per file"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl From<&AddDataFile> for pb_actions::AddDataFile {
