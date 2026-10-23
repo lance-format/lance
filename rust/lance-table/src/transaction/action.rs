@@ -458,7 +458,7 @@ mod tests {
             let add = Action::AddIndexSegment(AddIndexSegment {
                 uuid: uuid::Uuid::from_u128(1),
                 name: "by_a".into(),
-                fields: vec![Ref::Committed(0)],
+                fields: vec![FieldRef::Committed(0)],
                 covering_fields: Vec::new(),
                 index_details: None,
                 index_version: 1,

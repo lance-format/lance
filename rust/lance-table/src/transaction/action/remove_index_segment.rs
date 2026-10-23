@@ -83,7 +83,7 @@ mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::action::{
-        Action, AddIndexSegment, CompositeOperation, Footprint, Ref, UserStep,
+        Action, AddIndexSegment, CompositeOperation, FieldRef, Footprint, Ref, UserStep,
     };
     use crate::transaction::test_support::sample_index_metadata;
 
@@ -154,7 +154,7 @@ mod tests {
                 Action::AddIndexSegment(AddIndexSegment {
                     uuid: new_uuid,
                     name: "by_a".into(),
-                    fields: vec![Ref::Committed(0)],
+                    fields: vec![FieldRef::Committed(0)],
                     covering_fields: Vec::new(),
                     index_details: None,
                     index_version: 1,
@@ -206,7 +206,7 @@ mod tests {
         let theirs = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
             uuid: Uuid::from_u128(2),
             name: "by_a".into(),
-            fields: vec![Ref::Committed(0)],
+            fields: vec![FieldRef::Committed(0)],
             covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
