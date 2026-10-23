@@ -32,7 +32,7 @@ impl AddField {
         let id = state.mint_field(self.local)?;
         let parent_id = self
             .parent
-            .map(|parent| state.resolve_field(parent).map(|id| id.get()))
+            .map(|parent| state.resolve_schema_field(parent, "AddField"))
             .transpose()?;
         state.reject_duplicate_sibling_name(parent_id, &self.def.name, "AddField")?;
 

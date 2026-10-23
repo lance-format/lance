@@ -471,10 +471,12 @@ impl Footprint {
     }
 }
 
-/// A field id a concurrent writer could also be naming, or `None` for a field
-/// this operation mints, which no one else can see yet.
+/// A schema field id a concurrent writer could also be naming, or `None` for
+/// a field this operation mints, which no one else can see yet. A reserved
+/// id is `None` too: a lineage column belongs to a fragment this operation
+/// adds, so no concurrent writer can name it either.
 fn committed_field(reference: FieldRef) -> Option<i32> {
-    reference.committed()
+    reference.committed().filter(|id| *id >= 0)
 }
 
 impl From<&CompositeOperation> for Footprint {

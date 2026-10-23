@@ -31,21 +31,43 @@ pub struct AddDataFile {
 impl AddDataFile {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
-        let field_ids = self
+        let resolved = self
             .field_ids
             .iter()
-            .map(|field| state.resolve_field(*field).map(|id| id.get()))
+            .map(|field| state.resolve_field(*field))
             .collect::<Result<Vec<_>>>()?;
-        // A column for a field the schema does not have is data no reader can
-        // see, such as one dropped earlier in the same operation.
-        if let Some(missing) = field_ids
-            .iter()
-            .find(|id| state.schema().field_by_id(**id).is_none())
-        {
-            return Err(Error::invalid_input(format!(
-                "AddDataFile for fragment {fragment_id} names field {missing}, which does not \
-                 exist (field ids {field_ids:?})"
-            )));
+        let field_ids: Vec<i32> = resolved.iter().map(|id| id.get()).collect();
+        let spilled_lineage = state
+            .fragment_mut(fragment_id, "AddDataFile")?
+            .spilled_row_lineage_field_ids();
+        for id in &resolved {
+            if id.is_schema() {
+                // A column for a field the schema does not have is data no
+                // reader can see, such as one dropped earlier in the operation.
+                if state.schema().field_by_id(id.get()).is_none() {
+                    return Err(Error::invalid_input(format!(
+                        "AddDataFile for fragment {fragment_id} names field {id}, which does \
+                         not exist (field ids {field_ids:?})"
+                    )));
+                }
+            } else if id.is_row_lineage() {
+                // The column only means something to a fragment whose metadata
+                // points at it, and only a fragment added here can still be
+                // given one: a committed fragment's sequences are settled.
+                if !state.is_new_fragment(fragment_id) || !spilled_lineage.contains(&id.get()) {
+                    return Err(Error::invalid_input(format!(
+                        "AddDataFile for fragment {fragment_id} binds row lineage field {id}, \
+                         but the fragment is not one this operation adds with that sequence \
+                         spilled (field ids {field_ids:?})"
+                    )));
+                }
+            } else {
+                return Err(Error::invalid_input(format!(
+                    "AddDataFile for fragment {fragment_id} names reserved field id {id}; a data \
+                     file binds schema fields and its fragment's spilled row lineage columns \
+                     only (field ids {field_ids:?})"
+                )));
+            }
         }
 
         if !self.file.fields.is_empty() {
@@ -157,7 +179,7 @@ mod tests {
         added_field, apply, backed_manifest, manifest_with_base, mint_base,
     };
     use crate::transaction::action::{Action, AddField, AddFragment, TombstoneFieldData};
-    use crate::transaction::test_support::sample_manifest;
+    use crate::transaction::test_support::{make_stable_row_id_manifest, sample_manifest};
     use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
@@ -330,7 +352,7 @@ mod tests {
     )]
     #[case::lineage_the_fragment_keeps_inline(
         vec![
-            new_fragment(Some(RowIdMeta::Inline(write_row_ids(&(0..10).into()).into()))),
+            new_fragment(Some(RowIdMeta::Inline(write_row_ids(&(10..20).into()).into()))),
             file_binding(Ref::Local(0), &[0, ROW_ID_FIELD_ID]),
         ],
         Some("row lineage field -3")
@@ -366,7 +388,12 @@ mod tests {
         #[case] actions: Vec<Action>,
         #[case] expected_error: Option<&str>,
     ) {
-        let result = apply(&backed_manifest(), actions);
+        // Spilling row ids takes a dataset that has them.
+        let mut fragment = backed_manifest().fragments[0].clone();
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&(0..10).into()).into()));
+        let manifest = make_stable_row_id_manifest(vec![fragment]);
+
+        let result = apply(&manifest, actions);
         match expected_error {
             None => {
                 result.unwrap();

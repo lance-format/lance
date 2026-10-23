@@ -27,7 +27,7 @@ pub struct AlterField {
 
 impl AlterField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let field_id = state.resolve_field(self.field)?.get();
+        let field_id = state.resolve_schema_field(self.field, "AlterField")?;
         let missing = || {
             Error::invalid_input(format!(
                 "AlterField names field {field_id}, which does not exist"
