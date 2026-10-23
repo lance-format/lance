@@ -144,10 +144,13 @@ impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{Action, AddFragment, TombstoneFieldData};
+    use crate::transaction::action::test_support::{
+        added_field, apply, backed_manifest, manifest_with_base, mint_base,
+    };
+    use crate::transaction::action::{Action, AddField, AddFragment, TombstoneFieldData};
     use crate::transaction::test_support::sample_manifest;
     use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
 
     #[test]
     fn test_add_data_file_rejects_an_unbound_local_token() {
@@ -204,6 +207,74 @@ mod tests {
             error.to_string().contains("file.fields must be empty"),
             "unexpected error: {error}"
         );
+    }
+
+    /// `base` is where the file lives; the embedded `base_id` is stamped from
+    /// it, so a writer that sets that too has said it twice.
+    #[rstest]
+    #[case::own_directory(None, None, false, Ok(None))]
+    #[case::committed_base(None, Some(Ref::Committed(1)), false, Ok(Some(1)))]
+    #[case::base_minted_earlier(None, Some(Ref::Local(0)), true, Ok(Some(2)))]
+    #[case::embedded_base_id(Some(1), None, false, Err("file.base_id must be unset"))]
+    #[case::embedded_base_id_beside_base(
+        Some(1),
+        Some(Ref::Committed(1)),
+        false,
+        Err("file.base_id must be unset")
+    )]
+    #[case::committed_base_the_dataset_lacks(
+        None,
+        Some(Ref::Committed(7)),
+        false,
+        Err("base id 7 in an action names no base path of the dataset")
+    )]
+    #[case::base_not_minted(
+        None,
+        Some(Ref::Local(0)),
+        false,
+        Err("local base token 0, which no earlier action in this operation minted")
+    )]
+    fn test_add_data_file_stamps_its_base(
+        #[case] embedded_base_id: Option<u32>,
+        #[case] base: Option<Ref>,
+        #[case] mint_base_first: bool,
+        #[case] expected: std::result::Result<Option<u32>, &str>,
+    ) {
+        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
+        file.base_id = embedded_base_id;
+        let mut actions = Vec::new();
+        if mint_base_first {
+            actions.push(mint_base());
+        }
+        actions.push(Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: added_field("added"),
+        }));
+        actions.push(Action::AddDataFile(AddDataFile {
+            fragment: Ref::Committed(0),
+            file,
+            field_ids: vec![FieldRef::Local(0)],
+            data_change: true,
+            base,
+        }));
+
+        let result = apply(&manifest_with_base(), actions);
+
+        match expected {
+            Ok(base_id) => {
+                let next = result.unwrap();
+                assert_eq!(next.fragments[0].files.last().unwrap().base_id, base_id);
+            }
+            Err(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(
+                    error.to_string().contains(message),
+                    "unexpected error: {error}"
+                );
+            }
+        }
     }
 
     #[test]
