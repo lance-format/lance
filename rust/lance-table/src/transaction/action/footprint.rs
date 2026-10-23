@@ -306,10 +306,10 @@ struct IndexClaim {
 /// built by a newer library.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct IndexIdentity {
-    pub fields: Vec<Ref>,
+    pub fields: Vec<FieldRef>,
     /// Which of `fields` are merely carried: two writers that disagree about
     /// this disagree about what the index answers for, not just what it holds.
-    pub covering_fields: Vec<Ref>,
+    pub covering_fields: Vec<FieldRef>,
     /// The type url of the segment's index details, or `None` when it has none.
     pub type_url: Option<String>,
     /// What a query against the index expects of every segment, or `None` for
@@ -572,7 +572,7 @@ impl Footprint {
     pub(super) fn require_field_data(
         &mut self,
         fragment: u64,
-        fields: impl IntoIterator<Item = Ref>,
+        fields: impl IntoIterator<Item = FieldRef>,
     ) {
         for field in fields.into_iter().filter_map(committed_field) {
             self.require(Coordinate::FieldData { fragment, field });
