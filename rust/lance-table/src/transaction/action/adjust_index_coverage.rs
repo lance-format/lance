@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{non_empty, required};
-use super::{Coordinate, Footprint, Ref};
+use super::{Coordinate, FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
@@ -53,6 +53,14 @@ pub struct AdjustIndexCoverage {
     /// these take no [`Ref`]: a fragment minted in this same operation was not
     /// in the coverage to begin with.
     pub remove_fragments: Vec<u64>,
+    /// The fields the segment is keyed on, declared as
+    /// [`AddIndexSegment::fields`](super::AddIndexSegment::fields) declares
+    /// them. Apply rejects a declaration that does not match the segment.
+    pub fields: Vec<FieldRef>,
+    /// The fields whose values the segment carries, declared as
+    /// [`AddIndexSegment::covering_fields`](super::AddIndexSegment::covering_fields)
+    /// declares them.
+    pub covering_fields: Vec<FieldRef>,
 }
 
 impl AdjustIndexCoverage {
@@ -138,6 +146,8 @@ impl DeepSizeOf for AdjustIndexCoverage {
             + self.name.deep_size_of_children(context)
             + self.add_fragments.deep_size_of_children(context)
             + self.remove_fragments.deep_size_of_children(context)
+            + self.fields.deep_size_of_children(context)
+            + self.covering_fields.deep_size_of_children(context)
     }
 }
 
@@ -152,6 +162,12 @@ impl From<&AdjustIndexCoverage> for pb_actions::AdjustIndexCoverage {
                 .map(|fragment| (*fragment).into())
                 .collect(),
             remove_fragments: value.remove_fragments.clone(),
+            fields: value.fields.iter().map(|field| (*field).into()).collect(),
+            covering_fields: value
+                .covering_fields
+                .iter()
+                .map(|field| (*field).into())
+                .collect(),
         }
     }
 }
@@ -169,6 +185,16 @@ impl TryFrom<pb_actions::AdjustIndexCoverage> for AdjustIndexCoverage {
                 .map(Ref::try_from)
                 .collect::<Result<Vec<_>>>()?,
             remove_fragments: message.remove_fragments,
+            fields: message
+                .fields
+                .into_iter()
+                .map(FieldRef::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            covering_fields: message
+                .covering_fields
+                .into_iter()
+                .map(FieldRef::try_from)
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }
@@ -176,7 +202,7 @@ impl TryFrom<pb_actions::AdjustIndexCoverage> for AdjustIndexCoverage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::IndexMetadata;
+    use crate::format::{IndexMetadata, Manifest};
     use crate::transaction::action::test_support::{
         apply_with_indices, backed_manifest, footprint,
     };
@@ -186,6 +212,14 @@ mod tests {
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
     use std::sync::Arc;
+
+    /// `backed_manifest` with fragment ids up to 9 handed out, so an
+    /// adjustment can name fragments other than 0 as committed.
+    fn manifest_with_reserved_ids() -> Manifest {
+        let mut manifest = backed_manifest();
+        manifest.max_fragment_id = Some(9);
+        manifest
+    }
 
     fn covering(name: &str, fragments: impl IntoIterator<Item = u32>) -> IndexMetadata {
         IndexMetadata {
@@ -200,6 +234,8 @@ mod tests {
             name: name.into(),
             add_fragments: add,
             remove_fragments: remove,
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: Vec::new(),
         })
     }
 
@@ -207,7 +243,7 @@ mod tests {
     fn test_adjust_index_coverage_adds_and_removes() {
         let segment = covering("by_a", [0, 1]);
         let (_, indices) = apply_with_indices(
-            &backed_manifest(),
+            &manifest_with_reserved_ids(),
             vec![adjust(
                 segment.uuid,
                 "by_a",
@@ -256,7 +292,7 @@ mod tests {
     fn test_a_fragment_named_on_both_sides_ends_up_uncovered() {
         let segment = covering("by_a", [0]);
         let (_, indices) = apply_with_indices(
-            &backed_manifest(),
+            &manifest_with_reserved_ids(),
             vec![adjust(
                 segment.uuid,
                 "by_a",
@@ -302,26 +338,26 @@ mod tests {
     #[rstest]
     #[case::added(vec![Ref::Committed(u64::from(u32::MAX) + 1)], vec![])]
     #[case::removed(vec![], vec![u64::from(u32::MAX) + 1])]
-    fn test_a_fragment_id_an_index_cannot_record_is_rejected(
+    fn test_a_fragment_id_no_manifest_can_hold_is_rejected(
         #[case] add: Vec<Ref>,
         #[case] remove: Vec<u64>,
     ) {
         let segment = covering("by_a", [0]);
         let error = apply_with_indices(
-            &backed_manifest(),
+            &manifest_with_reserved_ids(),
             vec![adjust(segment.uuid, "by_a", add, remove)],
             vec![segment],
         )
         .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("largest fragment id"), "{error}");
+        assert!(error.to_string().contains("fragment 4294967296"), "{error}");
     }
 
     #[test]
     fn test_adjusting_a_segment_that_is_not_there_is_rejected() {
         let error = apply_with_indices(
-            &backed_manifest(),
+            &manifest_with_reserved_ids(),
             vec![adjust(
                 Uuid::from_u128(1),
                 "by_a",
@@ -348,7 +384,7 @@ mod tests {
             ..sample_index_metadata("system")
         };
         let error = apply_with_indices(
-            &backed_manifest(),
+            &manifest_with_reserved_ids(),
             vec![adjust(
                 segment.uuid,
                 "system",
@@ -386,7 +422,7 @@ mod tests {
     fn test_adjusting_a_segment_of_another_index_is_rejected() {
         let segment = covering("by_a", [0]);
         let error = apply_with_indices(
-            &backed_manifest(),
+            &manifest_with_reserved_ids(),
             vec![adjust(
                 segment.uuid,
                 "by_b",
