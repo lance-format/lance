@@ -368,7 +368,7 @@ mod tests {
     #[rstest]
     #[case::a_top_level_column(read(&[0], &[0]), None)]
     #[case::no_cells(read(&[], &[]), None)]
-    #[case::a_missing_field(read(&[9], &[0]), Some("names field 9, which is not in the schema"))]
+    #[case::a_field_beyond_the_read_version(read(&[9], &[0]), Some("names field 9 by a Committed ref"))]
     #[case::a_missing_fragment(read(&[0], &[7]), Some("fragment 7, which does not exist"))]
     #[case::an_unpacked_struct(read(&[1], &[0]), Some("names field 1 ('s'), which is a struct or inside one"))]
     #[case::a_struct_child(read(&[2], &[0]), Some("names field 2 ('x'), which is a struct or inside one"))]

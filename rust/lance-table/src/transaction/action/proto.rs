@@ -191,7 +191,11 @@ mod tests {
     use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays, AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
+        DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
+        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;

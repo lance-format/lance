@@ -342,8 +342,11 @@ mod tests {
 
     #[test]
     fn test_overlaying_a_fragment_that_is_not_there_is_rejected() {
+        // Handed out, so a committed ref may name it, but not in the dataset.
+        let mut manifest = backed_manifest();
+        manifest.max_fragment_id = Some(42);
         let error = apply(
-            &backed_manifest(),
+            &manifest,
             vec![add(Ref::Committed(42), vec![overlay("a.lance", &[0])])],
         )
         .unwrap_err();
