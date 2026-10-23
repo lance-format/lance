@@ -2884,7 +2884,12 @@ mod composite {
     /// A data file of `fragment`, as an `AddDataFile` carries it: with no
     /// field list of its own, since the action's `field_ids` is that list.
     fn existing_data_file(dataset: &Dataset, fragment: usize) -> DataFile {
-        without_fields(dataset.fragments()[fragment].files[0].clone())
+        without_fields(existing_overlay_file(dataset, fragment))
+    }
+
+    /// A data file of `fragment` as an overlay carries it, field list and all.
+    fn existing_overlay_file(dataset: &Dataset, fragment: usize) -> DataFile {
+        dataset.fragments()[fragment].files[0].clone()
     }
 
     fn without_fields(file: DataFile) -> DataFile {
@@ -4703,7 +4708,7 @@ mod composite {
         let dataset = test_dataset(false).await;
         let overlaid = dataset.fragments()[0].id;
         let file = existing_data_file(&dataset, 0);
-        let overlay_file = existing_data_file(&dataset, 1);
+        let overlay_file = existing_overlay_file(&dataset, 1);
         let expected_version = dataset.version().version + 1;
 
         let dataset = commit(
@@ -4720,8 +4725,9 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
                 Action::AddOverlays(AddOverlays {
                     fragment: Ref::Committed(overlaid),
@@ -4761,14 +4767,15 @@ mod composite {
                 // nothing else in the commit says when they last changed.
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(rewritten),
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(rewritten),
                     file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
                 Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
                     fragment_ids: vec![rewritten],
@@ -4855,13 +4862,14 @@ mod composite {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
                 file: existing_data_file(dataset, 0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
+                base: None,
             }),
         ];
         if let Some(key_hashes) = key_hashes {
             actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
-                key_fields: vec![Ref::Committed(0)],
+                key_fields: vec![FieldRef::Committed(0)],
                 filter: KeyExistenceFilter {
                     field_ids: Vec::new(),
                     filter: FilterType::ExactSet(key_hashes.iter().copied().collect()),
@@ -4914,7 +4922,7 @@ mod composite {
         Action::AddOverlays(AddOverlays {
             fragment: Ref::Committed(fragment),
             overlays: vec![DataOverlayFile {
-                data_file: existing_data_file(dataset, 1),
+                data_file: existing_overlay_file(dataset, 1),
                 coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
                 committed_version: 0,
             }],
@@ -4977,6 +4985,7 @@ mod composite {
                         base_id: None,
                     }),
                     data_change: true,
+                    base: None,
                 }),
                 Action::AddFragment(AddFragment {
                     id: Ref::Local(0),
@@ -4989,8 +4998,9 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file: existing_data_file(dataset, 0),
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
             ]
         };
@@ -5059,13 +5069,14 @@ mod composite {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
                 file: existing_data_file(&dataset, 0),
-                field_ids: vec![Ref::Committed(1)],
+                field_ids: vec![FieldRef::Committed(1)],
                 data_change: true,
+                base: None,
             }),
             Action::AddOverlays(AddOverlays {
                 fragment: Ref::Local(0),
                 overlays: vec![DataOverlayFile {
-                    data_file: existing_data_file(&dataset, 1),
+                    data_file: existing_overlay_file(&dataset, 1),
                     coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
                     committed_version: 0,
                 }],
@@ -5076,7 +5087,7 @@ mod composite {
         let dropped = commit(
             dataset.clone(),
             vec![Action::DropField(DropField {
-                field: Ref::Committed(0),
+                field: FieldRef::Committed(0),
             })],
         )
         .await;

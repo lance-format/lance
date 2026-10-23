@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Footprint, Ref};
+use super::{FieldRef, Footprint};
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
@@ -31,7 +31,7 @@ use lance_core::{Error, Result};
 /// because the other's rows carry values in those columns too. Conflict
 /// detection matches assertions by key column set on that assumption.
 ///
-/// An assertion over a column the same operation mints ([`Ref::Local`]) guards
+/// An assertion over a column the same operation mints ([`FieldRef::Local`]) guards
 /// nothing concurrent: no other writer can insert into that column, so conflict
 /// detection ignores it.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -39,7 +39,7 @@ pub struct AssertUniqueKeys {
     /// The key columns, in order. This is the authoritative list; the field ids
     /// the filter carries are an artifact of the shared filter type, ignored
     /// here and cleared on encode.
-    pub key_fields: Vec<Ref>,
+    pub key_fields: Vec<FieldRef>,
     /// Hashes of the key values of every row this operation inserts, over
     /// `key_fields`.
     pub filter: KeyExistenceFilter,
@@ -58,7 +58,7 @@ impl AssertUniqueKeys {
             ));
         }
         for key_field in &self.key_fields {
-            let field_id = state.resolve_field(*key_field)?;
+            let field_id = state.resolve_schema_field(*key_field, "AssertUniqueKeys")?;
             if state.schema().field_by_id(field_id).is_none() {
                 return Err(Error::invalid_input(format!(
                     "AssertUniqueKeys names key field {field_id}, which is not in the schema"
@@ -99,7 +99,7 @@ impl TryFrom<pb_actions::AssertUniqueKeys> for AssertUniqueKeys {
             key_fields: message
                 .key_fields
                 .into_iter()
-                .map(Ref::try_from)
+                .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
             filter: KeyExistenceFilter::try_from(&filter)?,
         })
@@ -114,13 +114,13 @@ mod tests {
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
     use crate::transaction::action::{
-        Action, AddFragment, AddOverlays, RemoveFragment, TombstoneFieldData,
+        Action, AddFragment, AddOverlays, Ref, RemoveFragment, TombstoneFieldData,
     };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use std::sync::Arc;
 
-    fn assertion(key_fields: Vec<Ref>, hashes: &[u64]) -> Action {
+    fn assertion(key_fields: Vec<FieldRef>, hashes: &[u64]) -> Action {
         Action::AssertUniqueKeys(AssertUniqueKeys {
             key_fields,
             filter: KeyExistenceFilter {
@@ -154,7 +154,7 @@ mod tests {
         let manifest = backed_manifest();
         let out = apply(
             &manifest,
-            vec![assertion(vec![Ref::Committed(0)], &[1, 2, 3])],
+            vec![assertion(vec![FieldRef::Committed(0)], &[1, 2, 3])],
         )
         .unwrap();
 
@@ -177,7 +177,7 @@ mod tests {
     fn test_asserting_over_a_field_that_is_not_there_is_rejected() {
         let error = apply(
             &backed_manifest(),
-            vec![assertion(vec![Ref::Committed(9)], &[1])],
+            vec![assertion(vec![FieldRef::Committed(9)], &[1])],
         )
         .unwrap_err();
 
@@ -189,8 +189,14 @@ mod tests {
 
     #[test]
     fn test_inserts_with_disjoint_keys_do_not_conflict() {
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1, 2])]);
-        let theirs = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[3, 4])]);
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1, 2]),
+        ]);
+        let theirs = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[3, 4]),
+        ]);
 
         assert!(!ours.conflicts_with(&theirs));
         assert!(!theirs.conflicts_with(&ours));
@@ -198,8 +204,14 @@ mod tests {
 
     #[test]
     fn test_inserts_sharing_a_key_conflict() {
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1, 2])]);
-        let theirs = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[2, 3])]);
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1, 2]),
+        ]);
+        let theirs = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[2, 3]),
+        ]);
 
         assert!(ours.conflicts_with(&theirs));
         assert!(theirs.conflicts_with(&ours));
@@ -211,24 +223,35 @@ mod tests {
     /// matching them would compare hashes of unrelated values.
     #[test]
     fn test_an_assertion_over_a_minted_key_column_does_not_conflict() {
-        let over = |key_field: Ref, hashes: &[u64]| {
+        let over = |key_field: FieldRef, hashes: &[u64]| {
             footprint(vec![append(0), assertion(vec![key_field], hashes)])
         };
         let plain_append = footprint(vec![append(0)]);
 
-        assert!(!over(Ref::Local(3), &[1, 2]).conflicts_with(&over(Ref::Local(3), &[2, 3])));
-        assert!(!over(Ref::Local(3), &[1, 2]).conflicts_with(&plain_append));
-        assert!(!plain_append.conflicts_with(&over(Ref::Local(3), &[1, 2])));
+        assert!(
+            !over(FieldRef::Local(3), &[1, 2]).conflicts_with(&over(FieldRef::Local(3), &[2, 3]))
+        );
+        assert!(!over(FieldRef::Local(3), &[1, 2]).conflicts_with(&plain_append));
+        assert!(!plain_append.conflicts_with(&over(FieldRef::Local(3), &[1, 2])));
         // The same overlap over a committed column is a collision.
-        assert!(over(Ref::Committed(3), &[1, 2]).conflicts_with(&over(Ref::Committed(3), &[2, 3])));
+        assert!(
+            over(FieldRef::Committed(3), &[1, 2])
+                .conflicts_with(&over(FieldRef::Committed(3), &[2, 3]))
+        );
     }
 
     #[test]
     fn test_assertions_over_different_key_columns_conflict() {
         // Two filters over different columns hash different values, so neither
         // says anything about the other's keys.
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
-        let theirs = footprint(vec![append(0), assertion(vec![Ref::Committed(1)], &[2])]);
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1]),
+        ]);
+        let theirs = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(1)], &[2]),
+        ]);
 
         assert!(ours.conflicts_with(&theirs));
     }
@@ -241,21 +264,23 @@ mod tests {
     fn test_assertions_are_matched_by_key_column() {
         let ours = footprint(vec![
             append(0),
-            assertion(vec![Ref::Committed(0)], &[1]),
-            assertion(vec![Ref::Committed(1)], &[5]),
+            assertion(vec![FieldRef::Committed(0)], &[1]),
+            assertion(vec![FieldRef::Committed(1)], &[5]),
         ]);
         let disjoint = footprint(vec![
             append(0),
-            assertion(vec![Ref::Committed(0)], &[2]),
-            assertion(vec![Ref::Committed(1)], &[6]),
+            assertion(vec![FieldRef::Committed(0)], &[2]),
+            assertion(vec![FieldRef::Committed(1)], &[6]),
         ]);
         let overlapping_on_the_second = footprint(vec![
             append(0),
-            assertion(vec![Ref::Committed(0)], &[2]),
-            assertion(vec![Ref::Committed(1)], &[5]),
+            assertion(vec![FieldRef::Committed(0)], &[2]),
+            assertion(vec![FieldRef::Committed(1)], &[5]),
         ]);
-        let silent_on_the_second =
-            footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[2])]);
+        let silent_on_the_second = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[2]),
+        ]);
 
         assert!(!ours.conflicts_with(&disjoint));
         assert!(ours.conflicts_with(&overlapping_on_the_second));
@@ -269,11 +294,14 @@ mod tests {
     /// writer asserts nothing about which, so the assertion cannot be checked.
     #[test]
     fn test_an_assertion_conflicts_with_an_in_place_write_to_its_key_column() {
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
-        let rewrite = |field: u64| {
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1]),
+        ]);
+        let rewrite = |field: i32| {
             footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(field)],
+                field_ids: vec![FieldRef::Committed(field)],
                 data_change: true,
             })])
         };
@@ -287,7 +315,10 @@ mod tests {
     /// hold any key, just as a full rewrite's can.
     #[test]
     fn test_an_assertion_conflicts_with_an_overlay_of_its_key_column() {
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1]),
+        ]);
         let overlay = |field: i32| {
             footprint(vec![Action::AddOverlays(AddOverlays {
                 fragment: Ref::Committed(0),
@@ -319,7 +350,7 @@ mod tests {
     fn test_assertions_with_incomparable_filters_conflict() {
         let bloom = |number_of_items: u64| {
             Action::AssertUniqueKeys(AssertUniqueKeys {
-                key_fields: vec![Ref::Committed(0)],
+                key_fields: vec![FieldRef::Committed(0)],
                 filter: KeyExistenceFilter {
                     field_ids: Vec::new(),
                     filter: FilterType::Bloom {
@@ -340,7 +371,10 @@ mod tests {
 
     #[test]
     fn test_an_assertion_conflicts_with_an_unqualified_insert() {
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1]),
+        ]);
         let plain_append = footprint(vec![append(0)]);
 
         assert!(ours.conflicts_with(&plain_append));
@@ -354,7 +388,10 @@ mod tests {
 
     #[test]
     fn test_an_assertion_ignores_a_concurrent_change_that_inserts_no_rows() {
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1]),
+        ]);
         let removal = footprint(vec![Action::RemoveFragment(RemoveFragment {
             fragment: Ref::Committed(3),
             data_change: true,
@@ -367,7 +404,10 @@ mod tests {
     fn test_a_compaction_is_not_an_insert() {
         // Compaction rewrites rows that are already there, so it cannot have
         // introduced a key the assertion would have to rule out.
-        let ours = footprint(vec![append(0), assertion(vec![Ref::Committed(0)], &[1])]);
+        let ours = footprint(vec![
+            append(0),
+            assertion(vec![FieldRef::Committed(0)], &[1]),
+        ]);
         let compaction = footprint(vec![compact(0)]);
 
         assert!(!ours.conflicts_with(&compaction));
