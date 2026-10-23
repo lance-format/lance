@@ -37,7 +37,7 @@ impl AlterField {
             let field = state.schema().field_by_id(field_id).ok_or_else(missing)?;
             if *name != field.name {
                 let parent_id = (field.parent_id >= 0).then_some(field.parent_id);
-                state.reject_duplicate_sibling_name(parent_id, name, "AlterField")?;
+                state.check_field_name(parent_id, name, "AlterField")?;
             }
         }
         let field = state
