@@ -14,6 +14,11 @@
 //! is already allocated, so apply checks the claim rather than making one, and
 //! replay leaves it alone.
 //!
+//! Reservations are the one exception to applying in order: whatever their
+//! position, they are summed and taken off the counters after the operation's
+//! own mints. A reservation creates nothing another action can name, so the
+//! order has no other visible effect.
+//!
 //! [`ApplyState`] is that working copy, and its methods are the API the action
 //! modules program against. What each action does with it lives in that action's
 //! own module.
