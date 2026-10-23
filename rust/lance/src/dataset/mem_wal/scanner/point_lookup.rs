@@ -341,10 +341,8 @@ impl LsmPointLookupPlanner {
     /// Like [`Self::lookup`] but does NOT drop a tombstone: the returned 1-row
     /// batch carries the `_tombstone` marker (`true` ⇒ the key's newest fresh
     /// version is a delete); `None` still means the key is absent from every
-    /// source. Partial-update merge uses this to treat a fresh-deleted PK as
-    /// absent, so it never resurrects stale, not-yet-compacted base columns.
-    /// Always plans (no in-memory fast path) — used off the hot read path, on
-    /// small partial-update batches.
+    /// source. Always plans (no in-memory fast path); for many keys use
+    /// [`Self::lookup_many_keep_tombstone`], which scans each source once.
     pub async fn lookup_keep_tombstone(
         &self,
         pk_values: &[ScalarValue],
@@ -2712,13 +2710,8 @@ mod tests {
         let schema = pk_ts_schema();
         let planner =
             active_ts_planner(&[ts_real(&schema, &[1, 2, 3], "v"), ts_tomb(&schema, &[2])]);
-        let keys = vec![
-            vec![ScalarValue::Int32(Some(1))],
-            vec![ScalarValue::Int32(Some(2))],
-            vec![ScalarValue::Int32(Some(3))],
-        ];
         let batch = planner
-            .lookup_many_keep_tombstone(&keys, None)
+            .lookup_many_keep_tombstone(&int32_keys([1, 2, 3]), None)
             .await
             .unwrap();
         assert_eq!(
