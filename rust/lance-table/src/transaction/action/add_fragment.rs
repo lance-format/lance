@@ -183,6 +183,7 @@ mod tests {
     use crate::transaction::action::{Action, AddDataFile, FieldRef, ReserveFragmentIds};
     use crate::transaction::test_support::sample_manifest;
     use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
 
     fn add_fragment(id: Ref) -> Action {
         Action::AddFragment(AddFragment {
@@ -262,6 +263,26 @@ mod tests {
         let error = apply(&sample_manifest(), vec![add_fragment(Ref::Committed(1))]).unwrap_err();
 
         assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("no commit has reserved"),
+            "{error}"
+        );
+    }
+
+    /// A reservation is taken after the operation's own mints, so an id it
+    /// reserves is not yet reserved for the actions beside it.
+    #[rstest]
+    #[case::reserve_then_claim(vec![
+        Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 }),
+        add_fragment(Ref::Committed(1)),
+    ])]
+    #[case::claim_then_reserve(vec![
+        add_fragment(Ref::Committed(1)),
+        Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 }),
+    ])]
+    fn test_an_id_reserved_in_the_same_operation_cannot_be_claimed(#[case] actions: Vec<Action>) {
+        let error = apply(&sample_manifest(), actions).unwrap_err();
+
         assert!(
             error.to_string().contains("no commit has reserved"),
             "{error}"
