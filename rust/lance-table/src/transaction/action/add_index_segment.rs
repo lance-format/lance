@@ -1413,6 +1413,67 @@ mod tests {
         assert!(index_footprint(covering("by_a", None)).conflicts_with(&drop));
     }
 
+    /// A struct is dropped children first, so a build over a child loses to
+    /// the child's own drop rather than slipping past the parent's. Landing
+    /// second, the drop discards the segment as it applies.
+    #[test]
+    fn test_a_build_over_a_child_loses_to_a_committed_struct_drop() {
+        let build = index_footprint(AddIndexSegment {
+            fields: vec![FieldRef::Committed(2)],
+            ..covering("by_a", Some(vec![0]))
+        });
+        let drop = footprint(
+            [2, 1]
+                .into_iter()
+                .map(|field| {
+                    Action::DropField(DropField {
+                        field: FieldRef::Committed(field),
+                    })
+                })
+                .collect(),
+        );
+
+        assert!(build.conflicts_with(&drop));
+        assert!(!drop.conflicts_with(&build));
+
+        let mut manifest = backed_manifest();
+        manifest.schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new(
+                    "s",
+                    arrow_schema::DataType::Struct(
+                        vec![arrow_schema::Field::new(
+                            "a",
+                            arrow_schema::DataType::Int32,
+                            true,
+                        )]
+                        .into(),
+                    ),
+                    true,
+                ),
+            ]))
+            .unwrap();
+        let committed_segment = IndexMetadata {
+            fields: vec![2],
+            ..sample_index_metadata("by_a")
+        };
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![
+                Action::DropField(DropField {
+                    field: FieldRef::Committed(2),
+                }),
+                Action::DropField(DropField {
+                    field: FieldRef::Committed(1),
+                }),
+            ],
+            vec![committed_segment],
+        )
+        .unwrap();
+        assert!(indices.is_empty(), "{indices:?}");
+    }
+
     /// A segment requires the data of the fragments it covers, and that data
     /// is gone if the fragment is: a compaction landing first would leave the
     /// segment describing rows the dataset no longer has, in a fragment the
