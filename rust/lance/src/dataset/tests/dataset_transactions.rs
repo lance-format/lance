@@ -2451,8 +2451,17 @@ mod composite {
             .unwrap()
     }
 
+    /// A data file of `fragment`, as an `AddDataFile` carries it: with no
+    /// field list of its own, since the action's `field_ids` is that list.
     fn existing_data_file(dataset: &Dataset, fragment: usize) -> DataFile {
-        dataset.fragments()[fragment].files[0].clone()
+        without_fields(dataset.fragments()[fragment].files[0].clone())
+    }
+
+    fn without_fields(file: DataFile) -> DataFile {
+        DataFile {
+            fields: Arc::from([]),
+            ..file
+        }
     }
 
     fn int32_field(name: &str) -> LanceField {
@@ -2664,7 +2673,7 @@ mod composite {
                     }),
                     Action::AddDataFile(AddDataFile {
                         fragment: Ref::Local(0),
-                        file: borrowed_file,
+                        file: without_fields(borrowed_file),
                         field_ids: vec![FieldRef::Local(0)],
                         data_change: true,
                         base: None,
@@ -2971,7 +2980,7 @@ mod composite {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(fragment_id),
-                    file,
+                    file: without_fields(file),
                     field_ids: vec![FieldRef::Local(0)],
                     data_change: true,
                     base: None,
@@ -3015,7 +3024,7 @@ mod composite {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(fragment_id),
-                    file,
+                    file: without_fields(file),
                     field_ids: vec![FieldRef::Local(0)],
                     data_change: true,
                     base: None,
@@ -3112,7 +3121,7 @@ mod composite {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(2),
-                    file,
+                    file: without_fields(file),
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                     base: None,
@@ -3514,7 +3523,7 @@ mod composite {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(fragment_id),
-                    file,
+                    file: without_fields(file),
                     field_ids: fields,
                     data_change: true,
                     base: None,

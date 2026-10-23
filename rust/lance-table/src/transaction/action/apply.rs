@@ -728,7 +728,10 @@ mod tests {
                     }),
                     Action::AddDataFile(AddDataFile {
                         fragment: Ref::Committed(0),
-                        file: replacement,
+                        file: DataFile {
+                            fields: Arc::from([]),
+                            ..replacement
+                        },
                         field_ids: vec![FieldRef::Committed(0)],
                         data_change: true,
                         base: None,
@@ -886,7 +889,7 @@ mod tests {
                     fragment: Ref::Committed(0),
                     file: DataFile::new(
                         "data/0-new.lance",
-                        vec![rewritten],
+                        Vec::<i32>::new(),
                         vec![0],
                         ConcreteFileVersion::V2_0,
                         None,
