@@ -7,7 +7,7 @@
 //! contexts through exchange, spill, and retries. It does not read payloads or
 //! retain source snapshots. See the [execution contract](https://lance.org/guide/blob_references/).
 //! [`BlobRefCapture`] creates references from scanned Blob V2 descriptors;
-//! reference readers are a separate API.
+//! [`BlobRefReader`] fetches full values and ranges through authenticated bindings.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -40,8 +40,13 @@ use crate::Dataset;
 use crate::dataset::refs::check_valid_branch;
 
 pub use crate::dataset::blob::capture::BlobRefCapture;
+pub use crate::dataset::blob::{
+    BlobMaterializationAdmission, BlobMaterializationContext, BlobMaterializationReservation,
+    BlobReadRange, BlobRefBinding, BlobRefDemand, BlobRefReadStream, BlobRefReader, BlobRefRequest,
+    ReadBlobRef,
+};
 
-mod pb {
+pub(crate) mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.blob.reference.rs"));
 }
 
@@ -408,6 +413,37 @@ impl BlobRef {
         Ok(offset..end)
     }
 
+    pub(crate) fn object_locator_in_context(
+        &self,
+        context: &BlobSourceContext,
+    ) -> Result<pb::ObjectLocator> {
+        let object = self.object_locator()?;
+        if object.source_id.as_ref() != context.source_id {
+            return Err(Error::invalid_input(format!(
+                "Blob reference does not match source_context slot {}",
+                self.source_context,
+            )));
+        }
+        if let Some(base_id) = object.base_id
+            && !context.registered_bases.contains(base_id)
+        {
+            return Err(Error::invalid_input(format!(
+                "Blob reference references unknown base_id {base_id}"
+            )));
+        }
+        if object.origin == pb::object_locator::Origin::ExternalImmutable as i32
+            && !context
+                .proto
+                .required_capabilities
+                .contains(&IMMUTABLE_EXTERNAL)
+        {
+            return Err(Error::invalid_input(
+                "Blob reference requires the external immutability assumption",
+            ));
+        }
+        Ok(object)
+    }
+
     fn object_locator(&self) -> Result<pb::ObjectLocator> {
         let object = pb::ObjectLocator::decode(self.locator.clone()).map_err(|error| {
             Error::invalid_input(format!("Invalid blob object locator protobuf: {error}",))
@@ -574,30 +610,11 @@ impl BlobRefBatch {
                     "Blob reference row {index} uses missing source_context slot {} (context count {})",
                     reference.source_context, batch.contexts.len(),
                 )))?;
-                let object = reference.object_locator()?;
-                if object.source_id.as_ref() != context.source_id {
-                    return Err(Error::invalid_input(format!(
-                        "Blob reference row {index} does not match source_context slot {}",
-                        reference.source_context,
-                    )));
-                }
-                if let Some(base_id) = object.base_id
-                    && !context.registered_bases.contains(base_id)
-                {
-                    return Err(Error::invalid_input(format!(
-                        "Blob reference row {index} references unknown base_id {base_id}",
-                    )));
-                }
-                if object.origin == pb::object_locator::Origin::ExternalImmutable as i32
-                    && !context
-                        .proto
-                        .required_capabilities
-                        .contains(&IMMUTABLE_EXTERNAL)
-                {
-                    return Err(Error::invalid_input(format!(
-                        "Blob reference row {index} requires the external immutability assumption",
-                    )));
-                }
+                reference
+                    .object_locator_in_context(context)
+                    .map_err(|error| {
+                        Error::invalid_input(format!("Blob reference row {index}: {error}"))
+                    })?;
             }
         }
         Ok(batch)
@@ -759,11 +776,12 @@ fn canonical_uri(uri: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::{process::Command, sync::atomic::Ordering, time::Duration};
 
     use arrow_array::{
         DictionaryArray, RecordBatchIterator, StringArray, UInt8Array, UInt32Array, UInt64Array,
     };
+    use futures::{FutureExt, TryStreamExt};
     use lance_core::datatypes::{BlobHandling, BlobKind};
     use lance_core::utils::address::RowAddress;
     use lance_file::version::LanceFileVersion;
@@ -777,7 +795,10 @@ mod tests {
         blob_field_with_options,
     };
     use crate::dataset::WriteParams;
-    use crate::dataset::blob::test_util::{create_multi_base_blob_v2_fixture, managed_blob_schema};
+    use crate::dataset::blob::test_util::{
+        RecordingRangeObjectStore, create_multi_base_blob_v2_fixture, gated_range_store,
+        managed_blob_schema, recording_range_store,
+    };
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
 
@@ -1140,12 +1161,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(first, context);
+            let dataset = Arc::new(dataset.clone());
             BlobRefCapture::try_new(
-                Arc::new(dataset.clone()),
-                context,
+                dataset.clone(),
+                context.clone(),
                 dataset.schema().field("blob").unwrap().id,
             )
             .unwrap();
+            BlobRefBinding::try_new(context, dataset).unwrap();
         }
         let mut latest = original.clone();
         latest
@@ -1327,6 +1350,113 @@ mod tests {
     }
 
     #[cfg_attr(coverage, coverage(off))]
+    async fn recorded_ref_binding(
+        store: Arc<ObjectStore>,
+        identity: &str,
+    ) -> (BlobRefBinding, BlobSourceContext) {
+        let dataset = capture_dataset("memory://").await;
+        let source = BlobSourceContext::from_dataset(&dataset, identity, "workers")
+            .await
+            .unwrap();
+        let mut dataset = dataset.as_ref().clone();
+        dataset.object_store = store;
+        (
+            BlobRefBinding::try_new(source.clone(), Arc::new(dataset)).unwrap(),
+            source,
+        )
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn recorded_ref_reader(
+        io_bytes: u64,
+        output_bytes: u64,
+    ) -> (
+        BlobRefReader,
+        BlobSourceContext,
+        Arc<BlobMaterializationContext>,
+        Arc<RecordingRangeObjectStore>,
+    ) {
+        let (store, recorded) = recording_range_store(Bytes::from_static(b"abcdefghijklmnop"));
+        let (binding, source) = recorded_ref_binding(store, "catalog/table").await;
+        let budget = BlobMaterializationContext::try_new(io_bytes, output_bytes).unwrap();
+        let reader = BlobRefReader::try_new(vec![binding], budget.clone()).unwrap();
+        (reader, source, budget, recorded)
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    fn ref_read_request(
+        source: &BlobSourceContext,
+        index: u64,
+        offset: u64,
+        length: u64,
+        demand: BlobRefDemand,
+    ) -> BlobRefRequest {
+        let reference = source
+            .reference(
+                "memory:///_blobs/payload.blob".to_string(),
+                offset,
+                Some(length),
+                BlobKind::Packed,
+                None,
+            )
+            .unwrap();
+        BlobRefRequest::new(index, Some(reference), demand)
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn capture_ref_batch(dataset: &Arc<Dataset>, source: &BlobSourceContext) -> BlobRefBatch {
+        let (field, addresses, descriptors) = capture_inputs(dataset).await;
+        BlobRefCapture::try_new(
+            dataset.clone(),
+            source.clone(),
+            dataset.schema().field("blob").unwrap().id,
+        )
+        .unwrap()
+        .capture(source, &field, &addresses, &descriptors)
+        .await
+        .unwrap()
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn wait_for_ref_budget_release(budget: &BlobMaterializationContext) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.reserved_bytes().unwrap() != 0 || budget.io_reserved_bytes().unwrap() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn read_one_ref(
+        dataset: &Arc<Dataset>,
+        source: &BlobSourceContext,
+        reference: BlobRef,
+    ) -> Bytes {
+        let budget = BlobMaterializationContext::try_new(1 << 20, 4 << 20).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source.clone(), dataset.clone()).unwrap()],
+            budget,
+        )
+        .unwrap();
+        reader
+            .read([BlobRefRequest::new(
+                42,
+                Some(reference),
+                BlobRefDemand::Whole,
+            )])
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .unwrap()
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
     async fn capture_inputs(dataset: &Dataset) -> (Field, Vec<RowAddress>, StructArray) {
         let batch = dataset
             .scan()
@@ -1503,6 +1633,12 @@ mod tests {
             read_captured(&fixture.dataset, &reference).await.as_ref(),
             fixture.expected.as_slice()
         );
+        assert_eq!(
+            read_one_ref(&fixture.dataset, &source, reference)
+                .await
+                .as_ref(),
+            fixture.expected.as_slice()
+        );
     }
 
     #[rstest]
@@ -1563,6 +1699,14 @@ mod tests {
                 b"abcdefgh"
             );
         }
+        assert_eq!(
+            read_one_ref(&dataset, &source, reference).await.as_ref(),
+            if range.is_some() {
+                b"cde".as_slice()
+            } else {
+                b"abcdefgh".as_slice()
+            }
+        );
     }
 
     #[rstest]
@@ -1594,6 +1738,10 @@ mod tests {
         assert_eq!(
             object.object_uri,
             url::Url::from_file_path(object_path).unwrap().as_str()
+        );
+        assert_eq!(
+            read_one_ref(&dataset, &source, reference).await.as_ref(),
+            b"cde"
         );
     }
 
@@ -1682,6 +1830,22 @@ mod tests {
                 .contains("does not match dataset snapshot")
         );
         let restored = BlobRefBatch::decode(&captured.encode().unwrap()).unwrap();
+        let worker_latest = Dataset::open(dataset.uri()).await.unwrap();
+        let error = BlobRefBinding::try_new(source.clone(), Arc::new(worker_latest.clone()))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match dataset snapshot")
+        );
+        let worker = Arc::new(
+            worker_latest
+                .checkout_version(source.version())
+                .await
+                .unwrap(),
+        );
         for (row, expected) in [(0, b"abc".as_slice()), (1, b"abcde"), (2, b"abcdefghij")] {
             assert_eq!(
                 read_captured(&dataset, &restored.reference(row).unwrap().unwrap())
@@ -1693,6 +1857,22 @@ mod tests {
                 read_captured(&cloned, &clone_refs.reference(row).unwrap().unwrap())
                     .await
                     .as_ref(),
+                expected
+            );
+            assert_eq!(
+                read_one_ref(&worker, &source, restored.reference(row).unwrap().unwrap())
+                    .await
+                    .as_ref(),
+                expected
+            );
+            assert_eq!(
+                read_one_ref(
+                    &cloned,
+                    &cloned_source,
+                    clone_refs.reference(row).unwrap().unwrap()
+                )
+                .await
+                .as_ref(),
                 expected
             );
         }
@@ -1834,6 +2014,592 @@ mod tests {
                 .await
                 .as_ref(),
             b"abc"
+        );
+        assert_eq!(
+            read_one_ref(&branch, &source, captured.reference(0).unwrap().unwrap())
+                .await
+                .as_ref(),
+            b"abc"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_refs_coalesces_ranges_and_retains_output_reservations() {
+        let (reader, source, budget, recorded) = recorded_ref_reader(1024, 1024).await;
+        let range = BlobRefDemand::Range(BlobReadRange::new(2, 4));
+        let requests = [
+            ref_read_request(&source, 90, 0, 10, range),
+            ref_read_request(
+                &source,
+                17,
+                0,
+                10,
+                BlobRefDemand::Range(BlobReadRange::new(4, 4)),
+            ),
+            ref_read_request(&source, 4, 8, 2, BlobRefDemand::Whole),
+            ref_read_request(&source, 23, 0, 10, range),
+            BlobRefRequest::new(1000, None, BlobRefDemand::Whole),
+            ref_read_request(&source, 11, 0, 0, BlobRefDemand::Whole),
+            ref_read_request(
+                &source,
+                12,
+                0,
+                10,
+                BlobRefDemand::Range(BlobReadRange::new(10, 0)),
+            ),
+        ];
+        let stream = reader.read(requests).unwrap();
+        assert!(recorded.requested_ranges().is_empty());
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        let by_index = results
+            .iter()
+            .map(|result| (result.request_index, result.data.as_deref()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_index.len(), 7);
+        assert_eq!(by_index[&90], Some(b"cdef".as_slice()));
+        assert_eq!(by_index[&17], Some(b"efgh".as_slice()));
+        assert_eq!(by_index[&4], Some(b"ij".as_slice()));
+        assert_eq!(by_index[&23], by_index[&90]);
+        assert_eq!(by_index[&1000], None);
+        assert_eq!(by_index[&11], Some(b"".as_slice()));
+        assert_eq!(by_index[&12], Some(b"".as_slice()));
+        assert_eq!(
+            by_index[&23].unwrap().as_ptr(),
+            by_index[&90].unwrap().as_ptr()
+        );
+        assert_eq!(recorded.requested_blob_ranges(), vec![2..10]);
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 0);
+        // Eight physical bytes plus fourteen logical bytes, including duplicates.
+        assert_eq!(budget.reserved_bytes().unwrap(), 22);
+        let clone = results
+            .iter()
+            .find(|result| result.request_index == 90)
+            .unwrap()
+            .data
+            .clone();
+        drop(results);
+        assert_eq!(budget.reserved_bytes().unwrap(), 22);
+        drop(clone);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[rstest]
+    #[case::bounded(4, 8)]
+    #[case::oversized(2, 3)]
+    #[tokio::test]
+    async fn read_refs_backpressure_and_oversized_values(
+        #[case] io_bytes: u64,
+        #[case] output_bytes: u64,
+    ) {
+        let (reader, source, budget, recorded) = recorded_ref_reader(io_bytes, output_bytes).await;
+        let mut stream =
+            reader
+                .read((0..3).map(|index| {
+                    ref_read_request(&source, index, index * 4, 4, BlobRefDemand::Whole)
+                }))
+                .unwrap();
+        let first = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(first.data.as_deref(), Some(b"abcd".as_slice()));
+        assert_eq!(budget.reserved_bytes().unwrap(), 8);
+        assert!(stream.try_next().now_or_never().is_none());
+        assert_eq!(recorded.requested_blob_ranges(), vec![0..4]);
+        let retained = first.data.clone();
+        drop(first);
+        assert!(stream.try_next().now_or_never().is_none());
+        drop(retained);
+        let second = tokio::time::timeout(Duration::from_secs(1), stream.try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.data.as_deref(), Some(b"efgh".as_slice()));
+        drop(second);
+        let third = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(third.data.as_deref(), Some(b"ijkl".as_slice()));
+        drop(third);
+        assert!(stream.try_next().await.unwrap().is_none());
+        assert_eq!(recorded.requested_blob_ranges(), vec![0..4, 4..8, 8..12]);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn read_refs_cancels_budget_wait_without_losing_the_next_admission() {
+        let (reader, source, budget, _) = recorded_ref_reader(4, 8).await;
+        let mut stream = reader
+            .read([
+                ref_read_request(&source, 10, 0, 4, BlobRefDemand::Whole),
+                ref_read_request(&source, 20, 4, 4, BlobRefDemand::Whole),
+            ])
+            .unwrap();
+        let first = stream.try_next().await.unwrap().unwrap();
+        assert!(stream.try_next().now_or_never().is_none());
+        stream.cancel();
+        let error = stream.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("request 20 source_context 0"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        drop(stream);
+        assert_eq!(budget.reserved_bytes().unwrap(), 8);
+        drop(first);
+        let mut next = reader
+            .read([ref_read_request(&source, 30, 8, 4, BlobRefDemand::Whole)])
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), next.try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.data.as_deref(), Some(b"ijkl".as_slice()));
+        drop(result);
+        drop(next);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[rstest]
+    #[case::cancel(true)]
+    #[case::drop(false)]
+    #[tokio::test]
+    async fn read_refs_cancels_inflight_io(#[case] cancel: bool) {
+        let (store, recorded, gate) = gated_range_store(
+            Bytes::from_static(b"abcdefgh"),
+            "mock://recording/blob-range-tests",
+        );
+        let (binding, source) = recorded_ref_binding(store, "catalog/table").await;
+        let budget = BlobMaterializationContext::try_new(4, 8).unwrap();
+        let reader = BlobRefReader::try_new(vec![binding], budget.clone()).unwrap();
+        let mut stream = reader
+            .read([ref_read_request(&source, 70, 0, 4, BlobRefDemand::Whole)])
+            .unwrap();
+        assert!(stream.try_next().now_or_never().is_none());
+        tokio::time::timeout(Duration::from_secs(1), recorded.wait_for_blob_requests(1))
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved_bytes().unwrap(), 8);
+        assert_eq!(budget.io_reserved_bytes().unwrap(), 4);
+        if cancel {
+            let token = stream.cancellation_token();
+            token.cancel();
+            let error = stream.try_next().await.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("request 70"), "{error}");
+            assert!(error.to_string().contains("cancelled"), "{error}");
+        }
+        drop(stream);
+        // A backend already reading owns its admission until that read finishes.
+        assert_eq!(budget.reserved_bytes().unwrap(), 8);
+        assert_eq!(budget.io_reserved_bytes().unwrap(), 4);
+        gate.add_permits(1);
+        wait_for_ref_budget_release(&budget).await;
+        assert_eq!(recorded.active_blob_requests.load(Ordering::Acquire), 0);
+        gate.add_permits(1);
+        let mut next = reader
+            .read([ref_read_request(&source, 80, 4, 4, BlobRefDemand::Whole)])
+            .unwrap();
+        assert_eq!(
+            next.try_next().await.unwrap().unwrap().data.as_deref(),
+            Some(b"efgh".as_slice())
+        );
+        drop(next);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn read_refs_cancels_buffered_output() {
+        let (reader, source, budget, _) = recorded_ref_reader(16, 32).await;
+        let mut stream = reader
+            .read([
+                ref_read_request(&source, 1, 0, 4, BlobRefDemand::Whole),
+                ref_read_request(&source, 2, 4, 4, BlobRefDemand::Whole),
+            ])
+            .unwrap();
+        let first = stream.try_next().await.unwrap().unwrap();
+        stream.cancel();
+        let error = stream.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("cancelled"));
+        assert!(stream.try_next().await.unwrap().is_none());
+        assert_eq!(budget.reserved_bytes().unwrap(), 16);
+        drop(first);
+        drop(stream);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn read_refs_shares_io_budget_between_readers() {
+        let (first_store, first_recorded, first_gate) = gated_range_store(
+            Bytes::from_static(b"abcdefgh"),
+            "mock://recording/blob-range-tests",
+        );
+        let (second_store, second_recorded, second_gate) = gated_range_store(
+            Bytes::from_static(b"ijklmnop"),
+            "mock://recording/blob-range-tests",
+        );
+        let (first_binding, first_source) =
+            recorded_ref_binding(first_store, "catalog/first").await;
+        let (second_binding, second_source) =
+            recorded_ref_binding(second_store, "catalog/second").await;
+        let budget = BlobMaterializationContext::try_new(4, 64).unwrap();
+        let first_reader = BlobRefReader::try_new(vec![first_binding], budget.clone()).unwrap();
+        let second_reader = BlobRefReader::try_new(vec![second_binding], budget.clone()).unwrap();
+        let mut first = first_reader
+            .read([ref_read_request(
+                &first_source,
+                10,
+                0,
+                4,
+                BlobRefDemand::Whole,
+            )])
+            .unwrap();
+        let mut second = second_reader
+            .read([ref_read_request(
+                &second_source,
+                20,
+                0,
+                4,
+                BlobRefDemand::Whole,
+            )])
+            .unwrap();
+
+        assert!(first.try_next().now_or_never().is_none());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            first_recorded.wait_for_blob_requests(1),
+        )
+        .await
+        .unwrap();
+        assert!(second.try_next().now_or_never().is_none());
+        assert_eq!(budget.reserved_bytes().unwrap(), 16);
+        assert_eq!(budget.io_reserved_bytes().unwrap(), 4);
+        assert_eq!(
+            second_recorded
+                .started_blob_requests
+                .load(Ordering::Acquire),
+            0
+        );
+        drop(first);
+        assert!(second.try_next().now_or_never().is_none());
+        assert_eq!(
+            second_recorded
+                .started_blob_requests
+                .load(Ordering::Acquire),
+            0
+        );
+        first_gate.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            let release = async {
+                second_recorded.wait_for_blob_requests(1).await;
+                assert_eq!(budget.io_reserved_bytes().unwrap(), 4);
+                second_gate.add_permits(1);
+            };
+            let (result, ()) = tokio::join!(second.try_next(), release);
+            result.unwrap().unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.data.as_deref(), Some(b"ijkl".as_slice()));
+        drop(result);
+        drop(second);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn read_refs_keeps_equal_uris_in_different_bindings_separate() {
+        let (first_store, first_recorded) = recording_range_store(Bytes::from_static(b"abc"));
+        let (second_store, second_recorded) = recording_range_store(Bytes::from_static(b"xyz"));
+        assert_eq!(first_store.store_prefix, second_store.store_prefix);
+        let (first, first_source) = recorded_ref_binding(first_store, "catalog/first").await;
+        let (second, second_source) = recorded_ref_binding(second_store, "catalog/second").await;
+        let budget = BlobMaterializationContext::try_new(16, 32).unwrap();
+        let reader = BlobRefReader::try_new(vec![first, second], budget).unwrap();
+        let first = ref_read_request(&first_source, 100, 0, 3, BlobRefDemand::Whole);
+        let mut second = ref_read_request(&second_source, 200, 0, 3, BlobRefDemand::Whole);
+        let reference = second.reference.take().unwrap();
+        second.reference =
+            Some(BlobRef::try_new(1, reference.locator().to_vec(), reference.length()).unwrap());
+        let results = reader
+            .read([second, first])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let results = results
+            .into_iter()
+            .map(|result| (result.request_index, result.data.unwrap()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(results[&100].as_ref(), b"abc");
+        assert_eq!(results[&200].as_ref(), b"xyz");
+        assert_eq!(first_recorded.requested_blob_ranges(), vec![0..3]);
+        assert_eq!(second_recorded.requested_blob_ranges(), vec![0..3]);
+    }
+
+    #[tokio::test]
+    async fn read_refs_from_captured_multifragment_descriptors() {
+        let dataset = capture_dataset("memory://").await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let batch = capture_ref_batch(&dataset, &source).await;
+        let batch = BlobRefBatch::decode(&batch.encode().unwrap()).unwrap();
+        let budget = BlobMaterializationContext::try_new(4096, 8192).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source, dataset).unwrap()],
+            budget,
+        )
+        .unwrap();
+        let requests = (0..6).map(|index| {
+            BlobRefRequest::new(
+                100 + index as u64,
+                batch.reference(index).unwrap(),
+                BlobRefDemand::Whole,
+            )
+        });
+        let results = reader
+            .read(requests)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let results = results
+            .into_iter()
+            .map(|result| (result.request_index, result.data))
+            .collect::<HashMap<_, _>>();
+        for (index, expected) in [
+            Some(b"abc".as_slice()),
+            Some(b"abcde"),
+            Some(b"abcdefghij"),
+            None,
+            Some(b""),
+            Some(b"uv"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(results[&(100 + index as u64)].as_deref(), expected);
+        }
+    }
+
+    #[rstest]
+    #[case::absolute(false)]
+    #[case::registered(true)]
+    #[tokio::test]
+    async fn read_refs_caches_unknown_external_lengths(#[case] is_registered: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let (dataset, path) = capture_external_dataset(directory.path(), None, is_registered).await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap()
+            .with_external_immutability_assumption();
+        let batch = capture_ref_batch(&dataset, &source).await;
+        let reference = batch.reference(0).unwrap();
+        let budget = BlobMaterializationContext::try_new(64, 128).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source, dataset).unwrap()],
+            budget,
+        )
+        .unwrap();
+        let mut stream = reader
+            .read([BlobRefRequest::new(
+                10,
+                reference.clone(),
+                BlobRefDemand::Range(BlobReadRange::new(2, 3)),
+            )])
+            .unwrap();
+        assert_eq!(
+            stream.try_next().await.unwrap().unwrap().data.as_deref(),
+            Some(b"cde".as_slice())
+        );
+        drop(stream);
+        // A bounds error after removing the object proves cached metadata is used.
+        std::fs::remove_file(path).unwrap();
+        let mut invalid = reader
+            .read([BlobRefRequest::new(
+                11,
+                reference,
+                BlobRefDemand::Range(BlobReadRange::new(9, 1)),
+            )])
+            .unwrap();
+        let error = invalid.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("request 11 source_context 0"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("exceeds length 8"), "{error}");
+    }
+
+    #[rstest]
+    #[case::bounds("bounds", "exceeds blob length")]
+    #[case::overflow("overflow", "overflows u64")]
+    #[case::missing_slot("slot", "missing source_context slot 99")]
+    #[case::wrong_source("source", "does not match source_context")]
+    #[case::wrong_authority("authority", "outside its bound storage root")]
+    #[case::duplicate_index("index", "Duplicate blob request_index")]
+    #[tokio::test]
+    async fn read_refs_rejects_invalid_demands_before_io(
+        #[case] invalid: &str,
+        #[case] message: &str,
+    ) {
+        let (reader, source, _, recorded) = recorded_ref_reader(16, 32).await;
+        let mut request = ref_read_request(&source, 42, 0, 8, BlobRefDemand::Whole);
+        match invalid {
+            "bounds" => request.demand = BlobRefDemand::Range(BlobReadRange::new(9, 0)),
+            "overflow" => request.demand = BlobRefDemand::Range(BlobReadRange::new(u64::MAX, 2)),
+            "slot" => {
+                let reference = request.reference.take().unwrap();
+                request.reference = Some(
+                    BlobRef::try_new(99, reference.locator().to_vec(), reference.length()).unwrap(),
+                );
+            }
+            "source" => request.reference = Some(reference(&context(1, None), 0, Some(8))),
+            "authority" => {
+                request.reference = Some(
+                    source
+                        .reference(
+                            "s3://other/table/blob".to_string(),
+                            0,
+                            Some(8),
+                            BlobKind::Packed,
+                            None,
+                        )
+                        .unwrap(),
+                )
+            }
+            "index" => {}
+            _ => unreachable!(),
+        }
+        let mut requests = vec![request];
+        if invalid == "index" {
+            requests.push(BlobRefRequest::new(42, None, BlobRefDemand::Whole));
+        }
+        let error = reader.read(requests).err().unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+        assert!(recorded.requested_ranges().is_empty());
+    }
+
+    #[rstest]
+    #[case::zero_io(0, 1)]
+    #[case::zero_output(1, 0)]
+    fn read_refs_rejects_zero_budgets(#[case] io: u64, #[case] output: u64) {
+        let error = BlobMaterializationContext::try_new(io, output).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("must be nonzero"));
+    }
+
+    #[tokio::test]
+    async fn read_refs_empty_and_null_requests_need_no_bindings() {
+        let budget = BlobMaterializationContext::try_new(1, 1).unwrap();
+        let reader = BlobRefReader::try_new(vec![], budget.clone()).unwrap();
+        assert!(reader.read([]).unwrap().try_next().await.unwrap().is_none());
+        let values = reader
+            .read([
+                BlobRefRequest::new(17, None, BlobRefDemand::Whole),
+                BlobRefRequest::new(90, None, BlobRefDemand::Range(BlobReadRange::new(100, 5))),
+            ])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            values,
+            vec![
+                ReadBlobRef {
+                    request_index: 17,
+                    data: None
+                },
+                ReadBlobRef {
+                    request_index: 90,
+                    data: None
+                }
+            ]
+        );
+        assert_eq!(budget.reserved_bytes().unwrap(), 0);
+        let mut complete = reader
+            .read([BlobRefRequest::new(1, None, BlobRefDemand::Whole)])
+            .unwrap();
+        assert!(complete.try_next().await.unwrap().is_some());
+        complete.cancel();
+        assert!(complete.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_refs_payload_error_is_not_null_and_releases_budgets() {
+        let directory = tempfile::tempdir().unwrap();
+        let (dataset, path) = capture_external_dataset(
+            directory.path(),
+            Some(crate::blob::BlobRange { offset: 2, size: 3 }),
+            false,
+        )
+        .await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap()
+            .with_external_immutability_assumption();
+        let batch = capture_ref_batch(&dataset, &source).await;
+        let owned_path = directory.path().join("table/owned.bin");
+        std::fs::write(&owned_path, b"abc").unwrap();
+        let owned = source
+            .reference(
+                url::Url::from_file_path(owned_path).unwrap().into(),
+                0,
+                Some(3),
+                BlobKind::Managed,
+                None,
+            )
+            .unwrap();
+        let budget = BlobMaterializationContext::try_new(64, 128).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source, dataset).unwrap()],
+            budget.clone(),
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut stream = reader
+            .read([
+                BlobRefRequest::new(71, batch.reference(0).unwrap(), BlobRefDemand::Whole),
+                BlobRefRequest::new(72, Some(owned), BlobRefDemand::Whole),
+            ])
+            .unwrap();
+        let error = stream.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("request 71 source_context 0"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("payload read failed"), "{error}");
+        assert!(stream.try_next().await.unwrap().is_none());
+        drop(stream);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn read_refs_validates_bindings_and_requires_finite_budgets() {
+        let (store, _) = recording_range_store(Bytes::from_static(b"abc"));
+        let (binding, _) = recorded_ref_binding(store, "catalog/table").await;
+        let budget = BlobMaterializationContext::try_new(16, 32).unwrap();
+        let error = BlobRefReader::try_new(vec![binding.clone(), binding.clone()], budget)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Duplicate"));
+        let error =
+            BlobRefReader::try_new(vec![binding], BlobMaterializationContext::new(None, None))
+                .err()
+                .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("finite budgets"));
+        let dataset = capture_dataset("memory://").await;
+        let error = BlobRefBinding::try_new(context(1, None), dataset)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match dataset snapshot")
         );
     }
 
