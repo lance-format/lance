@@ -2840,7 +2840,7 @@ mod composite {
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
-        ConfigUpdate, DropField, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
+        ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
         ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
@@ -3081,8 +3081,9 @@ mod composite {
                     Action::AddDataFile(AddDataFile {
                         fragment: Ref::Local(0),
                         file: borrowed_file,
-                        field_ids: vec![Ref::Local(0)],
+                        field_ids: vec![FieldRef::Local(0)],
                         data_change: true,
+                        base: None,
                     }),
                 ],
             ))
@@ -3186,6 +3187,7 @@ mod composite {
                     base_id: None,
                 }),
                 data_change: true,
+                base: None,
             })],
         )
         .await;
@@ -3206,7 +3208,7 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![Action::AlterField(AlterField {
-                field: Ref::Committed(field_id as u64),
+                field: FieldRef::Committed(field_id),
                 name: Some("renamed".into()),
                 nullable: Some(true),
             })],
@@ -3281,6 +3283,7 @@ mod composite {
                         base_id: None,
                     }),
                     data_change: true,
+                    base: None,
                 })],
             )
         };
@@ -3326,21 +3329,23 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file: first_file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
                 // The same commit then replaces the data it just added, naming the
                 // fragment by the token it was minted under.
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Local(0),
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file: second_file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -3383,8 +3388,9 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(fragment_id),
                     file,
-                    field_ids: vec![Ref::Local(0)],
+                    field_ids: vec![FieldRef::Local(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -3411,7 +3417,7 @@ mod composite {
             dataset,
             vec![
                 Action::DropField(DropField {
-                    field: Ref::Committed(0),
+                    field: FieldRef::Committed(0),
                 }),
                 Action::AddField(AddField {
                     local: 0,
@@ -3426,8 +3432,9 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(fragment_id),
                     file,
-                    field_ids: vec![Ref::Local(0)],
+                    field_ids: vec![FieldRef::Local(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -3522,8 +3529,9 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(2),
                     file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -3602,7 +3610,7 @@ mod composite {
                     "step",
                     vec![Action::TombstoneFieldData(TombstoneFieldData {
                         fragment: Ref::Committed(fragment_id),
-                        field_ids: vec![Ref::Committed(0)],
+                        field_ids: vec![FieldRef::Committed(0)],
                         data_change: true,
                     })],
                 )])),
@@ -3641,8 +3649,9 @@ mod composite {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
                 file: existing_data_file(dataset, 0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
+                base: None,
             }),
         ]
     }
@@ -3671,8 +3680,9 @@ mod composite {
             actions.push(Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(fragment.id),
                 file: existing_data_file(dataset, index),
-                field_ids: vec![Ref::Local(0)],
+                field_ids: vec![FieldRef::Local(0)],
                 data_change: true,
+                base: None,
             }));
         }
         actions
@@ -3705,7 +3715,7 @@ mod composite {
         commit(
             test_dataset(false).await,
             vec![Action::AlterField(AlterField {
-                field: Ref::Committed(0),
+                field: FieldRef::Committed(0),
                 name: None,
                 nullable: Some(true),
             })],
@@ -3715,7 +3725,7 @@ mod composite {
 
     fn tighten_field_zero() -> Vec<Action> {
         vec![Action::AlterField(AlterField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
             name: None,
             nullable: Some(false),
         })]
@@ -3754,7 +3764,7 @@ mod composite {
                 def: int32_field("b"),
             }),
             Action::AlterField(AlterField {
-                field: Ref::Local(0),
+                field: FieldRef::Local(0),
                 name: None,
                 nullable: Some(false),
             }),
@@ -3763,8 +3773,9 @@ mod composite {
             add_and_tighten.push(Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(fragment.id),
                 file: existing_data_file(&original, index),
-                field_ids: vec![Ref::Local(0)],
+                field_ids: vec![FieldRef::Local(0)],
                 data_change: true,
+                base: None,
             }));
         }
         let append = append_with_field_zero(&original);
@@ -3810,8 +3821,9 @@ mod composite {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
                 file: existing_data_file(&with_b, 0),
-                field_ids: vec![Ref::Committed(b as u64)],
+                field_ids: vec![FieldRef::Committed(b)],
                 data_change: true,
+                base: None,
             }),
         ];
         let (first, stale) = if append_first {
@@ -3850,7 +3862,7 @@ mod composite {
         assert!(error.to_string().contains("Detached"), "{error}");
 
         detached(vec![Action::AlterField(AlterField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
             name: Some("renamed".into()),
             nullable: None,
         })])
@@ -3902,10 +3914,10 @@ mod composite {
             .await
             .map(|group| (group.0, group.1))
             .unwrap();
-        let fields: Vec<Ref> = file
+        let fields: Vec<FieldRef> = file
             .fields
             .iter()
-            .map(|id| Ref::Committed(*id as u64))
+            .map(|id| FieldRef::Committed(*id))
             .collect();
 
         let updated = commit(
@@ -3921,6 +3933,7 @@ mod composite {
                     file,
                     field_ids: fields,
                     data_change: true,
+                    base: None,
                 }),
             ],
         )

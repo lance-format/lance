@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::transaction::action::test_support::apply;
-    use crate::transaction::action::{Action, AddDataFile, ReserveFragmentIds};
+    use crate::transaction::action::{Action, AddDataFile, FieldRef, ReserveFragmentIds};
     use crate::transaction::test_support::sample_manifest;
     use lance_file::version::ConcreteFileVersion;
 
@@ -212,8 +212,9 @@ mod tests {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -305,8 +306,9 @@ mod tests {
                     // does not need a local token alongside the reserved id.
                     fragment: Ref::Committed(1),
                     file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )

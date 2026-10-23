@@ -5,7 +5,7 @@
 
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{Footprint, Ref};
+use super::{FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -21,7 +21,7 @@ use lance_core::{Error, Result};
 pub struct TombstoneFieldData {
     pub fragment: Ref,
     /// The fields whose current backing is tombstoned.
-    pub field_ids: Vec<Ref>,
+    pub field_ids: Vec<FieldRef>,
     /// `false` marks a tombstone whose data is re-added by an
     /// [`AddDataFile`](super::AddDataFile) for the same fields in the same
     /// operation, i.e. a re-encode that moves the bytes without changing any
@@ -36,7 +36,7 @@ impl TombstoneFieldData {
         let field_ids = self
             .field_ids
             .iter()
-            .map(|field| state.resolve_field(*field))
+            .map(|field| state.resolve_field(*field).map(|id| id.get()))
             .collect::<Result<Vec<_>>>()?;
         let fragment = state.fragment_mut(fragment_id, "TombstoneFieldData")?;
 
@@ -101,7 +101,7 @@ impl TryFrom<pb_actions::TombstoneFieldData> for TombstoneFieldData {
             field_ids: message
                 .field_ids
                 .into_iter()
-                .map(Ref::try_from)
+                .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
             data_change: data_change_from_wire(message.data_change),
         })
@@ -123,7 +123,7 @@ mod tests {
     fn tombstone_field_zero() -> Action {
         Action::TombstoneFieldData(TombstoneFieldData {
             fragment: Ref::Committed(0),
-            field_ids: vec![Ref::Committed(0)],
+            field_ids: vec![FieldRef::Committed(0)],
             data_change: true,
         })
     }
@@ -177,7 +177,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(7)],
+                field_ids: vec![FieldRef::Committed(7)],
                 data_change: true,
             })],
         )
@@ -202,12 +202,13 @@ mod tests {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(0),
                     file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V1),
-                    field_ids: vec![Ref::Local(0)],
+                    field_ids: vec![FieldRef::Local(0)],
                     data_change: true,
+                    base: None,
                 }),
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(0),
-                    field_ids: vec![Ref::Local(0)],
+                    field_ids: vec![FieldRef::Local(0)],
                     data_change: false,
                 }),
             ],

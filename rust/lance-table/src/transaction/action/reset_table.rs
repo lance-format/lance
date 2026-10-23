@@ -70,7 +70,7 @@ mod tests {
         added_field, apply, apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, Ref, ReserveFragmentIds,
+        Action, AddDataFile, AddField, AddFragment, FieldRef, Ref, ReserveFragmentIds,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use lance_file::version::ConcreteFileVersion;
@@ -128,8 +128,9 @@ mod tests {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
-                    field_ids: vec![Ref::Local(0)],
+                    field_ids: vec![FieldRef::Local(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -161,8 +162,9 @@ mod tests {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(token),
                 file: DataFile::new_unstarted(path, ConcreteFileVersion::V2_0),
-                field_ids: vec![Ref::Local(token)],
+                field_ids: vec![FieldRef::Local(token)],
                 data_change: true,
+                base: None,
             })
         };
         let next = apply(
@@ -233,8 +235,9 @@ mod tests {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
                 file: DataFile::new_unstarted("data/compacted.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: false,
+                base: None,
             }),
         ]);
         let records_nothing = footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds {

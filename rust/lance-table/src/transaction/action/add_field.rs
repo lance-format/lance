@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, Footprint, Ref};
+use super::{Coordinate, FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
@@ -20,7 +20,7 @@ pub struct AddField {
     /// Token standing in for the field id until it is allocated at apply.
     pub local: u32,
     /// The parent field, or `None` for a top-level column.
-    pub parent: Option<Ref>,
+    pub parent: Option<FieldRef>,
     /// The field definition. Its `id`, `parent_id`, and `children` are ignored:
     /// `local` and `parent` carry that structure, and each child is its own
     /// action.
@@ -32,7 +32,7 @@ impl AddField {
         let id = state.mint_field(self.local)?;
         let parent_id = self
             .parent
-            .map(|parent| state.resolve_field(parent))
+            .map(|parent| state.resolve_field(parent).map(|id| id.get()))
             .transpose()?;
         state.reject_duplicate_sibling_name(parent_id, &self.def.name, "AddField")?;
 
@@ -113,7 +113,7 @@ impl TryFrom<pb_actions::AddField> for AddField {
     fn try_from(message: pb_actions::AddField) -> Result<Self> {
         Ok(Self {
             local: message.local,
-            parent: message.parent.map(Ref::try_from).transpose()?,
+            parent: message.parent.map(FieldRef::try_from).transpose()?,
             def: Field::from(&required(message.def, "AddField.def")?),
         })
     }
@@ -124,7 +124,7 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::transaction::action::test_support::{added_field, apply};
-    use crate::transaction::action::{Action, AddDataFile};
+    use crate::transaction::action::{Action, AddDataFile, Ref};
     use crate::transaction::test_support::sample_manifest;
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_file::version::ConcreteFileVersion;
@@ -174,8 +174,9 @@ mod tests {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(0),
                     file: DataFile::new_unstarted("data/added.lance", ConcreteFileVersion::V2_0),
-                    field_ids: vec![Ref::Local(7)],
+                    field_ids: vec![FieldRef::Local(7)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -205,7 +206,7 @@ mod tests {
                 }),
                 Action::AddField(AddField {
                     local: 1,
-                    parent: Some(Ref::Local(0)),
+                    parent: Some(FieldRef::Local(0)),
                     def: added_field("child"),
                 }),
             ],
@@ -225,7 +226,7 @@ mod tests {
             &manifest,
             vec![Action::AddField(AddField {
                 local: 0,
-                parent: Some(Ref::Committed(7)),
+                parent: Some(FieldRef::Committed(7)),
                 def: added_field("orphan"),
             })],
         )
@@ -273,7 +274,7 @@ mod tests {
                 }),
                 Action::AddField(AddField {
                     local: 1,
-                    parent: Some(Ref::Local(0)),
+                    parent: Some(FieldRef::Local(0)),
                     def: added_field("id"),
                 }),
             ],
@@ -291,12 +292,12 @@ mod tests {
                 }),
                 Action::AddField(AddField {
                     local: 1,
-                    parent: Some(Ref::Local(0)),
+                    parent: Some(FieldRef::Local(0)),
                     def: added_field("child"),
                 }),
                 Action::AddField(AddField {
                     local: 2,
-                    parent: Some(Ref::Local(0)),
+                    parent: Some(FieldRef::Local(0)),
                     def: added_field("child"),
                 }),
             ],
