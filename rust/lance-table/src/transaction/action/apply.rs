@@ -761,6 +761,7 @@ mod tests {
     use super::*;
     use crate::feature_flags::{FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS};
     use crate::format::DataFile;
+    use crate::rowids::write_row_ids;
     use crate::system_index::mem_wal::{
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
         new_mem_wal_index_meta,
@@ -769,11 +770,13 @@ mod tests {
         added_field, apply, apply_with_indices, backed_manifest,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation, ConfigUpdate,
-        DropField, FieldMetadataUpdate, RemoveFragment, ResetTable, SetDeletionFile,
-        TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
+        ConfigUpdate, DropField, FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds,
+        ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
     };
-    use crate::transaction::test_support::{default_build_config, sample_index_metadata};
+    use crate::transaction::test_support::{
+        default_build_config, make_stable_row_id_manifest, sample_index_metadata,
+    };
     use crate::transaction::{DataReplacementGroup, Operation, UpdateMap};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_core::{ROW_ADDR, ROW_ID, ROW_ID_FIELD_ID};
@@ -1304,6 +1307,83 @@ mod tests {
             error
                 .to_string()
                 .contains("is a reserved name and cannot be used in a Lance dataset"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn config_update() -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            config: Some(UpdateMap {
+                update_entries: vec![("k", "v").into()],
+                replace: false,
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn fragment_counter_at_max() -> Manifest {
+        let mut manifest = backed_manifest();
+        manifest.max_fragment_id = Some(u32::MAX);
+        manifest
+    }
+
+    fn field_counter_at_max() -> Manifest {
+        let mut manifest = backed_manifest();
+        manifest.max_allocated_field_id = Some(i32::MAX);
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        manifest
+    }
+
+    fn base_counter_at_max() -> Manifest {
+        let mut manifest = backed_manifest();
+        manifest.base_paths.insert(
+            u32::MAX,
+            BasePath::new(u32::MAX, "s3://bucket/last".into(), None, false),
+        );
+        manifest
+    }
+
+    fn row_id_counter_at_max() -> Manifest {
+        let mut fragment = backed_manifest().fragments[0].clone();
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&(0..10).into()).into()));
+        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        manifest.next_row_id = u64::MAX - 5;
+        manifest
+    }
+
+    /// Every id counter is a high-water mark, and a mint past its maximum is
+    /// an error naming the counter, never a wrap. An operation that mints
+    /// nothing still commits on a table whose counter is spent.
+    #[rstest]
+    #[case::fragment(fragment_counter_at_max(), mint_fragment(0), "fragment id")]
+    #[case::fragment_reservation(
+        fragment_counter_at_max(),
+        Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 }),
+        "fragment id"
+    )]
+    #[case::field(field_counter_at_max(), mint_field(0, "added", None), "field id")]
+    #[case::base(
+        base_counter_at_max(),
+        Action::AddBase(AddBase {
+            local: 0,
+            base: BasePath::new(0, "s3://bucket/new".into(), None, false),
+        }),
+        "base id"
+    )]
+    #[case::row_id(row_id_counter_at_max(), mint_fragment(0), "row id")]
+    fn test_an_exhausted_counter_refuses_a_mint(
+        #[case] manifest: Manifest,
+        #[case] mint: Action,
+        #[case] counter: &str,
+    ) {
+        apply(&manifest, vec![config_update()]).unwrap();
+
+        let error = apply(&manifest, vec![mint]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{counter} counter is exhausted")),
             "unexpected error: {error}"
         );
     }
