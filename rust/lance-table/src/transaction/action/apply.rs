@@ -27,7 +27,7 @@ use crate::rowids::version::build_version_meta;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::Schema;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, is_system_column};
 use std::collections::{HashMap, HashSet};
 
 /// The field id written into a data file's field list once the file no longer
@@ -275,17 +275,26 @@ impl<'a> ApplyState<'a> {
         &mut self.schema
     }
 
-    /// Reject `name` if a field with that name already sits under `parent_id`
-    /// (or at the top level, for `None`). Field names are unique among
-    /// siblings, and this is the one place the schema is at hand to check it:
-    /// the footprint keeps two concurrent writers from taking one name, but a
-    /// name already committed is only visible here.
-    pub(super) fn reject_duplicate_sibling_name(
+    /// Check that a field may take `name` under `parent_id` (or at the top
+    /// level, for `None`). No field there may have it already: names are
+    /// unique among siblings, and this is the one place the schema is at hand
+    /// to check it -- the footprint keeps two concurrent writers from taking
+    /// one name, but a name already committed is only visible here.
+    ///
+    /// A top-level name may also not be a system column's: the scanner
+    /// injects those, so a stored one would collide with it on read. This is
+    /// the check the insert path makes.
+    pub(super) fn check_field_name(
         &self,
         parent_id: Option<i32>,
         name: &str,
         action: &str,
     ) -> Result<()> {
+        if parent_id.is_none() && is_system_column(name) {
+            return Err(Error::invalid_input(format!(
+                "The column {name} is a reserved name and cannot be used in a Lance dataset"
+            )));
+        }
         let siblings = match parent_id {
             None => &self.schema.fields,
             Some(parent_id) => {

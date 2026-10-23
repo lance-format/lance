@@ -34,7 +34,7 @@ impl AddField {
             .parent
             .map(|parent| state.resolve_schema_field(parent, "AddField"))
             .transpose()?;
-        state.reject_duplicate_sibling_name(parent_id, &self.def.name, "AddField")?;
+        state.check_field_name(parent_id, &self.def.name, "AddField")?;
 
         // The definition's own id, parent id, and children are ignored: the
         // minted id and the parent reference carry that structure, and each
