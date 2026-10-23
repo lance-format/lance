@@ -106,6 +106,7 @@ mod tests {
     use crate::transaction::action::{Action, Ref, RemoveFragment};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn refresh(fragment_ids: Vec<u64>) -> Action {
@@ -189,14 +190,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_refreshing_a_fragment_that_is_not_there_is_rejected() {
-        let error = apply(&manifest_with_rows(3), vec![refresh(vec![7])]).unwrap_err();
+    /// A fragment id the read version handed out but no longer holds, and
+    /// one it never handed out, which may since name another writer's
+    /// fragment.
+    #[rstest]
+    #[case::removed(
+        Some(7),
+        "RefreshRowVersionMetadata targets fragment 7, which does not exist"
+    )]
+    #[case::beyond_the_read_version(None, "fragment 7 by a Committed ref")]
+    fn test_refreshing_a_fragment_that_is_not_there_is_rejected(
+        #[case] fragment_mark: Option<u32>,
+        #[case] expected: &str,
+    ) {
+        let mut manifest = manifest_with_rows(3);
+        manifest.max_fragment_id = fragment_mark;
 
+        let error = apply(&manifest, vec![refresh(vec![7])]).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
-            error
-                .to_string()
-                .contains("RefreshRowVersionMetadata targets fragment 7, which does not exist"),
+            error.to_string().contains(expected),
             "unexpected error: {error}"
         );
     }
