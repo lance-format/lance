@@ -104,7 +104,9 @@ mod tests {
     use crate::format::{DataFile, Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
-    use crate::transaction::action::{Action, Ref, RemoveFragment};
+    use crate::transaction::action::{
+        Action, AddDataFile, AddFragment, FieldRef, Ref, RemoveFragment, TombstoneFieldData,
+    };
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
@@ -242,5 +244,86 @@ mod tests {
         assert!(removal(0).conflicts_with(&ours));
         assert!(!ours.conflicts_with(&removal(1)));
         assert!(!removal(1).conflicts_with(&ours));
+    }
+
+    fn rewrite_field_zero(fragment: Ref, data_change: bool) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if fragment.committed().is_some() {
+            actions.push(Action::TombstoneFieldData(TombstoneFieldData {
+                fragment,
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change,
+            }));
+        }
+        actions.push(Action::AddDataFile(AddDataFile {
+            fragment,
+            file: DataFile::new_unstarted("data/rewritten.lance", ConcreteFileVersion::V2_0),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change,
+            base: None,
+        }));
+        actions
+    }
+
+    fn append() -> Vec<Action> {
+        let mut actions = vec![Action::AddFragment(AddFragment {
+            id: Ref::Local(0),
+            physical_rows: 3,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })];
+        actions.extend(rewrite_field_zero(Ref::Local(0), true));
+        actions
+    }
+
+    /// Which rows a change restamps is not implied by the file it writes, so
+    /// apply does not derive it: a data change written into a fragment that
+    /// was already there has to say so with a refresh, or its rows keep the
+    /// versions from before the change and a reader of changes since then
+    /// misses them. A fragment the operation adds is stamped as a whole
+    /// anyway.
+    #[rstest]
+    #[case::rewrite_without_refresh(
+        true,
+        rewrite_field_zero(Ref::Committed(0), true),
+        Some("fragment 0")
+    )]
+    #[case::rewrite_with_refresh(
+        true,
+        [rewrite_field_zero(Ref::Committed(0), true), vec![refresh(vec![0])]].concat(),
+        None
+    )]
+    #[case::refresh_before_the_rewrite(
+        true,
+        [vec![refresh(vec![0])], rewrite_field_zero(Ref::Committed(0), true)].concat(),
+        None
+    )]
+    #[case::rearrangement(true, rewrite_field_zero(Ref::Committed(0), false), None)]
+    #[case::fragment_added_in_the_operation(true, append(), None)]
+    #[case::no_stable_row_ids(false, rewrite_field_zero(Ref::Committed(0), true), None)]
+    fn test_a_data_change_to_an_existing_fragment_needs_a_refresh(
+        #[case] stable_row_ids: bool,
+        #[case] actions: Vec<Action>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let manifest = if stable_row_ids {
+            manifest_with_rows(3)
+        } else {
+            backed_manifest()
+        };
+
+        let result = apply(&manifest, actions);
+
+        let Some(expected_error) = expected_error else {
+            result.unwrap();
+            return;
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(expected_error), "{message}");
+        assert!(message.contains("RefreshRowVersionMetadata"), "{message}");
     }
 }
