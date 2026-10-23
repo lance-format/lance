@@ -4,7 +4,7 @@
 //! Assert that the cells an operation read are unchanged.
 
 use super::apply::ApplyState;
-use super::{FieldRef, Footprint};
+use super::{FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
 use arrow_schema::DataType;
 use lance_core::deepsize::{Context, DeepSizeOf};
@@ -92,7 +92,9 @@ impl AssertCellsUnchanged {
             }
         }
         for selection in &self.rows {
-            state.fragment_mut(u64::from(selection.fragment_id), "AssertCellsUnchanged")?;
+            let fragment_id =
+                state.resolve_fragment(Ref::Committed(u64::from(selection.fragment_id)))?;
+            state.fragment_mut(fragment_id, "AssertCellsUnchanged")?;
         }
         Ok(())
     }

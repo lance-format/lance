@@ -4,7 +4,7 @@
 //! Restamp the row-version metadata of fragments rewritten in place.
 
 use super::apply::ApplyState;
-use super::{Coordinate, Footprint};
+use super::{Coordinate, Footprint, Ref};
 use crate::format::pb_actions;
 use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
 use lance_core::deepsize::DeepSizeOf;
@@ -46,7 +46,8 @@ impl RefreshRowVersionMetadata {
         }
         let new_version = state.new_version();
         for fragment_id in &self.fragment_ids {
-            let fragment = state.fragment_mut(*fragment_id, "RefreshRowVersionMetadata")?;
+            let fragment_id = state.resolve_fragment(Ref::Committed(*fragment_id))?;
+            let fragment = state.fragment_mut(fragment_id, "RefreshRowVersionMetadata")?;
             refresh_row_latest_update_meta_for_full_frag_rewrite_cols(fragment, new_version)?;
         }
         Ok(())
