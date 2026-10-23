@@ -483,6 +483,8 @@ mod tests {
             name: "by_a".into(),
             add_fragments: vec![Ref::Committed(1)],
             remove_fragments: vec![0],
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: Vec::new(),
         });
         assert!(
             !adjust.is_data_change(),

@@ -434,7 +434,7 @@ mod tests {
         TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
-    use crate::transaction::{Operation, Transaction};
+    use crate::transaction::{Operation, ReadVersionState, Transaction};
     use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
@@ -496,9 +496,10 @@ mod tests {
     fn test_a_relocated_segment_reflects_the_version_it_was_built_against() {
         // Stand in for a retry: the set was built against `read_version` and is
         // being applied to a manifest two commits further along.
-        let mut manifest = backed_manifest();
+        let read = backed_manifest();
+        let mut manifest = read.clone();
         manifest.version += 2;
-        let read_version = manifest.version - 2;
+        let read_version = read.version;
 
         let transaction = Transaction::new(
             read_version,
@@ -512,11 +513,15 @@ mod tests {
             None,
         );
         let (_, indices) = transaction
-            .build_manifest(
+            .build_manifest_with_read_version(
                 Some(&manifest),
                 Vec::new(),
                 "tx.txn",
                 &default_build_config(),
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
             )
             .unwrap();
 
@@ -528,9 +533,10 @@ mod tests {
     /// have seen, however far the manifest has moved since.
     #[test]
     fn test_a_segment_cannot_reflect_a_version_committed_after_the_one_it_read() {
-        let mut manifest = backed_manifest();
+        let read = backed_manifest();
+        let mut manifest = read.clone();
         manifest.version += 2;
-        let read_version = manifest.version - 2;
+        let read_version = read.version;
 
         let transaction = Transaction::new(
             read_version,
@@ -544,11 +550,15 @@ mod tests {
             None,
         );
         let error = transaction
-            .build_manifest(
+            .build_manifest_with_read_version(
                 Some(&manifest),
                 Vec::new(),
                 "tx.txn",
                 &default_build_config(),
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
             )
             .unwrap_err();
 
@@ -960,6 +970,8 @@ mod tests {
                 name: "mixed".into(),
                 add_fragments: Vec::new(),
                 remove_fragments: Vec::new(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
             })],
             existing,
         )
@@ -1132,7 +1144,7 @@ mod tests {
 
     #[rstest]
     #[case::unbound_local_token(Ref::Local(0), "local base token 0")]
-    #[case::committed_id_the_manifest_lacks(Ref::Committed(3), "base id 3")]
+    #[case::committed_id_the_manifest_lacks(Ref::Committed(0), "base id 0")]
     fn test_a_segment_base_must_exist(#[case] base: Ref, #[case] expected: &str) {
         let error = apply_with_indices(
             &backed_manifest(),

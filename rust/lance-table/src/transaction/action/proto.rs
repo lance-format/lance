@@ -286,6 +286,8 @@ mod tests {
                 name: "by_b".into(),
                 add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
                 remove_fragments: vec![2, 3],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: vec![FieldRef::Committed(1)],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
@@ -386,6 +388,8 @@ mod tests {
             name: String::new(),
             add_fragments: Vec::new(),
             remove_fragments: Vec::new(),
+            fields: Vec::new(),
+            covering_fields: Vec::new(),
         })),
     }, "AdjustIndexCoverage.name")]
     fn test_an_index_action_without_a_name_is_rejected(
