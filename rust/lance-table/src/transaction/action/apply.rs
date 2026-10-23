@@ -741,7 +741,7 @@ mod tests {
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{DataReplacementGroup, Operation, UpdateMap};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-    use lance_core::ROW_ID_FIELD_ID;
+    use lance_core::{ROW_ADDR, ROW_ID, ROW_ID_FIELD_ID};
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -1206,6 +1206,69 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
             error.to_string().contains("names reserved field id -3"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn struct_field(name: &str) -> lance_core::datatypes::Field {
+        lance_core::datatypes::Field::try_from(ArrowField::new(
+            name,
+            DataType::Struct(Fields::empty()),
+            true,
+        ))
+        .unwrap()
+    }
+
+    /// The scanner injects the system columns at the top level, so a stored
+    /// column by one of those names would collide with it on read. Nested
+    /// fields are addressed through their parent and cannot collide.
+    #[rstest]
+    #[case::add_top_level(
+        vec![mint_field(0, ROW_ID, None)],
+        true
+    )]
+    #[case::add_nested(
+        vec![
+            Action::AddField(AddField { local: 0, parent: None, def: struct_field("s") }),
+            mint_field(1, ROW_ID, Some(FieldRef::Local(0))),
+        ],
+        false
+    )]
+    #[case::rename_top_level(
+        vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: Some(ROW_ADDR.into()),
+            nullable: None,
+        })],
+        true
+    )]
+    #[case::rename_nested(
+        vec![
+            Action::AddField(AddField { local: 0, parent: None, def: struct_field("s") }),
+            mint_field(1, "child", Some(FieldRef::Local(0))),
+            Action::AlterField(AlterField {
+                field: FieldRef::Local(1),
+                name: Some(ROW_ADDR.into()),
+                nullable: None,
+            }),
+        ],
+        false
+    )]
+    fn test_a_top_level_field_may_not_take_a_system_column_name(
+        #[case] actions: Vec<Action>,
+        #[case] rejected: bool,
+    ) {
+        let result = apply(&backed_manifest(), actions);
+        if !rejected {
+            result.unwrap();
+            return;
+        }
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("is a reserved name and cannot be used in a Lance dataset"),
             "unexpected error: {error}"
         );
     }
