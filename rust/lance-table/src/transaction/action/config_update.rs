@@ -75,7 +75,7 @@ impl ConfigUpdate {
         let writes_clustering_key = self.writes_any(&[LANCE_UNENFORCED_CLUSTERING_KEY_POSITION]);
 
         for update in &self.field_metadata {
-            let field_id = state.resolve_field(update.field)?.get();
+            let field_id = state.resolve_schema_field(update.field, "ConfigUpdate")?;
             let field = state
                 .schema_mut()
                 .field_by_id_mut(field_id)
