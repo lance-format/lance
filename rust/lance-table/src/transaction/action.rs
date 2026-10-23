@@ -128,6 +128,11 @@ use lance_core::{
 /// `AddField`s on divergent branches become two distinct fields rather than a
 /// collision.
 ///
+/// A committed id must exist at the operation's read version: apply rejects
+/// one above that version's high-water mark, since a concurrent commit may
+/// have minted it since. An object minted in the same operation is named by
+/// its local token.
+///
 /// Local tokens are scoped to one [`CompositeOperation`] and must be distinct within
 /// it. The id spaces (fragment, field, base) do not share a token namespace: a
 /// fragment token 0 and a field token 0 are unrelated.

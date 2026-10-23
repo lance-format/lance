@@ -25,8 +25,8 @@ pub struct AddFragment {
     /// allocated at apply, which re-allocates when the operation is replayed
     /// onto a newer version.
     ///
-    /// [`Ref::Committed`] names an id out of a range an earlier commit reserved
-    /// with [`ReserveFragmentIds`](super::ReserveFragmentIds). It exists for a
+    /// [`Ref::Committed`] names an id out of a range a commit at or before the
+    /// read version reserved with [`ReserveFragmentIds`](super::ReserveFragmentIds). It exists for a
     /// writer that has to know the id before it commits, because it bakes row
     /// addresses into an index it writes in the same commit. Such an id is the
     /// writer's alone and stays valid at every later version, so it does not

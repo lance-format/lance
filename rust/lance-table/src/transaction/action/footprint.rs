@@ -25,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 ///
 /// Only committed coordinates appear. A minted fragment, field, or base has no
 /// id in the read version, so no concurrent writer can be naming the same
-/// thing; relocation re-resolves it against whatever version wins.
+/// thing; relocation re-resolves it against whatever version wins. Apply
+/// rejects a committed id above the read version's high-water mark, so a
+/// committed coordinate always names something the writer read.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Coordinate {
     /// Whether a committed fragment is still part of the dataset.

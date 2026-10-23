@@ -233,7 +233,8 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("parent field 7"), "{error}");
+        // Above the read version's field mark, so it cannot name a parent.
+        assert!(error.to_string().contains("field 7"), "{error}");
     }
 
     #[test]
