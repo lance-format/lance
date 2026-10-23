@@ -5,10 +5,10 @@ moving lazy blob values between processes. It carries source contexts and nullab
 reference arrays through exchange, spill, and retries. It does not change stored
 Blob v2 descriptors or any persisted Lance format.
 
-Protocol version 1 supplies transport, descriptor capture, validation, and context
-remapping. Fetching reference payloads, binding APIs, and coordinated snapshot
-retention are separate capabilities. Serializing a reference does not provide
-these capabilities.
+Protocol version 1 supplies transport, descriptor capture, validation, context
+remapping, and planned Rust reference reads. Java/Python bindings and coordinated
+snapshot retention are separate capabilities. Serializing a reference does not
+authenticate a worker or retain source files.
 
 ## Source contexts
 
@@ -125,6 +125,88 @@ whole-object lengths remain unknown; a later reader must resolve and cache that
 metadata. External references require the source context's explicit immutability
 assumption. The application must retain source snapshots through all deferred
 reads and retries, as described below.
+
+## Reading references
+
+`BlobRefReader` accepts full-value and blob-local range demands. On each worker,
+resolve every context's `access_context_key` to authenticated storage settings and
+open its exact branch and version. Pair that snapshot with its transported context
+using `BlobRefBinding::try_new`. Supply bindings in the same slot order as the
+reference context table. Construction checks the loaded manifest; each request
+also checks its locator fingerprint, registered base, and bound storage root.
+
+```rust
+use futures::TryStreamExt;
+use lance::Result;
+use lance::blob::reference::{
+    BlobMaterializationContext, BlobReadRange, BlobRef, BlobRefBinding,
+    BlobRefDemand, BlobRefReader, BlobRefRequest,
+};
+
+async fn fetch(bindings: Vec<BlobRefBinding>, reference: Option<BlobRef>) -> Result<()> {
+    let budget = BlobMaterializationContext::try_new(1 << 20, 8 << 20)?;
+    let reader = BlobRefReader::try_new(bindings, budget)?;
+    let mut results = reader.read([
+        BlobRefRequest::new(7, reference.clone(), BlobRefDemand::Whole),
+        BlobRefRequest::new(19, reference, BlobRefDemand::Range(BlobReadRange::new(0, 16))),
+    ])?;
+    while let Some(result) = results.try_next().await? {
+        // Route by result.request_index and consume result.data here.
+        // Drop the result before requesting more than the budget can retain.
+        let _ = result.request_index;
+    }
+    Ok(())
+}
+```
+
+Request indices are engine supplied and must be unique within an operation.
+Completion order is unspecified; repeated references still produce separate
+indexed results. SQL nulls return `None`, while empty values and empty ranges
+return a non-null empty buffer. Nulls do not require a source binding or payload
+bounds, but all range arithmetic must be valid. Non-null ranges must fit the
+logical blob, including an empty range at its end.
+
+Reader sessions cache object resolution and unknown external lengths across
+operations. Known lengths require no HEAD request. An unknown external length
+requires one successful metadata lookup per object and binding; a later demand
+uses the cached size. Payload fetching never takes rows or rereads descriptors.
+Registered storage bases use their bound routing; standalone external URIs use
+the authenticated snapshot's registry and storage parameters.
+
+The existing Lance planner groups compatible backing objects, merges overlapping
+and nearby physical ranges, and shares immutable byte buffers for duplicate and
+overlapping demands. Equal URIs with distinct object-store bindings remain
+separate. The I/O scheduler is shared through `BlobMaterializationContext`.
+
+Both context limits must be nonzero. Reference reads sharing a context share an
+aggregate I/O admission budget and a materialization budget. Each bounded batch
+charges its coalesced physical spans plus its logical result lengths, counting
+duplicates separately. This also allows an adapter to construct one copied output
+per request while retaining the corresponding returned buffers. Planning metadata
+is proportional to request count; session metadata is proportional to the distinct
+objects touched. These limits govern payload bytes, not that metadata.
+
+One request whose charge exceeds a limit is admitted alone when that budget is
+idle. A limit therefore does not impose a hard cap on a single oversized value.
+Applications requiring a hard maximum must split large values into range demands.
+
+Returned `Bytes`, their clones, and their slices retain the batch's materialization
+reservation until the last owner is dropped. An adapter copying results into Arrow
+arrays must retain those owners alongside the arrays, or acquire and retain a
+separate output reservation through `budget.admission().reserve(bytes).await`.
+Arbitrary additional copies are outside the reader's accounting. Use
+`reserved_bytes()` and `io_reserved_bytes()` to observe outstanding reservations.
+Retaining all results while collecting a multi-batch stream can fill the budget
+and prevent the next batch from proceeding; consume and release results as the
+stream advances.
+
+Call `stream.cancel()` or obtain `stream.cancellation_token()` for another task.
+Cancellation interrupts metadata, admission, and read waits. Dropping a stream
+also discards pending outputs and readers. Backend I/O already submitted may
+finish before its cancelled response is discarded; its reader retains both
+reservations until that happens. Previously yielded buffers remain valid and
+keep their reservations. A read error terminates the operation and marks all
+remaining demands incomplete; it never substitutes null values for failures.
 
 ## Reference values
 
