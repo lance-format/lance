@@ -673,6 +673,26 @@ declaring `FLAG_INDEPENDENT_COVERING_FIELDS`; until a release implements that
 flag, apply rejects the overlapping form and lowers a disjoint one to the
 legacy subset representation.
 
+Field references are `FieldRef`s rather than the `Ref` that fragments and
+bases use, because a field id is signed: an `AddDataFile` binds a data file's
+columns with the same ids its `DataFile.fields` would carry, including the
+reserved negative ids of the hidden row lineage columns. A data file inside an
+action leaves `fields` and `base_id` unset, and apply stamps them from the
+action's `field_ids` and `base`.
+
+Actions apply in order, with one exception: `ReserveFragmentIds` and
+`ReserveRowIds` are summed and taken after the operation's own mints, wherever
+they appear. A reservation creates nothing another action can reference, so
+this has no other visible effect within the operation, and a fragment can claim
+a reserved id only from an earlier commit's reservation. `ResetTable` discards
+objects but never rewinds the id counters.
+
+`data_change` is per action. `false` asserts the action changes no row's
+values: the rows it adds, removes, or rebinds are the same logical rows with
+the same values before and after, as when compaction moves rows or a column
+file is re-encoded. Change-data-capture readers emit rows only from
+`data_change = true` actions, and one operation may mix both.
+
 ### Compatibility
 
 A `CompositeOperation` produces an ordinary manifest, so a reader that scans a
