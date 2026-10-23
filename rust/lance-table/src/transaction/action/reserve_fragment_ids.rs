@@ -68,6 +68,7 @@ mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply, backed_manifest};
     use crate::transaction::action::{Action, AddFragment, Ref};
+    use rstest::rstest;
 
     fn reserve(count: u32) -> Action {
         Action::ReserveFragmentIds(ReserveFragmentIds { count })
@@ -96,15 +97,26 @@ mod tests {
         assert_eq!(next.fragments.len(), 1);
     }
 
-    #[test]
-    fn test_a_later_mint_skips_the_reserved_range() {
-        let next = apply(&backed_manifest(), vec![reserve(3), add_fragment(0)]).unwrap();
+    /// The reservation is taken after the operation's own mints wherever the
+    /// action sits, so the range read back -- the `count` ids ending at the
+    /// committed high-water mark -- never includes a fragment the operation
+    /// added.
+    #[rstest]
+    #[case::reserve_then_add(vec![reserve(2), add_fragment(0)], vec![0, 1], 3)]
+    #[case::add_then_reserve(vec![add_fragment(0), reserve(2)], vec![0, 1], 3)]
+    #[case::two_reservations(vec![reserve(2), reserve(3)], vec![0], 5)]
+    fn test_a_reservation_is_taken_after_the_operations_mints(
+        #[case] actions: Vec<Action>,
+        #[case] fragment_ids: Vec<u64>,
+        #[case] high_water: u64,
+    ) {
+        let next = apply(&backed_manifest(), actions).unwrap();
 
         assert_eq!(
             next.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
-            vec![0, 4],
-            "the minted fragment must not land inside the reserved range"
+            fragment_ids
         );
+        assert_eq!(next.max_fragment_id(), Some(high_water));
     }
 
     #[test]
