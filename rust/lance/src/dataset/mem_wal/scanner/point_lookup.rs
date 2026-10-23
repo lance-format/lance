@@ -8,8 +8,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow::compute::{filter_record_batch, not};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use datafusion::common::ScalarValue;
 use datafusion::execution::TaskContext;
@@ -34,7 +35,7 @@ use crate::dataset::mem_wal::index::{IndexStore, MemTableVisibility};
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 
-use super::collector::LsmDataSourceCollector;
+use super::collector::{InMemoryMemTableRef, LsmDataSourceCollector};
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
 use super::generation_read::{GenerationRead, memtable_matches_table};
@@ -121,8 +122,7 @@ pub struct LsmPointLookupPlanner {
     /// fast paths read columns by the table's names, so if any memtable was
     /// created before a schema change, lookups take the slower plan path.
     in_memory_matches_table: bool,
-    /// Source scans built so far, so tests can tell how a call's planning
-    /// grows with its keys.
+    /// Source scans built so far, so tests can tell which sources a call read.
     #[cfg(test)]
     source_scans: std::sync::atomic::AtomicUsize,
 }
@@ -308,7 +308,7 @@ impl LsmPointLookupPlanner {
             // object. An arm resolves a generation's schema before it
             // scans, which nests deeply enough to need that.
             let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                Box::pin(self.build_source_scan(&source, projection, &filter_expr, true));
+                Box::pin(self.build_source_scan(&source, projection, &filter_expr));
             let scan = arm.await?;
 
             // Data is stored in reverse order, so first match is newest
@@ -341,8 +341,10 @@ impl LsmPointLookupPlanner {
     /// Like [`Self::lookup`] but does NOT drop a tombstone: the returned 1-row
     /// batch carries the `_tombstone` marker (`true` ⇒ the key's newest fresh
     /// version is a delete); `None` still means the key is absent from every
-    /// source. Always plans (no in-memory fast path); for many keys use
-    /// [`Self::lookup_many_keep_tombstone`], which scans each source once.
+    /// source. Partial-update merge uses this to treat a fresh-deleted PK as
+    /// absent, so it never resurrects stale, not-yet-compacted base columns.
+    /// Always plans (no in-memory fast path) — used off the hot read path, on
+    /// small partial-update batches.
     pub async fn lookup_keep_tombstone(
         &self,
         pk_values: &[ScalarValue],
@@ -364,125 +366,59 @@ impl LsmPointLookupPlanner {
     }
 
     /// Tombstone-preserving [`Self::lookup_many`] for single- or multi-column
-    /// keys: the newest fresh version of each key in the carry schema
-    /// (canonical output + `_tombstone`), a deleted key included with
-    /// `_tombstone = true`. Keys absent from every source are omitted, a
-    /// repeated key appears once, and row order is not guaranteed.
-    ///
-    /// Batched: each source is scanned once, newest first, for every key no
-    /// newer source has resolved, so a call plans one scan per source however
-    /// many keys it carries. The newest-wins rule is
-    /// [`Self::lookup_keep_tombstone`]'s: the newest source holding a key
-    /// answers for it, tombstone included, and older sources are not asked.
+    /// keys: returns each found key's newest version in the carry schema
+    /// (canonical output + `_tombstone`); keys absent from every source are
+    /// omitted. Several keys that [`Self::lookup_many`] would batch are resolved
+    /// the same way, with the memtables probed and each on-disk source scanned
+    /// once; any other call resolves each key with [`Self::lookup_keep_tombstone`].
     pub async fn lookup_many_keep_tombstone(
         &self,
         keys: &[Vec<ScalarValue>],
         projection: Option<&[String]>,
     ) -> Result<RecordBatch> {
-        validate_projection_names(projection, &self.base_schema, &[])?;
         let canonical =
             canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?;
         let target = carry_schema(&canonical, &self.pk_columns);
-        let pk_types = self
-            .pk_columns
+        let single_column: Option<Vec<ScalarValue>> = keys
             .iter()
-            .map(|c| Ok(self.base_schema.field_with_name(c)?.data_type().clone()))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Keys cast to the key columns' types, so they compare equal to the
-        // values the scans return. A null key value matches nothing.
-        let mut remaining: Vec<Vec<ScalarValue>> = Vec::with_capacity(keys.len());
-        let mut seen: HashSet<Vec<ScalarValue>> = HashSet::with_capacity(keys.len());
-        for key in keys {
-            if key.len() != self.pk_columns.len() {
-                return Err(lance_core::Error::invalid_input(format!(
-                    "Expected {} primary key values, got {}",
-                    self.pk_columns.len(),
-                    key.len()
-                )));
-            }
-            let key = key
-                .iter()
-                .zip(&pk_types)
-                .map(|(v, t)| v.cast_to(t))
-                .collect::<datafusion::error::Result<Vec<_>>>()?;
-            if key.iter().any(ScalarValue::is_null) {
-                continue;
-            }
-            if seen.insert(key.clone()) {
-                remaining.push(key);
-            }
-        }
-
-        let mut sources = self.collector.collect()?;
-        sources.sort_by_key(|b| std::cmp::Reverse(b.generation()));
-
-        let mut out: Vec<RecordBatch> = Vec::new();
-        for source in sources {
-            if remaining.is_empty() {
-                break;
-            }
-            let found = {
-                // A generation's bloom filter rules out the keys it cannot hold.
-                let wanted: HashSet<&Vec<ScalarValue>> =
-                    match self.bloom_filters.get(&source.generation().as_u64()) {
-                        Some(bf) => remaining
-                            .iter()
-                            .filter(|k| bf.check_hash(compute_pk_hash_from_scalars(k)))
-                            .collect(),
-                        None => remaining.iter().collect(),
-                    };
-                if wanted.is_empty() {
-                    continue;
-                }
-                let filter = self.build_pk_in_filter_expr(&wanted)?;
-                // Boxed and type-erased for the same reason as in
-                // `plan_lookup_coalesced`.
-                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                    Box::pin(self.build_source_scan(&source, projection, &filter, false));
-                let batches: Vec<RecordBatch> = arm
-                    .await?
-                    .execute(0, self.task_ctx.clone())?
-                    .try_collect()
-                    .await?;
-                // Each source lists a key's newest version first, so the first
-                // row per key is the one the per-key plan would return.
-                let mut found: HashSet<Vec<ScalarValue>> = HashSet::new();
-                for batch in batches {
-                    let pk_arrays = self
-                        .pk_columns
+            .map(|key| match key.as_slice() {
+                [value] => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Some(single_column) = single_column
+            && self.batchable(&single_column, &canonical)
+        {
+            let distinct = distinct_keys(&single_column);
+            let refs = self.collector.in_memory_refs_newest_first();
+            if let Some((hits, pending)) = self.probe_in_memory(&refs, &distinct, true)? {
+                // Memtable rows keep a deleted key's nulls, so they are gathered
+                // at the carry schema's nullability.
+                let widened = relax_non_pk_nullability(&canonical, &self.pk_columns);
+                let mut out = Vec::with_capacity(hits.len() + 1);
+                for ((ri, batch_idx), rows) in hits {
+                    let store = &refs[ri].batch_store;
+                    let gathered = gather_rows(store, batch_idx, &rows, &widened)?;
+                    let tombstones = rows
                         .iter()
-                        .map(|c| {
-                            batch.column_by_name(c).ok_or_else(|| {
-                                lance_core::Error::internal(format!(
-                                    "point lookup: key column `{c}` missing from a source scan"
-                                ))
-                            })
-                        })
+                        .map(|&row| is_tombstone_at(store, batch_idx, row as usize))
                         .collect::<Result<Vec<_>>>()?;
-                    let mut rows: Vec<u32> = Vec::new();
-                    for row in 0..batch.num_rows() {
-                        let key = pk_arrays
-                            .iter()
-                            .map(|a| ScalarValue::try_from_array(a, row))
-                            .collect::<datafusion::error::Result<Vec<_>>>()?;
-                        if wanted.contains(&key) && !found.contains(&key) {
-                            found.insert(key);
-                            rows.push(row as u32);
-                        }
-                    }
-                    if !rows.is_empty() {
-                        out.push(arrow_select::take::take_record_batch(
-                            &batch,
-                            &UInt32Array::from(rows),
-                        )?);
-                    }
+                    let mut columns = gathered.columns().to_vec();
+                    columns.push(Arc::new(BooleanArray::from(tombstones)));
+                    out.push(RecordBatch::try_new(target.clone(), columns)?);
                 }
-                found
-            };
-            remaining.retain(|k| !found.contains(k));
+                if !pending.is_empty() && self.collector.has_on_disk_sources() {
+                    out.extend(self.lookup_many_on_disk(pending, projection).await?);
+                }
+                return Ok(arrow_select::concat::concat_batches(&target, &out)?);
+            }
         }
-
+        let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(b) = self.lookup_keep_tombstone(key, projection).await? {
+                out.push(b);
+            }
+        }
         match out.len() {
             0 => Ok(RecordBatch::new_empty(target)),
             1 => Ok(out.pop().unwrap()),
@@ -634,56 +570,18 @@ impl LsmPointLookupPlanner {
                 .unwrap_or_else(|| RecordBatch::new_empty(target)));
         }
 
-        // Fast path: single pk column, every key matches the pk Arrow type, no
-        // system columns in the output. Otherwise the batched scan path (correct
-        // for multi-column keys, coercible types, system-column projections).
-        let pk_type = self
-            .pk_columns
-            .first()
-            .and_then(|c| self.base_schema.field_with_name(c).ok())
-            .map(|f| f.data_type().clone());
-        let fast_eligible = self.in_memory_matches_table
-            && self.pk_columns.len() == 1
-            && !target.fields().iter().any(|f| is_system_column(f.name()))
-            && pk_type
-                .as_ref()
-                .map(|t| keys.iter().all(|k| &k.data_type() == t))
-                .unwrap_or(false);
-        if !fast_eligible {
-            return self.lookup_many_batched(keys, projection, &target).await;
+        if !self.batchable(keys, &target) {
+            return self
+                .lookup_many_via_per_key(keys, projection, &target)
+                .await;
         }
-
+        let keys = distinct_keys(keys);
         let refs = self.collector.in_memory_refs_newest_first();
-        // Hits grouped by (memtable index, batch index) so each source batch is
-        // gathered with a single `take`.
-        let mut hits: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
-        let mut pending: Vec<ScalarValue> = Vec::new();
-        for key in keys {
-            let mut resolved = false;
-            for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, key, self.visibility)? {
-                    ProbePos::Found { batch_idx, row } => {
-                        // Newest version is a tombstone → the key is deleted:
-                        // resolve it as a miss (emit nothing) and do not fall
-                        // through to an older source.
-                        if !is_tombstone_at(&m.batch_store, batch_idx, row)? {
-                            hits.entry((ri, batch_idx)).or_default().push(row as u32);
-                        }
-                        resolved = true;
-                        break;
-                    }
-                    ProbePos::Miss => continue,
-                    ProbePos::NoIndex => {
-                        // A memtable without the pk BTree can't be batch-probed;
-                        // fall back to the batched scan path.
-                        return self.lookup_many_batched(keys, projection, &target).await;
-                    }
-                }
-            }
-            if !resolved {
-                pending.push(key.clone());
-            }
-        }
+        let Some((hits, pending)) = self.probe_in_memory(&refs, &keys, false)? else {
+            return self
+                .lookup_many_via_per_key(&keys, projection, &target)
+                .await;
+        };
 
         let mut out: Vec<RecordBatch> = Vec::with_capacity(hits.len() + 1);
         for ((ri, batch_idx), rows) in hits {
@@ -694,14 +592,17 @@ impl LsmPointLookupPlanner {
                 &target,
             )?);
         }
-        // Keys absent from every in-memory memtable may live on disk; resolve
-        // those via the batched scan path. (All-in-memory hit case: `pending` is
-        // empty.)
+        // Keys absent from every in-memory memtable may live on disk. A key
+        // whose newest version there is a delete is not found.
         if !pending.is_empty() && self.collector.has_on_disk_sources() {
-            out.push(
-                self.lookup_many_batched(&pending, projection, &target)
-                    .await?,
-            );
+            for batch in self.lookup_many_on_disk(pending, projection).await? {
+                let tombstones = batch.column(batch.num_columns() - 1).as_boolean();
+                let live = filter_record_batch(&batch, &not(tombstones)?)?;
+                // Drop `_tombstone`, the carry schema's last column.
+                let mut columns = live.columns().to_vec();
+                columns.pop();
+                out.push(RecordBatch::try_new(target.clone(), columns)?);
+            }
         }
 
         match out.len() {
@@ -711,35 +612,141 @@ impl LsmPointLookupPlanner {
         }
     }
 
-    /// [`Self::lookup_many`] for keys its in-memory fast path cannot answer:
-    /// [`Self::lookup_many_keep_tombstone`] without the deleted keys.
-    async fn lookup_many_batched(
+    /// Whether [`Self::lookup_many`] can resolve `keys` together: several keys
+    /// on a single-column primary key, each exactly the key column's type (the
+    /// per-key path coerces other types, the batched one compares values as
+    /// given), every in-memory memtable on the table's schema, and no system
+    /// columns in `target`.
+    fn batchable(&self, keys: &[ScalarValue], target: &SchemaRef) -> bool {
+        let pk_type = match self.pk_columns.as_slice() {
+            [pk] => self
+                .base_schema
+                .field_with_name(pk)
+                .ok()
+                .map(|f| f.data_type()),
+            _ => None,
+        };
+        self.in_memory_matches_table
+            && keys.len() > 1
+            && !target.fields().iter().any(|f| is_system_column(f.name()))
+            && pk_type.is_some_and(|t| keys.iter().all(|k| &k.data_type() == t))
+    }
+
+    /// Probe the in-memory memtables (`refs`, newest first) for each key's
+    /// newest visible row. Returns those rows and the keys no memtable holds.
+    /// A key whose newest version is a delete is resolved without a row unless
+    /// `keep_tombstones`. `None` when a memtable has no primary-key index.
+    fn probe_in_memory(
+        &self,
+        refs: &[&InMemoryMemTableRef],
+        keys: &[ScalarValue],
+        keep_tombstones: bool,
+    ) -> Result<Option<(RowsByBatch, Vec<ScalarValue>)>> {
+        let mut hits = RowsByBatch::new();
+        let mut pending: Vec<ScalarValue> = Vec::new();
+        'keys: for key in keys {
+            for (ri, m) in refs.iter().enumerate() {
+                match probe_position(&m.batch_store, &m.index_store, key, self.visibility)? {
+                    ProbePos::Found { batch_idx, row } => {
+                        if keep_tombstones || !is_tombstone_at(&m.batch_store, batch_idx, row)? {
+                            hits.entry((ri, batch_idx)).or_default().push(row as u32);
+                        }
+                        continue 'keys;
+                    }
+                    ProbePos::Miss => continue,
+                    ProbePos::NoIndex => return Ok(None),
+                }
+            }
+            pending.push(key.clone());
+        }
+        Ok(Some((hits, pending)))
+    }
+
+    /// Resolve single-column `keys` from the on-disk sources, newest generation
+    /// first, in the carry schema. Each source is scanned once, for the keys no
+    /// newer source held (and its bloom filter admits), and reading stops once
+    /// every key is resolved. A source lists its rows newest first, so a key's
+    /// first row is its newest version there.
+    async fn lookup_many_on_disk(
+        &self,
+        keys: Vec<ScalarValue>,
+        projection: Option<&[String]>,
+    ) -> Result<Vec<RecordBatch>> {
+        use datafusion::prelude::{col, lit};
+
+        let pk = &self.pk_columns[0];
+        let mut pending: HashSet<ScalarValue> = keys.into_iter().collect();
+        let mut sources: Vec<LsmDataSource> = self
+            .collector
+            .collect()?
+            .into_iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    LsmDataSource::BaseTable { .. } | LsmDataSource::SsTable { .. }
+                )
+            })
+            .collect();
+        sources.sort_by_key(|s| std::cmp::Reverse(s.generation()));
+
+        let mut out = Vec::new();
+        for source in sources {
+            let bloom = self.bloom_filters.get(&source.generation().as_u64());
+            let candidates: Vec<Expr> = pending
+                .iter()
+                .filter(|k| {
+                    bloom.is_none_or(|bf| {
+                        bf.check_hash(compute_pk_hash_from_scalars(std::slice::from_ref(*k)))
+                    })
+                })
+                .map(|k| lit(k.clone()))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let filter = col(pk.as_str()).in_list(candidates, false);
+            // Type-erased for the same `Send`-proof depth as `plan_lookup_coalesced`.
+            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                Box::pin(self.build_source_scan(&source, projection, &filter));
+            let mut stream = arm.await?.execute(0, self.task_ctx.clone())?;
+            while let Some(batch) = stream.try_next().await? {
+                let pk_values = batch.column_by_name(pk).ok_or_else(|| {
+                    lance_core::Error::internal("point-lookup: scan output lacks the primary key")
+                })?;
+                let first = (0..batch.num_rows())
+                    .map(|i| Ok(pending.remove(&ScalarValue::try_from_array(pk_values, i)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let first = filter_record_batch(&batch, &BooleanArray::from(first))?;
+                if first.num_rows() > 0 {
+                    out.push(first);
+                }
+                if pending.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Correctness fallback for [`Self::lookup_many`]: resolve each key with
+    /// [`Self::lookup`] and concatenate.
+    async fn lookup_many_via_per_key(
         &self,
         keys: &[ScalarValue],
         projection: Option<&[String]>,
         target: &SchemaRef,
     ) -> Result<RecordBatch> {
-        let keys: Vec<Vec<ScalarValue>> = keys.iter().map(|k| vec![k.clone()]).collect();
-        let carried = self.lookup_many_keep_tombstone(&keys, projection).await?;
-        let deleted = carried
-            .column_by_name(TOMBSTONE)
-            .ok_or_else(|| lance_core::Error::internal("point lookup result missing _tombstone"))?
-            .as_boolean();
-        let live: BooleanArray = deleted.iter().map(|d| Some(d != Some(true))).collect();
-        let live = arrow_select::filter::filter_record_batch(&carried, &live)?;
-        let columns = target
-            .fields()
-            .iter()
-            .map(|f| {
-                live.column_by_name(f.name()).cloned().ok_or_else(|| {
-                    lance_core::Error::internal(format!(
-                        "point lookup result missing column `{}`",
-                        f.name()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(RecordBatch::try_new(target.clone(), columns)?)
+        let mut out: Vec<RecordBatch> = Vec::new();
+        for key in keys {
+            if let Some(b) = self.lookup(std::slice::from_ref(key), projection).await? {
+                out.push(b);
+            }
+        }
+        match out.len() {
+            0 => Ok(RecordBatch::new_empty(target.clone())),
+            1 => Ok(out.pop().unwrap()),
+            _ => Ok(arrow_select::concat::concat_batches(target, &out)?),
+        }
     }
 
     /// Build a composable one-shot `ExecutionPlan` that yields the point-lookup
@@ -788,46 +795,16 @@ impl LsmPointLookupPlanner {
         expr.ok_or_else(|| lance_core::Error::invalid_input("No primary key columns specified"))
     }
 
-    /// A filter matching every key in `keys`: one `IN` list per key column.
-    /// For a composite key it also matches the other combinations of those
-    /// values, which the caller drops by matching each row's whole key.
-    fn build_pk_in_filter_expr(&self, keys: &HashSet<&Vec<ScalarValue>>) -> Result<Expr> {
-        use datafusion::prelude::{col, lit};
-
-        let mut expr: Option<Expr> = None;
-        for (i, col_name) in self.pk_columns.iter().enumerate() {
-            let mut distinct = HashSet::with_capacity(keys.len());
-            let values: Vec<Expr> = keys
-                .iter()
-                .map(|k| &k[i])
-                .filter(|v| distinct.insert(*v))
-                .map(|v| lit(v.clone()))
-                .collect();
-            let in_list = col(col_name.as_str()).in_list(values, false);
-            expr = Some(match expr {
-                Some(e) => e.and(in_list),
-                None => in_list,
-            });
-        }
-
-        expr.ok_or_else(|| lance_core::Error::invalid_input("No primary key columns specified"))
-    }
-
     /// Build scan plan for a single data source.
     ///
     /// Output is projected to the canonical schema so user-requested system
     /// columns appear at the requested position — NULL where the source
     /// doesn't produce them or where per-source values aren't meaningful.
-    ///
-    /// The rows are listed newest first. `newest_only` keeps just the first,
-    /// for a filter naming one key; without it a filter naming many keys keeps
-    /// every version of each.
     async fn build_source_scan(
         &self,
         source: &LsmDataSource,
         projection: Option<&[String]>,
         filter: &Expr,
-        newest_only: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         #[cfg(test)]
         self.source_scans
@@ -959,11 +936,11 @@ impl LsmPointLookupPlanner {
                     None => raw,
                     Some(generation) => generation.reconcile(raw)?,
                 };
-                // The filter restricts to the requested keys, so the scan
-                // yields their insert history. Within the active memtable
-                // larger `_rowid` = newer insert, so sorting `_rowid` DESC lists
-                // each key's newest version first; `newest_only` keeps just
-                // that row for a one-key filter.
+                // The filter already restricts to the exact PK value, so the
+                // scan yields that key's insert history. Within the active
+                // memtable larger `_rowid` = newer insert, so sorting `_rowid`
+                // DESC and keeping the first row picks the newest version — one
+                // row per (value-exact) PK.
                 let rowid_idx = raw.schema().index_of(lance_core::ROW_ID)?;
                 let ordering = LexOrdering::new(vec![PhysicalSortExpr {
                     expr: Arc::new(Column::new(lance_core::ROW_ID, rowid_idx)),
@@ -976,7 +953,7 @@ impl LsmPointLookupPlanner {
                     lance_core::Error::internal("point-lookup: failed to build _rowid ordering")
                 })?;
                 let newest: Arc<dyn ExecutionPlan> =
-                    Arc::new(SortExec::new(ordering, raw).with_fetch(newest_only.then_some(1)));
+                    Arc::new(SortExec::new(ordering, raw).with_fetch(Some(1)));
                 // Per-source `_rowid` would collide with the base table's;
                 // NULL it before canonicalization (the value is internal to
                 // this arm). project_to_canonical drops it entirely when
@@ -1108,6 +1085,19 @@ fn is_tombstone_at(batch_store: &BatchStore, batch_idx: usize, row: usize) -> Re
         lance_core::Error::internal("point-lookup: _tombstone column is not Boolean")
     })?;
     Ok(arr.is_valid(row) && arr.value(row))
+}
+
+/// Memtable rows to gather, keyed by (memtable, batch) so each batch is
+/// gathered with one `take`.
+type RowsByBatch = HashMap<(usize, usize), Vec<u32>>;
+
+/// `keys` without nulls, which match no row, or repeats.
+fn distinct_keys(keys: &[ScalarValue]) -> Vec<ScalarValue> {
+    let mut seen = HashSet::with_capacity(keys.len());
+    keys.iter()
+        .filter(|k| !k.is_null() && seen.insert(*k))
+        .cloned()
+        .collect()
 }
 
 /// Result of probing the in-memory memtables newest-first in `lookup()`.
@@ -1988,8 +1978,9 @@ mod tests {
         .unwrap()
     }
 
-    /// Build an in-memory active memtable ref from batches, with a B-tree on
-    /// `id` and the visibility watermark advanced so every row is visible.
+    /// Build an in-memory active memtable ref from batches, with a B-tree and
+    /// the primary-key index on `id` and the visibility watermark advanced so
+    /// every row is visible.
     fn active_memtable_ref(
         schema: &Arc<ArrowSchema>,
         batches: &[RecordBatch],
@@ -1997,7 +1988,8 @@ mod tests {
     ) -> crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef {
         use crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef;
         let batch_store = Arc::new(BatchStore::with_capacity(64));
-        let index_store = btree_on_id(schema);
+        let mut index_store = btree_on_id(schema);
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         for b in batches {
             let (idx, row_offset, _) = batch_store.append(b.clone()).unwrap();
             index_store
@@ -3058,13 +3050,15 @@ mod tests {
     /// | 8 | | | | | tombstone | tombstone |
     /// | 9 | | | | | | absent |
     /// | 10 | | | g2b then g2a | | | g2b |
-    async fn layered_ts_planner(base_uri: &str) -> LsmPointLookupPlanner {
+    async fn layered_ts_planner() -> (tempfile::TempDir, LsmPointLookupPlanner) {
         use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
         let base_schema = create_pk_schema();
         let ts = pk_ts_schema();
         let base = Arc::new(
             create_dataset(
-                base_uri,
+                &base_uri,
                 vec![create_test_batch(&base_schema, &[1, 2, 3, 4, 5, 6], "base")],
             )
             .await,
@@ -3108,7 +3102,9 @@ mod tests {
                 frozen: vec![frozen],
             },
         );
-        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema).unwrap()
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema).unwrap();
+        (temp, planner)
     }
 
     fn int32_keys(ids: impl IntoIterator<Item = i32>) -> Vec<Vec<ScalarValue>> {
@@ -3119,12 +3115,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_lookup_many_keep_tombstone_newest_source_wins() {
-        let temp = tempfile::tempdir().unwrap();
-        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
-        let planner = layered_ts_planner(&base_uri).await;
+        let (_temp, planner) = layered_ts_planner().await;
 
-        // Key 2 twice: a repeated key comes back once.
-        let keys = int32_keys([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2]);
+        // Keys 2 and 6 twice: a repeated key comes back once. A null key
+        // matches nothing.
+        let mut keys = int32_keys([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2, 6]);
+        keys.push(vec![ScalarValue::Int32(None)]);
         let batch = planner
             .lookup_many_keep_tombstone(&keys, None)
             .await
@@ -3166,43 +3162,32 @@ mod tests {
                 .lookup_keep_tombstone(&[ScalarValue::Int32(Some(id))], None)
                 .await
                 .unwrap();
-            let expected = single.map(|b| {
-                let name = b.column_by_name("name").unwrap().as_string::<i32>();
-                (
-                    name.is_valid(0).then(|| name.value(0).to_string()),
-                    tombstone_at(&b),
-                )
-            });
+            let expected = single.and_then(|b| version_of(&b, id));
             assert_eq!(version_of(&batch, id), expected, "key {id}");
         }
     }
 
-    /// `lookup_many` answers the keys its in-memory probe misses with one scan
-    /// per source, leaves out deleted keys, and agrees with [`LsmPointLookupPlanner::lookup`].
+    /// `lookup_many` answers the keys no memtable holds with one scan per
+    /// on-disk source, leaves out deleted keys, and agrees with
+    /// [`LsmPointLookupPlanner::lookup`].
     #[tokio::test]
     async fn test_lookup_many_resolves_on_disk_keys_once_per_source() {
         use std::sync::atomic::Ordering;
-        let temp = tempfile::tempdir().unwrap();
-        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
-        let planner = layered_ts_planner(&base_uri).await;
+        let (_temp, planner) = layered_ts_planner().await;
         let keys: Vec<ScalarValue> = (1..=10).map(|i| ScalarValue::Int32(Some(i))).collect();
 
-        planner.source_scans.store(0, Ordering::Relaxed);
         let batch = planner.lookup_many(&keys, None).await.unwrap();
-        assert_eq!(planner.source_scans.load(Ordering::Relaxed), 5);
+        assert_eq!(planner.source_scans.load(Ordering::Relaxed), 3);
         assert_eq!(sorted_ids(&batch), vec![1, 2, 3, 6, 7, 10]);
 
-        for key in &keys {
+        for id in 1..=10 {
             let single = planner
-                .lookup(std::slice::from_ref(key), None)
+                .lookup(&[ScalarValue::Int32(Some(id))], None)
                 .await
                 .unwrap();
-            let ScalarValue::Int32(Some(id)) = key else {
-                unreachable!()
-            };
             let many = (0..batch.num_rows())
                 .map(|r| batch.slice(r, 1))
-                .find(|row| id_at(row) == *id);
+                .find(|row| id_at(row) == id);
             assert_eq!(
                 many.as_ref().map(name_at),
                 single.as_ref().map(name_at),
@@ -3212,15 +3197,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_many_keep_tombstone_plans_once_per_source() {
+    async fn test_lookup_many_keep_tombstone_scans_each_on_disk_source_once() {
         use std::sync::atomic::Ordering;
-        let temp = tempfile::tempdir().unwrap();
-        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
-        let planner = layered_ts_planner(&base_uri).await;
-        let sources = 5;
+        let (_temp, planner) = layered_ts_planner().await;
 
-        // An absent key keeps every source in play, so each is scanned once
-        // whether the call carries ten keys or a thousand.
+        // The memtables are probed, not scanned. An absent key keeps every
+        // on-disk source in play, so each is scanned once whether the call
+        // carries ten keys or a thousand.
         for n in [10, 1_000] {
             planner.source_scans.store(0, Ordering::Relaxed);
             let batch = planner
@@ -3228,47 +3211,80 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(batch.num_rows(), 9);
-            assert_eq!(
-                planner.source_scans.load(Ordering::Relaxed),
-                sources,
-                "{n} keys"
-            );
+            assert_eq!(planner.source_scans.load(Ordering::Relaxed), 3, "{n} keys");
         }
 
-        // Once the newer sources resolve every key, the older ones are skipped:
-        // 8 and 5 are tombstones in the active memtable.
+        // Keys the memtables resolve, including one with several versions,
+        // read nothing on disk; a null key never keeps a source in play.
         planner.source_scans.store(0, Ordering::Relaxed);
-        planner
-            .lookup_many_keep_tombstone(&int32_keys([5, 8]), None)
-            .await
-            .unwrap();
-        assert_eq!(planner.source_scans.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn test_lookup_many_keep_tombstone_casts_and_skips_null_keys() {
-        // Int64 keys against the Int32 key column resolve like Int32 keys, and
-        // a null key matches nothing.
-        let temp = tempfile::tempdir().unwrap();
-        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
-        let planner = layered_ts_planner(&base_uri).await;
-        let keys = vec![
-            vec![ScalarValue::Int64(Some(2))],
-            vec![ScalarValue::Int64(Some(4))],
-            vec![ScalarValue::Int32(None)],
-        ];
+        let mut keys = int32_keys([5, 6, 8]);
+        keys.push(vec![ScalarValue::Int32(None)]);
         let batch = planner
             .lookup_many_keep_tombstone(&keys, None)
             .await
             .unwrap();
-        assert_eq!(sorted_ids(&batch), vec![2, 4]);
-        assert_eq!(version_of(&batch, 4), Some((None, true)));
+        assert_eq!(planner.source_scans.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            version_of(&batch, 6),
+            Some((Some("g4b_6".to_string()), false))
+        );
+
+        // Keys gen 2 resolves leave gen 1 and the base unread.
+        planner.source_scans.store(0, Ordering::Relaxed);
+        planner
+            .lookup_many_keep_tombstone(&int32_keys([4, 10]), None)
+            .await
+            .unwrap();
+        assert_eq!(planner.source_scans.load(Ordering::Relaxed), 1);
+
+        // Gen 2's bloom filter rules out 7 and 9, so only gen 1 and the base are read.
+        let mut bloom = Sbbf::with_ndv_fpp(100, 0.01).unwrap();
+        for id in [4, 5, 10] {
+            bloom.insert_hash(compute_pk_hash_from_scalars(&[ScalarValue::Int32(Some(
+                id,
+            ))]));
+        }
+        let planner = planner.with_bloom_filter(2, Arc::new(bloom));
+        planner.source_scans.store(0, Ordering::Relaxed);
+        let batch = planner
+            .lookup_many_keep_tombstone(&int32_keys([7, 9]), None)
+            .await
+            .unwrap();
+        assert_eq!(planner.source_scans.load(Ordering::Relaxed), 2);
+        assert_eq!(sorted_ids(&batch), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_many_keys_of_another_type_resolve_per_key() {
+        // A key of another type than the key column is coerced per key as a
+        // single lookup would: 1.9 matches no Int32 key, an out-of-range Int64
+        // matches nothing rather than erroring, and Int64 6 finds the active
+        // memtable's version, not the base table's.
+        let (_temp, planner) = layered_ts_planner().await;
+        let keys = [
+            ScalarValue::Float64(Some(1.9)),
+            ScalarValue::Int64(Some(i64::MAX)),
+            ScalarValue::Int32(Some(2)),
+            ScalarValue::Int64(Some(6)),
+        ];
+        let batch = planner.lookup_many(&keys, None).await.unwrap();
+        assert_eq!(sorted_ids(&batch), vec![2, 6]);
+        assert!((0..batch.num_rows()).any(|r| name_at(&batch.slice(r, 1)) == "g4b_6"));
+
+        let keys: Vec<Vec<ScalarValue>> = keys.into_iter().map(|k| vec![k]).collect();
+        let batch = planner
+            .lookup_many_keep_tombstone(&keys, None)
+            .await
+            .unwrap();
+        assert_eq!(sorted_ids(&batch), vec![2, 6]);
+        assert_eq!(
+            version_of(&batch, 6),
+            Some((Some("g4b_6".to_string()), false))
+        );
     }
 
     #[tokio::test]
     async fn test_lookup_many_keep_tombstone_composite_key_matches_whole_key() {
-        // The per-column IN lists also match (1, 2) and (2, 1); only the
-        // requested pairs may come back.
         let mut pk = HashMap::new();
         pk.insert(
             "lance-schema:unenforced-primary-key".to_string(),
