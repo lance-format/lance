@@ -435,6 +435,7 @@ mod tests {
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, Transaction};
+    use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
@@ -558,6 +559,29 @@ mod tests {
     /// The footprint only compares against commits after the read, so nothing
     /// would catch a rewrite between the build and the read; a segment has to
     /// have been built from the snapshot the operation reads.
+    /// A segment indexes schema fields; a reserved id names a column of one
+    /// data file, which no index can be keyed on or carry.
+    #[rstest]
+    #[case::keyed(segment("idx", vec![FieldRef::Committed(ROW_ID_FIELD_ID)]))]
+    #[case::carried(AddIndexSegment {
+        covering_fields: vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
+        ..segment("idx", vec![FieldRef::Committed(0)])
+    })]
+    fn test_a_segment_over_a_reserved_field_id_is_rejected(#[case] action: AddIndexSegment) {
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![Action::AddIndexSegment(action)],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("names reserved field id -3"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn test_a_segment_built_before_the_version_read_is_rejected() {
         let manifest = backed_manifest();
