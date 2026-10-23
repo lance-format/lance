@@ -202,8 +202,9 @@ mod tests {
         added_field, apply, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, AddIndexSegment, AlterField, CompositeOperation, DropField,
-        RemoveFragment, SetDeletionFile, TombstoneFieldData, UserStep,
+        Action, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage, AlterField,
+        CompositeOperation, DropField, FieldRef, RemoveFragment, SetDeletionFile,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
     use crate::transaction::{Operation, Transaction};
@@ -810,5 +811,24 @@ mod tests {
 
         assert!(ours.conflicts_with(&theirs));
         assert!(theirs.conflicts_with(&ours));
+    }
+
+    /// Unlike a rewrite, an overlay does not invalidate a widened segment: a
+    /// read masks an overlay committed after the segment's `dataset_version`,
+    /// so the index never answers from the values it replaced.
+    #[test]
+    fn test_an_overlay_does_not_conflict_with_a_widening_onto_its_fragment() {
+        let widen = footprint(vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "by_a".into(),
+            add_fragments: vec![Ref::Committed(7)],
+            remove_fragments: Vec::new(),
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: Vec::new(),
+        })]);
+        let overlay = footprint(vec![add(Ref::Committed(7), vec![overlay("a.lance", &[0])])]);
+
+        assert!(!widen.conflicts_with(&overlay));
+        assert!(!overlay.conflicts_with(&widen));
     }
 }
