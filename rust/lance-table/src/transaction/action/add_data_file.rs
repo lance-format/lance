@@ -151,11 +151,14 @@ impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::RowIdMeta;
+    use crate::rowids::write_row_ids;
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, manifest_with_base, mint_base,
     };
     use crate::transaction::action::{Action, AddField, AddFragment, TombstoneFieldData};
     use crate::transaction::test_support::sample_manifest;
+    use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
@@ -274,6 +277,101 @@ mod tests {
                 assert_eq!(next.fragments[0].files.last().unwrap().base_id, base_id);
             }
             Err(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(
+                    error.to_string().contains(message),
+                    "unexpected error: {error}"
+                );
+            }
+        }
+    }
+
+    fn new_fragment(row_id_meta: Option<RowIdMeta>) -> Action {
+        Action::AddFragment(AddFragment {
+            id: Ref::Local(0),
+            physical_rows: 10,
+            row_id_meta,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    fn file_binding(fragment: Ref, field_ids: &[i32]) -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment,
+            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+            field_ids: field_ids.iter().copied().map(FieldRef::Committed).collect(),
+            data_change: true,
+            base: None,
+        })
+    }
+
+    /// A file binds schema fields, plus the hidden lineage column of a
+    /// sequence its own fragment declared spilled in this operation. Every
+    /// other negative id is a sentinel of the stored format, not a column.
+    #[rstest]
+    #[case::unassigned_placeholder(
+        vec![new_fragment(None), file_binding(Ref::Local(0), &[0, -1])],
+        Some("reserved field id -1")
+    )]
+    #[case::tombstone(
+        vec![new_fragment(None), file_binding(Ref::Local(0), &[0, -2])],
+        Some("reserved field id -2")
+    )]
+    #[case::unknown_negative(
+        vec![new_fragment(None), file_binding(Ref::Local(0), &[0, -6])],
+        Some("reserved field id -6")
+    )]
+    #[case::lineage_in_a_committed_fragment(
+        vec![file_binding(Ref::Committed(0), &[ROW_ID_FIELD_ID])],
+        Some("row lineage field -3")
+    )]
+    #[case::lineage_the_fragment_keeps_inline(
+        vec![
+            new_fragment(Some(RowIdMeta::Inline(write_row_ids(&(0..10).into()).into()))),
+            file_binding(Ref::Local(0), &[0, ROW_ID_FIELD_ID]),
+        ],
+        Some("row lineage field -3")
+    )]
+    #[case::lineage_the_fragment_spills(
+        vec![
+            new_fragment(Some(RowIdMeta::Column)),
+            file_binding(Ref::Local(0), &[0, ROW_ID_FIELD_ID]),
+        ],
+        None
+    )]
+    #[case::lineage_in_a_file_of_its_own(
+        vec![
+            new_fragment(Some(RowIdMeta::Column)),
+            file_binding(Ref::Local(0), &[0]),
+            file_binding(Ref::Local(0), &[ROW_ID_FIELD_ID]),
+        ],
+        None
+    )]
+    #[case::spilled_lineage_no_file_carries(
+        vec![new_fragment(Some(RowIdMeta::Column)), file_binding(Ref::Local(0), &[0])],
+        Some("spills row lineage field -3 but no AddDataFile binds it")
+    )]
+    #[case::spilled_lineage_two_files_carry(
+        vec![
+            new_fragment(Some(RowIdMeta::Column)),
+            file_binding(Ref::Local(0), &[0, ROW_ID_FIELD_ID]),
+            file_binding(Ref::Local(0), &[ROW_ID_FIELD_ID]),
+        ],
+        Some("binds row lineage field -3 in more than one data file")
+    )]
+    fn test_add_data_file_binds_only_schema_and_declared_lineage_fields(
+        #[case] actions: Vec<Action>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let result = apply(&backed_manifest(), actions);
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(message) => {
                 let error = result.unwrap_err();
                 assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
                 assert!(

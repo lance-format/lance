@@ -677,12 +677,14 @@ mod tests {
         added_field, apply, apply_with_indices, backed_manifest,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation, DropField,
-        RemoveFragment, ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
+        Action, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation, ConfigUpdate,
+        DropField, FieldMetadataUpdate, RemoveFragment, ResetTable, SetDeletionFile,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
-    use crate::transaction::{DataReplacementGroup, Operation};
+    use crate::transaction::{DataReplacementGroup, Operation, UpdateMap};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -1112,6 +1114,43 @@ mod tests {
                 assert!(error.contains(expected), "unexpected error: {error}");
             }
         }
+    }
+
+    /// A reserved id names a column of one data file, never a field of the
+    /// schema, so only the action that binds a file's columns accepts one.
+    #[rstest]
+    #[case::tombstone(Action::TombstoneFieldData(TombstoneFieldData {
+        fragment: Ref::Committed(0),
+        field_ids: vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
+        data_change: true,
+    }))]
+    #[case::drop(Action::DropField(DropField {
+        field: FieldRef::Committed(ROW_ID_FIELD_ID),
+    }))]
+    #[case::alter(Action::AlterField(AlterField {
+        field: FieldRef::Committed(ROW_ID_FIELD_ID),
+        name: Some("renamed".into()),
+        nullable: None,
+    }))]
+    #[case::parent(mint_field(0, "child", Some(FieldRef::Committed(ROW_ID_FIELD_ID))))]
+    #[case::field_metadata(Action::ConfigUpdate(ConfigUpdate {
+        field_metadata: vec![FieldMetadataUpdate {
+            field: FieldRef::Committed(ROW_ID_FIELD_ID),
+            updates: UpdateMap {
+                update_entries: vec![],
+                replace: false,
+            },
+        }],
+        ..Default::default()
+    }))]
+    fn test_a_reserved_field_id_names_no_schema_field(#[case] action: Action) {
+        let error = apply(&backed_manifest(), vec![action]).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("names reserved field id -3"),
+            "unexpected error: {error}"
+        );
     }
 
     fn rename_field_zero() -> Action {
