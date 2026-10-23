@@ -67,6 +67,7 @@ macro_rules! for_each_action {
             AddIndexSegment,
             RemoveIndexSegment,
             AdjustIndexCoverage,
+            DropIndex,
             ReserveFragmentIds,
             ReserveRowIds,
             ResetTable,
@@ -85,6 +86,7 @@ mod alter_field;
 mod apply;
 mod config_update;
 mod drop_field;
+mod drop_index;
 mod footprint;
 mod proto;
 mod query_contract;
@@ -108,6 +110,7 @@ pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
+pub use drop_index::DropIndex;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
 pub use remove_fragment::RemoveFragment;
 pub use remove_index_segment::RemoveIndexSegment;
