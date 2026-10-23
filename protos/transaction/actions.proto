@@ -31,7 +31,8 @@ package lance.transaction;
  *    manifest, not the resulting state. That is what lets actions compose
  *    into one commit and replay onto another branch with no special cases.
  *
- * 2. `Ref = Committed | Local`. A minting action cannot know its
+ * 2. `Ref = Committed | Local` (and `FieldRef`, its field-id form). A
+ *    minting action cannot know its
  *    counter-allocated id (field, fragment, base) until commit, and gets a
  *    different one on replay onto another target, so it names the id with
  *    a `Local` token resolved against the target's counters at apply. A
@@ -47,17 +48,29 @@ package lance.transaction;
  * 4. Assertions carry only preconditions no post-image can reconstruct, e.g.
  *    the keys a merge-insert inserted (`AssertUniqueKeys`).
  *
+ * 5. `data_change` is per action. `false` asserts the action changes no
+ *    row's values: the rows it adds, removes, or rebinds are the same
+ *    logical rows with the same values before and after (e.g. compaction
+ *    moving rows, re-encoding a column file). CDC readers emit rows only
+ *    from `data_change = true` actions; an operation may mix both. Absent
+ *    is treated as true.
+ *
+ * Actions apply in order, with one exception: `ReserveFragmentIds` and
+ * `ReserveRowIds` are summed and taken after the operation's own mints,
+ * wherever they appear. A reservation creates nothing an action can
+ * reference, so the order has no other visible effect within the operation.
+ *
  * Off the wire and recomputed instead: conflict footprints, a pure function
  * of each action, and large row-level deltas recoverable from the
  * read-version state.
  */
 
 /*
- * A reference to a counter-allocated identifier (field id, fragment id, or base
- * id) that may not be committed yet.
+ * A reference to a counter-allocated fragment or base id that may not be
+ * committed yet. Field ids use `FieldRef`.
  *
  * `committed` is an already-assigned id. `local` is a placeholder token minted
- * by an `AddFragment`, `AddField`, or `AddBase` action earlier in the same
+ * by an `AddFragment` or `AddBase` action earlier in the same
  * `CompositeOperation`; it resolves to a freshly-allocated committed id at
  * apply, and re-resolves against the target's counters on merge/rebase. `local` tokens are scoped to a single
  * `CompositeOperation` and must be distinct within it (validated by the writer once
@@ -66,6 +79,24 @@ package lance.transaction;
 message Ref {
   oneof kind {
     uint64 committed = 1;
+    uint32 local = 2;
+  }
+}
+
+/*
+ * A reference to a field id that may not be committed yet: the field-id form
+ * of `Ref`.
+ *
+ * `committed` is signed because field ids are: besides schema field ids
+ * (>= 0), `AddDataFile.field_ids` may bind the reserved ids -3/-4/-5 of the
+ * hidden row lineage columns (see RowLineageColumn), as `DataFile.fields`
+ * does. No other negative id is accepted, and every other field reference
+ * takes a schema field id only. `local` is a token minted by an
+ * `AddField` earlier in the same `CompositeOperation`, scoped like `Ref`'s.
+ */
+message FieldRef {
+  oneof kind {
+    sint32 committed = 1;
     uint32 local = 2;
   }
 }
@@ -141,6 +172,11 @@ message Action {
  * Its data files arrive via AddDataFile actions referencing this fragment by
  * the same `id`. A newly added fragment has no deletion vector; deletions are
  * applied by a later operation via SetDeletionFile.
+ *
+ * Each `column_*` lineage arm must be backed by exactly one of the
+ * fragment's AddDataFile actions binding the matching reserved field id, and
+ * a reserved lineage id may only be bound in a fragment that declared its
+ * arm.
  */
 message AddFragment {
   /*
@@ -150,7 +186,11 @@ message AddFragment {
    * allocated id at apply. Committed names an id out of a range an earlier
    * commit reserved with ReserveFragmentIds, for a writer that must know the
    * fragment's id before committing (see rationale 2); apply rejects an id
-   * that is not reserved or is already in use.
+   * that is not reserved or is already in use, or that an index segment's
+   * stored fragment coverage still names.
+   *
+   * A Committed id must come from an earlier commit's reservation, not one in
+   * the same operation: reservations are taken after the operation's mints.
    *
    * AddField and AddBase have no Committed form, because no reservation
    * mechanism exists for field or base ids.
@@ -163,6 +203,10 @@ message AddFragment {
    * DataFragment. Absent on datasets without stable row ids. A `column_*` arm
    * means the sequence is a hidden column of one of the data files this
    * fragment's AddDataFile actions add; see RowLineageColumn.
+   *
+   * Supplied inline row ids (ids out of a ReserveRowIds range) must be
+   * disjoint from those of every other fragment the operation adds, and
+   * conflict with a concurrent operation supplying any of the same ids.
    */
   oneof row_id_sequence {
     bytes inline_row_ids = 3;
@@ -176,10 +220,7 @@ message AddFragment {
     bytes inline_created_at_versions = 7;
     lance.table.RowLineageColumn column_created_at_versions = 8;
   }
-  /*
-   * false => rearrangement only (rows unchanged, e.g. compaction); CDC and
-   * streaming consumers may skip it. Absent is treated as true (real change).
-   */
+  // Data-change marker; see rationale 5 at the top of this file.
   optional bool data_change = 9;
 }
 
@@ -190,18 +231,28 @@ message AddDataFile {
   // The fragment to add the file to (Committed, or a same-op Local fragment).
   Ref fragment = 1;
   /*
-   * The data file. Its `fields` are left unset (-1) and stamped in at apply
-   * once `field_ids` resolve; `field_ids` below is the authority for the
-   * column -> field mapping.
+   * The data file. Its `fields` must be empty and its `base_id` unset: apply
+   * stamps both from `field_ids` and `base`, which are the authority.
    */
   lance.table.DataFile file = 2;
   /*
-   * One entry per column in `file`, in order. Committed for existing fields,
+   * The file's field ids, as `DataFile.fields` would carry them, in order;
+   * when `file.column_indices` is non-empty it has exactly one entry per id.
+   * Committed for existing fields or a reserved negative id (see FieldRef),
    * Local for fields minted by an AddField in the same operation.
+   *
+   * A field id may appear only once, and so may a column index other than
+   * -1.
    */
-  repeated Ref field_ids = 3;
+  repeated FieldRef field_ids = 3;
   // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 4;
+  /*
+   * The base path the file lives under: Committed for a base in the target
+   * manifest, Local for one minted by an AddBase earlier in the same
+   * operation. Absent => the dataset's own data directory.
+   */
+  optional Ref base = 5;
 }
 
 /*
@@ -217,9 +268,10 @@ message AddField {
   /*
    * The parent field: Committed to reparent under an existing field, Local for
    * a parent minted by an earlier AddField in the same operation. Absent =>
-   * top-level column.
+   * top-level column, whose name must not be a reserved system column name
+   * such as `_rowid`.
    */
-  optional Ref parent = 2;
+  optional FieldRef parent = 2;
   // Field definition; its `id` and `parent_id` are ignored (see `local`, `parent`).
   lance.file.Field def = 3;
 }
@@ -246,7 +298,7 @@ message AddBase {
 message TombstoneFieldData {
   Ref fragment = 1;
   // The fields whose current backing is tombstoned.
-  repeated Ref field_ids = 2;
+  repeated FieldRef field_ids = 2;
   // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 3;
 }
@@ -277,9 +329,16 @@ message SetDeletionFile {
    * first.
    */
   uint64 fragment = 1;
+  // The deletion file. Its `base_id` must be unset; apply stamps it from `base`.
   lance.table.DeletionFile deletion_file = 2;
   // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 3;
+  /*
+   * The base path the deletion file lives under: Committed for a base in the
+   * target manifest, Local for one minted by an AddBase earlier in the same
+   * operation. Absent => the dataset's own deletion directory.
+   */
+  optional Ref base = 4;
 }
 
 /*
@@ -299,7 +358,7 @@ message ConfigUpdate {
   repeated FieldMetadata field_metadata = 4;
 
   message FieldMetadata {
-    Ref field = 1;
+    FieldRef field = 1;
     UpdateMap updates = 2;
   }
 }
@@ -322,9 +381,15 @@ message AddOverlays {
 }
 
 /*
- * Refresh row-version (created-at / last-updated-at) metadata for fragments
- * whose columns were merged in place, mirroring the implicit refresh Merge
- * performs on stable-row-id datasets.
+ * Restamp every row of each listed fragment as updated by this commit: every
+ * row's last_updated_at_version becomes the commit version, replacing an
+ * inline or spilled sequence with an inline uniform one. created_at versions
+ * are untouched.
+ *
+ * Explicit because how many rows a change restamps is not implied by the
+ * file it writes: a partial update can write a whole-fragment column file
+ * yet restamp only the matched rows, and a key-only match restamps rows with
+ * no file at all.
  */
 message RefreshRowVersionMetadata {
   repeated uint64 fragment_ids = 1;
@@ -343,7 +408,7 @@ message UpdateCompactedSsTables {
  * no live fields).
  */
 message DropField {
-  Ref field = 1;
+  FieldRef field = 1;
 }
 
 /*
@@ -357,7 +422,8 @@ message DropField {
  * type, and AddDataFile for the new field's data.
  */
 message AlterField {
-  Ref field = 1;
+  FieldRef field = 1;
+  // A top-level field may not be renamed to a reserved system column name.
   optional string name = 2;
   optional bool nullable = 3;
 }
@@ -381,7 +447,7 @@ message AddIndexSegment {
    * action does not inherit that, because it has no historical encoding to
    * stay compatible with. Apply derives the manifest's representation.
    */
-  repeated Ref fields = 3;
+  repeated FieldRef fields = 3;
   /*
    * Field ids whose values the segment carries but is not necessarily keyed
    * on. Independent of `fields` rather than a subset of it, and the segment's
@@ -394,7 +460,7 @@ message AddIndexSegment {
    * apply rejects an overlapping declaration until it does. A disjoint
    * declaration lowers to the legacy subset form and commits today.
    */
-  repeated Ref covering_fields = 12;
+  repeated FieldRef covering_fields = 12;
   google.protobuf.Any index_details = 4;
   optional int32 index_version = 5;
   /*
@@ -506,6 +572,9 @@ message AdjustIndexCoverage {
  * Actions before it in the same operation are allowed; it discards their
  * changes to the schema, fragments, and indices. A committed reference after
  * it to a fragment from before it is rejected.
+ *
+ * It discards objects but never rewinds the id counters: fragment, field, and
+ * row ids minted afterwards stay above every id the table has handed out.
  */
 message ResetTable {}
 
@@ -513,6 +582,10 @@ message ResetTable {}
  * Reserve a contiguous range of fragment ids from the counter, for a later
  * (possibly distributed) writer to populate. Fragments written against a
  * reserved range reference those ids as Committed.
+ *
+ * Like ReserveRowIds, the reservation is taken after the operation's own
+ * mints, wherever the action appears, so the reserved range is the `count`
+ * ids ending at the committed manifest's max_fragment_id.
  */
 message ReserveFragmentIds {
   uint32 count = 1;
@@ -550,10 +623,13 @@ message ReserveRowIds {
 message AssertUniqueKeys {
   /*
    * Field ids of the key columns (unenforced primary key). Committed, or Local
-   * for same-op minted fields. This is the authoritative key-column list;
-   * `filter.field_ids` (an artifact of the shared KeyExistenceFilter type) is
-   * ignored here and left empty.
+   * for same-op minted fields.
    */
-  repeated Ref key_fields = 1;
+  repeated FieldRef key_fields = 1;
+  /*
+   * `filter.field_ids` must be empty; `key_fields` is the only key list.
+   * Decode rejects a non-empty one.
+   */
   KeyExistenceFilter filter = 2;
 }
+
