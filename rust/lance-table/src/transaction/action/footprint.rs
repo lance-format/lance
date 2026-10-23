@@ -615,6 +615,16 @@ impl Footprint {
         });
     }
 
+    /// Record that this set rewrites the index `name` wholesale, reaching
+    /// whatever segments it holds when the set applies.
+    pub(super) fn rewrite_index(&mut self, name: String) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: None,
+        });
+    }
+
     /// Record that this set brings `fragments` under `name` by widening a
     /// segment that is already there, without restating what the index is.
     pub(super) fn extend_index_coverage(
