@@ -154,7 +154,7 @@ impl AddIndexSegment {
     /// rather than silently flattened, which would drop the fact that the
     /// column is carried. Both this lowering and the rejection come out when a
     /// release implements the flag; the action's own shape does not change.
-    fn lower_covering(
+    pub(super) fn lower_covering(
         name: &str,
         keys: Vec<i32>,
         covering: Vec<i32>,
