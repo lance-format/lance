@@ -120,10 +120,10 @@ pub(super) struct ApplyState<'a> {
     /// counter or claimed out of a reservation.
     new_fragments: HashSet<u64>,
 
-    /// The highest fragment id this operation reserved for a later writer, if
-    /// it reserved any. No fragment backs it, so the manifest assembly cannot
-    /// infer it from the fragment list.
-    reserved_fragment_ids: Option<u64>,
+    /// How many fragment ids this operation reserved for a later writer. Like
+    /// [`Self::reserved_row_ids`], taken off the counter after this
+    /// operation's own fragments are numbered.
+    reserved_fragment_ids: u64,
 
     /// How many row ids this operation reserved for a later writer. Taken off
     /// the counter after this operation's own fragments are numbered, so the
@@ -161,7 +161,7 @@ impl<'a> ApplyState<'a> {
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
             new_fragments: HashSet::new(),
-            reserved_fragment_ids: None,
+            reserved_fragment_ids: 0,
             reserved_row_ids: 0,
             rebound_fields: HashMap::new(),
             reset: false,
@@ -188,13 +188,13 @@ impl<'a> ApplyState<'a> {
             .then_some(current_manifest.next_row_id);
         self.assign_row_ids_to_new_fragments(&mut next_row_id, new_version)?;
         self.take_row_id_reservation(&mut next_row_id)?;
+        let reserved_fragment_high_water = self.take_fragment_id_reservation()?;
 
         let ApplyState {
             schema,
             mut fragments,
             new_bases,
             rebound_fields,
-            reserved_fragment_ids,
             reset,
             config: dataset_config,
             table_metadata,
@@ -244,14 +244,7 @@ impl<'a> ApplyState<'a> {
         // A reserved id backs no fragment, so the manifest assembly cannot
         // derive it from the fragment list; raise the high-water mark to cover
         // the range so a later writer's ids are not handed out twice.
-        if let Some(high_water) = reserved_fragment_ids {
-            let high_water = u32::try_from(high_water).map_err(|_| {
-                Error::invalid_input(format!(
-                    "reserving fragment ids up to {high_water} exceeds the maximum fragment id \
-                     ({})",
-                    u32::MAX
-                ))
-            })?;
+        if let Some(high_water) = reserved_fragment_high_water {
             manifest.max_fragment_id = Some(
                 manifest
                     .max_fragment_id
@@ -427,15 +420,21 @@ impl<'a> ApplyState<'a> {
         Ok(id)
     }
 
-    /// Take `count` ids off the fragment counter without minting fragments for
-    /// them. The reserved ids are `[next, next + count)`; a later writer names
-    /// them as [`Ref::Committed`].
-    pub(super) fn reserve_fragment_ids(&mut self, count: u32) {
-        if count == 0 {
-            return;
-        }
-        self.next_fragment_id += u64::from(count);
-        self.reserved_fragment_ids = Some(self.next_fragment_id - 1);
+    /// Set `count` fragment ids aside for a later writer, on top of any this
+    /// operation already reserved. A later writer names them as
+    /// [`Ref::Committed`].
+    pub(super) fn reserve_fragment_ids(&mut self, count: u32) -> Result<()> {
+        self.reserved_fragment_ids = self
+            .reserved_fragment_ids
+            .checked_add(u64::from(count))
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "reserving {count} more fragment ids on top of {} already reserved in this \
+                     operation overflows the fragment id counter",
+                    self.reserved_fragment_ids
+                ))
+            })?;
+        Ok(())
     }
 
     /// Set `count` row ids aside for a later writer, on top of any this
@@ -654,6 +653,33 @@ impl<'a> ApplyState<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Take this operation's fragment id reservation off the counter, after its
+    /// own fragments have been numbered, so the reserved range is always the
+    /// top `count` ids of the committed high-water mark. Returns that mark, or
+    /// `None` if nothing was reserved.
+    ///
+    /// A reserved id backs no fragment, so the manifest assembly cannot derive
+    /// the mark from the fragment list.
+    fn take_fragment_id_reservation(&mut self) -> Result<Option<u32>> {
+        if self.reserved_fragment_ids == 0 {
+            return Ok(None);
+        }
+        let high_water = self
+            .next_fragment_id
+            .checked_add(self.reserved_fragment_ids - 1)
+            .and_then(|high_water| u32::try_from(high_water).ok())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "reserving {} fragment ids from {} exceeds the maximum fragment id ({})",
+                    self.reserved_fragment_ids,
+                    self.next_fragment_id,
+                    u32::MAX
+                ))
+            })?;
+        self.next_fragment_id = u64::from(high_water) + 1;
+        Ok(Some(high_water))
     }
 
     /// Take this operation's row id reservation off the counter, after its own
