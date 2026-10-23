@@ -24,6 +24,7 @@ use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
 use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
+use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::Schema;
@@ -213,7 +214,7 @@ impl<'a> ApplyState<'a> {
         if reset {
             indices.clear();
         }
-        prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema);
+        prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema)?;
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
         Transaction::normalize_fragments(&mut fragments)?;
@@ -771,28 +772,47 @@ impl<'a> ApplyState<'a> {
 /// be keyed on a child. Ancestry is read from `base_schema`, the schema of the
 /// version being committed on top of, because a field this operation drops or
 /// moves has already left the schema being built.
+///
+/// A user index with no bitmap -- one built before indices recorded their
+/// coverage -- has no fragment to prune, so a rewrite under it is refused
+/// rather than left to serve stale rows. System indices carry no bitmap by
+/// design and are keyed on no column, so a rewrite never affects them.
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
     rebound: &HashMap<u64, HashSet<i32>>,
     base_schema: &Schema,
-) {
+) -> Result<()> {
     if rebound.is_empty() {
-        return;
+        return Ok(());
     }
     for index in indices.iter_mut() {
+        let affected_field = |fields: &HashSet<i32>| {
+            fields
+                .iter()
+                .copied()
+                .find(|field| field_affects_index(*field, &index.fields, base_schema))
+        };
         let Some(bitmap) = index.fragment_bitmap.as_mut() else {
+            if !is_system_index(index)
+                && let Some(field) = rebound.values().find_map(affected_field)
+            {
+                return Err(Error::invalid_input(format!(
+                    "index '{}' has unknown coverage; migrate or rebuild it before rewriting \
+                     field {field}",
+                    index.name
+                )));
+            }
             continue;
         };
         for (fragment_id, fields) in rebound {
-            if fields
-                .iter()
-                .any(|field| field_affects_index(*field, &index.fields, base_schema))
+            if affected_field(fields).is_some()
                 && let Ok(fragment_id) = u32::try_from(*fragment_id)
             {
                 bitmap.remove(fragment_id);
             }
         }
     }
+    Ok(())
 }
 
 fn unbound_token_err(space: &str, token: u32) -> Error {
