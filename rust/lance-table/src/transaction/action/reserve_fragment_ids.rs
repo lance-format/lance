@@ -12,9 +12,13 @@ use lance_core::{Error, Result};
 /// Reserve a contiguous range of fragment ids from the counter, for a later
 /// (possibly distributed) writer to populate.
 ///
-/// The range starts wherever the counter stands when this action is applied, so
-/// the reserving writer learns which ids it got by reading the committed
-/// manifest's high-water mark: the range is the `count` ids ending there.
+/// The reservation is taken after the operation's own fragments are numbered,
+/// wherever this action sits among them: the one exception to actions
+/// applying in order, and an invisible one, since a reservation creates
+/// nothing another action can name. The reserving writer learns which ids it
+/// got by reading the committed manifest's high-water mark: the range is the
+/// `count` ids ending there. An id reserved in this operation cannot be
+/// claimed in it.
 /// Fragments written against the range name those ids as
 /// [`Ref::Committed`](super::Ref::Committed).
 ///
@@ -30,8 +34,7 @@ pub struct ReserveFragmentIds {
 
 impl ReserveFragmentIds {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        state.reserve_fragment_ids(self.count);
-        Ok(())
+        state.reserve_fragment_ids(self.count)
     }
 
     /// A reserved id backs no rows until something is written to it.
