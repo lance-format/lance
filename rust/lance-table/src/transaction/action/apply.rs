@@ -1086,6 +1086,63 @@ mod tests {
         assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
     }
 
+    /// An index from before fragment bitmaps has no record of what it covers,
+    /// so there is no fragment to prune out of it when data under it is
+    /// rewritten. Keeping it would serve stale results, and dropping it
+    /// silently would lose an index the user built, so the rewrite is refused.
+    #[rstest]
+    #[case::indexed_field(0, true)]
+    #[case::other_field(1, false)]
+    fn test_rewriting_under_an_index_of_unknown_coverage_is_refused(
+        #[case] indexed: i32,
+        #[case] rejected: bool,
+    ) {
+        let index = IndexMetadata {
+            fields: vec![indexed],
+            fragment_bitmap: None,
+            ..sample_index_metadata("idx")
+        };
+
+        let result = apply_with_indices(
+            &backed_manifest(),
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(0),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(0),
+                    file: DataFile::new(
+                        "data/0-new.lance",
+                        vec![],
+                        vec![0],
+                        ConcreteFileVersion::V2_0,
+                        None,
+                        None,
+                    ),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+            vec![index],
+        );
+
+        if !rejected {
+            result.unwrap();
+            return;
+        }
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "index 'idx' has unknown coverage; migrate or rebuild it before rewriting field 0"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
     fn apply_steps(manifest: &Manifest, steps: Vec<Vec<Action>>) -> Result<Manifest> {
         let steps = steps
             .into_iter()
