@@ -192,10 +192,12 @@ impl TryFrom<pb_actions::AddFragment> for AddFragment {
 mod tests {
     use super::*;
     use crate::format::DataFile;
-    use crate::transaction::action::test_support::apply;
+    use crate::format::IndexMetadata;
+    use crate::transaction::action::test_support::{apply, apply_with_indices};
     use crate::transaction::action::{Action, AddDataFile, FieldRef, ReserveFragmentIds};
-    use crate::transaction::test_support::sample_manifest;
+    use crate::transaction::test_support::{sample_index_metadata, sample_manifest};
     use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
 
     fn add_fragment(id: Ref) -> Action {
@@ -300,6 +302,48 @@ mod tests {
             error.to_string().contains("no commit has reserved"),
             "{error}"
         );
+    }
+
+    /// Index coverage bitmaps are not pruned when a fragment is removed, and
+    /// readers intersect them with the fragments that exist. A reserved id
+    /// some segment still lists would read as indexed the moment it is
+    /// claimed, though no index has seen its rows.
+    #[rstest]
+    #[case::listed_by_an_index(1, Some("index 'idx' segment"))]
+    #[case::not_listed(2, None)]
+    fn test_a_reserved_id_an_index_still_lists_cannot_be_claimed(
+        #[case] id: u64,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let reserved = apply(
+            &sample_manifest(),
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+        )
+        .unwrap();
+        let stale_index = IndexMetadata {
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            ..sample_index_metadata("idx")
+        };
+
+        let result = apply_with_indices(
+            &reserved,
+            vec![add_fragment(Ref::Committed(id))],
+            vec![stale_index],
+        );
+
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(message) => {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, lance_core::Error::InvalidInput { .. }),
+                    "{error:?}"
+                );
+                assert!(error.to_string().contains(message), "{error}");
+            }
+        }
     }
 
     #[test]
