@@ -159,14 +159,6 @@ macro_rules! define_action_proto {
                     $(Some(pb_actions::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
-                    // Specified ahead of its implementation in this stack.
-                    // TODO: implement AssertCellsUnchanged and drop this arm.
-                    Some(pb_actions::action::Action::AssertCellsUnchanged(_)) => {
-                        Err(Error::not_supported(
-                            "the action-based transaction uses AssertCellsUnchanged, which this \
-                             version of Lance does not implement",
-                        ))
-                    }
                     // The fragment reuse actions are specified but not yet
                     // implemented. Reject rather than skip: silently dropping
                     // an action would apply a partial transaction.
@@ -199,11 +191,7 @@ mod tests {
     use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
-        AdjustIndexCoverage, AlterField, AssertUniqueKeys, ConfigUpdate, DropField, DropIndex,
-        FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment,
-        ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile, TombstoneFieldData,
-        UpdateCompactedSsTables,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays, AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -338,6 +326,19 @@ mod tests {
                     field_ids: Vec::new(),
                     filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
                 },
+            }),
+            Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(1)],
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 5,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
+                    },
+                ],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
