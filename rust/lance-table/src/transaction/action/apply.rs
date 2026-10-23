@@ -851,7 +851,7 @@ mod tests {
         new_mem_wal_index_meta,
     };
     use crate::transaction::action::test_support::{
-        added_field, apply, apply_with_indices, backed_manifest,
+        added_field, apply, apply_with_indices, backed_manifest, manifest_with_base, mint_base,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
@@ -1586,5 +1586,218 @@ mod tests {
             matches!(error, Error::CorruptFile { .. }),
             "unexpected error: {error:?}"
         );
+    }
+
+    /// Apply `actions` on top of `current` as an operation that read `read`,
+    /// the shape of a retry after a concurrent commit.
+    fn apply_after_reading(
+        read: &Manifest,
+        current: &Manifest,
+        actions: Vec<Action>,
+    ) -> Result<Manifest> {
+        Transaction::new(
+            read.version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step", actions,
+            )])),
+            None,
+        )
+        .build_manifest_with_read_version(
+            Some(current),
+            Vec::new(),
+            "tx.txn",
+            &default_build_config(),
+            Some(ReadVersionState {
+                manifest: read,
+                indices: &[],
+            }),
+        )
+        .map(|(manifest, _)| manifest)
+    }
+
+    fn assert_rejected_beyond_read_mark(result: Result<Manifest>, named: &str) {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(named), "{message}");
+        assert!(
+            message.contains("read version's high-water mark"),
+            "{message}"
+        );
+        assert!(message.contains("Local"), "{message}");
+    }
+
+    fn data_file_under_base(fragment: Ref, base: Ref) -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment,
+            file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change: true,
+            base: Some(base),
+        })
+    }
+
+    /// A committed id above the read version's mark names nothing the writer
+    /// could have read. Even when this operation is what mints it, a replay
+    /// onto a version where a concurrent commit took that id first would
+    /// silently target the other writer's object, so the writer must name it
+    /// by its local token.
+    #[rstest]
+    #[case::deletion_file_on_a_minted_fragment(
+        vec![
+            mint_fragment(0),
+            Action::SetDeletionFile(SetDeletionFile {
+                fragment: 5,
+                deletion_file: None,
+                data_change: true,
+                base: None,
+            }),
+        ],
+        "fragment 5",
+    )]
+    #[case::data_file_for_a_minted_field(
+        vec![
+            mint_field(0, "added", None),
+            mint_fragment(0),
+            write_data(Ref::Local(0), FieldRef::Committed(1)),
+        ],
+        "field 1",
+    )]
+    #[case::data_file_under_a_minted_base(
+        vec![
+            mint_base(),
+            mint_fragment(0),
+            data_file_under_base(Ref::Local(0), Ref::Committed(2)),
+        ],
+        "base 2",
+    )]
+    fn test_a_committed_ref_to_an_id_minted_in_the_same_operation_is_rejected(
+        #[case] actions: Vec<Action>,
+        #[case] named: &str,
+    ) {
+        // Fragments 1-4 are reserved, so the fragment minted here is 5.
+        let mut read = manifest_with_base();
+        read.max_fragment_id = Some(4);
+
+        assert_rejected_beyond_read_mark(apply(&read, actions), named);
+    }
+
+    /// The retry case the check exists for: the id exists by the time this
+    /// operation applies, but a concurrent commit minted it for its own
+    /// object.
+    #[rstest]
+    #[case::deletion_file(
+        Action::SetDeletionFile(SetDeletionFile {
+            fragment: 1,
+            deletion_file: None,
+            data_change: true,
+            base: None,
+        }),
+        "fragment 1",
+    )]
+    #[case::remove_fragment(
+        Action::RemoveFragment(RemoveFragment {
+            fragment: Ref::Committed(1),
+            data_change: true,
+        }),
+        "fragment 1",
+    )]
+    #[case::data_file_for_a_field(write_data(Ref::Committed(0), FieldRef::Committed(1)), "field 1")]
+    #[case::data_file_under_a_base(
+        data_file_under_base(Ref::Local(0), Ref::Committed(2)),
+        "base 2"
+    )]
+    fn test_a_committed_ref_to_an_id_a_concurrent_commit_minted_is_rejected(
+        #[case] action: Action,
+        #[case] named: &str,
+    ) {
+        let read = manifest_with_base();
+        let current = apply(
+            &read,
+            vec![
+                mint_field(0, "concurrent", None),
+                mint_base(),
+                mint_fragment(0),
+                write_data(Ref::Local(0), FieldRef::Committed(0)),
+            ],
+        )
+        .unwrap();
+
+        assert_rejected_beyond_read_mark(
+            apply_after_reading(&read, &current, vec![mint_fragment(0), action]),
+            named,
+        );
+    }
+
+    /// A reservation the operation could have read back is claimable on a
+    /// retry; one a concurrent commit took after the read is not, even though
+    /// the version applied onto has it.
+    #[rstest]
+    #[case::reserved_before_the_read(3, None)]
+    #[case::reserved_concurrently(6, Some("no commit has reserved"))]
+    fn test_a_fragment_claim_must_come_from_a_reservation_at_the_read_version(
+        #[case] id: u64,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let mut read = backed_manifest();
+        read.max_fragment_id = Some(4);
+        let current = apply(
+            &read,
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+        )
+        .unwrap();
+
+        let result = apply_after_reading(
+            &read,
+            &current,
+            vec![Action::AddFragment(AddFragment {
+                id: Ref::Committed(id),
+                physical_rows: 10,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            })],
+        );
+
+        match expected_error {
+            None => {
+                let next = result.unwrap();
+                assert!(next.fragments.iter().any(|fragment| fragment.id == id));
+            }
+            Some(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(error.to_string().contains(message), "{error}");
+                assert!(error.to_string().contains("read version"), "{error}");
+            }
+        }
+    }
+
+    /// Without the read version there is nothing to check a committed id
+    /// against, so an apply onto any other version fails closed.
+    #[test]
+    fn test_an_apply_without_the_read_version_fails_closed() {
+        let read = backed_manifest();
+        let current = apply(&read, vec![mint_fragment(0)]).unwrap();
+
+        let error = Transaction::new(
+            read.version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step",
+                vec![remove_fragment_zero()],
+            )])),
+            None,
+        )
+        .build_manifest(
+            Some(&current),
+            Vec::new(),
+            "tx.txn",
+            &default_build_config(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("read version"), "{error}");
     }
 }
