@@ -65,6 +65,7 @@ impl TryFrom<pb_actions::ResetTable> for ResetTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::FLAG_NON_REUSABLE_FIELD_IDS;
     use crate::format::DataFile;
     use crate::transaction::action::test_support::{
         added_field, apply, apply_with_indices, backed_manifest, footprint,
@@ -74,6 +75,7 @@ mod tests {
     };
     use crate::transaction::test_support::sample_index_metadata;
     use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
 
     fn reset() -> Action {
         Action::ResetTable(ResetTable)
@@ -197,6 +199,58 @@ mod tests {
             .flat_map(|fragment| fragment.files.iter().map(|file| file.path.as_str()))
             .collect();
         assert_eq!(paths, vec!["data/fresh.lance"]);
+    }
+
+    fn mint_fragment(token: u32) -> Action {
+        Action::AddFragment(AddFragment {
+            id: Ref::Local(token),
+            physical_rows: 4,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    fn mint_field(token: u32, name: &str) -> Action {
+        Action::AddField(AddField {
+            local: token,
+            parent: None,
+            def: added_field(name),
+        })
+    }
+
+    /// A reset discards objects but never rewinds a counter: the committed
+    /// marks cover every id the table or this operation handed out, including
+    /// ids the reset then discarded. `backed_manifest` holds fragment 0 and
+    /// field 0, with no fragment mark recorded yet.
+    #[rstest]
+    #[case::bare_reset(vec![reset()], 0, 0)]
+    #[case::mint_then_reset(vec![mint_field(0, "early"), mint_fragment(0), reset()], 1, 1)]
+    #[case::mint_reset_mint(
+        vec![
+            mint_field(0, "early"),
+            mint_fragment(0),
+            reset(),
+            mint_field(1, "fresh"),
+            mint_fragment(1),
+        ],
+        2,
+        2
+    )]
+    fn test_reset_never_rewinds_the_id_counters(
+        #[case] actions: Vec<Action>,
+        #[case] fragment_mark: u64,
+        #[case] field_mark: i32,
+    ) {
+        let mut manifest = backed_manifest();
+        manifest.activate_non_reusable_field_ids();
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+
+        let next = apply(&manifest, actions).unwrap();
+
+        assert_eq!(next.max_fragment_id(), Some(fragment_mark));
+        assert_eq!(next.max_field_id(), field_mark);
     }
 
     #[test]
