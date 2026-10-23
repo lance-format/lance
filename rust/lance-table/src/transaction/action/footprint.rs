@@ -987,8 +987,22 @@ mod tests {
         vec![tombstone(0, &[1])],
         false,
     )]
-    // A child added under a struct needs the struct to still be there; the
-    // struct dropped afterwards takes the child with it, as intended.
+    // A struct is dropped children first, so a write to a child collides with
+    // the child's own drop rather than slipping past the parent's. Landing
+    // second, the drop tombstones the child's new data on apply.
+    #[case::a_write_to_a_child_landing_after_its_struct_was_dropped(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
+        vec![drop_field(2), drop_field(1)],
+        true,
+    )]
+    #[case::a_struct_dropped_after_a_write_to_a_child(
+        vec![drop_field(2), drop_field(1)],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
+        false,
+    )]
+    // A child added under a struct needs the struct to still be there. The
+    // reverse order is not a footprint conflict, but the drop then finds a
+    // live child it did not name, and apply rejects it.
     #[case::a_child_landing_after_its_parent_was_dropped(
         vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
         vec![drop_field(1)],

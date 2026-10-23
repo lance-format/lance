@@ -132,13 +132,16 @@ impl TryFrom<pb_actions::DropField> for DropField {
 mod tests {
     use super::*;
     use crate::format::DataFile;
+    use crate::format::Manifest;
     use crate::transaction::action::test_support::{
         added_field, apply, apply_with_indices, backed_manifest,
     };
     use crate::transaction::action::{Action, AddField};
     use crate::transaction::test_support::sample_index_metadata;
-    use arrow_schema::{DataType, Field as ArrowField};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
     use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
     use std::sync::Arc;
 
     #[test]
@@ -193,30 +196,121 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_drop_field_takes_the_whole_subtree() {
+    /// `id` at 0, then `s: {a, t: {b}}` at 1-4, with fragment 0's second file
+    /// backing the whole struct.
+    fn manifest_with_struct() -> Manifest {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![
+                    ArrowField::new("a", DataType::Int32, true),
+                    ArrowField::new(
+                        "t",
+                        DataType::Struct(Fields::from(vec![ArrowField::new(
+                            "b",
+                            DataType::Int32,
+                            true,
+                        )])),
+                        true,
+                    ),
+                ])),
+                true,
+            ),
+        ]);
         let mut manifest = backed_manifest();
-        let mut parent = Field::try_from(ArrowField::new("parent", DataType::Int32, true)).unwrap();
-        parent.id = 1;
-        let mut child = added_field("child");
-        child.id = 2;
-        child.parent_id = 1;
-        parent.children.push(child);
-        manifest.schema.fields.push(parent);
+        manifest.schema = Schema::try_from(&arrow).unwrap();
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.files.push(DataFile::new(
+            "data/0-s.lance",
+            vec![1, 2, 3, 4],
+            vec![0, 1, 2, 3],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
+        manifest.fragments = Arc::new(vec![fragment]);
+        manifest
+    }
 
+    fn drop_field(id: i32) -> Action {
+        Action::DropField(DropField {
+            field: FieldRef::Committed(id),
+        })
+    }
+
+    /// A drop names exactly one field, so that every field it removes is in
+    /// its footprint; a struct with children still in place would take them
+    /// with it unnamed.
+    #[rstest]
+    #[case::struct_with_children(vec![drop_field(1)], "field 1")]
+    #[case::nested_struct_before_its_child(
+        vec![drop_field(2), drop_field(3), drop_field(4), drop_field(1)],
+        "field 3"
+    )]
+    fn test_drop_field_rejects_a_field_with_live_children(
+        #[case] actions: Vec<Action>,
+        #[case] named: &str,
+    ) {
+        let error = apply(&manifest_with_struct(), actions).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(named), "{message}");
+        assert!(
+            message.contains("children first, deepest first"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_drop_field_takes_a_struct_children_first() {
         let next = apply(
-            &manifest,
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(1),
-            })],
+            &manifest_with_struct(),
+            vec![drop_field(4), drop_field(3), drop_field(2), drop_field(1)],
         )
         .unwrap();
 
-        assert!(next.schema.field_by_id(1).is_none());
-        assert!(
-            next.schema.field_by_id(2).is_none(),
-            "a struct's children cannot outlive it"
+        assert_eq!(
+            next.schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![0]
         );
+        // The struct's file backed nothing else, so it is pruned.
+        assert_eq!(next.fragments[0].files.len(), 1);
+        assert_eq!(next.fragments[0].files[0].path, "data/0.lance");
+    }
+
+    /// A drop that lands after a concurrent write to a child still applies:
+    /// it tombstones the child out of every file the version it lands on
+    /// holds, the concurrent one included.
+    #[test]
+    fn test_drop_field_landing_after_a_write_to_a_child() {
+        let mut manifest = manifest_with_struct();
+        let mut concurrent = manifest.fragments[0].clone();
+        concurrent.id = 1;
+        concurrent.files = vec![DataFile::new(
+            "data/1-a.lance",
+            vec![2],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        )];
+        let mut fragments = manifest.fragments.as_ref().clone();
+        fragments.push(concurrent);
+        manifest.fragments = Arc::new(fragments);
+
+        let next = apply(
+            &manifest,
+            vec![drop_field(4), drop_field(3), drop_field(2), drop_field(1)],
+        )
+        .unwrap();
+
+        let concurrent = next.fragments.iter().find(|f| f.id == 1).unwrap();
+        assert!(concurrent.files.is_empty(), "{:?}", concurrent.files);
     }
 
     #[test]
