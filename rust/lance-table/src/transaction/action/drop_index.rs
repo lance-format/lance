@@ -7,6 +7,7 @@ use super::Footprint;
 use super::apply::ApplyState;
 use super::proto::non_empty;
 use crate::format::pb_actions;
+use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -28,15 +29,25 @@ pub struct DropIndex {
 }
 
 impl DropIndex {
-    pub(super) fn apply(&self, _state: &mut ApplyState) -> Result<()> {
-        Err(Error::not_supported("DropIndex is not implemented yet"))
+    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        state.drop_index(&self.name)
     }
 
+    /// An index is derived state, so dropping one changes no row a reader
+    /// sees -- except the MemWAL index, which holds rows of its own. Unlike
+    /// [`RemoveIndexSegment`](super::RemoveIndexSegment) there is no flag to
+    /// leave this to the writer: a whole index is never dropped as part of a
+    /// rearrangement.
     pub(super) fn is_data_change(&self) -> bool {
-        false
+        self.name == MEM_WAL_INDEX_NAME
     }
 
-    pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
+    /// A claim on the index with unstated coverage, which collides with every
+    /// other claim on the same name, in either order. Nothing else is written:
+    /// the segments it removes are whatever the index holds at apply.
+    pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        footprint.rewrite_index(self.name.clone());
+    }
 }
 
 impl From<&DropIndex> for pb_actions::DropIndex {
@@ -61,7 +72,6 @@ impl TryFrom<pb_actions::DropIndex> for DropIndex {
 mod tests {
     use super::*;
     use crate::format::{DataFile, IndexMetadata};
-    use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
     use crate::transaction::action::test_support::{
         apply_with_indices, backed_manifest, footprint,
     };

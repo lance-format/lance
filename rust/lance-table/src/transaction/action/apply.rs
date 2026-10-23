@@ -405,6 +405,18 @@ impl<'a> ApplyState<'a> {
         Ok(())
     }
 
+    /// Remove every segment of the index `name`.
+    pub(super) fn drop_index(&mut self, name: &str) -> Result<()> {
+        let before = self.indices.len();
+        self.indices.retain(|index| index.name != name);
+        if self.indices.len() == before {
+            return Err(Error::invalid_input(format!(
+                "DropIndex names index '{name}', which has no segment in the dataset"
+            )));
+        }
+        Ok(())
+    }
+
     /// Where the segment `uuid` lives, checking on the way that it really
     /// belongs to `name`. A mismatch means the operation was planned against a
     /// different set of segments, the same way a missing segment does.
