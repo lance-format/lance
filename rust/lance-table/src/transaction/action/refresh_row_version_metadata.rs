@@ -12,14 +12,21 @@ use lance_core::{Error, Result};
 
 /// Record that every row of these fragments was updated by this operation.
 ///
-/// Under stable row ids a fragment carries a `last_updated_at_version` sequence
-/// per row. Rewriting a fragment's columns in place leaves the rows where they
-/// are, so nothing else in the operation restates when they last changed; this
-/// action does, mirroring the refresh a legacy `Merge` performs implicitly.
+/// What it writes: every row's `last_updated_at_version` becomes the commit
+/// version. The fragment's sequence, inline or spilled to a column, is
+/// replaced with an inline uniform one. `created_at_version` is untouched: the
+/// rows are the same rows, and a row minted by this operation gets both stamps
+/// from the [`AddFragment`](super::AddFragment) that minted it.
 ///
-/// `created_at_version` is deliberately untouched: the rows are the same rows,
-/// and a row minted by this operation gets both stamps from the
-/// [`AddFragment`](super::AddFragment) that minted it.
+/// Why it is an action rather than implied by the data files the operation
+/// writes: how many rows a column rewrite restamps is not a function of the
+/// file. An update in rewrite-columns mode, and merge-insert's partial-fragment
+/// path, write a whole-fragment column file but restamp only the matched rows;
+/// a key-only merge-insert match restamps rows with no file at all; a `Merge`
+/// restamps on removing a file or changing its path.
+/// [`AddOverlays`](super::AddOverlays) can imply its restamp only because its
+/// coverage bitmap is exactly the set of changed rows. This action covers the
+/// whole-fragment case, mirroring the refresh a legacy `Merge` performs.
 ///
 /// Fragments are named by committed id. A fragment this operation minted has
 /// nothing to restamp.
