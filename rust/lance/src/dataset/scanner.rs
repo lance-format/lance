@@ -1806,8 +1806,11 @@ impl Scanner {
     ///
     /// An empty list is rejected immediately. Segment selection without a vector query
     /// is rejected during planning. When index use is enabled, planning also rejects
-    /// unknown UUIDs, segments from different logical indices or the wrong vector column,
-    /// and incompatible query metrics.
+    /// unknown UUIDs and segments from different logical indices or the wrong vector
+    /// column. Query metric compatibility is checked when selected segments overlap the
+    /// fragment scope. With no overlap, ordinary search uses flat KNN with the query
+    /// metric, or the selected index's metric when unset, while fast search returns
+    /// no rows. See [`Self::distance_metric`] for metric defaults.
     ///
     /// # Example
     ///
@@ -9343,7 +9346,6 @@ pub mod test_dataset {
 #[cfg(test)]
 mod test {
 
-    use self::VectorSearchSetting::{Fragments, Nearest, Segments};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -22772,13 +22774,6 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(actual, expected);
     }
 
-    #[derive(Clone, Copy, Debug)]
-    enum VectorSearchSetting {
-        Nearest,
-        Fragments,
-        Segments,
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum FragmentFilterPhase {
         None,
@@ -23368,16 +23363,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .project(&["id"])
             .unwrap();
         let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNSubIndex"), "{plan}");
         let actual = scan.try_into_batch().await.unwrap();
         FragmentVectorFixture::assert_rows(&actual, &expected, &plan);
     }
 
     #[rstest]
-    #[case::nearest_segments([Nearest, Segments])]
-    #[case::segments_nearest([Segments, Nearest])]
     #[tokio::test]
     async fn test_vector_search_respects_index_segments(
-        #[case] order: [VectorSearchSetting; 2],
         #[values(false, true)] is_fast: bool,
         #[values(5, 80)] k: usize,
     ) {
@@ -23386,20 +23379,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         if is_fast {
             scanner.fast_search();
         }
-        for setting in order {
-            match setting {
-                Nearest => {
-                    scanner.nearest("vec", &fixture.query, k).unwrap();
-                }
-                Segments => {
-                    scanner
-                        .with_index_segments(vec![fixture.segments[0]])
-                        .unwrap();
-                }
-                Fragments => unreachable!("segment-only queries do not set fragments"),
-            }
-        }
-        scanner.nprobes(1);
+        scanner
+            .with_index_segments(vec![fixture.segments[0]])
+            .unwrap()
+            .nearest("vec", &fixture.query, k)
+            .unwrap()
+            .nprobes(1);
         fixture
             .assert_result(
                 &mut scanner,
@@ -23412,15 +23397,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[rstest]
-    #[case::nearest_fragments_segments([Nearest, Fragments, Segments])]
-    #[case::nearest_segments_fragments([Nearest, Segments, Fragments])]
-    #[case::segments_nearest_fragments([Segments, Nearest, Fragments])]
-    #[case::fragments_nearest_segments([Fragments, Nearest, Segments])]
-    #[case::fragments_segments_nearest([Fragments, Segments, Nearest])]
-    #[case::segments_fragments_nearest([Segments, Fragments, Nearest])]
     #[tokio::test]
     async fn test_vector_search_intersects_fragments_and_index_segments(
-        #[case] order: [VectorSearchSetting; 3],
         #[values(false, true)] is_fast: bool,
         #[values(5, 80)] k: usize,
     ) {
@@ -23429,22 +23407,13 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         if is_fast {
             scanner.fast_search();
         }
-        for setting in order {
-            match setting {
-                Nearest => {
-                    scanner.nearest("vec", &fixture.query, k).unwrap();
-                }
-                Fragments => {
-                    scanner.with_fragments(fixture.dataset.fragments()[1..].to_vec());
-                }
-                Segments => {
-                    scanner
-                        .with_index_segments(vec![fixture.segments[0]])
-                        .unwrap();
-                }
-            }
-        }
-        scanner.nprobes(1);
+        scanner
+            .with_fragments(fixture.dataset.fragments()[1..].to_vec())
+            .with_index_segments(vec![fixture.segments[0]])
+            .unwrap()
+            .nearest("vec", &fixture.query, k)
+            .unwrap()
+            .nprobes(1);
         let (expected_fragments, path) = if is_fast {
             (vec![1], FragmentSearchPath::Ann(1))
         } else {
@@ -23465,14 +23434,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[rstest]
-    #[case::postfilter_nearest_first(FragmentFilterPhase::Post, [Nearest, Fragments, Segments])]
-    #[case::postfilter_fragments_first(FragmentFilterPhase::Post, [Fragments, Segments, Nearest])]
-    #[case::prefilter_nearest_first(FragmentFilterPhase::Pre, [Nearest, Fragments, Segments])]
-    #[case::prefilter_fragments_first(FragmentFilterPhase::Pre, [Fragments, Segments, Nearest])]
+    #[case::postfilter(FragmentFilterPhase::Post)]
+    #[case::prefilter(FragmentFilterPhase::Pre)]
     #[tokio::test]
     async fn test_vector_search_fragment_filter_phase(
         #[case] phase: FragmentFilterPhase,
-        #[case] order: [VectorSearchSetting; 3],
         #[values(false, true)] is_fast: bool,
         #[values(5, 80)] k: usize,
     ) {
@@ -23483,22 +23449,13 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         if is_fast {
             scanner.fast_search();
         }
-        for setting in order {
-            match setting {
-                Nearest => {
-                    scanner.nearest("vec", &fixture.query, k).unwrap();
-                }
-                Fragments => {
-                    scanner.with_fragments(fixture.dataset.fragments()[1..].to_vec());
-                }
-                Segments => {
-                    scanner
-                        .with_index_segments(vec![fixture.segments[0]])
-                        .unwrap();
-                }
-            }
-        }
-        scanner.nprobes(1);
+        scanner
+            .with_fragments(fixture.dataset.fragments()[1..].to_vec())
+            .with_index_segments(vec![fixture.segments[0]])
+            .unwrap()
+            .nearest("vec", &fixture.query, k)
+            .unwrap()
+            .nprobes(1);
         let (expected_fragments, path) = if is_fast {
             (vec![1], FragmentSearchPath::Ann(1))
         } else {
@@ -23537,40 +23494,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         #[case] has_explicit_segments: bool,
         #[case] is_fast: bool,
         #[case] expected: (&[usize], FragmentSearchPath),
-        #[values(false, true)] is_fragments_first: bool,
         #[values(5, 80)] k: usize,
     ) {
         let (expected_fragments, path) = expected;
         let fixture = FragmentVectorFixture::new(mode != FragmentIndexMode::Unindexed, false).await;
         let mut scanner = fixture.dataset.scan();
-        let order = if is_fragments_first {
-            [Fragments, Segments, Nearest]
-        } else {
-            [Nearest, Fragments, Segments]
-        };
-        for setting in order {
-            match setting {
-                Nearest => {
-                    scanner.nearest("vec", &fixture.query, k).unwrap();
-                }
-                Fragments => {
-                    scanner.with_fragments(
-                        fragment_ids
-                            .iter()
-                            .map(|id| fixture.dataset.fragments()[*id].clone())
-                            .collect(),
-                    );
-                }
-                Segments => {
-                    if has_explicit_segments {
-                        scanner
-                            .with_index_segments(vec![fixture.segments[0]])
-                            .unwrap();
-                    }
-                }
-            }
+        scanner.with_fragments(
+            fragment_ids
+                .iter()
+                .map(|id| fixture.dataset.fragments()[*id].clone())
+                .collect(),
+        );
+        if has_explicit_segments {
+            scanner
+                .with_index_segments(vec![fixture.segments[0]])
+                .unwrap();
         }
-        scanner.nprobes(1);
+        scanner
+            .nearest("vec", &fixture.query, k)
+            .unwrap()
+            .nprobes(1);
         if mode == FragmentIndexMode::Flat {
             scanner.use_index(false);
         }
@@ -23676,6 +23619,48 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 && err.to_string().contains(&unknown_segment.to_string()),
             "unexpected error: {err}"
         );
+    }
+
+    #[rstest]
+    #[case::disjoint(false, false)]
+    #[case::disjoint_fast(false, true)]
+    #[case::empty(true, false)]
+    #[case::empty_fast(true, true)]
+    #[tokio::test]
+    async fn test_vector_search_disjoint_index_segments_metric(
+        #[case] is_empty: bool,
+        #[case] is_fast: bool,
+    ) {
+        let fixture = FragmentVectorFixture::new(true, false).await;
+        let fragments = if is_empty {
+            Vec::new()
+        } else {
+            fixture.dataset.fragments()[2..].to_vec()
+        };
+        let mut scanner = fixture.dataset.scan();
+        scanner
+            .with_fragments(fragments)
+            .with_index_segments(vec![fixture.segments[0]])
+            .unwrap()
+            .nearest("vec", &fixture.query, 5)
+            .unwrap()
+            .distance_metric(DistanceType::Dot)
+            .project(&["id"])
+            .unwrap();
+        if is_fast {
+            scanner.fast_search();
+        }
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(!plan.contains("ANNSubIndex"), "{plan}");
+        let actual = scanner.try_into_batch().await.unwrap();
+        let expected = if is_empty || is_fast {
+            Vec::new()
+        } else {
+            assert!(plan.contains("KNNVectorDistance"), "{plan}");
+            // The zero query ties all dot distances; row IDs break ties.
+            (32..37).map(|id| (id, 1.0)).collect()
+        };
+        FragmentVectorFixture::assert_rows(&actual, &expected, &plan);
     }
 
     #[rstest]
