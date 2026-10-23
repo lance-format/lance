@@ -6,7 +6,8 @@
 //! [`BlobRefBatch`] carries a nullable Arrow extension array and its source
 //! contexts through exchange, spill, and retries. It does not read payloads or
 //! retain source snapshots. See the [execution contract](https://lance.org/guide/blob_references/).
-//! Descriptor capture and reference readers are separate APIs.
+//! [`BlobRefCapture`] creates references from scanned Blob V2 descriptors;
+//! reference readers are a separate API.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -24,6 +25,7 @@ use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Fields, Schema};
 use bytes::{Buf, Bytes};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
+use lance_core::datatypes::BlobKind;
 use lance_core::{Error, Result};
 use lance_io::object_store::uri_to_url;
 use lance_table::{
@@ -32,9 +34,12 @@ use lance_table::{
 };
 use object_store::path::Path;
 use prost::Message;
+use roaring::RoaringBitmap;
 
 use crate::Dataset;
 use crate::dataset::refs::check_valid_branch;
+
+pub use crate::dataset::blob::capture::BlobRefCapture;
 
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.blob.reference.rs"));
@@ -76,6 +81,7 @@ static REFERENCE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 pub struct BlobSourceContext {
     proto: pb::SourceContext,
     source_id: [u8; 32],
+    registered_bases: Arc<RoaringBitmap>,
 }
 
 impl BlobSourceContext {
@@ -182,6 +188,72 @@ impl BlobSourceContext {
         &self.proto.manifest
     }
 
+    pub(crate) fn validate_dataset(&self, dataset: &Dataset) -> Result<()> {
+        let location = dataset.manifest_location();
+        let mut manifest =
+            Manifest::try_from(table_pb::Manifest::decode(self.proto.manifest.clone())?)?;
+        manifest.detach_sparse_inline_row_ids(self.proto.manifest.len());
+        if self.proto.table_uri != canonical_uri(&dataset.refs.root()?.uri)?
+            || self.proto.manifest_path != location.path.as_ref()
+            || self.proto.manifest_identity != location.identity
+            || !matches_loaded_manifest(&manifest, dataset.manifest())
+        {
+            return Err(Error::invalid_input(format!(
+                "Blob source context {:?}/{} at {} does not match dataset snapshot {:?}/{} at {}",
+                self.proto.branch,
+                self.proto.version,
+                self.proto.table_uri,
+                dataset.manifest().branch,
+                dataset.version().version,
+                dataset.uri(),
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reference(
+        &self,
+        object_uri: String,
+        offset: u64,
+        length: Option<u64>,
+        kind: BlobKind,
+        base_id: Option<u32>,
+    ) -> Result<BlobRef> {
+        let origin = match kind {
+            BlobKind::External => {
+                if !self
+                    .proto
+                    .required_capabilities
+                    .contains(&IMMUTABLE_EXTERNAL)
+                {
+                    return Err(Error::invalid_input(
+                        "Capturing an external blob requires the external immutability assumption",
+                    ));
+                }
+                pb::object_locator::Origin::ExternalImmutable
+            }
+            BlobKind::Inline
+            | BlobKind::Packed
+            | BlobKind::Dedicated
+            | BlobKind::Managed
+            | BlobKind::ManagedWithBase => pb::object_locator::Origin::Lance,
+        };
+        BlobRef::try_new(
+            0,
+            pb::ObjectLocator {
+                protocol_version: VERSION,
+                source_id: Bytes::copy_from_slice(&self.source_id),
+                object_uri: canonical_uri(&object_uri)?,
+                offset,
+                length,
+                origin: origin as i32,
+                base_id,
+            }
+            .encode_to_vec(),
+            length,
+        )
+    }
+
     fn from_proto(proto: pb::SourceContext) -> Result<Self> {
         check_version(proto.protocol_version, "source context")?;
         if proto.required_capabilities != [OBJECT_RANGES]
@@ -239,7 +311,12 @@ impl BlobSourceContext {
             )));
         }
         let source_id = *blake3::hash(&proto.encode_to_vec()).as_bytes();
-        Ok(Self { proto, source_id })
+        let registered_bases = Arc::new(manifest.base_paths.iter().map(|base| base.id).collect());
+        Ok(Self {
+            proto,
+            source_id,
+            registered_bases,
+        })
     }
 }
 
@@ -504,6 +581,13 @@ impl BlobRefBatch {
                         reference.source_context,
                     )));
                 }
+                if let Some(base_id) = object.base_id
+                    && !context.registered_bases.contains(base_id)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Blob reference row {index} references unknown base_id {base_id}",
+                    )));
+                }
                 if object.origin == pb::object_locator::Origin::ExternalImmutable as i32
                     && !context
                         .proto
@@ -677,13 +761,25 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    use arrow_array::{DictionaryArray, RecordBatchIterator, StringArray, UInt32Array};
+    use arrow_array::{
+        DictionaryArray, RecordBatchIterator, StringArray, UInt8Array, UInt32Array, UInt64Array,
+    };
+    use lance_core::datatypes::{BlobHandling, BlobKind};
+    use lance_core::utils::address::RowAddress;
     use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::ObjectStore;
+    use lance_table::format::BasePath;
+    use object_store::ObjectStoreExt;
     use rstest::rstest;
 
-    use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::blob::{
+        BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobFieldOptions, blob_field,
+        blob_field_with_options,
+    };
     use crate::dataset::WriteParams;
+    use crate::dataset::blob::test_util::{create_multi_base_blob_v2_fixture, managed_blob_schema};
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
 
     #[cfg_attr(coverage, coverage(off))]
     fn context(version: u64, branch: Option<&str>) -> BlobSourceContext {
@@ -721,6 +817,7 @@ mod tests {
             } else {
                 pb::object_locator::Origin::ExternalImmutable
             } as i32,
+            base_id: None,
         };
         BlobRef::try_new(slot, locator.encode_to_vec(), length).unwrap()
     }
@@ -1038,11 +1135,17 @@ mod tests {
             .await
             .unwrap();
         let reopened = Dataset::open(uri).await.unwrap();
-        for dataset in [&cached, &reopened] {
+        for dataset in [&original, &cached, &reopened] {
             let context = BlobSourceContext::from_dataset(dataset, "catalog/first", "workers")
                 .await
                 .unwrap();
             assert_eq!(first, context);
+            BlobRefCapture::try_new(
+                Arc::new(dataset.clone()),
+                context,
+                dataset.schema().field("blob").unwrap().id,
+            )
+            .unwrap();
         }
         let mut latest = original.clone();
         latest
@@ -1089,5 +1192,694 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("no longer matches"));
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn capture_dataset(uri: &str) -> Arc<Dataset> {
+        let mut blobs = BlobArrayBuilder::new(6);
+        for bytes in [
+            Some(b"abc".as_slice()),
+            Some(b"abcde"),
+            Some(b"abcdefghij"),
+            None,
+            Some(b""),
+            Some(b"uv"),
+        ] {
+            if let Some(bytes) = bytes {
+                blobs.push_bytes(bytes).unwrap();
+            } else {
+                blobs.push_null().unwrap();
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![blob_field_with_options(
+            "blob",
+            true,
+            BlobFieldOptions::default()
+                .with_inline_size_threshold(4)
+                .with_dedicated_size_threshold(std::num::NonZeroUsize::new(8).unwrap()),
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+        Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                uri,
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn capture_external_dataset(
+        directory: &std::path::Path,
+        range: Option<crate::blob::BlobRange>,
+        is_registered: bool,
+    ) -> (Arc<Dataset>, std::path::PathBuf) {
+        let external = directory.join("external with space.bin");
+        std::fs::write(&external, b"abcdefgh").unwrap();
+        let mut builder = BlobDescriptorArrayBuilder::new("blob");
+        builder
+            .push(BlobDescriptor::External {
+                base_id: if is_registered { 1 } else { 0 },
+                uri: if is_registered {
+                    "external with space.bin".to_string()
+                } else {
+                    url::Url::from_file_path(&external).unwrap().to_string()
+                },
+                offset: range.map_or(0, |range| range.offset),
+                size: range.map_or(0, |range| range.size),
+            })
+            .unwrap();
+        let (field, array) = builder.finish().unwrap().into_parts();
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                directory.join("table").to_str().unwrap(),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    allow_external_blob_outside_bases: true,
+                    initial_bases: is_registered.then(|| {
+                        vec![BasePath::new(
+                            1,
+                            url::Url::from_directory_path(directory).unwrap().into(),
+                            None,
+                            false,
+                        )]
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        (dataset, external)
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn capture_managed_dataset(
+        directory: &std::path::Path,
+        base_id: Option<u32>,
+    ) -> (Arc<Dataset>, std::path::PathBuf) {
+        let base = directory.join("base with space");
+        let object_path = base.join("_blobs/managed.bin");
+        std::fs::create_dir_all(base.join("_blobs")).unwrap();
+        std::fs::write(&object_path, b"abcdefgh").unwrap();
+        let mut builder = BlobDescriptorArrayBuilder::new("blob");
+        builder
+            .push(BlobDescriptor::Managed {
+                base_id,
+                uri: "_blobs/managed.bin".to_string(),
+                offset: 2,
+                size: 3,
+            })
+            .unwrap();
+        let (field, array) = builder.finish().unwrap().into_parts();
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                directory.join("table").to_str().unwrap(),
+                Some(WriteParams {
+                    initial_bases: Some(vec![BasePath::new(
+                        base_id.unwrap_or(1),
+                        url::Url::from_directory_path(&base).unwrap().into(),
+                        None,
+                        true,
+                    )]),
+                    target_bases: base_id.is_none().then_some(vec![1]),
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        (dataset, object_path)
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn capture_inputs(dataset: &Dataset) -> (Field, Vec<RowAddress>, StructArray) {
+        let batch = dataset
+            .scan()
+            .project(&["blob"])
+            .unwrap()
+            .blob_handling(BlobHandling::BlobsDescriptions)
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let field = batch.schema().field_with_name("blob").unwrap().clone();
+        let addresses = batch[lance_core::ROW_ADDR]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .map(RowAddress::from)
+            .collect();
+        (field, addresses, batch["blob"].as_struct().clone())
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn read_captured(dataset: &Dataset, reference: &BlobRef) -> Bytes {
+        let object = reference.object_locator().unwrap();
+        let params = dataset.store_params.as_deref().cloned().unwrap_or_default();
+        let (store, path) = if let Some(base_id) = object.base_id {
+            (
+                dataset.object_store(Some(base_id)).await.unwrap(),
+                ObjectStore::extract_path_from_uri(
+                    dataset.session.store_registry(),
+                    &object.object_uri,
+                )
+                .unwrap(),
+            )
+        } else if object.origin == pb::object_locator::Origin::Lance as i32 {
+            // Resolve the primary source through its authenticated context.
+            // Reopening memory:// by URI would create a different storage authority.
+            (
+                dataset.object_store.clone(),
+                ObjectStore::extract_path_from_uri(
+                    dataset.session.store_registry(),
+                    &object.object_uri,
+                )
+                .unwrap(),
+            )
+        } else {
+            ObjectStore::from_uri_and_params(
+                dataset.session.store_registry(),
+                &object.object_uri,
+                &params,
+            )
+            .await
+            .unwrap()
+        };
+        let length = match object.length {
+            Some(length) => length,
+            None => store.size(&path).await.unwrap(),
+        };
+        if length == 0 {
+            return Bytes::new();
+        }
+        let before = store.io_stats_snapshot().requests.len();
+        let bytes = store
+            .inner
+            .get_range(&path, object.offset..object.offset + length)
+            .await
+            .unwrap();
+        let stats = store.io_stats_snapshot();
+        let requests = &stats.requests[before..];
+        assert_eq!(
+            requests.len(),
+            1,
+            "payload reads must not reread descriptors: {requests:?}"
+        );
+        assert_eq!(requests[0].path, path);
+        assert_eq!(
+            requests[0].range,
+            Some(object.offset..object.offset + length)
+        );
+        bytes
+    }
+
+    #[tokio::test]
+    async fn capture_roundtrip_without_payload_or_descriptor_reads() {
+        let dataset = capture_dataset("memory://").await;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let (field, addresses, descriptors) = capture_inputs(&dataset).await;
+        let indices = UInt32Array::from(vec![2, 0, 4, 3, 1, 2, 5]);
+        let selected = arrow::compute::take(&descriptors, &indices, None).unwrap();
+        let addresses = indices
+            .values()
+            .iter()
+            .map(|index| addresses[*index as usize])
+            .collect::<Vec<_>>();
+        let mut capture = BlobRefCapture::try_new(
+            dataset.clone(),
+            source.clone(),
+            dataset.schema().field("blob").unwrap().id,
+        )
+        .unwrap();
+        let before = dataset.object_store.io_stats_snapshot();
+        let batch = capture
+            .capture(&source, &field, &addresses, selected.as_struct())
+            .await
+            .unwrap();
+        // Reusing the session must not introduce descriptor or payload lookups.
+        let repeated = capture
+            .capture(&source, &field, &addresses, selected.as_struct())
+            .await
+            .unwrap();
+        let restored = BlobRefBatch::decode(&batch.encode().unwrap()).unwrap();
+        assert_eq!(batch.array(), repeated.array());
+        assert_eq!(batch.array(), restored.array());
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().requests.len(),
+            before.requests.len()
+        );
+        for (row, expected) in [
+            Some(b"abcdefghij".as_slice()),
+            Some(b"abc"),
+            Some(b""),
+            None,
+            Some(b"abcde"),
+            Some(b"abcdefghij"),
+            Some(b"uv"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match (restored.reference(row).unwrap(), expected) {
+                (Some(reference), Some(expected)) => {
+                    assert_eq!(reference.length(), Some(expected.len() as u64));
+                    assert_eq!(read_captured(&dataset, &reference).await.as_ref(), expected);
+                }
+                (None, None) => {}
+                other => panic!("Unexpected captured value {other:?}"),
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::inline(3, None, true)]
+    #[case::packed(65_537, None, true)]
+    #[case::dedicated(65_537, Some(65_536), true)]
+    #[case::data_only(65_537, None, false)]
+    #[tokio::test]
+    async fn capture_non_default_bases(
+        #[case] size: usize,
+        #[case] dedicated: Option<usize>,
+        #[case] is_dataset_root: bool,
+    ) {
+        let fixture =
+            create_multi_base_blob_v2_fixture(vec![7; size], dedicated, is_dataset_root).await;
+        let source = BlobSourceContext::from_dataset(&fixture.dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let (field, addresses, descriptors) = capture_inputs(&fixture.dataset).await;
+        let id = fixture.dataset.schema().field("blob").unwrap().id;
+        let mut capture =
+            BlobRefCapture::try_new(fixture.dataset.clone(), source.clone(), id).unwrap();
+        let captured = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap();
+        let captured = BlobRefBatch::decode(&captured.encode().unwrap()).unwrap();
+        let reference = captured.reference(0).unwrap().unwrap();
+        let object = reference.object_locator().unwrap();
+        assert_eq!(object.base_id, Some(1));
+        assert!(object.object_uri.contains("/blob_base/"));
+        assert_eq!(
+            read_captured(&fixture.dataset, &reference).await.as_ref(),
+            fixture.expected.as_slice()
+        );
+    }
+
+    #[rstest]
+    #[case::whole_object(None, false)]
+    #[case::range(Some(crate::blob::BlobRange { offset: 2, size: 3 }), false)]
+    #[case::registered_whole_object(None, true)]
+    #[case::registered_range(Some(crate::blob::BlobRange { offset: 2, size: 3 }), true)]
+    #[tokio::test]
+    async fn capture_external_preserves_unknown_lengths(
+        #[case] range: Option<crate::blob::BlobRange>,
+        #[case] is_registered: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let (dataset, external) =
+            capture_external_dataset(directory.path(), range, is_registered).await;
+        let uri = url::Url::from_file_path(&external).unwrap().to_string();
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let (field, addresses, descriptors) = capture_inputs(&dataset).await;
+        let id = dataset.schema().field("blob").unwrap().id;
+        // Capture must also work without access to external object metadata.
+        std::fs::remove_file(&external).unwrap();
+        let mut capture = BlobRefCapture::try_new(dataset.clone(), source.clone(), id).unwrap();
+        let error = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("external immutability assumption")
+        );
+        let source = source.with_external_immutability_assumption();
+        let mut capture = BlobRefCapture::try_new(dataset.clone(), source.clone(), id).unwrap();
+        let before = dataset.object_store.io_stats_snapshot();
+        let references = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().requests.len(),
+            before.requests.len()
+        );
+        let reference = references.reference(0).unwrap().unwrap();
+        let object = reference.object_locator().unwrap();
+        assert_eq!(object.object_uri, uri);
+        assert_eq!(object.base_id, is_registered.then_some(1));
+        assert_eq!(object.offset, range.map_or(0, |range| range.offset));
+        assert_eq!(reference.length(), range.map(|range| range.size));
+        std::fs::write(&external, b"abcdefgh").unwrap();
+        if range.is_some() {
+            assert_eq!(read_captured(&dataset, &reference).await.as_ref(), b"cde");
+        } else {
+            assert_eq!(
+                read_captured(&dataset, &reference).await.as_ref(),
+                b"abcdefgh"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::inherited(None)]
+    #[case::explicit(Some(1))]
+    #[tokio::test]
+    async fn capture_managed_bases(#[case] base_id: Option<u32>) {
+        let directory = tempfile::tempdir().unwrap();
+        let (dataset, object_path) = capture_managed_dataset(directory.path(), base_id).await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let (field, addresses, descriptors) = capture_inputs(&dataset).await;
+        let mut capture = BlobRefCapture::try_new(
+            dataset.clone(),
+            source.clone(),
+            dataset.schema().field("blob").unwrap().id,
+        )
+        .unwrap();
+        let references = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap();
+        let references = BlobRefBatch::decode(&references.encode().unwrap()).unwrap();
+        let reference = references.reference(0).unwrap().unwrap();
+        assert_eq!(read_captured(&dataset, &reference).await.as_ref(), b"cde");
+        let object = reference.object_locator().unwrap();
+        assert_eq!(object.base_id, Some(base_id.unwrap_or(1)));
+        assert_eq!(
+            object.object_uri,
+            url::Url::from_file_path(object_path).unwrap().as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_refs_survive_compaction_and_shallow_clone() {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = capture_dataset(directory.path().join("source").to_str().unwrap()).await;
+        dataset
+            .tags()
+            .create("captured", dataset.manifest().version)
+            .await
+            .unwrap();
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/source", "workers")
+            .await
+            .unwrap();
+        let (field, addresses, descriptors) = capture_inputs(&dataset).await;
+        let field_id = dataset.schema().field("blob").unwrap().id;
+        let mut capture =
+            BlobRefCapture::try_new(dataset.clone(), source.clone(), field_id).unwrap();
+        let captured = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap();
+        let mut latest = dataset.as_ref().clone();
+        let cloned = Arc::new(
+            latest
+                .shallow_clone(
+                    directory.path().join("clone").to_str().unwrap(),
+                    source.version(),
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+        let cloned_source = BlobSourceContext::from_dataset(&cloned, "catalog/clone", "workers")
+            .await
+            .unwrap();
+        let (clone_field, clone_addresses, clone_descriptors) = capture_inputs(&cloned).await;
+        let mut clone_capture =
+            BlobRefCapture::try_new(cloned.clone(), cloned_source.clone(), field_id).unwrap();
+        let clone_refs = clone_capture
+            .capture(
+                &cloned_source,
+                &clone_field,
+                &clone_addresses,
+                &clone_descriptors,
+            )
+            .await
+            .unwrap();
+        for row in [0, 1, 2, 4, 5] {
+            assert_eq!(
+                captured
+                    .reference(row)
+                    .unwrap()
+                    .unwrap()
+                    .object_locator()
+                    .unwrap()
+                    .object_uri,
+                clone_refs
+                    .reference(row)
+                    .unwrap()
+                    .unwrap()
+                    .object_locator()
+                    .unwrap()
+                    .object_uri
+            );
+        }
+        compact_files(
+            &mut latest,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(latest.manifest().version > source.version());
+        let error = BlobRefCapture::try_new(Arc::new(latest), source.clone(), field_id)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match dataset snapshot")
+        );
+        let restored = BlobRefBatch::decode(&captured.encode().unwrap()).unwrap();
+        for (row, expected) in [(0, b"abc".as_slice()), (1, b"abcde"), (2, b"abcdefghij")] {
+            assert_eq!(
+                read_captured(&dataset, &restored.reference(row).unwrap().unwrap())
+                    .await
+                    .as_ref(),
+                expected
+            );
+            assert_eq!(
+                read_captured(&cloned, &clone_refs.reference(row).unwrap().unwrap())
+                    .await
+                    .as_ref(),
+                expected
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::wrong_source("source", "scan source does not match")]
+    #[case::wrong_field("field", "expected descriptor field")]
+    #[case::wrong_layout("layout", "expected descriptor field")]
+    #[case::wrong_descriptor_shape("shape", "expected descriptor field")]
+    #[case::cardinality("cardinality", "descriptor count")]
+    #[case::missing_fragment("fragment", "missing fragment")]
+    #[case::bad_offset("offset", "invalid address")]
+    #[case::null_child("null_child", "null children")]
+    #[case::unknown_kind("kind", "Unknown blob kind")]
+    #[case::overflow("overflow", "overflows u64")]
+    #[case::dedicated_offset("dedicated", "nonzero position")]
+    #[tokio::test]
+    async fn capture_rejects_invalid_inputs(#[case] invalid: &str, #[case] message: &str) {
+        let dataset = capture_dataset("memory://").await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let (mut field, addresses, descriptors) = capture_inputs(&dataset).await;
+        let mut addresses = addresses[..1].to_vec();
+        let mut descriptors = descriptors.slice(0, 1);
+        let mut scan_source = source.clone();
+        let mut arrays = descriptors.columns().to_vec();
+        match invalid {
+            "source" => scan_source = source.clone().with_external_immutability_assumption(),
+            "field" => field = field.with_name("other"),
+            "layout" => field = field.with_metadata(HashMap::new()),
+            "shape" => {}
+            "cardinality" => addresses.clear(),
+            "fragment" => addresses[0] = RowAddress::new_from_parts(999, 0),
+            "offset" => addresses[0] = RowAddress::new_from_parts(0, 999),
+            "null_child" => arrays[1] = Arc::new(UInt64Array::from(vec![None])),
+            "kind" => arrays[0] = Arc::new(UInt8Array::from(vec![255])),
+            "overflow" => arrays[1] = Arc::new(UInt64Array::from(vec![u64::MAX])),
+            "dedicated" => {
+                arrays[0] = Arc::new(UInt8Array::from(vec![BlobKind::Dedicated as u8]));
+                arrays[1] = Arc::new(UInt64Array::from(vec![1]));
+            }
+            _ => unreachable!(),
+        }
+        let mut fields = descriptors
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>();
+        if invalid == "shape" {
+            fields[1] = fields[1].clone().with_name("not_position");
+        }
+        descriptors = StructArray::try_new(fields.into(), arrays, None).unwrap();
+        field = field.with_data_type(descriptors.data_type().clone());
+        let mut capture = BlobRefCapture::try_new(
+            dataset.clone(),
+            source,
+            dataset.schema().field("blob").unwrap().id,
+        )
+        .unwrap();
+        let error = capture
+            .capture(&scan_source, &field, &addresses, &descriptors)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[rstest]
+    #[case::empty(0)]
+    #[case::all_null(3)]
+    #[tokio::test]
+    async fn capture_empty_and_null_batches(#[case] count: usize) {
+        let dataset = capture_dataset("memory://").await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let (field, _, descriptors) = capture_inputs(&dataset).await;
+        let descriptors = StructArray::new_null(descriptors.fields().clone(), count);
+        let addresses = vec![RowAddress::from(RowAddress::TOMBSTONE_ROW); count];
+        let mut capture = BlobRefCapture::try_new(
+            dataset.clone(),
+            source.clone(),
+            dataset.schema().field("blob").unwrap().id,
+        )
+        .unwrap();
+        let before = dataset.object_store.io_stats_snapshot().requests.len();
+        let captured = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap();
+        let restored = BlobRefBatch::decode(&captured.encode().unwrap()).unwrap();
+        assert_eq!(restored.array().len(), count);
+        assert_eq!(restored.array().null_count(), count);
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().requests.len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_branch_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_dataset =
+            capture_dataset(directory.path().join("table").to_str().unwrap()).await;
+        let field_id = source_dataset.schema().field("blob").unwrap().id;
+        let main = BlobSourceContext::from_dataset(&source_dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let mut source_dataset = source_dataset.as_ref().clone();
+        let branch = Arc::new(
+            source_dataset
+                .create_branch("experiment", main.version(), None)
+                .await
+                .unwrap(),
+        );
+        let error = BlobRefCapture::try_new(branch.clone(), main, field_id)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match dataset snapshot")
+        );
+        let source = BlobSourceContext::from_dataset(&branch, "catalog/table", "workers")
+            .await
+            .unwrap();
+        let (field, addresses, descriptors) = capture_inputs(&branch).await;
+        let mut capture =
+            BlobRefCapture::try_new(branch.clone(), source.clone(), field_id).unwrap();
+        let captured = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_captured(&branch, &captured.reference(0).unwrap().unwrap())
+                .await
+                .as_ref(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn rejects_unregistered_locator_base() {
+        let context = context(1, None);
+        let mut locator = reference(&context, 0, Some(3)).object_locator().unwrap();
+        locator.base_id = Some(999);
+        let reference = BlobRef::try_new(0, locator.encode_to_vec(), Some(3)).unwrap();
+        let error = BlobRefBatch::try_new(vec![context], [Some(reference)]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("unknown base_id 999"));
+    }
+
+    #[test]
+    fn registered_zero_base_survives_transport() {
+        let mut proto = context(1, None).proto;
+        let mut manifest = table_pb::Manifest::decode(proto.manifest.clone()).unwrap();
+        manifest.base_paths.push(table_pb::BasePath {
+            id: 0,
+            name: None,
+            path: "s3://source/table.lance".to_string(),
+            is_dataset_root: true,
+        });
+        proto.manifest = manifest.encode_to_vec().into();
+        let context = BlobSourceContext::from_proto(proto).unwrap();
+        let reference = context
+            .reference(
+                "s3://source/table.lance/data/blob".to_string(),
+                0,
+                Some(3),
+                BlobKind::Managed,
+                Some(0),
+            )
+            .unwrap();
+        let batch = BlobRefBatch::try_new(vec![context], [Some(reference)]).unwrap();
+        let restored = BlobRefBatch::decode(&batch.encode().unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .reference(0)
+                .unwrap()
+                .unwrap()
+                .object_locator()
+                .unwrap()
+                .base_id,
+            Some(0)
+        );
     }
 }

@@ -5,10 +5,10 @@ moving lazy blob values between processes. It carries source contexts and nullab
 reference arrays through exchange, spill, and retries. It does not change stored
 Blob v2 descriptors or any persisted Lance format.
 
-Protocol version 1 supplies transport, validation, and context remapping. Capturing
-references from scanned descriptors, fetching their bytes, binding APIs, and
-coordinated snapshot retention are separate capabilities. Serializing a reference
-does not provide these capabilities.
+Protocol version 1 supplies transport, descriptor capture, validation, and context
+remapping. Fetching reference payloads, binding APIs, and coordinated snapshot
+retention are separate capabilities. Serializing a reference does not provide
+these capabilities.
 
 ## Source contexts
 
@@ -70,6 +70,62 @@ Capability 1 is required. Capability 2 is optional. Missing, duplicate, reordere
 or unsupported capability entries are rejected. These are transport capabilities;
 they do not advertise a payload reader or retention service.
 
+## Capturing scan descriptors
+
+`BlobRefCapture` converts an existing top-level Blob V2 descriptor column into a
+`BlobRefBatch`. Create a session for the exact scan snapshot and Lance field ID,
+then reuse it across batches. Preserve the source context alongside the scan
+output; capture rejects a different snapshot or storage binding. Raw descriptor
+arrays do not carry provenance, so callers must maintain that association when
+reordering or combining scan output.
+
+```rust
+use std::sync::Arc;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use lance::{Dataset, Result};
+use lance::blob::reference::{BlobRefCapture, BlobRefBatch, BlobSourceContext};
+use lance_core::datatypes::BlobHandling;
+use lance_core::utils::address::RowAddress;
+
+async fn capture(dataset: Arc<Dataset>) -> Result<BlobRefBatch> {
+    let source = BlobSourceContext::from_dataset(
+        &dataset, "catalog/table-incarnation", "query/storage-binding",
+    ).await?;
+    let field_id = dataset.schema().field_id("image")?;
+    let mut capture = BlobRefCapture::try_new(dataset.clone(), source.clone(), field_id)?;
+    let batch = dataset.scan().project(&["image"])?
+        .blob_handling(BlobHandling::BlobsDescriptions)
+        .with_row_address().try_into_batch().await?;
+    let addresses = batch["_rowaddr"].as_primitive::<UInt64Type>()
+        .values().iter().copied().map(RowAddress::from).collect::<Vec<_>>();
+    capture.capture(
+        &source, batch.schema().field_with_name("image")?,
+        &addresses, batch["image"].as_struct(),
+    ).await
+}
+```
+
+Use the original scan field before aliasing, and physical `_rowaddr` values from
+the same scan. Capture validates field identity, descriptor layout and child
+validity, cardinality, physical address bounds, and range overflow. Null blobs,
+known empty blobs, duplicates, and input ordering are preserved. Nested containers
+require a row-to-parent mapping and are outside this capture API.
+
+Capture reuses Lance's descriptor resolver for Inline, Packed, Dedicated, Managed,
+and External storage. Inline references point into the original data file; other
+Lance-owned references point to the resolved sidecar or managed object. Registered
+bases, including shallow-clone source bases, are resolved from the source snapshot.
+The locator preserves the selected base ID so workers can apply its exact storage
+binding even when multiple bases have the same URI.
+
+Capture does not reread descriptors, read payloads, or HEAD objects. Fragment,
+object store, and base resolution metadata are cached within the session. External
+whole-object lengths remain unknown; a later reader must resolve and cache that
+metadata. External references require the source context's explicit immutability
+assumption. The application must retain source snapshots through all deferred
+reads and retries, as described below.
+
 ## Reference values
 
 A reference column uses the Arrow extension name `lance.blob.ref` and extension
@@ -108,9 +164,14 @@ have been remapped.
 The wire messages are defined in `protos/blob_reference.proto`. Engines transport
 locators without constructing object paths or interpreting stored Blob-kind values.
 Version 1 encodes an absolute object URI, physical offset, optional exact length,
-origin, and source fingerprint. A Lance-owned object must have a known length.
+origin, optional registered base ID, and source fingerprint. An absent base ID
+selects primary storage for a Lance-owned object or the absolute URI's storage
+binding for an external object. A present base ID must exist in the source
+manifest; zero is a valid registered ID. A Lance-owned object must have a known length.
 An external whole-object reference may have an unknown length only at object
 offset zero. External subranges require an explicit length.
+Workers must resolve primary and registered-base storage through the authenticated
+source binding. Opening the locator URI with default storage settings is not equivalent.
 
 The source fingerprint is BLAKE3 of the validated `SourceContext` encoded by Lance.
 Encoding uses ascending protobuf field numbers, minimal varints, omitted implicit
