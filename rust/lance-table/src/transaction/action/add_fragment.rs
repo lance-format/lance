@@ -31,7 +31,12 @@ pub struct AddFragment {
     /// addresses into an index it writes in the same commit. Such an id is the
     /// writer's alone and stays valid at every later version, so it does not
     /// move under replay -- but it is also not the writer's to choose freely:
-    /// apply rejects an id that is not reserved or is already in use.
+    /// apply rejects an id that is not reserved or is already in use, and one
+    /// an index segment's coverage still lists.
+    ///
+    /// Known limitation: an id claimed, then removed, then claimed again
+    /// within one operation is not caught. Nothing from the first claim
+    /// outlives the operation, so the result is still consistent.
     pub id: Ref,
     /// Physical rows in the fragment, including rows later tombstoned.
     pub physical_rows: u64,
