@@ -34,6 +34,10 @@ use std::collections::{HashMap, HashSet};
 /// backs that field. A file whose every slot is tombstoned is dropped.
 pub(super) const TOMBSTONED_FIELD: i32 = -2;
 
+/// The largest fragment id a manifest can record: its high-water mark is a
+/// `u32`, so an id past it could be handed out again.
+const MAX_FRAGMENT_ID: u64 = u32::MAX as u64;
+
 impl Transaction {
     /// Build the next manifest by applying an action set.
     ///
@@ -107,9 +111,14 @@ pub(super) struct ApplyState<'a> {
     config: HashMap<String, String>,
     table_metadata: HashMap<String, String>,
 
-    next_fragment_id: u64,
-    next_field_id: i32,
-    next_base_id: u32,
+    /// The highest id handed out so far in each space, by the version being
+    /// committed on top of or by this operation. Kept as marks rather than
+    /// next ids so a counter at its maximum is representable, and the next
+    /// mint fails rather than wraps. No fragment id has been handed out while
+    /// the fragment mark is `None`; base ids start at 1.
+    fragment_high_water: Option<u64>,
+    field_high_water: i32,
+    base_high_water: u32,
 
     /// Local token -> the id minted for it, one map per id space.
     fragment_tokens: HashMap<u32, u64>,
@@ -149,14 +158,9 @@ impl<'a> ApplyState<'a> {
             existing_base_paths: manifest.base_paths.clone(),
             config: manifest.config.clone(),
             table_metadata: manifest.table_metadata.clone(),
-            next_fragment_id: manifest.max_fragment_id().map(|id| id + 1).unwrap_or(0),
-            next_field_id: manifest.max_field_id() + 1,
-            next_base_id: manifest
-                .base_paths
-                .keys()
-                .max()
-                .map(|id| id + 1)
-                .unwrap_or(1),
+            fragment_high_water: manifest.max_fragment_id(),
+            field_high_water: manifest.max_field_id(),
+            base_high_water: manifest.base_paths.keys().max().copied().unwrap_or(0),
             fragment_tokens: HashMap::new(),
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
@@ -389,8 +393,14 @@ impl<'a> ApplyState<'a> {
         if self.fragment_tokens.contains_key(&token) {
             return Err(duplicate_token_err("fragment", token));
         }
-        let id = self.next_fragment_id;
-        self.next_fragment_id += 1;
+        let id = match self.fragment_high_water {
+            None => 0,
+            Some(mark) => mark
+                .checked_add(1)
+                .filter(|id| *id <= MAX_FRAGMENT_ID)
+                .ok_or_else(|| exhausted_err("fragment id", MAX_FRAGMENT_ID))?,
+        };
+        self.fragment_high_water = Some(id);
         self.fragment_tokens.insert(token, id);
         self.new_fragments.insert(id);
         Ok(id)
@@ -399,16 +409,16 @@ impl<'a> ApplyState<'a> {
     /// Claim an id an earlier commit set aside with
     /// [`ReserveFragmentIds`](super::ReserveFragmentIds).
     ///
-    /// Only ids already below the counter can be claimed. Anything at or above
+    /// Only ids at or below the high-water mark can be claimed. Anything above
     /// it is an id a later mint would hand out again, so a writer that guessed
     /// rather than reserved is rejected here instead of colliding later.
     fn claim_reserved_fragment_id(&mut self, id: u64) -> Result<u64> {
-        if id >= self.next_fragment_id {
+        if self.fragment_high_water.is_none_or(|mark| id > mark) {
             return Err(Error::invalid_input(format!(
-                "AddFragment adds a fragment at id {id}, which no commit has reserved: only ids \
-                 below {} are reserved. Reserve a range with ReserveFragmentIds and read the \
-                 committed manifest's high-water mark back before naming an id.",
-                self.next_fragment_id
+                "AddFragment adds a fragment at id {id}, which no commit has reserved: the \
+                 fragment id high-water mark is {:?}. Reserve a range with ReserveFragmentIds \
+                 and read the committed manifest's high-water mark back before naming an id.",
+                self.fragment_high_water
             )));
         }
         if self.fragments.iter().any(|fragment| fragment.id == id) {
@@ -454,8 +464,11 @@ impl<'a> ApplyState<'a> {
         if self.field_tokens.contains_key(&token) {
             return Err(duplicate_token_err("field", token));
         }
-        let id = self.next_field_id;
-        self.next_field_id += 1;
+        let id = self
+            .field_high_water
+            .checked_add(1)
+            .ok_or_else(|| exhausted_err("field id", i32::MAX))?;
+        self.field_high_water = id;
         self.field_tokens.insert(token, id);
         Ok(id)
     }
@@ -464,8 +477,11 @@ impl<'a> ApplyState<'a> {
         if self.base_tokens.contains_key(&token) {
             return Err(duplicate_token_err("base", token));
         }
-        let id = self.next_base_id;
-        self.next_base_id += 1;
+        let id = self
+            .base_high_water
+            .checked_add(1)
+            .ok_or_else(|| exhausted_err("base id", u32::MAX))?;
+        self.base_high_water = id;
         self.base_tokens.insert(token, id);
         Ok(id)
     }
@@ -666,19 +682,13 @@ impl<'a> ApplyState<'a> {
         if self.reserved_fragment_ids == 0 {
             return Ok(None);
         }
-        let high_water = self
-            .next_fragment_id
-            .checked_add(self.reserved_fragment_ids - 1)
-            .and_then(|high_water| u32::try_from(high_water).ok())
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "reserving {} fragment ids from {} exceeds the maximum fragment id ({})",
-                    self.reserved_fragment_ids,
-                    self.next_fragment_id,
-                    u32::MAX
-                ))
-            })?;
-        self.next_fragment_id = u64::from(high_water) + 1;
+        let high_water = match self.fragment_high_water {
+            None => Some(self.reserved_fragment_ids - 1),
+            Some(mark) => mark.checked_add(self.reserved_fragment_ids),
+        }
+        .and_then(|high_water| u32::try_from(high_water).ok())
+        .ok_or_else(|| exhausted_err("fragment id", MAX_FRAGMENT_ID))?;
+        self.fragment_high_water = Some(u64::from(high_water));
         Ok(Some(high_water))
     }
 
@@ -746,6 +756,12 @@ fn unbound_token_err(space: &str, token: u32) -> Error {
     Error::invalid_input(format!(
         "an action references local {space} token {token}, which no earlier action in this \
          operation minted"
+    ))
+}
+
+fn exhausted_err(counter: &str, max: impl std::fmt::Display) -> Error {
+    Error::invalid_input(format!(
+        "the {counter} counter is exhausted: this operation needs an id past the maximum, {max}"
     ))
 }
 
