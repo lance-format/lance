@@ -372,6 +372,13 @@ mod tests {
         ],
         None
     )]
+    #[case::lineage_bound_twice_in_one_file(
+        vec![
+            new_fragment(Some(RowIdMeta::Column)),
+            file_binding(Ref::Local(0), &[0, ROW_ID_FIELD_ID, ROW_ID_FIELD_ID]),
+        ],
+        Some("binds field -3 at positions 1 and 2")
+    )]
     #[case::spilled_lineage_no_file_carries(
         vec![new_fragment(Some(RowIdMeta::Column)), file_binding(Ref::Local(0), &[0])],
         Some("spills row lineage field -3 but no AddDataFile binds it")
@@ -394,6 +401,60 @@ mod tests {
         let manifest = make_stable_row_id_manifest(vec![fragment]);
 
         let result = apply(&manifest, actions);
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(
+                    error.to_string().contains(message),
+                    "unexpected error: {error}"
+                );
+            }
+        }
+    }
+
+    /// A data file maps each field to one column and each column to one field,
+    /// so a repeat in either list leaves a reader two answers. A column index
+    /// of -1 (a field with no top-level column) is not a column, and a v1 file
+    /// has no column indices at all.
+    #[rstest]
+    #[case::distinct(&[0, 1], &[0, 1], None)]
+    #[case::repeated_field(&[0, 0], &[0, 1], Some("binds field 0 at positions 0 and 1"))]
+    #[case::repeated_column(&[0, 1], &[2, 2], Some("binds column 2 at positions 0 and 1"))]
+    #[case::repeated_unplaced_column(&[0, 1], &[-1, -1], None)]
+    #[case::no_column_indices(&[0, 1], &[], None)]
+    fn test_add_data_file_rejects_a_repeated_binding(
+        #[case] field_ids: &[i32],
+        #[case] column_indices: &[i32],
+        #[case] expected_error: Option<&str>,
+    ) {
+        let mut manifest = backed_manifest();
+        manifest.schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("a", arrow_schema::DataType::Int32, true),
+                arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true),
+            ]))
+            .unwrap();
+        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
+        file.column_indices = column_indices.into();
+
+        let result = apply(
+            &manifest,
+            vec![
+                new_fragment(None),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: field_ids.iter().copied().map(FieldRef::Committed).collect(),
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        );
+
         match expected_error {
             None => {
                 result.unwrap();
