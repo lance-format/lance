@@ -10,13 +10,15 @@ use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use std::collections::HashSet;
 
 /// Remove a field from the schema.
 ///
-/// The field's descendants go with it, since a struct's children cannot outlive
-/// it. At apply, any data file left backing no live field is dropped, and any
-/// index over a removed field is discarded.
+/// The field must have no children left: a struct or list is dropped by one
+/// `DropField` per descendant, deepest first, then the parent, all in the same
+/// operation. Naming every removed field is what makes the footprint complete,
+/// since a footprint has no schema to expand a subtree with. At apply, any data
+/// file left backing no live field is dropped, and any index over a removed
+/// field is discarded.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DropField {
     pub field: FieldRef,
@@ -30,9 +32,18 @@ impl DropField {
                 "DropField names field {field_id}, which does not exist"
             ))
         })?;
-        // A struct's children cannot outlive it, so the whole subtree goes.
-        let mut dropped = HashSet::new();
-        collect_subtree_ids(field, &mut dropped);
+        if !field.children.is_empty() {
+            let children = field
+                .children
+                .iter()
+                .map(|child| child.id.to_string())
+                .collect::<Vec<_>>();
+            return Err(Error::invalid_input(format!(
+                "DropField names field {field_id}, which still has children [{}]; drop a \
+                 field's children first, deepest first, in the same operation",
+                children.join(", ")
+            )));
+        }
         remove_field(&mut state.schema_mut().fields, field_id);
 
         // The fields are gone from the schema, so the slots that backed them in
@@ -42,14 +53,14 @@ impl DropField {
         // normalization.
         for fragment in state.fragments_mut() {
             for file in fragment.files.iter_mut() {
-                if !file.fields.iter().any(|id| dropped.contains(id)) {
+                if !file.fields.contains(&field_id) {
                     continue;
                 }
                 let fields = file
                     .fields
                     .iter()
                     .map(|id| {
-                        if dropped.contains(id) {
+                        if *id == field_id {
                             TOMBSTONED_FIELD
                         } else {
                             *id
@@ -59,11 +70,12 @@ impl DropField {
                 file.fields = fields.into();
             }
 
-            let overlaid: Vec<u32> = dropped
-                .iter()
-                .filter_map(|id| u32::try_from(*id).ok())
-                .collect();
-            crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
+            if let Ok(overlaid) = u32::try_from(field_id) {
+                crate::format::overlay::tombstone_overlay_fields(
+                    &mut fragment.overlays,
+                    &[overlaid],
+                );
+            }
         }
 
         // Indices over a field that no longer exists are discarded wholesale by
@@ -81,20 +93,11 @@ impl DropField {
     /// requires that definition, so it collides with the drop as `Requires`
     /// against `Writes`.
     ///
-    /// Only the named field's definition is written: a footprint has no schema
-    /// to expand a struct with. A concurrent write to a child of a dropped
-    /// struct requires the child's definition, which this does not write, so
-    /// it is not caught here and fails when it is applied against the version
-    /// where the child no longer exists.
+    /// That is complete for a struct too, because apply only drops a field
+    /// with no children left: the children were each dropped by their own
+    /// `DropField` in the same operation, which writes their definitions.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write_field_definition(self.field);
-    }
-}
-
-fn collect_subtree_ids(field: &Field, out: &mut HashSet<i32>) {
-    out.insert(field.id);
-    for child in &field.children {
-        collect_subtree_ids(child, out);
     }
 }
 
