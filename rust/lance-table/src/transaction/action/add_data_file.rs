@@ -55,7 +55,14 @@ impl AddDataFile {
                 self.file.fields
             )));
         }
+        if let Some(base_id) = self.file.base_id {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment_id} carries file.base_id {base_id}; \
+                 file.base_id must be unset, since the action's base names where the file lives"
+            )));
+        }
         let mut file = self.file.clone();
+        file.base_id = self.base.map(|base| state.resolve_base(base)).transpose()?;
         if !file.column_indices.is_empty() && file.column_indices.len() != field_ids.len() {
             return Err(Error::invalid_input(format!(
                 "AddDataFile for fragment {fragment_id} lists {} field ids but the file has {} \

@@ -40,9 +40,33 @@ pub struct SetDeletionFile {
 
 impl SetDeletionFile {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        let deletion_file = match (&self.deletion_file, self.base) {
+            (None, Some(base)) => {
+                return Err(Error::invalid_input(format!(
+                    "SetDeletionFile for fragment {} clears its deletion file but names base \
+                     {base:?}; a base only says where a deletion file lives",
+                    self.fragment
+                )));
+            }
+            (None, None) => None,
+            (Some(file), base) => {
+                if let Some(base_id) = file.base_id {
+                    return Err(Error::invalid_input(format!(
+                        "SetDeletionFile for fragment {} carries deletion_file.base_id \
+                         {base_id}; deletion_file.base_id must be unset, since the action's \
+                         base names where the file lives",
+                        self.fragment
+                    )));
+                }
+                Some(DeletionFile {
+                    base_id: base.map(|base| state.resolve_base(base)).transpose()?,
+                    ..file.clone()
+                })
+            }
+        };
         state
             .fragment_mut(self.fragment, "SetDeletionFile")?
-            .deletion_file = self.deletion_file.clone();
+            .deletion_file = deletion_file;
         Ok(())
     }
 
