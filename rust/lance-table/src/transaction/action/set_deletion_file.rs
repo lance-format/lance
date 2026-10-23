@@ -64,8 +64,9 @@ impl SetDeletionFile {
                 })
             }
         };
+        let fragment_id = state.resolve_fragment(Ref::Committed(self.fragment))?;
         state
-            .fragment_mut(self.fragment, "SetDeletionFile")?
+            .fragment_mut(fragment_id, "SetDeletionFile")?
             .deletion_file = deletion_file;
         Ok(())
     }
@@ -194,9 +195,9 @@ mod tests {
     )]
     #[case::committed_base_the_dataset_lacks(
         Some(deletion_file(None)),
-        Some(Ref::Committed(7)),
+        Some(Ref::Committed(0)),
         false,
-        Err("base id 7 in an action names no base path of the dataset")
+        Err("base id 0 in an action names no base path of the dataset")
     )]
     #[case::base_not_minted(
         Some(deletion_file(None)),

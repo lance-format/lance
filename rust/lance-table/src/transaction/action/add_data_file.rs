@@ -285,9 +285,9 @@ mod tests {
     )]
     #[case::committed_base_the_dataset_lacks(
         None,
-        Some(Ref::Committed(7)),
+        Some(Ref::Committed(0)),
         false,
-        Err("base id 7 in an action names no base path of the dataset")
+        Err("base id 0 in an action names no base path of the dataset")
     )]
     #[case::base_not_minted(
         None,

@@ -83,7 +83,29 @@ impl Transaction {
             .any(|index| index.name == MEM_WAL_INDEX_NAME)
             .then(|| Self::logical_index_segments(&current_indices));
 
-        let mut state = ApplyState::new(current_manifest, current_indices);
+        // Committed ids are checked against the version the writer read, not
+        // the one applied onto: an id minted in between belongs to whichever
+        // concurrent commit minted it. Without the read version that check
+        // has nothing to run against, so only an apply onto the read version
+        // itself -- a detached commit, or a build with no history -- proceeds.
+        let read_manifest = match &read_version_state {
+            Some(read) => read.manifest,
+            None if current_manifest.version == self.read_version => current_manifest,
+            None => {
+                return Err(Error::invalid_input(format!(
+                    "an action-based transaction that read version {} is being applied onto \
+                     version {} without the read version's manifest, so its committed ids \
+                     cannot be checked against what it read",
+                    self.read_version, current_manifest.version
+                )));
+            }
+        };
+
+        let mut state = ApplyState::new(
+            current_manifest,
+            current_indices,
+            ReadMarks::of(read_manifest),
+        );
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
@@ -98,12 +120,35 @@ impl Transaction {
     }
 }
 
+/// The id high-water marks of the version the operation read. A committed id
+/// above them names something the writer cannot have seen.
+struct ReadMarks {
+    fragment: Option<u64>,
+    field: i32,
+    base: u32,
+}
+
+impl ReadMarks {
+    fn of(manifest: &Manifest) -> Self {
+        Self {
+            fragment: manifest.max_fragment_id(),
+            field: manifest.max_field_id(),
+            base: max_base_id(manifest),
+        }
+    }
+}
+
+fn max_base_id(manifest: &Manifest) -> u32 {
+    manifest.base_paths.keys().max().copied().unwrap_or(0)
+}
+
 /// The state of the version being committed on top of, plus the id
 /// allocations made so far.
 pub(super) struct ApplyState<'a> {
     /// The version being committed on top of: the read version on a first
     /// attempt, the latest committed version on a retry.
     current_manifest: &'a Manifest,
+    read_marks: ReadMarks,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
@@ -157,9 +202,10 @@ pub(super) struct ApplyState<'a> {
 }
 
 impl<'a> ApplyState<'a> {
-    fn new(manifest: &'a Manifest, indices: Vec<IndexMetadata>) -> Self {
+    fn new(manifest: &'a Manifest, indices: Vec<IndexMetadata>, read_marks: ReadMarks) -> Self {
         Self {
             current_manifest: manifest,
+            read_marks,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
             indices,
@@ -169,7 +215,7 @@ impl<'a> ApplyState<'a> {
             table_metadata: manifest.table_metadata.clone(),
             fragment_high_water: manifest.max_fragment_id(),
             field_high_water: manifest.max_field_id(),
-            base_high_water: manifest.base_paths.keys().max().copied().unwrap_or(0),
+            base_high_water: max_base_id(manifest),
             fragment_tokens: HashMap::new(),
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
@@ -429,16 +475,20 @@ impl<'a> ApplyState<'a> {
     /// Claim an id an earlier commit set aside with
     /// [`ReserveFragmentIds`](super::ReserveFragmentIds).
     ///
-    /// Only ids at or below the high-water mark can be claimed. Anything above
-    /// it is an id a later mint would hand out again, so a writer that guessed
-    /// rather than reserved is rejected here instead of colliding later.
+    /// Only ids at or below the read version's high-water mark can be
+    /// claimed. Anything above it was not reserved when the writer read the
+    /// table: it is an id a later mint would hand out, or one a concurrent
+    /// commit reserved for its own writer. A writer that guessed rather than
+    /// reserved is rejected here instead of colliding later.
     fn claim_reserved_fragment_id(&mut self, id: u64) -> Result<u64> {
-        if self.fragment_high_water.is_none_or(|mark| id > mark) {
+        let unreserved = |mark: Option<u64>| mark.is_none_or(|mark| id > mark);
+        if unreserved(self.read_marks.fragment) || unreserved(self.fragment_high_water) {
             return Err(Error::invalid_input(format!(
-                "AddFragment adds a fragment at id {id}, which no commit has reserved: the \
-                 fragment id high-water mark is {:?}. Reserve a range with ReserveFragmentIds \
-                 and read the committed manifest's high-water mark back before naming an id.",
-                self.fragment_high_water
+                "AddFragment adds a fragment at id {id}, which no commit has reserved as of the \
+                 read version: its fragment id high-water mark is {}. Reserve a range with \
+                 ReserveFragmentIds and read the committed manifest's high-water mark back \
+                 before naming an id, or name a new fragment by a Local ref.",
+                display_mark(self.read_marks.fragment)
             )));
         }
         if self.fragments.iter().any(|fragment| fragment.id == id) {
@@ -525,7 +575,16 @@ impl<'a> ApplyState<'a> {
 
     pub(super) fn resolve_fragment(&self, reference: Ref) -> Result<u64> {
         match reference {
-            Ref::Committed(id) => Ok(id),
+            Ref::Committed(id) => {
+                if self.read_marks.fragment.is_none_or(|mark| id > mark) {
+                    return Err(beyond_read_mark_err(
+                        "fragment",
+                        id,
+                        display_mark(self.read_marks.fragment),
+                    ));
+                }
+                Ok(id)
+            }
             Ref::Local(token) => self
                 .fragment_tokens
                 .get(&token)
@@ -538,6 +597,9 @@ impl<'a> ApplyState<'a> {
     /// top of has, or one an earlier action in this operation minted.
     pub(super) fn resolve_base(&self, reference: Ref) -> Result<u32> {
         match reference {
+            Ref::Committed(id) if id > u64::from(self.read_marks.base) => Err(
+                beyond_read_mark_err("base", id, self.read_marks.base.to_string()),
+            ),
             Ref::Committed(id) => u32::try_from(id)
                 .ok()
                 .filter(|id| self.existing_base_paths.contains_key(id))
@@ -554,8 +616,15 @@ impl<'a> ApplyState<'a> {
         }
     }
 
+    /// The reserved negative ids are not drawn from the field counter, so only
+    /// a schema field id is held to the read version's mark.
     pub(super) fn resolve_field(&self, reference: FieldRef) -> Result<FieldId> {
         match reference {
+            FieldRef::Committed(id) if id > self.read_marks.field => Err(beyond_read_mark_err(
+                "field",
+                id,
+                self.read_marks.field.to_string(),
+            )),
             FieldRef::Committed(id) => Ok(FieldId(id)),
             FieldRef::Local(token) => self
                 .field_tokens
@@ -818,6 +887,22 @@ fn prune_rebound_fields_from_indices(
         }
     }
     Ok(())
+}
+
+fn beyond_read_mark_err(space: &str, id: impl std::fmt::Display, mark: String) -> Error {
+    Error::invalid_input(format!(
+        "an action names {space} {id} by a Committed ref, but the read version's high-water mark \
+         for {space} ids is {mark}: the id did not exist when the operation read the table, and \
+         a concurrent commit may since have minted it. Name a {space} this operation mints by \
+         its Local ref."
+    ))
+}
+
+fn display_mark(mark: Option<u64>) -> String {
+    mark.map_or_else(
+        || "unset (no id handed out)".to_string(),
+        |mark| mark.to_string(),
+    )
 }
 
 fn unbound_token_err(space: &str, token: u32) -> Error {
