@@ -202,14 +202,16 @@ impl TryFrom<pb_actions::AdjustIndexCoverage> for AdjustIndexCoverage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{IndexMetadata, Manifest};
+    use crate::format::{DataFile, IndexMetadata, Manifest};
     use crate::transaction::action::test_support::{
         apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddFragment, AddIndexSegment, FieldRef, RemoveFragment,
+        Action, AddDataFile, AddFragment, AddIndexSegment, FieldRef, RemoveFragment,
+        TombstoneFieldData,
     };
     use crate::transaction::test_support::sample_index_metadata;
+    use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -494,5 +496,134 @@ mod tests {
         let narrow = footprint(vec![adjust(Uuid::from_u128(1), "by_a", vec![], vec![7])]);
 
         assert!(!narrow.conflicts_with(&footprint(vec![build("by_a", 7)])));
+    }
+
+    fn widen_declaring(fields: Vec<i32>, covering_fields: Vec<i32>, onto: u64) -> Action {
+        Action::AdjustIndexCoverage(AdjustIndexCoverage {
+            uuid: Uuid::from_u128(1),
+            name: "by_a".into(),
+            add_fragments: vec![Ref::Committed(onto)],
+            remove_fragments: Vec::new(),
+            fields: fields.into_iter().map(FieldRef::Committed).collect(),
+            covering_fields: covering_fields
+                .into_iter()
+                .map(FieldRef::Committed)
+                .collect(),
+        })
+    }
+
+    fn rewrite(fragment: u64, field: i32) -> Vec<Action> {
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment),
+                field_ids: vec![FieldRef::Committed(field)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment),
+                file: DataFile::new_unstarted("data/rewritten.lance", ConcreteFileVersion::V2_0),
+                field_ids: vec![FieldRef::Committed(field)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    /// Widening is a claim that the segment's files already describe the
+    /// fragment's rows, which only holds while the indexed columns there are
+    /// the ones the remap was planned against. A rewrite of a keyed or carried
+    /// column that commits first breaks that, the same as it would for a new
+    /// segment over the fragment. One that commits second needs no conflict:
+    /// it prunes the fragment from the widened coverage as it applies.
+    #[rstest]
+    #[case::keyed_column_rewritten_first(vec![0], vec![1], 0, true, true)]
+    #[case::carried_column_rewritten_first(vec![0], vec![1], 1, true, true)]
+    #[case::other_column_rewritten_first(vec![0], vec![1], 2, true, false)]
+    #[case::keyed_column_rewritten_second(vec![0], vec![1], 0, false, false)]
+    fn test_widening_requires_the_data_it_covers(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] rewritten: i32,
+        #[case] rewrite_commits_first: bool,
+        #[case] expected: bool,
+    ) {
+        let widen = footprint(vec![widen_declaring(fields, covering_fields, 7)]);
+        let rewrite = footprint(rewrite(7, rewritten));
+
+        let conflicts = if rewrite_commits_first {
+            widen.conflicts_with(&rewrite)
+        } else {
+            rewrite.conflicts_with(&widen)
+        };
+        assert_eq!(conflicts, expected);
+    }
+
+    /// The order the footprint lets through: the rewrite lands on a version
+    /// where the widened segment already covers the fragment, and takes it
+    /// back out.
+    #[test]
+    fn test_a_rewrite_after_a_widening_prunes_the_widened_fragment() {
+        let segment = covering("by_a", [0, 1]);
+        let mut manifest = backed_manifest();
+        let mut second = manifest.fragments[0].clone();
+        second.id = 1;
+        second.files[0].path = "data/1.lance".into();
+        manifest.fragments = Arc::new(vec![manifest.fragments[0].clone(), second]);
+
+        let (_, indices) = apply_with_indices(&manifest, rewrite(1, 0), vec![segment]).unwrap();
+
+        assert_eq!(indices[0].fragment_bitmap, Some([0].into_iter().collect()));
+    }
+
+    /// The declared fields are what the footprint requires, so they have to be
+    /// the segment's own. They are declared the way a segment is added, keys
+    /// and carried columns apart, and compared with the legacy form the
+    /// manifest stores.
+    #[rstest]
+    #[case::matching(vec![0], vec![], vec![0], vec![], None)]
+    #[case::matching_with_a_carried_column(vec![0, 1], vec![1], vec![0], vec![1], None)]
+    #[case::different_key(vec![0], vec![], vec![1], vec![], Some("fields"))]
+    #[case::missing_key(vec![0], vec![], vec![], vec![], Some("fields"))]
+    #[case::undeclared_carried_column(vec![0, 1], vec![1], vec![0, 1], vec![], Some("fields"))]
+    #[case::carried_column_declared_as_a_key(vec![0, 1], vec![1], vec![0], vec![], Some("fields"))]
+    fn test_the_declared_fields_must_match_the_segment(
+        #[case] segment_fields: Vec<i32>,
+        #[case] segment_covering_fields: Vec<i32>,
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let mut manifest = manifest_with_reserved_ids();
+        manifest.schema.fields.push({
+            let mut carried = crate::transaction::action::test_support::added_field("carried");
+            carried.id = 1;
+            carried
+        });
+        let segment = IndexMetadata {
+            uuid: Uuid::from_u128(1),
+            fields: segment_fields,
+            covering_fields: segment_covering_fields,
+            ..covering("by_a", [0])
+        };
+
+        let result = apply_with_indices(
+            &manifest,
+            vec![widen_declaring(fields, covering_fields, 2)],
+            vec![segment],
+        );
+
+        let Some(expected_error) = expected_error else {
+            let (_, indices) = result.unwrap();
+            assert_eq!(
+                indices[0].fragment_bitmap,
+                Some([0, 2].into_iter().collect())
+            );
+            return;
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(expected_error), "{message}");
+        assert!(message.contains("does not match"), "{message}");
     }
 }
