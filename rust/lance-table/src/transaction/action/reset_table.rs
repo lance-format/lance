@@ -18,9 +18,13 @@ use lance_core::deepsize::DeepSizeOf;
 /// those with a [`ConfigUpdate`](super::ConfigUpdate) or an
 /// [`AddBase`](super::AddBase) in the same operation.
 ///
-/// The id counters are not reset. A field or fragment added after the reset gets
-/// a fresh id, so a stale file naming an old id can never be mistaken for the
-/// new table's data.
+/// It discards objects but never rewinds the id counters. A field or fragment
+/// added after the reset gets a fresh id, so a stale file naming an old id can
+/// never be mistaken for the new table's data, and the committed high-water
+/// marks still cover every id handed out -- the discarded table's, and any
+/// this operation minted before the reset. (The field mark is recorded only
+/// on a table under the non-reusable field id contract; elsewhere field ids
+/// are derived from the schema and files.)
 ///
 /// Actions before it in the same operation are allowed, and it discards their
 /// changes to the schema, fragments, and indices. After it, a committed
