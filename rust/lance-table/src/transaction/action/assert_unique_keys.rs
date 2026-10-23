@@ -212,8 +212,9 @@ mod tests {
         )
         .unwrap_err();
 
+        // Field 9 is beyond anything the read version handed out.
         assert!(
-            error.to_string().contains("not in the schema"),
+            error.to_string().contains("field 9 by a Committed ref"),
             "unexpected error: {error}"
         );
     }
