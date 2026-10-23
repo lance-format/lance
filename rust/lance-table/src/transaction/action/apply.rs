@@ -192,7 +192,7 @@ impl<'a> ApplyState<'a> {
             .then_some(current_manifest.next_row_id);
         self.assign_row_ids_to_new_fragments(&mut next_row_id, new_version)?;
         self.take_row_id_reservation(&mut next_row_id)?;
-        let reserved_fragment_high_water = self.take_fragment_id_reservation()?;
+        self.take_fragment_id_reservation()?;
 
         let ApplyState {
             schema,
@@ -200,6 +200,8 @@ impl<'a> ApplyState<'a> {
             new_bases,
             rebound_fields,
             reset,
+            fragment_high_water,
+            field_high_water,
             config: dataset_config,
             table_metadata,
             ..
@@ -245,15 +247,25 @@ impl<'a> ApplyState<'a> {
         manifest.config = dataset_config;
         manifest.table_metadata = table_metadata;
 
-        // A reserved id backs no fragment, so the manifest assembly cannot
-        // derive it from the fragment list; raise the high-water mark to cover
-        // the range so a later writer's ids are not handed out twice.
-        if let Some(high_water) = reserved_fragment_high_water {
+        // The assembly derives the marks from what the manifest still holds,
+        // which misses ids this operation reserved or minted and then
+        // discarded (a reset), and ids the version being committed on top of
+        // handed out before a reset emptied it. Raise them to cover every id
+        // handed out, so none is handed out twice.
+        if let Some(high_water) = fragment_high_water {
+            let high_water = u32::try_from(high_water)
+                .map_err(|_| exhausted_err("fragment id", MAX_FRAGMENT_ID))?;
             manifest.max_fragment_id = Some(
                 manifest
                     .max_fragment_id
                     .map_or(high_water, |current| current.max(high_water)),
             );
+        }
+        // Only a table under the non-reusable field id contract records a
+        // field mark; elsewhere field ids are derived from the schema and
+        // files and are reusable by that table's own rules.
+        if let Some(current) = manifest.max_allocated_field_id.as_mut() {
+            *current = (*current).max(field_high_water);
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
@@ -673,14 +685,10 @@ impl<'a> ApplyState<'a> {
 
     /// Take this operation's fragment id reservation off the counter, after its
     /// own fragments have been numbered, so the reserved range is always the
-    /// top `count` ids of the committed high-water mark. Returns that mark, or
-    /// `None` if nothing was reserved.
-    ///
-    /// A reserved id backs no fragment, so the manifest assembly cannot derive
-    /// the mark from the fragment list.
-    fn take_fragment_id_reservation(&mut self) -> Result<Option<u32>> {
+    /// top `count` ids of the committed high-water mark.
+    fn take_fragment_id_reservation(&mut self) -> Result<()> {
         if self.reserved_fragment_ids == 0 {
-            return Ok(None);
+            return Ok(());
         }
         let high_water = match self.fragment_high_water {
             None => Some(self.reserved_fragment_ids - 1),
@@ -689,7 +697,7 @@ impl<'a> ApplyState<'a> {
         .and_then(|high_water| u32::try_from(high_water).ok())
         .ok_or_else(|| exhausted_err("fragment id", MAX_FRAGMENT_ID))?;
         self.fragment_high_water = Some(u64::from(high_water));
-        Ok(Some(high_water))
+        Ok(())
     }
 
     /// Take this operation's row id reservation off the counter, after its own
