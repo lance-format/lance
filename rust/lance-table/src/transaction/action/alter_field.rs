@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, Footprint, Ref};
+use super::{Coordinate, FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -20,14 +20,14 @@ use lance_core::{Error, Result};
 /// [`AddField`](super::AddField) under the same name, and the data.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AlterField {
-    pub field: Ref,
+    pub field: FieldRef,
     pub name: Option<String>,
     pub nullable: Option<bool>,
 }
 
 impl AlterField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let field_id = state.resolve_field(self.field)?;
+        let field_id = state.resolve_field(self.field)?.get();
         let missing = || {
             Error::invalid_input(format!(
                 "AlterField names field {field_id}, which does not exist"
@@ -115,7 +115,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![Action::AlterField(AlterField {
-                field: Ref::Committed(0),
+                field: FieldRef::Committed(0),
                 name: Some("renamed".into()),
                 nullable: Some(true),
             })],
@@ -135,7 +135,7 @@ mod tests {
         let error = apply(
             &backed_manifest(),
             vec![Action::AlterField(AlterField {
-                field: Ref::Committed(7),
+                field: FieldRef::Committed(7),
                 name: Some("nope".into()),
                 nullable: None,
             })],
@@ -155,7 +155,7 @@ mod tests {
         });
         let rename = |name: &str| {
             Action::AlterField(AlterField {
-                field: Ref::Committed(0),
+                field: FieldRef::Committed(0),
                 name: Some(name.into()),
                 nullable: None,
             })
@@ -186,7 +186,7 @@ mod tests {
                     def: added_field("before"),
                 }),
                 Action::AlterField(AlterField {
-                    field: Ref::Local(0),
+                    field: FieldRef::Local(0),
                     name: Some("after".into()),
                     nullable: None,
                 }),

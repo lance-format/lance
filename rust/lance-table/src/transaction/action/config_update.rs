@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::footprint::UnenforcedKey;
 use super::proto::required;
-use super::{ConfigMap, Coordinate, Footprint, Ref};
+use super::{ConfigMap, Coordinate, FieldRef, Footprint};
 use crate::format::pb_actions;
 use crate::transaction::UpdateMap;
 use crate::transaction::update_map::apply_update_map;
@@ -33,7 +33,7 @@ pub struct ConfigUpdate {
     pub table_metadata: Option<UpdateMap>,
     /// Schema-level metadata.
     pub schema_metadata: Option<UpdateMap>,
-    /// Per-field metadata, in application order. Keyed by [`Ref`] so a field
+    /// Per-field metadata, in application order. Keyed by [`FieldRef`] so a field
     /// minted earlier in the same operation can be given metadata.
     pub field_metadata: Vec<FieldMetadataUpdate>,
 }
@@ -41,7 +41,7 @@ pub struct ConfigUpdate {
 /// One field's metadata within a [`ConfigUpdate`].
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct FieldMetadataUpdate {
-    pub field: Ref,
+    pub field: FieldRef,
     pub updates: UpdateMap,
 }
 
@@ -75,7 +75,7 @@ impl ConfigUpdate {
         let writes_clustering_key = self.writes_any(&[LANCE_UNENFORCED_CLUSTERING_KEY_POSITION]);
 
         for update in &self.field_metadata {
-            let field_id = state.resolve_field(update.field)?;
+            let field_id = state.resolve_field(update.field)?.get();
             let field = state
                 .schema_mut()
                 .field_by_id_mut(field_id)
@@ -125,9 +125,7 @@ impl ConfigUpdate {
             // concurrent writer can be naming it. A committed field's metadata
             // goes with the field: writing it needs the field to still be
             // there, and is lost with it if the field is dropped afterwards.
-            if let Some(id) = update.field.committed()
-                && let Ok(id) = i32::try_from(id)
-            {
+            if let Some(id) = update.field.committed() {
                 footprint.write_map_update(ConfigMap::Field(id), &update.updates);
                 footprint.require_field_definition(update.field);
             }
@@ -341,7 +339,7 @@ mod tests {
             vec![Action::ConfigUpdate(ConfigUpdate {
                 schema_metadata: Some(merge(&[("schema", Some("yes"))])),
                 field_metadata: vec![FieldMetadataUpdate {
-                    field: Ref::Committed(0),
+                    field: FieldRef::Committed(0),
                     updates: merge(&[("comment", Some("the id"))]),
                 }],
                 ..Default::default()
@@ -366,7 +364,7 @@ mod tests {
                 }),
                 Action::ConfigUpdate(ConfigUpdate {
                     field_metadata: vec![FieldMetadataUpdate {
-                        field: Ref::Local(0),
+                        field: FieldRef::Local(0),
                         updates: merge(&[("comment", Some("brand new"))]),
                     }],
                     ..Default::default()
@@ -388,7 +386,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::ConfigUpdate(ConfigUpdate {
                 field_metadata: vec![FieldMetadataUpdate {
-                    field: Ref::Committed(7),
+                    field: FieldRef::Committed(7),
                     updates: merge(&[("comment", Some("nope"))]),
                 }],
                 ..Default::default()
@@ -402,10 +400,10 @@ mod tests {
 
     #[test]
     fn test_config_update_sets_then_refuses_to_change_the_primary_key() {
-        let set_key = |field: u64| {
+        let set_key = |field: i32| {
             Action::ConfigUpdate(ConfigUpdate {
                 field_metadata: vec![FieldMetadataUpdate {
-                    field: Ref::Committed(field),
+                    field: FieldRef::Committed(field),
                     updates: merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
                 }],
                 ..Default::default()
@@ -435,7 +433,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::ConfigUpdate(ConfigUpdate {
                 field_metadata: vec![FieldMetadataUpdate {
-                    field: Ref::Committed(0),
+                    field: FieldRef::Committed(0),
                     updates: merge(&[(
                         LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
                         Some("not a number"),
@@ -493,16 +491,16 @@ mod tests {
     fn test_dropping_a_field_collides_with_updating_its_metadata() {
         let metadata = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
             field_metadata: vec![FieldMetadataUpdate {
-                field: Ref::Committed(1),
+                field: FieldRef::Committed(1),
                 updates: merge(&[("comment", Some("x"))]),
             }],
             ..Default::default()
         })]);
         let dropped = footprint(vec![Action::DropField(DropField {
-            field: Ref::Committed(1),
+            field: FieldRef::Committed(1),
         })]);
         let other = footprint(vec![Action::DropField(DropField {
-            field: Ref::Committed(2),
+            field: FieldRef::Committed(2),
         })]);
 
         // Metadata landing after the drop names a field that is gone; the
@@ -515,10 +513,10 @@ mod tests {
 
     #[test]
     fn test_declaring_the_primary_key_on_different_fields_collides() {
-        let primary_key = |field: u64| {
+        let primary_key = |field: i32| {
             footprint(vec![Action::ConfigUpdate(ConfigUpdate {
                 field_metadata: vec![FieldMetadataUpdate {
-                    field: Ref::Committed(field),
+                    field: FieldRef::Committed(field),
                     updates: merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
                 }],
                 ..Default::default()
@@ -526,14 +524,14 @@ mod tests {
         };
         let clustering_key = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
             field_metadata: vec![FieldMetadataUpdate {
-                field: Ref::Committed(3),
+                field: FieldRef::Committed(3),
                 updates: merge(&[(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, Some("0"))]),
             }],
             ..Default::default()
         })]);
         let comment = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
             field_metadata: vec![FieldMetadataUpdate {
-                field: Ref::Committed(3),
+                field: FieldRef::Committed(3),
                 updates: merge(&[("comment", Some("x"))]),
             }],
             ..Default::default()

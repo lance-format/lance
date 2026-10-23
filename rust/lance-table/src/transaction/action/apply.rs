@@ -18,7 +18,7 @@
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
-use super::{CompositeOperation, Ref};
+use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::inherit_sticky_feature_flags;
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
@@ -471,15 +471,14 @@ impl<'a> ApplyState<'a> {
         }
     }
 
-    pub(super) fn resolve_field(&self, reference: Ref) -> Result<i32> {
+    pub(super) fn resolve_field(&self, reference: FieldRef) -> Result<FieldId> {
         match reference {
-            Ref::Committed(id) => i32::try_from(id).map_err(|_| {
-                Error::invalid_input(format!("field id {id} in an action is out of range"))
-            }),
-            Ref::Local(token) => self
+            FieldRef::Committed(id) => Ok(FieldId(id)),
+            FieldRef::Local(token) => self
                 .field_tokens
                 .get(&token)
                 .copied()
+                .map(FieldId)
                 .ok_or_else(|| unbound_token_err("field", token)),
         }
     }
@@ -724,14 +723,15 @@ mod tests {
                 vec![
                     Action::TombstoneFieldData(TombstoneFieldData {
                         fragment: Ref::Committed(0),
-                        field_ids: vec![Ref::Committed(0)],
+                        field_ids: vec![FieldRef::Committed(0)],
                         data_change: true,
                     }),
                     Action::AddDataFile(AddDataFile {
                         fragment: Ref::Committed(0),
                         file: replacement,
-                        field_ids: vec![Ref::Committed(0)],
+                        field_ids: vec![FieldRef::Committed(0)],
                         data_change: true,
+                        base: None,
                     }),
                 ],
             )]))
@@ -796,8 +796,9 @@ mod tests {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
                 file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![Ref::Local(0)],
+                field_ids: vec![FieldRef::Local(0)],
                 data_change: true,
+                base: None,
             }),
         ];
 
@@ -878,7 +879,7 @@ mod tests {
             vec![
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(0),
-                    field_ids: vec![Ref::Committed(rewritten as u64)],
+                    field_ids: vec![FieldRef::Committed(rewritten)],
                     data_change: true,
                 }),
                 Action::AddDataFile(AddDataFile {
@@ -891,8 +892,9 @@ mod tests {
                         None,
                         None,
                     ),
-                    field_ids: vec![Ref::Committed(rewritten as u64)],
+                    field_ids: vec![FieldRef::Committed(rewritten)],
                     data_change: true,
+                    base: None,
                 }),
             ],
             vec![IndexMetadata {
@@ -936,16 +938,17 @@ mod tests {
         })
     }
 
-    fn write_data(fragment: Ref, field: Ref) -> Action {
+    fn write_data(fragment: Ref, field: FieldRef) -> Action {
         Action::AddDataFile(AddDataFile {
             fragment,
             file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
             field_ids: vec![field],
             data_change: true,
+            base: None,
         })
     }
 
-    fn mint_field(token: u32, name: &str, parent: Option<Ref>) -> Action {
+    fn mint_field(token: u32, name: &str, parent: Option<FieldRef>) -> Action {
         Action::AddField(AddField {
             local: token,
             parent,
@@ -962,7 +965,7 @@ mod tests {
 
     fn drop_field_zero() -> Action {
         Action::DropField(DropField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
         })
     }
 
@@ -971,15 +974,15 @@ mod tests {
     /// is a fragment of the rejection, or `None` for a sequence that applies.
     #[rstest]
     #[case::use_before_mint(
-        vec![vec![write_data(Ref::Local(0), Ref::Committed(0)), mint_fragment(0)]],
+        vec![vec![write_data(Ref::Local(0), FieldRef::Committed(0)), mint_fragment(0)]],
         Some("references local fragment token 0, which no earlier action in this operation minted"),
     )]
     #[case::child_before_its_local_parent(
-        vec![vec![mint_field(1, "child", Some(Ref::Local(0))), mint_field(0, "parent", None)]],
+        vec![vec![mint_field(1, "child", Some(FieldRef::Local(0))), mint_field(0, "parent", None)]],
         Some("references local field token 0, which no earlier action in this operation minted"),
     )]
     #[case::data_file_after_remove(
-        vec![vec![remove_fragment_zero(), write_data(Ref::Committed(0), Ref::Committed(0))]],
+        vec![vec![remove_fragment_zero(), write_data(Ref::Committed(0), FieldRef::Committed(0))]],
         Some("AddDataFile targets fragment 0, which does not exist"),
     )]
     #[case::deletion_file_after_remove(
@@ -989,6 +992,7 @@ mod tests {
                 fragment: 0,
                 deletion_file: None,
                 data_change: true,
+                base: None,
             }),
         ]],
         Some("SetDeletionFile targets fragment 0, which does not exist"),
@@ -998,7 +1002,7 @@ mod tests {
             remove_fragment_zero(),
             Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
             }),
         ]],
@@ -1008,7 +1012,7 @@ mod tests {
         vec![vec![
             drop_field_zero(),
             Action::AlterField(AlterField {
-                field: Ref::Committed(0),
+                field: FieldRef::Committed(0),
                 name: Some("renamed".into()),
                 nullable: None,
             }),
@@ -1016,11 +1020,11 @@ mod tests {
         Some("AlterField names field 0, which does not exist"),
     )]
     #[case::data_file_after_drop(
-        vec![vec![drop_field_zero(), write_data(Ref::Committed(0), Ref::Committed(0))]],
+        vec![vec![drop_field_zero(), write_data(Ref::Committed(0), FieldRef::Committed(0))]],
         Some("AddDataFile for fragment 0 names field 0, which does not exist"),
     )]
     #[case::child_after_its_parent_is_dropped(
-        vec![vec![drop_field_zero(), mint_field(0, "child", Some(Ref::Committed(0)))]],
+        vec![vec![drop_field_zero(), mint_field(0, "child", Some(FieldRef::Committed(0)))]],
         Some("AddField names parent field 0, which does not exist"),
     )]
     #[case::double_remove(
@@ -1033,15 +1037,15 @@ mod tests {
     )]
     #[case::token_used_a_step_before_it_is_minted(
         vec![
-            vec![write_data(Ref::Local(0), Ref::Committed(0))],
+            vec![write_data(Ref::Local(0), FieldRef::Committed(0))],
             vec![mint_fragment(0)],
         ],
         Some("references local fragment token 0, which no earlier action in this operation minted"),
     )]
     #[case::token_minted_in_two_steps(
         vec![
-            vec![mint_fragment(0), write_data(Ref::Local(0), Ref::Committed(0))],
-            vec![mint_fragment(0), write_data(Ref::Local(0), Ref::Committed(0))],
+            vec![mint_fragment(0), write_data(Ref::Local(0), FieldRef::Committed(0))],
+            vec![mint_fragment(0), write_data(Ref::Local(0), FieldRef::Committed(0))],
         ],
         Some("local fragment token 0 is minted more than once in this operation"),
     )]
@@ -1049,25 +1053,25 @@ mod tests {
         vec![vec![
             Action::ResetTable(ResetTable),
             mint_field(0, "x", None),
-            write_data(Ref::Committed(0), Ref::Local(0)),
+            write_data(Ref::Committed(0), FieldRef::Local(0)),
         ]],
         Some("AddDataFile targets fragment 0, which does not exist"),
     )]
     #[case::token_minted_a_step_before_it_is_used(
         vec![
             vec![mint_fragment(0)],
-            vec![write_data(Ref::Local(0), Ref::Committed(0))],
+            vec![write_data(Ref::Local(0), FieldRef::Committed(0))],
         ],
         None,
     )]
     #[case::actions_before_a_reset(
         vec![vec![
             mint_fragment(0),
-            write_data(Ref::Local(0), Ref::Committed(0)),
+            write_data(Ref::Local(0), FieldRef::Committed(0)),
             Action::ResetTable(ResetTable),
             mint_field(1, "x", None),
             mint_fragment(1),
-            write_data(Ref::Local(1), Ref::Local(1)),
+            write_data(Ref::Local(1), FieldRef::Local(1)),
         ]],
         None,
     )]
@@ -1089,7 +1093,7 @@ mod tests {
 
     fn rename_field_zero() -> Action {
         Action::AlterField(AlterField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
             name: Some("renamed".into()),
             nullable: None,
         })

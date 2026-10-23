@@ -115,8 +115,8 @@ use apply::ApplyState;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 
-/// A reference to a counter-allocated identifier -- a field id, fragment id, or
-/// base id -- that may not have been assigned yet.
+/// A reference to a counter-allocated fragment id or base id that may not have
+/// been assigned yet. Field ids use [`FieldRef`].
 ///
 /// [`Ref::Committed`] is a concrete id that already exists in the manifest.
 /// [`Ref::Local`] is a placeholder token minted by an `Add*` action earlier in
@@ -127,8 +127,8 @@ use lance_core::deepsize::DeepSizeOf;
 /// collision.
 ///
 /// Local tokens are scoped to one [`CompositeOperation`] and must be distinct within
-/// it. The three id spaces do not share a token namespace: a fragment token 0
-/// and a field token 0 are unrelated.
+/// it. The id spaces (fragment, field, base) do not share a token namespace: a
+/// fragment token 0 and a field token 0 are unrelated.
 ///
 /// ```
 /// # use lance_table::transaction::action::Ref;
@@ -165,6 +165,68 @@ impl Ref {
     }
 }
 
+/// A reference to a field id that may not have been assigned yet: the field-id
+/// form of [`Ref`].
+///
+/// A separate type because field ids are signed. Schema fields are `>= 0`, and
+/// [`AddDataFile::field_ids`] may also bind the reserved ids of the hidden row
+/// lineage columns ([`ROW_ID_FIELD_ID`](lance_core::ROW_ID_FIELD_ID) and its
+/// two siblings), the way a data file's own field list does. Every other field
+/// reference takes a schema field id; apply rejects anything else.
+///
+/// ```
+/// # use lance_table::transaction::action::FieldRef;
+/// let existing = FieldRef::Committed(3);
+/// assert_eq!(existing.committed(), Some(3));
+///
+/// // A field minted by an AddField with `local: 0` earlier in the operation.
+/// let minted = FieldRef::Local(0);
+/// assert_eq!(minted.local(), Some(0));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, DeepSizeOf)]
+pub enum FieldRef {
+    Committed(i32),
+    Local(u32),
+}
+
+impl FieldRef {
+    /// The committed id, or `None` if this is an unresolved local token.
+    pub fn committed(&self) -> Option<i32> {
+        match self {
+            Self::Committed(id) => Some(*id),
+            Self::Local(_) => None,
+        }
+    }
+
+    /// The local token, or `None` if this reference is already committed.
+    pub fn local(&self) -> Option<u32> {
+        match self {
+            Self::Local(token) => Some(*token),
+            Self::Committed(_) => None,
+        }
+    }
+}
+
+/// A field id as apply resolved it: a schema field, or one of the reserved
+/// negative ids a data file's field list may carry.
+///
+/// Scoped to the action layer, where a [`FieldRef`] can name either kind and
+/// each action has to say which it accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct FieldId(i32);
+
+impl FieldId {
+    pub(super) fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for FieldId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A composable transaction: an ordered list of user steps that commit
 /// atomically as a single manifest change.
 ///
@@ -182,7 +244,7 @@ impl Ref {
 /// # use lance_file::version::ConcreteFileVersion;
 /// # use lance_table::format::DataFile;
 /// use lance_table::transaction::action::{
-///     Action, AddDataFile, AddFragment, CompositeOperation, Ref, UserStep,
+///     Action, AddDataFile, AddFragment, CompositeOperation, FieldRef, Ref, UserStep,
 /// };
 ///
 /// let operation = CompositeOperation::new(vec![
@@ -202,8 +264,9 @@ impl Ref {
 ///         vec![Action::AddDataFile(AddDataFile {
 ///             fragment: Ref::Local(0),
 ///             file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-///             field_ids: vec![Ref::Committed(0)],
+///             field_ids: vec![FieldRef::Committed(0)],
 ///             data_change: true,
+///             base: None,
 ///         })],
 ///     ),
 /// ]);
@@ -323,12 +386,14 @@ mod tests {
         assert_eq!(Ref::Committed(7).local(), None);
         assert_eq!(Ref::Local(2).local(), Some(2));
         assert_eq!(Ref::Local(2).committed(), None);
+        assert_eq!(FieldRef::Committed(-3).committed(), Some(-3));
+        assert_eq!(FieldRef::Local(2).local(), Some(2));
     }
 
     #[test]
     fn test_data_change_defaults_by_action_kind() {
         let alter = Action::AlterField(AlterField {
-            field: Ref::Committed(1),
+            field: FieldRef::Committed(1),
             name: Some("renamed".into()),
             nullable: None,
         });

@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire};
-use super::{Coordinate, Footprint};
+use super::{Coordinate, Footprint, Ref};
 use crate::format::{DeletionFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -33,6 +33,9 @@ pub struct SetDeletionFile {
     pub deletion_file: Option<DeletionFile>,
     /// See [`AddFragment::data_change`](super::AddFragment::data_change).
     pub data_change: bool,
+    /// The base path the deletion file lives under: committed, or one minted
+    /// earlier in the same operation. `None` for the dataset's own directory.
+    pub base: Option<Ref>,
 }
 
 impl SetDeletionFile {
@@ -60,6 +63,7 @@ impl From<&SetDeletionFile> for pb_actions::SetDeletionFile {
             fragment: value.fragment,
             deletion_file: value.deletion_file.as_ref().map(pb::DeletionFile::from),
             data_change: data_change_to_wire(value.data_change),
+            base: value.base.map(Into::into),
         }
     }
 }
@@ -75,6 +79,7 @@ impl TryFrom<pb_actions::SetDeletionFile> for SetDeletionFile {
                 .map(DeletionFile::try_from)
                 .transpose()?,
             data_change: data_change_from_wire(message.data_change),
+            base: message.base.map(Ref::try_from).transpose()?,
         })
     }
 }
@@ -102,6 +107,7 @@ mod tests {
                 fragment: 0,
                 deletion_file: Some(deletion_file.clone()),
                 data_change: true,
+                base: None,
             })],
         )
         .unwrap();
@@ -114,6 +120,7 @@ mod tests {
                 fragment: 0,
                 deletion_file: None,
                 data_change: true,
+                base: None,
             })],
         )
         .unwrap();
@@ -128,6 +135,7 @@ mod tests {
                 fragment: 7,
                 deletion_file: None,
                 data_change: true,
+                base: None,
             })],
         )
         .unwrap_err();

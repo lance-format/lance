@@ -1134,7 +1134,7 @@ mod tests {
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DataStorageFormat};
     use crate::transaction::action::{
-        AddField, AlterField, CompositeOperation, DropField, Ref, SetDeletionFile, UserStep,
+        AddField, AlterField, CompositeOperation, DropField, FieldRef, SetDeletionFile, UserStep,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
@@ -2132,18 +2132,19 @@ mod tests {
     )]
     #[case::rename(
         Action::AlterField(AlterField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
             name: Some("renamed".into()),
             nullable: None,
         }),
         true
     )]
-    #[case::drop_field(Action::DropField(DropField { field: Ref::Committed(0) }), true)]
+    #[case::drop_field(Action::DropField(DropField { field: FieldRef::Committed(0) }), true)]
     #[case::data_only(
         Action::SetDeletionFile(SetDeletionFile {
             fragment: 0,
             deletion_file: None,
             data_change: true,
+            base: None,
         }),
         true
     )]
