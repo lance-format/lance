@@ -198,9 +198,13 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::IndexMetadata;
+    use crate::rowids::version::RowDatasetVersionSequence;
+    use crate::rowids::write_row_ids;
     use crate::transaction::action::test_support::{apply, apply_with_indices};
     use crate::transaction::action::{Action, AddDataFile, FieldRef, ReserveFragmentIds};
-    use crate::transaction::test_support::{sample_index_metadata, sample_manifest};
+    use crate::transaction::test_support::{
+        make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
+    };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -400,5 +404,81 @@ mod tests {
         let added = next.fragments.iter().find(|f| f.id == 1).unwrap();
         assert_eq!(added.files.len(), 1);
         assert_eq!(added.files[0].fields.as_ref(), &[0]);
+    }
+
+    fn fragment_carrying(
+        data_change: bool,
+        row_ids: bool,
+        last_updated: bool,
+        created: bool,
+    ) -> Action {
+        let versions = || {
+            RowDatasetVersionMeta::from_sequence(
+                &RowDatasetVersionSequence::from_uniform_row_count(10, 1),
+            )
+            .unwrap()
+        };
+        Action::AddFragment(AddFragment {
+            id: Ref::Local(0),
+            physical_rows: 10,
+            row_id_meta: row_ids.then(|| RowIdMeta::Inline(write_row_ids(&(0..10).into()).into())),
+            last_updated_at_version_meta: last_updated.then(versions),
+            created_at_version_meta: created.then(versions),
+            data_change,
+        })
+    }
+
+    /// A fragment that only moves rows (compaction) has to keep their
+    /// identity: with a sequence left out, apply would mint fresh row ids or
+    /// stamp the commit version, and the moved rows would read as new ones.
+    /// A data change is stamped instead, and a dataset without stable row ids
+    /// has no lineage to keep.
+    #[rstest]
+    #[case::move_with_every_sequence(true, fragment_carrying(false, true, true, true), None)]
+    #[case::move_without_row_ids(
+        true,
+        fragment_carrying(false, false, true, true),
+        Some("row ids")
+    )]
+    #[case::move_without_last_updated_versions(
+        true,
+        fragment_carrying(false, true, false, true),
+        Some("last_updated_at versions")
+    )]
+    #[case::move_without_created_versions(
+        true,
+        fragment_carrying(false, true, true, false),
+        Some("created_at versions")
+    )]
+    #[case::data_change_without_sequences(true, fragment_carrying(true, false, false, false), None)]
+    #[case::move_without_stable_row_ids(false, fragment_carrying(false, false, false, false), None)]
+    fn test_a_move_on_a_stable_row_id_dataset_carries_its_lineage(
+        #[case] stable_row_ids: bool,
+        #[case] action: Action,
+        #[case] missing: Option<&str>,
+    ) {
+        let manifest = if stable_row_ids {
+            make_stable_row_id_manifest(vec![])
+        } else {
+            sample_manifest()
+        };
+
+        let result = apply(&manifest, vec![action]);
+
+        let Some(missing) = missing else {
+            let next = result.unwrap();
+            let added = next.fragments.iter().max_by_key(|f| f.id).unwrap();
+            assert_eq!(added.row_id_meta.is_some(), stable_row_ids);
+            assert_eq!(added.last_updated_at_version_meta.is_some(), stable_row_ids);
+            assert_eq!(added.created_at_version_meta.is_some(), stable_row_ids);
+            return;
+        };
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("data_change = false"), "{error}");
+        assert!(error.to_string().contains(missing), "{error}");
     }
 }
