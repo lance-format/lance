@@ -78,6 +78,7 @@ macro_rules! for_each_action {
             ResetTable,
             ConfigUpdate,
             AssertUniqueKeys,
+            AssertCellsUnchanged,
         }
     };
 }
@@ -91,6 +92,7 @@ mod add_overlays;
 mod adjust_index_coverage;
 mod alter_field;
 mod apply;
+mod assert_cells_unchanged;
 mod assert_unique_keys;
 mod config_update;
 mod drop_field;
@@ -119,6 +121,7 @@ pub use add_index_segment::AddIndexSegment;
 pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
+pub use assert_cells_unchanged::{AssertCellsUnchanged, RowSelection, SelectedRows};
 pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
