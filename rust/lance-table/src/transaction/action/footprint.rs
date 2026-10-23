@@ -349,7 +349,7 @@ pub struct Footprint {
 /// A claim about which keys an action set inserts, and over which columns.
 #[derive(Debug, Clone, PartialEq)]
 struct KeyAssertion {
-    key_fields: Vec<Ref>,
+    key_fields: Vec<FieldRef>,
     filter: KeyExistenceFilter,
 }
 
@@ -579,13 +579,13 @@ impl Footprint {
 
     /// Whether this set writes, wholly or in part, the data of any of `fields`
     /// in some committed fragment.
-    fn writes_into_any_of(&self, fields: &[Ref]) -> bool {
+    fn writes_into_any_of(&self, fields: &[FieldRef]) -> bool {
         self.claims
             .iter()
             .filter(|(_, mode)| **mode >= Mode::WritesPart)
             .any(|(coordinate, _)| match coordinate {
                 Coordinate::FieldData { field, .. } => {
-                    fields.contains(&Ref::Committed(*field as u64))
+                    fields.contains(&FieldRef::Committed(*field))
                 }
                 _ => false,
             })
@@ -699,7 +699,7 @@ impl Footprint {
     pub(super) fn write_partial_field_data(
         &mut self,
         fragment: Ref,
-        fields: impl IntoIterator<Item = Ref>,
+        fields: impl IntoIterator<Item = FieldRef>,
     ) {
         let committed_fragment = fragment.committed();
         for field in fields.into_iter().filter_map(committed_field) {
@@ -861,7 +861,11 @@ impl Footprint {
     /// concurrent writer can insert into, so the assertion has nothing to
     /// guard against. Nor could it be matched: assertions are matched by key
     /// columns, and a local token means a different column in each operation.
-    pub(super) fn assert_unique_keys(&mut self, key_fields: Vec<Ref>, filter: KeyExistenceFilter) {
+    pub(super) fn assert_unique_keys(
+        &mut self,
+        key_fields: Vec<FieldRef>,
+        filter: KeyExistenceFilter,
+    ) {
         if key_fields.iter().any(|field| field.committed().is_none()) {
             return;
         }

@@ -87,7 +87,7 @@ mod tests {
     use crate::transaction::action::test_support::{
         apply_with_indices, backed_manifest, footprint,
     };
-    use crate::transaction::action::{Action, AddIndexSegment, Ref};
+    use crate::transaction::action::{Action, AddIndexSegment, FieldRef, Ref};
     use crate::transaction::test_support::sample_index_metadata;
     use uuid::Uuid;
 
@@ -230,7 +230,7 @@ mod tests {
         let rebuild = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
             uuid: Uuid::from_u128(20),
             name: MEM_WAL_INDEX_NAME.into(),
-            fields: vec![Ref::Committed(0)],
+            fields: vec![FieldRef::Committed(0)],
             covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
@@ -252,7 +252,7 @@ mod tests {
         let segment = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
             uuid: Uuid::from_u128(21),
             name: "by_a".into(),
-            fields: vec![Ref::Committed(0)],
+            fields: vec![FieldRef::Committed(0)],
             covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
