@@ -68,7 +68,7 @@ mod tests {
     use super::*;
     use crate::format::{Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, read_row_ids, write_row_ids};
-    use crate::transaction::action::test_support::{apply, backed_manifest};
+    use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
     use crate::transaction::action::{Action, AddFragment, Ref};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use rstest::rstest;
@@ -218,5 +218,61 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("overflows"), "{error}");
+    }
+
+    fn supplied(local: u32, row_ids: Vec<u64>) -> Action {
+        let sequence = RowIdSequence::try_from_iter(row_ids.iter().copied()).unwrap();
+        Action::AddFragment(AddFragment {
+            id: Ref::Local(local),
+            physical_rows: row_ids.len() as u64,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&sequence).into())),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    /// A row id names one row, so two fragments of one operation carrying the
+    /// same supplied id would give it two rows.
+    #[rstest]
+    #[case::disjoint(vec![supplied(0, (10..15).collect()), supplied(1, (15..20).collect())], None)]
+    #[case::overlapping(
+        vec![supplied(0, (10..15).collect()), supplied(1, (14..20).collect())],
+        Some("carries row id 14, which fragment 2 added in this operation also carries")
+    )]
+    fn test_supplied_row_ids_are_disjoint_within_an_operation(
+        #[case] actions: Vec<Action>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let result = apply(&stable_manifest(), actions);
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+                assert!(error.to_string().contains(message), "{error}");
+            }
+        }
+    }
+
+    /// Two concurrent writers spending the same reserved row ids collide.
+    /// The claim is the exact set each supplies, not its min..max range, so
+    /// two compactions whose rows interleave in id order do not.
+    #[rstest]
+    #[case::the_same_ids(vec![1000, 1001], vec![1001, 1002], true)]
+    #[case::disjoint_ranges(vec![1000, 1001], vec![1002, 1003], false)]
+    #[case::interleaved_but_disjoint(vec![10, 30], vec![20, 40], false)]
+    fn test_supplied_row_ids_conflict_only_where_they_overlap(
+        #[case] ours: Vec<u64>,
+        #[case] theirs: Vec<u64>,
+        #[case] expected: bool,
+    ) {
+        let ours = footprint(vec![supplied(0, ours)]);
+        let theirs = footprint(vec![supplied(0, theirs)]);
+
+        assert_eq!(ours.conflicts_with(&theirs), expected);
+        assert_eq!(theirs.conflicts_with(&ours), expected);
     }
 }
