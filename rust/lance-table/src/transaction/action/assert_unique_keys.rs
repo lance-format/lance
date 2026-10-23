@@ -149,6 +149,29 @@ mod tests {
         Action::AddFragment(fragment)
     }
 
+    /// `key_fields` is the only key list. The filter type keeps a field list
+    /// of its own for the legacy operation, and a second list here could only
+    /// disagree with the first.
+    #[test]
+    fn test_decoding_rejects_a_filter_with_its_own_field_ids() {
+        let Action::AssertUniqueKeys(assertion) = assertion(vec![FieldRef::Committed(0)], &[1])
+        else {
+            unreachable!()
+        };
+        let mut message = pb_actions::AssertUniqueKeys::from(&assertion);
+        message.filter.as_mut().unwrap().field_ids = vec![0];
+
+        let error = AssertUniqueKeys::try_from(message).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("filter.field_ids [0] beside key_fields [Committed(0)]"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn test_an_assertion_changes_nothing() {
         let manifest = backed_manifest();
