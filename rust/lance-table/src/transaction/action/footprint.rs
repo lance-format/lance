@@ -18,6 +18,7 @@
 
 use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::transaction::UpdateMap;
+use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 
 /// One thing an action set writes.
@@ -242,6 +243,11 @@ pub struct Footprint {
     values_written: HashSet<i32>,
     /// Whether this set adds a fragment.
     rows_added: bool,
+    /// Row ids this set's new fragments arrive carrying, out of a reservation
+    /// or kept by a compaction. A row id names one row, so two sets supplying
+    /// the same id collide. The exact set rather than a range, so two
+    /// compactions whose rows interleave in id order do not.
+    supplied_row_ids: RoaringTreemap,
     /// Whether this set rewrites the table wholesale. Such a set collides with
     /// every concurrent set, including one that records no claim at all -- an
     /// append's rows would vanish or survive the reset depending on which
@@ -270,6 +276,12 @@ impl Footprint {
             return true;
         }
         if self.claims_conflict_with(committed) || self.preconditions_violated_by(committed) {
+            return true;
+        }
+        if !self
+            .supplied_row_ids
+            .is_disjoint(&committed.supplied_row_ids)
+        {
             return true;
         }
         self.required_fragment_removed_by(committed) || committed.required_fragment_removed_by(self)
@@ -399,6 +411,11 @@ impl Footprint {
     pub(super) fn add_rows(&mut self) {
         self.rows_added = true;
         self.require(Coordinate::NewRowSchema);
+    }
+
+    /// Record row ids a fragment this set adds arrives carrying.
+    pub(super) fn supply_row_ids(&mut self, row_ids: &RoaringTreemap) {
+        self.supplied_row_ids |= row_ids;
     }
 
     /// Record that this set adds a column that rows must carry a value for, or
