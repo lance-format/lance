@@ -77,14 +77,13 @@ impl Transaction {
             .any(|index| index.name == MEM_WAL_INDEX_NAME)
             .then(|| Self::logical_index_segments(&current_indices));
 
-        let mut state = ApplyState::new(current_manifest);
+        let mut state = ApplyState::new(current_manifest, current_indices);
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
 
         state.into_manifest(
             self,
-            current_indices,
             transaction_file_path,
             config,
             mem_wal_segments_before.as_ref(),
@@ -106,6 +105,8 @@ pub(super) struct ApplyState<'a> {
     /// committed on top of.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
+    /// The index segments of the version being committed on top of.
+    indices: Vec<IndexMetadata>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
     /// these are inherited wholesale by the manifest assembly, so an edit has
     /// to be written back over the assembled manifest.
@@ -150,11 +151,12 @@ pub(super) struct ApplyState<'a> {
 }
 
 impl<'a> ApplyState<'a> {
-    fn new(manifest: &'a Manifest) -> Self {
+    fn new(manifest: &'a Manifest, indices: Vec<IndexMetadata>) -> Self {
         Self {
             current_manifest: manifest,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
+            indices,
             new_bases: Vec::new(),
             existing_base_paths: manifest.base_paths.clone(),
             config: manifest.config.clone(),
@@ -177,7 +179,6 @@ impl<'a> ApplyState<'a> {
     fn into_manifest(
         mut self,
         transaction: &Transaction,
-        current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
         mem_wal_segments_before: Option<&LogicalIndexSegments>,
@@ -198,6 +199,7 @@ impl<'a> ApplyState<'a> {
         let ApplyState {
             schema,
             mut fragments,
+            mut indices,
             new_bases,
             rebound_fields,
             reset,
@@ -208,7 +210,6 @@ impl<'a> ApplyState<'a> {
             ..
         } = self;
 
-        let mut indices = current_indices;
         if reset {
             indices.clear();
         }
@@ -437,6 +438,23 @@ impl<'a> ApplyState<'a> {
         if self.fragments.iter().any(|fragment| fragment.id == id) {
             return Err(Error::invalid_input(format!(
                 "AddFragment adds a fragment at id {id}, which already exists"
+            )));
+        }
+        // Coverage bitmaps are not pruned when a fragment is removed, and
+        // readers intersect them with the fragments that exist, so an id a
+        // segment still lists would read as indexed once claimed.
+        if let Ok(bitmap_id) = u32::try_from(id)
+            && let Some(index) = self.indices.iter().find(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(bitmap_id))
+            })
+        {
+            return Err(Error::invalid_input(format!(
+                "AddFragment adds a fragment at id {id}, which index '{}' segment {} still lists \
+                 in its coverage; reserve a fresh range rather than reuse this id",
+                index.name, index.uuid
             )));
         }
         self.new_fragments.insert(id);
