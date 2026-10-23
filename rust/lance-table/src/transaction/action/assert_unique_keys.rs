@@ -36,9 +36,9 @@ use lance_core::{Error, Result};
 /// detection ignores it.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AssertUniqueKeys {
-    /// The key columns, in order. This is the authoritative list; the field ids
-    /// the filter carries are an artifact of the shared filter type, ignored
-    /// here and cleared on encode.
+    /// The key columns, in order, and the only key list: the field ids the
+    /// filter type carries are an artifact of its use by the legacy operation,
+    /// cleared on encode and rejected on decode.
     pub key_fields: Vec<FieldRef>,
     /// Hashes of the key values of every row this operation inserts, over
     /// `key_fields`.
@@ -95,12 +95,20 @@ impl TryFrom<pb_actions::AssertUniqueKeys> for AssertUniqueKeys {
 
     fn try_from(message: pb_actions::AssertUniqueKeys) -> Result<Self> {
         let filter = required(message.filter, "AssertUniqueKeys.filter")?;
+        let key_fields = message
+            .key_fields
+            .into_iter()
+            .map(FieldRef::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        if !filter.field_ids.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "AssertUniqueKeys carries filter.field_ids {:?} beside key_fields {key_fields:?}; \
+                 filter.field_ids must be empty, since key_fields is the only key list",
+                filter.field_ids
+            )));
+        }
         Ok(Self {
-            key_fields: message
-                .key_fields
-                .into_iter()
-                .map(FieldRef::try_from)
-                .collect::<Result<Vec<_>>>()?,
+            key_fields,
             filter: KeyExistenceFilter::try_from(&filter)?,
         })
     }
