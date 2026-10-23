@@ -77,6 +77,11 @@ package lance.transaction;
  * apply, and re-resolves against the target's counters on merge/rebase. `local` tokens are scoped to a single
  * `CompositeOperation` and must be distinct within it (validated by the writer once
  * the write path exists).
+ *
+ * A `committed` id must exist at the operation's read version: apply rejects
+ * one above the read version's high-water mark for its id space, because a
+ * concurrent commit may since have minted that id for an unrelated object.
+ * An object minted in the same operation is named by its `local` token.
  */
 message Ref {
   oneof kind {
@@ -95,6 +100,9 @@ message Ref {
  * does. No other negative id is accepted, and every other field reference
  * takes a schema field id only. `local` is a token minted by an
  * `AddField` earlier in the same `CompositeOperation`, scoped like `Ref`'s.
+ *
+ * As with `Ref`, a `committed` schema field id must exist at the read
+ * version. The reserved negative ids are not counter-allocated and are exempt.
  */
 message FieldRef {
   oneof kind {
@@ -159,6 +167,7 @@ message Action {
     AddIndexSegment add_index_segment = 14;
     RemoveIndexSegment remove_index_segment = 15;
     AdjustIndexCoverage adjust_index_coverage = 16;
+    DropIndex drop_index = 22;
     // -- Wholesale-within-operation --
     ResetTable reset_table = 17;
     ReserveFragmentIds reserve_fragment_ids = 18;
@@ -192,8 +201,9 @@ message AddFragment {
    * that is not reserved or is already in use, or that an index segment's
    * stored fragment coverage still names.
    *
-   * A Committed id must come from an earlier commit's reservation, not one in
-   * the same operation: reservations are taken after the operation's mints.
+   * A Committed id must come from a reservation committed at or before the
+   * operation's read version, not one in the same operation: reservations are
+   * taken after the operation's mints.
    *
    * AddField and AddBase have no Committed form, because no reservation
    * mechanism exists for field or base ids.
@@ -409,6 +419,12 @@ message UpdateCompactedSsTables {
 /*
  * Remove a field from the schema (and, at apply, prune any data file left with
  * no live fields).
+ *
+ * The field must have no live children: dropping a struct or list is a
+ * DropField per descendant, deepest first, then the parent, all in the same
+ * operation. Apply rejects a DropField whose field still has children. Naming
+ * every dropped field keeps the conflict footprint exact: a concurrent change
+ * to a child conflicts with that child's own DropField.
  */
 message DropField {
   FieldRef field = 1;
@@ -559,6 +575,27 @@ message AdjustIndexCoverage {
    * segment really carries this name.
    */
   string name = 4;
+  /*
+   * The segment's `fields` and `covering_fields`, exactly as it stands at
+   * apply; apply rejects a mismatch. Carried so the conflict footprint can
+   * require the data of these fields in every committed fragment the
+   * adjustment adds, which a concurrent rewrite of those columns invalidates.
+   */
+  repeated FieldRef fields = 5;
+  repeated FieldRef covering_fields = 6;
+}
+
+/*
+ * Remove every segment of the logical index `name`, as the segments stand at
+ * apply, including any committed concurrently. Apply rejects the action if
+ * no segment carries the name.
+ *
+ * Use this to drop an index. RemoveIndexSegment is for segment-level
+ * maintenance (e.g. optimize replacing segments), which a concurrent new
+ * segment must not be swept up by.
+ */
+message DropIndex {
+  string name = 1;
 }
 
 /*

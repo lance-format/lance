@@ -659,6 +659,11 @@ that resolves against the target's counters at apply time. Both properties are
 what let a composite operation be replayed against a newer version, or onto a
 different branch, without rewriting it.
 
+A committed identifier, by contrast, must already exist at the operation's
+read version. Apply rejects a committed fragment, field, or base id above the
+read version's high-water mark for that id space, since a concurrent commit may
+have minted it for an unrelated object in the meantime.
+
 The full action vocabulary and the reasoning behind its shape are defined in
 `protos/transaction/actions.proto`.
 
