@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{Footprint, Ref};
+use super::{FieldRef, Footprint, Ref};
 use crate::format::overlay::DataOverlayFile;
 use crate::format::pb;
 use crate::format::pb_actions;
@@ -150,7 +150,7 @@ impl AddOverlays {
             // A negative id marks a tombstoned column in the overlay's file,
             // which holds no values a reader sees.
             .filter(|field| *field >= 0)
-            .map(|field| Ref::Committed(field as u64));
+            .map(FieldRef::Committed);
         footprint.write_partial_field_data(self.fragment, fields);
         if let Some(fragment) = self.fragment.committed() {
             footprint.write_part_of_deletions(fragment);
@@ -375,7 +375,7 @@ mod tests {
         let rewrite = |field: i32| {
             footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(field as u64)],
+                field_ids: vec![FieldRef::Committed(field)],
                 data_change: true,
             })])
         };
@@ -396,12 +396,12 @@ mod tests {
     fn test_an_overlay_needs_its_field_defined_as_it_was() {
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
         let altered = footprint(vec![Action::AlterField(AlterField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
             name: Some("renamed".into()),
             nullable: None,
         })]);
         let dropped = footprint(vec![Action::DropField(DropField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
         })]);
 
         assert!(overlaid.conflicts_with(&altered));
@@ -421,7 +421,7 @@ mod tests {
         let build = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
             uuid: uuid::Uuid::from_u128(1),
             name: "by_a".into(),
-            fields: vec![Ref::Committed(0)],
+            fields: vec![FieldRef::Committed(0)],
             covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
@@ -448,14 +448,14 @@ mod tests {
             add(Ref::Committed(0), vec![overlay("a.lance", &[0])]),
             Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
             }),
         ]);
         let other_overlay = footprint(vec![add(Ref::Committed(0), vec![overlay("b.lance", &[0])])]);
         let other_column = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
             fragment: Ref::Committed(0),
-            field_ids: vec![Ref::Committed(1)],
+            field_ids: vec![FieldRef::Committed(1)],
             data_change: true,
         })]);
 
@@ -610,15 +610,15 @@ mod tests {
         partly_tombstoned.data_file.fields = vec![-1, 1].into();
         partly_tombstoned.data_file.column_indices = vec![0, 1].into();
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![partly_tombstoned])]);
-        let rewrite = |field: u64| {
+        let rewrite = |field: i32| {
             footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(field)],
+                field_ids: vec![FieldRef::Committed(field)],
                 data_change: true,
             })])
         };
         let drop_field_zero = footprint(vec![Action::DropField(DropField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
         })]);
 
         assert!(overlaid.conflicts_with(&rewrite(1)));
@@ -687,7 +687,7 @@ mod tests {
     #[rstest::rstest]
     #[case::replacement(
         vec![
-            Action::DropField(DropField { field: Ref::Committed(0) }),
+            Action::DropField(DropField { field: FieldRef::Committed(0) }),
             Action::AddField(AddField {
                 local: 0,
                 parent: None,
@@ -696,7 +696,7 @@ mod tests {
         ],
         true,
     )]
-    #[case::drop(vec![Action::DropField(DropField { field: Ref::Committed(0) })], false)]
+    #[case::drop(vec![Action::DropField(DropField { field: FieldRef::Committed(0) })], false)]
     fn test_an_overlay_on_a_minted_fragment_needs_its_field_defined_as_it_was(
         #[case] schema_change: Vec<Action>,
         #[case] schema_change_conflicts_landing_second: bool,
@@ -734,6 +734,7 @@ mod tests {
                 fragment,
                 deletion_file: None,
                 data_change: true,
+                base: None,
             })])
         };
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
@@ -761,6 +762,7 @@ mod tests {
             fragment: 0,
             deletion_file: None,
             data_change: true,
+            base: None,
         })]);
 
         assert!(!overlaid.conflicts_with(&delete));
@@ -787,7 +789,7 @@ mod tests {
         actions.push(add(fragment, vec![overlay("a.lance", &[0])]));
         let overlaid = footprint(actions);
         let tighten = footprint(vec![Action::AlterField(AlterField {
-            field: Ref::Committed(0),
+            field: FieldRef::Committed(0),
             name: None,
             nullable: Some(false),
         })]);
