@@ -15,7 +15,6 @@ import textwrap
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -4004,27 +4003,19 @@ def test_merge_insert_analyze_plan_matches_execute_routing():
     assert "join_type=Right" in streaming, streaming
 
 
-@contextlib.contextmanager
-def _source_retry_commit_lock(uri, commits, version, conflict_kind="update"):
-    commits.append(version)
-    if len(commits) == 1:
-        # Commit hooks run on a Rust worker. Open the competing dataset from a
-        # Python thread to avoid nesting the synchronous constructor's runtime.
-        def compete():
-            if conflict_kind == "upsert":
-                competing = lance.dataset(uri)
-                (
-                    competing.merge_insert("id")
-                    .when_matched_update_all()
-                    .when_not_matched_insert_all()
-                    .execute(pa.table({"id": [0, 1], "value": [-2, -2]}))
-                )
-            else:
-                lance.dataset(uri).update({"value": "-2"})
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            executor.submit(compete).result(timeout=10)
-    yield
+def _commit_competing_write(uri, conflict_kind="update"):
+    """Change target rows so a merge from the previous version must retry."""
+    competing = lance.dataset(uri)
+    if conflict_kind == "upsert":
+        (
+            competing.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(pa.table({"id": [0, 1], "value": [-2, -2]}))
+        )
+    else:
+        competing.update({"value": "-2"})
+    assert competing.version == 2
 
 
 @pytest.mark.parametrize(
@@ -4042,8 +4033,11 @@ def _source_retry_commit_lock(uri, commits, version, conflict_kind="update"):
     ],
 )
 @pytest.mark.parametrize("conflict_kind", ["update", "upsert"])
-def test_merge_insert_source_retry(tmp_path, source_kind, conflict_kind):
-    """Force a conflicting commit after the source was read, then verify replay."""
+@pytest.mark.parametrize("conflict_retries", [0, 2], ids=["no-retry", "retry"])
+def test_merge_insert_source_retry(
+    tmp_path, source_kind, conflict_kind, conflict_retries
+):
+    """Overlapping commits require source replay instead of an automatic rebase."""
     from lance.types import WriteSource, coerce_source
 
     data = pa.table({"id": [0, 1, 2, 3], "value": [10, 11, 12, 13]})
@@ -4081,21 +4075,32 @@ def test_merge_insert_source_retry(tmp_path, source_kind, conflict_kind):
         expected_mode = "materialized" if source_kind == "table" else "replayable"
         assert coerce_source(source).mode == expected_mode
 
-    commits = []
-
-    def commit_lock(version):
-        return _source_retry_commit_lock(target_uri, commits, version, conflict_kind)
-
-    target = lance.dataset(target_uri, commit_lock=commit_lock)
-    stats = (
+    target = lance.dataset(target_uri)
+    _commit_competing_write(target_uri, conflict_kind)
+    assert target.version == 1
+    builder = (
         target.merge_insert("id")
         .when_matched_update_all()
         .when_not_matched_insert_all()
-        .conflict_retries(2)
-        .execute(source)
+        .conflict_retries(conflict_retries)
     )
-    assert len(commits) == 2
+
+    if conflict_retries == 0:
+        # Success here would mean the transaction rebased without replaying.
+        with pytest.raises(OSError, match="Too many concurrent writers"):
+            builder.execute(source)
+        assert target.version == 1
+        latest = lance.dataset(target_uri)
+        assert latest.version == 2
+        expected_ids = [0, 1] if conflict_kind == "upsert" else [0]
+        assert latest.to_table().sort_by("id") == pa.table(
+            {"id": expected_ids, "value": [-2] * len(expected_ids)}
+        )
+        return
+
+    stats = builder.execute(source)
     assert target.version == 3
+    assert lance.dataset(target_uri).version == 3
     assert target.to_table().sort_by("id") == data
     check_merge_stats(stats, (2, 2, 0) if conflict_kind == "upsert" else (3, 1, 0))
 
@@ -4127,14 +4132,11 @@ def test_registered_source_retry_and_lifecycle(tmp_path):
     assert source.calls == []
     uri = tmp_path / "target"
     lance.write_dataset(data, uri)
-    commits = []
-
-    def commit_lock(version):
-        return _source_retry_commit_lock(uri, commits, version)
-
-    target = lance.dataset(uri, commit_lock=commit_lock)
+    target = lance.dataset(uri)
+    _commit_competing_write(uri)
+    assert target.version == 1
     target.merge_insert("id").when_matched_update_all().execute(source)
-    assert len(commits) == 2
+    assert target.version == 3
     assert len(source.calls) == 2
     assert all(call != threading.get_ident() for call in source.calls)
     assert target.to_table().sort_by("id") == data
@@ -4232,20 +4234,18 @@ def test_replayable_source_conflict_without_retries(tmp_path):
         return WriteSource(data.schema, open_reader, mode="replayable")
 
     lance.write_dataset(data, tmp_path)
-    commits = []
-    target = lance.dataset(
-        tmp_path,
-        commit_lock=lambda version: _source_retry_commit_lock(
-            tmp_path, commits, version
-        ),
-    )
+    target = lance.dataset(tmp_path)
+    _commit_competing_write(tmp_path)
+    assert target.version == 1
     with pytest.raises(OSError, match="Too many concurrent writers"):
         target.merge_insert("id").when_matched_update_all().conflict_retries(0).execute(
             ExternalSource()
         )
     assert calls == [True]
-    assert len(commits) == 1
-    assert lance.dataset(tmp_path).version == 2
+    assert target.version == 1
+    latest = lance.dataset(tmp_path)
+    assert latest.version == 2
+    assert latest.to_table() == pa.table({"id": [0], "value": [-2]})
 
 
 @pytest.mark.parametrize(
@@ -4312,13 +4312,11 @@ def test_computed_source_replays_original_values_on_retry(tmp_path, monkeypatch)
     monkeypatch.setattr(scanner, "to_reader", open_reader)
     uri = tmp_path / "target"
     lance.write_dataset(data, uri)
-    commits = []
-    target = lance.dataset(
-        uri,
-        commit_lock=lambda version: _source_retry_commit_lock(uri, commits, version),
-    )
+    target = lance.dataset(uri)
+    _commit_competing_write(uri)
+    assert target.version == 1
     target.merge_insert("id").when_matched_update_all().execute(scanner)
-    assert len(commits) == 2
+    assert target.version == 3
     assert calls == [True]
     assert target.to_table().sort_by("id") == pa.Table.from_batches(observed).sort_by(
         "id"
