@@ -16,8 +16,8 @@ pub struct AddDataFile {
     /// The fragment to add the file to: committed, or a fragment minted earlier
     /// in the same operation.
     pub fragment: Ref,
-    /// The file. Its `fields` are placeholders and are stamped in at apply from
-    /// `field_ids`, which is the authority for the column -> field mapping.
+    /// The file, with `fields` left empty: apply stamps them from `field_ids`,
+    /// the only field list the action carries.
     pub file: DataFile,
     /// One entry per column in `file`, in column order.
     pub field_ids: Vec<FieldRef>,
@@ -48,6 +48,13 @@ impl AddDataFile {
             )));
         }
 
+        if !self.file.fields.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment_id} carries file.fields {:?}; \
+                 file.fields must be empty, since field_ids is the file's field list",
+                self.file.fields
+            )));
+        }
         let mut file = self.file.clone();
         if !file.column_indices.is_empty() && file.column_indices.len() != field_ids.len() {
             return Err(Error::invalid_input(format!(
