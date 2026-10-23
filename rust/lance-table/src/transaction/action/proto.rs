@@ -4,7 +4,7 @@
 //! The envelope around the per-action protobuf encodings.
 //!
 //! Each action encodes itself, in its own module; this module carries the
-//! [`Ref`], [`CompositeOperation`], and [`UserStep`] wrappers, the dispatch over
+//! [`Ref`], [`FieldRef`], [`CompositeOperation`], and [`UserStep`] wrappers, the dispatch over
 //! the `oneof`, and the helpers the per-action conversions share.
 //!
 //! Reading is fail-closed: an action this build does not implement is an error,
@@ -12,7 +12,7 @@
 //! transactions with `try_collect`, so a transaction carrying an unknown action
 //! must abort the commit rather than be treated as a no-op.
 
-use super::{Action, CompositeOperation, Ref, UserStep};
+use super::{Action, CompositeOperation, FieldRef, Ref, UserStep};
 use crate::format::pb_actions;
 use lance_core::{Error, Result};
 
@@ -49,6 +49,30 @@ impl TryFrom<pb_actions::Ref> for Ref {
             Some(pb_actions::r#ref::Kind::Local(token)) => Ok(Self::Local(token)),
             None => Err(Error::invalid_input(
                 "a Ref in an action was empty; it must be either committed or local",
+            )),
+        }
+    }
+}
+
+impl From<FieldRef> for pb_actions::FieldRef {
+    fn from(value: FieldRef) -> Self {
+        let kind = match value {
+            FieldRef::Committed(id) => pb_actions::field_ref::Kind::Committed(id),
+            FieldRef::Local(token) => pb_actions::field_ref::Kind::Local(token),
+        };
+        Self { kind: Some(kind) }
+    }
+}
+
+impl TryFrom<pb_actions::FieldRef> for FieldRef {
+    type Error = Error;
+
+    fn try_from(message: pb_actions::FieldRef) -> Result<Self> {
+        match message.kind {
+            Some(pb_actions::field_ref::Kind::Committed(id)) => Ok(Self::Committed(id)),
+            Some(pb_actions::field_ref::Kind::Local(token)) => Ok(Self::Local(token)),
+            None => Err(Error::invalid_input(
+                "a FieldRef in an action was empty; it must be either committed or local",
             )),
         }
     }
@@ -174,12 +198,13 @@ mod tests {
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
                 file: sample_data_file(),
-                field_ids: vec![Ref::Committed(1), Ref::Local(3)],
+                field_ids: vec![FieldRef::Committed(1), FieldRef::Local(3)],
                 data_change: false,
+                base: Some(Ref::Local(1)),
             }),
             Action::AddField(AddField {
                 local: 3,
-                parent: Some(Ref::Committed(1)),
+                parent: Some(FieldRef::Committed(1)),
                 def: Field::try_from(ArrowField::new("added", DataType::Int32, true)).unwrap(),
             }),
             Action::AddBase(AddBase {
@@ -188,7 +213,7 @@ mod tests {
             }),
             Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(4),
-                field_ids: vec![Ref::Committed(7), Ref::Committed(8)],
+                field_ids: vec![FieldRef::Committed(7), FieldRef::Committed(8)],
                 data_change: true,
             }),
             Action::RemoveFragment(RemoveFragment {
@@ -205,14 +230,15 @@ mod tests {
                     base_id: None,
                 }),
                 data_change: true,
+                base: Some(Ref::Committed(2)),
             }),
             Action::AlterField(AlterField {
-                field: Ref::Committed(2),
+                field: FieldRef::Committed(2),
                 name: Some("renamed".into()),
                 nullable: Some(false),
             }),
             Action::DropField(DropField {
-                field: Ref::Committed(3),
+                field: FieldRef::Committed(3),
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
@@ -228,7 +254,7 @@ mod tests {
                     replace: true,
                 }),
                 field_metadata: vec![FieldMetadataUpdate {
-                    field: Ref::Local(3),
+                    field: FieldRef::Local(3),
                     updates: UpdateMap {
                         update_entries: vec![("d", "3").into()],
                         replace: false,
@@ -295,6 +321,11 @@ mod tests {
     #[test]
     fn test_empty_ref_is_rejected() {
         let error = Ref::try_from(pb_actions::Ref { kind: None }).unwrap_err();
+        assert!(
+            error.to_string().contains("committed or local"),
+            "unexpected message: {error}"
+        );
+        let error = FieldRef::try_from(pb_actions::FieldRef { kind: None }).unwrap_err();
         assert!(
             error.to_string().contains("committed or local"),
             "unexpected message: {error}"

@@ -3689,7 +3689,8 @@ mod tests {
     use lance_table::format::{InlineRowIds, RowIdMeta};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
     use lance_table::transaction::action::{
-        Action as TxnAction, CompositeOperation, Ref as ActionRef, TombstoneFieldData, UserStep,
+        Action as TxnAction, CompositeOperation, FieldRef, Ref as ActionRef, TombstoneFieldData,
+        UserStep,
     };
 
     use super::*;
@@ -6440,10 +6441,10 @@ mod tests {
         )
     }
 
-    fn tombstone_txn(fragment: u64, field: u64) -> Transaction {
+    fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
         action_txn(vec![TxnAction::TombstoneFieldData(TombstoneFieldData {
             fragment: ActionRef::Committed(fragment),
-            field_ids: vec![ActionRef::Committed(field)],
+            field_ids: vec![FieldRef::Committed(field)],
             data_change: true,
         })])
     }

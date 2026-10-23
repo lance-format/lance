@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{Footprint, Ref};
+use super::{FieldRef, Footprint, Ref};
 use crate::format::{DataFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -20,9 +20,12 @@ pub struct AddDataFile {
     /// `field_ids`, which is the authority for the column -> field mapping.
     pub file: DataFile,
     /// One entry per column in `file`, in column order.
-    pub field_ids: Vec<Ref>,
+    pub field_ids: Vec<FieldRef>,
     /// See [`AddFragment::data_change`](super::AddFragment::data_change).
     pub data_change: bool,
+    /// The base path the file lives under: committed, or one minted earlier in
+    /// the same operation. `None` for the dataset's own data directory.
+    pub base: Option<Ref>,
 }
 
 impl AddDataFile {
@@ -31,7 +34,7 @@ impl AddDataFile {
         let field_ids = self
             .field_ids
             .iter()
-            .map(|field| state.resolve_field(*field))
+            .map(|field| state.resolve_field(*field).map(|id| id.get()))
             .collect::<Result<Vec<_>>>()?;
         // A column for a field the schema does not have is data no reader can
         // see, such as one dropped earlier in the same operation.
@@ -108,6 +111,7 @@ impl From<&AddDataFile> for pb_actions::AddDataFile {
             file: Some(pb::DataFile::from(&value.file)),
             field_ids: value.field_ids.iter().map(|id| (*id).into()).collect(),
             data_change: data_change_to_wire(value.data_change),
+            base: value.base.map(Into::into),
         }
     }
 }
@@ -122,9 +126,10 @@ impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
             field_ids: message
                 .field_ids
                 .into_iter()
-                .map(Ref::try_from)
+                .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
             data_change: data_change_from_wire(message.data_change),
+            base: message.base.map(Ref::try_from).transpose()?,
         })
     }
 }
@@ -145,8 +150,9 @@ mod tests {
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(3),
                 file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
+                base: None,
             })],
         )
         .unwrap_err();
@@ -167,8 +173,9 @@ mod tests {
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(0),
                 file,
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
+                base: None,
             })],
         )
         .unwrap_err();
@@ -188,8 +195,9 @@ mod tests {
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(7),
                 file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
+                base: None,
             })],
         )
         .unwrap_err();
@@ -202,8 +210,9 @@ mod tests {
         Action::AddDataFile(AddDataFile {
             fragment: Ref::Committed(0),
             file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-            field_ids: vec![Ref::Committed(0)],
+            field_ids: vec![FieldRef::Committed(0)],
             data_change: true,
+            base: None,
         })
     }
 
@@ -225,7 +234,7 @@ mod tests {
             vec![
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(0),
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: false,
                 }),
                 add_file_for_field_zero(),

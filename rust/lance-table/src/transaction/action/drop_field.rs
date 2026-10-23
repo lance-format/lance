@@ -5,7 +5,7 @@
 
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
 use super::proto::required;
-use super::{Footprint, Ref};
+use super::{FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
@@ -19,12 +19,12 @@ use std::collections::HashSet;
 /// index over a removed field is discarded.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DropField {
-    pub field: Ref,
+    pub field: FieldRef,
 }
 
 impl DropField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let field_id = state.resolve_field(self.field)?;
+        let field_id = state.resolve_field(self.field)?.get();
         let field = state.schema().field_by_id(field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "DropField names field {field_id}, which does not exist"
@@ -146,7 +146,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![Action::DropField(DropField {
-                field: Ref::Committed(0),
+                field: FieldRef::Committed(0),
             })],
             vec![sample_index_metadata("idx")],
         )
@@ -179,7 +179,7 @@ mod tests {
         let next = apply(
             &manifest,
             vec![Action::DropField(DropField {
-                field: Ref::Committed(0),
+                field: FieldRef::Committed(0),
             })],
         )
         .unwrap();
@@ -207,7 +207,7 @@ mod tests {
         let next = apply(
             &manifest,
             vec![Action::DropField(DropField {
-                field: Ref::Committed(1),
+                field: FieldRef::Committed(1),
             })],
         )
         .unwrap();
@@ -224,7 +224,7 @@ mod tests {
         let error = apply(
             &backed_manifest(),
             vec![Action::DropField(DropField {
-                field: Ref::Committed(7),
+                field: FieldRef::Committed(7),
             })],
         )
         .unwrap_err();
@@ -239,7 +239,7 @@ mod tests {
             &backed_manifest(),
             vec![
                 Action::DropField(DropField {
-                    field: Ref::Committed(0),
+                    field: FieldRef::Committed(0),
                 }),
                 Action::AddField(AddField {
                     local: 0,
@@ -261,21 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_field_rejects_a_field_id_out_of_range() {
-        let error = apply(
-            &backed_manifest(),
-            vec![Action::DropField(DropField {
-                field: Ref::Committed(u64::from(u32::MAX) + 1),
-            })],
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("out of range"),
-            "unexpected message: {error}"
-        );
-    }
-
-    #[test]
     fn test_drop_field_can_name_a_field_minted_in_the_same_operation() {
         // A squash of "add column" and "drop column" lowers to exactly this,
         // and has no committed id to name the field by.
@@ -288,7 +273,7 @@ mod tests {
                     def: added_field("transient"),
                 }),
                 Action::DropField(DropField {
-                    field: Ref::Local(0),
+                    field: FieldRef::Local(0),
                 }),
             ],
         )

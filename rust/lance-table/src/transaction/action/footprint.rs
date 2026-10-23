@@ -16,7 +16,7 @@
 //! Which coordinates an action writes is decided by that action, in its own
 //! module. This module holds the coordinate space and the comparison.
 
-use super::{Action, CompositeOperation, Ref};
+use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::transaction::UpdateMap;
 use std::collections::{HashMap, HashSet};
 
@@ -378,7 +378,7 @@ impl Footprint {
     pub(super) fn write_field_data(
         &mut self,
         fragment: Ref,
-        fields: impl IntoIterator<Item = Ref>,
+        fields: impl IntoIterator<Item = FieldRef>,
     ) {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
@@ -413,7 +413,7 @@ impl Footprint {
     /// Record that this set only holds if `field` has had no values written
     /// since it read it, such as a stricter nullability the apply does not
     /// check the values against.
-    pub(super) fn require_no_values_written(&mut self, field: Ref) {
+    pub(super) fn require_no_values_written(&mut self, field: FieldRef) {
         if let Some(field) = committed_field(field) {
             self.preconditions
                 .push(Precondition::NoValuesWritten(field));
@@ -421,7 +421,7 @@ impl Footprint {
     }
 
     /// A field's entry in the schema.
-    pub(super) fn write_field_definition(&mut self, field: Ref) {
+    pub(super) fn write_field_definition(&mut self, field: FieldRef) {
         if let Some(field) = committed_field(field) {
             self.write(Coordinate::FieldDefinition(field));
         }
@@ -429,7 +429,7 @@ impl Footprint {
 
     /// Record that this set depends on `field` still being defined as it was,
     /// without redefining it: a child added under it, metadata written on it.
-    pub(super) fn require_field_definition(&mut self, field: Ref) {
+    pub(super) fn require_field_definition(&mut self, field: FieldRef) {
         if let Some(field) = committed_field(field) {
             self.require(Coordinate::FieldDefinition(field));
         }
@@ -473,8 +473,8 @@ impl Footprint {
 
 /// A field id a concurrent writer could also be naming, or `None` for a field
 /// this operation mints, which no one else can see yet.
-fn committed_field(reference: Ref) -> Option<i32> {
-    i32::try_from(reference.committed()?).ok()
+fn committed_field(reference: FieldRef) -> Option<i32> {
+    reference.committed()
 }
 
 impl From<&CompositeOperation> for Footprint {
@@ -534,21 +534,22 @@ mod tests {
             fragment,
             fields
                 .iter()
-                .map(|field| Ref::Committed(*field as u64))
+                .map(|field| FieldRef::Committed(*field))
                 .collect(),
         )
     }
 
-    fn add_data_file_for(fragment: Ref, field_ids: Vec<Ref>) -> Action {
+    fn add_data_file_for(fragment: Ref, field_ids: Vec<FieldRef>) -> Action {
         Action::AddDataFile(AddDataFile {
             fragment,
             file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
             field_ids,
             data_change: true,
+            base: None,
         })
     }
 
-    fn add_field(local: u32, name: &str, parent: Option<Ref>) -> Action {
+    fn add_field(local: u32, name: &str, parent: Option<FieldRef>) -> Action {
         Action::AddField(AddField {
             local,
             parent,
@@ -566,7 +567,7 @@ mod tests {
 
     fn set_nullability(field: i32, nullable: bool) -> Action {
         Action::AlterField(AlterField {
-            field: Ref::Committed(field as u64),
+            field: FieldRef::Committed(field),
             name: None,
             nullable: Some(nullable),
         })
@@ -574,7 +575,7 @@ mod tests {
 
     fn tighten_local_field(local: u32) -> Action {
         Action::AlterField(AlterField {
-            field: Ref::Local(local),
+            field: FieldRef::Local(local),
             name: None,
             nullable: Some(false),
         })
@@ -591,13 +592,13 @@ mod tests {
     fn add_column(name: &str, fragment: u64) -> Vec<Action> {
         vec![
             add_field(1, name, None),
-            add_data_file_for(Ref::Committed(fragment), vec![Ref::Local(1)]),
+            add_data_file_for(Ref::Committed(fragment), vec![FieldRef::Local(1)]),
         ]
     }
 
     fn rename_field(field: i32, name: &str) -> Action {
         Action::AlterField(AlterField {
-            field: Ref::Committed(field as u64),
+            field: FieldRef::Committed(field),
             name: Some(name.into()),
             nullable: None,
         })
@@ -605,14 +606,14 @@ mod tests {
 
     fn drop_field(field: i32) -> Action {
         Action::DropField(DropField {
-            field: Ref::Committed(field as u64),
+            field: FieldRef::Committed(field),
         })
     }
 
     fn tombstone(fragment: u64, fields: &[i32]) -> Action {
         Action::TombstoneFieldData(TombstoneFieldData {
             fragment: Ref::Committed(fragment),
-            field_ids: fields.iter().map(|id| Ref::Committed(*id as u64)).collect(),
+            field_ids: fields.iter().map(|id| FieldRef::Committed(*id)).collect(),
             data_change: true,
         })
     }
@@ -629,6 +630,7 @@ mod tests {
             fragment,
             deletion_file: None,
             data_change: true,
+            base: None,
         })
     }
 
@@ -715,17 +717,17 @@ mod tests {
     )]
     #[case::same_field_definition(
         vec![rename_field(1, "a")],
-        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
         true,
     )]
     #[case::different_field_definitions(
-        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, nullable: None })],
-        vec![Action::AlterField(AlterField { field: Ref::Committed(2), name: None, nullable: None })],
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: None })],
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(2), name: None, nullable: None })],
         false,
     )]
     #[case::dropping_a_field_collides_with_altering_it(
         vec![drop_field(1)],
-        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
         true,
     )]
     #[case::dropping_a_field_leaves_other_fields_alone(
@@ -766,8 +768,8 @@ mod tests {
         true,
     )]
     #[case::adding_the_same_name_under_different_parents(
-        vec![add_field(0, "c", Some(Ref::Committed(1)))],
-        vec![add_field(0, "c", Some(Ref::Committed(2)))],
+        vec![add_field(0, "c", Some(FieldRef::Committed(1)))],
+        vec![add_field(0, "c", Some(FieldRef::Committed(2)))],
         true,
     )]
     #[case::bases_with_the_same_name(
@@ -967,26 +969,26 @@ mod tests {
     // A child added under a struct needs the struct to still be there; the
     // struct dropped afterwards takes the child with it, as intended.
     #[case::a_child_landing_after_its_parent_was_dropped(
-        vec![add_field(0, "child", Some(Ref::Committed(1)))],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
         vec![drop_field(1)],
         true,
     )]
     #[case::a_parent_dropped_after_a_child_was_added(
         vec![drop_field(1)],
-        vec![add_field(0, "child", Some(Ref::Committed(1)))],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
         false,
     )]
     // A stale append may write the parent packed, without the new child.
     #[case::an_append_landing_after_a_child_was_added_under_a_committed_parent(
         append(2),
-        vec![add_field(0, "child", Some(Ref::Committed(1)))],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
         true,
     )]
     #[case::an_append_landing_after_a_child_was_added_under_a_local_parent(
         append(2),
         vec![
             add_field(0, "parent", None),
-            add_field(1, "child", Some(Ref::Local(0))),
+            add_field(1, "child", Some(FieldRef::Local(0))),
         ],
         false,
     )]
