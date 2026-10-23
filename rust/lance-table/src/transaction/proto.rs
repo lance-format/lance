@@ -1053,9 +1053,8 @@ mod tests {
         fragment
     }
 
-    /// The composite spelling of minting `count` wide fragments, the way the
-    /// wire format describes it today: `file.fields` unset (-1) per column and
-    /// `field_ids` the authority.
+    /// The composite spelling of minting `count` wide fragments: `file.fields`
+    /// empty and `field_ids` the file's only field list.
     fn mint_wide_fragments(count: usize, data_change: bool) -> Vec<Action> {
         (0..count)
             .flat_map(|index| {
@@ -1071,7 +1070,7 @@ mod tests {
                     }),
                     Action::AddDataFile(AddDataFile {
                         fragment: Ref::Local(token),
-                        file: wide_data_file(index, vec![-1; WIDE_COLUMNS as usize]),
+                        file: wide_data_file(index, Vec::new()),
                         field_ids: (0..WIDE_COLUMNS).map(FieldRef::Committed).collect(),
                         data_change,
                         base: None,
@@ -1097,14 +1096,14 @@ mod tests {
     /// A wide table makes the per-column cost of an action set visible: 100
     /// fragments of 200 columns each, appended, and compacted 10 to 1.
     ///
-    /// The bound is what the format costs today, so it only catches growth.
-    /// Tighten it once the shape of `AddDataFile.file.fields` is settled; the
-    /// -1 placeholders are most of the append's overhead.
+    /// Each bound is what the format costs today plus ~10%, so it only catches
+    /// growth. What remains of the append's overhead is `field_ids`: a
+    /// `FieldRef` per column costs a few bytes more than a packed `int32`.
     #[rstest]
     #[case::append(
         Operation::Append { fragments: (0..100).map(wide_fragment).collect() },
         composite(mint_wide_fragments(100, true)),
-        5.5,
+        2.3,
     )]
     #[case::compaction(
         Operation::Rewrite {
@@ -1126,7 +1125,7 @@ mod tests {
                 .chain(mint_wide_fragments(10, false))
                 .collect(),
         ),
-        0.6,
+        0.23,
     )]
     fn test_a_wide_action_set_stays_within_a_bound_of_the_legacy_size(
         #[case] legacy: Operation,
