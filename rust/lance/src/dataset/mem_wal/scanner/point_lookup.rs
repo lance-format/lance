@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use datafusion::common::ScalarValue;
@@ -636,8 +637,8 @@ impl LsmPointLookupPlanner {
         }
 
         // Fast path: single pk column, every key matches the pk Arrow type, no
-        // system columns in the output. Otherwise the per-key path (correct for
-        // multi-column keys, coercible types, system-column projections).
+        // system columns in the output. Otherwise the batched scan path (correct
+        // for multi-column keys, coercible types, system-column projections).
         let pk_type = self
             .pk_columns
             .first()
@@ -651,9 +652,7 @@ impl LsmPointLookupPlanner {
                 .map(|t| keys.iter().all(|k| &k.data_type() == t))
                 .unwrap_or(false);
         if !fast_eligible {
-            return self
-                .lookup_many_via_per_key(keys, projection, &target)
-                .await;
+            return self.lookup_many_batched(keys, projection, &target).await;
         }
 
         let refs = self.collector.in_memory_refs_newest_first();
@@ -678,10 +677,8 @@ impl LsmPointLookupPlanner {
                     ProbePos::Miss => continue,
                     ProbePos::NoIndex => {
                         // A memtable without the pk BTree can't be batch-probed;
-                        // fall back to the fully-correct per-key path.
-                        return self
-                            .lookup_many_via_per_key(keys, projection, &target)
-                            .await;
+                        // fall back to the batched scan path.
+                        return self.lookup_many_batched(keys, projection, &target).await;
                     }
                 }
             }
@@ -700,10 +697,11 @@ impl LsmPointLookupPlanner {
             )?);
         }
         // Keys absent from every in-memory memtable may live on disk; resolve
-        // those via the plan path. (All-in-memory hit case: `pending` is empty.)
+        // those via the batched scan path. (All-in-memory hit case: `pending` is
+        // empty.)
         if !pending.is_empty() && self.collector.has_on_disk_sources() {
             out.push(
-                self.lookup_many_via_per_key(&pending, projection, &target)
+                self.lookup_many_batched(&pending, projection, &target)
                     .await?,
             );
         }
@@ -715,25 +713,35 @@ impl LsmPointLookupPlanner {
         }
     }
 
-    /// Correctness fallback for [`Self::lookup_many`]: resolve each key with
-    /// [`Self::lookup`] and concatenate.
-    async fn lookup_many_via_per_key(
+    /// [`Self::lookup_many`] for keys its in-memory fast path cannot answer:
+    /// [`Self::lookup_many_keep_tombstone`] without the deleted keys.
+    async fn lookup_many_batched(
         &self,
         keys: &[ScalarValue],
         projection: Option<&[String]>,
         target: &SchemaRef,
     ) -> Result<RecordBatch> {
-        let mut out: Vec<RecordBatch> = Vec::new();
-        for key in keys {
-            if let Some(b) = self.lookup(std::slice::from_ref(key), projection).await? {
-                out.push(b);
-            }
-        }
-        match out.len() {
-            0 => Ok(RecordBatch::new_empty(target.clone())),
-            1 => Ok(out.pop().unwrap()),
-            _ => Ok(arrow_select::concat::concat_batches(target, &out)?),
-        }
+        let keys: Vec<Vec<ScalarValue>> = keys.iter().map(|k| vec![k.clone()]).collect();
+        let carried = self.lookup_many_keep_tombstone(&keys, projection).await?;
+        let deleted = carried
+            .column_by_name(TOMBSTONE)
+            .ok_or_else(|| lance_core::Error::internal("point lookup result missing _tombstone"))?
+            .as_boolean();
+        let live: BooleanArray = deleted.iter().map(|d| Some(d != Some(true))).collect();
+        let live = arrow_select::filter::filter_record_batch(&carried, &live)?;
+        let columns = target
+            .fields()
+            .iter()
+            .map(|f| {
+                live.column_by_name(f.name()).cloned().ok_or_else(|| {
+                    lance_core::Error::internal(format!(
+                        "point lookup result missing column `{}`",
+                        f.name()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(target.clone(), columns)?)
     }
 
     /// Build a composable one-shot `ExecutionPlan` that yields the point-lookup
@@ -3173,6 +3181,40 @@ mod tests {
                 )
             });
             assert_eq!(version_of(&batch, id), expected, "key {id}");
+        }
+    }
+
+    /// `lookup_many` answers the keys its in-memory probe misses with one scan
+    /// per source, leaves out deleted keys, and agrees with [`LsmPointLookupPlanner::lookup`].
+    #[tokio::test]
+    async fn test_lookup_many_resolves_on_disk_keys_once_per_source() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let planner = layered_ts_planner(&base_uri).await;
+        let keys: Vec<ScalarValue> = (1..=10).map(|i| ScalarValue::Int32(Some(i))).collect();
+
+        planner.source_scans.store(0, Ordering::Relaxed);
+        let batch = planner.lookup_many(&keys, None).await.unwrap();
+        assert_eq!(planner.source_scans.load(Ordering::Relaxed), 5);
+        assert_eq!(sorted_ids(&batch), vec![1, 2, 3, 6, 7, 10]);
+
+        for key in &keys {
+            let single = planner
+                .lookup(std::slice::from_ref(key), None)
+                .await
+                .unwrap();
+            let ScalarValue::Int32(Some(id)) = key else {
+                unreachable!()
+            };
+            let many = (0..batch.num_rows())
+                .map(|r| batch.slice(r, 1))
+                .find(|row| id_at(row) == *id);
+            assert_eq!(
+                many.as_ref().map(name_at),
+                single.as_ref().map(name_at),
+                "key {id}"
+            );
         }
     }
 
