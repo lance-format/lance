@@ -7,6 +7,7 @@ use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Coordinate, Footprint, Ref};
 use crate::format::{Fragment, RowIdMeta, pb, pb_actions};
+use crate::rowids::read_row_ids;
 use crate::rowids::version::RowDatasetVersionMeta;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
@@ -79,10 +80,22 @@ impl AddFragment {
     /// one writer's alone, but nothing in the format enforces that, so two
     /// operations handed the same range would otherwise each add a fragment at
     /// the same id and the second commit would silently win.
+    ///
+    /// Row ids the fragment arrives carrying are claimed as an exact set, so
+    /// two operations spending one reservation collide. A sequence that does
+    /// not decode takes the table exclusively: apply rejects it anyway, and a
+    /// footprint must not under-report. A spilled sequence lives in a file
+    /// this cannot read, and goes unclaimed.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.add_rows();
         if let Some(id) = self.id.committed() {
             footprint.write(Coordinate::FragmentExistence(id));
+        }
+        if let Some(RowIdMeta::Inline(data)) = &self.row_id_meta {
+            match read_row_ids(data) {
+                Ok(sequence) => footprint.supply_row_ids(&sequence.to_treemap()),
+                Err(_) => footprint.take_exclusive(),
+            }
         }
     }
 }

@@ -38,12 +38,13 @@ impl ReserveRowIds {
     }
 
     /// Nothing. Ids come off a monotonic counter, so two operations reserving
-    /// at once get disjoint ranges rather than colliding.
+    /// at once get disjoint ranges rather than colliding. Spending them is
+    /// what claims them: [`AddFragment`](super::AddFragment) claims the exact
+    /// row ids it carries, so two writers spending one reservation collide.
     ///
-    /// Unlike a fragment id, a reserved row id is never a coordinate: the
-    /// sequence a fragment carries is opaque to the footprint, so two writers
-    /// spending the same reservation are not caught. A reservation has to be
-    /// spent by the writer that made it, and only once.
+    /// Not caught: a writer supplying ids that a commit before its read
+    /// version already spent. Nothing records which reserved ids are still
+    /// outstanding (see <https://github.com/lance-format/lance/issues/10253>).
     pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
 }
 
@@ -238,7 +239,7 @@ mod tests {
     #[case::disjoint(vec![supplied(0, (10..15).collect()), supplied(1, (15..20).collect())], None)]
     #[case::overlapping(
         vec![supplied(0, (10..15).collect()), supplied(1, (14..20).collect())],
-        Some("carries row id 14, which fragment 2 added in this operation also carries")
+        Some("carries row id 14, which fragment 2 also added in this operation carries")
     )]
     fn test_supplied_row_ids_are_disjoint_within_an_operation(
         #[case] actions: Vec<Action>,
