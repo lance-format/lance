@@ -9,8 +9,8 @@ use super::{Coordinate, Footprint, Ref};
 use crate::format::{Fragment, RowIdMeta, pb, pb_actions};
 use crate::rowids::read_row_ids;
 use crate::rowids::version::RowDatasetVersionMeta;
-use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, Result};
 
 /// Add a new, empty fragment.
 ///
@@ -54,12 +54,17 @@ pub struct AddFragment {
     /// off the fragments it merged, since moving a row does not update it.
     pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
-    /// `false` marks a pure rearrangement, e.g. a compaction rewrite.
+    /// `false` marks a pure rearrangement, e.g. a compaction rewrite. On a
+    /// dataset with stable row ids such a fragment must carry all three
+    /// lineage sequences, since its rows keep their identity.
     pub data_change: bool,
 }
 
 impl AddFragment {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        if !self.data_change && state.uses_stable_row_ids() {
+            self.check_carries_lineage()?;
+        }
         let id = state.add_fragment_id(self.id)?;
         state.push_fragment(Fragment {
             id,
@@ -72,6 +77,37 @@ impl AddFragment {
             created_at_version_meta: self.created_at_version_meta.clone(),
         });
         Ok(())
+    }
+
+    /// A fragment that only moves rows keeps their identity, so it has to
+    /// carry every lineage sequence: apply stamps whatever is left out as if
+    /// the rows were new, with fresh row ids and this commit's version.
+    fn check_carries_lineage(&self) -> Result<()> {
+        let missing = [
+            (self.row_id_meta.is_none(), "row ids"),
+            (
+                self.last_updated_at_version_meta.is_none(),
+                "last_updated_at versions",
+            ),
+            (
+                self.created_at_version_meta.is_none(),
+                "created_at versions",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(is_missing, sequence)| is_missing.then_some(sequence))
+        .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Error::invalid_input(format!(
+            "AddFragment {:?} has data_change = false on a dataset with stable row ids but does \
+             not carry its {}; a fragment that only moves rows must carry their row id \
+             sequence and both row version sequences, inline or as a column, or be marked as \
+             a data change",
+            self.id,
+            missing.join(", ")
+        )))
     }
 
     pub(super) fn is_data_change(&self) -> bool {

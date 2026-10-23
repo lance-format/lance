@@ -330,6 +330,10 @@ impl<'a> ApplyState<'a> {
         Ok((manifest, indices))
     }
 
+    pub(super) fn uses_stable_row_ids(&self) -> bool {
+        self.current_manifest.uses_stable_row_ids()
+    }
+
     pub(super) fn schema(&self) -> &Schema {
         &self.schema
     }
