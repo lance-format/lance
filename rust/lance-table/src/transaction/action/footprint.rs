@@ -340,6 +340,9 @@ pub struct Footprint {
     /// The unique-key preconditions this set carries, one per
     /// [`AssertUniqueKeys`](super::AssertUniqueKeys).
     key_assertions: Vec<KeyAssertion>,
+    /// The cells this set read and needs unchanged, one per
+    /// [`AssertCellsUnchanged`](super::AssertCellsUnchanged).
+    cell_assertions: Vec<CellAssertion>,
     /// What this set writes into logical indices. A segment's uuid is a
     /// coordinate, but the thing two writers can collide over is the index the
     /// segment joins, which is not a set of ids -- see [`IndexClaim`].
@@ -351,6 +354,42 @@ pub struct Footprint {
 struct KeyAssertion {
     key_fields: Vec<FieldRef>,
     filter: KeyExistenceFilter,
+}
+
+/// Cells an action set read and needs unchanged: the declared fields in the
+/// selected fragments. Fragment granularity, which over-rejects a selection of
+/// some of a fragment's rows; refining it against overlay coverage is
+/// follow-up work.
+#[derive(Debug, Clone, PartialEq)]
+struct CellAssertion {
+    fields: HashSet<i32>,
+    fragments: HashSet<u64>,
+}
+
+impl CellAssertion {
+    /// Whether `committed` may have changed one of these cells: written the
+    /// data of a declared field in a selected fragment, wholly or by overlay;
+    /// redefined or dropped a declared field; or removed a selected fragment.
+    /// A deletion does not count, since a deleted row's value is invisible.
+    fn changed_by(&self, committed: &Footprint) -> bool {
+        let wrote_a_cell = committed
+            .claims
+            .iter()
+            .filter(|(_, mode)| **mode >= Mode::WritesPart)
+            .any(|(coordinate, _)| match coordinate {
+                Coordinate::FieldData { fragment, field } => {
+                    self.fragments.contains(fragment) && self.fields.contains(field)
+                }
+                Coordinate::FieldDefinition(field) => self.fields.contains(field),
+                Coordinate::FragmentExistence(fragment) => self.fragments.contains(fragment),
+                _ => false,
+            });
+        let removed_a_fragment = committed.regions.keys().any(|region| match region {
+            Region::Fragment(fragment) => self.fragments.contains(fragment),
+            Region::Map(_) => false,
+        });
+        wrote_a_cell || removed_a_fragment
+    }
 }
 
 /// What an action set writes into one logical index.
@@ -437,6 +476,15 @@ impl Footprint {
             return true;
         }
         if self.claims_conflict_with(committed) || self.preconditions_violated_by(committed) {
+            return true;
+        }
+        // One-way, like the preconditions: a set that landed first was valid
+        // when it landed, whatever it read.
+        if self
+            .cell_assertions
+            .iter()
+            .any(|assertion| assertion.changed_by(committed))
+        {
             return true;
         }
         if !self
@@ -871,6 +919,16 @@ impl Footprint {
         }
         self.key_assertions
             .push(KeyAssertion { key_fields, filter });
+    }
+
+    /// Record that this set read `fields` in `fragments` and needs those cells
+    /// unchanged by any set that lands after it read.
+    pub(super) fn assert_cells_unchanged(&mut self, fields: HashSet<i32>, fragments: HashSet<u64>) {
+        if fields.is_empty() || fragments.is_empty() {
+            return;
+        }
+        self.cell_assertions
+            .push(CellAssertion { fields, fragments });
     }
 
     /// Record that this set removes `fragment` outright: its existence, and

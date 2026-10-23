@@ -6,6 +6,7 @@
 use super::apply::ApplyState;
 use super::{FieldRef, Footprint};
 use crate::format::pb_actions;
+use arrow_schema::DataType;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
@@ -66,7 +67,33 @@ impl AssertCellsUnchanged {
     /// on, so an assertion over something that is not there fails rather than
     /// silently guarding nothing.
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let _ = state;
+        for field in &self.fields {
+            if let FieldRef::Local(token) = field {
+                return Err(Error::invalid_input(format!(
+                    "AssertCellsUnchanged names a field minted in the same operation (local \
+                     token {token}), which has no value at the version read"
+                )));
+            }
+            let field_id = state.resolve_schema_field(*field, "AssertCellsUnchanged")?;
+            let field = state.schema().field_by_id(field_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "AssertCellsUnchanged names field {field_id}, which is not in the schema"
+                ))
+            })?;
+            let is_unpacked_struct =
+                matches!(field.data_type(), DataType::Struct(_)) && !field.is_packed_struct();
+            if field.parent_id >= 0 || is_unpacked_struct {
+                return Err(Error::invalid_input(format!(
+                    "AssertCellsUnchanged names field {field_id} ('{}'), which is a struct or \
+                     inside one; only top-level columns and packed structs can be asserted, \
+                     because conflict detection cannot relate a struct to its children",
+                    field.name
+                )));
+            }
+        }
+        for selection in &self.rows {
+            state.fragment_mut(u64::from(selection.fragment_id), "AssertCellsUnchanged")?;
+        }
         Ok(())
     }
 
@@ -74,7 +101,21 @@ impl AssertCellsUnchanged {
         false
     }
 
-    pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
+    /// A precondition on what a concurrent set wrote, at fragment granularity:
+    /// the declared fields in the selected fragments. A minted field names
+    /// nothing a concurrent set could write, and apply rejects it anyway.
+    pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        footprint.assert_cells_unchanged(
+            self.fields
+                .iter()
+                .filter_map(|field| field.committed())
+                .collect(),
+            self.rows
+                .iter()
+                .map(|selection| u64::from(selection.fragment_id))
+                .collect(),
+        );
+    }
 }
 
 impl DeepSizeOf for AssertCellsUnchanged {
@@ -329,8 +370,8 @@ mod tests {
     #[case::no_cells(read(&[], &[]), None)]
     #[case::a_missing_field(read(&[9], &[0]), Some("names field 9, which is not in the schema"))]
     #[case::a_missing_fragment(read(&[0], &[7]), Some("fragment 7, which does not exist"))]
-    #[case::an_unpacked_struct(read(&[1], &[0]), Some("field 1 ('s') is a struct or inside one"))]
-    #[case::a_struct_child(read(&[2], &[0]), Some("field 2 ('x') is a struct or inside one"))]
+    #[case::an_unpacked_struct(read(&[1], &[0]), Some("names field 1 ('s'), which is a struct or inside one"))]
+    #[case::a_struct_child(read(&[2], &[0]), Some("names field 2 ('x'), which is a struct or inside one"))]
     #[case::a_reserved_id(read(&[-3], &[0]), Some("names reserved field id -3"))]
     #[case::a_field_minted_in_the_operation(
         Action::AssertCellsUnchanged(AssertCellsUnchanged {
