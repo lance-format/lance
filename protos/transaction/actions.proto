@@ -7,6 +7,7 @@ import "file.proto";
 import "table.proto";
 import "transaction/common.proto";
 import "google/protobuf/any.proto";
+import "google/protobuf/empty.proto";
 
 package lance.transaction;
 
@@ -46,7 +47,8 @@ package lance.transaction;
  *    optional, so concurrent alters of different facets commute too.
  *
  * 4. Assertions carry only preconditions no post-image can reconstruct, e.g.
- *    the keys a merge-insert inserted (`AssertUniqueKeys`).
+ *    the keys a merge-insert inserted (`AssertUniqueKeys`) or the cells an
+ *    update read (`AssertCellsUnchanged`).
  *
  * 5. `data_change` is per action. `false` asserts the action changes no
  *    row's values: the rows it adds, removes, or rebinds are the same
@@ -163,6 +165,7 @@ message Action {
     ReserveRowIds reserve_row_ids = 20;
     // -- Assertions (preconditions, not deltas) --
     AssertUniqueKeys assert_unique_keys = 19;
+    AssertCellsUnchanged assert_cells_unchanged = 21;
   }
 }
 
@@ -633,3 +636,43 @@ message AssertUniqueKeys {
   KeyExistenceFilter filter = 2;
 }
 
+/*
+ * An assertion (precondition), not a delta: the declared cells -- the cross
+ * product of `fields` and `rows` -- hold the values they held at the
+ * operation's read version. Conflict detection otherwise compares only what
+ * two operations write (snapshot isolation), so a writer whose values depend
+ * on what it read (an update computing `a = b`) must declare the read here.
+ *
+ * "Unchanged" follows the cell preconditions proposed for the legacy
+ * transaction (#9121): a cell counts as changed if its field was dropped or changed type or
+ * nullability, its fragment was removed, the data file carrying its field was
+ * replaced, or an overlay touching it was added. A change to the deletion
+ * vector does not count. Implementations may over-reject (e.g. at fragment
+ * granularity) but must never under-reject.
+ */
+message AssertCellsUnchanged {
+  /*
+   * The fields read. Committed schema field ids only: a field minted in the
+   * same operation has no prior value.
+   */
+  repeated FieldRef fields = 1;
+  // The rows read, one entry per fragment.
+  repeated RowSelection rows = 2;
+}
+
+/*
+ * A per-fragment selection of row offsets.
+ *
+ * Mirrors the legacy transaction's `Precondition.RowSelection` so the two can
+ * be unified.
+ */
+message RowSelection {
+  // The committed fragment. Must not repeat within one list.
+  uint32 fragment_id = 1;
+  oneof coverage {
+    // The entire fragment.
+    google.protobuf.Empty full = 2;
+    // The selected row offsets, as a portable-serialized Roaring bitmap.
+    bytes bitmap = 3;
+  }
+}
