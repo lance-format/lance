@@ -180,7 +180,9 @@ mod tests {
     use crate::transaction::action::test_support::{
         apply_with_indices, backed_manifest, footprint,
     };
-    use crate::transaction::action::{Action, AddFragment, AddIndexSegment, RemoveFragment};
+    use crate::transaction::action::{
+        Action, AddFragment, AddIndexSegment, FieldRef, RemoveFragment,
+    };
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
     use std::sync::Arc;
@@ -367,7 +369,7 @@ mod tests {
         Action::AddIndexSegment(AddIndexSegment {
             uuid: Uuid::new_v4(),
             name: name.into(),
-            fields: vec![Ref::Committed(0)],
+            fields: vec![FieldRef::Committed(0)],
             covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,

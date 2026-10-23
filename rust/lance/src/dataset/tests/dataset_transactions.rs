@@ -3971,7 +3971,7 @@ mod composite {
         AddIndexSegment {
             uuid: Uuid::new_v4(),
             name: name.into(),
-            fields: vec![Ref::Committed(0)],
+            fields: vec![FieldRef::Committed(0)],
             covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
@@ -4018,8 +4018,9 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
                 // The index covers the fragment this same commit minted, which
                 // has no id until the commit lands.
@@ -4069,13 +4070,14 @@ mod composite {
             actions.push(Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(fragment.id),
                 file: existing_data_file(&dataset, index),
-                field_ids: vec![Ref::Local(0)],
+                field_ids: vec![FieldRef::Local(0)],
                 data_change: true,
+                base: None,
             }));
             covered.push(Ref::Committed(fragment.id));
         }
         actions.push(Action::AddIndexSegment(AddIndexSegment {
-            fields: vec![Ref::Local(0)],
+            fields: vec![FieldRef::Local(0)],
             ..index_segment("by_b", covered)
         }));
         let dataset = commit(dataset, actions).await;
@@ -4213,14 +4215,15 @@ mod composite {
         vec![
             Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(0),
                 file,
-                field_ids: vec![Ref::Committed(0)],
+                field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
+                base: None,
             }),
         ]
     }
@@ -4343,7 +4346,7 @@ mod composite {
             fields: metadata
                 .fields
                 .into_iter()
-                .map(|id| Ref::Committed(id as u64))
+                .map(FieldRef::Committed)
                 .collect(),
             covering_fields: Vec::new(),
             index_details: metadata.index_details,
@@ -4427,14 +4430,15 @@ mod composite {
             vec![
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(1),
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(1),
                     file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
@@ -4507,8 +4511,9 @@ mod composite {
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
                     file,
-                    field_ids: vec![Ref::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
+                    base: None,
                 }),
             ],
         )
