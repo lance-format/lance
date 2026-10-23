@@ -28,6 +28,7 @@ use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result, is_system_column};
+use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 
 /// The field id written into a data file's field list once the file no longer
@@ -656,19 +657,35 @@ impl<'a> ApplyState<'a> {
     /// [`ReserveRowIds`](super::ReserveRowIds), which moved the watermark past
     /// them. An id at or above the watermark was never reserved, and the next
     /// append would hand it out a second time.
+    ///
+    /// Two fragments of this operation carrying the same id are rejected too:
+    /// a row id names one row.
     fn validate_supplied_row_ids(&self, next_row_id: u64) -> Result<()> {
+        let mut supplied: Vec<(u64, RoaringTreemap)> = Vec::new();
         for fragment in &self.fragments {
             if !self.new_fragments.contains(&fragment.id) {
                 continue;
             }
-            // An external sequence lives in a file, which this synchronous path
+            // A spilled sequence lives in a file, which this synchronous path
             // has no way to read; it goes unchecked.
             let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
                 continue;
             };
-            let Some(range) = read_row_ids(data)?.row_id_range() else {
+            let sequence = read_row_ids(data)?;
+            let row_ids = sequence.to_treemap();
+            for (other, other_row_ids) in &supplied {
+                if let Some(shared) = (&row_ids & other_row_ids).min() {
+                    return Err(Error::invalid_input(format!(
+                        "fragment {} carries row id {shared}, which fragment {other} also added in \
+                         this operation carries; a row id names one row",
+                        fragment.id
+                    )));
+                }
+            }
+            let Some(range) = sequence.row_id_range() else {
                 continue;
             };
+            supplied.push((fragment.id, row_ids));
             if *range.end() >= next_row_id {
                 return Err(Error::invalid_input(format!(
                     "fragment {} is added carrying row id {}, which no commit has reserved: \
