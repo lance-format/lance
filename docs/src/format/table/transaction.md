@@ -693,6 +693,18 @@ the same values before and after, as when compaction moves rows or a column
 file is re-encoded. Change-data-capture readers emit rows only from
 `data_change = true` actions, and one operation may mix both.
 
+### Isolation
+
+Two `CompositeOperation`s conflict when they write overlapping parts of the
+manifest, or when one breaks a precondition the other asserts. Without
+assertions this is snapshot isolation: concurrent writers that each read a
+value the other overwrites can both commit. A writer whose values depend on
+what it read must declare the read with `AssertCellsUnchanged`. For example,
+`UPDATE t SET a = b` and `UPDATE t SET b = a` from the same snapshot write
+disjoint columns, so without assertions both commit and the columns end up
+swapped, which neither serial order produces (either leaves them equal); each
+declaring the column it read makes the second commit conflict.
+
 ### Compatibility
 
 A `CompositeOperation` produces an ordinary manifest, so a reader that scans a
