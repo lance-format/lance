@@ -138,7 +138,7 @@ impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
 mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{Action, TombstoneFieldData};
+    use crate::transaction::action::{Action, AddFragment, TombstoneFieldData};
     use crate::transaction::test_support::sample_manifest;
     use lance_file::version::ConcreteFileVersion;
 
@@ -158,6 +158,43 @@ mod tests {
         .unwrap_err();
         assert!(
             error.to_string().contains("local fragment token 3"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// `field_ids` is the only field list on the wire; a second one in the
+    /// embedded file could only disagree with it.
+    #[test]
+    fn test_add_data_file_rejects_a_file_carrying_its_own_field_ids() {
+        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
+        file.fields = vec![0].into();
+        file.column_indices = vec![0].into();
+
+        let error = apply(
+            &sample_manifest(),
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("file.fields must be empty"),
             "unexpected error: {error}"
         );
     }
