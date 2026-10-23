@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 /// Remove an index segment.
 ///
-/// Dropping a whole logical index is one of these per segment carrying its
-/// name, since the format knows only segments. Removing the last segment of an
-/// index is what makes the index disappear.
+/// For segment-level maintenance, such as an optimize replacing segments.
+/// Dropping a whole logical index is a [`DropIndex`](super::DropIndex), which
+/// also removes any segment a concurrent writer added under the name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoveIndexSegment {
     /// The segment to remove.

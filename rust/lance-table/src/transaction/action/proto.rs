@@ -182,7 +182,7 @@ mod tests {
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, ConfigUpdate, DropField, FieldMetadataUpdate, RemoveFragment,
+        AlterField, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate, RemoveFragment,
         RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
         TombstoneFieldData,
     };
@@ -280,6 +280,9 @@ mod tests {
                 uuid: Uuid::from_u128(8),
                 name: "by_a".into(),
                 data_change: true,
+            }),
+            Action::DropIndex(DropIndex {
+                name: "by_c".into(),
             }),
             Action::AdjustIndexCoverage(AdjustIndexCoverage {
                 uuid: Uuid::from_u128(9),
