@@ -4,7 +4,7 @@
 //! Fixtures shared by the per-action test modules.
 
 use super::{Action, CompositeOperation, Footprint, UserStep};
-use crate::format::{DataFile, Fragment, IndexMetadata, Manifest};
+use crate::format::{BasePath, DataFile, Fragment, IndexMetadata, Manifest};
 use crate::transaction::test_support::{default_build_config, sample_manifest};
 use crate::transaction::{Operation, Transaction};
 use arrow_schema::{DataType, Field as ArrowField};
@@ -61,4 +61,24 @@ pub(super) fn backed_manifest() -> Manifest {
     ));
     manifest.fragments = Arc::new(vec![fragment]);
     manifest
+}
+
+/// `backed_manifest` with one base path besides the dataset's own, at id 1,
+/// so an action can name a committed base. A base minted on top of it gets
+/// id 2.
+pub(super) fn manifest_with_base() -> Manifest {
+    let mut manifest = backed_manifest();
+    manifest.base_paths.insert(
+        1,
+        BasePath::new(1, "s3://bucket/other".into(), Some("other".into()), false),
+    );
+    manifest
+}
+
+/// An action minting base token 0 at a location no fixture uses.
+pub(super) fn mint_base() -> Action {
+    Action::AddBase(super::AddBase {
+        local: 0,
+        base: BasePath::new(0, "s3://bucket/minted".into(), None, false),
+    })
 }

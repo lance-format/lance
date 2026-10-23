@@ -88,8 +88,11 @@ impl TryFrom<pb_actions::SetDeletionFile> for SetDeletionFile {
 mod tests {
     use super::*;
     use crate::format::DeletionFileType;
-    use crate::transaction::action::Action;
-    use crate::transaction::action::test_support::{apply, backed_manifest};
+    use crate::transaction::action::test_support::{
+        apply, backed_manifest, manifest_with_base, mint_base,
+    };
+    use crate::transaction::action::{Action, Ref};
+    use rstest::rstest;
 
     #[test]
     fn test_set_deletion_file_sets_and_clears() {
@@ -141,5 +144,81 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    }
+
+    fn deletion_file(base_id: Option<u32>) -> DeletionFile {
+        DeletionFile {
+            read_version: 1,
+            id: 3,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(2),
+            base_id,
+        }
+    }
+
+    /// The same contract as [`AddDataFile`](super::super::AddDataFile)'s: `base`
+    /// says where the file lives and apply stamps the embedded `base_id`.
+    #[rstest]
+    #[case::own_directory(Some(deletion_file(None)), None, false, Ok(None))]
+    #[case::committed_base(Some(deletion_file(None)), Some(Ref::Committed(1)), false, Ok(Some(1)))]
+    #[case::base_minted_earlier(Some(deletion_file(None)), Some(Ref::Local(0)), true, Ok(Some(2)))]
+    #[case::embedded_base_id(
+        Some(deletion_file(Some(1))),
+        None,
+        false,
+        Err("deletion_file.base_id must be unset")
+    )]
+    #[case::committed_base_the_dataset_lacks(
+        Some(deletion_file(None)),
+        Some(Ref::Committed(7)),
+        false,
+        Err("base id 7 in an action names no base path of the dataset")
+    )]
+    #[case::base_not_minted(
+        Some(deletion_file(None)),
+        Some(Ref::Local(0)),
+        false,
+        Err("local base token 0, which no earlier action in this operation minted")
+    )]
+    #[case::base_for_a_cleared_deletion_file(
+        None,
+        Some(Ref::Committed(1)),
+        false,
+        Err("names base")
+    )]
+    fn test_set_deletion_file_stamps_its_base(
+        #[case] file: Option<DeletionFile>,
+        #[case] base: Option<Ref>,
+        #[case] mint_base_first: bool,
+        #[case] expected: std::result::Result<Option<u32>, &str>,
+    ) {
+        let mut actions = Vec::new();
+        if mint_base_first {
+            actions.push(mint_base());
+        }
+        actions.push(Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: file,
+            data_change: true,
+            base,
+        }));
+
+        let result = apply(&manifest_with_base(), actions);
+
+        match expected {
+            Ok(base_id) => {
+                let next = result.unwrap();
+                let stamped = next.fragments[0].deletion_file.as_ref().unwrap();
+                assert_eq!(stamped.base_id, base_id);
+            }
+            Err(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(
+                    error.to_string().contains(message),
+                    "unexpected error: {error}"
+                );
+            }
+        }
     }
 }
