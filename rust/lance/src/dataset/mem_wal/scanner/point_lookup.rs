@@ -14,12 +14,12 @@ use datafusion::common::ScalarValue;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::expressions::{Column, Literal, NotExpr};
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
 use lance_arrow::RecordBatchExt;
@@ -981,7 +981,10 @@ impl LsmPointLookupPlanner {
         // Output carries `_tombstone` (canonical + the marker) so it survives
         // the union/coalesce to the post-coalesce filter; base / legacy sources
         // that lack the column get a synthesized `false`.
-        project_to_carry(scan, &target, &self.pk_columns)
+        let plan = project_to_carry(scan, &target, &self.pk_columns)?;
+        // Lookups read partition 0 and take a key's first row as its newest.
+        debug_assert_eq!(plan.output_partitioning().partition_count(), 1);
+        Ok(plan)
     }
 
     /// Create an empty execution plan with the canonical output schema.
@@ -3053,6 +3056,7 @@ mod tests {
     /// | 7 | | g1 | | | | g1 |
     /// | 8 | | | | | tombstone | tombstone |
     /// | 9 | | | | | | absent |
+    /// | 10 | | | g2b then g2a | | | g2b |
     async fn layered_ts_planner(base_uri: &str) -> LsmPointLookupPlanner {
         use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
         let base_schema = create_pk_schema();
@@ -3073,7 +3077,13 @@ mod tests {
         .await;
         create_dataset(
             &gen_uri(2),
-            vec![ts_real(&ts, &[5], "g2"), ts_tomb(&ts, &[4])],
+            // A flush writes newest first and keeps every version.
+            vec![
+                ts_real(&ts, &[10], "g2b"),
+                ts_real(&ts, &[10], "g2a"),
+                ts_real(&ts, &[5], "g2"),
+                ts_tomb(&ts, &[4]),
+            ],
         )
         .await;
         let shard = ShardSnapshot::new(shard_id)
@@ -3113,7 +3123,7 @@ mod tests {
         let planner = layered_ts_planner(&base_uri).await;
 
         // Key 2 twice: a repeated key comes back once.
-        let keys = int32_keys([1, 2, 3, 4, 5, 6, 7, 8, 9, 2]);
+        let keys = int32_keys([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2]);
         let batch = planner
             .lookup_many_keep_tombstone(&keys, None)
             .await
@@ -3142,10 +3152,15 @@ mod tests {
             "tombstone of a key held nowhere else"
         );
         assert_eq!(version_of(&batch, 9), None, "absent key omitted");
-        assert_eq!(batch.num_rows(), 8);
+        assert_eq!(
+            version_of(&batch, 10),
+            live("g2b_10"),
+            "newest within an SSTable"
+        );
+        assert_eq!(batch.num_rows(), 9);
 
         // Each key agrees with the per-key plan.
-        for id in 1..=9 {
+        for id in 1..=10 {
             let single = planner
                 .lookup_keep_tombstone(&[ScalarValue::Int32(Some(id))], None)
                 .await
@@ -3177,7 +3192,7 @@ mod tests {
                 .lookup_many_keep_tombstone(&int32_keys(1..=n), None)
                 .await
                 .unwrap();
-            assert_eq!(batch.num_rows(), 8);
+            assert_eq!(batch.num_rows(), 9);
             assert_eq!(
                 planner.source_scans.load(Ordering::Relaxed),
                 sources,
