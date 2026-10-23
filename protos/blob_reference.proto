@@ -51,6 +51,11 @@ message ObjectLocator {
    */
   optional uint64 length = 5;
   Origin origin = 6;
+  /* Registered base in the source manifest, including inherited data-file bases.
+   * Absent selects primary storage for Lance objects or the absolute URI's
+   * storage binding for external objects. Present zero is a valid registered ID.
+   */
+  optional uint32 base_id = 7;
 
   enum Origin {
     UNSPECIFIED = 0;
