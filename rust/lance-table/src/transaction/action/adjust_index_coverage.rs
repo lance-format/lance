@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{non_empty, required};
-use super::{Coordinate, FieldRef, Footprint, Ref};
+use super::{AddIndexSegment, Coordinate, FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
@@ -73,10 +73,30 @@ impl AdjustIndexCoverage {
         let removed = self
             .remove_fragments
             .iter()
-            .map(|fragment| self.coverage_id(*fragment))
+            .map(|fragment| self.coverage_id(state.resolve_fragment(Ref::Committed(*fragment))?))
             .collect::<Result<Vec<_>>>()?;
+        let resolve = |fields: &[FieldRef]| {
+            fields
+                .iter()
+                .map(|field| state.resolve_schema_field(*field, "AdjustIndexCoverage"))
+                .collect::<Result<Vec<_>>>()
+        };
+        let (fields, covering_fields) = AddIndexSegment::lower_covering(
+            &self.name,
+            resolve(&self.fields)?,
+            resolve(&self.covering_fields)?,
+        )?;
 
         let segment = state.index_segment_mut(self.uuid, &self.name)?;
+        if segment.fields != fields || segment.covering_fields != covering_fields {
+            return Err(Error::invalid_input(format!(
+                "AdjustIndexCoverage for segment {} of index '{}' declares fields {fields:?} \
+                 (carried {covering_fields:?}), which does not match the segment's fields {:?} \
+                 (carried {:?}); declare the segment's keyed and carried fields as an \
+                 AddIndexSegment would",
+                self.uuid, self.name, segment.fields, segment.covering_fields
+            )));
+        }
         let Some(bitmap) = segment.fragment_bitmap.as_mut() else {
             return Err(Error::invalid_input(format!(
                 "index segment {} records no fragment coverage, so there is nothing to adjust; \
@@ -116,26 +136,27 @@ impl AdjustIndexCoverage {
     /// fragments are also required to still be there: coverage of a fragment a
     /// concurrent set removed describes rows the dataset no longer has.
     ///
+    /// Each committed fragment brought in also requires the data of every
+    /// keyed and carried field, as a new segment over it would: the widening
+    /// holds only while those columns are the ones the remap was planned
+    /// against. A rewrite committing first conflicts; one committing second
+    /// prunes the fragment from the coverage as it applies. Overlays need no
+    /// claim, since a read masks an overlay newer than the segment's
+    /// `dataset_version`.
+    ///
     /// Removals claim nothing: coverage the index gives up cannot collide with
     /// coverage another writer takes on.
-    ///
-    /// What this cannot require is the fragments' *data*. The action names no
-    /// fields -- the segment already has them -- so the footprint cannot say
-    /// which columns the widened coverage depends on, and a concurrent rewrite
-    /// of an indexed column in one of these fragments is not caught here. The
-    /// caller widening coverage over committed fragments is answerable for
-    /// having indexed them as they stand; the safe shape is to widen in the
-    /// same operation that writes the fragments, where they are minted and no
-    /// concurrent writer can touch them.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write(Coordinate::IndexSegment(self.uuid));
         footprint.extend_index_coverage(self.name.clone(), self.add_fragments.iter().copied());
+        let dependencies = self.fields.iter().chain(self.covering_fields.iter());
         for fragment in self
             .add_fragments
             .iter()
             .filter_map(|fragment| fragment.committed())
         {
             footprint.require_fragment(fragment);
+            footprint.require_field_data(fragment, dependencies.clone().copied());
         }
     }
 }
