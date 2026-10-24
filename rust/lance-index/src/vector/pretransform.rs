@@ -129,6 +129,50 @@ impl VectorIndex for PreTransformIndex {
             .await
     }
 
+    async fn partition_row_ids_range(
+        &self,
+        partition_id: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<arrow_array::UInt64Array> {
+        self.inner.partition_row_ids_range(partition_id, rows).await
+    }
+
+    async fn range_search_in_partition_range(
+        &self,
+        partition_id: usize,
+        rows: std::ops::Range<usize>,
+        query: &Query,
+        threshold: f32,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let query = self.transformed_query(query)?;
+        self.inner
+            .range_search_in_partition_range(
+                partition_id,
+                rows,
+                &query,
+                threshold,
+                pre_filter,
+                metrics,
+            )
+            .await
+    }
+
+    async fn range_search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        threshold: f32,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let query = self.transformed_query(query)?;
+        self.inner
+            .range_search_in_partition(partition_id, &query, threshold, pre_filter, metrics)
+            .await
+    }
+
     async fn prepare_partition_search(
         &self,
         partition_id: usize,

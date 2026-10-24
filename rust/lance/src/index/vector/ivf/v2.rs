@@ -65,9 +65,9 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    IndexFileKey, OriginLatencyClass, QueryResidual, QueryScratch, QueryScratchCapacity,
-    QueryScratchPool, RabitRawQueryContext, ResidentAttach, ResidentColumns,
-    ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
+    DistCalculator, DistanceCalculatorOptions, IndexFileKey, OriginLatencyClass, QueryResidual,
+    QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentAttach,
+    ResidentColumns, ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
     origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
     resident_store_fits, shares_resident_store,
 };
@@ -1062,6 +1062,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
 
     fn codec() -> Option<CacheCodec> {
         super::partition_serde::partition_entry_codec::<S, Q>()
+    }
+}
+
+#[derive(Debug)]
+struct IVFRangeStorageKey<Q: Quantization> {
+    partition: usize,
+    rows: Range<usize>,
+    quantization: PhantomData<Q>,
+}
+impl<Q: Quantization + 'static> CacheKey for IVFRangeStorageKey<Q> {
+    type ValueType = Q::Storage;
+    fn key(&self) -> Cow<'_, str> {
+        format!(
+            "ivf-radius-{}-{}-{}",
+            self.partition, self.rows.start, self.rows.end
+        )
+        .into()
+    }
+    fn type_name() -> &'static str {
+        "IVFRadiusStorageRange"
+    }
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-radius-storage-range", 1)
+    }
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(std::any::type_name::<Q>());
+        builder.write_u64(self.partition as u64);
+        builder.write_u64(self.rows.start as u64);
+        builder.write_u64(self.rows.end as u64);
     }
 }
 
@@ -2830,6 +2859,119 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         local_metrics.dump_into(metrics);
 
+        Ok(batch)
+    }
+
+    async fn range_search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        threshold: f32,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        self.range_search_in_partition_range(
+            partition_id,
+            0..self.partition_size(partition_id),
+            query,
+            threshold,
+            pre_filter,
+            metrics,
+        )
+        .await
+    }
+
+    async fn partition_row_ids_range(
+        &self,
+        partition_id: usize,
+        rows: Range<usize>,
+    ) -> Result<UInt64Array> {
+        self.storage
+            .read_partition_row_ids_range(partition_id, rows)
+            .await
+    }
+
+    async fn range_search_in_partition_range(
+        &self,
+        partition_id: usize,
+        rows: Range<usize>,
+        query: &Query,
+        threshold: f32,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        if !threshold.is_finite() {
+            return Err(Error::invalid_input("radius must be finite"));
+        }
+        let key = IVFRangeStorageKey::<Q> {
+            partition: partition_id,
+            rows: rows.clone(),
+            quantization: PhantomData,
+        };
+        let storage = self
+            .index_cache
+            .get_or_insert_with_key(key, || async {
+                self.storage.load_partition_range(partition_id, rows).await
+            })
+            .await?;
+        pre_filter.wait_for_ready().await?;
+        let mask = pre_filter.mask();
+        let centroid = self.ivf.centroid(partition_id);
+        let rq_cache = self.rq_search_cache.clone();
+        let raw_query = self.prepare_rq_raw_query_context(&query.key)?;
+        let query = Self::preprocess_partition_query(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            partition_id,
+            centroid.as_ref(),
+            query,
+        )?;
+        let scratch_pool = self.scratch_pool.clone();
+        let use_residual = self.use_query_residual;
+        let use_scratch = self.use_residual_scratch;
+        let comparisons = storage.len();
+        let batch = spawn_cpu(move || -> Result<RecordBatch> {
+            let rotated = rotated_partition_centroid_slice(rq_cache.as_deref(), partition_id);
+            let residual = Self::query_context_for_scratch(
+                use_residual,
+                use_scratch,
+                partition_id,
+                centroid.as_ref(),
+                rotated,
+                raw_query.as_deref(),
+            )?;
+            scratch_pool.with_scratch(|scratch| {
+                let calculator = storage.dist_calculator_with_scratch(
+                    query.key,
+                    query.dist_q_c,
+                    residual,
+                    &mut scratch.query_f32,
+                    DistanceCalculatorOptions {
+                        approx_mode: query.approx_mode,
+                    },
+                );
+                let mut ids = Vec::new();
+                let mut distances = Vec::new();
+                for (offset, &id) in storage.row_ids().enumerate() {
+                    if mask.selected(id) {
+                        let distance = calculator.distance(offset as u32);
+                        if distance.is_finite() && distance <= threshold {
+                            ids.push(id);
+                            distances.push(distance);
+                        }
+                    }
+                }
+                Ok(RecordBatch::try_new(
+                    VECTOR_RESULT_SCHEMA.clone(),
+                    vec![
+                        Arc::new(Float32Array::from(distances)),
+                        Arc::new(UInt64Array::from(ids)),
+                    ],
+                )?)
+            })
+        })
+        .await?;
+        metrics.record_comparisons(comparisons);
         Ok(batch)
     }
 

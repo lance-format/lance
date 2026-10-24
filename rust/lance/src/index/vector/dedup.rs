@@ -98,7 +98,7 @@ impl DuplicatePairsOptions {
     }
 }
 
-fn pair_schema() -> SchemaRef {
+pub(super) fn pair_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("row_id_a", DataType::UInt64, false),
         Field::new("row_id_b", DataType::UInt64, false),

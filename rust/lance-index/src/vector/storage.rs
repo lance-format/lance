@@ -15,8 +15,9 @@ use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array, cast::AsArray,
-    types::UInt8Type,
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
+    cast::AsArray,
+    types::{UInt8Type, UInt64Type},
 };
 use arrow_schema::SchemaRef;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
@@ -64,7 +65,7 @@ use super::pairwise::{
     EncodedPartition, PairwisePartition, PairwiseScorer, PairwiseSpillWriter, list_values,
 };
 use super::quantizer::{Quantizer, QuantizerMetadata};
-use super::{ApproxMode, DISTANCE_TYPE_KEY};
+use super::{ApproxMode, DISTANCE_TYPE_KEY, PQ_CODE_COLUMN};
 
 pub use crate::vector::bq::resident::{
     ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, ResidentStoreViews,
@@ -1607,6 +1608,66 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let batch = self
             .read_partition_batch(part_id, io_stats.as_ref())
             .await?;
+        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        Q::Storage::try_from_batch_with_remapper(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            remapper,
+        )
+    }
+
+    /// Read just the row IDs of a storage-order range, including compaction remaps.
+    pub async fn read_partition_row_ids_range(
+        &self,
+        part_id: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<UInt64Array> {
+        if part_id >= self.num_partitions()
+            || rows.start > rows.end
+            || rows.end > self.partition_size(part_id)
+        {
+            return Err(Error::invalid_input("partition row range out of bounds"));
+        }
+        if rows.is_empty() {
+            return Ok(UInt64Array::from(Vec::<u64>::new()));
+        }
+        let partition = self.ivf.row_range(part_id);
+        let batch = self
+            .read_vector_columns(
+                ReadBatchParams::Range(partition.start + rows.start..partition.start + rows.end),
+                &[ROW_ID],
+            )
+            .await?;
+        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let batch = if let Some(remapper) = remapper {
+            remapper.remap_row_ids_record_batch(batch, 0)?
+        } else {
+            batch
+        };
+        Ok(batch.column(0).as_primitive::<UInt64Type>().clone())
+    }
+
+    /// Load only a bounded range of codes. PQ spans are gathered from the full
+    /// partition's transposed layout before constructing range-local storage.
+    pub async fn load_partition_range(
+        &self,
+        part_id: usize,
+        rows: std::ops::Range<usize>,
+    ) -> Result<Q::Storage> {
+        let quantizer = self.quantizer()?;
+        let mut batch = self.read_pairwise_codes(part_id, rows, &quantizer).await?;
+        if matches!(quantizer, Quantizer::Product(_)) && !self.metadata.is_transposed() {
+            let codes = batch[PQ_CODE_COLUMN].as_fixed_size_list();
+            let width = codes.value_length() as usize;
+            let values = super::pq::storage::transpose(
+                codes.values().as_primitive::<UInt8Type>(),
+                width,
+                batch.num_rows(),
+            );
+            let codes = FixedSizeListArray::try_new_from_values(values, width as i32)?;
+            batch = batch.replace_column_by_name(PQ_CODE_COLUMN, Arc::new(codes))?;
+        }
         let (batch, remapper) = self.remap_partition_batch(batch).await?;
         Q::Storage::try_from_batch_with_remapper(
             batch,
