@@ -131,7 +131,7 @@ pub async fn write_fragments(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
@@ -140,12 +140,7 @@ pub async fn write_fragments(
     // the blob promotion, which gives every negative field id a new one.
     let (mut normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
     if dataset.is_none() {
-        if keep_field_ids {
-            normalized_schema.try_set_field_id(None)?;
-        } else {
-            // Input Arrow IDs must not seed allocation for a new dataset's blob children.
-            normalized_schema.try_reassign_field_ids(None)?;
-        }
+        write::assign_new_table_field_ids(&mut normalized_schema, inherited_field_ids)?;
     }
     let normalized_schema = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -159,7 +154,7 @@ pub async fn write_fragments(
         normalized_schema,
         &params,
         schema_compare_options(version),
-        keep_field_ids,
+        inherited_field_ids,
     )?;
     schema.fields.extend(lineage_fields);
     match version {
