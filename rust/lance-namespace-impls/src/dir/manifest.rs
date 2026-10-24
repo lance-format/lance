@@ -2316,9 +2316,26 @@ impl ManifestNamespace {
             .is_some())
     }
 
+    /// Join a relative table location (which may contain `/` separators) onto a base
+    /// path, preserving each path segment.  `object_store::Path::join` appends its
+    /// argument as a single segment and percent-encodes `/`, which collapses nested
+    /// or non-ASCII locations and makes storage probes / deletes miss the real data.
+    fn join_location(
+        base: &object_store::path::Path,
+        location: &str,
+    ) -> Result<object_store::path::Path> {
+        // Build the target path by parsing the full relative location, so that each
+        // `/`-separated segment is treated as its own path part and non-ASCII / `%`
+        // bytes are not re-encoded again.  `Path::parse` decodes percent-encoding and
+        // rejects traversal, matching how `construct_full_uri` addresses the data.
+        Ok(object_store::path::Path::parse(format!(
+            "{base}/{location}"
+        ))?)
+    }
+
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
-        Self::path_has_actual_manifests(&self.object_store, &self.base_path.clone().join(location))
-            .await
+        let path = Self::join_location(&self.base_path, location)?;
+        Self::path_has_actual_manifests(&self.object_store, &path).await
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
@@ -3262,7 +3279,7 @@ impl LanceNamespace for ManifestNamespace {
                 self.delete_from_manifest(&object_id).boxed().await?;
 
                 // Delete physical data directory using the dir_name from manifest
-                let table_path = self.base_path.clone().join(info.location.as_str());
+                let table_path = Self::join_location(&self.base_path, info.location.as_str())?;
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
@@ -3950,7 +3967,7 @@ mod tests {
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
-        DropTableRequest, ListTablesRequest, TableExistsRequest,
+        DropTableRequest, ListTablesRequest, RegisterTableRequest, TableExistsRequest,
     };
     use lance_table::feature_flags::FLAG_UNKNOWN;
     use lance_table::format::Fragment;
@@ -6546,5 +6563,33 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.alter_table_drop_columns(request).await;
         assert!(result.is_err(), "Should fail when table does not exist");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_drop_nested_table_removes_physical_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let nested = std::path::Path::new(temp_path).join("outside/held");
+        std::fs::create_dir_all(nested.join("_versions")).unwrap();
+        std::fs::write(nested.join("_versions/1.manifest"), b"{}").unwrap();
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["nested".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        req.location = "outside/held".to_string();
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop_request = DropTableRequest::new();
+        drop_request.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop_request).await.unwrap();
+        assert!(!nested.exists());
     }
 }
