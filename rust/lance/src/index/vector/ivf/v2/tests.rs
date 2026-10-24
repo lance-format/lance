@@ -6007,6 +6007,14 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
     assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
 
+    // Prewarm an index that was already opened for demand, so its retained
+    // cache handle must remain suitable for the later query.
+    dataset
+        .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let before_prewarm = dataset.session().cache_diagnostics();
+
     // Reset IO stats after index creation.
     dataset.object_store.as_ref().io_stats_incremental();
 
@@ -6027,6 +6035,18 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         stats.read_iops > 0,
         "prewarm should have read from disk, but read_iops was 0"
     );
+    let after_prewarm = dataset.session().cache_diagnostics();
+    assert!(
+        after_prewarm.index.activity.warm.attempts > before_prewarm.index.activity.warm.attempts
+    );
+    assert!(
+        after_prewarm.index.activity.warm.loads_succeeded
+            > before_prewarm.index.activity.warm.loads_succeeded
+    );
+    assert!(
+        after_prewarm.index.activity.warm.load_bytes
+            > before_prewarm.index.activity.warm.load_bytes
+    );
 
     // Query should not perform IO after prewarming all deltas.
     let q = vectors.value(0);
@@ -6045,6 +6065,17 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         read_iops,
         0,
         "query should not perform IO after prewarm"
+    );
+
+    let after_query = dataset.session().cache_diagnostics();
+    assert!(after_query.index.activity.hits > after_prewarm.index.activity.hits);
+    assert_eq!(
+        after_query.index.activity.warm.attempts,
+        after_prewarm.index.activity.warm.attempts
+    );
+    assert_eq!(
+        after_query.index.activity.warm.loads_succeeded,
+        after_prewarm.index.activity.warm.loads_succeeded
     );
 
     // Second prewarm should not need IO (already cached).

@@ -13,14 +13,22 @@
  */
 package org.lance;
 
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -463,6 +471,133 @@ public class SessionTest {
       // so the implicit close from try-with-resources remains safe)
       session.close();
       assertThrows(IllegalArgumentException.class, session::metadataCacheStats);
+    }
+  }
+
+  @Test
+  void testIndexCacheStatsAndCompleteDiagnostics() {
+    try (Session session =
+        Session.builder().indexCacheSizeBytes(0).metadataCacheSizeBytes(2048).build()) {
+      CacheStats indexStats = session.getIndexCacheStats();
+      assertEquals(0, indexStats.getHits());
+      assertEquals(0, indexStats.getMisses());
+      assertEquals(0, indexStats.getNumEntries());
+      assertEquals(0, indexStats.getSizeBytes());
+
+      CacheDiagnostics diagnostics = session.getCacheDiagnostics();
+      assertEquals(
+          CacheDiagnostics.BackendKind.QUICK, diagnostics.getIndex().getBackend().getKind());
+      assertEquals(0, diagnostics.getIndex().getBackend().getCapacityBytes().orElseThrow());
+      assertFalse(diagnostics.getIndex().getBackend().getEnabled().orElseThrow());
+      assertFalse(diagnostics.getIndex().getUtilization().isPresent());
+      assertEquals(2048, diagnostics.getMetadata().getBackend().getCapacityBytes().orElseThrow());
+      assertTrue(diagnostics.getMetadata().getBackend().getEnabled().orElseThrow());
+      assertEquals(0.0, diagnostics.getMetadata().getUtilization().orElseThrow());
+      assertEquals(0, diagnostics.getIndex().getActivity().getLoadsInFlight());
+      assertEquals(0, diagnostics.getIndex().getActivity().getWarm().getAttempts());
+      assertEquals(0, diagnostics.getMetadata().getActivity().getWarm().getLoadBytes());
+
+      CacheDiagnostics refreshed = session.getCacheDiagnostics(true);
+      assertEquals(0, refreshed.getMetadata().getBackend().getNumEntries().orElseThrow());
+
+      CacheDiagnosticsOptions options =
+          CacheDiagnosticsOptions.builder().refresh(true).byType(true).build();
+      assertTrue(options.getRefresh());
+      assertTrue(options.getByType());
+      CacheDiagnostics byType = session.getCacheDiagnostics(options);
+      CacheDiagnostics.ByType indexByType = byType.getIndex().getByType().orElseThrow();
+      assertTrue(indexByType.getActivity().isEmpty());
+      assertTrue(indexByType.getOccupancy().orElseThrow().getTypes().isEmpty());
+      assertEquals(0, indexByType.getTypeLabelOverflowEvents());
+
+      session.close();
+      assertThrows(IllegalArgumentException.class, session::getIndexCacheStats);
+      assertThrows(IllegalArgumentException.class, session::getCacheDiagnostics);
+    }
+  }
+
+  @Test
+  void testCacheDiagnosticsAfterIndexedReads(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("diagnostics").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().indexCacheBackend("moka://?capacity=1048576").build()) {
+      TestUtils.SimpleTestDataset fixture = new TestUtils.SimpleTestDataset(allocator, path);
+      fixture.createEmptyDataset().close();
+      fixture.write(1, 16).close();
+      try (Dataset dataset = fixture.write(2, 16)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            true);
+      }
+      try (Dataset dataset =
+          Dataset.open().allocator(allocator).uri(path).session(session).build()) {
+        assertEquals(2, dataset.getFragments().size());
+        ScanOptions options = new ScanOptions.Builder().filter("id = 7").build();
+        try (LanceScanner scanner = dataset.newScan(options);
+            ArrowReader reader = scanner.scanBatches()) {
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            rows += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(2, rows);
+        }
+        CacheDiagnostics first = session.getCacheDiagnostics(true);
+        try (LanceScanner scanner = dataset.newScan(options);
+            ArrowReader reader = scanner.scanBatches()) {
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            rows += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(2, rows);
+        }
+        CacheDiagnostics second =
+            session.getCacheDiagnostics(
+                CacheDiagnosticsOptions.builder().refresh(true).byType(true).build());
+        CacheDiagnostics.Snapshot[] before = {first.getIndex(), first.getMetadata()};
+        CacheDiagnostics.Snapshot[] after = {second.getIndex(), second.getMetadata()};
+        for (int tier = 0; tier < after.length; tier++) {
+          CacheDiagnostics.Activity activity = after[tier].getActivity();
+          assertTrue(
+              activity.getHits() > before[tier].getActivity().getHits(), "cache tier " + tier);
+          assertTrue(activity.getMisses() > 0);
+          assertTrue(activity.getLoadsStarted() > 0);
+          assertEquals(activity.getLoadsStarted(), activity.getLoadsSucceeded());
+          assertTrue(activity.getLoadSuccessDurationNs() > 0);
+          assertEquals(0, activity.getLookupErrors());
+          assertEquals(0, activity.getLoadsFailed());
+          assertEquals(0, activity.getLoadsCancelled());
+          assertEquals(0, activity.getLoadsInFlight());
+          CacheDiagnostics.ByType byType = after[tier].getByType().orElseThrow();
+          assertFalse(byType.getActivity().isEmpty());
+          assertEquals(
+              activity.getHits(),
+              byType.getActivity().stream().mapToLong(row -> row.getActivity().getHits()).sum());
+          assertEquals(
+              activity.getMisses(),
+              byType.getActivity().stream().mapToLong(row -> row.getActivity().getMisses()).sum());
+          assertEquals(
+              activity.getLoadsSucceeded(),
+              byType.getActivity().stream()
+                  .mapToLong(row -> row.getActivity().getLoadsSucceeded())
+                  .sum());
+          assertFalse(byType.getOccupancy().orElseThrow().getTypes().isEmpty());
+          assertTrue(after[tier].getBackend().getWriteAttempts().orElseThrow() > 0);
+          assertTrue(after[tier].getBackend().getSizeBytes().orElseThrow() > 0);
+        }
+        assertEquals(CacheDiagnostics.BackendKind.MOKA, second.getIndex().getBackend().getKind());
+        assertEquals(
+            CacheDiagnostics.BackendKind.QUICK, second.getMetadata().getBackend().getKind());
+        assertFalse(second.getIndex().getBackend().getSizeRemovals().isPresent());
+        assertFalse(second.getIndex().getBackend().getAdmissions().isPresent());
+        assertEquals(
+            session.getIndexCacheStats().getHits(), second.getIndex().getActivity().getHits());
+        assertEquals(
+            session.metadataCacheStats().getMisses(),
+            second.getMetadata().getActivity().getMisses());
+      }
     }
   }
 

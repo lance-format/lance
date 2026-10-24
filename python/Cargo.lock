@@ -4164,6 +4164,7 @@ dependencies = [
  "libc",
  "libm",
  "log",
+ "metrics",
  "moka",
  "num_cpus",
  "object_store 0.14.2",
