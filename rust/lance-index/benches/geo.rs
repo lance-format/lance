@@ -113,7 +113,10 @@ async fn rect_search_rtree(
 }
 
 fn bench_rtree(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let num_rows = 1_000_000;
 
     let tempdir = tempfile::tempdir().unwrap();

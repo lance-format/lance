@@ -283,7 +283,10 @@ async fn run_queries(
 fn bench_ivf_pq_throughput(c: &mut Criterion) {
     env_logger::init();
 
-    let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     let mut group = c.benchmark_group("ivf_pq_throughput");
     group.throughput(Throughput::Elements(NUM_QUERIES as u64));
