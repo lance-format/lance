@@ -38,11 +38,11 @@ use lance_table::format::{DataFile, Fragment};
 use crate::Dataset;
 use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::schema_evolution::{ColumnAlteration, NewColumnTransform};
-use crate::dataset::transaction::{DataReplacementGroup, Operation};
+use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::{
-    DATA_DIR, MergeInsertBuilder, MergeInsertWriteMode, UpdateBuilder, WriteDestination,
-    WriteParams,
+    CommitBuilder, DATA_DIR, InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode,
+    UpdateBuilder, WriteDestination, WriteMode, WriteParams,
 };
 use crate::index::DatasetIndexExt;
 
@@ -1116,4 +1116,1297 @@ async fn test_merge_insert_rewrite_with_binary_view_input_seeds_stored_column() 
         assert_eq!(actual, expected);
     }
     assert_all_fragments_seed_physical_rows(&dataset, "blob").await;
+}
+
+// --- Binary-copy compaction seed carrying -----------------------------------
+//
+// Binary copy moves data pages verbatim; the output file's seed is the
+// concatenation of its inputs' zone records, per output and per column, and a
+// column whose inputs cannot be represented under the fixed-stride layout
+// simply loses its seed while the data still copies.
+
+use crate::dataset::optimize::{
+    CompactionMetrics, CompactionMode, CompactionOptions, compact_files,
+};
+use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
+
+/// Counts `plan_run` execution events while it is the default subscriber. A
+/// seed harvest never executes a plan; the fallback column scan does, so the
+/// count tells which path an index update took.
+#[derive(Clone, Default)]
+struct BinaryCopyPlanRunCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BinaryCopyPlanRunCounter {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use lance_core::utils::tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION};
+
+        #[derive(Default)]
+        struct TypeField(Option<String>);
+        impl tracing::field::Visit for TypeField {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "type" {
+                    self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
+                }
+            }
+        }
+
+        if event.metadata().target() != TRACE_EXECUTION {
+            return;
+        }
+        let mut ty = TypeField::default();
+        event.record(&mut ty);
+        if ty.0.as_deref() == Some(EXECUTION_PLAN_RUN) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+fn assert_seed_flags_set(dataset: &Dataset) {
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0,
+        "reader flag"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS,
+        0,
+        "writer flag"
+    );
+}
+
+async fn force_binary_copy(dataset: &mut Dataset, target_rows: u64) -> CompactionMetrics {
+    compact_files(
+        dataset,
+        CompactionOptions {
+            target_rows_per_fragment: target_rows as usize,
+            compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// Like [`all_seeded_dataset`] but keeps the unseeded pre-index fragment.
+/// The planner never mixes fragments with different index coverage in one
+/// bin, so the covered pre-index fragment stays put and compaction takes the
+/// seeded appends alone, while the index keeps live training data (an index
+/// whose covered fragments are all gone is rebuilt by scan, not updated).
+async fn seeded_appends_dataset(uri: &str, appends: usize, rows_per_append: i32) -> Dataset {
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..8, base_value))], schema()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["val"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    for append in 0..appends as i32 {
+        let start = 8 + append * rows_per_append;
+        dataset
+            .append(
+                RecordBatchIterator::new(
+                    [Ok(rows(start..start + rows_per_append, base_value))],
+                    schema(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+}
+
+/// The fragments compaction added: every fragment with an id above the
+/// pre-compaction maximum.
+fn fragments_above(dataset: &Dataset, max_before: u64) -> Vec<Fragment> {
+    dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| fragment.id > max_before)
+        .cloned()
+        .collect()
+}
+
+/// A dataset whose every fragment carries a `val` seed: the pre-index
+/// fragment is fully deleted after seeded appends, leaving only aligned
+/// (or ragged, per `rows_per_append`) seeded fragments.
+async fn all_seeded_dataset(uri: &str, appends: usize, rows_per_append: i32) -> Dataset {
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..8, base_value))], schema()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["val"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    for append in 0..appends as i32 {
+        let start = 8 + append * rows_per_append;
+        dataset
+            .append(
+                RecordBatchIterator::new(
+                    [Ok(rows(start..start + rows_per_append, base_value))],
+                    schema(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // Drop the unseeded pre-index fragment so every remaining input has a
+    // `val` seed.
+    dataset.delete("id < 8").await.unwrap();
+    assert_eq!(dataset.fragments().len(), appends);
+    for fragment in dataset.fragments().iter() {
+        assert!(fragment.deletion_file.is_none());
+        let file = serving_file(fragment, field_id(&dataset, "val"));
+        assert!(seed_in_file(&dataset, &file.path, "val").await.is_some());
+    }
+    dataset
+}
+
+/// Aligned seeded inputs merge into one output whose seed matches the
+/// output's physical values exactly, and the sticky flags stay set.
+#[tokio::test]
+async fn test_binary_copy_merges_aligned_seeds() {
+    let dir = TempStrDir::default();
+    // 8-row fragments with rows_per_zone = 4: every tail zone is full.
+    let mut dataset = all_seeded_dataset(dir.as_str(), 3, 8).await;
+    assert_seed_flags_set(&dataset);
+    let before = dataset.scan().try_into_batch().await.unwrap();
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(metrics.fragments_removed, 3);
+
+    let output_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(output_ids.len(), 1);
+    assert_seed_matches_data(&dataset, &output_ids, "val").await;
+    assert_seed_flags_set(&dataset);
+
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(before, after);
+}
+
+/// Several output files: each output's seed covers exactly its own inputs,
+/// with the null bitmap offsets reset per output.
+#[tokio::test]
+async fn test_binary_copy_multi_output_seeds_are_independent() {
+    let dir = TempStrDir::default();
+    let mut dataset = all_seeded_dataset(dir.as_str(), 4, 8).await;
+
+    let metrics = force_binary_copy(&mut dataset, 16).await;
+    assert_eq!(metrics.fragments_added, 2);
+
+    let output_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(output_ids.len(), 2);
+    for fragment in dataset.fragments().iter() {
+        assert_eq!(fragment.physical_rows, Some(16));
+    }
+    assert_seed_matches_data(&dataset, &output_ids, "val").await;
+}
+
+/// An output fed by exactly one input carries that input's seed verbatim,
+/// ragged tail and all; an output merging ragged inputs carries their
+/// concatenated records.
+#[tokio::test]
+async fn test_binary_copy_single_source_output_carries_seed_verbatim() {
+    let dir = TempStrDir::default();
+    // 10-row seeded appends with rows_per_zone = 4: zones [4, 4, 2] each.
+    let mut dataset = seeded_appends_dataset(dir.as_str(), 3, 10).await;
+    let val = field_id(&dataset, "val");
+    let last_input = dataset.fragments().last().unwrap().clone();
+    let last_input_seed = seed_in_file(&dataset, &serving_file(&last_input, val).path, "val")
+        .await
+        .unwrap();
+    let max_before = dataset.fragments().iter().map(|f| f.id).max().unwrap();
+
+    // The bin flushes an output at 15 rows: the first two sources merge into
+    // a 20-row output, the third lands alone as a whole source file.
+    let metrics = force_binary_copy(&mut dataset, 15).await;
+    assert_eq!(metrics.fragments_added, 2);
+
+    let outputs = fragments_above(&dataset, max_before);
+    assert_eq!(outputs.len(), 2);
+    let merged = outputs
+        .iter()
+        .find(|f| f.physical_rows == Some(20))
+        .unwrap();
+    let single = outputs
+        .iter()
+        .find(|f| f.physical_rows == Some(10))
+        .unwrap();
+    assert!(
+        seed_in_file(&dataset, &serving_file(merged, val).path, "val")
+            .await
+            .is_some(),
+        "ragged sources concatenate under the self-describing layout"
+    );
+    let carried = seed_in_file(&dataset, &serving_file(single, val).path, "val")
+        .await
+        .unwrap();
+    assert_eq!(
+        carried, last_input_seed,
+        "single-source outputs carry bytes verbatim"
+    );
+}
+
+/// Ragged inputs (short tail zones) concatenate into a seed with short zones
+/// mid file: version 1 records are self-describing, the merged seed feeds the
+/// next index update without a scan, and indexed queries match unindexed
+/// scans.
+#[tokio::test]
+async fn test_binary_copy_merges_ragged_seeds_and_feeds_index_update() {
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int32Type;
+
+    let dir = TempStrDir::default();
+    // 10-row seeded appends with rows_per_zone = 4: zones [4, 4, 2] per
+    // input, so the merged seed holds short zones mid file. The covered
+    // pre-index fragment stays out of the bin and keeps the index alive.
+    let mut dataset = seeded_appends_dataset(dir.as_str(), 2, 10).await;
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let max_before = dataset.fragments().iter().map(|f| f.id).max().unwrap();
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+
+    let fragment = fragments_above(&dataset, max_before)[0].clone();
+    let file = serving_file(&fragment, field_id(&dataset, "val"));
+    assert!(
+        seed_in_file(&dataset, &file.path, "val").await.is_some(),
+        "self-describing version 1 records carry mid-file short zones"
+    );
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(before, after);
+    assert_seed_flags_set(&dataset);
+
+    // The compacted fragment is unindexed; the update must integrate the
+    // merged seed (its granularity differs from a fresh collection) without
+    // scanning the column.
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let plan_runs = BinaryCopyPlanRunCounter::default();
+    let subscriber = tracing_subscriber::registry().with(plan_runs.clone());
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        plan_runs.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the index update must come from the merged seed, not a column scan"
+    );
+
+    for filter in ["val >= 10 AND val < 15", "val IS NULL", "val = 23"] {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+        let plan = indexed.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+            "filter {filter} must use the zone map index: {plan}"
+        );
+        let indexed_ids: Vec<i32> = indexed.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let expected_ids: Vec<i32> = unindexed.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(indexed_ids, expected_ids, "filter {filter}");
+    }
+}
+
+/// Seed locators keep their `<buffer_index>:<rows_per_zone>` encoding: a
+/// normal write declares the index's granularity, and a binary-copy output
+/// declares the column's current index granularity.
+#[tokio::test]
+async fn test_seed_locator_keeps_rows_per_zone() {
+    async fn locator(dataset: &Dataset, fragment: &Fragment) -> (u32, u64) {
+        let file = serving_file(fragment, field_id(dataset, "val"));
+        let reader = open_data_file(dataset, &file.path).await;
+        let value = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(&format!("{SEED_META_KEY_PREFIX}val"))
+            .unwrap()
+            .clone();
+        let (index, rows_per_zone) = value
+            .split_once(':')
+            .unwrap_or_else(|| panic!("locator '{value}' lacks the rows_per_zone suffix"));
+        (index.parse().unwrap(), rows_per_zone.parse().unwrap())
+    }
+
+    let dir = TempStrDir::default();
+    let mut dataset = all_seeded_dataset(dir.as_str(), 2, 8).await;
+    let fragment = dataset.fragments()[0].clone();
+    assert_eq!(locator(&dataset, &fragment).await.1, ROWS_PER_ZONE);
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    let output = dataset.fragments()[0].clone();
+    assert_eq!(locator(&dataset, &output).await.1, ROWS_PER_ZONE);
+}
+
+/// Boundary queries around every internal short zone of a merged ragged
+/// seed, after a fresh reopen (so the persisted index, not session memory,
+/// answers); then a later seeded append over the ragged index; then a full
+/// re-encoding maintenance pass followed by the ordinary index refresh.
+#[tokio::test]
+async fn test_binary_copy_ragged_zone_boundaries_reopen_and_maintenance() {
+    use crate::dataset::optimize::compact_files;
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int32Type;
+
+    async fn assert_indexed_matches_scan(
+        phase: &str,
+        dataset: &Dataset,
+        filters: &[String],
+        require_index: bool,
+    ) {
+        for filter in filters {
+            let mut indexed = dataset.scan();
+            indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+            let plan = indexed.explain_plan(false).await.unwrap();
+            if require_index {
+                assert!(
+                    plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+                    "[{phase}] filter {filter} must use the zone map index: {plan}"
+                );
+            }
+            let indexed_ids: Vec<i32> = indexed.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec();
+            let mut unindexed = dataset.scan();
+            unindexed
+                .use_scalar_index(false)
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let expected_ids: Vec<i32> = unindexed.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec();
+            assert_eq!(indexed_ids, expected_ids, "[{phase}] filter {filter}");
+        }
+    }
+
+    fn boundary_filters(boundaries: &[i32]) -> Vec<String> {
+        let mut filters = vec!["val IS NULL".to_string(), "val IS NOT NULL".to_string()];
+        for boundary in boundaries {
+            for value in [boundary - 1, *boundary, boundary + 1] {
+                filters.push(format!("val = {value}"));
+            }
+            filters.push(format!(
+                "val >= {} AND val < {}",
+                boundary - 1,
+                boundary + 1
+            ));
+        }
+        filters
+    }
+
+    let dir = TempStrDir::default();
+    // Appends of 10 rows (ids 8..18 and 18..28) under rows_per_zone = 4: the
+    // merged output's zones are [4, 4, 2, 4, 4, 2] at output offsets
+    // 0, 4, 8, 10, 14, 18, that is ids 8, 12, 16, 18, 22, 26.
+    let mut dataset = seeded_appends_dataset(dir.as_str(), 2, 10).await;
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(reopened.fragments().len(), 2);
+    let internal_boundary_ids = [12, 16, 18, 22, 26];
+    assert_indexed_matches_scan(
+        "after reopen",
+        &reopened,
+        &boundary_filters(&internal_boundary_ids),
+        true,
+    )
+    .await;
+
+    let mut dataset = reopened;
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(28..38, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    let mut filters = boundary_filters(&internal_boundary_ids);
+    filters.extend(boundary_filters(&[32, 36]));
+    assert_indexed_matches_scan("after later append + update", &reopened, &filters, true).await;
+
+    // Full re-encoding maintenance: results must match the scan whether or
+    // not the planner routes through the remapped index right away.
+    let mut dataset = reopened;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1_000_000,
+            compaction_mode: Some(CompactionMode::Reencode),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    assert_indexed_matches_scan("after re-encode", &reopened, &filters, false).await;
+
+    // The ordinary refresh then integrates the re-encoded output's fresh seed
+    // and queries route through the index again.
+    let mut dataset = reopened;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    assert_indexed_matches_scan("after re-encode + refresh", &reopened, &filters, true).await;
+}
+
+/// A column seeded in only some inputs loses its seed (partial statistics
+/// must not impersonate the whole output), while a column seeded in every
+/// input keeps its merged seed.
+#[tokio::test]
+async fn test_binary_copy_partial_column_coverage() {
+    let dir = TempStrDir::default();
+    let mut dataset = seeded_appends_dataset(dir.as_str(), 1, 8).await;
+    // The `id` index arrives after the first append, so that fragment has a
+    // `val` seed but no `id` seed; the next append carries both. Dropping the
+    // index afterwards leaves the written seeds in place and gives both
+    // appends the same (empty) index coverage, so they share one bin.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(16..24, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = field_id(&dataset, "id");
+    let newest = dataset.fragments().last().unwrap().clone();
+    assert!(
+        seed_in_file(&dataset, &serving_file(&newest, id).path, "id")
+            .await
+            .is_some()
+    );
+    let id_index = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.fields == vec![id])
+        .unwrap()
+        .name
+        .clone();
+    dataset.drop_index(&id_index).await.unwrap();
+    let max_before = dataset.fragments().iter().map(|f| f.id).max().unwrap();
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+
+    let outputs = fragments_above(&dataset, max_before);
+    assert_eq!(outputs.len(), 1);
+    let file = serving_file(&outputs[0], id);
+    assert!(
+        seed_in_file(&dataset, &file.path, "id").await.is_none(),
+        "one input has no 'id' seed, so the output must not claim one"
+    );
+    let output_ids: Vec<u64> = outputs.iter().map(|f| f.id).collect();
+    assert_seed_matches_data(&dataset, &output_ids, "val").await;
+}
+
+/// A rename between the write and the compaction: seeds match by field id and
+/// the output key uses the current column name.
+#[tokio::test]
+async fn test_binary_copy_carries_seed_across_rename() {
+    let dir = TempStrDir::default();
+    let mut dataset = all_seeded_dataset(dir.as_str(), 2, 8).await;
+    dataset
+        .alter_columns(&[ColumnAlteration::new("val".into()).rename("renamed".into())])
+        .await
+        .unwrap();
+
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+
+    let fragment = &dataset.fragments()[0];
+    let file = serving_file(fragment, field_id(&dataset, "renamed"));
+    assert!(
+        seed_in_file(&dataset, &file.path, "val").await.is_none(),
+        "the stale write-time name must not key the output seed"
+    );
+    let output_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_seed_matches_data(&dataset, &output_ids, "renamed").await;
+}
+
+// Version 1 seeds are announced by the paired `FLAG_ZONE_WRITE_SEEDS` bits.
+// The write path embeds such a seed only when the writer's snapshot already
+// carries the bits, and every commit sets them for the seed-requesting
+// indices in the manifest it builds, so no manifest references a seed its
+// bits do not announce. These tests pin that rule across the commit paths.
+
+fn seed_flags_set(dataset: &Dataset) -> bool {
+    dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS != 0
+        && dataset.manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS != 0
+}
+
+async fn last_fragment_seeded(dataset: &Dataset) -> bool {
+    let fragment = dataset.fragments().last().unwrap();
+    let file = serving_file(fragment, field_id(dataset, "val"));
+    seed_in_file(dataset, &file.path, "val").await.is_some()
+}
+
+async fn append_rows(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(ids, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+async fn stage_append(dataset: &Arc<Dataset>, ids: std::ops::Range<i32>) -> Transaction {
+    InsertBuilder::new(dataset.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![rows(ids, base_value)])
+        .await
+        .unwrap()
+}
+
+/// The transaction as a reader of its serialized form sees it.
+fn serialized_round_trip(transaction: &Transaction) -> Transaction {
+    let encoded = lance_table::format::pb::Transaction::try_from(transaction).unwrap();
+    Transaction::try_from(encoded).unwrap()
+}
+
+/// Commit a copy of the latest manifest with the zone seed bits cleared, the
+/// way a build that predates the flag left a seeded index behind, and reopen.
+async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
+    use crate::dataset::{ManifestWriteConfig, write_manifest_file};
+    use crate::index::load_all_indices;
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.reader_feature_flags &= !FLAG_ZONE_WRITE_SEEDS;
+    manifest.writer_feature_flags &= !FLAG_ZONE_WRITE_SEEDS;
+    manifest.version += 1;
+    let indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        Some(indices),
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    let mut reopened = dataset.clone();
+    reopened.checkout_latest().await.unwrap();
+    assert!(!seed_flags_set(&reopened));
+    assert_eq!(reopened.load_indices().await.unwrap().len(), 1);
+    reopened
+}
+
+async fn dataset_with_seeded_index(uri: &str) -> Dataset {
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..8, base_value))], schema()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["val"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// Creating a seed-requesting index activates the bits in that commit, before
+/// any seeded file exists; an index without seeds and plain writes do not; the
+/// bits stay set after the index is dropped, across a restore and in a clone.
+#[tokio::test]
+async fn test_zone_seed_flags_follow_index_configuration() {
+    let unseeded_dir = TempStrDir::default();
+    let mut unseeded = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..8, base_value))], schema()),
+        unseeded_dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!seed_flags_set(&unseeded));
+    unseeded
+        .create_index(
+            &["val"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(false),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(!seed_flags_set(&unseeded));
+    append_rows(&mut unseeded, 8..16).await;
+    assert!(
+        !seed_flags_set(&unseeded),
+        "an index that does not ask for seeds must not activate the bits"
+    );
+    assert!(!last_fragment_seeded(&unseeded).await);
+
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..8, base_value))], schema()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let pre_index_version = dataset.manifest.version;
+    dataset
+        .create_index(
+            &["val"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        seed_flags_set(&dataset),
+        "the commit that configures seeds sets the bits before any seeded file exists"
+    );
+    append_rows(&mut dataset, 8..16).await;
+    assert!(seed_flags_set(&dataset));
+    assert!(last_fragment_seeded(&dataset).await);
+
+    let clone_dir = TempStrDir::default();
+    let cloned = dataset
+        .shallow_clone(clone_dir.as_str(), dataset.version_id(), None)
+        .await
+        .unwrap();
+    assert!(seed_flags_set(&cloned), "sticky into a shallow clone");
+
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    dataset.drop_index(&index_name).await.unwrap();
+    assert!(
+        seed_flags_set(&dataset),
+        "sticky after the index is dropped"
+    );
+    append_rows(&mut dataset, 16..24).await;
+    assert!(seed_flags_set(&dataset));
+
+    let mut restored = dataset.checkout_version(pre_index_version).await.unwrap();
+    restored.restore().await.unwrap();
+    assert!(seed_flags_set(&restored), "sticky across restore");
+}
+
+/// A seeded index left behind by a build that did not set the bits: writes
+/// against that snapshot embed no seed, the next commit activates the bits,
+/// and writes after that are seeded.
+#[tokio::test]
+async fn test_zone_seed_flags_legacy_index_activates_before_seeding() {
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(dir.as_str()).await;
+    let mut legacy = reopen_with_seed_flags_cleared(&dataset).await;
+
+    append_rows(&mut legacy, 8..16).await;
+    assert!(
+        seed_flags_set(&legacy),
+        "the first commit activates the bits"
+    );
+    assert!(
+        !last_fragment_seeded(&legacy).await,
+        "a write against an unflagged snapshot must not embed a seed"
+    );
+
+    append_rows(&mut legacy, 16..24).await;
+    assert!(last_fragment_seeded(&legacy).await);
+}
+
+/// A staged append serialized, committed on a fresh handle at a later version
+/// where the index has been dropped: the legacy case publishes no seed, the
+/// flagged case keeps its seed and the sticky bits.
+#[tokio::test]
+async fn test_zone_seed_flags_staged_append_committed_after_index_drop() {
+    let legacy_dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(legacy_dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let index_name = legacy.load_indices().await.unwrap()[0].name.clone();
+    let staged = serialized_round_trip(&stage_append(&legacy, 8..16).await);
+    let mut dropped = (*legacy).clone();
+    dropped.drop_index(&index_name).await.unwrap();
+    assert!(!seed_flags_set(&dropped), "nothing left to announce");
+    let fresh = Dataset::open(legacy_dir.as_str()).await.unwrap();
+    assert_eq!(fresh.manifest.version, dropped.manifest.version);
+    let committed = CommitBuilder::new(Arc::new(fresh))
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(!last_fragment_seeded(&committed).await);
+    assert!(!seed_flags_set(&committed));
+
+    let flagged_dir = TempStrDir::default();
+    let flagged = Arc::new(dataset_with_seeded_index(flagged_dir.as_str()).await);
+    assert!(seed_flags_set(&flagged));
+    let index_name = flagged.load_indices().await.unwrap()[0].name.clone();
+    let staged = serialized_round_trip(&stage_append(&flagged, 8..16).await);
+    let mut dropped = (*flagged).clone();
+    dropped.drop_index(&index_name).await.unwrap();
+    assert!(seed_flags_set(&dropped));
+    let fresh = Dataset::open(flagged_dir.as_str()).await.unwrap();
+    let committed = CommitBuilder::new(Arc::new(fresh))
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(last_fragment_seeded(&committed).await);
+    assert!(seed_flags_set(&committed));
+}
+
+/// Rebase over an interleaved commit and detached commits, from a flagged
+/// base and from a legacy base.
+#[tokio::test]
+async fn test_zone_seed_flags_rebase_and_detached_commits() {
+    let dir = TempStrDir::default();
+    let flagged = Arc::new(dataset_with_seeded_index(dir.as_str()).await);
+
+    let staged = stage_append(&flagged, 8..16).await;
+    let mut interleaved = (*flagged).clone();
+    interleaved.delete("id = 0").await.unwrap();
+    let rebased = CommitBuilder::new(flagged.clone())
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(seed_flags_set(&rebased));
+    assert!(last_fragment_seeded(&rebased).await);
+
+    let staged = stage_append(&flagged, 16..24).await;
+    let detached = CommitBuilder::new(flagged.clone())
+        .with_detached(true)
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(seed_flags_set(&detached));
+    assert!(last_fragment_seeded(&detached).await);
+
+    let legacy_dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(legacy_dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let staged = stage_append(&legacy, 8..16).await;
+    let detached = CommitBuilder::new(legacy.clone())
+        .with_detached(true)
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(
+        seed_flags_set(&detached),
+        "a detached commit activates the bits for the index it publishes"
+    );
+    assert!(!last_fragment_seeded(&detached).await);
+}
+
+/// Re-encoding compaction: outputs written against a legacy snapshot carry no
+/// seed while the rewrite commit activates the bits; outputs written against a
+/// flagged snapshot carry seeds.
+#[tokio::test]
+async fn test_zone_seed_flags_reencode_compaction() {
+    let dir = TempStrDir::default();
+    let dataset = seeded_appends_dataset(dir.as_str(), 2, 8).await;
+    let mut legacy = reopen_with_seed_flags_cleared(&dataset).await;
+    let max_before = legacy.fragments().iter().map(|f| f.id).max().unwrap();
+    let metrics = compact_files(
+        &mut legacy,
+        CompactionOptions {
+            compaction_mode: Some(CompactionMode::Reencode),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(metrics.fragments_added > 0);
+    assert!(
+        seed_flags_set(&legacy),
+        "the rewrite commit activates the bits"
+    );
+    for fragment in fragments_above(&legacy, max_before) {
+        let file = serving_file(&fragment, field_id(&legacy, "val"));
+        assert!(
+            seed_in_file(&legacy, &file.path, "val").await.is_none(),
+            "a rewrite against an unflagged snapshot must not embed seeds"
+        );
+    }
+
+    append_rows(&mut legacy, 100..108).await;
+    append_rows(&mut legacy, 108..116).await;
+    let max_before = legacy.fragments().iter().map(|f| f.id).max().unwrap();
+    let metrics = compact_files(
+        &mut legacy,
+        CompactionOptions {
+            compaction_mode: Some(CompactionMode::Reencode),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(metrics.fragments_added > 0);
+    for fragment in fragments_above(&legacy, max_before) {
+        let file = serving_file(&fragment, field_id(&legacy, "val"));
+        assert!(seed_in_file(&legacy, &file.path, "val").await.is_some());
+    }
+}
+
+/// The fragments a commit added, ordered by id, with the ids of the rows
+/// each one holds, so a test can say which staged write produced it.
+async fn new_fragments_with_ids(dataset: &Dataset, max_before: u64) -> Vec<(Fragment, Vec<i32>)> {
+    let mut out = Vec::new();
+    for fragment in fragments_above(dataset, max_before) {
+        let batch = dataset
+            .scan()
+            .with_fragments(vec![fragment.clone()])
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids: Vec<i32> = batch["id"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        out.push((fragment, ids));
+    }
+    out
+}
+
+async fn fragment_seeded(dataset: &Dataset, fragment: &Fragment) -> bool {
+    let file = serving_file(fragment, field_id(dataset, "val"));
+    seed_in_file(dataset, &file.path, "val").await.is_some()
+}
+
+/// A worker stages fragments against a snapshot (`execute_uncommitted`), the
+/// transaction crosses a process boundary (proto round trip) and a
+/// coordinator commits it on a freshly opened handle at a later version.
+#[tokio::test]
+async fn test_zone_seed_flags_distributed_publication() {
+    // Flagged snapshot: the staged file carries its seed and the bits travel
+    // through sticky inheritance from the later version.
+    let dir = TempStrDir::default();
+    let flagged = Arc::new(dataset_with_seeded_index(dir.as_str()).await);
+    let staged = serialized_round_trip(&stage_append(&flagged, 8..16).await);
+    let mut elsewhere = (*flagged).clone();
+    elsewhere.delete("id = 0").await.unwrap();
+    let fresh = Dataset::open(dir.as_str()).await.unwrap();
+    assert!(fresh.manifest.version > staged.read_version);
+    let committed = CommitBuilder::new(Arc::new(fresh))
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(seed_flags_set(&committed));
+    assert!(last_fragment_seeded(&committed).await);
+
+    // Legacy snapshot, index still present at commit time: the staged file
+    // carries no seed; the commit activates the bits for the index it
+    // publishes.
+    let legacy_dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(legacy_dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let staged = serialized_round_trip(&stage_append(&legacy, 8..16).await);
+    let fresh = Dataset::open(legacy_dir.as_str()).await.unwrap();
+    let committed = CommitBuilder::new(Arc::new(fresh))
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(seed_flags_set(&committed));
+    assert!(!last_fragment_seeded(&committed).await);
+
+    // Legacy snapshot, index dropped before the commit: nothing announces
+    // seeds and no file carries one.
+    let legacy_dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(legacy_dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let index_name = legacy.load_indices().await.unwrap()[0].name.clone();
+    let staged = serialized_round_trip(&stage_append(&legacy, 8..16).await);
+    let mut dropped = (*legacy).clone();
+    dropped.drop_index(&index_name).await.unwrap();
+    assert!(
+        !seed_flags_set(&dropped),
+        "empty prepared index list after the drop"
+    );
+    let fresh = Dataset::open(legacy_dir.as_str()).await.unwrap();
+    let committed = CommitBuilder::new(Arc::new(fresh))
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(!seed_flags_set(&committed));
+    assert!(!last_fragment_seeded(&committed).await);
+}
+
+/// `execute_batch` merges transactions staged against different snapshots
+/// and takes the minimum read version. Files staged before activation carry
+/// no seed, files staged after it do, and the published manifest carries the
+/// bits whenever any seeded file is published.
+#[tokio::test]
+async fn test_zone_seed_flags_execute_batch_mixed_snapshots() {
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let staged_legacy = stage_append(&legacy, 100..108).await;
+
+    // An activating commit from the legacy snapshot: its own file is unseeded.
+    let mut activated = (*legacy).clone();
+    append_rows(&mut activated, 8..16).await;
+    assert!(seed_flags_set(&activated));
+    assert!(!last_fragment_seeded(&activated).await);
+    let activated = Arc::new(activated);
+    let staged_flagged = stage_append(&activated, 200..208).await;
+
+    let max_before = activated.fragments().iter().map(|f| f.id).max().unwrap();
+    let result = CommitBuilder::new(activated.clone())
+        .execute_batch(vec![staged_legacy, staged_flagged])
+        .await
+        .unwrap();
+    let batched = result.dataset;
+    assert!(seed_flags_set(&batched));
+    let added = new_fragments_with_ids(&batched, max_before).await;
+    assert_eq!(added.len(), 2);
+    for (fragment, ids) in &added {
+        let seeded = fragment_seeded(&batched, fragment).await;
+        if ids.contains(&100) {
+            assert!(
+                !seeded,
+                "the file staged against the legacy snapshot has no seed"
+            );
+        } else {
+            assert!(ids.contains(&200));
+            assert!(
+                seeded,
+                "the file staged against the flagged snapshot is seeded"
+            );
+        }
+    }
+
+    // The index disappears before publication: the file staged after the
+    // activation is still seeded and the bits are sticky.
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&batched).await);
+    let staged_legacy = stage_append(&legacy, 300..308).await;
+    let mut activated = (*legacy).clone();
+    append_rows(&mut activated, 16..24).await;
+    let activated = Arc::new(activated);
+    let staged_flagged = stage_append(&activated, 400..408).await;
+    let index_name = activated.load_indices().await.unwrap()[0].name.clone();
+    let mut dropped = (*activated).clone();
+    dropped.drop_index(&index_name).await.unwrap();
+    assert!(seed_flags_set(&dropped));
+    let max_before = dropped.fragments().iter().map(|f| f.id).max().unwrap();
+    let result = CommitBuilder::new(Arc::new(dropped))
+        .execute_batch(vec![staged_legacy, staged_flagged])
+        .await
+        .unwrap();
+    let batched = result.dataset;
+    assert!(seed_flags_set(&batched));
+    let added = new_fragments_with_ids(&batched, max_before).await;
+    assert_eq!(added.len(), 2);
+    for (fragment, ids) in &added {
+        let seeded = fragment_seeded(&batched, fragment).await;
+        assert_eq!(seeded, ids.contains(&400), "ids {ids:?}");
+    }
+
+    // The index disappears before any activation: no file was ever seeded
+    // and nothing announces seeds.
+    let dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let staged_before = stage_append(&legacy, 100..108).await;
+    let index_name = legacy.load_indices().await.unwrap()[0].name.clone();
+    let mut dropped = (*legacy).clone();
+    dropped.drop_index(&index_name).await.unwrap();
+    assert!(!seed_flags_set(&dropped));
+    let dropped = Arc::new(dropped);
+    let staged_after = stage_append(&dropped, 200..208).await;
+    let max_before = dropped.fragments().iter().map(|f| f.id).max().unwrap();
+    let result = CommitBuilder::new(dropped.clone())
+        .execute_batch(vec![staged_before, staged_after])
+        .await
+        .unwrap();
+    let batched = result.dataset;
+    assert!(!seed_flags_set(&batched));
+    let added = new_fragments_with_ids(&batched, max_before).await;
+    assert_eq!(added.len(), 2);
+    for (fragment, _) in &added {
+        assert!(!fragment_seeded(&batched, fragment).await);
+    }
+}
+
+/// A detached commit whose supplied handle is newer than the transaction's
+/// read version: the detached manifest descends from the handle, so the bits
+/// follow that ancestry, and the file's seed presence follows the snapshot it
+/// was written against.
+#[tokio::test]
+async fn test_zone_seed_flags_detached_commit_with_newer_handle() {
+    // Flagged: staged at F, handle at F + 1.
+    let dir = TempStrDir::default();
+    let flagged = Arc::new(dataset_with_seeded_index(dir.as_str()).await);
+    let staged = stage_append(&flagged, 8..16).await;
+    let mut newer = (*flagged).clone();
+    newer.delete("id = 0").await.unwrap();
+    assert!(newer.manifest.version > staged.read_version);
+    let detached = CommitBuilder::new(Arc::new(newer))
+        .with_detached(true)
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(seed_flags_set(&detached));
+    assert!(last_fragment_seeded(&detached).await);
+
+    // Legacy: staged at L (no seed), handle at L + 1 whose commit activated
+    // the bits.
+    let legacy_dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(legacy_dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let staged = stage_append(&legacy, 8..16).await;
+    let mut newer = (*legacy).clone();
+    newer.delete("id = 0").await.unwrap();
+    assert!(seed_flags_set(&newer));
+    let detached = CommitBuilder::new(Arc::new(newer))
+        .with_detached(true)
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(seed_flags_set(&detached));
+    assert!(!last_fragment_seeded(&detached).await);
+
+    // Legacy: staged at L (no seed), handle at L + 1 where the index was
+    // dropped without activation: nothing to announce.
+    let legacy_dir = TempStrDir::default();
+    let dataset = dataset_with_seeded_index(legacy_dir.as_str()).await;
+    let legacy = Arc::new(reopen_with_seed_flags_cleared(&dataset).await);
+    let staged = stage_append(&legacy, 8..16).await;
+    let index_name = legacy.load_indices().await.unwrap()[0].name.clone();
+    let mut dropped = (*legacy).clone();
+    dropped.drop_index(&index_name).await.unwrap();
+    assert!(!seed_flags_set(&dropped));
+    let detached = CommitBuilder::new(Arc::new(dropped))
+        .with_detached(true)
+        .execute(staged)
+        .await
+        .unwrap();
+    assert!(!seed_flags_set(&detached));
+    assert!(!last_fragment_seeded(&detached).await);
+}
+
+/// Detached snapshots remain valid writing bases when the commit uses that
+/// exact snapshot, including the batch publication path.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_zone_seed_flags_same_detached_snapshot(#[values(false, true)] is_batch: bool) {
+    let dir = TempStrDir::default();
+    let initial = Arc::new(dataset_with_seeded_index(dir.as_str()).await);
+    let staged = stage_append(&initial, 100..108).await;
+    let detached = Arc::new(
+        CommitBuilder::new(initial)
+            .with_detached(true)
+            .execute(staged)
+            .await
+            .unwrap(),
+    );
+    let first = stage_append(&detached, 200..208).await;
+    let builder = CommitBuilder::new(detached.clone()).with_detached(true);
+    let committed = if is_batch {
+        let second = stage_append(&detached, 300..308).await;
+        builder
+            .execute_batch(vec![first, second])
+            .await
+            .unwrap()
+            .dataset
+    } else {
+        builder.execute(first).await.unwrap()
+    };
+    assert!(seed_flags_set(&committed));
+    assert!(last_fragment_seeded(&committed).await);
+}
+
+/// Imported files may remap field ids in `DataFile.fields` while their
+/// footers keep the original ids; carried seeds must follow the physical
+/// column, or another column's bounds would prune matching rows.
+#[tokio::test]
+async fn test_binary_copy_translates_remapped_seed_fields() {
+    let source_dir = TempStrDir::default();
+    let initial = arrow_array::record_batch!(
+        ("discarded", Int32, [0, 0]),
+        ("id", Int32, [0, 1]),
+        ("val", Int32, [0, 10]),
+        ("untouched", Utf8, ["u0", "u1"])
+    )
+    .unwrap();
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+        source_dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    source.drop_columns(&["discarded"]).await.unwrap();
+    assert_eq!(field_id(&source, "id"), 1);
+    assert_eq!(field_id(&source, "val"), 2);
+    for column in ["id", "val"] {
+        source
+            .create_index(
+                &[column],
+                IndexType::ZoneMap,
+                None,
+                &zone_map_params(true),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    for start in [100, 108] {
+        source
+            .append(
+                RecordBatchIterator::new([Ok(rows(start..start + 8, |_| Some(999)))], schema()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let destination_dir = TempStrDir::default();
+    let mut destination = dataset_with_seeded_index(destination_dir.as_str()).await;
+    assert_seed_flags_set(&destination);
+    let mut fragments = source.fragments()[1..].to_vec();
+    for fragment in &mut fragments {
+        for file in &mut fragment.files {
+            assert!(seed_in_file(&source, &file.path, "id").await.is_some());
+            assert!(seed_in_file(&source, &file.path, "val").await.is_some());
+            destination
+                .object_store
+                .copy(
+                    &source.base.clone().join(DATA_DIR).join(file.path.as_str()),
+                    &destination
+                        .base
+                        .clone()
+                        .join(DATA_DIR)
+                        .join(file.path.as_str()),
+                )
+                .await
+                .unwrap();
+            file.fields = file
+                .fields
+                .iter()
+                .map(|id| id - 1)
+                .collect::<Vec<_>>()
+                .into();
+        }
+    }
+    let transaction = Transaction::new(
+        destination.version_id(),
+        Operation::Append { fragments },
+        None,
+    );
+    destination = CommitBuilder::new(Arc::new(destination))
+        .execute(transaction)
+        .await
+        .unwrap();
+    let mut flat = destination.scan();
+    flat.use_scalar_index(false).filter("val = 999").unwrap();
+    assert_eq!(flat.try_into_batch().await.unwrap().num_rows(), 16);
+
+    let metrics = force_binary_copy(&mut destination, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(metrics.fragments_removed, 2);
+    destination
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let destination = Dataset::open(destination_dir.as_str()).await.unwrap();
+    let mut flat = destination.scan();
+    flat.use_scalar_index(false).filter("val = 999").unwrap();
+    let expected = flat.try_into_batch().await.unwrap().num_rows();
+    assert_eq!(expected, 16);
+    let mut indexed = destination.scan();
+    indexed.filter("val = 999").unwrap();
+    let plan = indexed.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+        "{plan}"
+    );
+    assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
 }

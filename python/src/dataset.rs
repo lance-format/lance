@@ -1695,12 +1695,13 @@ impl Dataset {
         batch.to_pyarrow(self_.py())
     }
 
-    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
+    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None, ignore_deletions = false))]
     fn take_rows<'py>(
         self_: PyRef<'py, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
+        ignore_deletions: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let projection = match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
@@ -1716,11 +1717,13 @@ impl Dataset {
         }
         .infer_error()?;
 
+        let builder = self_
+            .ds
+            .take_builder(&row_indices, projection)
+            .infer_error()?
+            .with_ignore_deletions(ignore_deletions);
         let batch = rt()
-            .block_on(
-                Some(self_.py()),
-                self_.ds.take_rows(&row_indices, projection),
-            )?
+            .block_on(Some(self_.py()), builder.execute())?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
@@ -2645,6 +2648,7 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "ZONEMAP" => IndexType::ZoneMap,
             "BLOOMFILTER" => IndexType::BloomFilter,
+            "MINHASHLSH" => IndexType::MinHashLsh,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
@@ -2682,6 +2686,10 @@ impl Dataset {
             }),
             "BLOOMFILTER" => Box::new(ScalarIndexParams {
                 index_type: "bloomfilter".to_string(),
+                params: None,
+            }),
+            "MINHASHLSH" => Box::new(ScalarIndexParams {
+                index_type: "minhashlsh".to_string(),
                 params: None,
             }),
             "RTREE" => Box::new(ScalarIndexParams {

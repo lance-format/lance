@@ -20,7 +20,7 @@ use super::locate::{
 };
 use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
 use crate::dataset::Dataset;
-use lance_core::datatypes::{BlobKind, Field as LanceField};
+use lance_core::datatypes::{BlobKind, BlobV2Layout, Field as LanceField};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 
@@ -240,20 +240,84 @@ pub(in crate::dataset) async fn managed_paths(
 }
 
 /// Preserve Managed references and adopt Packed/Dedicated objects in place.
-/// Only Inline payloads are copied. Implicit source bases become explicit when
-/// a shallow clone rewrites descriptors into its own table base.
-pub(in crate::dataset) async fn preserve_managed_descriptors(
+/// Only Inline payloads are copied. Source bases are made explicit when needed
+/// to preserve their identity at the destination.
+/// Convert scanned descriptors into prepared write values without reading
+/// out-of-line payloads. `row_addrs` must identify each descriptor's source
+/// row in `dataset`; `field_id` identifies its blob leaf. Inline values are
+/// read from their source data file. The caller must retain the source snapshot
+/// until the new references have been committed.
+///
+/// `field` supplies the destination name, nullability and metadata. The returned
+/// array has the prepared Blob v2 layout and can be interleaved with values from
+/// [`BlobDescriptorArrayBuilder`] before writing.
+///
+/// `target_base_id` is the destination data file's base in the same dataset:
+/// `None` for primary storage, or `Some(id)` for a registered base. Write the
+/// returned array only to that base, using the same base registry. Reusing
+/// primary-storage objects in a registered base requires a registered base
+/// whose URI matches the dataset URI; otherwise this function returns an error.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::StructArray;
+/// # use arrow_schema::Field;
+/// # use lance::Dataset;
+/// # async fn preserve(dataset: Arc<Dataset>, values: &StructArray, rows: &[u64], field: &Field) -> lance::Result<()> {
+/// let prepared = lance::dataset::preserve_managed_descriptors(
+///     &dataset, 0, values, rows, field, None,
+/// ).await?;
+/// # let _ = prepared;
+/// # Ok(()) }
+/// ```
+pub async fn preserve_managed_descriptors(
     dataset: &Arc<Dataset>,
     field_id: u32,
     values: &StructArray,
     row_addrs: &[u64],
     field: &ArrowField,
+    target_base_id: Option<u32>,
 ) -> Result<ArrayRef> {
     if values.len() != row_addrs.len() {
-        return Err(Error::internal(
-            "Blob descriptors and row addresses have different lengths",
-        ));
+        return Err(Error::invalid_input(format!(
+            "Blob descriptor count {} does not match row address count {}",
+            values.len(),
+            row_addrs.len()
+        )));
     }
+    if BlobV2Layout::classify(values.fields()) != Some(BlobV2Layout::Descriptor) {
+        return Err(Error::invalid_input(format!(
+            "Expected Blob v2 descriptors, got {:?}",
+            values.data_type()
+        )));
+    }
+    let source_field = i32::try_from(field_id)
+        .ok()
+        .and_then(|id| dataset.schema().field_by_id(id));
+    if !source_field.is_some_and(|field| field.is_blob_v2()) {
+        return Err(Error::invalid_input(format!(
+            "Source field {field_id} is not a Blob v2 field"
+        )));
+    }
+    dataset.blob_base_path(target_base_id)?;
+    let primary_base_id = dataset
+        .manifest
+        .base_paths
+        .values()
+        .find(|base| base.path == dataset.uri)
+        .map(|base| base.id);
+    let preserve_base = |source_base_id: Option<u32>| -> Result<Option<u32>> {
+        match (source_base_id, target_base_id) {
+            (None, Some(target)) => primary_base_id.map(Some).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Cannot preserve primary-storage blob references in target base {target}: \
+                     dataset URI '{}' has no registered base",
+                    dataset.uri
+                ))
+            }),
+            _ => Ok(source_base_id),
+        }
+    };
     let columns = BlobV2DescriptorColumns::new(values);
     let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
         field.name(),
@@ -271,12 +335,12 @@ pub(in crate::dataset) async fn preserve_managed_descriptors(
             BlobKind::Managed | BlobKind::ManagedWithBase => {
                 context.collect_managed(&columns, row, *row_addr).await?;
                 builder.push(BlobDescriptor::Managed {
-                    base_id: resolve_managed_base_id(
+                    base_id: preserve_base(resolve_managed_base_id(
                         dataset,
                         field_id,
                         *row_addr,
                         columns.managed_base_id(row),
-                    )?,
+                    )?)?,
                     uri: columns.blob_uris.value(row).to_string(),
                     offset: columns.positions.value(row),
                     size: columns.sizes.value(row),
@@ -299,7 +363,7 @@ pub(in crate::dataset) async fn preserve_managed_descriptors(
                     .collect::<Vec<_>>()
                     .join("/");
                 builder.push(BlobDescriptor::Managed {
-                    base_id: location.base_id,
+                    base_id: preserve_base(location.base_id)?,
                     uri,
                     offset: if kind == BlobKind::Dedicated {
                         0

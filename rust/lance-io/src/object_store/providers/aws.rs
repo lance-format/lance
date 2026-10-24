@@ -152,6 +152,7 @@ impl AwsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
+        aws_credentials: Option<&AwsCredentialProvider>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         let bucket = base_path
             .host_str()
@@ -169,6 +170,16 @@ impl AwsStoreProvider {
                 "OpendalStore does not currently support an explicit provider_scheme (currently set to {:?})",
                 provider_scheme
             )));
+        }
+
+        // The provider reaches the native store through the params, which this
+        // arm does not pass on, so a request here would be signed with whatever
+        // credentials OpenDAL resolves for itself instead.
+        if aws_credentials.is_some() {
+            return Result::Err(Error::not_supported(
+                "OpendalStore does not currently support an explicit aws_credentials provider"
+                    .to_string(),
+            ));
         }
 
         // Set required OpenDAL configuration
@@ -227,8 +238,12 @@ impl ObjectStoreProvider for AwsStoreProvider {
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
             (
-                self.build_opendal_s3_store(&base_path, &storage_options)
-                    .await?,
+                self.build_opendal_s3_store(
+                    &base_path,
+                    &storage_options,
+                    params.aws_credentials.as_ref(),
+                )
+                .await?,
                 None,
             )
         } else {
@@ -1111,6 +1126,34 @@ mod tests {
             .unwrap();
         assert_eq!(store.scheme, "s3");
         assert!(!store.supports_conditional_multipart_put);
+    }
+
+    /// A credential provider handed to the OpenDAL arm would be dropped, and
+    /// the requests signed from the environment instead.
+    #[tokio::test]
+    async fn test_use_opendal_rejects_an_explicit_credential_provider() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AwsStoreProvider;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let params = ObjectStoreParams {
+            aws_credentials: Some(
+                Arc::new(MockAwsCredentialsProvider::default()) as AwsCredentialProvider
+            ),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let err = provider.new_store(url, &params).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "got: {err:?}, expected NotSupported"
+        );
+        assert!(err.to_string().contains("aws_credentials"), "got: {err}");
     }
 
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back

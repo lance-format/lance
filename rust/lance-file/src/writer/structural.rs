@@ -14,7 +14,6 @@ use lance_core::{
     utils::bit::pad_bytes,
 };
 use lance_encoding::{
-    decoder::PageEncoding,
     encoder::{
         BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
         OutOfLineBuffers,
@@ -212,10 +211,7 @@ impl StructuralFileSink {
             buffer_sizes.push(buffer.len() as u64);
             self.write_aligned_buffer(&buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = crate::writer::encode_page_encoding(&encoded_page.description)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -863,14 +859,7 @@ pub fn encode_batch_body(batch: &EncodedBatch, write_schema: bool) -> Result<Enc
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = crate::writer::encode_page_encoding(&page_info.encoding)?;
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
                     page_info.buffer_offsets_and_sizes.iter().copied().unzip();
                 Ok(pbfile::column_metadata::Page {
