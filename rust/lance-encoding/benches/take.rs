@@ -44,9 +44,11 @@ fn metadata(bss_on: bool) -> HashMap<String, String> {
             "3".to_string(),
         ),
     ]);
-    if bss_on {
-        metadata.insert("lance-encoding:bss".to_string(), "on".to_string());
-    }
+    // Automatic BSS would hide the integer bitpacking and RLE paths.
+    metadata.insert(
+        "lance-encoding:bss".to_string(),
+        if bss_on { "on" } else { "off" }.to_string(),
+    );
     metadata
 }
 
