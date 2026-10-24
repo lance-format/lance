@@ -4467,6 +4467,33 @@ impl Scanner {
         )?))
     }
 
+    /// Whether the filtered read scans target fragments its index query does not cover
+    /// and filters them after reading. Never for `fast_search` or the legacy format.
+    async fn filters_rows_outside_index(&self, filter_plan: &ExprFilterPlan) -> Result<bool> {
+        let Some(index_query) = filter_plan.index_query.as_ref() else {
+            return Ok(false);
+        };
+        let is_legacy = self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format()
+            == lance_file::version::ConcreteFileVersion::V1;
+        if is_legacy || self.fast_search || filter_plan.full_expr.is_none() {
+            return Ok(false);
+        }
+        let covered =
+            ScalarIndexExec::fragments_covered_by_index_query(index_query, self.dataset.as_ref())
+                .await?;
+        let targets = self
+            .fragments
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments().as_slice());
+        Ok(targets
+            .iter()
+            .any(|fragment| !covered.contains(fragment.id as u32)))
+    }
+
     async fn filtered_read_source(
         &self,
         filter_plan: &mut ExprFilterPlan,
@@ -4495,6 +4522,15 @@ impl Scanner {
             // the second step.
             self.calc_eager_projection(&effective_filter, &effective_projection)?
                 .with_row_id()
+        } else if self.filters_rows_outside_index(&effective_filter).await? {
+            // Defer the expensive columns, as a refine does, so the uncovered fragments
+            // are filtered on the cheap ones.
+            let eager = self.calc_eager_projection(&effective_filter, &effective_projection)?;
+            if effective_projection.field_ids.is_subset(&eager.field_ids) {
+                effective_projection
+            } else {
+                eager.with_row_id()
+            }
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
             // columns that the user asked for.
@@ -18351,6 +18387,82 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
+    /// An index lookup must not read a wide column for every row of the fragments
+    /// the index does not cover yet, only for the rows that match.
+    #[tokio::test]
+    async fn test_index_lookup_late_materializes_unindexed_fragments() {
+        use lance_io::assert_io_lt;
+
+        const VALUE_LEN: u64 = 64 * 1024;
+        // Even keys only, so an odd key inside a fragment's range is absent.
+        let fragment = |first_key: i64| {
+            gen_batch()
+                .col("key", array::step_custom::<Int64Type>(first_key, 2))
+                .col("n", array::step::<Int64Type>())
+                .col(
+                    "blob",
+                    array::rand_fixedbin(ByteCount::from(VALUE_LEN), true),
+                )
+                .into_reader_rows(RowCount::from(64), BatchCount::from(1))
+        };
+        let mut dataset = Dataset::write(fragment(0), "memory://late-unindexed", None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        // Two fragments the index does not cover.
+        for first_key in [2_000, 4_000] {
+            dataset.append(fragment(first_key), None).await.unwrap();
+        }
+
+        let lookup = |filter: &'static str, style: MaterializationStyle| {
+            let dataset = &dataset;
+            async move {
+                let mut scan = dataset.scan();
+                scan.project(&["key", "blob"])
+                    .unwrap()
+                    .filter(filter)
+                    .unwrap()
+                    .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                        "key".to_string(),
+                    )]))
+                    .unwrap()
+                    .materialization_style(style);
+                scan.try_into_batch().await.unwrap()
+            }
+        };
+        for (filter, matches) in [
+            // Inside the uncovered fragments' key ranges, but absent.
+            ("key IN (2001, 2003, 4001, 4003)", 0),
+            // Matches in both the indexed and the uncovered fragments.
+            ("key IN (6, 2006, 4020, 4021)", 3),
+            ("key = 4020", 1),
+            // An unindexed refine part (only 4020 has n > 5).
+            ("key IN (6, 2006, 4020, 4021) AND n > 5", 1),
+        ] {
+            dataset.object_store.io_stats_incremental();
+            let batch = lookup(filter, MaterializationStyle::Heuristic).await;
+            let io_stats = dataset.object_store.io_stats_incremental();
+            assert_eq!(batch.num_rows(), matches, "{filter}");
+            assert_io_lt!(
+                io_stats,
+                read_bytes,
+                (matches as u64 + 2) * VALUE_LEN * 2,
+                "{filter}"
+            );
+            let early = lookup(filter, MaterializationStyle::AllEarly).await;
+            assert_eq!(batch, early, "{filter}");
+        }
+    }
+
     #[tokio::test]
     async fn test_blob_all_binary_late_materialization() {
         // A selective filter that projects a blob column with `blob_handling=all_binary`
@@ -19344,9 +19456,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       FilterExec: i@0 > 10
         LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
-            "LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
-            range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+            // The appended fragment is filtered on `i` first; `s` is taken for the matches.
+            "ProjectionExec: expr=[s@2 as s]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    LanceRead: uri=..., projection=[i], num_fragments=5, range_before=None, \
+    range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+      ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -19394,10 +19509,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       FilterExec: i@0 > 10
         LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
         } else {
-            "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
-  LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
-  range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+            "ProjectionExec: expr=[regexp_match(s@2, .*) as matches]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    LanceRead: uri=..., projection=[i], num_fragments=5, range_before=None, \
+    range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+      ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
