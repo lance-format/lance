@@ -70,7 +70,7 @@ pub struct TransactionRebase<'a> {
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// so a concurrent `Merge` can be told which columns it rewrote in place
     /// and which fields it removed or retyped.
-    read_fragments: Option<Vec<Fragment>>,
+    read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
@@ -261,7 +261,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
-                let read_fragments = is_create_index.then(|| dataset.fragments().as_ref().clone());
+                let read_fragments = is_create_index.then(|| dataset.fragments().clone());
                 let read_schema = is_create_index.then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
