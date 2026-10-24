@@ -3408,7 +3408,22 @@ async fn test_ivf_pq_f64_smoke(#[case] version: IndexFileVersion) {
 
 #[tokio::test]
 async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
-    let params = pq_matrix_params(1, DistanceType::Cosine, IndexFileVersion::Legacy);
+    let mut ivf_params = IvfBuildParams::new(1);
+    ivf_params.max_iters = 2;
+    ivf_params.sample_rate = PQ_MATRIX_NUM_ROWS;
+    // Multi-vector scoring compounds quantization error. Four-dimensional
+    // sub-vectors keep recall clear of the threshold with this small codebook
+    // training sample; the single-vector matrix's eight-dimensional ones do not.
+    let pq_params = PQBuildParams {
+        num_sub_vectors: 8,
+        num_bits: 8,
+        max_iters: 2,
+        sample_rate: 1,
+        ..Default::default()
+    };
+    let mut params =
+        VectorIndexParams::with_ivf_pq_params(DistanceType::Cosine, ivf_params, pq_params);
+    params.version(IndexFileVersion::Legacy);
     test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
 }
 

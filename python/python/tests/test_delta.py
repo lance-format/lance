@@ -141,6 +141,13 @@ def test_delta_validation_errors():
     ):
         ds.delta(end_version=2)
 
+    # Error: compared_against combined with a version range
+    with pytest.raises(
+        ValueError,
+        match="Invalid user input: Cannot combine compared_against_version",
+    ):
+        ds.delta(compared_against=1, begin_version=1, end_version=1)
+
 
 def test_delta_get_deleted_row_ids():
     table = pa.table(

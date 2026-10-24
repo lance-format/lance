@@ -8,6 +8,11 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 
 ## List of datasets
 
+* `v6.0.1/wrapped_bitpacked_levels.lance`: Synthetic nullable half-float lists
+  with a dense prefix and a long null run. The legacy writer wraps a mini-block
+  structural count at 65,536; its out-of-line bitpacked buffers retain all levels.
+  `test_data/v6.0.1/datagen.py`, run with pylance 6.0.1, regenerates it.
+
 * `v0.7.5/with_deletions`: This is a simple table created with deletions. It is
   written in a version of Lance that did not record the `Fragment.physical_rows`
   or `DeletionFile.num_deleted_rows`, so these values are not present in the

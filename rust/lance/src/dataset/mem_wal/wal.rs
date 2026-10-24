@@ -129,6 +129,7 @@ impl WalFlushFailure {
 /// blocked on it would hang until some unrelated write happened to move a cursor
 /// again. With nothing cached there is nothing to leave stale — `notify` is a
 /// bare wake-up and every waiter recomputes from the cursors themselves.
+#[derive(Debug)]
 pub struct WriterCursors {
     durable: AtomicUsize,
     /// Bumped whenever a cursor advances or the writer poisons. Carries no
@@ -207,6 +208,21 @@ impl WriterCursors {
             return Err(failure.into_error());
         }
         Ok(())
+    }
+
+    /// Interrupt admission waits, including those inside custom backpressure
+    /// controllers, when the writer can no longer make progress.
+    pub(crate) async fn wait_for_failure(&self) -> Error {
+        let mut receiver = self.notify_rx.clone();
+        loop {
+            receiver.borrow_and_update();
+            if let Err(error) = self.check_poisoned() {
+                return error;
+            }
+            if receiver.changed().await.is_err() {
+                return Error::io("Writer cursor channel closed");
+            }
+        }
     }
 
     pub(crate) fn mark_terminal_failure(&self, error: &Error) {
