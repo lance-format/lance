@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Blob v2 — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/table/blob/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../file/">Specification</a>
+    <a href="../../file/encoding/">Encoding Strategy</a>
+    <a href="../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../">Lance Table Format</a>
+    <a href="../schema/">Schema</a>
+    <a class="active" href="./">Blob v2</a>
+    <a href="../table_config/">Table Config</a>
+    <a href="../versioning/">Versioning</a>
+    <a href="../transaction/">Transactions</a>
+    <a href="../layout/">Layout</a>
+    <a href="../branch_tag/">Branch & Tag</a>
+    <a href="../row_id_lineage/">Row ID & Lineage</a>
+    <a href="../data_overlay_file/">Data Overlay Files</a>
+    <a href="../clustering/">Clustering Metadata</a>
+    <a href="../fragment_metadata/">Fragment Metadata Tree</a>
+    <a href="../mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../index/scalar/btree/">BTree</a>
+    <a href="../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../index/scalar/label_list/">Label List</a>
+    <a href="../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../index/scalar/zone_write_seeds/">Zone Write Seeds</a>
+    <a href="../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../index/scalar/ngram/">N-gram</a>
+    <a href="../../index/scalar/minhash_lsh/">MinHash LSH (experimental)</a>
+    <a href="../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../index/scalar/rtree/">RTree</a>
+    <a href="../../index/scalar/json/">JSON</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Table Format</span>
+        <span>/</span><b>Blob v2</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="blob-v2">Blob v2<a class="headerlink" href="#blob-v2" title="Permanent link">&para;</a></h1>
+<p>Blob v2 represents nullable binary values such as images, audio, and video.
+A column stores a small descriptor per value, allowing scans without fetching
+payloads and subsequent reads of whole values or byte ranges. Payloads may reside
+inside a Lance data file, in Lance-owned objects, or in externally owned objects.
+Independently addressed Managed objects can survive data-file rewrites without
+copying their bytes.</p>
+<p>Writers accept bytes or a URI. A URI can be recorded as an External reference or
+ingested into Lance-owned storage. Lance retains its payloads while any
+protected snapshot (a table version retained by the cleanup policy) references
+them; see <a href="#snapshot-lifetime">Snapshot Lifetime</a>. External owners must preserve
+their objects. Blob v2 requires file format 2.2 or later. API examples and
+configuration belong in the
+<a href="../../../guide/blob/">Blob Columns guide</a>.</p>
+<h2 id="logical-input-values">Logical Input Values<a class="headerlink" href="#logical-input-values" title="Permanent link">&para;</a></h2>
+<p>For each non-null blob struct:</p>
+<ul>
+<li>Exactly one of <code>data</code> and <code>uri</code> must be non-null. Empty <code>data</code> is valid.</li>
+<li><code>uri</code> must be non-empty. Without a range, it denotes the whole external object.</li>
+<li><code>position</code> and <code>size</code> must both be null or both be non-null. When supplied,
+  they require <code>uri</code>, must have <code>size &gt; 0</code>, and select
+  <code>[position, position + size)</code> without overflowing <code>UInt64</code>.</li>
+</ul>
+<p>Absent range children mean the same as null range children. Input ranges select
+external bytes; they never address Lance-owned storage.
+Nullness comes from outer struct validity, and children beneath a null struct
+are ignored. Writers must reject invalid shapes and value combinations with
+errors identifying the field and offending input.</p>
+<h2 id="schema">Schema<a class="headerlink" href="#schema" title="Permanent link">&para;</a></h2>
+<p>The <strong>table manifest</strong> retains the logical struct shape supplied when the column
+is created: either the minimal or complete schema below, including child metadata
+and nullability. Legacy blob-marked binary inputs are converted to a Blob v2
+logical struct by dataset writers targeting file format 2.2 or later; see
+<a href="../../../guide/blob/#version-compatibility">Version Compatibility</a>.
+The <strong>data file</strong> stores the five-child descriptor schema, regardless of the
+logical shape. Writers convert logical <code>data</code>, <code>uri</code>, <code>position</code>, and <code>size</code>
+values into that descriptor; those input children are not stored alongside it.
+The descriptor itself is a packed struct occupying one physical column.</p>
+<h3 id="table-schema">Table Schema<a class="headerlink" href="#table-schema" title="Permanent link">&para;</a></h3>
+<p>Both shapes are logical input schemas. Use the minimal shape for bytes or
+whole-object URIs; use the complete shape to supply byte ranges within external
+objects. Writers may append either shape to an existing Blob v2 column, retaining
+the table's existing logical shape. Supplying a complete input to a column created
+with the minimal shape does not require rewriting existing payloads or changing
+the manifest schema.</p>
+<p>The minimal schema is:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>blob: struct (nullable)
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    &lt;metadata&gt;: {"ARROW:extension:name": "lance.blob.v2"}
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    data: large_binary (nullable)
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    uri:        string (nullable)
+</span></code></pre></div>
+<p>The complete schema is:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>blob: struct (nullable)
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    &lt;metadata&gt;: {"ARROW:extension:name": "lance.blob.v2"}
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    data:     large_binary (nullable)
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    uri:            string (nullable)
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    position:          u64 (nullable)
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    size:              u64 (nullable)
+</span></code></pre></div>
+<p>A logical blob field:</p>
+<ul>
+<li>Must carry <code>ARROW:extension:name = "lance.blob.v2"</code> on the blob field itself,
+  including when nested.</li>
+<li>Must have exactly the children, types, and order of one of these schemas.
+  <code>data</code> and <code>uri</code> must be nullable. Child metadata does not affect recognition.</li>
+<li>May declare both <code>position</code> and <code>size</code>, or neither; either field may
+  be nullable or non-nullable.</li>
+<li>May have any outer name and be nullable or non-nullable.</li>
+<li>May appear beneath <code>Struct</code>, <code>List</code>, and <code>LargeList</code>, including combinations.</li>
+</ul>
+<p>Other child types, extra children, and reordered children are invalid.
+Container validity, list boundaries, and element order keep their Arrow
+meanings. Materialization replaces the blob field with <code>LargeBinary</code>, preserving
+that structure. A null list, empty list, null blob, and empty blob remain distinct.</p>
+<h3 id="data-file-schema">Data File Schema<a class="headerlink" href="#data-file-schema" title="Permanent link">&para;</a></h3>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>blob: struct (nullable)
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    &lt;metadata&gt;: {
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>        "lance-encoding:blob": "true",
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        "lance-encoding:packed": "true"
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    }
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    kind:         u8 (non-nullable)
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    position:    u64 (non-nullable)
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    size:        u64 (non-nullable)
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    blob_id:     u32 (non-nullable)
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    blob_uri: string (non-nullable)
+</span></code></pre></div>
+<p>The outer name and nullability follow the blob field. It maps to one physical
+column; see <a href="../schema/#blob-identity-namespace">Blob Identity Namespace</a> for
+field-ID mapping. Descriptor scans expose this physical representation without
+changing the table schema.</p>
+<p>Names, order, types, and numeric kinds are format contracts.
+<a href="../../file/encoding/#struct-packing">Struct packing</a> determines child encoding,
+not fixed byte offsets. Packed struct encoding is independent of the <code>Packed</code>
+payload kind.</p>
+<h2 id="descriptor-kinds">Descriptor Kinds<a class="headerlink" href="#descriptor-kinds" title="Permanent link">&para;</a></h2>
+<p>Positions and sizes count bytes from the beginning of the selected object.
+The exclusive end is <code>position + size</code>; arithmetic must not overflow.</p>
+<p>Packed and Dedicated remain the default out-of-line storage kinds without the
+<a href="#capability-and-compatibility">Managed opt-in</a>. They are not deprecated by this
+specification.</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Object</th>
+<th><code>position</code></th>
+<th><code>size</code></th>
+<th><code>blob_id</code></th>
+<th><code>blob_uri</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 Inline</td>
+<td>Owning data file</td>
+<td>Absolute file offset</td>
+<td>Length</td>
+<td>0</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td>1 Packed</td>
+<td>Owning file's sidecar</td>
+<td>Offset in sidecar</td>
+<td>Length</td>
+<td>Sidecar ID</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td>2 Dedicated</td>
+<td>Owning file's sidecar</td>
+<td>0</td>
+<td>Object length</td>
+<td>Sidecar ID</td>
+<td><code>""</code></td>
+</tr>
+<tr>
+<td>3 External</td>
+<td>Externally owned</td>
+<td>Offset</td>
+<td>Length; 0 requests object-length lookup</td>
+<td>0 for absolute URI; otherwise base ID</td>
+<td>Absolute URI or relative path</td>
+</tr>
+<tr>
+<td>4 Managed</td>
+<td>Lance-owned, implicit base</td>
+<td>Offset</td>
+<td>Length; 0 is empty</td>
+<td>Unused; writers set 0</td>
+<td>Relative path</td>
+</tr>
+<tr>
+<td>5 ManagedWithBase</td>
+<td>Lance-owned, explicit base</td>
+<td>Offset</td>
+<td>Length; 0 is empty</td>
+<td>Base ID, including 0</td>
+<td>Relative path</td>
+</tr>
+</tbody>
+</table>
+<p>Inline bytes occupy an out-of-line buffer inside the data file; descriptor page
+compression does not change payload offsets or require payload decompression.
+An Inline descriptor with <code>size = 0</code>, including an all-zero descriptor, is empty.</p>
+<h3 id="external-resolution">External Resolution<a class="headerlink" href="#external-resolution" title="Permanent link">&para;</a></h3>
+<p>With <code>blob_id = 0</code>, resolve <code>blob_uri</code> as an absolute URI through the reader's
+object-store registry, using the dataset's runtime storage options and credential
+configuration. Anonymous access is not assumed; credentials are not stored in
+the descriptor. Otherwise, look up that <strong>ID</strong>, not an array index, in
+<code>manifest.base_paths</code>, use its object store and credentials, and append
+<code>blob_uri</code> directly. Do not add <code>data/</code>.</p>
+<p>For <code>size &gt; 0</code>, read the recorded interval. A writer that knows a non-empty
+object's length <code>N</code> may use <code>position = 0, size = N</code>, avoiding the length lookup.
+Without an explicit input range, writers store <code>position = 0, size = 0</code>.
+The zero-size sentinel discovers the complete object length at read time and
+uses it as the read length, retaining the recorded position. It means neither
+an explicit empty range nor the bytes remaining after position.</p>
+<p>Recording a length fixes the requested interval, not the object's contents.
+External descriptors store no ETag, content hash, or object version to detect
+mutation. Owners should use immutable object locations when reproducible reads
+are required. Reference writes need not check existence or length, so missing
+objects and truncated ranges may fail only when read.</p>
+<h3 id="managed-resolution">Managed Resolution<a class="headerlink" href="#managed-resolution" title="Permanent link">&para;</a></h3>
+<p>Both Managed kinds use a non-empty canonical relative <code>blob_uri</code>: no <code>://</code>,
+backslashes, leading or trailing slash, empty components, or <code>.</code> or <code>..</code>
+components.</p>
+<ul>
+<li><strong>Kind 4:</strong> locate the row's fragment and the <code>DataFile</code> supplying the blob
+  field. Use that file's <code>base_id</code> binding, or the current dataset root if absent.</li>
+<li><strong>Kind 5:</strong> use the descriptor's <code>blob_id</code> binding in <code>manifest.base_paths</code>.
+  Every <code>UInt32</code> value, including zero, is a possible explicit ID.</li>
+</ul>
+<p>Append <code>blob_uri</code> directly to the resolved base, using its object store and
+credentials. Do not infer any prefix from <code>BasePath.is_dataset_root</code>.
+The default dataset root needs no registration. Explicit IDs must already have
+bindings, which must not be rebound while referenced. Moving descriptors between
+files or base-ID namespaces must preserve their resolved object locations.</p>
+<p><code>size</code> is exact. Materializing a zero-length Managed value returns empty bytes
+without reading the payload or discovering its length; it does not establish
+that the object exists. Path, base, and range validation still apply. This
+differs from the released External sentinel. Empty byte inputs can use Inline,
+but empty Managed ranges are also valid stored values.</p>
+<h3 id="null-descriptors">Null Descriptors<a class="headerlink" href="#null-descriptors" title="Permanent link">&para;</a></h3>
+<p>Writers must encode nullness in the outer descriptor struct validity, using
+the file's repetition and definition levels. Readers must also accept released
+schemas with nullable children and recognize a null <code>kind</code> as a null blob.
+Children beneath a null blob are ignored; nullness must not be inferred from
+any other child. Non-null blobs require values in the children used by their kind.
+Unknown kinds or bases and invalid ranges are errors. Non-empty reads of missing
+or truncated payloads must fail rather than return null or an empty value.</p>
+<h2 id="object-layout">Object Layout<a class="headerlink" href="#object-layout" title="Permanent link">&para;</a></h2>
+<h3 id="managed-object-layout">Managed Object Layout<a class="headerlink" href="#managed-object-layout" title="Permanent link">&para;</a></h3>
+<p>New Managed objects use names independent of data files:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>&lt;base_path&gt;/
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    _blobs/
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>        &lt;uuid&gt;.blob
+</span></code></pre></div>
+<p><code>_blobs/</code> is inside the selected table storage base. Objects contain raw bytes,
+without framing or an offset index, and may hold one or many values. Descriptors
+supply their boundaries. Readers must not infer boundaries from row order or
+require the <code>_blobs/</code> prefix: an adopted sidecar keeps its existing path under
+<code>data/</code>, including after its original data file is removed.</p>
+<h3 id="sidecar-resolution">Sidecar Resolution<a class="headerlink" href="#sidecar-resolution" title="Permanent link">&para;</a></h3>
+<p>Inline, Packed, and Dedicated need the owning data file's identity. Locate it
+through the row's fragment and field-to-file mapping. Its <code>DataFile.base_id</code>
+determines the data directory: <code>&lt;dataset_root&gt;/data</code> without a base, <code>&lt;base&gt;/data</code>
+for a dataset-root base, or <code>&lt;base&gt;</code> for a non-root base.</p>
+<p>Let <code>data_file_key</code> be the final component of <code>DataFile.path</code> without <code>.lance</code>:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>&lt;data_directory&gt;/
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    &lt;DataFile.path&gt;
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    &lt;data_file_key&gt;/
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>        &lt;encoded_blob_id&gt;.blob
+</span></code></pre></div>
+<p>Sidecar IDs are nonzero <code>UInt32</code> values scoped to the data file, shared by its
+blob columns. Encode the ID as 32 binary digits, least significant bit first,
+then append <code>.blob</code>: ID 1 is <code>10000000000000000000000000000000.blob</code>, and ID 2
+is <code>01000000000000000000000000000000.blob</code>. Different data files may reuse an
+ID. Both sidecar kinds, like Managed objects, contain raw bytes without framing.</p>
+<h2 id="writer-policy">Writer Policy<a class="headerlink" href="#writer-policy" title="Permanent link">&para;</a></h2>
+<p>Without the <a href="#capability-and-compatibility">Managed opt-in</a>, byte inputs use
+Inline, Packed, or Dedicated according to placement thresholds. With the opt-in,
+out-of-line payloads use Managed kinds instead; packing multiple values and
+dedicating an object to one value do not require different Managed kinds.
+Readers always follow the recorded descriptor, independent of placement policy.</p>
+<p>In <strong>reference mode</strong>, URI input becomes External without copying bytes.
+Writers match registered non-dataset-root bases by object store and path
+components, preferring the longest matching base. They record the base ID and
+remaining relative path. Unmatched URIs require explicit permission to reference
+outside those bases; otherwise writing fails.</p>
+<p>In <strong>ingest mode</strong>, writers copy the source object or selected range into
+Lance-owned storage using the byte-input policy. Destination offsets address
+the copied bytes; there is no persisted ingest kind. Credentials remain runtime
+configuration.</p>
+<h2 id="snapshot-lifetime">Snapshot Lifetime<a class="headerlink" href="#snapshot-lifetime" title="Permanent link">&para;</a></h2>
+<p>Payloads and descriptor files must be complete before the
+<a href="../transaction/">manifest commit</a> publishes their references. Uploading an
+object alone does not make it live. Published Lance-owned payloads must remain
+immutable while protected snapshots reference them.</p>
+<p>When reusing an existing object, the source snapshot must remain protected from
+cleanup until the destination commit completes. Establish retention, for example
+through a source tag, before cleanup can retire it. An open handle or an
+existence check does not pin the snapshot. Compaction, reference appends, and
+shallow clones rely on this retention rule; manifest publication alone provides
+no additional lease for the preceding work.</p>
+<h3 id="rewrites">Rewrites<a class="headerlink" href="#rewrites" title="Permanent link">&para;</a></h3>
+<p>Rewrites must preserve bytes, nullness, nesting, and reference semantics.
+With Managed storage enabled, compaction behaves as follows:</p>
+<table>
+<thead>
+<tr>
+<th>Input kind</th>
+<th>Output descriptor</th>
+<th>Payload bytes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0 Inline</td>
+<td>Inline, pointing into the new data file</td>
+<td>Copied</td>
+</tr>
+<tr>
+<td>1 Packed</td>
+<td>Managed, pointing to the original sidecar and range</td>
+<td>Not read</td>
+</tr>
+<tr>
+<td>2 Dedicated</td>
+<td>Managed, pointing to the original sidecar, offset 0 and recorded size</td>
+<td>Not read</td>
+</tr>
+<tr>
+<td>3 External</td>
+<td>Same resolved reference and range</td>
+<td>Not read</td>
+</tr>
+<tr>
+<td>4 Managed</td>
+<td>Same object and range, preserving the source file's base</td>
+<td>Not read</td>
+</tr>
+<tr>
+<td>5 ManagedWithBase</td>
+<td>Same object, base, and range</td>
+<td>Not read</td>
+</tr>
+</tbody>
+</table>
+<p>Packed and Dedicated cannot be copied unchanged into a different data-file
+namespace. Resolve the sidecar first, then record its relative path, including
+<code>data/</code> when appropriate. For any Managed rewrite, use kind 5 when retaining
+an explicit source base; kind 4 requires the destination file to resolve to
+the same implicit base. Ordinary row compaction does not repack Managed objects
+or reclaim their unused ranges. Without the opt-in, compaction uses byte-input
+placement for Lance-owned payloads.</p>
+<h3 id="garbage-collection">Garbage Collection<a class="headerlink" href="#garbage-collection" title="Permanent link">&para;</a></h3>
+<p>Protected snapshots include the latest version, retained history, tags, and
+branch references under the table's cleanup policy. Managed liveness is the
+union of references from their live rows. Cleanup follows each snapshot's
+schema, descriptor files, deletion state, and base bindings, including nested
+fields. It needs no payload reads or per-object manifest inventory.</p>
+<p>Inline lifetime follows its data file. Packed and Dedicated sidecars remain
+protected by their owning data files, and adopted sidecars also remain
+protected by Managed references. Any live range retains the whole object;
+removing the producing data file or deleting other ranges does not free it.
+External objects are never deleted by Lance.</p>
+<p>Cleanup may delete unreferenced objects only within its own storage namespace
+and under the rules for expired versions and uncommitted objects. References
+must be established before deletion; failures reading required manifests or
+descriptors must stop cleanup. Referencing another dataset's base does not grant
+deletion authority, and a missing source manifest does not prove descendant
+branches have released their references.</p>
+<h3 id="clones">Clones<a class="headerlink" href="#clones" title="Permanent link">&para;</a></h3>
+<p>A shallow clone preserves source locations, including kind 4's implicit base
+through <code>DataFile.base_id</code>. It relies on continued source retention, such as a
+source tag, and does not independently extend object lifetime.</p>
+<p>A deep clone copies Lance-owned payloads into destination storage. Local Managed
+objects keep their relative paths, allowing their descriptor files to be copied
+unchanged. Registered-base objects are copied and their references rebound to
+the destination. The clone must survive removal of the source dataset. External
+references remain externally owned in both clone modes.</p>
+<h2 id="capability-and-compatibility">Capability and Compatibility<a class="headerlink" href="#capability-and-compatibility" title="Permanent link">&para;</a></h2>
+<p>Schema metadata <code>lance.blob.managed = "true"</code> opts writes and compaction into
+Managed storage. Absent metadata or <code>"false"</code> selects the existing placement
+policy; other values are invalid. Prepared Managed references require the opt-in.
+Committing <code>"true"</code> activates <code>FLAG_MANAGED_BLOBS = 16384</code> (<code>1 &lt;&lt; 14</code>) in both
+<code>reader_feature_flags</code> and <code>writer_feature_flags</code>, even without new blob files.
+A manifest with only one bit set is invalid.</p>
+<p>Both bits remain set in subsequent versions, including after removing the
+opt-in, dropping blob fields, or restoring an older snapshot. Activation does
+not rewrite existing files: flagged snapshots can contain all six kinds, and
+supporting readers must understand Packed and Dedicated as well as Managed.
+Clients without the capability must reject flagged snapshots.</p>
+<p>Before enabling Managed storage, upgrade or stop <strong>all</strong> maintenance clients.
+Older clients can run cleanup through cached handles or unflagged historical
+snapshots and delete adopted sidecars still referenced by newer snapshots.
+The flag cannot revoke those handles or protect those maintenance paths.
+All maintenance after activation therefore requires Managed support.</p>
+<p>Managed kinds use the same descriptor schema in file formats 2.2 and 2.3.
+They preserve the released meanings of kinds 0–3, including nullable <code>kind</code>
+and the External sentinel; logical input validation must not be applied
+retroactively to descriptors. The earlier two-child blob layout retains its
+separate <a href="../../file/encoding/#blob-page-layout">Blob Page Layout</a> read contract.
+Legacy marked binary inputs are adapted as described in the
+<a href="../../../guide/blob/">Blob Columns guide</a>; ordinary unmarked binary columns
+do not become Blob v2. See <a href="../versioning/">Format Versioning</a> for capability
+rules and <a href="../../file/versioning/">File Format Versioning</a> for stability policy.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../schema/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Schema</div>
+        </a>
+        <a class="next" href="../table_config/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Table Config</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#logical-input-values">Logical Input Values</a>
+      <a class="ld-toc__h2" href="#schema">Schema</a>
+      <a class="ld-toc__h3" href="#table-schema">Table Schema</a>
+      <a class="ld-toc__h3" href="#data-file-schema">Data File Schema</a>
+      <a class="ld-toc__h2" href="#descriptor-kinds">Descriptor Kinds</a>
+      <a class="ld-toc__h3" href="#external-resolution">External Resolution</a>
+      <a class="ld-toc__h3" href="#managed-resolution">Managed Resolution</a>
+      <a class="ld-toc__h3" href="#null-descriptors">Null Descriptors</a>
+      <a class="ld-toc__h2" href="#object-layout">Object Layout</a>
+      <a class="ld-toc__h3" href="#managed-object-layout">Managed Object Layout</a>
+      <a class="ld-toc__h3" href="#sidecar-resolution">Sidecar Resolution</a>
+      <a class="ld-toc__h2" href="#writer-policy">Writer Policy</a>
+      <a class="ld-toc__h2" href="#snapshot-lifetime">Snapshot Lifetime</a>
+      <a class="ld-toc__h3" href="#rewrites">Rewrites</a>
+      <a class="ld-toc__h3" href="#garbage-collection">Garbage Collection</a>
+      <a class="ld-toc__h3" href="#clones">Clones</a>
+      <a class="ld-toc__h2" href="#capability-and-compatibility">Capability and Compatibility</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../../file/">File format</a>
+        <a href="../">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>
