@@ -22,6 +22,26 @@ The chosen type is recorded in the index details as `target_data_type`. It is
 carried the type, and for one whose type a later rewrite of the details could
 not recover.
 
+### Row Domain of the Target
+
+The JSON index's own on-disk format version (`JSON_INDEX_VERSION`, recorded in
+`IndexMetadata::index_version` of the JSON index's segment) bumps from 0 to 1
+to record the row domain of the wrapped target. A JSON index segment persisted
+at version 1 wraps a target that was itself built in the row-address domain,
+for target types that support it (see [BTree](btree.md), [Bitmap](bitmap.md),
+[LabelList](label_list.md), and, once migrated, [Inverted](fts.md),
+[NGram](ngram.md), [R-Tree](rtree.md), and [MinHash LSH](minhash_lsh.md)), on a
+dataset with stable row ids enabled. A segment persisted before version 1
+wraps a target in its pre-migration, row-id-domain floor version, regardless
+of target type.
+
+Because the JSON wrapper and its target index are always written by the same
+build, the wrapper segment's own `index_version` is sufficient to recover the
+target's domain: a reader does not need to separately store or infer the
+target's own version. This lifts the restriction under which a JSON-wrapped
+BTree, Bitmap, or LabelList target could not be created or optimized in the
+row-address domain on a stable-row-id dataset.
+
 ## Index Details
 
 ```protobuf

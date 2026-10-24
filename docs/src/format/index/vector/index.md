@@ -53,6 +53,17 @@ The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
+`index_version` also tracks the row domain of the auxiliary file's `_rowid`
+column, independently for each quantization type: `VECTOR_INDEX_VERSION`
+bumps from 1 to 2 for FLAT, PQ, SQ, and HNSW, and `IVF_RQ_INDEX_VERSION` bumps
+from 2 to 3 for RQ. From its new version onward, a segment built on a dataset
+with stable row ids enabled stores the physical row address
+(`fragment_id << 32 | offset`) of each vector in `_rowid` instead of the
+dataset's logical row id; without stable row ids a row id and a row address
+are the same value, so the pre-migration version is kept. A segment persisted
+before its type's new version stores row ids throughout, and merging never
+combines segments of differing domain.
+
 ## Storage Layout (V3)
 
 Each vector index is stored as 2 regular Lance files - index file and auxiliary file.
@@ -180,7 +191,7 @@ No quantization applied - stores original vectors in their full precision:
 
 | Column   | Type                     | Nullable | Description                                           |
 | -------- | ------------------------ | -------- | ----------------------------------------------------- |
-| `_rowid` | uint64                   | true     | Row identifier                                        |
+| `_rowid` | uint64                   | true     | Row identifier (a physical row address from `VECTOR_INDEX_VERSION` 2 onward; a row id in a segment persisted at version 1) |
 | `flat`   | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
 
 ##### PQ
@@ -189,7 +200,7 @@ Compresses vectors using product quantization for significant memory savings:
 
 | Column      | Type                                            | Nullable | Description                                   |
 | ----------- | ----------------------------------------------- | -------- | --------------------------------------------- |
-| `_rowid`    | uint64                                          | true     | Row identifier                                |
+| `_rowid`    | uint64                                          | true     | Row identifier (a physical row address from `VECTOR_INDEX_VERSION` 2 onward; a row id in a segment persisted at version 1) |
 | `__pq_code` | list<uint8>[num_sub_vectors * num_bits / 8]     | true     | PQ codes, packed to `num_bits` per subvector  |
 
 ##### SQ
@@ -198,7 +209,7 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 | Column      | Type                   | Nullable | Description                             |
 | ----------- | ---------------------- | -------- | --------------------------------------- |
-| `_rowid`    | uint64                 | true     | Row identifier                          |
+| `_rowid`    | uint64                 | true     | Row identifier (a physical row address from `VECTOR_INDEX_VERSION` 2 onward; a row id in a segment persisted at version 1) |
 | `__sq_code` | list<uint8>[dimension] | true     | SQ codes (list_size = vector dimension) |
 
 ##### RQ
@@ -207,7 +218,7 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 
 | Column               | Type                                             | Nullable | Present when                | Description                                                     |
 | -------------------- | ------------------------------------------------ | -------- | --------------------------- | --------------------------------------------------------------- |
-| `_rowid`             | uint64                                           | true     | always                      | Row identifier                                                  |
+| `_rowid`             | uint64                                           | true     | always                      | Row identifier (a physical row address from `IVF_RQ_INDEX_VERSION` 3 onward; a row id in a segment persisted at version 2) |
 | `_rabit_codes`       | list<uint8>[ceil(code_dim / 8)]                  | true     | always                      | Binary quantized codes (1 bit per dimension, packed into bytes) |
 | `__add_factors`      | float32                                          | true     | always                      | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | true     | always                      | Scale correction factors for distance computation               |

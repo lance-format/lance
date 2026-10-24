@@ -132,6 +132,16 @@ always comparable. Changing a parameter requires rebuilding the index.
 
 ## Storage Layout
 
+From format version 1 (`minhash_lsh_index_version`) onward, a segment built on
+a dataset with stable row ids enabled stores the physical row address
+(`fragment_id << 32 | offset`) of each document in `_rowid`, instead of the
+dataset's logical row id; without stable row ids a row id and a row address
+are the same value, so the pre-migration version is kept. A segment persisted
+before version 1 stores row ids throughout, as described in
+[Version 0 Reference](#version-0-reference). See
+[Version 1: Row-Address Domain](#version-1-row-address-domain) for the single
+change from version 0.
+
 Each segment consists of two Lance files:
 
 - `signatures.lance` — one row per indexed document: its `_rowid` and its
@@ -323,7 +333,9 @@ pa.schema(
 
 `_rowid` is the row id of the indexed row as the dataset hands it to the
 index: the row address, or the stable row id when the dataset has stable row
-ids enabled, like every scalar index. `signature` is the signature of the
+ids enabled, like every scalar index before its own migration to the
+row-address domain (see
+[Version 1: Row-Address Domain](#version-1-row-address-domain)). `signature` is the signature of the
 [Signature Procedure](#signature-procedure); its values are never null (the
 Lance schema does not record the nullability of a fixed-size list item, so a
 reader treats a null value as corruption of the file). The field metadata of
@@ -418,4 +430,25 @@ with a null value is corruption of `signatures.lance`.
 
 The fragments a segment covers are recorded in the index metadata of the
 dataset, never derived from the stored `_rowid` values (which do not identify
-fragments once stable row ids are enabled).
+fragments once stable row ids are enabled, prior to a segment's own migration
+to the row-address domain).
+
+## Version 1: Row-Address Domain
+
+This section is normative for `minhash_lsh_index_version = 1`. It changes
+nothing in [Version 0 Reference](#version-0-reference) except the values
+stored in the `_rowid` column of `signatures.lance`:
+
+- On a dataset with stable row ids enabled, `_rowid` holds the physical row
+  address (`fragment_id << 32 | offset`) of the indexed row rather than its
+  stable row id. On a dataset without stable row ids, a row id and a row
+  address are the same value, so a segment is still written at version 0.
+- The signature procedure, the band keys, `bands.lance`, the page table, and
+  every schema metadata key are unchanged from version 0.
+- A reader opens a version 1 segment exactly as a version 0 segment (see
+  [Opening a Segment](#opening-a-segment)); only the interpretation of
+  `_rowid` differs, and a reader determines which interpretation applies from
+  `minhash_lsh_index_version` alone, never from the stored values themselves.
+- **Segment merging** combines only segments of identical domain: a merge
+  never mixes a row-id-domain segment with a row-address-domain one, matching
+  the rule already applied to BTree, Bitmap, and LabelList segments.

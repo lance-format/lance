@@ -16,12 +16,18 @@ The N-gram index stores tokenized text as trigrams with their posting lists:
 
 1. `ngram_postings.lance` - Trigram tokens and their posting lists
 
+From format version 1 (`NGRAM_INDEX_VERSION`) onward, a segment built on a
+dataset with stable row ids enabled stores physical row addresses in
+`posting_list` instead of the dataset's logical row id; without stable row
+ids a row id and a row address are the same value, so the pre-migration
+version is kept.
+
 ### File Schema
 
 | Column         | Type   | Nullable | Description                                       |
 |----------------|--------|----------|---------------------------------------------------|
 | `tokens`       | UInt32 | true     | Hashed trigram token                              |
-| `posting_list` | Binary | false    | Compressed bitmap of row IDs containing the token |
+| `posting_list` | Binary | false    | Compressed bitmap of physical row addresses (`fragment_id << 32 \| offset`) containing the token. A segment persisted before format version 1 (`IndexMetadata::index_version`) stores row ids here instead. |
 
 ## Accelerated Queries
 

@@ -66,18 +66,24 @@ The R-Tree index consists of two files:
 1. `page_data.lance` - Stores all pages (leaf, branch) as repeated `(bbox, id)` tuples, written bottom-up (leaves first, then branch levels)
 2. `nulls.lance` - Stores a serialized RowAddrTreeMap of rows with null
 
+From format version 1 (`RTREE_INDEX_VERSION`) onward, a segment built on a
+dataset with stable row ids enabled stores physical row addresses in the
+leaf `id` column and in `nulls.lance` instead of the dataset's logical row
+id; without stable row ids a row id and a row address are the same value, so
+the pre-migration version is kept.
+
 ### Page File Schema
 
 | Column | Type     | Nullable | Description                                                                                                                                                                                                                                                     |
 |:-------|:---------|:---------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `bbox` | RectType | false    | Type is Rect defined by [geoarrow-rs](https://github.com/geoarrow/geoarrow-rs) RectType; physical storage is Struct<xmin: Float64, ymin: Float64, xmax: Float64, ymax: Float64>. Represents the node bounding box (leaf: item bbox; branch: child aggregation). |
-| `id`   | UInt64   | false    | Reuse the `id` column to store `rowid` in leaf pages and `pageid` in branch pages                                                                                                                                                                               |
+| `id`   | UInt64   | false    | Reuse the `id` column to store a physical row address (`fragment_id << 32 \| offset`) in leaf pages and `pageid` in branch pages. A segment persisted before format version 1 (`IndexMetadata::index_version`) stores a row id in leaf pages instead.                                                                                                                                                                               |
 
 ### Nulls File Schema
 
 | Column  | Type   | Nullable | Description                                                  |
 |:--------|:-------|:---------|:-------------------------------------------------------------|
-| `nulls` | Binary | false    | Serialized RowAddrTreeMap of rows with null/invalid geometry |
+| `nulls` | Binary | false    | Serialized RowAddrTreeMap of rows with null/invalid geometry. Holds physical row addresses from format version 1 onward, and row ids in a segment persisted before version 1. |
 
 ### Schema Metadata
 
