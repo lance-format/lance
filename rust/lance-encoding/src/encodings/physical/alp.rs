@@ -1475,23 +1475,15 @@ impl AlpMiniBlockDecompressor {
         let offsets: &[u32] = offsets_buf.as_deref().unwrap_or(&[]);
 
         if delta {
-            let mut cursor = header.base;
-            let mut pos = 0usize;
-            let emit = |enc: i64, out: &mut [u8], pos: &mut usize| {
-                let value = if header.mode & MODE_DIV != 0 {
-                    (enc as i32 as f32) / F10_F32[header.e as usize]
-                } else {
-                    (enc as i32 as f32) * F10_F32[header.f as usize] * IF10_F32[header.e as usize]
-                };
-                let bytes = value.to_bits().to_le_bytes();
-                out[*pos..*pos + 4].copy_from_slice(&bytes);
-                *pos += 4;
-            };
-            emit(cursor, out, &mut pos);
-            for &offset in offsets {
-                cursor = cursor.wrapping_add(offset as i64 + header.delta_base);
-                emit(cursor, out, &mut pos);
-            }
+            restore::restore_delta_chunk32(
+                offsets,
+                header.base,
+                header.delta_base,
+                header.mode & MODE_DIV != 0,
+                header.e as usize,
+                header.f as usize,
+                out,
+            );
         } else {
             restore::restore_chunk32(
                 offsets,
@@ -1535,23 +1527,15 @@ impl AlpMiniBlockDecompressor {
         let offsets: &[u64] = offsets_buf.as_deref().unwrap_or(&[]);
 
         if delta {
-            let mut cursor = header.base;
-            let mut pos = 0usize;
-            let emit = |enc: i64, out: &mut [u8], pos: &mut usize| {
-                let value = if header.mode & MODE_DIV != 0 {
-                    (enc as f64) / F10_F64[header.e as usize]
-                } else {
-                    (enc as f64) * F10_F64[header.f as usize] * IF10_F64[header.e as usize]
-                };
-                let bytes = value.to_bits().to_le_bytes();
-                out[*pos..*pos + 8].copy_from_slice(&bytes);
-                *pos += 8;
-            };
-            emit(cursor, out, &mut pos);
-            for &offset in offsets {
-                cursor = cursor.wrapping_add(offset as i64 + header.delta_base);
-                emit(cursor, out, &mut pos);
-            }
+            restore::restore_delta_chunk64(
+                offsets,
+                header.base,
+                header.delta_base,
+                header.mode & MODE_DIV != 0,
+                header.e as usize,
+                header.f as usize,
+                out,
+            );
         } else {
             restore::restore_chunk64(
                 offsets,
