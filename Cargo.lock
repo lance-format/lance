@@ -183,6 +183,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "argminmax"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "088a9c28ca36500c581f9f54b63460492d2b4f71e1e61d176e8fb79565109b01"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5070,6 +5079,7 @@ name = "lance-linalg"
 version = "15.0.0-beta.1"
 dependencies = [
  "approx",
+ "argminmax",
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
