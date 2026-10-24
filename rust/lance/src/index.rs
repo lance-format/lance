@@ -15739,17 +15739,18 @@ mod tests {
         }
     }
 
-    /// Compactions rewrite fragments 0 and 1 into 4 and 5, 2 and 3 into 6 and
-    /// 7, then 5 and 6 into 8 and 9. The index is caught up past the first
-    /// one, so a cleanup trims its record: 4 and 5 no longer trace to the
-    /// build, and neither do 8 and 9, though their other source, 6, does, as 7
-    /// still does.
+    /// Compactions rewrite fragments 2 and 3 into 4 and 5, then 0 and 1 into
+    /// 6 and 7 (relabeling 4 and 5 to 8 and 9), then 7 and 8 into 10 and 11
+    /// (relabeling 9 to 12). The index is caught up past the first compaction,
+    /// so a cleanup trims its record: 10, 11 and 12 no longer trace to the
+    /// build through 4 and 5, though the shared group's other source, 7, does,
+    /// as 6 still does.
     #[tokio::test]
     async fn test_sources_at_build_fails_on_a_missing_link_beside_a_traced_one() {
         let dir = TempStrDir::default();
         let (mut dataset, built) = recording_btree_table(dir.as_str(), 4).await;
         let version = dataset.manifest.version;
-        let first = compact_into_two(&mut dataset, &[0, 1]).await;
+        let first = compact_into_two(&mut dataset, &[2, 3]).await;
         crate::dataset::optimize::remapping::remap_column_index(
             &mut dataset,
             &["i"],
@@ -15757,8 +15758,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = compact_into_two(&mut dataset, &[2, 3]).await;
-        let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
+        let second = compact_into_two(&mut dataset, &[0, 1]).await;
+        let third = compact_into_two(&mut dataset, &[second[1], 8]).await;
+        assert_eq!(first, [4, 5]);
+        assert_eq!(second, [6, 7]);
+        assert_eq!(third, [10, 11]);
+        assert_eq!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            [6, 10, 11, 12]
+        );
         let trace = |versions: &[FragReuseVersion], fragment: u64| {
             sources_at_build(versions, version, fragment as u32, |id| built.contains(id)).map(
                 |mut sources| {
@@ -15778,13 +15791,13 @@ mod tests {
             .unwrap();
         let kept = dataset.frag_reuse_index().await.unwrap().unwrap();
         assert_eq!(kept.details.versions.len(), 2);
-        for fragment in [first[0], third[0], third[1]] {
+        for fragment in [12, third[0], third[1]] {
             assert_eq!(
                 trace(&kept.details.versions, fragment),
                 None,
                 "fragment {fragment}"
             );
         }
-        assert_eq!(trace(&kept.details.versions, second[1]), Some(vec![2, 3]));
+        assert_eq!(trace(&kept.details.versions, second[0]), Some(vec![0, 1]));
     }
 }
