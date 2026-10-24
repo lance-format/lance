@@ -33,7 +33,7 @@ use crate::dataset::rowids::place_carried_row_lineage;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
 use crate::dataset::write::merge_insert::inserted_rows::{
-    KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
+    KeyExistenceFilter, KeyExistenceFilterBuilder,
 };
 use crate::dataset::write::merge_insert::{
     InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, canonical_source_schema,
@@ -237,14 +237,9 @@ impl MergeState {
                     return Ok(None);
                 }
 
-                // Capture the key value for conflict detection (only for inserts, not updates)
-                if let Some(key_value) =
-                    extract_key_value_from_batch(batch, row_idx, &self.on_columns)
-                {
-                    self.inserted_rows_filter
-                        .insert(key_value)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                }
+                self.inserted_rows_filter
+                    .insert_row(batch, row_idx, &self.on_columns)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 self.metrics.num_inserted_rows.add(1);
                 Ok(Some(row_idx)) // Keep this row for writing
             }
@@ -286,9 +281,6 @@ pub struct FullSchemaMergeInsertExec {
     /// The caller's write parameters for the data files this node writes.
     write_params: Arc<WriteParams>,
     update_if_deferred: bool,
-    /// Whether the ON columns match the schema's unenforced primary key.
-    /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
-    is_primary_key: bool,
 }
 
 impl FullSchemaMergeInsertExec {
@@ -308,20 +300,6 @@ impl FullSchemaMergeInsertExec {
             Boundedness::Bounded,
         ));
 
-        // Check if ON columns match the schema's unenforced primary key
-        let field_ids: Vec<i32> = params
-            .on
-            .iter()
-            .filter_map(|name| dataset.schema().field(name).map(|f| f.id))
-            .collect();
-        let pk_field_ids: Vec<i32> = dataset
-            .schema()
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.id)
-            .collect();
-        let is_primary_key = !pk_field_ids.is_empty() && field_ids == pk_field_ids;
-
         Ok(Self {
             input,
             dataset,
@@ -336,7 +314,6 @@ impl FullSchemaMergeInsertExec {
             source_blob_columns,
             write_params,
             update_if_deferred: false,
-            is_primary_key,
         })
     }
 
@@ -1166,7 +1143,6 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             source_blob_columns: self.source_blob_columns.clone(),
             write_params: self.write_params.clone(),
             update_if_deferred: self.update_if_deferred,
-            is_primary_key: self.is_primary_key,
         }))
     }
 
@@ -1284,7 +1260,6 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let source_blob_columns = self.source_blob_columns.clone();
         let caller_write_params = self.write_params.clone();
-        let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
             state.updating_row_ids.clone()
@@ -1365,13 +1340,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let merge_state =
                 Mutex::into_inner(merge_state).expect("MergeState lock should be available");
             let delete_row_addrs_clone = merge_state.delete_row_addrs;
-            let inserted_rows_filter = if is_primary_key {
-                Some(KeyExistenceFilter::from_bloom_filter(
-                    &merge_state.inserted_rows_filter,
-                ))
-            } else {
-                None
-            };
+            let inserted_rows_filter = Some(merge_state.inserted_rows_filter.build());
 
             let (updated_fragments, removed_fragment_ids) =
                 match apply_deletions(&dataset, &delete_row_addrs_clone).await {
