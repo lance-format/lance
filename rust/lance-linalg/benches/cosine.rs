@@ -88,10 +88,14 @@ fn bench_distance(c: &mut Criterion) {
         const DIMENSION: usize = 1024;
         const TOTAL: usize = 1024 * 1024;
         let mut rng = rand::rng();
-        let key_u8: Vec<u8> = repeat_with(|| rng.random()).take(DIMENSION).collect();
-        let target_u8: Vec<u8> = repeat_with(|| rng.random())
-            .take(TOTAL * DIMENSION)
+        // Slice 64-byte-aligned views out of padded buffers: zmm loads split cache
+        // lines on misaligned inputs, so results depended on heap placement.
+        let key_buf: Vec<u8> = repeat_with(|| rng.random()).take(DIMENSION + 63).collect();
+        let key_u8 = &key_buf[key_buf.as_ptr().align_offset(64)..][..DIMENSION];
+        let target_buf: Vec<u8> = repeat_with(|| rng.random())
+            .take(TOTAL * DIMENSION + 63)
             .collect();
+        let target_u8 = &target_buf[target_buf.as_ptr().align_offset(64)..][..TOTAL * DIMENSION];
 
         c.bench_function("Cosine(u8, scalar)", |b| {
             b.iter(|| {
@@ -100,7 +104,7 @@ fn bench_distance(c: &mut Criterion) {
                         .as_chunks::<DIMENSION>()
                         .0
                         .iter()
-                        .map(|tgt| cosine_u8_scalar(&key_u8, tgt))
+                        .map(|tgt| cosine_u8_scalar(key_u8, tgt))
                         .fold(0.0, |acc: f32, v| acc + v),
                 );
             });
@@ -113,7 +117,7 @@ fn bench_distance(c: &mut Criterion) {
                         .as_chunks::<DIMENSION>()
                         .0
                         .iter()
-                        .map(|tgt| cosine_u8(&key_u8, tgt))
+                        .map(|tgt| cosine_u8(key_u8, tgt))
                         .fold(0.0, |acc: f32, v| acc + v),
                 );
             });
