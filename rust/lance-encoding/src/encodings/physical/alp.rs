@@ -45,6 +45,8 @@
 //! or above the raw size, or any chunk exceeding `MAX_MINIBLOCK_BYTES`) falls
 //! back to the flat [`ValueEncoder`], guaranteeing ALP never enlarges data.
 
+mod restore;
+
 use std::fmt::Debug;
 
 use crate::buffer::LanceBuffer;
@@ -1491,18 +1493,14 @@ impl AlpMiniBlockDecompressor {
                 emit(cursor, out, &mut pos);
             }
         } else {
-            let mut pos = 0usize;
-            for &offset in offsets {
-                let enc = (header.base + offset as i64) as i32;
-                let value = if header.mode & MODE_DIV != 0 {
-                    (enc as f32) / F10_F32[header.e as usize]
-                } else {
-                    (enc as f32) * F10_F32[header.f as usize] * IF10_F32[header.e as usize]
-                };
-                let bytes = value.to_bits().to_le_bytes();
-                out[pos..pos + 4].copy_from_slice(&bytes);
-                pos += 4;
-            }
+            restore::restore_chunk32(
+                offsets,
+                header.base,
+                header.mode & MODE_DIV != 0,
+                header.e as usize,
+                header.f as usize,
+                out,
+            );
         }
         Ok(())
     }
@@ -1555,18 +1553,14 @@ impl AlpMiniBlockDecompressor {
                 emit(cursor, out, &mut pos);
             }
         } else {
-            let mut pos = 0usize;
-            for &offset in offsets {
-                let enc = header.base.wrapping_add(offset as i64);
-                let value = if header.mode & MODE_DIV != 0 {
-                    (enc as f64) / F10_F64[header.e as usize]
-                } else {
-                    (enc as f64) * F10_F64[header.f as usize] * IF10_F64[header.e as usize]
-                };
-                let bytes = value.to_bits().to_le_bytes();
-                out[pos..pos + 8].copy_from_slice(&bytes);
-                pos += 8;
-            }
+            restore::restore_chunk64(
+                offsets,
+                header.base,
+                header.mode & MODE_DIV != 0,
+                header.e as usize,
+                header.f as usize,
+                out,
+            );
         }
         Ok(())
     }
