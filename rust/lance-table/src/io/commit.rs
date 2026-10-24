@@ -379,15 +379,36 @@ pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version
 /// Read the latest version from the hint file, or `None` if it does not exist
 /// or cannot be parsed.
 async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
-    let bytes = object_store
-        .inner
-        .get(&version_hint_path(base))
-        .await
-        .ok()?
-        .bytes()
-        .await
-        .ok()?;
-    Some(serde_json::from_slice::<VersionHint>(&bytes).ok()?.version)
+    read_version_hint(object_store, base).await.ok().flatten()
+}
+
+/// Read the version hint for retention planning, distinguishing absence from
+/// storage and decoding failures. A missing hint returns `Ok(None)`.
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_io::object_store::ObjectStore;
+/// # use lance_table::io::commit::read_version_hint;
+/// # use object_store::path::Path;
+/// # async fn example(store: &ObjectStore, base: &Path) -> Result<()> {
+/// let version = read_version_hint(store, base).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn read_version_hint(object_store: &ObjectStore, base: &Path) -> Result<Option<u64>> {
+    let result = match object_store.inner.get(&version_hint_path(base)).await {
+        Ok(result) => result,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = result.bytes().await?;
+    let hint = serde_json::from_slice::<VersionHint>(&bytes).map_err(|error| {
+        Error::invalid_input(format!(
+            "Invalid version hint at {}: {error}",
+            version_hint_path(base)
+        ))
+    })?;
+    Ok(Some(hint.version))
 }
 
 /// Read the version hint and probe upward to find the true latest manifest.

@@ -15,11 +15,17 @@ package org.lance;
 
 import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
+import org.lance.cleanup.CleanupRule;
 import org.lance.cleanup.RemovalStats;
+import org.lance.util.JsonUtils;
 
 import org.apache.arrow.util.Preconditions;
 
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * A cleanup operation with separate read-only explain and destructive execute actions.
@@ -33,10 +39,43 @@ public class CleanupOperation {
   private Optional<Long> deleteConcurrency = Optional.empty();
   private Optional<Long> deleteRateLimit = Optional.empty();
   private Optional<Long> maxCandidateFiles = Optional.empty();
+  private Optional<String> retentionPolicyJson = Optional.empty();
 
   CleanupOperation(Dataset dataset, CleanupPolicy policy) {
     this.dataset = Preconditions.checkNotNull(dataset, "dataset cannot be null");
     this.policy = Preconditions.checkNotNull(policy, "policy cannot be null");
+    this.retentionPolicyJson = policy.getRules().map(CleanupOperation::serializeRules);
+  }
+
+  /**
+   * Keep the newest eligible commit per UTC epoch-aligned interval after the given age, breaking
+   * timestamp ties by version. The age must be at least two days, measured from the hinted commit
+   * timestamp (or this dataset's commit without a hint). The hinted version and later versions are
+   * protected from thinning. The policy's beforeTimestampMillis independently expires all older
+   * versions, including sampled commits. Version filters limit both operations; tags, current
+   * versions and branch dependencies remain protected. The delay bounds exposure to delayed hint
+   * writes; it does not make hint updates monotonic.
+   *
+   * <p>Example: {@code dataset.cleanup(policy).withKeepOne(Duration.ofDays(1),
+   * Duration.ofDays(2)).execute()}.
+   *
+   * @param perInterval positive bucket width with millisecond precision
+   * @param olderThan full-history window, at least two days with millisecond precision
+   * @return this operation for chaining
+   */
+  public CleanupOperation withKeepOne(Duration perInterval, Duration olderThan) {
+    this.retentionPolicyJson =
+        Optional.of(serializeRules(List.of(CleanupRule.keepOne(perInterval, olderThan))));
+    return this;
+  }
+
+  private static String serializeRules(List<CleanupRule> rules) {
+    return JsonUtils.toJson(
+        Map.of(
+            "rules",
+            rules.stream()
+                .map(rule -> Preconditions.checkNotNull(rule, "rule cannot be null").toConfig())
+                .collect(Collectors.toList())));
   }
 
   /**
@@ -94,7 +133,7 @@ public class CleanupOperation {
    * @return cleanup explanation
    */
   public CleanupExplanation explain() {
-    return dataset.explainCleanup(policy, maxCandidateFiles);
+    return dataset.explainCleanup(policy, maxCandidateFiles, retentionPolicyJson);
   }
 
   /**
@@ -103,6 +142,6 @@ public class CleanupOperation {
    * @return removal stats
    */
   public RemovalStats execute() {
-    return dataset.executeCleanup(policy, deleteConcurrency, deleteRateLimit);
+    return dataset.executeCleanup(policy, deleteConcurrency, deleteRateLimit, retentionPolicyJson);
   }
 }

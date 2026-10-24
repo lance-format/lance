@@ -157,12 +157,63 @@ pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSA
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
 
+/// Validate that automatic retention cleanup cannot activate in older writers.
+///
+/// Retention rules use `lance.auto_cleanup.policy_interval`; the legacy interval
+/// must be absent. Call before publishing table configuration.
+///
+/// ```
+/// # use lance_table::{feature_flags::validate_auto_cleanup_config, format::Manifest};
+/// # fn check(manifest: &Manifest) -> lance_core::Result<()> {
+/// validate_auto_cleanup_config(manifest)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_auto_cleanup_config(manifest: &Manifest) -> Result<()> {
+    let has_retention_config = manifest.config.contains_key("lance.auto_cleanup.policy")
+        || manifest
+            .config
+            .keys()
+            .any(|key| key.starts_with("lance.auto_cleanup.keep_one."));
+    let has_policy_interval = manifest
+        .config
+        .contains_key("lance.auto_cleanup.policy_interval");
+    if (has_retention_config || has_policy_interval)
+        && manifest.config.contains_key("lance.auto_cleanup.interval")
+    {
+        return Err(Error::invalid_input(
+            "retention rules require lance.auto_cleanup.policy_interval; remove lance.auto_cleanup.interval before activating retention cleanup",
+        ));
+    }
+    for key in manifest.config.keys() {
+        if key.starts_with("lance.auto_cleanup.keep_one.")
+            && key != "lance.auto_cleanup.keep_one.per_interval"
+            && key != "lance.auto_cleanup.keep_one.older_than"
+        {
+            return Err(Error::invalid_input(format!(
+                "Unknown retention configuration key: {key}"
+            )));
+        }
+    }
+    let has_rules = manifest.config.contains_key("lance.auto_cleanup.policy")
+        || manifest
+            .config
+            .contains_key("lance.auto_cleanup.keep_one.per_interval");
+    if has_policy_interval && !has_rules {
+        return Err(Error::invalid_input(
+            "lance.auto_cleanup.policy_interval requires a cleanup policy or keep_one rules",
+        ));
+    }
+    Ok(())
+}
+
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
     manifest: &mut Manifest,
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
+    validate_auto_cleanup_config(manifest)?;
     // Carried across the reset: a `Manifest` only points at its index section,
     // so whether any index declares covering columns is not visible here.
     // `build_manifest` decides it from the index list it is committing and sets
@@ -468,6 +519,62 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::format::BasePath;
+
+    #[rstest::rstest]
+    #[case::missing(None, "requires a cleanup policy")]
+    #[case::age_only(
+        Some("lance.auto_cleanup.keep_one.older_than"),
+        "requires a cleanup policy"
+    )]
+    #[case::typo(
+        Some("lance.auto_cleanup.keep_one.per_intervl"),
+        "Unknown retention configuration key"
+    )]
+    fn retention_activation_requires_valid_rule_keys(
+        #[case] key: Option<&str>,
+        #[case] message: &str,
+    ) {
+        let mut manifest = empty_manifest();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.policy_interval".into(), "1".into());
+        if let Some(key) = key {
+            manifest.config.insert(key.into(), "2days".into());
+        }
+        let error = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message));
+    }
+
+    #[rstest::rstest]
+    #[case::policy(
+        "lance.auto_cleanup.policy",
+        r#"{"rules":[{"type":"remove_all","older_than":"30days"}]}"#
+    )]
+    #[case::shorthand("lance.auto_cleanup.keep_one.per_interval", "1day")]
+    fn retention_auto_cleanup_rejects_legacy_activation(#[case] key: &str, #[case] value: &str) {
+        let mut manifest = empty_manifest();
+        manifest.config.insert(key.into(), value.into());
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".into(), "1".into());
+        let error = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("policy_interval"));
+        manifest.config.remove("lance.auto_cleanup.interval");
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.policy_interval".into(), "1".into());
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        manifest.config.remove(key);
+        let error = apply_feature_flags(&mut manifest, false, false).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("requires a cleanup policy"));
+    }
+
     #[rstest::rstest]
     #[case::absent(None, false)]
     #[case::disabled(Some("false"), false)]
@@ -530,9 +637,6 @@ mod tests {
         // A build whose boundary is still 128 refuses the bit, which is the fence;
         // the module-level `const _` assertion keeps it at or above that boundary.
     }
-
-    use super::*;
-    use crate::format::BasePath;
 
     #[test]
     fn test_object_metadata_flag_fences_writes_without_blocking_reads() {
