@@ -114,6 +114,16 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     fn with_coalesce_gap(&self, _gap: u64) -> Option<Arc<dyn EncodingsIo>> {
         None
     }
+
+    /// How many bytes the scan behind this I/O service reads ahead of the
+    /// decoder before it waits for the decoder to consume them (the scan's
+    /// `io_buffer_size`): `Some(0)` if it never waits, and `None` if this
+    /// implementation has no such budget. A service from
+    /// [`Self::with_bypass_backpressure`] reports the same budget, although its
+    /// own reads never wait on it.
+    fn io_buffer_size(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer
