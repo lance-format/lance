@@ -25,13 +25,19 @@ const PQ: usize = DIM / 8;
 const TOTAL: usize = 16 * 1000;
 
 fn construct_dist_table(c: &mut Criterion) {
-    construct_dist_table_for_type::<Float16Type>(c, "f16");
-    construct_dist_table_for_type::<Float32Type>(c, "f32");
-    construct_dist_table_for_type::<Float64Type>(c, "f64");
+    // Sub-vector dimensions 8 and 16.
+    for num_sub_vectors in [PQ, PQ / 2] {
+        construct_dist_table_for_type::<Float16Type>(c, "f16", num_sub_vectors);
+        construct_dist_table_for_type::<Float32Type>(c, "f32", num_sub_vectors);
+        construct_dist_table_for_type::<Float64Type>(c, "f64", num_sub_vectors);
+    }
 }
 
-fn construct_dist_table_for_type<T: ArrowFloatType>(c: &mut Criterion, type_name: &str)
-where
+fn construct_dist_table_for_type<T: ArrowFloatType>(
+    c: &mut Criterion,
+    type_name: &str,
+    num_sub_vectors: usize,
+) where
     T::Native: L2 + Dot,
     T::ArrayType: FloatArray<T>,
 {
@@ -42,7 +48,7 @@ where
         format!(
             "construct_dist_table: {},PQ={},DIM={},type={}",
             DistanceType::L2,
-            PQ,
+            num_sub_vectors,
             DIM,
             type_name
         )
@@ -52,7 +58,7 @@ where
                 black_box(build_distance_table_l2(
                     codebook.as_slice(),
                     8,
-                    PQ,
+                    num_sub_vectors,
                     query.as_slice(),
                 ));
             })
@@ -63,7 +69,7 @@ where
         format!(
             "construct_dist_table: {},PQ={},DIM={},type={}",
             DistanceType::Dot,
-            PQ,
+            num_sub_vectors,
             DIM,
             type_name
         )
@@ -73,7 +79,7 @@ where
                 black_box(build_distance_table_dot(
                     codebook.as_slice(),
                     8,
-                    PQ,
+                    num_sub_vectors,
                     query.as_slice(),
                 ));
             })

@@ -774,7 +774,7 @@ fn inner_create_lookup_planner(
         None => get_pk_columns(&dataset)?,
     };
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
-    // A sealed generation stores the names it was written with, so the planner
+    // A flushed generation stores the names it was written with, so the planner
     // resolves its columns by id; `base_schema` carries none. Built before the
     // collector takes the dataset.
     let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));
@@ -1357,7 +1357,7 @@ fn write_stats_to_java<'a>(
 ) -> Result<JObject<'a>> {
     Ok(env.new_object(
         "org/lance/memwal/WriteStats",
-        "(JJJJJJJJ)V",
+        "(JJJJJJJJJ)V",
         &[
             JValueGen::Long(stats.put_count as i64),
             JValueGen::Long(stats.put_time.as_millis() as i64),
@@ -1367,6 +1367,7 @@ fn write_stats_to_java<'a>(
             JValueGen::Long(stats.memtable_flush_count as i64),
             JValueGen::Long(stats.memtable_flush_rows as i64),
             JValueGen::Long(stats.memtable_flush_time.as_millis() as i64),
+            JValueGen::Long(stats.memtable_flush_failures as i64),
         ],
     )?)
 }

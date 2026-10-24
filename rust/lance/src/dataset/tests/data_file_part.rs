@@ -20,6 +20,7 @@ use lance_core::{
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
 use rstest::rstest;
 
@@ -507,6 +508,7 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
 #[case::blob_registered(true, Some(7))]
 #[tokio::test]
 async fn restores_target_and_completed_parts_from_checkpoint(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
     #[case] has_blob: bool,
     #[case] base_id: Option<u32>,
 ) {
@@ -538,7 +540,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
             RecordBatchIterator::new([Ok(original.clone())], original.schema()),
             dataset_uri.as_str(),
             Some(WriteParams {
-                data_storage_version: Some(LanceFileVersion::V2_2),
+                data_storage_version: Some(version),
                 max_rows_per_file: 2,
                 initial_bases: base_id.map(|id| {
                     vec![BasePath {
@@ -782,10 +784,13 @@ async fn complete_logical_blob_schema_and_external_range_survive_assembly() {
 
 #[tokio::test]
 async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        blob_field("blob", true),
-    ]));
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field("blob", true),
+        ],
+        HashMap::from([(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string())]),
+    ));
     let make_batch = |ids: Vec<i32>, values: Vec<&'static [u8]>| {
         let mut blobs = BlobArrayBuilder::new(values.len());
         for value in values {
@@ -837,14 +842,12 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
     let mut invalid = serde_json::to_value(&first).unwrap();
     invalid["blob_ids"] = serde_json::json!({"start": 20, "end": 30});
     let invalid: DataFilePart = serde_json::from_value(invalid).unwrap();
-    let error = dataset
+    // Managed references use base IDs, so their identity is independent of the
+    // file-local sidecar lease recorded in the checkpoint.
+    dataset
         .concat_data_file_parts(&target, &[invalid])
         .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("outside declared range"),
-        "{error}"
-    );
+        .unwrap();
     let second = write_part(
         &dataset,
         &target,

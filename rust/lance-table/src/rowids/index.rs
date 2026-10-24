@@ -557,6 +557,15 @@ fn decompose_segment_no_deletions(segment: &U64Segment, start_address: u64) -> O
             let coverage = range.start..=range.end - 1;
             Some((coverage, (row_id_segment, address_segment)))
         }
+        U64Segment::Ranges { .. } if !segment.is_empty() => {
+            // Without deletions, a live ID's position is also its physical
+            // offset within this segment.
+            let row_id_segment = segment.clone();
+            let address_segment =
+                U64Segment::Range(start_address..start_address + row_id_segment.len() as u64);
+            let coverage = row_id_segment.range()?;
+            Some((coverage, (row_id_segment, address_segment)))
+        }
         _ if segment.is_empty() => None,
         _ => {
             // Non-Range segments: must iterate to build address mapping.
@@ -799,6 +808,100 @@ mod tests {
             index.get(6).unwrap(),
             Some(RowAddress::new_from_parts(1, 3))
         );
+    }
+
+    #[test]
+    fn test_merged_index_keeps_ranges_segments_compact() {
+        let row_id_ranges = [100..103, 108..110, 115..119];
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(50..53),
+            U64Segment::from_sorted_ranges(&row_id_ranges).unwrap(),
+        ]);
+        let source = fragment(7, sequence);
+        let index = RowIdIndex::new(std::slice::from_ref(&source)).unwrap();
+
+        let merged = index.merged.as_ref().expect("small input should be merged");
+        assert!(matches!(
+            merged.get(&100).unwrap().0,
+            U64Segment::Ranges { .. }
+        ));
+
+        for (row_id, row_offset) in [
+            (50, 0),
+            (51, 1),
+            (52, 2),
+            (100, 3),
+            (101, 4),
+            (102, 5),
+            (108, 6),
+            (109, 7),
+            (115, 8),
+            (116, 9),
+            (117, 10),
+            (118, 11),
+        ] {
+            assert_eq!(
+                index.get(row_id).unwrap(),
+                Some(RowAddress::new_from_parts(7, row_offset)),
+                "row id {row_id}"
+            );
+        }
+        for missing in [49, 53, 99, 103, 107, 110, 114, 119, 120] {
+            assert_eq!(index.get(missing).unwrap(), None, "row id {missing}");
+        }
+        assert_eq!(
+            index.get_many(&[108, 53, 100, 108]).unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(7, 6)),
+                None,
+                Some(RowAddress::new_from_parts(7, 3)),
+                Some(RowAddress::new_from_parts(7, 6)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_overlapping_ranges_chunks_keep_row_addresses() {
+        let left_ranges = [100..103, 108..110, 115..119];
+        let right_ranges = [103..108, 110..115];
+        let sources = [
+            fragment(
+                7,
+                RowIdSequence(vec![U64Segment::from_sorted_ranges(&left_ranges).unwrap()]),
+            ),
+            fragment(
+                8,
+                RowIdSequence(vec![U64Segment::from_sorted_ranges(&right_ranges).unwrap()]),
+            ),
+        ];
+        let index = RowIdIndex::new(&sources).unwrap();
+
+        for row_id in 100..119 {
+            let (fragment_id, row_offset) = if (100..103).contains(&row_id)
+                || (108..110).contains(&row_id)
+                || (115..119).contains(&row_id)
+            {
+                let row_offset = match row_id {
+                    100..=102 => row_id - 100,
+                    108..=109 => row_id - 105,
+                    115..=118 => row_id - 110,
+                    _ => unreachable!(),
+                };
+                (7, row_offset)
+            } else {
+                let row_offset = match row_id {
+                    103..=107 => row_id - 103,
+                    110..=114 => row_id - 105,
+                    _ => unreachable!(),
+                };
+                (8, row_offset)
+            };
+            assert_eq!(
+                index.get(row_id).unwrap(),
+                Some(RowAddress::new_from_parts(fragment_id, row_offset as u32)),
+                "row id {row_id}"
+            );
+        }
     }
 
     #[test]

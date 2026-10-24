@@ -415,6 +415,7 @@ impl UpdateJob {
                 self.dataset.schema(),
                 scan_schema.as_ref(),
                 false,
+                false,
             )?);
             let output_schema = rewrite_plan.output_schema().clone();
             let dataset = self.dataset.clone();
@@ -1033,6 +1034,12 @@ mod tests {
                 Err(Error::InvalidInput { .. })
             ),
             "Should return error if update expression references non-existent column"
+        );
+
+        let err = builder.clone().set("id", "coalesce(id), 0").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }) && err.to_string().contains("not valid"),
+            "Should return error instead of keeping only the first of two expressions, got {err}"
         );
 
         assert!(
@@ -1670,11 +1677,12 @@ mod tests {
             .await
             .unwrap();
 
-        let scalar_params = ScalarIndexParams::default();
+        // Need to use a row-id-domain index (while we still have one)
+        let scalar_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
         dataset
             .create_index(
                 &["str"],
-                IndexType::Scalar,
+                IndexType::NGram,
                 Some("str_idx".to_string()),
                 &scalar_params,
                 true,
@@ -1763,6 +1771,7 @@ mod tests {
     #[rstest]
     #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i < 100", 100)]
     #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::btree(BuiltinIndexType::BTree, IndexType::BTree, "i", "i < 100", 100)]
     #[case::fm(
         BuiltinIndexType::Fm,
         IndexType::Fm,

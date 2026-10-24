@@ -6,6 +6,7 @@ import random
 import re
 import threading
 from pathlib import Path
+from typing import Optional
 
 import lance
 import numpy as np
@@ -542,41 +543,131 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     assert index_frag_ids[0] in frag_ids
 
 
-def test_defer_index_remap(tmp_path: Path):
+SRID_RECORDING_REFUSED = "not supported by this build of Lance"
+
+
+@pytest.fixture(scope="module")
+def srid_recording_enabled() -> bool:
+    """Whether this build records row-address moves with stable row ids.
+
+    Found by compacting, as the gate is lance-table's debug assertions, which
+    CI's profile turns off for lance-table but not for pylance.
+    """
+    dataset = lance.write_dataset(
+        pa.table({"i": range(4)}),
+        "memory://srid_recording_probe",
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    try:
+        metrics = dataset.optimize.compact_files(defer_index_remap=True)
+    except OSError as error:
+        if SRID_RECORDING_REFUSED not in str(error):
+            raise
+        return False
+    assert metrics.fragments_removed == 2
+    assert any(idx.name == "__lance_frag_reuse" for idx in dataset.describe_indices())
+    return True
+
+
+def assert_nothing_recorded(base_dir: Path, version: int):
+    dataset = lance.dataset(base_dir)
+    assert dataset.version == version
+    assert not any(
+        idx.name == "__lance_frag_reuse" for idx in dataset.describe_indices()
+    )
+
+
+@pytest.mark.parametrize(
+    ("enable_stable_row_ids", "index_type"),
+    [(False, "BTREE"), (True, "ZONEMAP"), (True, None)],
+)
+def test_defer_index_remap(
+    tmp_path: Path,
+    enable_stable_row_ids: bool,
+    index_type: Optional[str],
+    srid_recording_enabled: bool,
+):
     base_dir = tmp_path / "dataset"
     data = pa.table({"i": range(6_000), "val": range(6_000)})
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
-    dataset.create_scalar_index("i", "BTREE")
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=1_000,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    if index_type is not None:
+        dataset.create_scalar_index("i", index_type)
     options = dict(
         target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
     )
 
     dataset.delete("i < 500")
+    before = dataset.scanner(
+        columns=["i"], with_row_id=True, with_row_address=True
+    ).to_table()
+    if enable_stable_row_ids and not srid_recording_enabled:
+        with pytest.raises(OSError, match=SRID_RECORDING_REFUSED):
+            dataset.optimize.compact_files(**options)
+        assert_nothing_recorded(base_dir, dataset.version)
+        return
     dataset.optimize.compact_files(**options)
 
     dataset = lance.dataset(base_dir)
     indices = dataset.describe_indices()
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
+    after = dataset.scanner(
+        columns=["i"], with_row_id=True, with_row_address=True
+    ).to_table()
+    new_addrs = dict(zip(after["i"].to_pylist(), after["_rowaddr"].to_pylist()))
+    remapped = dataset.remap_row_addrs(
+        pa.array(before["_rowaddr"].to_pylist(), pa.uint64())
+    ).to_pylist()
+    assert remapped == [new_addrs[i] for i in before["i"].to_pylist()]
+    if enable_stable_row_ids:
+        assert sorted(after["_rowid"].to_pylist()) == sorted(
+            before["_rowid"].to_pylist()
+        )
 
+
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
 @pytest.mark.parametrize("use_commit_options", [True, False])
-def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options: bool):
+def test_defer_index_remap_via_commit_options(
+    tmp_path: Path,
+    use_commit_options: bool,
+    enable_stable_row_ids: bool,
+    srid_recording_enabled: bool,
+):
     """Compaction.commit respects defer_index_remap passed in options.
 
     When options={"defer_index_remap": True} is supplied to Compaction.commit
     the __lance_frag_reuse system index must appear in describe_indices().
-    When the option is omitted (default) no such system index is written.
+    When the option is omitted (default) no such system index is written,
+    unless the tasks were planned with defer_index_remap on stable row ids.
     """
     base_dir = tmp_path / f"dataset_commit_opts_{use_commit_options}"
     data = pa.table({"i": range(6_000), "val": range(6_000)})
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
-    dataset.create_scalar_index("i", "BTREE")
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=1_000,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    dataset.create_scalar_index("i", "ZONEMAP" if enable_stable_row_ids else "BTREE")
     dataset.delete("i < 500")
 
-    plan = Compaction.plan(
-        dataset,
-        options=dict(target_rows_per_fragment=2_000, num_threads=1),
+    plan_options = dict(
+        target_rows_per_fragment=2_000,
+        num_threads=1,
+        defer_index_remap=enable_stable_row_ids,
     )
+    if enable_stable_row_ids and not srid_recording_enabled:
+        with pytest.raises(OSError, match=SRID_RECORDING_REFUSED):
+            Compaction.plan(dataset, options=plan_options)
+        assert_nothing_recorded(base_dir, dataset.version)
+        return
+    plan = Compaction.plan(dataset, options=plan_options)
     rewrites = [task.execute(dataset) for task in plan.tasks]
 
     if use_commit_options:
@@ -588,16 +679,46 @@ def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options
     indices = dataset.describe_indices()
     has_frag_reuse = any(idx.name == "__lance_frag_reuse" for idx in indices)
 
-    if use_commit_options:
+    if use_commit_options or enable_stable_row_ids:
         assert has_frag_reuse, (
             "expected __lance_frag_reuse system index when defer_index_remap=True "
-            "is passed to Compaction.commit"
+            "is passed to Compaction.commit or the tasks recorded their moves"
         )
     else:
         assert not has_frag_reuse, (
             "did not expect __lance_frag_reuse system index when options is omitted "
             "from Compaction.commit"
         )
+
+
+def test_defer_index_remap_with_stable_row_ids_allows_only_address_indices(
+    tmp_path: Path, srid_recording_enabled: bool
+):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"i": range(3_000), "category": ["a", "b", "c"] * 1_000})
+    dataset = lance.write_dataset(
+        data, base_dir, max_rows_per_file=1_000, enable_stable_row_ids=True
+    )
+    dataset.create_scalar_index("category", "BITMAP")
+    options = dict(target_rows_per_fragment=3_000, defer_index_remap=True)
+    refusal = "category_idx" if srid_recording_enabled else SRID_RECORDING_REFUSED
+    with pytest.raises(OSError, match=refusal):
+        dataset.optimize.compact_files(**options)
+
+    dataset.drop_index("category_idx")
+    if not srid_recording_enabled:
+        with pytest.raises(OSError, match=SRID_RECORDING_REFUSED):
+            dataset.optimize.compact_files(**options)
+        assert_nothing_recorded(base_dir, dataset.version)
+        assert dataset.to_table(filter="i = 7")["i"].to_pylist() == [7]
+        return
+    dataset.optimize.compact_files(**options)
+    assert any(idx.name == "__lance_frag_reuse" for idx in dataset.describe_indices())
+    for index_type in ["BITMAP", "BTREE"]:
+        with pytest.raises(ValueError, match="fragment reuse index"):
+            dataset.create_scalar_index("i", index_type)
+    dataset.create_scalar_index("i", "ZONEMAP")
+    assert dataset.to_table(filter="i = 7")["i"].to_pylist() == [7]
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")

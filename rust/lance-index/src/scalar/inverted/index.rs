@@ -111,6 +111,7 @@ mod posting_list;
 mod posting_prewarm;
 mod posting_reader;
 mod prewarm;
+mod scheduling;
 mod search;
 mod search_candidates;
 mod token_set;

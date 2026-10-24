@@ -14,7 +14,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{DataOverlayGroup, Operation, Transaction, UpdateMode},
+    dataset::transaction::{DataOverlayGroup, Operation, RewriteGroup, Transaction, UpdateMode},
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
@@ -23,6 +23,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
+use lance_table::format::overlay::staleness::overlay_affects_index;
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
@@ -57,6 +58,10 @@ pub struct TransactionRebase<'a> {
     current_lineage: Option<TaggedLineage>,
     /// The latest manifest's live fragments, loaded with `current_lineage`.
     current_live: Option<RoaringBitmap>,
+    /// The latest manifest's untagged fragment reuse index, as a CreateIndex
+    /// on an untagged table sees it (empty when the table has none). Loaded by
+    /// [`Self::load_current_lineage`]; `None` otherwise.
+    untagged_reuse: Option<Box<UntaggedReuse>>,
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
     /// struct is rewritten whole while an index on a child records the
@@ -276,6 +281,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    untagged_reuse: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments,
@@ -312,6 +318,7 @@ impl<'a> TransactionRebase<'a> {
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
+                        untagged_reuse: None,
                         current_live: None,
                         current_schema: None,
                         read_fragments: None,
@@ -332,6 +339,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    untagged_reuse: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -370,6 +378,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    untagged_reuse: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -392,6 +401,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    untagged_reuse: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -414,6 +424,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    untagged_reuse: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -435,6 +446,7 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_base: None,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                     current_lineage: None,
+                    untagged_reuse: None,
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
@@ -539,6 +551,7 @@ impl<'a> TransactionRebase<'a> {
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
         else {
+            self.load_untagged_reuse(dataset, &indices).await?;
             return Ok(());
         };
         let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?;
@@ -546,6 +559,79 @@ impl<'a> TransactionRebase<'a> {
         self.current_live = Some(dataset.fragment_bitmap.as_ref().clone());
         self.current_schema = Some(dataset.schema().clone());
         Ok(())
+    }
+
+    /// The untagged counterpart of the tagged lineage. Skipped when the
+    /// CreateIndex writes the fragment reuse index itself, which
+    /// `finish_create_index` checks, or the MemWAL index, which covers no
+    /// fragments.
+    async fn load_untagged_reuse(
+        &mut self,
+        dataset: &Dataset,
+        indices: &[IndexMetadata],
+    ) -> Result<()> {
+        let Operation::CreateIndex { new_indices, .. } = &self.transaction.operation else {
+            return Ok(());
+        };
+        if new_indices
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME || index.name == MEM_WAL_INDEX_NAME)
+        {
+            return Ok(());
+        }
+        let entry = indices
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
+        if lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+            &dataset.manifest,
+            entry,
+        ) {
+            return Ok(());
+        }
+        let mut reuse = UntaggedReuse {
+            groups: HashSet::new(),
+            sources: HashMap::new(),
+            manifest: dataset.manifest.clone(),
+        };
+        if let Some(entry) = entry {
+            let details = load_frag_reuse_index_details(dataset, entry).await?;
+            for group in details
+                .versions
+                .iter()
+                .flat_map(|version| version.groups.iter())
+            {
+                let old: Arc<[u64]> = sorted_ids(group.old_frags.iter().map(|f| f.id)).into();
+                for new in &group.new_frags {
+                    reuse.sources.insert(new.id as u32, old.clone());
+                }
+                reuse.groups.insert(old);
+            }
+        }
+        self.untagged_reuse = Some(Box::new(reuse));
+        Ok(())
+    }
+
+    /// Whether a version cleaned up from this attempt's window could hide a
+    /// change this CreateIndex must account for: it covers the source fragments
+    /// of a recorded deferred compaction, whose values must stay unchanged from
+    /// the build until that compaction read them, and its output's after.
+    /// Compactions before the build do not count: the index covers their
+    /// output under its own id.
+    pub(crate) fn needs_versions(&self, missing: &[u64]) -> bool {
+        let (Some(reuse), Operation::CreateIndex { new_indices, .. }) =
+            (&self.untagged_reuse, &self.transaction.operation)
+        else {
+            return false;
+        };
+        !missing.is_empty()
+            && reuse.groups.iter().any(|sources| {
+                new_indices.iter().any(|index| {
+                    index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
+                })
+            })
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -1137,6 +1223,24 @@ impl<'a> TransactionRebase<'a> {
                             live,
                             Some(lineage),
                         );
+                    } else if let Some(reuse) = &self.untagged_reuse {
+                        // An index built before a compaction covers its output's
+                        // rows under the fragments the output was compacted from,
+                        // and an index on a packed struct's child depends on the
+                        // parent's physical column.
+                        let updated = updated_fragments
+                            .iter()
+                            .map(|fragment| reuse.compacted_from(fragment.id as u32))
+                            .fold(RoaringBitmap::new(), |ids, more| ids | more);
+                        let fields = Transaction::with_descendants(
+                            &reuse.manifest.schema,
+                            fields_modified.clone(),
+                        );
+                        Transaction::prune_updated_fragment_ids_from_indices(
+                            new_indices,
+                            &updated,
+                            &fields,
+                        );
                     } else {
                         Transaction::prune_updated_fields_from_indices(
                             new_indices,
@@ -1248,15 +1352,30 @@ impl<'a> TransactionRebase<'a> {
                     if self_is_tagged_trim {
                         return Ok(());
                     }
-                    // if a reuse update is present, index remapping is deferred and
-                    // there is no conflict with concurrent CreateIndex of column indices.
+                    // if index remapping is deferred, there is no conflict with
+                    // concurrent CreateIndex of column indices: the index keeps covering
+                    // the rewritten rows under their old fragments. On an untagged table
+                    // the remap was deferred if the rewrite carries a reuse update
+                    // (visible only in the process that committed it) or the latest
+                    // reuse index records it.
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    if frag_reuse_index
+                    let deferred = frag_reuse_index
                         .as_ref()
                         .is_some_and(|entry| !is_tagged(entry))
-                    {
+                        || self
+                            .untagged_reuse
+                            .as_ref()
+                            .is_some_and(|reuse| reuse.records(groups));
+                    if deferred {
+                        if let Some(reuse) = &self.untagged_reuse
+                            && !reuse.withdraw_folded_overlays(groups, new_indices)
+                        {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
                         let ngram_coverage = new_indices
                             .iter()
                             .filter(|idx| {
@@ -1271,7 +1390,10 @@ impl<'a> TransactionRebase<'a> {
                         if groups
                             .iter()
                             .flat_map(|group| group.old_fragments.iter())
-                            .any(|fragment| ngram_coverage.contains(fragment.id as u32))
+                            .any(|fragment| {
+                                !compacted_from(self.untagged_reuse.as_deref(), fragment.id as u32)
+                                    .is_disjoint(&ngram_coverage)
+                            })
                         {
                             return Err(
                                 self.retryable_conflict_err(other_transaction, other_version)
@@ -1951,12 +2073,13 @@ impl<'a> TransactionRebase<'a> {
     /// and the version gate keeps indexes correct. A concurrent operation
     /// conflicts when it takes precedence over the overlay for cells the overlay
     /// covers, dropping the overlay's values: retryably when it rewrites the
-    /// physical layout of one of our fragments (Rewrite, Merge) or re-creates the
-    /// covered rows from the pre-overlay base (a row-moving Update — checked
-    /// row-by-row in `finish_data_overlay`), or removes an overlaid fragment
-    /// outright (a Delete / Update that drops the fragment); and incompatibly for
-    /// whole-dataset replacements (Overwrite / Restore) and MemWAL state updates
-    /// (UpdateMemWalState), which do not rebase against data operations.
+    /// physical layout of one of our fragments (Rewrite, Merge), drops a field
+    /// we overlay (Project), or re-creates the covered rows from the pre-overlay
+    /// base (a row-moving Update — checked row-by-row in `finish_data_overlay`),
+    /// or removes an overlaid fragment outright (a Delete / Update that drops the
+    /// fragment); and incompatibly for whole-dataset replacements (Overwrite /
+    /// Restore) and MemWAL state updates (UpdateMemWalState), which do not rebase
+    /// against data operations.
     fn check_data_overlay_txn(
         &mut self,
         other_transaction: &Transaction,
@@ -1966,12 +2089,33 @@ impl<'a> TransactionRebase<'a> {
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
-            | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
+            // A concurrent Project that dropped a field we overlay discards our
+            // values for it. Project only prunes the overlays already committed,
+            // so ours would otherwise land covering a field that no longer exists.
+            Operation::Project { schema, .. } => {
+                let Operation::DataOverlay { groups } = &self.transaction.operation else {
+                    return Err(wrong_operation_err(&self.transaction.operation));
+                };
+                let remaining_field_ids = schema
+                    .fields_pre_order()
+                    .map(|f| f.id)
+                    .collect::<HashSet<_>>();
+                let drops_our_field = groups
+                    .iter()
+                    .flat_map(|g| g.overlays.iter())
+                    .flat_map(|o| o.data_file.fields.iter())
+                    .any(|id| !remaining_field_ids.contains(id));
+                if drops_our_field {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
             // A concurrent Delete only tombstones rows via a deletion vector,
             // which preserves physical offsets; the overlay value for a deleted
             // offset is simply inert. Conflict only if the whole overlaid
@@ -3173,6 +3317,92 @@ fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
 
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
+}
+
+/// The latest manifest's untagged fragment reuse index, as a CreateIndex sees it.
+#[derive(Debug)]
+struct UntaggedReuse {
+    /// Each recorded group's source fragment ids, sorted.
+    groups: HashSet<Arc<[u64]>>,
+    /// Each recorded group's output fragments, mapped to its source ids.
+    sources: HashMap<u32, Arc<[u64]>>,
+    /// The latest manifest, whose schema overlays are matched against.
+    manifest: Arc<lance_table::format::Manifest>,
+}
+
+impl UntaggedReuse {
+    /// Whether every group of a rewrite is recorded, so it deferred its index
+    /// remap and the record is still there to translate an index built before it.
+    fn records(&self, groups: &[RewriteGroup]) -> bool {
+        !groups.is_empty()
+            && groups.iter().all(|group| {
+                self.groups
+                    .contains(sorted_ids(group.old_fragments.iter().map(|f| f.id)).as_slice())
+            })
+    }
+
+    fn compacted_from(&self, fragment: u32) -> RoaringBitmap {
+        let mut ids = RoaringBitmap::new();
+        let mut pending = vec![fragment];
+        while let Some(id) = pending.pop() {
+            if ids.insert(id)
+                && let Some(sources) = self.sources.get(&id)
+            {
+                pending.extend(sources.iter().map(|source| *source as u32));
+            }
+        }
+        ids
+    }
+
+    /// Withdraws from each index the groups that folded in an overlay on one of
+    /// its fields newer than it: nothing is left to mask the stale values.
+    /// Returns false if an index with no fragment bitmap, which covers every
+    /// fragment, needs a group withdrawn.
+    fn withdraw_folded_overlays(
+        &self,
+        groups: &[RewriteGroup],
+        indices: &mut [IndexMetadata],
+    ) -> bool {
+        for group in groups {
+            for index in indices.iter_mut() {
+                let folded = group.old_fragments.iter().any(|fragment| {
+                    fragment.overlays.iter().any(|overlay| {
+                        overlay_affects_index(
+                            overlay,
+                            &index.fields,
+                            index.dataset_version,
+                            &self.manifest.schema,
+                        )
+                    })
+                });
+                if !folded {
+                    continue;
+                }
+                let Some(bitmap) = &mut index.fragment_bitmap else {
+                    return false;
+                };
+                for fragment in &group.old_fragments {
+                    *bitmap -= self.compacted_from(fragment.id as u32);
+                }
+            }
+        }
+        true
+    }
+}
+
+/// `fragment` and every fragment a recorded deferred compaction made it from:
+/// the ids an index built before those compactions covers its rows under.
+fn compacted_from(reuse: Option<&UntaggedReuse>, fragment: u32) -> RoaringBitmap {
+    match reuse {
+        Some(reuse) => reuse.compacted_from(fragment),
+        None => RoaringBitmap::from_iter([fragment]),
+    }
+}
+
+fn sorted_ids(ids: impl Iterator<Item = u64>) -> Vec<u64> {
+    let mut ids: Vec<u64> = ids.collect();
+    ids.sort_unstable();
+    ids
 }
 
 #[cfg(test)]
@@ -4397,6 +4627,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4523,6 +4754,13 @@ mod tests {
 
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
+        // Fields 0 and 1; our overlay covers field 0.
+        let two_field_schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("a", arrow_schema::DataType::Int32, true),
+                arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true),
+            ]))
+            .unwrap();
 
         // Each case is checked against our overlay on fragment 1.
         let cases: Vec<(Operation, ConflictResult)> = vec![
@@ -4587,6 +4825,22 @@ mod tests {
                 Retryable,
             ),
             (Operation::Restore { version: 1 }, NotCompatible),
+            // A projection that keeps our overlaid field 0 is compatible; one that
+            // drops it would leave our overlay covering a missing field.
+            (
+                Operation::Project {
+                    schema: two_field_schema.clone(),
+                    preserves_nullability: true,
+                },
+                Compatible,
+            ),
+            (
+                Operation::Project {
+                    schema: two_field_schema.project_by_ids(&[1], true),
+                    preserves_nullability: true,
+                },
+                Retryable,
+            ),
             // Overwrite/Restore replace the dataset, and UpdateMemWalState does
             // not rebase against data operations — all hard conflicts.
             (
@@ -4616,6 +4870,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4682,6 +4937,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4830,6 +5086,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4879,6 +5136,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4901,6 +5159,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -4988,6 +5247,7 @@ mod tests {
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
+                        untagged_reuse: None,
                         current_live: None,
                         current_schema: None,
                         read_fragments: None,
@@ -5045,6 +5305,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5183,6 +5444,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5250,6 +5512,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5311,6 +5574,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5339,6 +5603,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5390,6 +5655,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5452,6 +5718,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5517,6 +5784,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5565,6 +5833,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5614,6 +5883,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -5690,6 +5960,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -5772,6 +6043,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -6474,6 +6746,7 @@ mod tests {
                 frag_reuse_base: None,
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
                 current_lineage: None,
+                untagged_reuse: None,
                 current_live: None,
                 current_schema: None,
                 read_fragments: None,
@@ -6544,6 +6817,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6589,6 +6863,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6635,6 +6910,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6681,6 +6957,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6738,6 +7015,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6770,6 +7048,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,
@@ -6823,6 +7102,7 @@ mod tests {
             frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
             current_lineage: None,
+            untagged_reuse: None,
             current_live: None,
             current_schema: None,
             read_fragments: None,

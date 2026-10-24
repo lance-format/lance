@@ -49,7 +49,9 @@ use lance_datafusion::utils::{
 };
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
+use lance_index::scalar::minhash_lsh::{MinHashHit, TopHits};
 use lance_index::vector::DIST_Q_C_COLUMN;
+use lance_index::vector::graph::OrderedFloat;
 use lance_index::vector::{
     DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query, VectorIndex,
     flat::compute_distance,
@@ -66,6 +68,7 @@ use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
+use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
 use lance_arrow::*;
 
@@ -1790,21 +1793,46 @@ impl PreFilter for SegmentPreFilter {
     }
 }
 
+/// The cached [`SegmentOwnershipMaskKey`] entry of `index` at the dataset's
+/// version; `None` when the segment needs no restriction.
+async fn segment_ownership_mask(
+    dataset: &Arc<Dataset>,
+    index: &IndexMetadata,
+) -> Result<Option<Arc<RowAddrMask>>> {
+    let Some(owned_fragments) = index.fragment_bitmap.as_ref() else {
+        return Ok(None);
+    };
+    let key = SegmentOwnershipMaskKey {
+        uuid: &index.uuid,
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    };
+    let loader_dataset = dataset.clone();
+    let mask = dataset
+        .index_cache
+        .get_or_insert_with_key(key, || async move {
+            // Cloned only on a miss so a cache hit does not copy the bitmap.
+            futures::future::OptionFuture::from(DatasetPreFilter::create_restricted_deletion_mask(
+                loader_dataset,
+                owned_fragments.clone(),
+            ))
+            .await
+            .transpose()
+        })
+        .await?;
+    Ok((*mask).clone())
+}
+
 async fn prefilter_for_segment(
     dataset: Arc<Dataset>,
     index: &IndexMetadata,
     base: Arc<DatasetPreFilter>,
 ) -> Result<Arc<dyn PreFilter>> {
-    let Some(owned_fragments) = index.fragment_bitmap.clone() else {
-        return Ok(base);
-    };
-    let Some(ownership_mask) =
-        DatasetPreFilter::create_restricted_deletion_mask(dataset, owned_fragments)
-    else {
-        return Ok(base);
-    };
-    let ownership_mask = ownership_mask.await?;
-    Ok(Arc::new(SegmentPreFilter::new(base, ownership_mask)))
+    match segment_ownership_mask(&dataset, index).await? {
+        Some(ownership_mask) => Ok(Arc::new(SegmentPreFilter::new(base, ownership_mask))),
+        None => Ok(base),
+    }
 }
 
 impl PartitionSearchControl for LatePartitionSearchControl {
@@ -2278,14 +2306,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         // fragment_bitmap, mirroring the `all_have_bitmaps` gate in
         // DatasetPreFilter::new so we never restrict more aggressively than the
         // shared prefilter's fallback.
-        let segment_bitmaps: Arc<HashMap<Uuid, RoaringBitmap>> =
+        let restricted_segments: Arc<HashSet<Uuid>> =
             Arc::new(if indices.iter().all(|idx| idx.fragment_bitmap.is_some()) {
-                indices
-                    .iter()
-                    .map(|idx| (idx.uuid, idx.fragment_bitmap.clone().unwrap()))
-                    .collect()
+                indices.iter().map(|idx| idx.uuid).collect()
             } else {
-                HashMap::new()
+                HashSet::new()
             });
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
@@ -2364,7 +2389,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let pre_filter = pre_filter.clone();
                     let indices_by_uuid = indices_by_uuid.clone();
                     let state = state.clone();
-                    let segment_bitmaps = segment_bitmaps.clone();
+                    let restricted_segments = restricted_segments.clone();
                     let mut query = query.clone();
                     async move {
                         let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
@@ -2383,8 +2408,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
-                        let (vector_type, _) = crate::index::vector::utils::get_vector_type(ds.schema(), &column)?;
-                        let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref(), &vector_type)?;
+                        let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref())?;
                         policy.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
 
                         // A segment's index file may still physically contain rows for
@@ -2396,17 +2420,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         // helper so it is correct for both row-address and stable-row-id
                         // datasets. The shared prefilter is built from the union of all
                         // segment bitmaps and cannot express this per-segment rule.
-                        let seg_mask = match segment_bitmaps.get(&index_uuid).cloned() {
-                            Some(bitmap) => {
-                                match DatasetPreFilter::create_restricted_deletion_mask(
-                                    ds.clone(),
-                                    bitmap,
-                                ) {
-                                    Some(fut) => Some(fut.await?),
-                                    None => None,
-                                }
-                            }
-                            None => None,
+                        let seg_mask = if restricted_segments.contains(&index_uuid) {
+                            segment_ownership_mask(&ds, index_metadata).await?
+                        } else {
+                            None
                         };
 
                         let early_search = Self::initial_search(
@@ -2719,8 +2736,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
         let result_schema = schema.clone();
         let fut = async move {
             let dim = query.key.len() / query_count;
-            // Per-query candidate (distance, row_id) pairs accumulated across deltas.
-            let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); query_count];
+            // Each max-heap retains only the best k candidates across deltas.
+            let mut candidates = (0..query_count)
+                .map(|_| TopHits::new(query.k))
+                .collect::<Vec<_>>();
 
             for index_meta in &indices {
                 let index = {
@@ -2821,13 +2840,17 @@ impl ExecutionPlan for ANNIvfBatchExec {
                             ))
                         })?
                         .as_primitive::<UInt64Type>();
-                    candidates[query_index].extend(
-                        dists
-                            .values()
-                            .iter()
-                            .copied()
-                            .zip(row_ids.values().iter().copied()),
-                    );
+                    for (distance, row_id) in dists
+                        .values()
+                        .iter()
+                        .copied()
+                        .zip(row_ids.values().iter().copied())
+                    {
+                        candidates[query_index].push(MinHashHit {
+                            distance: OrderedFloat(distance),
+                            row_id,
+                        });
+                    }
                 }
             }
 
@@ -2835,13 +2858,11 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut query_index_builder = Int32Builder::new();
             let mut distance_builder = Float32Builder::new();
             let mut row_id_builder = UInt64Builder::new();
-            for (query_index, cands) in candidates.iter_mut().enumerate() {
-                cands.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                cands.truncate(query.k);
-                for (distance, row_id) in cands.iter() {
+            for (query_index, hits) in candidates.into_iter().enumerate() {
+                for MinHashHit { distance, row_id } in hits.into_sorted() {
                     query_index_builder.append_value(query_index as i32);
-                    distance_builder.append_value(*distance);
-                    row_id_builder.append_value(*row_id);
+                    distance_builder.append_value(distance.0);
+                    row_id_builder.append_value(row_id);
                 }
             }
             let batch = RecordBatch::try_new(
@@ -3113,6 +3134,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
@@ -3120,6 +3142,44 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+        }
+    }
+
+    #[rstest]
+    #[case::single_segment(3, vec![vec![(3.0, 3), (1.0, 1), (2.0, 2)]])]
+    #[case::multiple_segments(2, vec![vec![(4.0, 4), (1.0, 3)], vec![(2.0, 2), (0.0, 1)]])]
+    #[case::empty_segment(2, vec![vec![], vec![(2.0, 2)], vec![]])]
+    #[case::fewer_than_k(4, vec![vec![(2.0, 2)], vec![(1.0, 1)]])]
+    #[case::zero_k(0, vec![vec![(1.0, 1)]])]
+    #[case::ties_and_duplicates(3, vec![vec![(1.0, 7), (1.0, 3)], vec![(1.0, 3), (1.0, 5)]])]
+    #[case::worse_after_full(1, vec![vec![(1.0, 1)], vec![(2.0, 2)]])]
+    #[case::float_total_order(3, vec![vec![(f32::NAN, 1), (-0.0, 3)], vec![(0.0, 2), (f32::NEG_INFINITY, 4)]])]
+    #[case::signed_zero_at_capacity(1, vec![vec![(0.0, 2)], vec![(-0.0, 3)]])]
+    fn test_ann_batch_candidate_merge_matches_sort(
+        #[case] k: usize,
+        #[case] segments: Vec<Vec<(f32, u64)>>,
+    ) {
+        let mut expected = segments.iter().flatten().copied().collect::<Vec<_>>();
+        expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        expected.truncate(k);
+
+        let mut hits = TopHits::new(k);
+        let mut candidates_seen = 0;
+        for segment in segments {
+            for (distance, row_id) in segment {
+                hits.push(MinHashHit {
+                    distance: OrderedFloat(distance),
+                    row_id,
+                });
+                candidates_seen += 1;
+                assert_eq!(hits.missing(), k.saturating_sub(candidates_seen));
+            }
+        }
+        let actual = hits.into_sorted();
+        assert_eq!(actual.len(), expected.len());
+        for (candidate, (distance, row_id)) in actual.iter().zip(expected) {
+            assert_eq!(candidate.distance.0.to_bits(), distance.to_bits());
+            assert_eq!(candidate.row_id, row_id);
         }
     }
 
@@ -3694,6 +3754,32 @@ mod tests {
             .unwrap();
         segment_prefilter.wait_for_ready().await.unwrap();
 
+        // The ownership mask is derived from the manifest, so the same segment at
+        // the same version serves the cached entry instead of walking the fragments.
+        let first_mask = segment_ownership_mask(&dataset, &old_segment)
+            .await
+            .unwrap()
+            .expect("a segment that owns a subset of the fragments is restricted");
+        let second_mask = segment_ownership_mask(&dataset, &old_segment)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first_mask, &second_mask));
+        let cached_mask = dataset
+            .index_cache
+            .get_with_key(&SegmentOwnershipMaskKey {
+                uuid: &old_segment.uuid,
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            })
+            .await
+            .expect("the ownership mask is cached under the segment's key");
+        assert!(Arc::ptr_eq(
+            &first_mask,
+            cached_mask.as_ref().as_ref().unwrap()
+        ));
+
         assert!(
             !segment_prefilter.is_empty(),
             "the segment ownership restriction is not globally empty"
@@ -3725,6 +3811,112 @@ mod tests {
             !ordinary_segment.needs_partition_row_ids(),
             "a user filter cannot take the no-filter fast path, so partition coverage is unused"
         );
+    }
+
+    /// Rows of `fragment_id` in the space the ownership mask is built in: row
+    /// addresses, or row ids on a stable-row-id dataset where each fragment of
+    /// the fixture holds 20 consecutive ids.
+    fn fixture_rows(fragment_id: u32, stable_row_ids: bool) -> impl Iterator<Item = u64> {
+        (0..20_u64).map(move |offset| {
+            if stable_row_ids {
+                u64::from(fragment_id) * 20 + offset
+            } else {
+                (u64::from(fragment_id) << 32) | offset
+            }
+        })
+    }
+
+    #[rstest]
+    #[case::row_addresses(false)]
+    #[case::stable_row_ids(true)]
+    #[tokio::test]
+    async fn test_segment_ownership_mask_follows_dataset_version(#[case] stable_row_ids: bool) {
+        let vectors = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "vector",
+                    array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(4)),
+                )
+                .into_reader_rows(RowCount::from(20), BatchCount::from(1))
+        };
+        let params = WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(vectors(), "memory://", Some(params))
+            .await
+            .unwrap();
+        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let segment = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![dataset.schema().field("vector").unwrap().id],
+            covering_fields: vec![],
+            name: "vector_idx".to_string(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(first_fragments.clone()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        fn key<'a>(
+            segment: &'a IndexMetadata,
+            dataset: &'a Dataset,
+        ) -> SegmentOwnershipMaskKey<'a> {
+            SegmentOwnershipMaskKey {
+                uuid: &segment.uuid,
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            }
+        }
+
+        // A segment that owns every fragment needs no restriction, and that
+        // answer is cached like a mask is: deciding it also walks every fragment.
+        let dataset = Arc::new(dataset);
+        assert!(
+            segment_ownership_mask(&dataset, &segment)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cached = dataset
+            .index_cache
+            .get_with_key(&key(&segment, &dataset))
+            .await
+            .expect("the no-restriction answer is cached");
+        assert!(cached.is_none());
+
+        // An append makes a new version with a fragment the segment does not own.
+        let mut appended = (*dataset).clone();
+        appended.append(vectors(), None).await.unwrap();
+        let appended = Arc::new(appended);
+        let new_fragment = (appended.fragment_bitmap.as_ref() - &first_fragments)
+            .iter()
+            .next()
+            .unwrap();
+        let mask = segment_ownership_mask(&appended, &segment)
+            .await
+            .unwrap()
+            .expect("the new version restricts the segment to the fragments it owns");
+        let owned_fragment = first_fragments.iter().next().unwrap();
+        assert!(fixture_rows(owned_fragment, stable_row_ids).all(|row| mask.selected(row)));
+        assert!(fixture_rows(new_fragment, stable_row_ids).all(|row| !mask.selected(row)));
+        let cached = appended
+            .index_cache
+            .get_with_key(&key(&segment, &appended))
+            .await
+            .expect("the mask is cached under the new version's key");
+        assert!(Arc::ptr_eq(&mask, cached.as_ref().as_ref().unwrap()));
+
+        // The old version keeps its own entry.
+        let stale = dataset
+            .index_cache
+            .get_with_key(&key(&segment, &dataset))
+            .await
+            .unwrap();
+        assert!(stale.is_none());
     }
 
     fn prepared_metrics() -> Arc<AnnIndexMetrics> {
@@ -3769,38 +3961,48 @@ mod tests {
     #[case::cosine("cosine", true)]
     #[case::dot("dot", true)]
     #[case::fixed_dot("fixed_dot", false)]
-    #[case::bounded_dot("bounded_dot", false)]
-    #[case::large_k_dot("large_k_dot", false)]
+    #[case::bounded_dot("bounded_dot", true)]
+    #[case::bounded_cosine("bounded_cosine", true)]
+    #[case::uncalibrated_dot("uncalibrated_dot", false)]
     #[case::hamming("hamming", false)]
-    #[case::float16_column("f16", false)]
-    #[case::float64_query("query_f64", false)]
-    #[case::null_query("null", false)]
-    #[case::nonfinite_query("nonfinite", false)]
-    #[case::multivector("multi", false)]
-    #[case::product("product", false)]
-    #[case::hnsw("hnsw", false)]
-    #[case::legacy("legacy", false)]
-    #[case::bounded("bounded", false)]
+    #[case::float16_query("f16", true)]
+    #[case::float64_query("query_f64", true)]
+    #[case::int8_query("int8", true)]
+    #[case::null_query("null", true)]
+    #[case::nan_query("nan", true)]
+    #[case::infinite_query("infinite", true)]
+    #[case::negative_infinite_query("negative_infinite", true)]
+    #[case::multivector("multi", true)]
+    #[case::product("product", true)]
+    #[case::hnsw("hnsw", true)]
+    #[case::legacy("legacy", true)]
+    #[case::bounded("bounded", true)]
     #[case::fixed("fixed", false)]
-    #[case::large_k("large_k", false)]
-    #[case::refine("refine", false)]
+    #[case::uncalibrated("uncalibrated", false)]
+    #[case::refine("refine", true)]
     fn test_auto_policy_gates_before_reading_experimental_config(
         #[case] scenario: &str,
         #[case] reads_config: bool,
+        #[values(1, 100, 101, 200, 500, 1000, 1001, 10_000, 10_001, 100_000)] k: usize,
     ) {
         let mut query = base_query();
-        query.k = if matches!(scenario, "large_k" | "large_k_dot") {
-            101
+        query.k = if matches!(scenario, "uncalibrated" | "uncalibrated_dot") {
+            100_001
         } else {
-            1
+            k
         };
         query.key = match scenario {
+            "f16" => Arc::new(arrow_array::Float16Array::from(vec![half::f16::ZERO])),
             "query_f64" => Arc::new(arrow_array::Float64Array::from(vec![0.0])),
+            "int8" => Arc::new(arrow_array::Int8Array::from(vec![0])),
             "null" => Arc::new(Float32Array::from(vec![None::<f32>])),
-            "nonfinite" => Arc::new(Float32Array::from(vec![f32::NAN])),
+            "nan" => Arc::new(Float32Array::from(vec![f32::NAN])),
+            "infinite" => Arc::new(Float32Array::from(vec![f32::INFINITY])),
+            "negative_infinite" => Arc::new(Float32Array::from(vec![f32::NEG_INFINITY])),
+            "multi" => Arc::new(Float32Array::from(vec![0.0, 1.0])),
             _ => Arc::new(Float32Array::from(vec![0.0])),
         };
-        if matches!(scenario, "bounded" | "bounded_dot") {
+        if matches!(scenario, "bounded" | "bounded_dot" | "bounded_cosine") {
             query.maximum_nprobes = Some(2);
         } else if matches!(scenario, "fixed" | "fixed_dot") {
             query.maximum_nprobes = Some(query.minimum_nprobes);
@@ -3808,20 +4010,10 @@ mod tests {
         if scenario == "refine" {
             query.refine_factor = Some(2);
         }
-        let element_type = if scenario == "f16" {
-            DataType::Float16
-        } else {
-            DataType::Float32
-        };
-        let mut vector_type =
-            DataType::FixedSizeList(Arc::new(ArrowField::new("item", element_type, true)), 1);
-        if scenario == "multi" {
-            vector_type = DataType::List(Arc::new(ArrowField::new("item", vector_type, true)));
-        }
         let index = PreparedThreadCapturingIndex {
             metric: match scenario {
-                "cosine" => DistanceType::Cosine,
-                "dot" | "fixed_dot" | "bounded_dot" | "large_k_dot" => DistanceType::Dot,
+                "cosine" | "bounded_cosine" => DistanceType::Cosine,
+                "dot" | "fixed_dot" | "bounded_dot" | "uncalibrated_dot" => DistanceType::Dot,
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },
@@ -3837,7 +4029,7 @@ mod tests {
             row_ids: vec![vec![1], vec![2]],
         };
         let mut called = false;
-        let result = AutoProbePolicy::select_with_config(&query, &index, &vector_type, |_, _| {
+        let result = AutoProbePolicy::select_with_config(&query, &index, |_, _| {
             called = true;
             Err(DataFusionError::Execution(
                 "invalid LANCE_AUTO_PROBE_MARGIN".to_owned(),
@@ -4748,6 +4940,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::Cosine),
