@@ -31,9 +31,13 @@ pub use lance_index_core::remapping::{
 };
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
+    LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+    ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering,
+    UpdateCriteria, lookup_batch, lookup_schema,
 };
+
+/// The most matches one built-in index's [`ScalarIndex::lookup`] batch holds.
+pub(crate) const LOOKUP_BATCH_SIZE: usize = 8192;
 
 pub mod bitmap;
 pub mod bloomfilter;
@@ -44,6 +48,8 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+#[cfg(test)]
+pub(crate) mod lookup_test_util;
 pub mod minhash_lsh;
 pub mod ngram;
 pub mod registry;
