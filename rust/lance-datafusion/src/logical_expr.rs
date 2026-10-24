@@ -6,6 +6,7 @@
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
+use crate::numeric_coercion::rewrite as rewrite_numeric;
 use datafusion::logical_expr::{Between, ScalarUDFImpl};
 use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::prelude::*;
@@ -96,7 +97,17 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
 /// - *expr*: a datafusion logical expression
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
+    if let Some(rewritten) = rewrite_numeric(expr, schema) {
+        return Ok(rewritten);
+    }
     match expr {
+        // A predicate wrapped in NOT or IS [NOT] TRUE/FALSE compares the same
+        // literal, so it has to be narrowed the same way.
+        Expr::Not(inner) => Ok(Expr::Not(Box::new(resolve_expr(inner.as_ref(), schema)?))),
+        Expr::IsTrue(inner) => Ok(Expr::IsTrue(Box::new(resolve_expr(inner, schema)?))),
+        Expr::IsFalse(inner) => Ok(Expr::IsFalse(Box::new(resolve_expr(inner, schema)?))),
+        Expr::IsNotTrue(inner) => Ok(Expr::IsNotTrue(Box::new(resolve_expr(inner, schema)?))),
+        Expr::IsNotFalse(inner) => Ok(Expr::IsNotFalse(Box::new(resolve_expr(inner, schema)?))),
         Expr::Between(Between {
             expr: inner_expr,
             low,

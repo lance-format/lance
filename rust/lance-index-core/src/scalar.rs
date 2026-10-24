@@ -293,6 +293,17 @@ pub trait IndexReader: Send + Sync {
             .buffered(batch_readahead.max(1) as usize);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+    /// Whether the decoder behind this reader splits batches before their i32
+    /// offsets overflow.
+    ///
+    /// Callers streaming rows of unbounded size (e.g. large posting lists) may
+    /// request multi-row batches only when this returns `true`: a decoder that
+    /// splits by row count alone can overflow its i32 offsets within a single
+    /// batch. When it returns `false`, such callers should request one row per
+    /// batch instead, which still reads the file in one sequential pass.
+    fn guarantees_byte_splitting(&self) -> bool {
+        false
+    }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file

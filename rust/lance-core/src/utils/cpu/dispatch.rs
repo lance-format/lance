@@ -77,25 +77,30 @@ impl<F: Copy> Candidate<F> {
 #[derive(Clone, Copy)]
 pub struct Kernel<F>(F);
 
-impl<A: ?Sized, B: ?Sized, R> Kernel<unsafe fn(&A, &B) -> R> {
-    /// Runs a pair kernel, such as a distance between two vectors.
-    #[inline(always)]
-    pub fn call(self, a: &A, b: &B) -> R {
-        // SAFETY: a `Kernel` only exists for a candidate whose features the
-        // host supports, which is the kernel's only precondition.
-        unsafe { (self.0)(a, b) }
-    }
+/// Implements `call` for one kernel signature, generic over the listed types.
+///
+/// Each signature needs its own impl: a reference parameter makes the pointer
+/// type generic over its lifetime, which a single generic impl cannot match.
+/// By-value parameters take a concrete type, since a generic `T` would
+/// overlap `&T` in another impl of the same arity.
+macro_rules! impl_call {
+    (<$($generic:ident $(: ?$bound:ident)?),*> fn($($arg:ident: $ty:ty),*)) => {
+        impl<$($generic $(: ?$bound)?,)* R> Kernel<unsafe fn($($ty),*) -> R> {
+            /// Runs the kernel.
+            #[inline(always)]
+            #[allow(clippy::too_many_arguments)]
+            pub fn call(self, $($arg: $ty),*) -> R {
+                // SAFETY: a `Kernel` only exists for a candidate whose
+                // features the host supports, which is the kernel's only
+                // precondition.
+                unsafe { (self.0)($($arg),*) }
+            }
+        }
+    };
 }
 
-impl<A: ?Sized, B: ?Sized, C, D: ?Sized, R> Kernel<unsafe fn(&A, &B, C, &mut D) -> R> {
-    /// Runs a slice-output kernel, such as distances from one query to a
-    /// batch written into an output slice.
-    #[inline(always)]
-    pub fn call(self, a: &A, b: &B, c: C, d: &mut D) -> R {
-        // SAFETY: see the two-argument `call`.
-        unsafe { (self.0)(a, b, c, d) }
-    }
-}
+impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
+impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
 
 /// One operation's kernels, best first, with the host's choice made once.
 ///
