@@ -129,6 +129,20 @@ impl VectorIndex for PreTransformIndex {
             .await
     }
 
+    async fn range_search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        threshold: f32,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let query = self.transformed_query(query)?;
+        self.inner
+            .range_search_in_partition(partition_id, &query, threshold, pre_filter, metrics)
+            .await
+    }
+
     async fn prepare_partition_search(
         &self,
         partition_id: usize,

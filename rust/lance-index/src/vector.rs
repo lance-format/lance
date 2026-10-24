@@ -321,6 +321,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// Asynchronously prepare a single-partition search so the CPU-heavy portion
     /// can be executed separately.
+    /// Uncapped inclusive radius search using the index representation. This
+    /// scans the selected IVF partition independently of its graph sub-index.
+    async fn range_search_in_partition(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _threshold: f32,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        Err(Error::not_supported(
+            "radius search requires a current-format IVF index",
+        ))
+    }
+
     async fn prepare_partition_search(
         &self,
         _partition_id: usize,

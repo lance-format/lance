@@ -15,6 +15,7 @@ pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
 pub mod pq;
+pub mod similarity_dedup;
 pub mod utils;
 
 #[cfg(test)]
