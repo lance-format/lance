@@ -250,8 +250,9 @@ impl Transaction {
     ///   segment derives no coverage of its destinations and those rows are
     ///   scanned until `optimize_indices` rebuilds them;
     /// - without a walkable history every retired fragment of `B` goes;
-    /// - a segment without a bitmap is untouched: its coverage is unknown,
-    ///   not empty, and the reader already excludes it.
+    /// - a segment without a bitmap is untouched here: commit preparation
+    ///   rejects rewrites of its indexed fields when it is a user index,
+    ///   because unknown coverage cannot be narrowed safely.
     ///
     /// What a withdrawal leaves is then settled per logical index name:
     /// - coverage partly left: the segment stays and serves what is left,
