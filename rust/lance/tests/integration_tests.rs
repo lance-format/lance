@@ -5,6 +5,7 @@
 
 mod count_pushdown;
 mod mem_wal;
+mod prefilter_union;
 #[cfg(feature = "slow_tests")]
 mod query;
 mod topk_late_materialization;
