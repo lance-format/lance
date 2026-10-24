@@ -24,6 +24,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
             local_dir_operations: None,
+            local_fsync: false,
             scheme: String::from("memory"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
