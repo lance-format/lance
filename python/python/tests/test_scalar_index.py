@@ -1228,6 +1228,452 @@ pub async fn edge_flat_operator() -> Result<EdgeFlat, EdgeFlatError> {
     assert operator_results.num_rows > 0
 
 
+# Code-analyzer lifecycle coverage: incremental index updates (append +
+# optimize, compaction, distributed builds) and every query path must agree
+# with a lance.tokenize() oracle for each flag combination.
+
+CODE_CONFIGS = [
+    pytest.param({}, id="default"),
+    pytest.param({"split_identifiers": True}, id="split"),
+    pytest.param(
+        {"split_identifiers": True, "preserve_original": False},
+        id="split-no-original",
+    ),
+    pytest.param({"index_operators": True}, id="operators"),
+]
+
+CORPUS = [
+    # path, code, text, grp
+    (
+        "src/parse.rs",
+        "pub fn parse_token(input: &str) -> Result<Token, ParseError>",
+        "parse token helper",
+        0,
+    ),
+    (
+        "src/token.rs",
+        "pub struct TokenStream { position: usize }",
+        "token stream state",
+        0,
+    ),
+    (
+        "src/user.rs",
+        "pub fn get_user_name(user_id: u64) -> Result<String, UserError>",
+        "user name lookup",
+        1,
+    ),
+    (
+        "src/user_set.rs",
+        "fn set_user_name(user_id: u64, name: String) -> Result<(), UserError>",
+        "user rename helper",
+        1,
+    ),
+    (
+        "src/index.rs",
+        "fn build_index(rows: &[Row]) -> Result<Index, BuildError>",
+        "index builder",
+        2,
+    ),
+    (
+        "src/search.rs",
+        "fn search_index(index: &Index, query: &str) -> Vec<Hit>",
+        "index search",
+        2,
+    ),
+    (
+        "web/client.ts",
+        "function getUserName(userId) { return users[userId] }",
+        "client user fetch",
+        0,
+    ),
+    (
+        "web/fetch.ts",
+        "async function fetchUserName(id) { return await api.getUserName(id) }",
+        "async user fetch",
+        0,
+    ),
+    ("src/ops.rs", "value.parse::<usize>()", "numeric parse", 1),
+    (
+        "src/ops2.rs",
+        "if count -> usize != 0 { return Err(Eof) }",
+        "count guard",
+        1,
+    ),
+]
+LATE_CORPUS = [
+    (
+        "src/parse_late.rs",
+        "pub fn late_parse_token() -> Result<Token, ParseError>",
+        "late token parse",
+        1,
+    ),
+    (
+        "src/user_late.rs",
+        "fn late_get_user_name() -> Result<String, UserError>",
+        "late user lookup",
+        2,
+    ),
+]
+ALL_ROWS = CORPUS + LATE_CORPUS
+
+MATCH_PROBES = [
+    ("parse_token", FullTextOperator.OR),
+    ("user_id", FullTextOperator.OR),
+    ("TokenStream", FullTextOperator.OR),
+    ("parse_token Result", FullTextOperator.AND),
+]
+MULTI_PROBES = [
+    ("token", FullTextOperator.OR),
+    ("user name", FullTextOperator.AND),
+]
+BOOLEAN_MUST = "parse_token"
+BOOLEAN_MUST_NOT = "index"
+BOOST_POSITIVE = "parse_token"
+BOOST_NEGATIVE = "index"
+LATE_ONLY_PROBES = {
+    "late_parse_token": "src/parse_late.rs",
+    "late_get_user_name": "src/user_late.rs",
+}
+
+
+def _rows_table(rows):
+    return pa.table(
+        {
+            "path": [row[0] for row in rows],
+            "code": [row[1] for row in rows],
+            "text": [row[2] for row in rows],
+            "grp": [row[3] for row in rows],
+        }
+    )
+
+
+def _create_code_index(ds, config):
+    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code", **config)
+
+
+def _create_text_index(ds):
+    ds.create_scalar_index("text", index_type="INVERTED")
+
+
+def _paths(ds, query, **kwargs):
+    table = ds.to_table(columns=["path"], full_text_query=query, **kwargs)
+    return set(table["path"].to_pylist())
+
+
+def _code_tokens(text, config):
+    return {token.text for token in lance.tokenize(text, analyzer="code", **config)}
+
+
+def _text_tokens(text):
+    return {token.text for token in lance.tokenize(text)}
+
+
+def _position_groups(tokens):
+    # Same-position tokens (an identifier and its delimiter parts) act as
+    # alternatives, so AND applies across positions rather than across tokens.
+    groups = {}
+    for token in tokens:
+        groups.setdefault(token.position, set()).add(token.text)
+    return list(groups.values())
+
+
+def _groups_match(query_groups, doc_tokens, operator):
+    hits = [bool(group & doc_tokens) for group in query_groups]
+    if operator == FullTextOperator.AND:
+        return all(hits)
+    return any(hits)
+
+
+def _match_oracle(query, operator, config, rows=None):
+    rows = ALL_ROWS if rows is None else rows
+    query_groups = _position_groups(lance.tokenize(query, analyzer="code", **config))
+    matched = set()
+    for path, code, _text, _grp in rows:
+        doc_tokens = _code_tokens(code, config)
+        if _groups_match(query_groups, doc_tokens, operator):
+            matched.add(path)
+    return matched
+
+
+def _multi_oracle(query, operator, config):
+    query_code_groups = _position_groups(
+        lance.tokenize(query, analyzer="code", **config)
+    )
+    query_text_groups = _position_groups(lance.tokenize(query))
+    matched = set()
+    for path, code, text, _grp in ALL_ROWS:
+        for query_groups, doc_tokens in (
+            (query_code_groups, _code_tokens(code, config)),
+            (query_text_groups, _text_tokens(text)),
+        ):
+            if _groups_match(query_groups, doc_tokens, operator):
+                matched.add(path)
+                break
+    return matched
+
+
+@pytest.mark.parametrize("config", CODE_CONFIGS)
+def test_code_analyzer_optimize_indices_matches_full_rebuild(tmp_path, config):
+    ds = lance.write_dataset(_rows_table(CORPUS), tmp_path / "ds")
+    _create_code_index(ds, config)
+
+    ds.insert(_rows_table(LATE_CORPUS))
+    ds.optimize.optimize_indices()
+    ds = lance.dataset(tmp_path / "ds")
+
+    rebuilt = lance.write_dataset(_rows_table(ALL_ROWS), tmp_path / "rebuilt")
+    _create_code_index(rebuilt, config)
+
+    for query, operator in MATCH_PROBES:
+        expected = _match_oracle(query, operator, config)
+        probe = MatchQuery(query, "code", operator=operator)
+        assert _paths(ds, probe) == expected
+        assert _paths(rebuilt, probe) == expected
+
+    for query, path in LATE_ONLY_PROBES.items():
+        probe = MatchQuery(query, "code", operator=FullTextOperator.AND)
+        assert _paths(ds, probe) == {path}
+
+    params = ds.stats.index_stats("code_idx")["indices"][0]["params"]
+    assert params["base_tokenizer"] == "code"
+    if "split_identifiers" in config:
+        assert params["split_identifiers"] is config["split_identifiers"]
+    if "preserve_original" in config:
+        assert params["preserve_original"] is config["preserve_original"]
+
+
+@pytest.mark.parametrize("defer_index_remap", [True, False])
+@pytest.mark.parametrize("config", CODE_CONFIGS)
+def test_code_analyzer_compact_files_remap_preserves_results(
+    tmp_path, config, defer_index_remap
+):
+    ds = lance.write_dataset(
+        _rows_table(ALL_ROWS), tmp_path / "ds", max_rows_per_file=4
+    )
+    _create_code_index(ds, config)
+    fragments_before = len(list(ds.get_fragments()))
+    assert fragments_before > 1
+
+    baseline = {
+        (query, operator): _paths(ds, MatchQuery(query, "code", operator=operator))
+        for query, operator in MATCH_PROBES
+    }
+
+    ds.optimize.compact_files(
+        target_rows_per_fragment=4096,
+        defer_index_remap=defer_index_remap,
+    )
+
+    ds = lance.dataset(tmp_path / "ds")
+    assert len(list(ds.get_fragments())) < fragments_before
+    for query, operator in MATCH_PROBES:
+        probe = MatchQuery(query, "code", operator=operator)
+        assert _paths(ds, probe) == baseline[(query, operator)]
+        assert _paths(ds, probe) == _match_oracle(query, operator, config)
+
+
+@pytest.mark.parametrize("config", CODE_CONFIGS)
+def test_code_analyzer_compact_materializes_deleted_rows(tmp_path, config):
+    ds = lance.write_dataset(
+        _rows_table(ALL_ROWS), tmp_path / "ds", max_rows_per_file=4
+    )
+    _create_code_index(ds, config)
+
+    ds.delete("grp = 2")
+    ds.optimize.compact_files(target_rows_per_fragment=4096, materialize_deletions=True)
+    ds = lance.dataset(tmp_path / "ds")
+
+    survivors = [row for row in ALL_ROWS if row[3] != 2]
+    assert ds.count_rows() == len(survivors)
+    for query, operator in MATCH_PROBES:
+        probe = MatchQuery(query, "code", operator=operator)
+        assert _paths(ds, probe) == _match_oracle(
+            query, operator, config, rows=survivors
+        )
+
+
+@pytest.mark.parametrize("config", CODE_CONFIGS)
+def test_code_analyzer_distributed_segments_merge_and_commit(tmp_path, config):
+    ds = lance.write_dataset(
+        _rows_table(ALL_ROWS), tmp_path / "ds", max_rows_per_file=4
+    )
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    assert len(fragment_ids) > 1
+
+    staged = [
+        ds.create_index_uncommitted(
+            column="code",
+            index_type="INVERTED",
+            name="code_dist",
+            fragment_ids=[fragment_id],
+            analyzer="code",
+            **config,
+        )
+        for fragment_id in fragment_ids
+    ]
+    merged = ds.merge_existing_index_segments(staged)
+    assert merged.fragment_ids == set(fragment_ids)
+    ds = ds.commit_existing_index_segments("code_dist", "code", [merged])
+
+    ds = lance.dataset(tmp_path / "ds")
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert "code_dist" in descriptions
+    assert len(descriptions["code_dist"].segments) == 1
+    assert descriptions["code_dist"].segments[0].index_version == 3
+
+    for query, operator in MATCH_PROBES:
+        probe = MatchQuery(query, "code", operator=operator)
+        assert _paths(ds, probe) == _match_oracle(query, operator, config)
+
+
+@pytest.mark.parametrize("config", CODE_CONFIGS)
+def test_code_analyzer_query_paths_match_tokenize_oracle(tmp_path, config):
+    # Three copies of the same rows: fully indexed, appended rows left
+    # unindexed, and optimized after the append.
+    full = lance.write_dataset(_rows_table(ALL_ROWS), tmp_path / "full")
+    _create_code_index(full, config)
+    _create_text_index(full)
+
+    delta = lance.write_dataset(_rows_table(CORPUS), tmp_path / "delta")
+    _create_code_index(delta, config)
+    _create_text_index(delta)
+    delta.insert(_rows_table(LATE_CORPUS))
+
+    optimized = lance.write_dataset(_rows_table(CORPUS), tmp_path / "optimized")
+    _create_code_index(optimized, config)
+    _create_text_index(optimized)
+    optimized.insert(_rows_table(LATE_CORPUS))
+    optimized.optimize.optimize_indices()
+
+    copies = {
+        "full": lance.dataset(tmp_path / "full"),
+        "delta": lance.dataset(tmp_path / "delta"),
+        "optimized": lance.dataset(tmp_path / "optimized"),
+    }
+    for copy_name, ds in copies.items():
+        for query, operator in MATCH_PROBES:
+            probe = MatchQuery(query, "code", operator=operator)
+            assert _paths(ds, probe) == _match_oracle(query, operator, config), (
+                copy_name,
+                query,
+            )
+        for query, operator in MULTI_PROBES:
+            probe = MultiMatchQuery(query, ["code", "text"], operator=operator)
+            assert _paths(ds, probe) == _multi_oracle(query, operator, config), (
+                copy_name,
+                query,
+            )
+
+        boolean = BooleanQuery(
+            [
+                (Occur.MUST, MatchQuery(BOOLEAN_MUST, "code")),
+                (Occur.MUST_NOT, MatchQuery(BOOLEAN_MUST_NOT, "code")),
+            ]
+        )
+        expected_boolean = _match_oracle(
+            BOOLEAN_MUST, FullTextOperator.OR, config
+        ) - _match_oracle(BOOLEAN_MUST_NOT, FullTextOperator.OR, config)
+        assert _paths(ds, boolean) == expected_boolean, copy_name
+
+        boost = BoostQuery(
+            MatchQuery(BOOST_POSITIVE, "code"),
+            MatchQuery(BOOST_NEGATIVE, "code"),
+            negative_boost=0.5,
+        )
+        expected_boost = _match_oracle(BOOST_POSITIVE, FullTextOperator.OR, config)
+        assert _paths(ds, boost) == expected_boost, copy_name
+
+        for query, path in LATE_ONLY_PROBES.items():
+            probe = MatchQuery(query, "code", operator=FullTextOperator.AND)
+            assert _paths(ds, probe) == {path}, (copy_name, query)
+
+        if config.get("index_operators"):
+            probe = MatchQuery("->", "code", operator=FullTextOperator.OR)
+            assert _paths(ds, probe) == _match_oracle(
+                "->", FullTextOperator.OR, config
+            ), copy_name
+
+    # limit truncates without dropping valid rows
+    expected = _match_oracle("parse_token", FullTextOperator.OR, config)
+    probe = MatchQuery("parse_token", "code", operator=FullTextOperator.OR)
+    limited = _paths(full, probe, limit=1)
+    assert len(limited) == 1
+    assert limited <= expected
+    assert _paths(full, probe, limit=100) == expected
+
+    # prefilter and postfilter agree with the oracle on indexed rows
+    low_group = {path for path, _code, _text, grp in ALL_ROWS if grp < 2}
+    for prefilter in (True, False):
+        filtered = _paths(full, probe, filter="grp < 2", prefilter=prefilter)
+        assert filtered == expected & low_group, (config, prefilter)
+
+
+def _run_code_format_probe(
+    tmp_path, env_value, creation_options=None, expected_format_version=None
+):
+    script = """
+import json
+import sys
+
+import lance
+import pyarrow as pa
+
+dataset = lance.write_dataset(pa.table({"code": ["getUserName"]}), sys.argv[1])
+dataset.create_scalar_index("code", index_type="INVERTED", **json.loads(sys.argv[2]))
+expected = json.loads(sys.argv[3])
+if expected is not None:
+    actual = dataset.describe_indices()[0].segments[0].index_version
+    assert actual == expected, (actual, expected)
+"""
+    env = os.environ.copy()
+    if env_value is None:
+        env.pop("LANCE_FTS_FORMAT_VERSION", None)
+    else:
+        env["LANCE_FTS_FORMAT_VERSION"] = env_value
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path / uuid.uuid4().hex[:8]),
+            json.dumps(creation_options or {}),
+            json.dumps(expected_format_version),
+        ],
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+
+def test_code_analyzer_format_version_from_env(tmp_path):
+    result = _run_code_format_probe(
+        tmp_path, "3", {"analyzer": "code"}, expected_format_version=3
+    )
+    assert result.returncode == 0, result.stderr
+
+    result = _run_code_format_probe(
+        tmp_path, None, {"analyzer": "code"}, expected_format_version=3
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_code_analyzer_rejects_non_v3_env_format_version(tmp_path):
+    for env_value in ("1", "2"):
+        result = _run_code_format_probe(tmp_path, env_value, {"analyzer": "code"})
+        assert result.returncode != 0
+        assert "requires FTS format_version=3" in result.stderr
+
+
+def test_code_analyzer_explicit_v3_overrides_env(tmp_path):
+    result = _run_code_format_probe(
+        tmp_path,
+        "2",
+        {"analyzer": "code", "format_version": 3},
+        expected_format_version=3,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_unindexed_full_text_search_on_empty_index(tmp_path):
     # Create fts index on empty table.
     schema = pa.schema({"text": pa.string()})
