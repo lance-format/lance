@@ -84,6 +84,12 @@ pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
 const SERVER_SIDE_COPY_ENABLED_ENV: &str = "LANCE_IO_SERVER_SIDE_COPY_ENABLED";
 
+#[derive(Clone, Copy)]
+enum StreamCopyMode {
+    Overwrite,
+    Create,
+}
+
 const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
 #[cfg(any(
     feature = "aws",
@@ -211,6 +217,8 @@ pub struct ObjectStore {
     /// Whether to use constant size upload parts for multipart uploads. This
     /// is only necessary for Cloudflare R2.
     pub use_constant_size_upload_parts: bool,
+    /// Whether multipart uploads honor [`PutMode::Create`] at completion.
+    supports_conditional_multipart_put: bool,
     /// Whether we can assume that the list of files is lexically ordered. This
     /// is true for object stores, but not for local filesystems.
     pub list_is_lexically_ordered: bool,
@@ -239,6 +247,10 @@ impl std::fmt::Debug for ObjectStore {
             .field(
                 "use_constant_size_upload_parts",
                 &self.use_constant_size_upload_parts,
+            )
+            .field(
+                "supports_conditional_multipart_put",
+                &self.supports_conditional_multipart_put,
             )
             .field("list_is_lexically_ordered", &self.list_is_lexically_ordered)
             .field("io_parallelism", &self.io_parallelism)
@@ -541,7 +553,11 @@ fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     let expanded = expand_tilde_path(str_path).unwrap_or_else(|| str_path.into());
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
-        .unwrap()
+        .map_err(|err| {
+            Error::invalid_input(format!(
+                "Invalid table location: '{str_path}' could not be resolved to an absolute path: {err}"
+            ))
+        })?
         .as_path()
         .to_path_buf();
     // path_abs::PathAbs::new(".") returns an empty string.
@@ -688,6 +704,7 @@ impl ObjectStore {
                 block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+                supports_conditional_multipart_put: false,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
@@ -801,6 +818,15 @@ impl ObjectStore {
         self.block_size
     }
 
+    /// Bytes one multipart upload of `total_bytes` to this store can hold in
+    /// memory at once. See [`crate::object_writer::upload_memory_bound_bytes`].
+    pub fn upload_memory_bound_bytes(&self, total_bytes: u64) -> u64 {
+        crate::object_writer::upload_memory_bound_bytes(
+            total_bytes,
+            self.use_constant_size_upload_parts,
+        )
+    }
+
     pub fn max_iop_size(&self) -> u64 {
         self.max_iop_size
     }
@@ -850,6 +876,7 @@ impl ObjectStore {
     /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
     pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
         self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        self.supports_conditional_multipart_put = false;
         self.paginated_lister = self
             .paginated_lister
             .take()
@@ -1248,6 +1275,103 @@ impl ObjectStore {
         destination_store: &Self,
         destination_path: &Path,
     ) -> Result<WriteResult> {
+        self.copy_via_stream_with_mode(
+            source_path,
+            destination_store,
+            destination_path,
+            StreamCopyMode::Overwrite,
+        )
+        .await
+    }
+
+    /// Copy within this store without replacing an existing destination.
+    ///
+    /// Backends with verified conditional multipart completion stream through
+    /// the client. Other backends retain their native conditional-copy path.
+    pub async fn copy_if_not_exists(
+        &self,
+        source_path: &Path,
+        destination_path: &Path,
+    ) -> Result<WriteResult> {
+        if self.supports_conditional_multipart_put {
+            return self
+                .copy_if_not_exists_via_stream(source_path, self, destination_path)
+                .await;
+        }
+
+        let source_size = self.size(source_path).await?;
+        match self
+            .inner
+            .copy_if_not_exists(source_path, destination_path)
+            .await
+        {
+            Ok(()) => {}
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => {
+                let destination_size = self.size(destination_path).await?;
+                if source_size != destination_size {
+                    return Err(Error::io(format!(
+                        "destination {destination_path} already exists with size \
+                         {destination_size}, but source {source_path} has size {source_size}"
+                    )));
+                }
+            }
+            Err(error) => return Err(Error::io(error.to_string())),
+        }
+
+        Ok(WriteResult {
+            size: usize::try_from(source_size).map_err(|_| {
+                Error::io(format!(
+                    "source {source_path} size {source_size} does not fit in usize"
+                ))
+            })?,
+            e_tag: None,
+        })
+    }
+
+    #[instrument(
+        name = "multipart_stream_copy_if_not_exists",
+        level = "info",
+        skip(self, source_path, destination_store, destination_path),
+        fields(
+            source = %source_path,
+            destination = %destination_path,
+            source_size = Empty,
+            read_chunk_size = Empty,
+            multipart_part_size = crate::object_writer::initial_upload_size(),
+            multipart_concurrency = crate::object_writer::max_upload_parallelism(),
+            part_count = Empty,
+            bytes_transferred = Empty,
+            destination_size = Empty,
+            validation = Empty,
+            elapsed_ms = Empty,
+        ),
+        err
+    )]
+    async fn copy_if_not_exists_via_stream(
+        &self,
+        source_path: &Path,
+        destination_store: &Self,
+        destination_path: &Path,
+    ) -> Result<WriteResult> {
+        self.copy_via_stream_with_mode(
+            source_path,
+            destination_store,
+            destination_path,
+            StreamCopyMode::Create,
+        )
+        .await
+    }
+
+    async fn copy_via_stream_with_mode(
+        &self,
+        source_path: &Path,
+        destination_store: &Self,
+        destination_path: &Path,
+        mode: StreamCopyMode,
+    ) -> Result<WriteResult> {
         let started_at = Instant::now();
         if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
             let source_size = std::fs::metadata(super::local::to_local_path(source_path))
@@ -1271,7 +1395,20 @@ impl ObjectStore {
             Span::current().record("source_size", source_size as u64);
 
             let metrics = destination_store.io_tracker.begin_io("copy");
-            let result = super::local::copy_file(source_path, destination_path);
+            let result = match mode {
+                StreamCopyMode::Overwrite => super::local::copy_file(source_path, destination_path),
+                StreamCopyMode::Create => match destination_store
+                    .inner
+                    .copy_if_not_exists(source_path, destination_path)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(copy_error) => match destination_store.size(destination_path).await {
+                        Ok(destination_size) if destination_size == source_size as u64 => Ok(()),
+                        _ => Err(Error::from(copy_error)),
+                    },
+                },
+            };
             metrics.record(&result, source_size as u64);
             result.map_err(|source| {
                 stream_copy_error(
@@ -1321,17 +1458,22 @@ impl ObjectStore {
         })?;
         Span::current().record("source_size", source_size as u64);
 
-        let mut writer = destination_store
-            .create(destination_path)
-            .await
-            .map_err(|source| {
-                stream_copy_error(
-                    "destination writer creation",
-                    source_path,
-                    destination_path,
-                    source,
-                )
-            })?;
+        let mut writer: Box<dyn Writer> = match mode {
+            StreamCopyMode::Overwrite => destination_store.create(destination_path).await,
+            StreamCopyMode::Create => {
+                ObjectWriter::new_with_mode(destination_store, destination_path, PutMode::Create)
+                    .await
+                    .map(|writer| Box::new(writer) as Box<dyn Writer>)
+            }
+        }
+        .map_err(|source| {
+            stream_copy_error(
+                "destination writer creation",
+                source_path,
+                destination_path,
+                source,
+            )
+        })?;
         let read_chunk_size = usize::try_from(self.max_iop_size())
             .unwrap_or(usize::MAX)
             .max(1);
@@ -1395,14 +1537,36 @@ impl ObjectStore {
         }
         Span::current().record("bytes_transferred", bytes_transferred as u64);
 
-        let write_result = Writer::shutdown(writer.as_mut()).await.map_err(|source| {
-            stream_copy_error(
-                "destination completion",
-                source_path,
-                destination_path,
-                source,
-            )
-        })?;
+        let write_result = match Writer::shutdown(writer.as_mut()).await {
+            Ok(write_result) => write_result,
+            Err(source) => {
+                let completion_error = stream_copy_error(
+                    "destination completion",
+                    source_path,
+                    destination_path,
+                    source,
+                );
+                if !matches!(mode, StreamCopyMode::Create) {
+                    return Err(completion_error);
+                }
+                let Ok(destination_size) = destination_store.size(destination_path).await else {
+                    return Err(completion_error);
+                };
+                Span::current().record("destination_size", destination_size);
+                if destination_size != source_size as u64 {
+                    Span::current().record("validation", "failed");
+                    return Err(Error::io(format!(
+                        "multipart_stream_copy existing destination size mismatch from \
+                         {source_path} to {destination_path}: source_size={source_size}, \
+                         destination_size={destination_size}"
+                    )));
+                }
+                WriteResult {
+                    size: source_size,
+                    e_tag: None,
+                }
+            }
+        };
         if write_result.size != source_size {
             Span::current().record("validation", "failed");
             return Err(Error::io(format!(
@@ -1499,11 +1663,18 @@ impl ObjectStore {
         Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
+    /// List objects recursively. On unordered stores, a retryable failure after
+    /// the first entry is returned to the caller because resuming by lexical
+    /// offset could silently omit entries.
     pub fn list(
         &self,
         path: Option<Path>,
     ) -> Pin<Box<dyn Stream<Item = Result<ObjectMeta>> + Send>> {
-        Box::pin(ListRetryStream::new(self.inner.clone(), path, 5).map(|m| m.map_err(|e| e.into())))
+        Box::pin(
+            ListRetryStream::new(self.inner.clone(), path, 5)
+                .with_lexical_ordering(self.list_is_lexically_ordered)
+                .map(|m| m.map_err(|e| e.into())),
+        )
     }
 
     /// Read all files (start from base directory) recursively
@@ -1537,15 +1708,32 @@ impl ObjectStore {
             metrics.record(&result, 0);
             return result;
         }
-        let sub_entries = self
-            .inner
-            .list(Some(&path))
-            .map(|m| m.map(|meta| meta.location))
-            .boxed();
+        // The deletion stream owns its input; share only the deferred zero-size paths.
+        let deferred = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let deferred_entries = deferred.clone();
+        let files = self.inner.list(Some(&path)).try_filter_map(move |entry| {
+            let deferred_entries = deferred_entries.clone();
+            async move {
+                // OpenDAL directories have size zero. Empty files can be deferred too,
+                // since every child path is longer than its parent directory.
+                if entry.size == 0 {
+                    deferred_entries.lock().await.push(entry.location);
+                    Ok(None)
+                } else {
+                    Ok(Some(entry.location))
+                }
+            }
+        });
+        // Feed one continuous stream so each backend retains its batching and concurrency.
         self.inner
-            .delete_stream(sub_entries)
-            .try_collect::<Vec<_>>()
+            .delete_stream(files.boxed())
+            .try_for_each(|_| future::ready(Ok(())))
             .await?;
+        let mut deferred = std::mem::take(&mut *deferred.lock().await);
+        deferred.sort_unstable_by_key(|location| std::cmp::Reverse(location.as_ref().len()));
+        for location in deferred {
+            self.inner.delete(&location).await?;
+        }
         if self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
@@ -1922,6 +2110,7 @@ impl ObjectStore {
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
+            supports_conditional_multipart_put: false,
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
@@ -2325,8 +2514,14 @@ mod tests {
         )
         .unwrap();
 
+        // The working directory is process state, and this one is about to be
+        // removed with the temp dir, so put it back as soon as the call that
+        // needs it returns.
+        let original_dir = std::env::current_dir().unwrap();
         set_current_dir(StdPath::new(tmp_path.as_ref())).expect("Error changing current dir");
-        let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
+        let opened = ObjectStore::from_uri("./bar/foo.lance").await;
+        set_current_dir(&original_dir).expect("Error restoring current dir");
+        let (store, path) = opened.unwrap();
 
         let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
             .await
@@ -2360,6 +2555,126 @@ mod tests {
 
         let sub_dirs = store.read_dir(base.clone().join("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
+    }
+
+    #[derive(Debug, Default)]
+    struct BatchedDeleteStore {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        deleted: Arc<AtomicUsize>,
+        deferred: Arc<tokio::sync::Mutex<Vec<Path>>>,
+    }
+
+    impl Display for BatchedDeleteStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BatchedDeleteStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for BatchedDeleteStore {
+        async fn put_opts(&self, _: &Path, _: PutPayload, _: PutOptions) -> OSResult<PutResult> {
+            unreachable!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _: &Path,
+            _: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            unreachable!()
+        }
+
+        async fn get_opts(&self, _: &Path, _: GetOptions) -> OSResult<GetResult> {
+            unreachable!()
+        }
+
+        fn list(&self, _: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let deferred = ["dataset", "dataset/data", "dataset/data/empty"]
+                .into_iter()
+                .map(|path| (Path::from(path), 0));
+            let files = (0..20_000)
+                .map(|index| (Path::from(format!("dataset/data/{index:05}.lance")), 128));
+            futures::stream::iter(deferred.chain(files).map(|(location, size)| {
+                Ok(ObjectMeta {
+                    location,
+                    size,
+                    last_modified: Utc::now(),
+                    e_tag: None,
+                    version: None,
+                })
+            }))
+            .boxed()
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            let active = self.active.clone();
+            let peak = self.peak.clone();
+            let deleted = self.deleted.clone();
+            let deferred = self.deferred.clone();
+            // Match S3's batching and concurrency, without depending on cloud timing.
+            locations
+                .try_chunks(1000)
+                .map(move |chunk| {
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    let deleted = deleted.clone();
+                    let deferred = deferred.clone();
+                    async move {
+                        let chunk = chunk.map_err(|error| error.1)?;
+                        if chunk
+                            .first()
+                            .is_some_and(|path| path.extension() == Some("lance"))
+                        {
+                            assert!(chunk.iter().all(|path| path.extension() == Some("lance")));
+                            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(count, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            deleted.fetch_add(chunk.len(), Ordering::SeqCst);
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        } else {
+                            assert_eq!(active.load(Ordering::SeqCst), 0);
+                            assert_eq!(deleted.load(Ordering::SeqCst), 20_000);
+                            deferred.lock().await.extend(chunk.iter().cloned());
+                        }
+                        Ok::<_, object_store::Error>(futures::stream::iter(
+                            chunk.into_iter().map(Ok),
+                        ))
+                    }
+                })
+                .buffered(20)
+                .try_flatten()
+                .boxed()
+        }
+
+        async fn list_with_delimiter(&self, _: Option<&Path>) -> OSResult<ListResult> {
+            unreachable!()
+        }
+
+        async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> OSResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_all_preserves_batch_concurrency() {
+        let backend = Arc::new(BatchedDeleteStore::default());
+        let mut store = ObjectStore::memory();
+        store.inner = backend.clone();
+        store.remove_dir_all("dataset").await.unwrap();
+        assert_eq!(backend.deleted.load(Ordering::SeqCst), 20_000);
+        assert_eq!(backend.peak.load(Ordering::SeqCst), 20);
+        assert_eq!(
+            *backend.deferred.lock().await,
+            [
+                Path::from("dataset/data/empty"),
+                Path::from("dataset/data"),
+                Path::from("dataset")
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3142,6 +3457,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_copy_if_not_exists_via_stream_preserves_existing_destination() {
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(CopyFailingStore {
+            inner: InMemory::new(),
+        });
+
+        let source = Path::from("source.bin");
+        let destination = Path::from("destination.bin");
+        store.put(&source, b"new contents").await.unwrap();
+        store.put(&destination, b"existing contents").await.unwrap();
+
+        store
+            .copy_if_not_exists_via_stream(&source, &store, &destination)
+            .await
+            .expect_err("conditional stream copy must not replace an existing object");
+
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            b"existing contents"
+        );
+        assert_eq!(
+            store.read_one_all(&source).await.unwrap().as_ref(),
+            b"new contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_via_stream_creates_destination() {
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(CopyFailingStore {
+            inner: InMemory::new(),
+        });
+
+        let source = Path::from("source.bin");
+        let destination = Path::from("destination.bin");
+        let contents = b"stream into a previously absent destination";
+        store.put(&source, contents).await.unwrap();
+
+        let result = store
+            .copy_if_not_exists_via_stream(&source, &store, &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(result.size, contents.len());
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            contents
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_via_stream_accepts_equal_size_retry() {
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(CopyFailingStore {
+            inner: InMemory::new(),
+        });
+
+        let source = Path::from("source.bin");
+        let destination = Path::from("destination.bin");
+        store.put(&source, b"new").await.unwrap();
+        store.put(&destination, b"old").await.unwrap();
+
+        let result = store
+            .copy_if_not_exists_via_stream(&source, &store, &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(result.size, 3);
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            b"old"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_accepts_equal_size_local_retry() {
+        let directory = TempStdDir::default();
+        let (store, base_path) = ObjectStore::from_uri(directory.to_str().unwrap())
+            .await
+            .unwrap();
+        let source = base_path.clone().join("source.bin");
+        let destination = base_path.join("destination.bin");
+        store.put(&source, b"new").await.unwrap();
+        store.put(&destination, b"old").await.unwrap();
+
+        let result = store
+            .copy_if_not_exists(&source, &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(result.size, 3);
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            b"old"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_uses_native_copy_without_conditional_multipart() {
+        let observations = Arc::new(MultipartObservations::default());
+        let mut store = ObjectStore::memory();
+        store.supports_conditional_multipart_put = false;
+        store.inner = Arc::new(ObservedMultipartStore {
+            inner: InMemory::new(),
+            observations: observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+
+        let source = Path::from("source.bin");
+        let destination = Path::from("destination.bin");
+        let contents = vec![42; crate::object_writer::initial_upload_size() + 1];
+        store.put(&source, &contents).await.unwrap();
+        observations.part_count.store(0, Ordering::SeqCst);
+
+        let result = store
+            .copy_if_not_exists(&source, &destination)
+            .await
+            .unwrap();
+
+        assert_eq!(result.size, contents.len());
+        assert_eq!(observations.native_copy_count.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.part_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.read_one_all(&destination).await.unwrap().as_ref(),
+            contents.as_slice()
+        );
+    }
+
+    #[tokio::test]
     async fn test_remove_stream_removes_every_path() {
         let store = ObjectStore::memory();
         let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
@@ -3488,6 +3933,52 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             contents.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_copy_if_not_exists_via_stream_uses_conditional_multipart_completion() {
+        let mut source_store = ObjectStore::memory();
+        source_store.max_iop_size = 1024 * 1024;
+        let observations = Arc::new(MultipartObservations::default());
+        let mut destination_store = ObjectStore::memory();
+        destination_store.inner = Arc::new(ObservedMultipartStore {
+            inner: InMemory::new(),
+            observations: observations.clone(),
+            fail_parts: false,
+            destination_size_adjustment: 0,
+        });
+
+        let source = Path::from("source.bin");
+        let destination = Path::from("destination.bin");
+        let contents = vec![42; crate::object_writer::initial_upload_size() * 2 + 1];
+        source_store.put(&source, &contents).await.unwrap();
+        destination_store
+            .put(&destination, b"existing contents")
+            .await
+            .unwrap();
+
+        source_store
+            .copy_if_not_exists_via_stream(&source, &destination_store, &destination)
+            .await
+            .expect_err("conditional multipart completion must reject an existing object");
+
+        assert!(
+            observations.part_count.load(Ordering::SeqCst) >= 2,
+            "conditional stream copy should use multipart upload for a large destination"
+        );
+        assert_eq!(
+            observations.abort_count.load(Ordering::SeqCst),
+            1,
+            "conditional completion failure should abort the multipart upload"
+        );
+        assert_eq!(
+            destination_store
+                .read_one_all(&destination)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"existing contents"
         );
     }
 

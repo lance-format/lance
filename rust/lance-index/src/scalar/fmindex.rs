@@ -2399,6 +2399,12 @@ mod tests {
             })
         }
 
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_buffer_size(bytes),
+            })
+        }
+
         async fn new_index_file(
             &self,
             _name: &str,

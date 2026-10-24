@@ -134,6 +134,14 @@ impl IndexStore for CountingStore {
             counter: self.counter.clone(),
         })
     }
+
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_buffer_size(bytes),
+            posting_file: self.posting_file.clone(),
+            counter: self.counter.clone(),
+        })
+    }
     async fn new_index_file(
         &self,
         name: &str,
@@ -248,6 +256,94 @@ fn set_test_posting_group_size(index: &mut Arc<InvertedIndex>, group_size: u32) 
     let inverted_list = Arc::get_mut(&mut partition.inverted_list)
         .expect("test posting reader should have one owner");
     inverted_list.grouping = PostingGrouping::SyntheticFixed { group_size };
+}
+
+async fn load_counted_v3_index(
+    cache: LanceCache,
+) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let batch = arrow_array::record_batch!(
+        (
+            "doc",
+            Utf8,
+            ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"]
+        ),
+        (ROW_ID, UInt64, [0, 1, 2, 3, 4, 5, 6, 7])
+    )
+    .unwrap();
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .block_size(256)
+        .unwrap()
+        .num_workers(1);
+    let mut builder = InvertedIndexBuilder::new(params);
+    builder
+        .update(
+            Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::once(async move { Ok(batch) }),
+            )),
+            store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    let metadata = store.open_index_file(METADATA_FILE).await.unwrap();
+    let partitions: Vec<u64> =
+        serde_json::from_str(metadata.schema().metadata.get("partitions").unwrap()).unwrap();
+    assert_eq!(partitions.len(), 1);
+    let counter = Arc::new(PostingMetadataCounter::default());
+    let store: Arc<dyn IndexStore> = Arc::new(CountingStore {
+        inner: store,
+        posting_file: posting_file_path(partitions[0]),
+        counter: counter.clone(),
+    });
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
+    (index, counter, tmpdir)
+}
+
+#[rstest::rstest]
+#[case::cold(false, 1)]
+#[case::prewarmed(true, 0)]
+#[tokio::test]
+async fn test_modern_search_avoids_unrequested_postings(
+    #[case] is_prewarmed: bool,
+    #[case] expected_posting_rows: usize,
+) {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (mut index, counter, _tmpdir) = load_counted_v3_index(cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    if is_prewarmed {
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
+            .unwrap();
+        counter.posting_rows_read.store(0, Ordering::Relaxed);
+        counter.impact_rows_read.store(0, Ordering::Relaxed);
+    }
+    let (rows, scores) = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["t0".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(1))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows, [0]);
+    assert_eq!(scores.len(), 1);
+    assert!(scores[0].is_finite() && scores[0] > 0.0);
+    assert_eq!(counter.posting_rows_read(), expected_posting_rows);
+    assert_eq!(counter.impact_rows_read(), expected_posting_rows);
 }
 
 /// IO regression test for the lazy posting-metadata refactor. Builds a
@@ -880,15 +976,26 @@ async fn test_default_posting_read_keeps_read_ahead_group() {
     assert_eq!(counter.impact_rows_read(), 4);
 }
 
+#[rstest::rstest]
+#[case::dense_alternatives(4, [0, 0], 1, 4, 1)]
+#[case::sparse_alternatives(8, [0, 0], 1, 8, 1)]
+#[case::dense_terms(4, [0, 1], 1, 4, 2)]
+#[case::sparse_terms(8, [0, 1], 2, 2, 2)]
 #[tokio::test]
-async fn test_cache_aware_same_group_expansions_share_one_read_ahead_group() {
+async fn test_cache_aware_same_group_expansions_bound_read_amplification(
+    #[case] group_size: u32,
+    #[case] positions: [u32; 2],
+    #[case] expected_reads: usize,
+    #[case] expected_rows: usize,
+    #[case] expected_postings: usize,
+) {
     let cache = LanceCache::with_capacity(1024 * 1024);
     let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
-    set_test_posting_group_size(&mut index, 4);
+    set_test_posting_group_size(&mut index, group_size);
     let partition = index.partitions[0].clone();
     let tokens = Tokens::with_positions(
         vec!["t0".to_owned(), "t1".to_owned()],
-        vec![0, 0],
+        positions.to_vec(),
         DocType::Text,
     );
     let scorer = MemBM25Scorer::new(
@@ -910,15 +1017,15 @@ async fn test_cache_aware_same_group_expansions_share_one_read_ahead_group() {
         .await
         .unwrap();
 
-    assert_eq!(loaded.postings.len(), 1);
-    assert_eq!(counter.read_range_calls(), 1);
-    assert_eq!(counter.rows_read(), 4);
-    assert_eq!(counter.metadata_rows_read(), 4);
-    assert_eq!(counter.posting_rows_read(), 4);
-    assert_eq!(counter.impact_rows_read(), 4);
-    assert_eq!(metrics.index_cache_misses(), 1);
-    assert_eq!(metrics.index_cache_hits(), 1);
-    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    assert_eq!(loaded.postings.len(), expected_postings);
+    assert_eq!(counter.read_range_calls(), expected_reads);
+    assert_eq!(counter.rows_read(), expected_rows);
+    assert_eq!(counter.metadata_rows_read(), expected_rows);
+    assert_eq!(counter.posting_rows_read(), expected_rows);
+    assert_eq!(counter.impact_rows_read(), expected_rows);
+    assert_eq!(metrics.index_cache_misses(), expected_reads);
+    assert_eq!(metrics.index_cache_hits(), 2 - expected_reads);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), expected_reads);
 }
 
 #[tokio::test]
@@ -1092,6 +1199,54 @@ async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
 
 // ===========================================================================
 // Regression tests for index-cache size accounting of cached posting lists.
+
+#[tokio::test]
+async fn test_packed_group_charges_retained_arrow_allocations() {
+    let (index, _cache) = load_v2_index_with_grouped_postings(16, 1).await;
+    let reader = &index.partitions[0].inverted_list;
+    reader.prewarm_posting_lists(false, 1).await.unwrap();
+    let (start, end) = reader.group_range_for_token(0).unwrap();
+    let group = reader
+        .index_cache
+        .get_with_key(&posting_list_group_cache_key(
+            start,
+            end,
+            reader.has_impacts,
+        ))
+        .await
+        .unwrap();
+    let PostingListGroupStorage::Packed(packed) = &group.storage else {
+        panic!("expected packed group")
+    };
+    let arrow_bytes: usize = packed
+        .batch
+        .columns()
+        .iter()
+        .map(|array| array.get_array_memory_size())
+        .sum();
+    let expected = std::mem::size_of::<PostingListGroup>()
+        + arrow_bytes
+        + packed.first_docs_state_capacity_bytes
+        + packed.impact_state_capacity_bytes;
+    assert_eq!(group.as_ref().deep_size_of(), expected);
+}
+
+#[test]
+fn test_packed_group_deduplicates_shared_buffer_capacity() {
+    let mut builder = ListBuilder::new(LargeBinaryBuilder::new());
+    for _ in 0..4 {
+        builder.values().append_value([1u8; 256]);
+        builder.append(true);
+    }
+    let full = builder.finish();
+    let first = full.slice(0, 1);
+    let second = full.slice(2, 1);
+    let mut context = lance_core::deepsize::Context::new();
+    let first_bytes = super::super::cache::retained_cache_bytes(&first, &mut context);
+    let second_bytes = super::super::cache::retained_cache_bytes(&second, &mut context);
+    assert_eq!(first_bytes, first.get_array_memory_size());
+    assert_eq!(second_bytes, std::mem::size_of::<ListArray>());
+}
 //
 // A cached posting list is a *slice* of a buffer read for a whole posting-list
 // group, so its `DeepSizeOf` impl must charge only the bytes the slice

@@ -88,7 +88,7 @@ pub struct MemTableFlusher {
 ///
 /// Read off the memtable being flushed, which is frozen. That matters: an
 /// appending store bumps these counters before it publishes the batch, so only
-/// a sealed one agrees with what a scan of it will see.
+/// a frozen one agrees with what a scan of it will see.
 #[derive(Clone, Copy)]
 struct FlushedSize {
     in_memory_bytes: Option<u64>,
@@ -288,6 +288,12 @@ impl MemTableFlusher {
         durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
+        if let Some(published) = self
+            .already_published(memtable, covered_wal_entry_position)
+            .await?
+        {
+            return Ok(published);
+        }
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -466,7 +472,11 @@ impl MemTableFlusher {
             session: self.session.clone(),
             ..Default::default()
         };
-        let mut builder = InsertBuilder::new(uri.as_str()).with_params(&write_params);
+        // The generation's columns keep the base table's field ids: reads and
+        // the merge into base resolve them by id, across renames and drops.
+        let mut builder = InsertBuilder::new(uri.as_str())
+            .with_params(&write_params)
+            .with_table_field_ids();
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
         }
@@ -556,6 +566,12 @@ impl MemTableFlusher {
         durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
+        if let Some(published) = self
+            .already_published(memtable, covered_wal_entry_position)
+            .await?
+        {
+            return Ok(published);
+        }
 
         if memtable.row_count() == 0 {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
@@ -755,6 +771,50 @@ impl MemTableFlusher {
         Ok(())
     }
 
+    /// The flush result if `memtable`'s generation is already published, `None`
+    /// if it is next to publish.
+    ///
+    /// Errors when an earlier generation is unpublished: publishing would move
+    /// the replay position past its WAL entries. Reads the cached manifest, so
+    /// call after `check_fenced` refreshes it.
+    async fn already_published(
+        &self,
+        memtable: &MemTable,
+        covered_wal_entry_position: u64,
+    ) -> Result<Option<FlushResult>> {
+        let generation = memtable.generation();
+        let manifest = self.manifest_store.latest().await?.ok_or_else(|| {
+            Error::io(format!(
+                "Shard manifest not found for shard {}",
+                self.shard_id
+            ))
+        })?;
+        match manifest.current_generation.cmp(&generation) {
+            std::cmp::Ordering::Equal => Ok(None),
+            std::cmp::Ordering::Less => Err(Error::internal(format!(
+                "MemTable generation {generation} cannot flush before generation {} of shard {}, \
+                 which has not flushed",
+                manifest.current_generation, self.shard_id
+            ))),
+            std::cmp::Ordering::Greater => {
+                // A compactor may already have drained the SSTable from the
+                // manifest, leaving no path to report.
+                let sstable = manifest
+                    .sstables
+                    .into_iter()
+                    .find(|sstable| sstable.generation == generation)
+                    .unwrap_or_else(|| {
+                        FlushedSize::of(memtable).sstable(generation, String::new())
+                    });
+                Ok(Some(FlushResult {
+                    sstable,
+                    rows_flushed: memtable.row_count(),
+                    covered_wal_entry_position,
+                }))
+            }
+        }
+    }
+
     /// Update the shard manifest with the new SSTable.
     async fn update_manifest(
         &self,
@@ -767,20 +827,34 @@ impl MemTableFlusher {
         let gen_path = gen_path.to_string();
 
         self.manifest_store
-            .commit_update(epoch, |current| {
+            .try_commit_update(epoch, |current| {
+                // Advancing over a failed generation would make WAL replay
+                // skip rows that never reached an SSTable. Check inside the CAS loop.
+                if generation != current.current_generation {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot flush generation {generation} for shard {}: expected current_generation={}",
+                        self.shard_id, current.current_generation
+                    )));
+                }
+                let next_generation = generation.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Generation {generation} overflows for shard {}",
+                        self.shard_id
+                    ))
+                })?;
                 let mut sstables = current.sstables.clone();
                 sstables.push(size.sstable(generation, gen_path.clone()));
 
-                ShardManifest {
+                Ok(ShardManifest {
                     version: current.next_version(),
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
                         .wal_entry_position_last_seen
                         .max(covered_wal_entry_position),
-                    current_generation: generation + 1,
+                    current_generation: next_generation,
                     sstables,
                     ..current.clone()
-                }
+                })
             })
             .await
     }
@@ -852,6 +926,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V2;
+    use rstest::rstest;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -977,7 +1052,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Nothing is durable yet, so the L0 flush must refuse.
+        // Nothing is durable yet, so the SSTable flush must refuse.
         let durable = 0;
         assert!(!memtable.all_flushed_to_wal(durable));
 
@@ -1061,6 +1136,89 @@ mod tests {
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
         assert_eq!(updated_manifest.sstables.len(), 1);
+    }
+
+    #[rstest]
+    #[case::gap(2)]
+    #[case::stale(0)]
+    #[tokio::test]
+    async fn test_flusher_requires_contiguous_generation(#[case] generation: u64) {
+        let fixture = FlushFixture::new().await;
+        let before = fixture.manifest_store.latest().await.unwrap().unwrap();
+        let size = FlushedSize {
+            in_memory_bytes: Some(4),
+            physical_rows: Some(1),
+            primary_key_bytes: None,
+        };
+        let error = fixture
+            .flusher
+            .update_manifest(fixture.epoch, generation, "uncommitted_gen", 2, size)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Cannot flush generation {generation} for shard"))
+        );
+        assert!(error.to_string().contains("expected current_generation=1"));
+        let after = fixture
+            .manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.current_generation, before.current_generation);
+        assert_eq!(
+            after.replay_after_wal_entry_position,
+            before.replay_after_wal_entry_position
+        );
+        assert!(after.sstables.is_empty());
+    }
+
+    /// A later generation is refused; a published one is reported without a
+    /// second commit.
+    #[tokio::test]
+    async fn a_flush_publishes_only_the_next_generation() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path,
+            base_uri,
+            shard_id,
+            manifest_store.clone(),
+        );
+        let schema = create_test_schema();
+        let mut first = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let durable = first.insert(create_test_batch(&schema, 10)).await.unwrap() + 1;
+        let mut second = MemTable::new(schema.clone(), 2, vec![]).unwrap();
+        second.insert(create_test_batch(&schema, 10)).await.unwrap();
+
+        let refused = flusher.flush(&second, epoch, 2, durable).await.unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("cannot flush before generation 1"),
+            "{refused}"
+        );
+        let untouched = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(untouched.current_generation, 1);
+        assert!(untouched.sstables.is_empty());
+
+        flusher.flush(&first, epoch, 1, durable).await.unwrap();
+        let published = manifest_store.latest().await.unwrap().unwrap();
+        let again = flusher.flush(&first, epoch, 1, durable).await.unwrap();
+        assert_eq!(again.sstable, published.sstables[0]);
+        assert_eq!(manifest_store.latest().await.unwrap().unwrap(), published);
     }
 
     /// A flushed generation records what it holds, read back off storage.
@@ -1361,7 +1519,13 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                index_store,
+                &details,
+                lance_index::scalar::btree::BTREE_INDEX_VERSION,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -1458,7 +1622,13 @@ mod tests {
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
         let index = plugin
-            .load_index(index_store, &details, 0, None, &LanceCache::no_cache())
+            .load_index(
+                index_store,
+                &details,
+                lance_index::scalar::btree::BTREE_INDEX_VERSION,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -1875,6 +2045,132 @@ mod tests {
             plan_str.contains("ANNIvfPartition:"),
             "query plan must use IVF partition, got: {plan_str}"
         );
+    }
+
+    /// A flushed cosine index ranks L2 against a normalized query, so it must
+    /// store normalized vectors.
+    #[tokio::test]
+    async fn test_flusher_cosine_index_ranks_unnormalized_vectors() {
+        use super::super::super::index::IndexStore;
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_linalg::distance::DistanceType;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        // Norms spread over 0.2..5.0, so ranking by L2 against raw vectors
+        // would disagree with cosine.
+        let (dim, num_vectors) = (32usize, 2000usize);
+        let mut seed: u64 = 42;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        };
+        let mut vectors = Vec::with_capacity(num_vectors * dim);
+        for _ in 0..num_vectors {
+            let row: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let target = 0.2 + 4.8 * (next() * 0.5 + 0.5);
+            vectors.extend(row.iter().map(|x| x * target / norm));
+        }
+        let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let cosine_distance = |id: usize| {
+            lance_linalg::distance::cosine_distance(&query, &vectors[id * dim..][..dim])
+        };
+        let mut by_distance: Vec<usize> = (0..num_vectors).collect();
+        by_distance.sort_by(|a, b| cosine_distance(*a).total_cmp(&cosine_distance(*b)));
+        let nearest: std::collections::HashSet<i32> =
+            by_distance[..10].iter().map(|id| *id as i32).collect();
+
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(item.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let index_specs = vec![MemIndexSpec::hnsw(
+            "vector_hnsw",
+            1,
+            "vector",
+            DistanceType::Cosine,
+        )];
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let lance_schema = lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap();
+        memtable.set_indexes(
+            IndexStore::from_specs(&index_specs, &lance_schema, num_vectors, 100).unwrap(),
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_vectors as i32)),
+                Arc::new(
+                    FixedSizeListArray::try_new(
+                        item,
+                        dim as i32,
+                        Arc::new(Float32Array::from(vectors.clone())),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            shard_id,
+            manifest_store.clone(),
+        );
+        let result = flusher
+            .flush_with_indexes(&memtable, epoch, &index_specs, 1, frag_id + 1)
+            .await
+            .unwrap();
+        let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, result.sstable.path);
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &Float32Array::from(query.clone()), 10)
+            .unwrap();
+        scan.distance_metric(DistanceType::Cosine);
+        // A wide search list keeps graph recall out of what this measures.
+        scan.ef(500);
+        scan.fast_search();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let distances = batch["_distance"]
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+
+        let found = ids
+            .values()
+            .iter()
+            .filter(|id| nearest.contains(id))
+            .count();
+        assert!(found >= 9, "recall@10 was {found}/10");
+        // Lance's SQ index reports cosine as L2 over normalized vectors.
+        for (id, distance) in ids.values().iter().zip(distances.values()) {
+            let expected = 2.0 * cosine_distance(*id as usize);
+            assert!(
+                (distance - expected).abs() < 0.05,
+                "id={id} reported {distance}, expected {expected}"
+            );
+        }
     }
 
     #[tokio::test]

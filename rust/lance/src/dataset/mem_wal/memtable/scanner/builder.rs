@@ -454,20 +454,13 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
                 // `Some(0)` is an exact match in the index model.
                 Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
                     .with_boost(m.boost),
-                // The fuzzy path expands each term independently and unions the
-                // expansions, so it cannot also require every term to match.
-                _ if m.operator != Operator::Or => {
-                    return Err(Error::not_supported(
-                        "MemTable fuzzy full-text search only supports OR match operators"
-                            .to_string(),
-                    ));
-                }
                 fuzziness => FtsQueryExpr::fuzzy_with_options(
                     m.terms.clone(),
                     fuzziness,
                     m.prefix_length,
                     m.max_expansions,
                 )
+                .with_operator(m.operator)
                 .with_boost(m.boost),
             },
             m.column.as_ref(),
@@ -562,6 +555,9 @@ pub struct MemTableScanner {
     /// each PK only, so an in-memtable update whose current version fails the
     /// predicate is excluded rather than leaking a stale older match.
     pk_columns: Option<Vec<String>>,
+    /// Whether [`Self::create_dedup_plan`] may answer a filter from the filter
+    /// indexes. Off reads every visible row.
+    memtable_filter_indexes: bool,
 }
 
 impl MemTableScanner {
@@ -585,7 +581,18 @@ impl MemTableScanner {
         visibility: MemTableVisibility,
     ) -> Self {
         let readable_count = indexes.prefix_count(visibility);
+        Self::new_at_readable_count(batch_store, indexes, schema, readable_count)
+    }
 
+    /// As [`Self::new`], bounded by the first `readable_count` published batches
+    /// the caller already snapshotted, so one query reads the memtable through a
+    /// single cursor.
+    pub(crate) fn new_at_readable_count(
+        batch_store: Arc<BatchStore>,
+        indexes: Arc<IndexStore>,
+        schema: SchemaRef,
+        readable_count: usize,
+    ) -> Self {
         Self {
             batch_store,
             indexes,
@@ -602,7 +609,17 @@ impl MemTableScanner {
             with_row_id: false,
             with_row_address: false,
             pk_columns: None,
+            memtable_filter_indexes: false,
         }
+    }
+
+    /// Let [`Self::create_dedup_plan`] answer a filter from the filter indexes,
+    /// keeping a match only when it is its key's newest visible version. Past
+    /// the match budget, or without a primary-key index, every visible row is
+    /// read.
+    pub fn with_memtable_filter_indexes(&mut self, enabled: bool) -> &mut Self {
+        self.memtable_filter_indexes = enabled;
+        self
     }
 
     /// Provide the primary-key columns. When set, a filtered vector/FTS search
@@ -1146,11 +1163,13 @@ impl MemTableScanner {
 
     /// Plan a newest-per-PK active-arm scan via `MemTableDedupScanExec` —
     /// dedup runs before the predicate so a PK whose newest version fails the
-    /// filter cannot leak an older version that passes. Unlike
-    /// `plan_full_scan`, this never takes the index route (dedup needs
-    /// every version) and never pushes a limit (the LSM caps results above
-    /// the cross-source merge).
+    /// filter cannot leak an older version that passes. With
+    /// [`Self::with_memtable_filter_indexes`] on, a filter the indexes answer
+    /// within the match budget is read from their matches instead, each kept
+    /// only if it is its key's newest visible version. It never pushes a limit (the LSM caps
+    /// results above the cross-source merge).
     pub async fn create_dedup_plan(&self, pk_columns: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
+        let pk_columns = &self.key_columns(pk_columns)?;
         validate_pk_types(&self.schema, pk_columns)?;
 
         let pk_indices = pk_columns
@@ -1180,17 +1199,43 @@ impl MemTableScanner {
             (None, None)
         };
 
-        Ok(Arc::new(MemTableDedupScanExec::new(
+        let dedup_scan: Arc<dyn ExecutionPlan> = Arc::new(MemTableDedupScanExec::new(
             self.batch_store.clone(),
+            self.readable_count,
+            projection_indices.clone(),
+            self.output_schema()?,
+            pk_indices.clone(),
+            self.with_row_id,
+            self.with_row_address,
+            filter_predicate.clone(),
+            filter_expr.clone(),
+        ));
+
+        // The newest-version check needs the primary-key index.
+        let (true, Some(filter), true) = (
+            self.memtable_filter_indexes,
+            filter_expr.as_ref(),
+            self.indexes.has_pk_index(),
+        ) else {
+            return Ok(dedup_scan);
+        };
+        let Some(indexed) = plan_filter(filter, self.indexes.filter_catalog())? else {
+            return Ok(dedup_scan);
+        };
+        let index_exec = ScalarMemIndexExec::new(
+            self.batch_store.clone(),
+            self.indexes.clone(),
+            indexed.searches,
+            filter_predicate,
+            indexed.is_whole_filter,
             self.readable_count,
             projection_indices,
             self.output_schema()?,
-            pk_indices,
             self.with_row_id,
             self.with_row_address,
-            filter_predicate,
-            filter_expr,
-        )))
+        )
+        .with_newest_check(pk_indices, dedup_scan);
+        Ok(Arc::new(index_exec))
     }
 
     /// Plan a filter answered from the memtable's indexes.
@@ -1239,7 +1284,12 @@ impl MemTableScanner {
         let projection_indices = self.compute_projection_indices()?;
         let base_schema = self.base_output_schema()?;
         let filter_predicate = self.filter_predicate()?;
-        if let Some(pk_columns) = &self.pk_columns {
+        let pk_columns = self
+            .pk_columns
+            .as_deref()
+            .map(|columns| self.key_columns(columns))
+            .transpose()?;
+        if let Some(pk_columns) = &pk_columns {
             validate_pk_types(&self.schema, pk_columns)?;
         }
 
@@ -1250,8 +1300,7 @@ impl MemTableScanner {
         // append-only PK data can still use HNSW safely. This relies on
         // `IndexStore` marking PK overrides before advancing the visible batch
         // watermark, so any snapshot that sees a rewrite also sees the flag.
-        let hnsw_safe_with_pk = self
-            .pk_columns
+        let hnsw_safe_with_pk = pk_columns
             .as_ref()
             .map(|_| self.indexes.has_pk_index() && !self.indexes.pk_has_overrides())
             .unwrap_or(true);
@@ -1278,18 +1327,28 @@ impl MemTableScanner {
                 self.with_row_id,
             )?)
         } else {
-            Arc::new(
-                MemTableBruteForceVectorExec::new(
-                    self.batch_store.clone(),
-                    query.clone(),
-                    max_readable,
-                    projection_indices,
-                    base_schema,
-                    self.with_row_id,
-                )?
-                .with_filter(filter_predicate)
-                .with_pk_columns(self.pk_columns.clone()),
-            )
+            let mut exec = MemTableBruteForceVectorExec::new(
+                self.batch_store.clone(),
+                query.clone(),
+                max_readable,
+                projection_indices,
+                base_schema,
+                self.with_row_id,
+            )?
+            .with_filter(filter_predicate)
+            .with_pk_columns(pk_columns)
+            .with_indexes(self.indexes.clone());
+            // Rank only the rows a filtered scan would read, via the same
+            // index/leftover split of the filter.
+            if self.use_index
+                && let Some(filter) = &self.filter
+            {
+                let optimized = Planner::new(self.schema.clone()).optimize_expr(filter.clone())?;
+                if let Some(indexed) = plan_filter(&optimized, self.indexes.filter_catalog())? {
+                    exec = exec.with_index_filter(indexed.searches, indexed.is_whole_filter);
+                }
+            }
+            Arc::new(exec)
         };
         self.apply_post_index_ops(exec).await
     }
@@ -1307,7 +1366,12 @@ impl MemTableScanner {
         let max_readable = self.readable_count;
         let projection_indices = self.compute_projection_indices()?;
         let filter_predicate = self.filter_predicate()?;
-        if let Some(pk_columns) = &self.pk_columns {
+        let pk_columns = self
+            .pk_columns
+            .as_deref()
+            .map(|columns| self.key_columns(columns))
+            .transpose()?;
+        if let Some(pk_columns) = &pk_columns {
             validate_pk_types(&self.schema, pk_columns)?;
         }
 
@@ -1321,8 +1385,24 @@ impl MemTableScanner {
             self.with_row_id,
         )?
         .with_filter(filter_predicate)
-        .with_pk_columns(self.pk_columns.clone());
+        .with_pk_columns(pk_columns);
         self.apply_post_index_ops(Arc::new(index_exec)).await
+    }
+
+    /// `pk_columns` in the key index's order, which its lookups expect. Errors
+    /// if they name another key.
+    fn key_columns(&self, pk_columns: &[String]) -> Result<Vec<String>> {
+        let Some(index_key) = self.indexes.pk_columns() else {
+            return Ok(pk_columns.to_vec());
+        };
+        if pk_columns.len() != index_key.len()
+            || !index_key.iter().all(|column| pk_columns.contains(column))
+        {
+            return Err(Error::invalid_input(format!(
+                "primary-key columns {pk_columns:?} differ from the memtable's key index columns {index_key:?}"
+            )));
+        }
+        Ok(index_key.to_vec())
     }
 
     fn empty_fts_plan(
@@ -1402,6 +1482,232 @@ impl MemTableScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::dataset::mem_wal::memtable::scanner::{fallback_reads, newest_checks};
+
+    /// A deduplicated filtered read from the filter indexes returns what
+    /// reading every row returns, across overwrites, deletes, rows not yet
+    /// visible, and every key type, single and composite.
+    #[tokio::test]
+    async fn memtable_filter_indexes_answer_like_reading_every_row() {
+        use crate::dataset::mem_wal::TOMBSTONE;
+        use crate::dataset::mem_wal::wal::WriterCursors;
+        use arrow_array::cast::AsArray;
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        const COLOURS: [&str; 16] = [
+            "red", "blue", "green", "amber", "black", "white", "grey", "pink", "cyan", "teal",
+            "navy", "lime", "plum", "rose", "sand", "gold",
+        ];
+        const FILTERS: [&str; 9] = [
+            "colour = 'red'",
+            "colour IN ('red', 'blue')",
+            "colour IS NULL",
+            "colour = 'red' OR colour = 'green'",
+            "colour > 'c'",
+            "colour = 'red' AND b > 1",
+            // Empty ranges: inverted, and a single point excluded at one end.
+            "colour BETWEEN 'red' AND 'blue'",
+            "colour > 'red' AND colour < 'blue'",
+            "colour > 'red' AND colour <= 'red'",
+        ];
+        // Every key type a memtable key index accepts.
+        const KEY_TYPES: [DataType; 13] = [
+            DataType::Int32,
+            DataType::Utf8,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Boolean,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+        ];
+
+        let mut seed: u64 = 0x5eed;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+        let (mut checked_reads, mut full_reads) = (0, 0);
+        for round in 0..150 {
+            let composite = round % 3 == 1;
+            let key_type = KEY_TYPES[round % KEY_TYPES.len()].clone();
+            let string_key = matches!(
+                key_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+            );
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", key_type.clone(), false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("colour", DataType::Utf8, true),
+                Field::new(TOMBSTONE, DataType::Boolean, false),
+            ]));
+            let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+            let mut indexes = IndexStore::from_specs(
+                &[MemIndexSpec::btree("colour_idx", 2, "colour")],
+                &lance_schema,
+                1024,
+                64,
+            )
+            .unwrap();
+            let pk: Vec<(String, i32)> = if composite {
+                vec![("a".to_string(), 0), ("b".to_string(), 1)]
+            } else {
+                vec![("a".to_string(), 0)]
+            };
+            indexes.enable_pk_index(&pk);
+            let cursors = Arc::new(WriterCursors::new(true));
+            indexes.set_durability(cursors.clone(), 0);
+            let batch_store = Arc::new(BatchStore::with_capacity(64));
+            let batches = 1 + next(40) as usize;
+            for position in 0..batches {
+                let rows = 1 + next(16) as usize;
+                let (mut a, mut b, mut colour, mut tombstone) = (vec![], vec![], vec![], vec![]);
+                for _ in 0..rows {
+                    a.push(next(60) as i32);
+                    b.push(if composite { next(3) as i32 } else { 1 });
+                    let deleted = next(7) == 0;
+                    colour.push(match next(17) {
+                        _ if deleted => None,
+                        16 => None,
+                        c => Some(COLOURS[c as usize]),
+                    });
+                    tombstone.push(deleted);
+                }
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        arrow_cast::cast(
+                            &if string_key {
+                                Arc::new(StringArray::from_iter_values(
+                                    a.iter().map(|key| format!("key{key:03}")),
+                                )) as arrow_array::ArrayRef
+                            } else {
+                                Arc::new(Int32Array::from(a)) as arrow_array::ArrayRef
+                            },
+                            &key_type,
+                        )
+                        .unwrap(),
+                        Arc::new(Int32Array::from(b)),
+                        Arc::new(StringArray::from(colour)),
+                        Arc::new(BooleanArray::from(tombstone)),
+                    ],
+                )
+                .unwrap();
+                let (_, offset, _) = batch_store.append(batch.clone()).unwrap();
+                indexes
+                    .insert_with_batch_position(&batch, offset, Some(position))
+                    .unwrap();
+            }
+            // Every batch is indexed; only a prefix is durable, so a newer
+            // version of a key can sit in the index without being visible.
+            cursors.advance_durable(next(batches as u64 + 1) as usize);
+            let indexes = Arc::new(indexes);
+            let pk_columns: Vec<String> = pk.iter().map(|(name, _)| name.clone()).collect();
+
+            for filter in FILTERS {
+                let filter = format!("({filter}) AND NOT {TOMBSTONE}");
+                let read = async |from_indexes: bool| {
+                    let mut scanner =
+                        MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+                    scanner.filter(&filter).unwrap();
+                    scanner.with_row_address();
+                    scanner.with_memtable_filter_indexes(from_indexes);
+                    let plan = scanner.create_dedup_plan(&pk_columns).await.unwrap();
+                    let ctx = datafusion::prelude::SessionContext::new();
+                    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                        .await
+                        .unwrap();
+                    let mut rows: Vec<(u64, String, i32)> = Vec::new();
+                    for batch in &batches {
+                        let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+                        let address = column("_rowaddr");
+                        let address = address.as_primitive::<arrow_array::types::UInt64Type>();
+                        let a = arrow_cast::cast(&column("a"), &DataType::Utf8).unwrap();
+                        let a = a.as_string::<i32>();
+                        let b = column("b");
+                        let b = b.as_primitive::<arrow_array::types::Int32Type>();
+                        for row in 0..batch.num_rows() {
+                            rows.push((address.value(row), a.value(row).to_string(), b.value(row)));
+                        }
+                    }
+                    rows.sort_unstable();
+                    (rows, newest_checks(&plan))
+                };
+                let (expected, _) = read(false).await;
+                let (actual, checks) = read(true).await;
+                assert_eq!(actual, expected, "round {round}, filter {filter}");
+                if checks > 0 {
+                    checked_reads += 1;
+                } else {
+                    full_reads += 1;
+                }
+            }
+        }
+        assert!(
+            checked_reads > 100 && full_reads > 50,
+            "both ways must be exercised: {checked_reads} checked, {full_reads} read in full"
+        );
+    }
+
+    /// An index that lists matches past the budget still gets every row read
+    /// rather than each match checked.
+    #[tokio::test]
+    async fn memtable_filter_indexes_read_every_row_past_the_budget_whatever_the_index() {
+        use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
+        use lance_core::datatypes::Schema as LanceSchema;
+
+        let schema = create_test_schema();
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let spec = wrapped(
+            MemIndexSpec::btree("name_idx", 1, "name"),
+            Deviation::IgnoresMatchBudget,
+        );
+        let mut indexes = IndexStore::from_specs(&[spec], &lance_schema, 1024, 16).unwrap();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        for position in 0..10 {
+            let batch = create_test_batch(&schema, position as i32 * 10, 10);
+            let (_, offset, _) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, offset, Some(position))
+                .unwrap();
+        }
+        let indexes = Arc::new(indexes);
+
+        for (filter, rows, checked) in [
+            ("name = 'name_42'", 1, true),
+            ("name >= 'name_2'", 88, false),
+        ] {
+            let mut scanner =
+                MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+            scanner.filter(filter).unwrap();
+            scanner.with_memtable_filter_indexes(true);
+            let plan = scanner
+                .create_dedup_plan(&["id".to_string()])
+                .await
+                .unwrap();
+            let ctx = datafusion::prelude::SessionContext::new();
+            let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                rows,
+                "{filter}"
+            );
+            assert_eq!(newest_checks(&plan) > 0, checked, "{filter}");
+            assert_eq!(fallback_reads(&plan), usize::from(!checked), "{filter}");
+        }
+    }
+
     use crate::dataset::mem_wal::index::MemIndexSpec;
     use crate::dataset::mem_wal::index::test_plugin::{Deviation, wrapped};
     use arrow_array::{
@@ -1710,6 +2016,7 @@ mod tests {
         );
     }
 
+    /// Each index query shape maps to its local form; a leaf without a column is rejected.
     #[test]
     fn local_fts_query_maps_leaf_shapes_and_rejects_the_rest() {
         use lance_index::scalar::inverted::query::{
@@ -1807,9 +2114,17 @@ mod tests {
                 .with_fuzziness(Some(1))
                 .with_column(Some("text".to_string())),
         ));
+        let local = local_fts_query(fuzzy_and, None).unwrap();
         assert!(
-            local_fts_query(fuzzy_and, None).is_err(),
-            "fuzzy AND cannot be represented by the local memtable query"
+            matches!(
+                local.expr,
+                FtsQueryExpr::Fuzzy {
+                    operator: Operator::And,
+                    fuzziness: Some(1),
+                    ..
+                }
+            ),
+            "fuzzy AND maps to a conjunctive Fuzzy leaf"
         );
 
         // Phrase -> local Phrase.
@@ -3434,6 +3749,391 @@ mod tests {
                 assert_eq!(
                     indexed_rids, scanned,
                     "`{filter}` with indexes on {indexed:?}, {declining:?} declining: index route vs reading every row"
+                );
+            }
+        }
+    }
+
+    /// One row of [`prefilter_memtable`], kept for computing expected answers.
+    struct PrefilterRow {
+        id: i64,
+        category: Option<String>,
+        /// `None` for a delete: a newer version of the key with no vector.
+        vector: Option<Vec<f32>>,
+        batch: usize,
+    }
+
+    /// A memtable keyed on `id`, with a B-tree on `category` (16 values plus
+    /// nulls) and an unindexed `vector`. Batches after the first rewrite
+    /// `rewrites` earlier keys and delete `deletes` more. All batches are
+    /// indexed; only the first `visible_batches` are visible.
+    fn prefilter_memtable(
+        batches: usize,
+        batch_rows: usize,
+        dim: i32,
+        rewrites: usize,
+        deletes: usize,
+        visible_batches: usize,
+    ) -> (
+        Arc<BatchStore>,
+        Arc<IndexStore>,
+        SchemaRef,
+        Vec<PrefilterRow>,
+    ) {
+        use crate::dataset::mem_wal::wal::WriterCursors;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+        ]));
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let mut indexes = IndexStore::from_specs(
+            &[MemIndexSpec::btree("category_idx", 1, "category")],
+            &lance_schema,
+            batches * batch_rows,
+            batches,
+        )
+        .unwrap();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        let cursors = Arc::new(WriterCursors::new(true));
+        indexes.set_durability(cursors.clone(), 0);
+        let batch_store = Arc::new(BatchStore::with_capacity(batches));
+
+        let mut seed: u64 = 0x9e3779b97f4a7c15;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let mut rows = Vec::new();
+        let mut next_id = 0i64;
+        for batch_index in 0..batches {
+            let (mut ids, mut categories) = (vec![], vec![]);
+            let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), dim);
+            for row in 0..batch_rows {
+                let id = if batch_index > 0 && row < rewrites + deletes {
+                    (next() % next_id as u64) as i64
+                } else {
+                    next_id += 1;
+                    next_id - 1
+                };
+                let deleted = batch_index > 0 && (rewrites..rewrites + deletes).contains(&row);
+                let category = match next() % 17 {
+                    _ if deleted => None,
+                    16 => None,
+                    c => Some(format!("cat{c:02}")),
+                };
+                let vector: Option<Vec<f32>> =
+                    (!deleted).then(|| (0..dim).map(|_| (next() % 1000) as f32 / 1000.0).collect());
+                match &vector {
+                    Some(vector) => {
+                        vectors.values().append_slice(vector);
+                        vectors.append(true);
+                    }
+                    None => {
+                        vectors.values().append_nulls(dim as usize);
+                        vectors.append(false);
+                    }
+                }
+                ids.push(id);
+                categories.push(category.clone());
+                rows.push(PrefilterRow {
+                    id,
+                    category,
+                    vector,
+                    batch: batch_index,
+                });
+            }
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(categories)),
+                    Arc::new(vectors.finish()),
+                ],
+            )
+            .unwrap();
+            let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, offset, Some(position))
+                .unwrap();
+        }
+        cursors.advance_durable(visible_batches);
+        (batch_store, Arc::new(indexes), schema, rows)
+    }
+
+    /// `(id, _distance)` of a prefiltered search, nearest first.
+    async fn prefiltered_nearest(
+        batch_store: &Arc<BatchStore>,
+        indexes: &Arc<IndexStore>,
+        schema: &SchemaRef,
+        filter: &str,
+        query: &[f32],
+        (lower, upper): (Option<f32>, Option<f32>),
+        k: usize,
+    ) -> Vec<(i64, f32)> {
+        use arrow_array::cast::AsArray;
+
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        scanner.with_pk_columns(vec!["id".to_string()]);
+        scanner.filter(filter).unwrap();
+        let query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(query.to_vec()));
+        scanner.nearest("vector", query.as_ref(), k).unwrap();
+        scanner.distance_range(lower, upper);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let distances = batch["_distance"].as_primitive::<arrow_array::types::Float32Type>();
+        let mut out: Vec<(i64, f32)> = ids
+            .values()
+            .iter()
+            .zip(distances.values().iter())
+            .map(|(&id, &distance)| (id, distance))
+            .collect();
+        out.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        out
+    }
+
+    /// The nearest `k` keys whose newest version passes `keep`, computed
+    /// directly from the rows written.
+    fn expected_nearest(
+        rows: &[PrefilterRow],
+        visible_batches: usize,
+        keep: impl Fn(&PrefilterRow) -> bool,
+        query: &[f32],
+        (lower, upper): (Option<f32>, Option<f32>),
+        k: usize,
+    ) -> Vec<(i64, f32)> {
+        let mut newest: std::collections::HashMap<i64, &PrefilterRow> =
+            std::collections::HashMap::new();
+        for row in rows.iter().filter(|row| row.batch < visible_batches) {
+            newest.insert(row.id, row);
+        }
+        let l2 = DistanceType::L2.func::<f32>();
+        let mut out: Vec<(i64, f32)> = newest
+            .values()
+            .filter(|row| keep(row))
+            .filter_map(|row| Some((row.id, l2(query, row.vector.as_ref()?))))
+            .filter(|&(_, d)| lower.is_none_or(|lb| d >= lb) && upper.is_none_or(|ub| d < ub))
+            .collect();
+        out.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        out.truncate(k);
+        out
+    }
+
+    /// A prefiltered search ranks exactly the keys whose newest visible version
+    /// passes the filter, with exact, partial, or no index answers, across
+    /// rewrites, deletes, indexed-but-invisible rows, and distance bounds.
+    #[tokio::test]
+    async fn a_prefiltered_vector_search_ranks_only_the_newest_matching_versions() {
+        type Keep = fn(&PrefilterRow) -> bool;
+        let cases: [(&str, Keep); 5] = [
+            ("category = 'cat03'", |row| {
+                row.category.as_deref() == Some("cat03")
+            }),
+            ("category IN ('cat01', 'cat05', 'cat09')", |row| {
+                matches!(row.category.as_deref(), Some("cat01" | "cat05" | "cat09"))
+            }),
+            // Matches about half the rows.
+            ("category < 'cat08'", |row| {
+                row.category.as_deref().is_some_and(|c| c < "cat08")
+            }),
+            // Only half of it is indexed.
+            ("category = 'cat03' AND id % 2 = 0", |row| {
+                row.category.as_deref() == Some("cat03") && row.id % 2 == 0
+            }),
+            // Nothing indexed.
+            ("id % 7 = 3", |row| row.id % 7 == 3),
+        ];
+        // Six batches, the last two indexed but not yet visible.
+        let (batch_store, indexes, schema, rows) = prefilter_memtable(6, 500, 4, 120, 30, 4);
+        assert!(indexes.pk_has_overrides(), "the fixture must rewrite keys");
+        for (filter, keep) in cases {
+            for query in [[0.1, 0.2, 0.3, 0.4], [0.9, 0.1, 0.5, 0.7]] {
+                for bounds in [(None, None), (Some(0.05), Some(0.6))] {
+                    let got = prefiltered_nearest(
+                        &batch_store,
+                        &indexes,
+                        &schema,
+                        filter,
+                        &query,
+                        bounds,
+                        10,
+                    )
+                    .await;
+                    let expected = expected_nearest(&rows, 4, keep, &query, bounds, 10);
+                    assert_eq!(
+                        got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                        "filter: {filter}, bounds: {bounds:?}"
+                    );
+                    for ((_, got), (_, expected)) in got.iter().zip(&expected) {
+                        assert!((got - expected).abs() < 1e-5, "filter: {filter}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A memtable keyed on `(a, b)` with a B-tree on `category`: 64 keys
+    /// `(i, 0)` in category `old`, then key `(3, 0)` rewritten into `new`.
+    fn composite_key_memtable() -> (Arc<BatchStore>, Arc<IndexStore>, SchemaRef) {
+        use arrow_array::FixedSizeListArray;
+        use arrow_array::types::Float32Type;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("category", DataType::Utf8, true),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let mut indexes = IndexStore::from_specs(
+            &[MemIndexSpec::btree("category_idx", 2, "category")],
+            &lance_schema,
+            128,
+            4,
+        )
+        .unwrap();
+        indexes.enable_pk_index(&[("a".to_string(), 0), ("b".to_string(), 1)]);
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let batch = |a: Vec<i32>, category: &str| {
+            let rows = a.len();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(a.clone())),
+                    Arc::new(Int32Array::from(vec![0; rows])),
+                    Arc::new(StringArray::from(vec![category; rows])),
+                    Arc::new(
+                        FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                            a.iter().map(|&a| Some([Some(a as f32), Some(0.0)])),
+                            2,
+                        ),
+                    ),
+                ],
+            )
+            .unwrap()
+        };
+        for batch in [batch((0..64).collect(), "old"), batch(vec![3], "new")] {
+            let (position, offset, _) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, offset, Some(position))
+                .unwrap();
+        }
+        assert!(indexes.pk_has_overrides());
+        (batch_store, Arc::new(indexes), schema)
+    }
+
+    /// Key columns given in another order than the key index's still keep
+    /// exactly each key's newest version, whether the filter is selective
+    /// enough to seek the key index or broad enough to hash every key.
+    #[rstest::rstest]
+    #[case::seek("category = 'new'", 1)]
+    #[case::hash("category IN ('old', 'new')", 64)]
+    #[tokio::test]
+    async fn reordered_composite_key_columns_keep_the_newest_version(
+        #[case] filter: &str,
+        #[case] expected_rows: usize,
+    ) {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+
+        let (batch_store, indexes, schema) = composite_key_memtable();
+        let newest_of_3 = |batch: &RecordBatch| {
+            let a = batch["a"].as_primitive::<Int32Type>();
+            let category = batch["category"].as_string::<i32>();
+            let versions: Vec<&str> = (0..batch.num_rows())
+                .filter(|&row| a.value(row) == 3)
+                .map(|row| category.value(row))
+                .collect();
+            assert_eq!(versions, ["new"], "filter: {filter}");
+            assert_eq!(batch.num_rows(), expected_rows, "filter: {filter}");
+        };
+        let reordered = vec!["b".to_string(), "a".to_string()];
+
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        scanner.with_pk_columns(reordered.clone());
+        scanner.filter(filter).unwrap();
+        let query = arrow_array::Float32Array::from(vec![3.0, 0.0]);
+        scanner.nearest("vector", &query, 100).unwrap();
+        newest_of_3(&scanner.try_into_batch().await.unwrap());
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
+        scanner.filter(filter).unwrap();
+        scanner.with_memtable_filter_indexes(true);
+        let plan = scanner.create_dedup_plan(&reordered).await.unwrap();
+        let ctx = SessionContext::new();
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+        newest_of_3(&arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap());
+    }
+
+    /// Key columns naming another key than the key index's are rejected.
+    #[tokio::test]
+    async fn key_columns_naming_another_key_are_rejected() {
+        let (batch_store, indexes, schema) = composite_key_memtable();
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        scanner.with_pk_columns(vec!["a".to_string()]);
+        let query = arrow_array::Float32Array::from(vec![3.0, 0.0]);
+        scanner.nearest("vector", &query, 10).unwrap();
+        let error = scanner.try_into_batch().await.unwrap_err().to_string();
+        assert!(error.contains("key index"), "{error}");
+
+        let scanner = MemTableScanner::new(batch_store, indexes, schema);
+        let error = scanner
+            .create_dedup_plan(&["a".to_string()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("key index"), "{error}");
+    }
+
+    /// Timing for prefiltered searches over 100,000 rows of 128-dim vectors,
+    /// with and without key rewrites. Run optimized with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    #[allow(clippy::print_stdout)]
+    async fn time_a_prefiltered_vector_search_over_a_large_memtable() {
+        let query: Vec<f32> = (0..128).map(|i| (i % 10) as f32 / 10.0).collect();
+        for rewrites in [0, 1_000] {
+            let (batch_store, indexes, schema, _) =
+                prefilter_memtable(10, 10_000, 128, rewrites, 0, 10);
+            for filter in ["category = 'cat03'", "id % 16 = 3", "category < 'cat08'"] {
+                let mut times = Vec::new();
+                for _ in 0..11 {
+                    let start = std::time::Instant::now();
+                    prefiltered_nearest(
+                        &batch_store,
+                        &indexes,
+                        &schema,
+                        filter,
+                        &query,
+                        (None, None),
+                        10,
+                    )
+                    .await;
+                    times.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                times.sort_by(f64::total_cmp);
+                println!(
+                    "rewrites={rewrites:5} filter={filter:20} median={:7.1} ms",
+                    times[times.len() / 2]
                 );
             }
         }

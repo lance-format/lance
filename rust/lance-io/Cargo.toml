@@ -36,6 +36,7 @@ metrics = { workspace = true, optional = true }
 moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
+quick-xml = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 tokio.workspace = true
@@ -53,6 +54,7 @@ reqsign-google = { version = "3.0.3", optional = true }
 io-uring = { workspace = true }
 
 [dev-dependencies]
+serde_json.workspace = true
 criterion.workspace = true
 lance-testing.workspace = true
 test-log.workspace = true
@@ -83,9 +85,10 @@ gcp = [
     "dep:reqsign-file-read-tokio",
     "dep:reqsign-google",
     "dep:serde_json",
+    "dep:quick-xml",
 ]
-aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
-azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "opendal/services-azdls", "dep:object_store_opendal"]
+aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal", "dep:quick-xml"]
+azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "opendal/services-azdls", "dep:object_store_opendal", "dep:quick-xml"]
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 goosefs = [
     "dep:opendal",

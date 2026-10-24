@@ -50,12 +50,17 @@ use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
-const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
+pub const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const SEED_NULL_BITMAP_META_KEY: &str = "seed_null_bitmap";
+/// Seed schema-metadata key carrying the seed format version. Absent on
+/// version 0 seeds (see `docs/src/format/index/scalar/zone_write_seeds.md`).
+const SEED_VERSION_META_KEY: &str = "version";
+/// The seed format version this writer emits.
+const SEED_FORMAT_VERSION: &str = "1";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
@@ -66,6 +71,11 @@ pub(crate) struct ZoneMapStatistics {
     null_count: u32,
     // only apply to float type
     nan_count: u32,
+    /// NaNs with the sign bit set (`<= nan_count`). `None` when the source
+    /// cannot split the sign: zones loaded from ZoneMap index files (the file
+    /// format has no column for it) and version 0 seeds. Version 1 seeds and
+    /// freshly computed zones carry `Some`.
+    negative_nan_count: Option<u32>,
     // Bound of this zone within the fragment. Persisted as three separate columns
     // (fragment_id, zone_start, zone_length) in the index file.
     bound: ZoneBound,
@@ -161,6 +171,43 @@ impl ZoneMapIndex {
         }
     }
 
+    fn scalar_is_negative_nan(value: &ScalarValue) -> bool {
+        match value {
+            ScalarValue::Float16(Some(value)) => value.is_nan() && value.is_sign_negative(),
+            ScalarValue::Float32(Some(value)) => value.is_nan() && value.is_sign_negative(),
+            ScalarValue::Float64(Some(value)) => value.is_nan() && value.is_sign_negative(),
+            _ => false,
+        }
+    }
+
+    /// Whether the zone may contain a positive NaN (sorts above positive
+    /// infinity under Arrow Rust ordering). Conservative `true` when the NaN
+    /// sign split is unknown.
+    fn zone_positive_nan_possible(zone: &ZoneMapStatistics) -> bool {
+        match zone.negative_nan_count {
+            Some(negative) => zone.nan_count > negative,
+            None => zone.nan_count > 0,
+        }
+    }
+
+    /// Whether the zone may contain a negative NaN (sorts below negative
+    /// infinity under Arrow Rust ordering). Conservative `true` when the NaN
+    /// sign split is unknown.
+    fn zone_negative_nan_possible(zone: &ZoneMapStatistics) -> bool {
+        match zone.negative_nan_count {
+            Some(negative) => negative > 0,
+            None => zone.nan_count > 0,
+        }
+    }
+
+    /// Whether the zone may contain any non-null value (finite or NaN).
+    /// Recorded bounds win over counts: a remapped legacy zone inherits its
+    /// source's counts, which are not exact for the shorter run.
+    fn zone_non_null_possible(zone: &ZoneMapStatistics) -> bool {
+        !Self::zone_has_missing_extrema(zone)
+            || zone.bound.length as u64 > u64::from(zone.null_count)
+    }
+
     /// Returns true if the zone has a non-null, non-NaN min value.
     fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
         !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
@@ -211,7 +258,11 @@ impl ZoneMapIndex {
                 if Self::zone_has_missing_extrema(zone) && Self::zone_has_comparable_values(zone) {
                     return None;
                 }
-                if Self::scalar_is_nan(&zone.max) {
+                // Any NaN breaks the fold: positive NaNs sort above every
+                // finite value and negative NaNs below, so no finite global
+                // range bounds a NaN-bearing zone. Legacy zones mark this with
+                // a NaN max; fresh zones keep finite bounds plus the counts.
+                if zone.nan_count > 0 || Self::scalar_is_nan(&zone.max) {
                     return None;
                 }
                 if Self::scalar_is_finite_bound(&zone.min)
@@ -236,9 +287,11 @@ impl ZoneMapIndex {
 
     /// Evaluates whether a zone could potentially contain values matching the query.
     ///
-    /// NaN query values use the explicit `nan_count`. For finite query values,
-    /// `ScalarValue` total ordering keeps finite values below a stored NaN max,
-    /// so zones with finite values plus NaNs remain conservative false positives.
+    /// Matching follows Arrow Rust total ordering, where NaNs rank by sign and
+    /// payload around the finite values. The counts know only how many NaNs of
+    /// each sign a zone holds, never their payloads, so a zone is pruned only
+    /// when the statistics prove no value can match; anything short of proof
+    /// keeps the zone for the predicate recheck.
     fn evaluate_zone_against_query(
         &self,
         zone: &ZoneMapStatistics,
@@ -290,7 +343,11 @@ impl ZoneMapIndex {
                 };
 
                 if is_nan {
-                    return Ok(zone.nan_count > 0);
+                    return Ok(if Self::scalar_is_negative_nan(target) {
+                        Self::zone_negative_nan_possible(zone)
+                    } else {
+                        Self::zone_positive_nan_possible(zone)
+                    });
                 }
 
                 if Self::zone_has_missing_extrema(zone) {
@@ -300,114 +357,111 @@ impl ZoneMapIndex {
                 Ok(target >= &zone.min && target <= &zone.max)
             }
             SargableQuery::Range(start, end) => {
-                // Zone overlaps with query range if there's any intersection between
-                // the zone's [min, max] and the query's range
-                if Self::zone_has_missing_extrema(zone) {
-                    return Ok(Self::zone_has_comparable_values(zone));
+                // NaN range bounds resolve from the counts alone, so handle
+                // them before the missing-extrema fallback: an all-NaN zone
+                // has null bounds yet still answers `x <= -NaN` exactly.
+                // A NaN on one side makes that side's answer independent of
+                // the other bound (conservatively over-inclusive).
+                //
+                // Total ordering ranks NaNs of the same sign by payload, and
+                // the counts say nothing about payloads. So a count can prove
+                // "no NaN of this sign", never "no NaN of this sign on this
+                // side of the bound NaN": whenever a same-sign NaN is
+                // possible, the zone stays and the predicate recheck decides.
+                match start {
+                    Bound::Included(s) if Self::scalar_is_nan(s) => {
+                        return Ok(if Self::scalar_is_negative_nan(s) {
+                            // x >= -NaN: every finite value and positive NaN
+                            // sorts above any -NaN; other -NaNs depend on
+                            // payload, which the counts cannot rule out.
+                            Self::zone_non_null_possible(zone)
+                        } else {
+                            // x >= +NaN: only positive NaNs can sort there.
+                            Self::zone_positive_nan_possible(zone)
+                        });
+                    }
+                    Bound::Excluded(s) if Self::scalar_is_nan(s) => {
+                        return Ok(if Self::scalar_is_negative_nan(s) {
+                            // x > -NaN: every finite value and positive NaN;
+                            // other -NaNs depend on payload.
+                            Self::zone_non_null_possible(zone)
+                        } else {
+                            // x > +NaN: a positive NaN with a larger payload
+                            // still sorts above the bound, so a positive NaN
+                            // count keeps the zone.
+                            Self::zone_positive_nan_possible(zone)
+                        });
+                    }
+                    _ => {}
+                }
+                match end {
+                    Bound::Included(e) if Self::scalar_is_nan(e) => {
+                        return Ok(if Self::scalar_is_negative_nan(e) {
+                            // x <= -NaN: only negative NaNs can sort there.
+                            Self::zone_negative_nan_possible(zone)
+                        } else {
+                            // x <= +NaN: every finite value and negative NaN;
+                            // other +NaNs depend on payload.
+                            Self::zone_non_null_possible(zone)
+                        });
+                    }
+                    Bound::Excluded(e) if Self::scalar_is_nan(e) => {
+                        return Ok(if Self::scalar_is_negative_nan(e) {
+                            // x < -NaN: a negative NaN with a larger payload
+                            // still sorts below the bound, so a negative NaN
+                            // count keeps the zone.
+                            Self::zone_negative_nan_possible(zone)
+                        } else {
+                            // x < +NaN: every finite value and negative NaN;
+                            // other +NaNs depend on payload.
+                            Self::zone_non_null_possible(zone)
+                        });
+                    }
+                    _ => {}
                 }
 
-                let zone_min = &zone.min;
-                let zone_max = &zone.max;
-
-                let start_check = match start {
-                    Bound::Unbounded => true,
-                    Bound::Included(s) => {
-                        // Handle NaN in range bounds - NaN is greater than all finite values
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0);
-                            }
-                            _ => {}
+                // Both bounds are now finite or unbounded. Each value class is
+                // judged against the WHOLE range, then the results are OR'd: a
+                // positive NaN satisfying the lower bound and a negative NaN
+                // satisfying the upper bound are different values, so neither
+                // matches a two-sided finite range. Positive NaNs sort above
+                // every finite value (they match only when the upper side is
+                // unbounded), negative NaNs below (only when the lower side is
+                // unbounded).
+                //
+                // Ordinary values are judged by the extrema; a non-finite
+                // bound (legacy NaN marker) means unknown and keeps the zone.
+                // Counts decide only when no bound was recorded: remapped
+                // legacy zones inherit inexact counts.
+                let ordinary_possible = if Self::zone_has_missing_extrema(zone) {
+                    Self::zone_has_comparable_values(zone)
+                } else {
+                    let above_start = match start {
+                        Bound::Unbounded => true,
+                        Bound::Included(s) => {
+                            !Self::scalar_is_finite_bound(&zone.max) || &zone.max >= s
                         }
-                        // Handle the case where zone_max is NaN
-                        // If zone_max is NaN, the zone contains both finite values and NaN
-                        // Since we don't know the actual max, we'll be conservative and include the zone
-                        match zone_max {
-                            ScalarValue::Float16(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float32(Some(f)) if f.is_nan() => true,
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => true,
-                            _ => zone_max >= s,
+                        Bound::Excluded(s) => {
+                            !Self::scalar_is_finite_bound(&zone.max) || &zone.max > s
                         }
-                    }
-                    Bound::Excluded(s) => {
-                        // Handle NaN in range bounds
-                        match s {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(false); // Nothing is greater than NaN
-                            }
-                            _ => {}
+                    };
+                    let below_end = match end {
+                        Bound::Unbounded => true,
+                        Bound::Included(e) => {
+                            !Self::scalar_is_finite_bound(&zone.min) || &zone.min <= e
                         }
-                        zone_max > s
-                    }
+                        Bound::Excluded(e) => {
+                            !Self::scalar_is_finite_bound(&zone.min) || &zone.min < e
+                        }
+                    };
+                    above_start && below_end
                 };
+                let positive_nan_matches =
+                    Self::zone_positive_nan_possible(zone) && matches!(end, Bound::Unbounded);
+                let negative_nan_matches =
+                    Self::zone_negative_nan_possible(zone) && matches!(start, Bound::Unbounded);
 
-                let end_check = match end {
-                    Bound::Unbounded => true,
-                    Bound::Included(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // NaN is included, so check if zone has NaN values or finite values
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(zone.nan_count > 0 || zone_min <= e);
-                            }
-                            _ => {}
-                        }
-                        zone_min <= e
-                    }
-                    Bound::Excluded(e) => {
-                        // Handle NaN in range bounds
-                        match e {
-                            ScalarValue::Float16(Some(f)) => {
-                                if f.is_nan() {
-                                    // Everything is less than NaN, so include all finite values
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float32(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(true);
-                                }
-                            }
-                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
-                                return Ok(true);
-                            }
-                            _ => {}
-                        }
-                        zone_min < e
-                    }
-                };
-
-                Ok(start_check && end_check)
+                Ok(ordinary_possible || positive_nan_matches || negative_nan_matches)
             }
             SargableQuery::IsIn(values) => {
                 // Zone contains matching values if any value in the set falls within [min, max]
@@ -418,7 +472,11 @@ impl ZoneMapIndex {
                         match value {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
-                                    zone.nan_count > 0
+                                    if f.is_sign_negative() {
+                                        Self::zone_negative_nan_possible(zone)
+                                    } else {
+                                        Self::zone_positive_nan_possible(zone)
+                                    }
                                 } else if Self::zone_has_missing_extrema(zone) {
                                     Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
@@ -429,7 +487,11 @@ impl ZoneMapIndex {
                             }
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
-                                    zone.nan_count > 0
+                                    if f.is_sign_negative() {
+                                        Self::zone_negative_nan_possible(zone)
+                                    } else {
+                                        Self::zone_positive_nan_possible(zone)
+                                    }
                                 } else if Self::zone_has_missing_extrema(zone) {
                                     Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
@@ -440,7 +502,11 @@ impl ZoneMapIndex {
                             }
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
-                                    zone.nan_count > 0
+                                    if f.is_sign_negative() {
+                                        Self::zone_negative_nan_possible(zone)
+                                    } else {
+                                        Self::zone_positive_nan_possible(zone)
+                                    }
                                 } else if Self::zone_has_missing_extrema(zone) {
                                     Self::zone_has_comparable_values(zone)
                                 } else if !Self::zone_has_finite_min(zone) {
@@ -672,6 +738,8 @@ impl ZoneMapIndex {
                 max,
                 null_count,
                 nan_count,
+                // The index file format has no sign-split column.
+                negative_nan_count: None,
                 bound: ZoneBound {
                     fragment_id: fragment_id_col.value(i),
                     start: zone_start_col.value(i),
@@ -889,11 +957,24 @@ impl ZoneMapIndex {
         let mut any_missing_bitmap = self.null_rows.is_none();
 
         for seed in seeds {
-            let (mut zones, seed_null_bitmap) = ZoneMapSeedWriter::deserialize_seed(
-                seed.fragment_id,
-                &seed.bytes,
-                self.rows_per_zone,
-            )?;
+            let (mut zones, seed_null_bitmap) =
+                ZoneMapSeedWriter::deserialize_seed(seed.fragment_id, &seed.bytes)?;
+            // The statistics stand in for a scan of the fragment, so they
+            // must cover exactly its physical rows.
+            let covered: u64 = zones
+                .iter()
+                .try_fold(0u64, |total, zone| {
+                    total.checked_add(zone.bound.length as u64)
+                })
+                .ok_or_else(|| {
+                    Error::invalid_input("seed zone lengths overflow u64".to_string())
+                })?;
+            if covered != seed.physical_rows {
+                return Err(Error::invalid_input(format!(
+                    "seed for fragment {} covers {} rows but the fragment holds {}",
+                    seed.fragment_id, covered, seed.physical_rows
+                )));
+            }
             new_zones.append(&mut zones);
 
             if !any_missing_bitmap {
@@ -1011,6 +1092,7 @@ fn remap_zone(
             max: zone.max.clone(),
             null_count,
             nan_count: zone.nan_count,
+            negative_nan_count: zone.negative_nan_count,
             bound: ZoneBound {
                 fragment_id: start >> 32,
                 start: start & u64::from(u32::MAX),
@@ -1214,9 +1296,23 @@ impl ZoneMapIndexBuilder {
                 ScalarValue::iter_to_array(std::iter::repeat_n(placeholder, self.maps.len()))?;
             (bounds.clone(), bounds)
         } else {
+            // The ZoneMap index file format predates the NaN sign split: it
+            // has no column for it, and released readers take a NaN max as
+            // the marker that the zone holds NaNs. Keep writing that marker
+            // here so existing readers stay conservative; fresh in-memory
+            // zones and version 1 seeds carry finite bounds plus the counts.
+            let legacy_max = |stat: &ZoneMapStatistics| {
+                if stat.nan_count > 0
+                    && let Some(nan) = nan_scalar(&self.items_type)
+                {
+                    nan
+                } else {
+                    stat.max.clone()
+                }
+            };
             (
                 ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?,
-                ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.max.clone()))?,
+                ScalarValue::iter_to_array(self.maps.iter().map(legacy_max))?,
             )
         };
         let null_counts =
@@ -1290,21 +1386,36 @@ impl ZoneMapIndexBuilder {
     }
 }
 
+/// Per-zone accumulator behind [`ZoneMapProcessor`].
+#[derive(Debug)]
+enum ZoneStatsAccumulator {
+    /// min, max, null_count and nan_count for scalar types.
+    Full(StatisticsAccumulator),
+    /// Parent-level null count only. Nested bounds are never consulted, so the
+    /// child values are not read at all.
+    NullOnly { null_count: u64 },
+}
+
 /// Index-specific processor that computes zone statistics while the trainer
 /// handles chunking and fragment boundaries.
 ///
 /// For non-nested types, tracks min, max, null_count, and nan_count.
-/// For nested types (List, FixedSizeList, Struct, Map, etc.), tracks only
-/// null_count; min and max are stored as typed null values.
+/// For nested types (List, FixedSizeList, Struct, Map, etc.), tracks only the
+/// parent-level null_count without inspecting child values; min and max are
+/// stored as typed null values.
 #[derive(Debug)]
 struct ZoneMapProcessor {
     data_type: DataType,
-    statistics: StatisticsAccumulator,
+    statistics: ZoneStatsAccumulator,
 }
 
 impl ZoneMapProcessor {
     fn new(data_type: DataType) -> Result<Self> {
-        let statistics = StatisticsAccumulator::new(&data_type);
+        let statistics = if data_type.is_nested() {
+            ZoneStatsAccumulator::NullOnly { null_count: 0 }
+        } else {
+            ZoneStatsAccumulator::Full(StatisticsAccumulator::new(&data_type))
+        };
         Ok(Self {
             data_type,
             statistics,
@@ -1329,30 +1440,15 @@ impl ZoneMapProcessor {
             ))
         })
     }
+}
 
-    fn nan_scalar(data_type: &DataType) -> Option<ScalarValue> {
-        match data_type {
-            DataType::Float16 => Some(ScalarValue::Float16(Some(half::f16::NAN))),
-            DataType::Float32 => Some(ScalarValue::Float32(Some(f32::NAN))),
-            DataType::Float64 => Some(ScalarValue::Float64(Some(f64::NAN))),
-            _ => None,
-        }
-    }
-
-    fn max_value_from_stats(
-        value: Option<&ArrayRef>,
-        data_type: &DataType,
-        nan_count: u32,
-    ) -> Result<ScalarValue> {
-        if nan_count > 0
-            && let Some(nan) = Self::nan_scalar(data_type)
-        {
-            // DataFusion's max accumulator surfaced NaN as the zone max.  Keep
-            // that stored zonemap shape while using arrow_stats so existing
-            // range/equality pruning remains conservative around NaN.
-            return Ok(nan);
-        }
-        Self::scalar_value_from_stat(value, data_type)
+/// The positive-NaN scalar for a float type; `None` for everything else.
+fn nan_scalar(data_type: &DataType) -> Option<ScalarValue> {
+    match data_type {
+        DataType::Float16 => Some(ScalarValue::Float16(Some(half::f16::NAN))),
+        DataType::Float32 => Some(ScalarValue::Float32(Some(f32::NAN))),
+        DataType::Float64 => Some(ScalarValue::Float64(Some(f64::NAN))),
+        _ => None,
     }
 }
 
@@ -1360,44 +1456,68 @@ impl ZoneProcessor for ZoneMapProcessor {
     type ZoneStatistics = ZoneMapStatistics;
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
-        self.statistics.update(array)?;
+        match &mut self.statistics {
+            ZoneStatsAccumulator::Full(statistics) => statistics.update(array)?,
+            ZoneStatsAccumulator::NullOnly { null_count } => {
+                if array.data_type() != &self.data_type {
+                    return Err(Error::invalid_input(format!(
+                        "Type mismatch: expected {:?}, got {:?}",
+                        self.data_type,
+                        array.data_type()
+                    )));
+                }
+                *null_count += array.null_count() as u64;
+            }
+        }
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
-        let statistics = self.statistics.statistics();
+        let statistics = match &self.statistics {
+            ZoneStatsAccumulator::Full(statistics) => statistics.statistics(),
+            ZoneStatsAccumulator::NullOnly { null_count } => {
+                return Ok(ZoneMapStatistics {
+                    min: ScalarValue::try_new_null(&self.data_type)?,
+                    max: ScalarValue::try_new_null(&self.data_type)?,
+                    null_count: Self::stat_count_to_u32("null_count", *null_count)?,
+                    nan_count: 0,
+                    negative_nan_count: Some(0),
+                    bound,
+                });
+            }
+        };
         let null_count = Self::stat_count_to_u32("null_count", statistics.null_count)?;
 
-        // For nested types, only null_count is meaningful; store null min/max.
-        if self.data_type.is_nested() {
-            return Ok(ZoneMapStatistics {
-                min: ScalarValue::try_new_null(&self.data_type)?,
-                max: ScalarValue::try_new_null(&self.data_type)?,
-                null_count,
-                nan_count: 0,
-                bound,
-            });
-        }
-
         let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
+        let negative_nan_count = Self::stat_count_to_u32(
+            "negative_nan_count",
+            statistics.negative_nan_count.unwrap_or(0),
+        )?;
+        // Bounds exclude NaNs of either sign (the accumulator skips them);
+        // NaN presence lives in the exact counts. The legacy "NaN max" marker
+        // is applied only when serializing the ZoneMap INDEX file, whose
+        // format predates the sign split.
         Ok(ZoneMapStatistics {
             min: Self::scalar_value_from_stat(
                 statistics.min.as_ref().map(|scalar| scalar.as_array()),
                 &self.data_type,
             )?,
-            max: Self::max_value_from_stats(
+            max: Self::scalar_value_from_stat(
                 statistics.max.as_ref().map(|scalar| scalar.as_array()),
                 &self.data_type,
-                nan_count,
             )?,
             null_count,
             nan_count,
+            negative_nan_count: Some(negative_nan_count),
             bound,
         })
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.statistics.reset();
+        match &mut self.statistics {
+            ZoneStatsAccumulator::Full(statistics) => statistics.reset(),
+            ZoneStatsAccumulator::NullOnly { null_count } => *null_count = 0,
+        }
         Ok(())
     }
 }
@@ -1671,6 +1791,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 ///
 /// Zone statistics are serialized as Arrow IPC bytes and embedded in the data
 /// file footer as a global buffer, keyed by `"lance.seed.<column_name>"`.
+/// It has one output contract, seed format version 1; a target version, if
+/// one is ever added, must be refused when the writer is created, before any
+/// data file is written. Existing files' seeds are never read on the write
+/// path, so files carrying other seed versions neither block nor slow a write.
 #[derive(Debug)]
 pub struct ZoneMapSeedWriter {
     column_name: String,
@@ -1727,6 +1851,19 @@ impl ZoneMapSeedWriter {
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.null_count));
         let nan_counts =
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.nan_count));
+        let negative_nan_counts = arrow_array::UInt32Array::from_iter_values(
+            zones
+                .iter()
+                .map(|s| {
+                    s.negative_nan_count.ok_or_else(|| {
+                        lance_core::Error::invalid_input(
+                            "version 1 seeds require the exact NaN sign split; a zone \
+                             without one cannot be serialized as a seed",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<u32>>>()?,
+        );
         let zone_lengths =
             arrow_array::UInt64Array::from_iter_values(zones.iter().map(|s| s.bound.length as u64));
 
@@ -1735,6 +1872,7 @@ impl ZoneMapSeedWriter {
             Field::new("max", data_type.clone(), true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
+            Field::new("negative_nan_count", DataType::UInt32, false),
             Field::new("zone_length", DataType::UInt64, false),
         ]));
 
@@ -1743,6 +1881,7 @@ impl ZoneMapSeedWriter {
             maxs,
             Arc::new(null_counts) as ArrayRef,
             Arc::new(nan_counts) as ArrayRef,
+            Arc::new(negative_nan_counts) as ArrayRef,
             Arc::new(zone_lengths) as ArrayRef,
         ];
         Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
@@ -1750,13 +1889,12 @@ impl ZoneMapSeedWriter {
 
     /// Deserialize zone map seed bytes (Arrow IPC) into zone statistics and a null bitmap.
     ///
-    /// Returns zone statistics (bounds reconstructed from sequential fragment layout) and an
+    /// Returns zone statistics (zones located by their cumulative lengths) and an
     /// optional `RoaringBitmap` of null row offsets within the fragment. The bitmap is absent
     /// for seeds written by older code that did not track null positions.
     pub(crate) fn deserialize_seed(
         fragment_id: u64,
         bytes: &bytes::Bytes,
-        rows_per_zone: u64,
     ) -> Result<(Vec<ZoneMapStatistics>, Option<RoaringBitmap>)> {
         use arrow_ipc::reader::FileReader;
         use std::io::Cursor;
@@ -1765,6 +1903,26 @@ impl ZoneMapSeedWriter {
         let mut reader = FileReader::try_new(cursor, None).map_err(|e| {
             lance_core::Error::invalid_input(format!("failed to read zone map seed IPC: {}", e))
         })?;
+
+        // Version dispatch: absence means version 0 (the original schema,
+        // whose max may carry the legacy +NaN marker and whose NaN sign split
+        // is unknown). Unknown future versions must not be misread as either,
+        // and are refused before any other metadata is interpreted.
+        let version = reader.schema().metadata.get(SEED_VERSION_META_KEY).cloned();
+        let is_v1 = match version.as_deref() {
+            None => false,
+            Some(SEED_FORMAT_VERSION) => true,
+            Some(other) => {
+                return Err(lance_core::Error::not_supported_source(
+                    format!(
+                        "zone map seed format version '{}' is not supported by this \
+                         build; please upgrade Lance",
+                        other
+                    )
+                    .into(),
+                ));
+            }
+        };
 
         let null_bitmap = if let Some(hex) = reader.schema().metadata.get(SEED_NULL_BITMAP_META_KEY)
         {
@@ -1830,25 +1988,107 @@ impl ZoneMapSeedWriter {
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| lance_core::Error::invalid_input("seed 'zone_length' is not UInt64"))?;
+        let negative_nan_count_col = if is_v1 {
+            Some(
+                batch
+                    .column_by_name("negative_nan_count")
+                    .ok_or_else(|| {
+                        lance_core::Error::invalid_input(
+                            "version 1 seed batch missing 'negative_nan_count' column",
+                        )
+                    })?
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .ok_or_else(|| {
+                        lance_core::Error::invalid_input("seed 'negative_nan_count' is not UInt32")
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let num_zones = batch.num_rows();
         let mut zones = Vec::with_capacity(num_zones);
+        // Zones cover the file's rows in order without gaps, so zone `i`
+        // starts at the checked cumulative sum of the earlier lengths; short
+        // zones may appear anywhere (binary-copy carry concatenates inputs).
+        let mut next_zone_start: u64 = 0;
         for i in 0..num_zones {
-            let zone_start = i as u64 * rows_per_zone;
-            let zone_length = zone_length_col.value(i) as usize;
+            let zone_start = next_zone_start;
+            let zone_length = zone_length_col.value(i);
+            let null_count = null_count_col.value(i);
+            let nan_count = nan_count_col.value(i);
+            let negative_nan_count = negative_nan_count_col.map(|col| col.value(i));
+            if zone_length == 0 {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "seed zone {} has zero length",
+                    i
+                )));
+            }
+            next_zone_start = next_zone_start.checked_add(zone_length).ok_or_else(|| {
+                lance_core::Error::invalid_input("seed zone lengths overflow u64")
+            })?;
+            if is_v1 {
+                // Validate per the format: exact counts that fit the zone,
+                // checked without overflow.
+                if u64::from(null_count) + u64::from(nan_count) > zone_length {
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "seed zone {} counts exceed zone_length: null_count={} nan_count={} \
+                         zone_length={}",
+                        i, null_count, nan_count, zone_length
+                    )));
+                }
+                if let Some(negative) = negative_nan_count
+                    && negative > nan_count
+                {
+                    return Err(lance_core::Error::invalid_input(format!(
+                        "seed zone {} negative_nan_count {} exceeds nan_count {}",
+                        i, negative, nan_count
+                    )));
+                }
+            }
             zones.push(ZoneMapStatistics {
                 min: datafusion_common::ScalarValue::try_from_array(min_col, i)?,
                 max: datafusion_common::ScalarValue::try_from_array(max_col, i)?,
-                null_count: null_count_col.value(i),
-                nan_count: nan_count_col.value(i),
+                null_count,
+                nan_count,
+                negative_nan_count,
                 bound: ZoneBound {
                     fragment_id,
                     start: zone_start,
-                    length: zone_length,
+                    length: zone_length as usize,
                 },
             });
         }
         Ok((zones, null_bitmap))
+    }
+}
+
+impl ZoneMapSeedWriter {
+    /// Record the null positions of `chunk` as runs: one bitmap insert per
+    /// contiguous null region instead of one per null row, so all-null and
+    /// clustered-null data cost almost nothing to track. `base_offset` is the
+    /// fragment-local offset of the chunk's first row.
+    fn record_null_runs(&mut self, chunk: &ArrayRef, base_offset: u32) {
+        let len = chunk.len() as u32;
+        let Some(nulls) = chunk.nulls() else {
+            return;
+        };
+        // The validity buffer marks valid rows; the gaps between its set runs
+        // are the null runs.
+        let mut cursor = 0u32;
+        for (start, end) in nulls.inner().set_slices() {
+            let start = start as u32;
+            if start > cursor {
+                self.null_offsets
+                    .insert_range(base_offset + cursor..base_offset + start);
+            }
+            cursor = end as u32;
+        }
+        if cursor < len {
+            self.null_offsets
+                .insert_range(base_offset + cursor..base_offset + len);
+        }
     }
 }
 
@@ -1868,11 +2108,7 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
 
             if chunk.null_count() > 0 {
                 let base_offset = (self.next_zone_start + self.rows_in_current_zone) as u32;
-                for i in 0..chunk_len {
-                    if chunk.is_null(i) {
-                        self.null_offsets.insert(base_offset + i as u32);
-                    }
-                }
+                self.record_null_runs(&chunk, base_offset);
             }
 
             self.rows_in_current_zone += chunk_len as u64;
@@ -1919,7 +2155,9 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
         let batch = Self::seed_batch_from_zones(&self.completed_zones, &self.data_type)?;
 
         // Embed null bitmap in schema metadata so deserialize_seed can reconstruct null_rows.
-        let null_offsets = std::mem::take(&mut self.null_offsets);
+        let mut null_offsets = std::mem::take(&mut self.null_offsets);
+        // Run containers make contiguous null regions a few bytes each.
+        null_offsets.optimize();
         let bitmap_bytes = if null_offsets.is_empty() {
             Vec::default()
         } else {
@@ -1935,6 +2173,10 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
             bitmap_bytes
         };
         let mut schema = batch.schema().as_ref().clone();
+        schema.metadata.insert(
+            SEED_VERSION_META_KEY.to_string(),
+            SEED_FORMAT_VERSION.to_string(),
+        );
         schema.metadata.insert(
             SEED_NULL_BITMAP_META_KEY.to_string(),
             hex_encode(&bitmap_bytes),
@@ -1974,6 +2216,12 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
     fn schema_metadata_value(&self, buf_index: u32) -> String {
         format!("{}:{}", buf_index, self.rows_per_zone)
     }
+
+    /// Version 1 seeds change how `max` and zone positions are read, so a
+    /// reader must declare support for them.
+    fn required_feature_flags(&self) -> u64 {
+        lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS
+    }
 }
 
 fn hex_encode(data: &[u8]) -> String {
@@ -1995,6 +2243,330 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
         .collect()
 }
 
+/// A zone write seed parsed and shape-validated for binary-copy carrying.
+///
+/// Binary-copy compaction moves whole data files' pages verbatim, so an
+/// output file's correct seed is the concatenation of its inputs' zone
+/// records in copy order. Parsing proves the buffer really is a zone map
+/// seed of a supported version whose statistics satisfy that version's
+/// layout contract; merging refuses anything it cannot reproduce exactly.
+#[derive(Debug)]
+pub struct MergeableSeed {
+    /// `None` is version 0; `"1"` is version 1. Other versions classify as
+    /// [`CarriedSeed::UnsupportedVersion`] before any statistic is read.
+    version: Option<String>,
+    /// The zone records under a metadata-free schema, so sources concatenate.
+    batch: RecordBatch,
+    /// Exact null offsets within the covered rows; `None` when the source
+    /// predates the bitmap.
+    null_bitmap: Option<RoaringBitmap>,
+    /// Checked sum of `zone_length`: the rows this seed covers.
+    total_rows: u64,
+    /// The collection granularity the locator declares (write-time
+    /// configuration, not a layout rule).
+    rows_per_zone: u64,
+}
+
+impl MergeableSeed {
+    /// The rows this seed covers; the caller must check it against the file's
+    /// physical row count before treating the seed as complete coverage.
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// Whether this seed declares format version 1 (finite bounds plus exact
+    /// NaN sign counts, locatable by zone length).
+    pub fn is_version_1(&self) -> bool {
+        self.version.as_deref() == Some(SEED_FORMAT_VERSION)
+    }
+
+    /// The collection granularity the source's locator declared.
+    pub fn rows_per_zone(&self) -> u64 {
+        self.rows_per_zone
+    }
+
+    /// Exact null offsets within the covered rows, when the source recorded them.
+    pub fn null_bitmap(&self) -> Option<&RoaringBitmap> {
+        self.null_bitmap.as_ref()
+    }
+}
+
+/// What a seed buffer turned out to be when parsed for binary-copy carrying.
+#[derive(Debug)]
+pub enum CarriedSeed {
+    /// A seed of a supported version whose statistics passed validation.
+    Supported(MergeableSeed),
+    /// A seed declaring a format version this build cannot interpret. It is
+    /// a recognized seed (so it does not disqualify the file), but its column
+    /// is copied without a seed: unknown statistics are never relabeled.
+    UnsupportedVersion(String),
+}
+
+fn seed_parse_error(message: impl std::fmt::Display) -> lance_core::Error {
+    lance_core::Error::invalid_input(format!("zone map seed: {}", message))
+}
+
+/// Parse and validate one seed buffer for binary-copy carrying.
+///
+/// `rows_per_zone` is the collection granularity the locator declares
+/// (`<buffer_index>:<rows_per_zone>`); zones are located by their lengths,
+/// never by it. A buffer whose `version` metadata this build does not
+/// support classifies as [`CarriedSeed::UnsupportedVersion`] without its
+/// statistics being read. An error means the buffer must be neither carried
+/// nor silently dropped: an unrecognized shape, or statistics that
+/// contradict the layout (zero-length zones, counts beyond the zone, a
+/// bitmap outside the covered rows). The caller then refuses binary copy for
+/// the file, preserving the existing protection against unknown global
+/// buffers.
+pub fn parse_seed_for_binary_copy(bytes: &bytes::Bytes, rows_per_zone: u64) -> Result<CarriedSeed> {
+    if rows_per_zone == 0 {
+        return Err(seed_parse_error("locator declares rows_per_zone 0"));
+    }
+    use arrow_ipc::reader::FileReader;
+    use std::io::Cursor;
+
+    let mut reader = FileReader::try_new(Cursor::new(bytes.as_ref()), None)
+        .map_err(|e| seed_parse_error(format!("not a readable IPC buffer: {}", e)))?;
+    let schema = reader.schema();
+    let version = schema.metadata.get(SEED_VERSION_META_KEY).cloned();
+    let is_v1 = match version.as_deref() {
+        None => false,
+        Some(SEED_FORMAT_VERSION) => true,
+        Some(other) => return Ok(CarriedSeed::UnsupportedVersion(other.to_string())),
+    };
+    let null_bitmap_hex = schema.metadata.get(SEED_NULL_BITMAP_META_KEY).cloned();
+
+    let batch = match reader.next() {
+        Some(Ok(batch)) => batch,
+        Some(Err(e)) => {
+            return Err(seed_parse_error(format!("unreadable zone batch: {}", e)));
+        }
+        None => return Err(seed_parse_error("no zone batch")),
+    };
+    if reader.next().is_some() {
+        return Err(seed_parse_error("more than one zone batch"));
+    }
+
+    let expected_columns = if is_v1 { 6 } else { 5 };
+    if batch.num_columns() != expected_columns {
+        return Err(seed_parse_error(format!(
+            "expected {} columns, found {}",
+            expected_columns,
+            batch.num_columns()
+        )));
+    }
+    let min_col = batch
+        .column_by_name("min")
+        .ok_or_else(|| seed_parse_error("missing 'min' column"))?;
+    let max_col = batch
+        .column_by_name("max")
+        .ok_or_else(|| seed_parse_error("missing 'max' column"))?;
+    if min_col.data_type() != max_col.data_type() {
+        return Err(seed_parse_error("'min' and 'max' column types differ"));
+    }
+    let null_count_col = batch
+        .column_by_name("null_count")
+        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+        .ok_or_else(|| seed_parse_error("missing or mistyped 'null_count' column"))?
+        .clone();
+    let nan_count_col = batch
+        .column_by_name("nan_count")
+        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+        .ok_or_else(|| seed_parse_error("missing or mistyped 'nan_count' column"))?
+        .clone();
+    let zone_length_col = batch
+        .column_by_name("zone_length")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| seed_parse_error("missing or mistyped 'zone_length' column"))?
+        .clone();
+    let negative_nan_count_col = if is_v1 {
+        Some(
+            batch
+                .column_by_name("negative_nan_count")
+                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+                .ok_or_else(|| seed_parse_error("missing or mistyped 'negative_nan_count' column"))?
+                .clone(),
+        )
+    } else {
+        None
+    };
+    // The count columns are non-null by contract; `min`/`max` are nullable
+    // (a null bound means unknown or no ordinary values).
+    for name in [
+        "null_count",
+        "nan_count",
+        "negative_nan_count",
+        "zone_length",
+    ] {
+        if let Some(col) = batch.column_by_name(name)
+            && col.null_count() > 0
+        {
+            return Err(seed_parse_error(format!(
+                "'{}' column must be non-null",
+                name
+            )));
+        }
+    }
+
+    let num_zones = batch.num_rows();
+    if num_zones == 0 {
+        return Err(seed_parse_error("zero zones"));
+    }
+    let mut total_rows: u64 = 0;
+    for i in 0..num_zones {
+        let zone_length = zone_length_col.value(i);
+        if zone_length == 0 {
+            return Err(seed_parse_error(format!("zone {} has zero length", i)));
+        }
+        let null_count = null_count_col.value(i);
+        let nan_count = nan_count_col.value(i);
+        if u64::from(null_count) + u64::from(nan_count) > zone_length {
+            return Err(seed_parse_error(format!(
+                "zone {} counts exceed zone_length: null_count={} nan_count={} zone_length={}",
+                i, null_count, nan_count, zone_length
+            )));
+        }
+        if let Some(negative) = negative_nan_count_col.as_ref().map(|col| col.value(i))
+            && negative > nan_count
+        {
+            return Err(seed_parse_error(format!(
+                "zone {} negative_nan_count {} exceeds nan_count {}",
+                i, negative, nan_count
+            )));
+        }
+        total_rows = total_rows
+            .checked_add(zone_length)
+            .ok_or_else(|| seed_parse_error("zone_length sum overflows u64"))?;
+    }
+
+    let null_bitmap = match null_bitmap_hex {
+        None => None,
+        Some(hex) => {
+            let bitmap_bytes = hex_decode(&hex)
+                .map_err(|e| seed_parse_error(format!("bad null bitmap hex: {}", e)))?;
+            let bitmap = if bitmap_bytes.is_empty() {
+                RoaringBitmap::default()
+            } else {
+                RoaringBitmap::deserialize_from(bitmap_bytes.as_slice())
+                    .map_err(|e| seed_parse_error(format!("bad null bitmap: {}", e)))?
+            };
+            if let Some(max) = bitmap.max()
+                && u64::from(max) >= total_rows
+            {
+                return Err(seed_parse_error(format!(
+                    "null bitmap offset {} outside the {} covered rows",
+                    max, total_rows
+                )));
+            }
+            Some(bitmap)
+        }
+    };
+
+    // A metadata-free schema, so batches from different sources concatenate.
+    let canonical_schema = Arc::new(arrow_schema::Schema::new(batch.schema().fields().clone()));
+    let batch = RecordBatch::try_new(canonical_schema, batch.columns().to_vec())?;
+
+    Ok(CarriedSeed::Supported(MergeableSeed {
+        version,
+        batch,
+        null_bitmap,
+        total_rows,
+        rows_per_zone,
+    }))
+}
+
+/// Merge the seeds of the files an output binary-copies, in copy order, into
+/// the output file's seed.
+///
+/// Every record keeps its original statistics; nothing is recomputed or
+/// re-chunked. Zones are located by their lengths, so sources collected at
+/// different granularities concatenate freely and short zones may land
+/// anywhere in the output (the caller picks the output locator's
+/// `rows_per_zone` from the current configuration). `Ok(None)` means the
+/// sources cannot be carried: any version 0 source (no implicit format
+/// conversion) or mismatched value types.
+///
+/// The null bitmap is the union of the sources' bitmaps shifted by each
+/// source's cumulative row offset; any source without a bitmap leaves the
+/// output without one (absence is "unknown", never zero).
+pub fn merge_seeds_for_binary_copy(sources: &[&MergeableSeed]) -> Result<Option<bytes::Bytes>> {
+    use arrow_ipc::writer::FileWriter;
+    use std::io::Cursor;
+
+    let Some(first) = sources.first() else {
+        return Ok(None);
+    };
+    if sources
+        .iter()
+        .any(|source| !source.is_version_1() || source.batch.schema() != first.batch.schema())
+    {
+        return Ok(None);
+    }
+
+    let mut null_bitmap = sources
+        .iter()
+        .all(|source| source.null_bitmap.is_some())
+        .then(RoaringBitmap::new);
+    let mut offset: u64 = 0;
+    for source in sources {
+        if let Some(merged) = null_bitmap.as_mut() {
+            for value in source.null_bitmap.as_ref().expect("checked above") {
+                let shifted = offset
+                    .checked_add(u64::from(value))
+                    .and_then(|shifted| u32::try_from(shifted).ok());
+                let Some(shifted) = shifted else {
+                    // The offsets no longer fit the bitmap's 32-bit space.
+                    return Ok(None);
+                };
+                merged.insert(shifted);
+            }
+        }
+        offset = offset
+            .checked_add(source.total_rows)
+            .ok_or_else(|| seed_parse_error("merged row count overflows u64"))?;
+    }
+
+    let batches: Vec<&RecordBatch> = sources.iter().map(|source| &source.batch).collect();
+    let merged = arrow_select::concat::concat_batches(&first.batch.schema(), batches)
+        .map_err(|e| seed_parse_error(format!("failed to concatenate zone records: {}", e)))?;
+
+    let mut schema = merged.schema().as_ref().clone();
+    schema.metadata.insert(
+        SEED_VERSION_META_KEY.to_string(),
+        SEED_FORMAT_VERSION.to_string(),
+    );
+    if let Some(mut bitmap) = null_bitmap {
+        bitmap.optimize();
+        let bitmap_bytes = if bitmap.is_empty() {
+            Vec::default()
+        } else {
+            let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+            bitmap
+                .serialize_into(&mut bitmap_bytes)
+                .map_err(|e| seed_parse_error(format!("failed to serialize null bitmap: {}", e)))?;
+            bitmap_bytes
+        };
+        schema.metadata.insert(
+            SEED_NULL_BITMAP_META_KEY.to_string(),
+            hex_encode(&bitmap_bytes),
+        );
+    }
+    let batch = RecordBatch::try_new(Arc::new(schema), merged.columns().to_vec())?;
+
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut writer = FileWriter::try_new(&mut buf, batch.schema_ref())
+            .map_err(|e| seed_parse_error(format!("failed to create IPC writer: {}", e)))?;
+        writer
+            .write(&batch)
+            .map_err(|e| seed_parse_error(format!("failed to write IPC batch: {}", e)))?;
+        writer
+            .finish()
+            .map_err(|e| seed_parse_error(format!("failed to finish IPC writer: {}", e)))?;
+    }
+    Ok(Some(bytes::Bytes::from(buf.into_inner())))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
@@ -2002,9 +2574,15 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::zoned::ZoneBound;
-    use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
-    use arrow::datatypes::{ArrowPrimitiveType, Decimal128Type, Float32Type, Int64Type};
-    use arrow_array::{Array, PrimitiveArray, RecordBatch, UInt64Array, record_batch};
+    use crate::scalar::zonemap::{
+        CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapStatistics,
+    };
+    use arrow::datatypes::{
+        ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int64Type,
+    };
+    use arrow_array::{
+        Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -2020,21 +2598,27 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
+    use std::ops::Bound;
 
+    use crate::scalar::seed::IndexSeedWriter;
+    use crate::scalar::zoned::ZoneProcessor;
     use crate::scalar::{
         RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
         lance_format::LanceIndexStore,
         zonemap::{
-            ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
-            merge_zonemap_indices, remap_zone,
+            SEED_NULL_BITMAP_META_KEY, SEED_VERSION_META_KEY, ZONEMAP_FILENAME,
+            ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapProcessor,
+            ZoneMapSeedWriter, merge_seeds_for_binary_copy, merge_zonemap_indices,
+            parse_seed_for_binary_copy, remap_zone,
         },
     };
+    use arrow_array::Int32Array;
+    use lance_core::Error;
 
-    // Add missing imports for the tests
-    use crate::Index; // Import Index trait to access calculate_included_frags
+    use crate::Index;
     use crate::metrics::NoOpMetricsCollector;
-    use roaring::RoaringBitmap; // Import RoaringBitmap for the test
-    use std::collections::{Bound, HashMap};
+    use roaring::RoaringBitmap;
+    use std::collections::HashMap;
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -2152,6 +2736,7 @@ mod tests {
             max: ScalarValue::Int64(Some(40)),
             null_count: 1,
             nan_count: 0,
+            negative_nan_count: Some(0),
             bound: ZoneBound {
                 fragment_id: 2,
                 start: 10,
@@ -2229,6 +2814,7 @@ mod tests {
             max: ScalarValue::Null,
             null_count: 2,
             nan_count: 0,
+            negative_nan_count: Some(0),
             bound: ZoneBound {
                 fragment_id: 0,
                 start: 0,
@@ -2295,6 +2881,145 @@ mod tests {
                 .to_string()
                 .contains("cannot safely remap a mixed-null ZoneMap zone")
         );
+    }
+
+    /// Remapping copies the source zone's counts into a shorter run, so a
+    /// legacy NaN-marker zone [5.0, +NaN] whose NaN row is removed must still
+    /// answer bounded ranges around 5.0 from its bounds, directly and after
+    /// a merge that persists the remapped zone.
+    #[tokio::test]
+    async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
+        let mut source = train_and_load::<Float64Type>(vec![vec![Some(5.0), Some(f64::NAN)]]).await;
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        let zone = &mut source_mut.zones[0];
+        zone.max = ScalarValue::Float64(Some(f64::NAN));
+        zone.negative_nan_count = None;
+        assert_eq!(zone.nan_count, 1);
+        source_mut.null_rows = None;
+        let new_row = 3_u64 << 32;
+        source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+
+        let remapped = remap_zone(
+            &source.zones[0],
+            source.fri.as_deref().unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(remapped.len(), 1);
+        assert_eq!(remapped[0].bound.length, 1);
+        assert_eq!(remapped[0].nan_count, 1, "inherited, not exact");
+
+        let five = ScalarValue::Float64(Some(5.0));
+        let queries = [
+            SargableQuery::Range(Bound::Included(five.clone()), Bound::Included(five.clone())),
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Float64(Some(4.0))),
+                Bound::Included(ScalarValue::Float64(Some(6.0))),
+            ),
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Float64(Some(4.0))),
+                Bound::Excluded(ScalarValue::Float64(Some(6.0))),
+            ),
+            SargableQuery::Equals(five.clone()),
+        ];
+        for query in &queries {
+            assert!(
+                source
+                    .evaluate_zone_against_query(&remapped[0], query)
+                    .unwrap(),
+                "the surviving 5.0 row must stay a candidate for {query:?}"
+            );
+        }
+
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .unwrap();
+        let merged = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+        for query in &queries {
+            let result = merged.search(query, &NoOpMetricsCollector).await.unwrap();
+            assert!(
+                result.row_addrs().selected(new_row),
+                "merged index must keep the 5.0 row for {query:?}"
+            );
+        }
+    }
+
+    /// The legacy-null variant: [5, null] without a null bitmap remapped to
+    /// the single 5 row keeps `null_count = 1`; the bounds, not that count,
+    /// decide bounded ranges.
+    #[tokio::test]
+    async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
+        let mut source = train_and_load::<Int64Type>(vec![vec![Some(5), None]]).await;
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.null_rows = None;
+        let new_row = 3_u64 << 32;
+        source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+
+        let remapped = remap_zone(
+            &source.zones[0],
+            source.fri.as_deref().unwrap(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(remapped.len(), 1);
+        assert_eq!(remapped[0].bound.length, 1);
+        assert_eq!(remapped[0].null_count, 1, "inherited, not exact");
+
+        let five = ScalarValue::Int64(Some(5));
+        let queries = [
+            SargableQuery::Range(Bound::Included(five.clone()), Bound::Included(five.clone())),
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(4))),
+                Bound::Excluded(ScalarValue::Int64(Some(6))),
+            ),
+            SargableQuery::Equals(five.clone()),
+        ];
+        for query in &queries {
+            assert!(
+                source
+                    .evaluate_zone_against_query(&remapped[0], query)
+                    .unwrap(),
+                "the surviving 5 row must stay a candidate for {query:?}"
+            );
+        }
+
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .unwrap();
+        let merged = ZoneMapIndex::load(dest_store, None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+        for query in &queries {
+            let result = merged.search(query, &NoOpMetricsCollector).await.unwrap();
+            assert!(
+                result.row_addrs().selected(new_row),
+                "merged index must keep the 5 row for {query:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2761,7 +3486,9 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the first three zones since they contain values in the range [0, 250]
+        // NaNs of either sign fail one side of a two-sided finite range, so
+        // they never keep a zone here; the finite mins still prune the last
+        // two zones even though the legacy NaN max hides the finite maxes.
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..300);
         assert_eq!(result, SearchResult::at_most(expected));
@@ -2837,8 +3564,12 @@ mod tests {
             Bound::Unbounded,
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        // Should match nothing since nothing is greater than NaN
-        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
+        // A positive NaN with a larger payload sorts above the canonical NaN
+        // bound, and the counts cannot rule one out, so every NaN-bearing zone
+        // stays and the predicate recheck decides.
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::at_most(expected));
 
         // Test IsIn query with mixed float types (Float16, Float32, Float64)
         let query = SargableQuery::IsIn(vec![
@@ -2938,6 +3669,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(99)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
@@ -2949,6 +3681,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(100)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 100,
@@ -3101,6 +3834,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(8191)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
@@ -3112,6 +3846,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16383)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 8192,
@@ -3123,6 +3858,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16425)),
                     null_count: 0,
                     nan_count: 0,
+                    negative_nan_count: None,
                     bound: ZoneBound {
                         fragment_id: 0,
                         start: 16384,
@@ -3262,6 +3998,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(4999)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -3273,6 +4010,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 5000,
@@ -3284,6 +4022,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(13191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -3295,6 +4034,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 5000,
@@ -3306,6 +4046,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -3471,6 +4212,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -3482,6 +4224,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -3493,6 +4236,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -3547,6 +4291,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
@@ -3558,6 +4303,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
@@ -3569,6 +4315,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
+                        negative_nan_count: None,
                         bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
@@ -3664,6 +4411,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("azz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 0,
                     start: 0,
@@ -3675,6 +4423,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("baz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 1,
                     start: 0,
@@ -3686,6 +4435,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("foz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 2,
                     start: 0,
@@ -3697,6 +4447,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("fzz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 3,
                     start: 0,
@@ -3708,6 +4459,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("foobar".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 4,
                     start: 0,
@@ -3719,6 +4471,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("gzz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 5,
                     start: 0,
@@ -3770,6 +4523,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("test".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 0,
                     start: 0,
@@ -3782,6 +4536,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("tf".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 1,
                     start: 0,
@@ -3794,6 +4549,7 @@ mod tests {
                 max: ScalarValue::Utf8(Some("def".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 2,
                     start: 0,
@@ -3853,6 +4609,7 @@ mod tests {
                 max: ScalarValue::LargeUtf8(Some("azz".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 0,
                     start: 0,
@@ -3864,6 +4621,7 @@ mod tests {
                 max: ScalarValue::LargeUtf8(Some("foobar".to_string())),
                 null_count: 0,
                 nan_count: 0,
+                negative_nan_count: Some(0),
                 bound: ZoneBound {
                     fragment_id: 1,
                     start: 0,
@@ -4137,11 +4895,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_zone_map_seed_writer_null_runs_match_positions() {
+        use crate::scalar::seed::IndexSeedWriter;
+
+        // Validity patterns: scattered, a long run, leading and trailing nulls.
+        let values: Vec<Option<i32>> = (0..1000)
+            .map(|i| {
+                if i < 7 || (200..600).contains(&i) || i % 13 == 0 || i >= 990 {
+                    None
+                } else {
+                    Some(i)
+                }
+            })
+            .collect();
+        let expected: RoaringBitmap = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_none())
+            .map(|(i, _)| i as u32)
+            .collect();
+        let array: ArrayRef = Arc::new(Int32Array::from(values));
+
+        // Observed as one array, as slices that split the runs, and with
+        // zones that split the runs: the recorded positions are identical.
+        let mut whole = ZoneMapSeedWriter::new("c", 64, DataType::Int32).unwrap();
+        whole.observe_batch(&array).unwrap();
+        let mut sliced = ZoneMapSeedWriter::new("c", 1000, DataType::Int32).unwrap();
+        for (start, len) in [(0, 3), (3, 300), (303, 500), (803, 197)] {
+            sliced.observe_batch(&array.slice(start, len)).unwrap();
+        }
+        for writer in [&mut whole, &mut sliced] {
+            let bytes = writer.finish().unwrap().unwrap();
+            let (_, bitmap) = ZoneMapSeedWriter::deserialize_seed(0, &bytes).unwrap();
+            assert_eq!(bitmap, Some(expected.clone()));
+        }
+
+        // No validity buffer means no nulls: the run scan records nothing.
+        let valid: ArrayRef = Arc::new(Int32Array::from_iter_values(0..10));
+        let mut writer = ZoneMapSeedWriter::new("c", 64, DataType::Int32).unwrap();
+        writer.record_null_runs(&valid, 0);
+        assert!(writer.null_offsets.is_empty());
+    }
+
     #[tokio::test]
     async fn test_zone_map_seed_writer_round_trip() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
-        use arrow_array::{ArrayRef, Int32Array};
         use datafusion_common::ScalarValue;
 
         let rows_per_zone = 4u64;
@@ -4168,8 +4967,7 @@ mod tests {
         assert_eq!(meta_val, "3:4");
 
         // Deserialize and verify
-        let (zones, null_bitmap) =
-            ZoneMapSeedWriter::deserialize_seed(42, &bytes, rows_per_zone).unwrap();
+        let (zones, null_bitmap) = ZoneMapSeedWriter::deserialize_seed(42, &bytes).unwrap();
         assert_eq!(zones.len(), 3, "expected 3 zones");
 
         // No nulls in the input, so null bitmap is empty
@@ -4204,8 +5002,6 @@ mod tests {
     #[tokio::test]
     async fn test_zone_map_seed_writer_spanning_batches() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
-        use arrow_array::{ArrayRef, Int32Array};
         use datafusion_common::ScalarValue;
 
         let rows_per_zone = 5u64;
@@ -4217,8 +5013,7 @@ mod tests {
         writer.observe_batch(&batch).unwrap();
 
         let bytes = writer.finish().unwrap().expect("should produce bytes");
-        let (zones, _null_bitmap) =
-            ZoneMapSeedWriter::deserialize_seed(1, &bytes, rows_per_zone).unwrap();
+        let (zones, _null_bitmap) = ZoneMapSeedWriter::deserialize_seed(1, &bytes).unwrap();
         assert_eq!(
             zones.len(),
             3,
@@ -4242,7 +5037,6 @@ mod tests {
     #[tokio::test]
     async fn test_zone_map_seed_writer_empty() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
 
         let mut writer = ZoneMapSeedWriter::new("col", 8, DataType::Int32).unwrap();
         let result = writer.finish().unwrap();
@@ -4255,7 +5049,6 @@ mod tests {
     #[tokio::test]
     async fn test_seed_null_bitmap_round_trip() {
         use crate::scalar::seed::IndexSeedWriter;
-        use crate::scalar::zonemap::ZoneMapSeedWriter;
         use arrow_array::Int32Array;
         use lance_select::RowSetOps;
 
@@ -4281,8 +5074,7 @@ mod tests {
         writer.observe_batch(&values).unwrap();
         let bytes = writer.finish().unwrap().expect("should produce bytes");
 
-        let (zones, null_bitmap) =
-            ZoneMapSeedWriter::deserialize_seed(7, &bytes, rows_per_zone).unwrap();
+        let (zones, null_bitmap) = ZoneMapSeedWriter::deserialize_seed(7, &bytes).unwrap();
         assert_eq!(zones.len(), 3);
         assert_eq!(zones[0].null_count, 2);
         assert_eq!(zones[1].null_count, 1);
@@ -4376,8 +5168,9 @@ mod tests {
 
         let seed = FragmentSeed {
             fragment_id: 1,
+            physical_rows: 4,
             bytes: seed_bytes,
-            metadata_value: format!("0:{}", rows_per_zone),
+            metadata_value: "0".to_string(),
         };
 
         // Update the index with the seed.
@@ -4500,8 +5293,9 @@ mod tests {
             .try_update_with_seeds(
                 &[FragmentSeed {
                     fragment_id: 1,
+                    physical_rows: 2,
                     bytes: seed_bytes,
-                    metadata_value: format!("0:{}", rows_per_zone),
+                    metadata_value: "0".to_string(),
                 }],
                 dest_store.as_ref(),
             )
@@ -4647,6 +5441,683 @@ mod tests {
     // ───────────────────────────── Nested type zone map tests ─────────────────────────────
 
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
+
+    // --- NaN pruning under Arrow Rust total ordering ----------------------
+    //
+    // Total ordering ranks NaNs by sign and payload:
+    //   -NaN(big payload) < -NaN(canonical) < -inf < finite < +inf
+    //                     < +NaN(canonical) < +NaN(big payload).
+    // Zone counts know only how many NaNs of each sign exist, never their
+    // payloads, so a zone may be pruned only when no payload could match.
+
+    const F32_NAN_CANONICAL_BITS: u32 = 0x7FC0_0000;
+    const F32_NAN_BIG_BITS: u32 = 0x7FFF_FFFF;
+    const F32_NAN_SIGNALING_BITS: u32 = 0x7F80_0001;
+    const F32_SIGN_BIT: u32 = 0x8000_0000;
+
+    fn f32_pos_nan(bits: u32) -> f32 {
+        f32::from_bits(bits)
+    }
+
+    fn f32_neg_nan(bits: u32) -> f32 {
+        f32::from_bits(bits | F32_SIGN_BIT)
+    }
+
+    /// Zone statistics as a version 1 seed reports them: finite extrema that
+    /// exclude NaNs, exact sign-split counts.
+    fn f32_zone_v1(values: &[Option<f32>]) -> ZoneMapStatistics {
+        let finite: Vec<f32> = values
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|value| !value.is_nan())
+            .collect();
+        let nans: Vec<f32> = values
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|value| value.is_nan())
+            .collect();
+        ZoneMapStatistics {
+            min: ScalarValue::Float32(finite.iter().copied().reduce(f32::min)),
+            max: ScalarValue::Float32(finite.iter().copied().reduce(f32::max)),
+            null_count: values.iter().filter(|value| value.is_none()).count() as u32,
+            nan_count: nans.len() as u32,
+            negative_nan_count: Some(
+                nans.iter().filter(|value| value.is_sign_negative()).count() as u32
+            ),
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: values.len(),
+            },
+        }
+    }
+
+    /// The same zone as a legacy source reports it: NaN presence folded into
+    /// the NaN max marker, sign split unknown.
+    fn f32_zone_legacy(values: &[Option<f32>]) -> ZoneMapStatistics {
+        let mut zone = f32_zone_v1(values);
+        zone.negative_nan_count = None;
+        if zone.nan_count > 0 {
+            zone.max = ScalarValue::Float32(Some(f32::NAN));
+        }
+        zone
+    }
+
+    fn f32_bound_value(bound: &Bound<ScalarValue>) -> Option<f32> {
+        match bound {
+            Bound::Included(ScalarValue::Float32(Some(value)))
+            | Bound::Excluded(ScalarValue::Float32(Some(value))) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Whether `value` satisfies the range under total ordering.
+    fn f32_total_order_in_range(
+        value: f32,
+        start: &Bound<ScalarValue>,
+        end: &Bound<ScalarValue>,
+    ) -> bool {
+        use std::cmp::Ordering;
+        let lower = match start {
+            Bound::Unbounded => true,
+            Bound::Included(_) => {
+                value.total_cmp(&f32_bound_value(start).unwrap()) != Ordering::Less
+            }
+            Bound::Excluded(_) => {
+                value.total_cmp(&f32_bound_value(start).unwrap()) == Ordering::Greater
+            }
+        };
+        let upper = match end {
+            Bound::Unbounded => true,
+            Bound::Included(_) => {
+                value.total_cmp(&f32_bound_value(end).unwrap()) != Ordering::Greater
+            }
+            Bound::Excluded(_) => value.total_cmp(&f32_bound_value(end).unwrap()) == Ordering::Less,
+        };
+        lower && upper
+    }
+
+    /// Exhaustive no-false-negative check: a pruned zone must have no row
+    /// matching the range under total ordering, across NaN payloads and signs,
+    /// strict and non-strict bounds, and known and unknown sign splits.
+    #[tokio::test]
+    async fn test_range_nan_pruning_never_drops_a_matching_zone() {
+        let index = train_and_load::<Float32Type>(vec![vec![Some(1.0)]]).await;
+
+        let pos_canonical = f32_pos_nan(F32_NAN_CANONICAL_BITS);
+        let pos_big = f32_pos_nan(F32_NAN_BIG_BITS);
+        let pos_signaling = f32_pos_nan(F32_NAN_SIGNALING_BITS);
+        let neg_canonical = f32_neg_nan(F32_NAN_CANONICAL_BITS);
+        let neg_big = f32_neg_nan(F32_NAN_BIG_BITS);
+
+        let value_sets: Vec<Vec<Option<f32>>> = vec![
+            vec![Some(pos_canonical); 3],
+            vec![Some(neg_canonical); 3],
+            vec![Some(pos_canonical), Some(pos_big), Some(pos_signaling)],
+            vec![Some(neg_canonical), Some(neg_big)],
+            vec![Some(pos_big), Some(neg_big)],
+            vec![Some(neg_canonical), None, None],
+            vec![Some(pos_canonical), None],
+            vec![Some(1.0), Some(2.0), Some(pos_canonical)],
+            vec![Some(-3.0), Some(5.0), Some(neg_big)],
+            vec![Some(1.0), Some(2.0)],
+            vec![None, None],
+            vec![Some(neg_big), Some(0.5), Some(pos_big), None],
+        ];
+        let bound_values = [
+            neg_big,
+            neg_canonical,
+            -2.0_f32,
+            0.0_f32,
+            2.0_f32,
+            pos_canonical,
+            pos_big,
+        ];
+        let mut bounds: Vec<Bound<ScalarValue>> = vec![Bound::Unbounded];
+        for value in bound_values {
+            bounds.push(Bound::Included(ScalarValue::Float32(Some(value))));
+            bounds.push(Bound::Excluded(ScalarValue::Float32(Some(value))));
+        }
+
+        for values in &value_sets {
+            for zone in [f32_zone_v1(values), f32_zone_legacy(values)] {
+                for start in &bounds {
+                    for end in &bounds {
+                        let query = SargableQuery::Range(start.clone(), end.clone());
+                        let kept = index.evaluate_zone_against_query(&zone, &query).unwrap();
+                        let matchable = values
+                            .iter()
+                            .flatten()
+                            .any(|value| f32_total_order_in_range(*value, start, end));
+                        assert!(
+                            kept || !matchable,
+                            "zone {zone:?} (values {values:?}) wrongly pruned for {query:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Targeted cases: zones kept when a NaN payload could match, pruned
+    /// exactly when the statistics prove no value can.
+    #[tokio::test]
+    async fn test_range_nan_pruning_cases() {
+        let index = train_and_load::<Float32Type>(vec![vec![Some(1.0)]]).await;
+        let eval =
+            |zone: &ZoneMapStatistics, start: Bound<ScalarValue>, end: Bound<ScalarValue>| {
+                index
+                    .evaluate_zone_against_query(zone, &SargableQuery::Range(start, end))
+                    .unwrap()
+            };
+        let f32s = |value: f32| ScalarValue::Float32(Some(value));
+        let pos_canonical = f32_pos_nan(F32_NAN_CANONICAL_BITS);
+        let pos_big = f32_pos_nan(F32_NAN_BIG_BITS);
+        let neg_canonical = f32_neg_nan(F32_NAN_CANONICAL_BITS);
+        let neg_big = f32_neg_nan(F32_NAN_BIG_BITS);
+
+        // All-negative-NaN zone: matches x < 0 (negative NaNs sort below every
+        // finite value), with and without a known sign split.
+        let all_neg = [Some(neg_canonical), Some(neg_canonical)];
+        for zone in [f32_zone_v1(&all_neg), f32_zone_legacy(&all_neg)] {
+            assert!(eval(&zone, Bound::Unbounded, Bound::Excluded(f32s(0.0))));
+            // But not x > 0: no negative NaN sorts above a finite bound.
+            if zone.negative_nan_count.is_some() {
+                assert!(!eval(&zone, Bound::Excluded(f32s(0.0)), Bound::Unbounded));
+            } else {
+                // Unknown split must stay conservative.
+                assert!(eval(&zone, Bound::Excluded(f32s(0.0)), Bound::Unbounded));
+            }
+        }
+
+        // All-positive-NaN zone: matches x > 0, not x < 0 when the split is known.
+        let all_pos = [Some(pos_canonical), Some(pos_big)];
+        for zone in [f32_zone_v1(&all_pos), f32_zone_legacy(&all_pos)] {
+            assert!(eval(&zone, Bound::Excluded(f32s(0.0)), Bound::Unbounded));
+            if zone.negative_nan_count.is_some() {
+                assert!(!eval(&zone, Bound::Unbounded, Bound::Excluded(f32s(0.0))));
+            }
+        }
+
+        // NaN mixed with nulls and no ordinary values: the null rows never
+        // match a range, the NaNs follow their sign.
+        let nan_and_null = [Some(neg_canonical), None, None];
+        let zone = f32_zone_v1(&nan_and_null);
+        assert!(eval(&zone, Bound::Unbounded, Bound::Included(f32s(10.0))));
+        assert!(!eval(&zone, Bound::Included(f32s(0.0)), Bound::Unbounded));
+
+        // Strict NaN bounds cannot exclude same-sign NaNs: payloads above or
+        // below the bound NaN exist.
+        let only_pos_big = [Some(pos_big)];
+        let zone = f32_zone_v1(&only_pos_big);
+        assert!(
+            eval(
+                &zone,
+                Bound::Excluded(f32s(pos_canonical)),
+                Bound::Unbounded
+            ),
+            "x > +NaN(canonical) must keep a zone holding +NaN(bigger payload)"
+        );
+        let only_neg_big = [Some(neg_big)];
+        let zone = f32_zone_v1(&only_neg_big);
+        assert!(
+            eval(
+                &zone,
+                Bound::Unbounded,
+                Bound::Excluded(f32s(neg_canonical))
+            ),
+            "x < -NaN(canonical) must keep a zone holding -NaN(bigger payload)"
+        );
+        // While the opposite sign is excluded exactly.
+        let zone = f32_zone_v1(&all_neg);
+        assert!(!eval(
+            &zone,
+            Bound::Excluded(f32s(pos_canonical)),
+            Bound::Unbounded
+        ));
+
+        // A two-sided finite range: neither NaN sign can satisfy both sides,
+        // so known statistics prune exactly on the finite extrema.
+        let finite_and_nan = [Some(1.0), Some(2.0), Some(pos_canonical)];
+        let zone = f32_zone_v1(&finite_and_nan);
+        assert!(eval(
+            &zone,
+            Bound::Included(f32s(0.0)),
+            Bound::Included(f32s(5.0))
+        ));
+        assert!(
+            !eval(
+                &zone,
+                Bound::Included(f32s(10.0)),
+                Bound::Included(f32s(20.0))
+            ),
+            "a two-sided finite range beyond the finite extrema must prune, NaNs included"
+        );
+        // The legacy marker hides the finite max, so only the min side prunes.
+        let zone = f32_zone_legacy(&finite_and_nan);
+        assert!(eval(
+            &zone,
+            Bound::Included(f32s(10.0)),
+            Bound::Included(f32s(20.0))
+        ));
+        assert!(!eval(
+            &zone,
+            Bound::Included(f32s(-10.0)),
+            Bound::Included(f32s(0.5))
+        ));
+    }
+
+    /// The other float widths share the sign logic: canonical and payload
+    /// NaNs keep and prune the same way for Float16 and Float64.
+    #[tokio::test]
+    async fn test_range_nan_pruning_other_float_widths() {
+        // Float64: a zone of negative NaNs matches x < 0, not x > 0.
+        let index = train_and_load::<Float64Type>(vec![vec![Some(1.0)]]).await;
+        let zone = ZoneMapStatistics {
+            min: ScalarValue::Float64(None),
+            max: ScalarValue::Float64(None),
+            null_count: 0,
+            nan_count: 2,
+            negative_nan_count: Some(2),
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 2,
+            },
+        };
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float64(Some(0.0))),
+        );
+        assert!(index.evaluate_zone_against_query(&zone, &query).unwrap());
+        let query = SargableQuery::Range(
+            Bound::Excluded(ScalarValue::Float64(Some(0.0))),
+            Bound::Unbounded,
+        );
+        assert!(!index.evaluate_zone_against_query(&zone, &query).unwrap());
+        // Strict bound against a same-sign payload NaN keeps the zone.
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float64(Some(f64::from_bits(
+                0xFFF8_0000_0000_0000,
+            )))),
+        );
+        assert!(index.evaluate_zone_against_query(&zone, &query).unwrap());
+
+        // Float16: a positive-NaN zone keeps x > +NaN (payload order) and
+        // prunes x < 0 when the split is known.
+        let index16 = train_and_load::<arrow_array::types::Float16Type>(vec![vec![Some(
+            half::f16::from_f32(1.0),
+        )]])
+        .await;
+        let zone = ZoneMapStatistics {
+            min: ScalarValue::Float16(None),
+            max: ScalarValue::Float16(None),
+            null_count: 0,
+            nan_count: 1,
+            negative_nan_count: Some(0),
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 1,
+            },
+        };
+        let query = SargableQuery::Range(
+            Bound::Excluded(ScalarValue::Float16(Some(half::f16::NAN))),
+            Bound::Unbounded,
+        );
+        assert!(index16.evaluate_zone_against_query(&zone, &query).unwrap());
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float16(Some(half::f16::from_f32(0.0)))),
+        );
+        assert!(!index16.evaluate_zone_against_query(&zone, &query).unwrap());
+    }
+
+    /// Equals and IsIn with NaN targets follow the sign counts, payload
+    /// conservative.
+    #[tokio::test]
+    async fn test_equals_nan_payload_targets() {
+        let index = train_and_load::<Float32Type>(vec![vec![Some(1.0)]]).await;
+        let pos_big = f32_pos_nan(F32_NAN_BIG_BITS);
+        let neg_canonical = f32_neg_nan(F32_NAN_CANONICAL_BITS);
+
+        let only_neg = [Some(neg_canonical)];
+        let zone = f32_zone_v1(&only_neg);
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(pos_big)));
+        assert!(
+            !index.evaluate_zone_against_query(&zone, &query).unwrap(),
+            "a +NaN target cannot match a zone with only negative NaNs"
+        );
+        let query =
+            SargableQuery::Equals(ScalarValue::Float32(Some(f32_neg_nan(F32_NAN_BIG_BITS))));
+        assert!(
+            index.evaluate_zone_against_query(&zone, &query).unwrap(),
+            "a -NaN target keeps a zone with negative NaNs regardless of payload"
+        );
+        let legacy = f32_zone_legacy(&only_neg);
+        let query = SargableQuery::IsIn(vec![ScalarValue::Float32(Some(pos_big))]);
+        assert!(
+            index.evaluate_zone_against_query(&legacy, &query).unwrap(),
+            "an unknown sign split stays conservative for NaN targets"
+        );
+    }
+
+    // --- Binary-copy seed parsing and merging ------------------------------
+
+    fn seed_bytes_f32(values: &[Option<f32>], rows_per_zone: u64) -> bytes::Bytes {
+        use crate::scalar::seed::IndexSeedWriter;
+        let mut writer = ZoneMapSeedWriter::new("val", rows_per_zone, DataType::Float32).unwrap();
+        let array: ArrayRef = Arc::new(arrow_array::Float32Array::from(values.to_vec()));
+        writer.observe_batch(&array).unwrap();
+        writer.finish().unwrap().unwrap()
+    }
+
+    /// Rewrite a seed buffer's schema metadata and zone batch, to fabricate
+    /// version 0 buffers and corrupt inputs.
+    fn transform_seed(
+        bytes: &bytes::Bytes,
+        transform: impl FnOnce(
+            &mut std::collections::HashMap<String, String>,
+            RecordBatch,
+        ) -> RecordBatch,
+    ) -> bytes::Bytes {
+        use arrow_ipc::reader::FileReader as IpcReader;
+        use arrow_ipc::writer::FileWriter as IpcWriter;
+        use std::io::Cursor;
+
+        let mut reader = IpcReader::try_new(Cursor::new(bytes.as_ref()), None).unwrap();
+        let mut metadata = reader.schema().metadata.clone();
+        let batch = reader.next().unwrap().unwrap();
+        let batch = transform(&mut metadata, batch);
+        let mut schema = batch.schema().as_ref().clone();
+        schema.metadata = metadata;
+        let batch = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap();
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = IpcWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        bytes::Bytes::from(buf.into_inner())
+    }
+
+    fn to_v0(bytes: &bytes::Bytes) -> bytes::Bytes {
+        transform_seed(bytes, |metadata, batch| {
+            metadata.remove(SEED_VERSION_META_KEY);
+            metadata.remove(SEED_NULL_BITMAP_META_KEY);
+            let keep: Vec<usize> = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| field.name() != "negative_nan_count")
+                .map(|(i, _)| i)
+                .collect();
+            batch.project(&keep).unwrap()
+        })
+    }
+
+    fn set_zone_lengths(bytes: &bytes::Bytes, lengths: &[u64]) -> bytes::Bytes {
+        transform_seed(bytes, |_, batch| {
+            let columns: Vec<ArrayRef> = batch
+                .schema()
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .map(|(field, col)| {
+                    if field.name() == "zone_length" {
+                        Arc::new(UInt64Array::from(lengths.to_vec())) as ArrayRef
+                    } else {
+                        col.clone()
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(batch.schema(), columns).unwrap()
+        })
+    }
+
+    /// Merged ragged sources: zone starts are the cumulative lengths, with
+    /// short zones mid file, and the statistics equal a concatenation.
+    #[test]
+    fn test_merge_seeds_cumulative_starts() {
+        let a_values: Vec<Option<f32>> = vec![
+            Some(1.0),
+            None,
+            Some(-f32::NAN),
+            Some(3.0),
+            // Tail zone of 2 rows under rows_per_zone = 4.
+            Some(f32::NAN),
+            None,
+        ];
+        let b_values: Vec<Option<f32>> = vec![Some(10.0), Some(-2.5), None];
+        // Different collection granularities concatenate: zones are located
+        // by their lengths, and the caller picks the output locator's value.
+        let a = seed_bytes_f32(&a_values, 4);
+        let b = seed_bytes_f32(&b_values, 8);
+        let parsed = [parse_supported(&a, 4), parse_supported(&b, 8)];
+        assert_eq!(
+            (parsed[0].rows_per_zone(), parsed[1].rows_per_zone()),
+            (4, 8)
+        );
+        assert_eq!(parsed[0].total_rows(), 6);
+        assert_eq!(parsed[1].total_rows(), 3);
+
+        let merged = merge_seeds_for_binary_copy(&[&parsed[0], &parsed[1]])
+            .unwrap()
+            .unwrap();
+        // Zones are located by length; the locator's rows_per_zone is never
+        // a read-time stride (a source zone may even exceed it).
+        let (zones, bitmap) = ZoneMapSeedWriter::deserialize_seed(7, &merged).unwrap();
+        let bounds: Vec<(u64, usize)> = zones
+            .iter()
+            .map(|z| (z.bound.start, z.bound.length))
+            .collect();
+        assert_eq!(bounds, vec![(0, 4), (4, 2), (6, 3)]);
+        assert!(zones.iter().all(|z| z.bound.fragment_id == 7));
+        assert_eq!(
+            zones.iter().map(|z| z.null_count).collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert_eq!(
+            zones.iter().map(|z| z.nan_count).collect::<Vec<_>>(),
+            vec![1, 1, 0]
+        );
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| z.negative_nan_count)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(0), Some(0)]
+        );
+        // Null offsets shifted by each source's cumulative rows: 1, 5, 6 + 2.
+        let bitmap = bitmap.unwrap();
+        assert_eq!(bitmap.iter().collect::<Vec<_>>(), vec![1, 5, 8]);
+    }
+
+    /// Any version 0 source refuses the merge; a bitmap missing on one source
+    /// leaves the output without one.
+    fn parse_supported(bytes: &bytes::Bytes, rows_per_zone: u64) -> MergeableSeed {
+        match parse_seed_for_binary_copy(bytes, rows_per_zone).unwrap() {
+            CarriedSeed::Supported(seed) => seed,
+            CarriedSeed::UnsupportedVersion(version) => {
+                panic!("expected a supported seed, got version {version}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_seeds_version_and_bitmap_rules() {
+        let a = seed_bytes_f32(&[Some(1.0), Some(2.0)], 2);
+        let b = seed_bytes_f32(&[Some(3.0), None], 2);
+        let a_parsed = parse_supported(&a, 2);
+
+        let b_v0 = to_v0(&b);
+        let b_v0_parsed = parse_supported(&b_v0, 2);
+        assert!(!b_v0_parsed.is_version_1());
+        assert!(
+            merge_seeds_for_binary_copy(&[&a_parsed, &b_v0_parsed])
+                .unwrap()
+                .is_none(),
+            "version 0 sources are never converted"
+        );
+
+        // A version 1 source without a bitmap (older writer) merges, but the
+        // output then has no bitmap: absence is unknown, not zero.
+        let b_no_bitmap = transform_seed(&b, |metadata, batch| {
+            metadata.remove(SEED_NULL_BITMAP_META_KEY);
+            batch
+        });
+        let b_parsed = parse_supported(&b_no_bitmap, 2);
+        let merged = merge_seeds_for_binary_copy(&[&a_parsed, &b_parsed])
+            .unwrap()
+            .unwrap();
+        let (zones, bitmap) = ZoneMapSeedWriter::deserialize_seed(0, &merged).unwrap();
+        assert!(bitmap.is_none());
+        assert_eq!(
+            zones.iter().map(|z| z.null_count).collect::<Vec<_>>(),
+            vec![0, 1],
+            "exact null counts survive a missing bitmap"
+        );
+    }
+
+    /// Corrupt or contradictory buffers refuse parsing instead of posing as
+    /// missing statistics; a future version is recognized but never
+    /// interpreted, so no merge can relabel it as version 1.
+    #[test]
+    fn test_parse_seed_rejects_corrupt_and_unknown() {
+        let good = seed_bytes_f32(&[Some(1.0), Some(2.0), Some(3.0)], 2);
+        let good_parsed = parse_supported(&good, 2);
+
+        // A version 2 fixture: version 1 bytes relabeled, which a version 1
+        // build must not read as version 1 even though the columns match.
+        let future_version = transform_seed(&good, |metadata, batch| {
+            metadata.insert(SEED_VERSION_META_KEY.to_string(), "2".to_string());
+            batch
+        });
+        let CarriedSeed::UnsupportedVersion(version) =
+            parse_seed_for_binary_copy(&future_version, 2).unwrap()
+        else {
+            panic!("a future version must not parse as supported statistics");
+        };
+        assert_eq!(version, "2");
+        // Only supported seeds can reach the merge; a version 1 source alone
+        // merges to itself, and the decoder refuses the version 2 bytes.
+        assert!(
+            merge_seeds_for_binary_copy(&[&good_parsed])
+                .unwrap()
+                .is_some()
+        );
+        let error = ZoneMapSeedWriter::deserialize_seed(0, &future_version).unwrap_err();
+        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+
+        // A future version may also change the bitmap encoding: the version
+        // is refused before any other metadata is interpreted, so the error
+        // names the version, not a corrupt bitmap.
+        let future_bitmap = transform_seed(&good, |metadata, batch| {
+            metadata.insert(SEED_VERSION_META_KEY.to_string(), "2".to_string());
+            metadata.insert(
+                SEED_NULL_BITMAP_META_KEY.to_string(),
+                "not-hex-in-version-2".to_string(),
+            );
+            batch
+        });
+        let error = ZoneMapSeedWriter::deserialize_seed(0, &future_bitmap).unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(matches!(
+            parse_seed_for_binary_copy(&future_bitmap, 2).unwrap(),
+            CarriedSeed::UnsupportedVersion(_)
+        ));
+
+        let zero_length = set_zone_lengths(&good, &[2, 0]);
+        assert!(parse_seed_for_binary_copy(&zero_length, 2).is_err());
+
+        // Counts exceeding the zone length contradict the statistics.
+        let shrunk = set_zone_lengths(&good, &[2, 1]);
+        let lying = transform_seed(&shrunk, |_, batch| {
+            let columns: Vec<ArrayRef> = batch
+                .schema()
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .map(|(field, col)| {
+                    if field.name() == "null_count" {
+                        Arc::new(UInt32Array::from(vec![0u32, 5])) as ArrayRef
+                    } else {
+                        col.clone()
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(batch.schema(), columns).unwrap()
+        });
+        assert!(parse_seed_for_binary_copy(&lying, 2).is_err());
+
+        assert!(
+            parse_seed_for_binary_copy(&bytes::Bytes::from_static(b"not an ipc buffer"), 2)
+                .is_err()
+        );
+        assert!(
+            parse_seed_for_binary_copy(&good, 0).is_err(),
+            "a locator must declare a non-zero rows_per_zone"
+        );
+
+        // A version 0 buffer parses (so the gate can account for it) but is
+        // never carried.
+        let v0 = to_v0(&good);
+        let v0_parsed = parse_supported(&v0, 2);
+        assert!(!v0_parsed.is_version_1());
+    }
+
+    /// deserialize_seed locates every zone by the cumulative lengths, for
+    /// both versions: a well-formed fixed-stride seed reads unchanged, and
+    /// mid-file short zones read at their true offsets.
+    #[test]
+    fn test_deserialize_seed_locates_zones_by_length() {
+        let values: Vec<Option<f32>> = (0..6).map(|i| Some(i as f32)).collect();
+        let v1 = seed_bytes_f32(&values, 4);
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v1).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 2)]
+        );
+        let v1_ragged = set_zone_lengths(&v1, &[2, 4]);
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v1_ragged).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (2, 4)]
+        );
+        // A zone longer than the declared rows_per_zone (a source collected at
+        // a coarser granularity) is still located by its length.
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v1).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 2)]
+        );
+
+        let v0 = to_v0(&v1);
+        let (zones, _) = ZoneMapSeedWriter::deserialize_seed(0, &v0).unwrap();
+        assert_eq!(
+            zones
+                .iter()
+                .map(|z| (z.bound.start, z.bound.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 4), (4, 2)]
+        );
+    }
 
     /// Build a FixedSizeList<Float32, list_size> zone map from `rows` (each row is a
     /// `Vec<Option<f32>>` of length `list_size`), then load and return the index.
@@ -5072,5 +6543,520 @@ mod tests {
         let mut exact_nulls = RowAddrTreeMap::new();
         exact_nulls.insert(0); // only row 0 is null
         assert_eq!(result, SearchResult::exact(exact_nulls));
+    }
+    /// Builds a `List<Int32>` with one parent-null row, an empty list, a list
+    /// containing a null child and a plain list: exactly one null row.
+    fn nested_list_fixture() -> ArrayRef {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_null();
+        builder.append(true);
+        builder.values().append_null();
+        builder.values().append_value(1);
+        builder.append(true);
+        builder.values().append_value(2);
+        builder.values().append_value(3);
+        builder.append(true);
+        Arc::new(builder.finish())
+    }
+
+    fn zone_bound(length: usize) -> ZoneBound {
+        ZoneBound {
+            fragment_id: 0,
+            start: 0,
+            length,
+        }
+    }
+
+    fn process_one_zone(array: &ArrayRef) -> ZoneMapStatistics {
+        let mut processor = ZoneMapProcessor::new(array.data_type().clone()).unwrap();
+        processor.process_chunk(array).unwrap();
+        processor.finish_zone(zone_bound(array.len())).unwrap()
+    }
+
+    /// Nested zone statistics count parent-level nulls only: empty lists,
+    /// null children and NaN children leave null_count and nan_count alone.
+    #[test]
+    fn test_nested_zone_stats_count_parent_nulls_only() {
+        use arrow::buffer::NullBuffer;
+        use arrow_array::StructArray;
+        use arrow_array::builder::{
+            FixedSizeListBuilder, Float32Builder, Int32Builder, LargeListBuilder, MapBuilder,
+            StringBuilder,
+        };
+
+        let mut cases: Vec<(&str, ArrayRef)> = vec![("list", nested_list_fixture())];
+
+        let mut large = LargeListBuilder::new(Int32Builder::new());
+        large.append_null();
+        large.append(true);
+        large.values().append_null();
+        large.values().append_value(1);
+        large.append(true);
+        large.values().append_value(2);
+        large.append(true);
+        cases.push(("large_list", Arc::new(large.finish())));
+
+        // [null, [NaN, 1.0], [null, null]]
+        let mut fsl = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        fsl.values().append_null();
+        fsl.values().append_null();
+        fsl.append(false);
+        fsl.values().append_value(f32::NAN);
+        fsl.values().append_value(1.0);
+        fsl.append(true);
+        fsl.values().append_null();
+        fsl.values().append_null();
+        fsl.append(true);
+        cases.push(("fixed_size_list", Arc::new(fsl.finish())));
+
+        // Row 0 is a null struct, row 1 is a valid struct whose field is null.
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let x: ArrayRef = Arc::new(Int32Array::from(vec![None, None, Some(5)]));
+        let strukt = StructArray::try_new(
+            vec![x_field].into(),
+            vec![x],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )
+        .unwrap();
+        cases.push(("struct", Arc::new(strukt)));
+
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map.append(false).unwrap();
+        map.keys().append_value("k");
+        map.values().append_null();
+        map.append(true).unwrap();
+        map.append(true).unwrap();
+        cases.push(("map", Arc::new(map.finish())));
+
+        for (name, array) in cases {
+            assert!(array.data_type().is_nested(), "{name}");
+            let stats = process_one_zone(&array);
+            assert_eq!(stats.null_count, 1, "{name}: only the parent null counts");
+            assert_eq!(stats.nan_count, 0, "{name}: nested NaN is not tracked");
+            assert!(stats.min.is_null(), "{name}: nested min is a typed null");
+            assert!(stats.max.is_null(), "{name}: nested max is a typed null");
+            assert_eq!(stats.min.data_type(), *array.data_type(), "{name}");
+            assert_eq!(stats.bound.length, array.len(), "{name}");
+        }
+
+        // The count accumulates across chunks and is cleared by reset.
+        let list = nested_list_fixture();
+        let mut processor = ZoneMapProcessor::new(list.data_type().clone()).unwrap();
+        processor.process_chunk(&list).unwrap();
+        processor.process_chunk(&list.slice(0, 2)).unwrap();
+        assert_eq!(processor.finish_zone(zone_bound(6)).unwrap().null_count, 2);
+        processor.reset().unwrap();
+        processor.process_chunk(&list.slice(1, 3)).unwrap();
+        assert_eq!(processor.finish_zone(zone_bound(3)).unwrap().null_count, 0);
+    }
+
+    /// The null-only path keeps the accumulator's type guard.
+    #[test]
+    fn test_nested_zone_stats_reject_type_mismatch() {
+        use crate::scalar::seed::IndexSeedWriter;
+        use arrow_array::builder::{Int64Builder, ListBuilder};
+
+        let list_i32 = nested_list_fixture();
+        let mut wide = ListBuilder::new(Int64Builder::new());
+        wide.values().append_value(1);
+        wide.append(true);
+        let list_i64: ArrayRef = Arc::new(wide.finish());
+        let plain: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+
+        let mut processor = ZoneMapProcessor::new(list_i32.data_type().clone()).unwrap();
+        for wrong in [&list_i64, &plain] {
+            let err = processor.process_chunk(wrong).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "unexpected error: {err:?}"
+            );
+            assert!(err.to_string().contains("Type mismatch"), "{err}");
+        }
+        // A rejected chunk leaves no trace.
+        processor.process_chunk(&list_i32).unwrap();
+        assert_eq!(processor.finish_zone(zone_bound(4)).unwrap().null_count, 1);
+
+        let mut writer = ZoneMapSeedWriter::new("c", 4, list_i32.data_type().clone()).unwrap();
+        let err = writer.observe_batch(&plain).unwrap_err();
+        assert!(err.to_string().contains("Type mismatch"), "{err}");
+    }
+
+    /// Seeds for a nested column carry parent-level null counts per zone and
+    /// exact parent-null positions, regardless of how the rows are batched.
+    #[test]
+    fn test_nested_seed_writer_null_only_round_trip() {
+        use crate::scalar::seed::IndexSeedWriter;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        // Row shapes: N = null row, E = empty list, C = list with a null child, V = values.
+        let shapes = ['N', 'E', 'C', 'V', 'N', 'N', 'N', 'V', 'E', 'C', 'N'];
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for (i, shape) in shapes.iter().enumerate() {
+            match shape {
+                'N' => builder.append_null(),
+                'E' => builder.append(true),
+                'C' => {
+                    builder.values().append_null();
+                    builder.values().append_value(i as i32);
+                    builder.append(true);
+                }
+                _ => {
+                    builder.values().append_value(i as i32);
+                    builder.values().append_value(i as i32 + 1);
+                    builder.append(true);
+                }
+            }
+        }
+        let array: ArrayRef = Arc::new(builder.finish());
+        let expected_nulls: RoaringBitmap = shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == 'N')
+            .map(|(i, _)| i as u32)
+            .collect();
+
+        let rows_per_zone = 4;
+        let mut whole =
+            ZoneMapSeedWriter::new("c", rows_per_zone, array.data_type().clone()).unwrap();
+        whole.observe_batch(&array).unwrap();
+        let mut sliced =
+            ZoneMapSeedWriter::new("c", rows_per_zone, array.data_type().clone()).unwrap();
+        for (start, len) in [(0, 3), (3, 2), (5, 6)] {
+            sliced.observe_batch(&array.slice(start, len)).unwrap();
+        }
+        let whole_bytes = whole.finish().unwrap().unwrap();
+        let sliced_bytes = sliced.finish().unwrap().unwrap();
+        assert_eq!(
+            whole_bytes, sliced_bytes,
+            "batching must not change the seed"
+        );
+
+        let (zones, bitmap) = ZoneMapSeedWriter::deserialize_seed(7, &whole_bytes).unwrap();
+        assert_eq!(bitmap, Some(expected_nulls));
+        let lengths: Vec<usize> = zones.iter().map(|z| z.bound.length).collect();
+        assert_eq!(lengths, vec![4, 4, 3]);
+        let null_counts: Vec<u32> = zones.iter().map(|z| z.null_count).collect();
+        assert_eq!(null_counts, vec![1, 3, 1]);
+        for zone in &zones {
+            assert_eq!(zone.bound.fragment_id, 7);
+            assert_eq!(zone.nan_count, 0);
+            assert!(zone.min.is_null() && zone.max.is_null());
+            assert_eq!(zone.min.data_type(), *array.data_type());
+        }
+    }
+
+    /// Training on a list column ignores empty lists and null children when
+    /// deciding which rows are null.
+    #[tokio::test]
+    async fn test_list_zonemap_training_ignores_child_nulls() {
+        let list_arr = nested_list_fixture();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, list_arr.data_type().clone(), true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let row_addr: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..4));
+        let batch = RecordBatch::try_new(schema.clone(), vec![list_arr, row_addr]).unwrap();
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(std::future::ready(Ok(batch))),
+        ));
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(10)),
+        )
+        .await
+        .unwrap();
+
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+        assert_eq!(index.zones.len(), 1);
+        assert_eq!(index.zones[0].null_count, 1, "only the null list row");
+        assert_eq!(index.zones[0].nan_count, 0);
+        assert!(index.zones[0].min.is_null() && index.zones[0].max.is_null());
+
+        let mut exact_nulls = RowAddrTreeMap::new();
+        exact_nulls.insert(0);
+        let result = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(result, SearchResult::exact(exact_nulls));
+
+        // Bounds are unknown, so value predicates stay conservative.
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &SargableQuery::Equals(SV::Int32(Some(99)))
+                )
+                .unwrap()
+        );
+        assert_eq!(index.value_range(), None);
+    }
+
+    fn f64_zone(
+        min: Option<f64>,
+        max: Option<f64>,
+        null_count: u32,
+        nan_count: u32,
+        negative_nan_count: Option<u32>,
+        length: usize,
+    ) -> ZoneMapStatistics {
+        ZoneMapStatistics {
+            min: ScalarValue::Float64(min),
+            max: ScalarValue::Float64(max),
+            null_count,
+            nan_count,
+            negative_nan_count,
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length,
+            },
+        }
+    }
+
+    fn range_q(start: Bound<f64>, end: Bound<f64>) -> SargableQuery {
+        let conv = |b: Bound<f64>| match b {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(v) => Bound::Included(ScalarValue::Float64(Some(v))),
+            Bound::Excluded(v) => Bound::Excluded(ScalarValue::Float64(Some(v))),
+        };
+        SargableQuery::Range(conv(start), conv(end))
+    }
+
+    /// The NaN sign split makes evaluation exact on both sides; an unknown
+    /// split stays conservative. The lower side was a live false negative
+    /// before the split existed.
+    #[tokio::test]
+    async fn test_eval_nan_sign_split() {
+        use std::ops::Bound;
+        let index = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let eval = |zone: &ZoneMapStatistics, q: &SargableQuery| {
+            index.evaluate_zone_against_query(zone, q).unwrap()
+        };
+
+        // Only negative NaNs besides the finite range [1, 5].
+        let neg = f64_zone(Some(1.0), Some(5.0), 0, 2, Some(2), 10);
+        // Only positive NaNs.
+        let pos = f64_zone(Some(1.0), Some(5.0), 0, 2, Some(0), 10);
+        // Split unknown (legacy / version 0 sources).
+        let unknown = f64_zone(Some(1.0), Some(5.0), 0, 2, None, 10);
+        // No NaNs at all.
+        let finite = f64_zone(Some(1.0), Some(5.0), 0, 0, Some(0), 10);
+
+        // Upper bounds: negative NaNs sort below every finite value.
+        let below = range_q(Bound::Unbounded, Bound::Included(0.0));
+        assert!(eval(&neg, &below), "negative NaNs match x <= 0");
+        assert!(!eval(&pos, &below), "positive NaNs sort above, no match");
+        assert!(eval(&unknown, &below), "unknown split stays conservative");
+        assert!(!eval(&finite, &below));
+
+        // Lower bounds: positive NaNs sort above every finite value.
+        let above = range_q(Bound::Included(10.0), Bound::Unbounded);
+        assert!(!eval(&neg, &above));
+        assert!(eval(&pos, &above));
+        assert!(eval(&unknown, &above));
+        assert!(!eval(&finite, &above));
+
+        // Equals and IsIn are sign-aware on NaN targets.
+        let eq_pos = SargableQuery::Equals(ScalarValue::Float64(Some(f64::NAN)));
+        let eq_neg = SargableQuery::Equals(ScalarValue::Float64(Some(-f64::NAN)));
+        assert!(!eval(&neg, &eq_pos));
+        assert!(eval(&neg, &eq_neg));
+        assert!(eval(&pos, &eq_pos));
+        assert!(!eval(&pos, &eq_neg));
+        assert!(eval(&unknown, &eq_pos) && eval(&unknown, &eq_neg));
+        let in_neg = SargableQuery::IsIn(vec![ScalarValue::Float64(Some(-f64::NAN))]);
+        assert!(eval(&neg, &in_neg));
+        assert!(!eval(&pos, &in_neg));
+    }
+
+    /// NaN range bounds resolve by sign, including on zones without usable
+    /// extrema (an all-NaN zone has null bounds).
+    #[tokio::test]
+    async fn test_eval_nan_range_bounds() {
+        use std::ops::Bound;
+        let index = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let eval = |zone: &ZoneMapStatistics, q: &SargableQuery| {
+            index.evaluate_zone_against_query(zone, q).unwrap()
+        };
+        let finite = f64_zone(Some(1.0), Some(5.0), 0, 0, Some(0), 10);
+        let all_neg_nan = f64_zone(None, None, 0, 2, Some(2), 2);
+
+        // x >= -NaN matches every non-null value (was: only NaN-bearing zones).
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Included(-f64::NAN), Bound::Unbounded)
+        ));
+        // x > -NaN matches every comparable value (was: nothing).
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Excluded(-f64::NAN), Bound::Unbounded)
+        ));
+        // x > +NaN matches nothing.
+        assert!(!eval(
+            &finite,
+            &range_q(Bound::Excluded(f64::NAN), Bound::Unbounded)
+        ));
+        // x <= +NaN matches every non-null value; x < +NaN excludes positive NaNs.
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Unbounded, Bound::Included(f64::NAN))
+        ));
+        assert!(eval(
+            &finite,
+            &range_q(Bound::Unbounded, Bound::Excluded(f64::NAN))
+        ));
+        // x < -NaN matches nothing.
+        assert!(!eval(
+            &finite,
+            &range_q(Bound::Unbounded, Bound::Excluded(-f64::NAN))
+        ));
+
+        // All-NaN zone (null bounds): x <= -NaN still answers exactly.
+        assert!(eval(
+            &all_neg_nan,
+            &range_q(Bound::Unbounded, Bound::Included(-f64::NAN))
+        ));
+        assert!(!eval(
+            &all_neg_nan,
+            &range_q(Bound::Included(f64::NAN), Bound::Unbounded)
+        ));
+    }
+
+    /// Freshly built zones keep finite bounds plus exact counts; the index
+    /// FILE still carries the legacy +NaN max marker so released readers stay
+    /// conservative, and reloading it leaves the sign split unknown.
+    #[tokio::test]
+    async fn test_index_file_keeps_legacy_nan_max() {
+        let index = train_and_load::<Float64Type>(vec![vec![
+            Some(1.0),
+            Some(-f64::NAN),
+            Some(3.0),
+            Some(4.0),
+        ]])
+        .await;
+        // rows_per_zone = 2: zone 0 holds [1.0, -NaN], zone 1 holds [3.0, 4.0].
+        assert_eq!(index.zones[0].nan_count, 1);
+        // Round-tripped through the index file: marker max, split unknown.
+        assert!(ZoneMapIndex::scalar_is_nan(&index.zones[0].max));
+        assert_eq!(index.zones[0].negative_nan_count, None);
+        assert_eq!(index.zones[0].min, ScalarValue::Float64(Some(1.0)));
+        // Conservative on both sides without the split.
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &range_q(std::ops::Bound::Unbounded, std::ops::Bound::Included(0.0))
+                )
+                .unwrap()
+        );
+        // The finite zone is exact.
+        assert!(ZoneMapIndex::zone_has_finite_extrema(&index.zones[1]));
+        assert_eq!(index.zones[1].negative_nan_count, None);
+    }
+
+    /// Version 1 seed round trip: finite bounds, exact sign split, version
+    /// metadata; and the reader rejects unknown versions and invalid counts.
+    #[test]
+    fn test_seed_v1_round_trip_and_validation() {
+        let mut writer = ZoneMapSeedWriter::new("c", 4, DataType::Float64).unwrap();
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            Some(-f64::NAN),
+            Some(f64::NAN),
+            Some(5.0),
+            Some(7.0),
+            None,
+        ]));
+        writer.observe_batch(&values).unwrap();
+        let bytes = writer.finish().unwrap().unwrap();
+
+        let (zones, _bitmap) = ZoneMapSeedWriter::deserialize_seed(3, &bytes).unwrap();
+        assert_eq!(zones.len(), 2);
+        // Zone 0: [1.0, -NaN, +NaN, 5.0] -> finite bounds, exact split.
+        assert_eq!(zones[0].min, ScalarValue::Float64(Some(1.0)));
+        assert_eq!(zones[0].max, ScalarValue::Float64(Some(5.0)));
+        assert_eq!(zones[0].nan_count, 2);
+        assert_eq!(zones[0].negative_nan_count, Some(1));
+        assert_eq!(zones[0].bound.fragment_id, 3);
+        // Zone 1: [7.0, null].
+        assert_eq!(zones[1].null_count, 1);
+        assert_eq!(zones[1].negative_nan_count, Some(0));
+
+        // Tampered version metadata is refused.
+        let tampered = {
+            use arrow_ipc::reader::FileReader;
+            use arrow_ipc::writer::FileWriter;
+            use std::io::Cursor;
+            let mut reader = FileReader::try_new(Cursor::new(bytes.as_ref()), None).unwrap();
+            let batch = reader.next().unwrap().unwrap();
+            let mut schema = batch.schema().as_ref().clone();
+            schema
+                .metadata
+                .insert("version".to_string(), "2".to_string());
+            let batch =
+                RecordBatch::try_new(Arc::new(schema.clone()), batch.columns().to_vec()).unwrap();
+            let mut buf = Cursor::new(Vec::new());
+            {
+                let mut w = FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+                w.write(&batch).unwrap();
+                w.finish().unwrap();
+            }
+            bytes::Bytes::from(buf.into_inner())
+        };
+        let err = ZoneMapSeedWriter::deserialize_seed(0, &tampered).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    /// Version 0 seeds (no version metadata) keep their legacy semantics:
+    /// split unknown, and a legacy +NaN max marker is preserved as data.
+    #[test]
+    fn test_seed_v0_read_back() {
+        use arrow_ipc::writer::FileWriter;
+        use std::io::Cursor;
+        // Hand-build a v0 seed batch: the old five-column schema, NaN max.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Float64, true),
+            Field::new("max", DataType::Float64, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float64Array::from(vec![Some(1.0)])),
+                Arc::new(Float64Array::from(vec![Some(f64::NAN)])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![2])),
+                Arc::new(UInt64Array::from(vec![4u64])),
+            ],
+        )
+        .unwrap();
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let bytes = bytes::Bytes::from(buf.into_inner());
+        let (zones, bitmap) = ZoneMapSeedWriter::deserialize_seed(1, &bytes).unwrap();
+        assert!(bitmap.is_none());
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].negative_nan_count, None);
+        assert!(ZoneMapIndex::scalar_is_nan(&zones[0].max));
+        assert_eq!(zones[0].nan_count, 2);
     }
 }

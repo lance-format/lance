@@ -112,7 +112,7 @@ pub struct LsmPointLookupPlanner {
     /// Prefix of the in-memory memtables this planner reads. Applies to the fast
     /// BTree probe and the plan fallback alike, so both resolve a key the same.
     visibility: MemTableVisibility,
-    /// `base_schema` with each field's id, which is what resolves a sealed
+    /// `base_schema` with each field's id, which is what resolves a flushed
     /// generation's columns to the table's. Defaults to `base_schema`, which
     /// carries them when the caller built it from a Lance schema.
     identity_schema: SchemaRef,
@@ -726,8 +726,8 @@ impl LsmPointLookupPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                // A sealed generation holds the names the table had when it was
-                // sealed, so the projection, the key filter and the output all
+                // A flushed generation holds the names the table had when it was
+                // frozen, so the projection, the key filter and the output all
                 // go through the same resolution the scanner uses.
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
                 let generation = GenerationRead::new(

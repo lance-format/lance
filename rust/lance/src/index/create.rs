@@ -138,11 +138,12 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     /// Train from rows already in the B-tree's shape: sorted by value, each
-    /// with its row id. An index that trains from another shape is refused.
+    /// with its row address. An index that trains from another shape is
+    /// refused.
     pub fn preprocessed_data(self, reader: Box<dyn RecordBatchReader + Send + 'static>) -> Self {
         self.preprocessed_stream(
             reader_to_stream(reader),
-            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
         )
     }
 
@@ -2197,8 +2198,8 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        // The worker scans the dataset's `(id, _rowid)` rows and sorts them by value,
-        // producing the BTree training stream `(value, _rowid)` externally — the "scan,
+        // The worker scans the dataset's `(id, _rowaddr)` rows and sorts them by value,
+        // producing the BTree training stream `(value, _rowaddr)` externally — the "scan,
         // sort, then hand a pre-sorted reader to the builder" path; no `range_id`.
         let sorted_batches: Vec<RecordBatch> = {
             let mut scan = dataset.scan();
@@ -2206,7 +2207,7 @@ mod tests {
                 "id".to_string(),
             )]))
             .unwrap();
-            scan.with_row_id();
+            scan.with_row_address();
             scan.project_with_transform(&[("value", "id")]).unwrap();
             scan.try_into_stream()
                 .await
@@ -2220,6 +2221,10 @@ mod tests {
             RecordBatchIterator::new(sorted_batches.into_iter().map(Ok), train_schema);
 
         // Build one self-contained segment directly from the sorted reader.
+        // This is also what the Java binding's generic preprocessed-data path
+        // exercises for a BTree index (see `execute_create_index` in
+        // `java/lance-jni/src/blocking_dataset.rs`), so this doubles as that
+        // path's regression coverage.
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
             .name("id_btree".to_string())
@@ -4172,8 +4177,12 @@ mod tests {
     /// The other Bitmap merge tests go through `optimize_indices` and build one
     /// segment per fragment, so this is the only coverage of the distributed-build
     /// entry point, and of a segment whose coverage is wider than one fragment.
-    /// Stable row ids make the filter an exact row-id allow-list, so the deleted
-    /// rows reach it rather than being masked at scan time.
+    /// Bitmap is now address-domain (see `BITMAP_ROW_ADDR_DOMAIN_VERSION`), so
+    /// -- like BTree -- its old-data filter is the coarse `Fragments` kind: a
+    /// fragment with any live rows still contributes every one of its postings,
+    /// deleted or not (masked at scan time instead, via the deletion vector).
+    /// The delete below empties a whole fragment so the filter still has
+    /// something real to exclude.
     #[tokio::test]
     async fn test_bitmap_merge_existing_index_segments_multi_fragment() {
         async fn count_value(dataset: &Dataset, segment: &IndexMetadata, value: &str) -> usize {
@@ -4244,8 +4253,9 @@ mod tests {
             .await
             .unwrap();
 
-        // One B from each segment's coverage, so both filters have work to do.
-        dataset.delete("id = 1 OR id = 9").await.unwrap();
+        // Empties fragment 0 entirely (one of each category), so the coarse
+        // Fragments filter actually excludes something.
+        dataset.delete("id < 4").await.unwrap();
 
         let merged = dataset
             .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())
@@ -4253,17 +4263,38 @@ mod tests {
             .unwrap();
         assert_eq!(
             merged.fragment_bitmap.as_ref(),
-            Some(&(0..4u32).collect::<RoaringBitmap>()),
-            "the merged segment must cover every fragment the sources did"
+            Some(&(1..4u32).collect::<RoaringBitmap>()),
+            "the merged segment must cover every fragment the sources did, minus the one emptied"
         );
 
-        for (value, expected) in [("A", 4), ("B", 2), ("C", 4), ("D", 4)] {
+        for (value, expected) in [("A", 3), ("B", 3), ("C", 3), ("D", 3)] {
             assert_eq!(
                 count_value(&dataset, &merged, value).await,
                 expected,
                 "wrong row count for cat = {value} after merging multi-fragment segments"
             );
         }
+
+        // A partial delete -- one row out of a fragment (2) that otherwise
+        // stays live -- is the case the coarse `Fragments` filter does NOT
+        // exclude from the merged postings: row 9 (cat = 'B') stays in
+        // `merged`'s bitmap for 'B', so this only passes end to end if the
+        // scanner's own deletion vector, not the index, is what masks it.
+        dataset.delete("id = 9").await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter("cat = 'B'").unwrap();
+        scanner.project(&["id"]).unwrap();
+        scanner.use_scalar_index(true);
+        let ids = scanner.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![5, 13],
+            "the scanner must mask row 9 via the deletion vector even though the coarse \
+             Fragments filter leaves its posting in the merged segment"
+        );
     }
 
     #[tokio::test]

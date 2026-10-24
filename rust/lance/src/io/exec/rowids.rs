@@ -527,7 +527,13 @@ impl ExecutionPlan for AddRowOffsetExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
+        stats
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+        // The input's byte count excludes the appended row-offset array.
+        stats.total_byte_size = Precision::Absent;
+        Ok(Arc::new(stats))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -585,12 +591,13 @@ impl ExecutionPlan for AddRowOffsetExec {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, RecordBatchIterator};
+    use arrow_array::{Int32Array, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field};
     use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
     use lance_datafusion::exec::OneShotExec;
+    use rstest::rstest;
 
     use crate::dataset::WriteParams;
 
@@ -734,6 +741,52 @@ mod test {
             .iter()
             .fold(0, |acc, col| acc + col.get_array_memory_size());
         assert_eq!(stats.total_byte_size, Precision::Exact(actual_byte_size));
+    }
+
+    #[rstest]
+    #[case::global(None, false)]
+    #[case::first_partition(Some(0), false)]
+    #[case::second_partition(Some(1), false)]
+    #[case::unknown(None, true)]
+    fn test_row_offset_statistics(
+        #[case] partition: Option<usize>,
+        #[case] has_unknown_statistics: bool,
+    ) {
+        let batch = record_batch!(
+            ("payload", Utf8, [Some("a"), None]),
+            (ROW_ADDR, UInt64, [0, 1])
+        )
+        .unwrap();
+        let input: Arc<dyn ExecutionPlan> = if has_unknown_statistics {
+            Arc::new(OneShotExec::from_batch(batch))
+        } else {
+            MemorySourceConfig::try_new_exec(
+                &[vec![batch.clone()], vec![batch.slice(0, 1)]],
+                batch.schema(),
+                None,
+            )
+            .unwrap()
+        };
+        let input_stats = input.partition_statistics(partition).unwrap();
+        let exec = AddRowOffsetExec::internal_new(input.clone(), Arc::new(HashMap::new())).unwrap();
+        let stats = exec.partition_statistics(partition).unwrap();
+
+        assert_eq!(stats.column_statistics.len(), exec.schema().fields().len());
+        assert_eq!(stats.num_rows, input_stats.num_rows);
+        assert_eq!(
+            stats.column_statistics[..input_stats.column_statistics.len()],
+            input_stats.column_statistics
+        );
+        assert_eq!(
+            stats.column_statistics.last().unwrap(),
+            &ColumnStatistics::new_unknown()
+        );
+        // Even an exact input size excludes the newly allocated row-offset array.
+        assert_eq!(stats.total_byte_size, Precision::Absent);
+        if !has_unknown_statistics {
+            assert!(matches!(input_stats.total_byte_size, Precision::Exact(_)));
+        }
+        assert_eq!(input.partition_statistics(partition).unwrap(), input_stats);
     }
 
     #[test]

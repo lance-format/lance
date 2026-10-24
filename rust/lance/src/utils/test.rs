@@ -1038,6 +1038,62 @@ pub async fn stage_index_segments(
     staged
 }
 
+/// Rewrites the fragments `fragment_ids` names into two through one
+/// distributed compaction task, deferring the index remap, so that the
+/// fragment reuse history records both outputs as produced from every one of
+/// them. Returns the outputs' ids.
+pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Vec<u64> {
+    use crate::dataset::index::DatasetIndexRemapperOptions;
+    use crate::dataset::optimize::{
+        CompactionOptions, CompactionTask, TaskData, commit_compaction,
+    };
+
+    let ids_before = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<Vec<_>>();
+    let fragments = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter(|fragment| fragment_ids.contains(&fragment.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let rows = fragments
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap())
+        .sum::<usize>();
+    let options = CompactionOptions {
+        target_rows_per_fragment: rows.div_ceil(2),
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    let task = CompactionTask {
+        task: TaskData { fragments },
+        read_version: dataset.manifest.version,
+        options: options.clone(),
+    };
+    let rewrite = task.execute(dataset).await.unwrap();
+    assert_eq!(rewrite.new_fragments.len(), 2);
+    commit_compaction(
+        dataset,
+        vec![rewrite],
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .unwrap();
+    dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .filter(|id| !ids_before.contains(id))
+        .collect()
+}
+
 /// Geometry fixtures shared by the RTree tests.
 #[cfg(feature = "geo")]
 pub mod geo {

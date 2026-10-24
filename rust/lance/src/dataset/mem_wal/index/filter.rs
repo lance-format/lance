@@ -50,7 +50,7 @@ impl MemIndexCatalog {
             if let [column] = spec.columns.as_slice()
                 && let Some(parser) = spec
                     .plugin
-                    .query_parser(spec.name.clone(), spec.index_details.as_deref())
+                    .query_parser(spec.name.clone(), spec.params.as_ref())
             {
                 catalog.add_parser(column, parser);
             }
@@ -62,7 +62,7 @@ impl MemIndexCatalog {
     /// after any maintained index on it. Only a catalog with a schema, as
     /// [`IndexStore::from_specs`] builds, can type the column.
     pub(crate) fn add_own_key_index(&mut self, column: &str) {
-        if let Some(parser) = BTreeMemIndexPlugin.query_parser(OWN_KEY_INDEX.to_string(), None) {
+        if let Some(parser) = BTreeMemIndexPlugin.query_parser(OWN_KEY_INDEX.to_string(), &()) {
             self.add_parser(column, parser);
         }
     }

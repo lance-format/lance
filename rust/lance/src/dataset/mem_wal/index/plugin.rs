@@ -147,7 +147,8 @@ pub struct ResolveContext<'a> {
     pub name: &'a str,
     /// The base table.
     pub dataset: &'a Dataset,
-    /// The base-table index entry.
+    /// The base-table index entry. Whatever the index depends on from it
+    /// belongs in the returned params; nothing else in it is compared.
     pub index_meta: &'a IndexMetadata,
     /// The shard schema.
     pub schema: &'a LanceSchema,
@@ -462,14 +463,14 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug + Any {
         Ok(ScalarIndexParams::default())
     }
 
-    /// The parser the on-disk index of this kind uses, so a filter expression
-    /// it claims reaches this index as the same query. `index_details` are the
-    /// base-table index's, absent for a memtable configured directly. `None`,
-    /// the default, keeps every filter off this kind.
+    /// The parser for filters this index answers, given the settings
+    /// [`resolve`](Self::resolve) returned. It marks for re-check any answer
+    /// this in-memory index cannot decide exactly. `None`, the default, keeps
+    /// every filter off this kind.
     fn query_parser(
         &self,
         _index_name: String,
-        _index_details: Option<&prost_types::Any>,
+        _params: &dyn MemIndexParams,
     ) -> Option<Box<dyn ScalarQueryParser>> {
         None
     }
@@ -571,8 +572,8 @@ fn check_details_message(plugin: &dyn MemIndexPlugin) -> Result<()> {
     Ok(())
 }
 
-/// One index a memtable maintains: its plugin, its columns, what the plugin
-/// resolved for it, and the base-table index's details.
+/// One index a memtable maintains: its plugin, its columns, and what the plugin
+/// resolved for it.
 #[derive(Clone)]
 pub struct MemIndexSpec {
     /// Index name, matching the base-table index it maintains.
@@ -585,9 +586,6 @@ pub struct MemIndexSpec {
     pub plugin: Arc<dyn MemIndexPlugin>,
     /// What [`MemIndexPlugin::resolve`] returned.
     pub params: Arc<dyn MemIndexParams>,
-    /// The base-table index's details message. The query parser is built from
-    /// it, and a change to it makes a different index.
-    pub index_details: Option<Arc<prost_types::Any>>,
 }
 
 impl MemIndexSpec {
@@ -615,12 +613,13 @@ impl MemIndexSpec {
             columns: vec![column.into()],
             plugin,
             params,
-            index_details: None,
         }
     }
 
     /// Whether `other` describes the same index: name, columns, field ids,
-    /// plugin type, plugin version, settings and base-table index details.
+    /// plugin type, plugin version and settings. The base-table index's details
+    /// count only through the settings a plugin resolves from them, so a base
+    /// index rewritten with the same settings is the same index.
     pub fn same_index(&self, other: &Self) -> bool {
         self.name == other.name
             && self.columns == other.columns
@@ -630,7 +629,6 @@ impl MemIndexSpec {
             && self.plugin.details_message() == other.plugin.details_message()
             && self.plugin.version() == other.plugin.version()
             && self.params.same_as(other.params.as_ref())
-            && self.index_details == other.index_details
     }
 
     /// `params` as `P`, the type its plugin's own

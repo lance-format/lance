@@ -31,7 +31,6 @@ use lance_file::{
     versions as file_versions,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::scalar::seed::IndexSeedWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -49,7 +48,8 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
-use super::write::{self, GenericWriter, TargetBaseInfo, WriteParams, WriterOptions};
+use super::write::seeds::SeedCollector;
+use super::write::{self, GenericWriter, TargetBaseInfo, WriteMode, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
@@ -105,20 +105,6 @@ pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOpti
     }
 }
 
-async fn create_seed_writers(
-    version: ConcreteFileVersion,
-    dataset: Option<&Dataset>,
-    params: &WriteParams,
-) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
-    match version {
-        ConcreteFileVersion::V1 => Ok(Vec::new()),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => write::create_seed_writers_current(dataset, params).await,
-    }
-}
-
 fn create_current_file_writer(
     version: ConcreteFileVersion,
     object_writer: Box<dyn ObjectWriter>,
@@ -145,6 +131,7 @@ pub async fn write_fragments(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    keep_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
@@ -153,8 +140,12 @@ pub async fn write_fragments(
     // the blob promotion, which gives every negative field id a new one.
     let (mut normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
     if dataset.is_none() {
-        // Input Arrow IDs must not seed allocation for a new dataset's blob children.
-        normalized_schema.try_reassign_field_ids(None)?;
+        if keep_field_ids {
+            normalized_schema.try_set_field_id(None)?;
+        } else {
+            // Input Arrow IDs must not seed allocation for a new dataset's blob children.
+            normalized_schema.try_reassign_field_ids(None)?;
+        }
     }
     let normalized_schema = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -168,6 +159,7 @@ pub async fn write_fragments(
         normalized_schema,
         &params,
         schema_compare_options(version),
+        keep_field_ids,
     )?;
     schema.fields.extend(lineage_fields);
     match version {
@@ -178,7 +170,9 @@ pub async fn write_fragments(
             write::validate_blob_v2_write_schema(&schema)?;
         }
     }
-    let seed_writers = create_seed_writers(version, dataset, &params).await?;
+    // Overwrite drops every index, so its seeds would have no consumer.
+    let consult_indices = !matches!(params.mode, WriteMode::Overwrite);
+    let seeds = SeedCollector::for_write(version, dataset, &schema, consult_indices).await?;
     let fragments = write_fragments_direct(
         version,
         dataset,
@@ -188,7 +182,7 @@ pub async fn write_fragments(
         data,
         params,
         target_bases_info,
-        seed_writers,
+        seeds,
         file_row_counts,
         preassigned_data_file_name,
     )
@@ -241,7 +235,7 @@ pub async fn write_fragments_direct(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-    seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    seeds: SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>> {
@@ -304,7 +298,7 @@ pub async fn write_fragments_direct(
         },
         external_base_resolver,
         target_bases_info,
-        seed_writers,
+        seeds,
         file_row_counts,
         preassigned_data_file_name,
     )

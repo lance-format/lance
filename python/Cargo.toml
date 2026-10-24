@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "14.0.0-beta.10"
+version = "15.0.0-beta.1"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -24,7 +24,7 @@ arrow-array = "58.0.0"
 arrow-cast = "58.0.0"
 arrow-data = "58.0.0"
 arrow-schema = "58.0.0"
-object_store = "0.14.1"
+object_store = "0.14.2"
 url = "2.5.7"
 datafusion = { version = "54.0.0", default-features = false }
 datafusion-ffi = "54.0.0"
@@ -79,7 +79,7 @@ uuid = "1.3.0"
 roaring = "0.11.4"
 serde_json = "1"
 serde = "1.0.197"
-serde_yaml = "0.9.34"
+yaml_serde = "0.10.0"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.17"
 tracing = { version = "0.1" }
@@ -104,6 +104,9 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+[patch.crates-io]
+object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }
 
 [lints.clippy]
 disallowed_macros = "deny"

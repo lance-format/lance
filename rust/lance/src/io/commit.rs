@@ -435,9 +435,16 @@ async fn do_commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
     session: Arc<Session>,
+    keep_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
-    canonicalize_non_reusable_field_ids(None, &mut transaction.operation, None)?;
+    if !keep_field_ids {
+        canonicalize_non_reusable_field_ids(None, &mut transaction.operation, None)?;
+    } else if let Operation::Overwrite { schema, .. } = &transaction.operation {
+        // Canonicalization would have checked the schema it renumbered.
+        schema.validate()?;
+        schema.verify_primary_key()?;
+    }
     let transaction = &transaction;
     validate_operation(None, &transaction.operation)?;
     let pb_transaction = pb::Transaction::try_from(transaction)?;
@@ -781,6 +788,7 @@ pub(crate) async fn commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
     session: Arc<Session>,
+    keep_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
@@ -793,6 +801,7 @@ pub(crate) async fn commit_new_dataset(
         manifest_naming_scheme,
         metadata_cache,
         session,
+        keep_field_ids,
     )
     .await
 }
@@ -950,7 +959,12 @@ pub(crate) fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // A field's children are named by this field's id only, so each entry can
     // be applied independently of the order the mapping is iterated in.
     for (old_field_id, new_field_id) in &old_field_id_mapping {
-        let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
+        let field = manifest.schema.mut_field_by_id(*old_field_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Cannot repair duplicate field id {} because it does not exist in the manifest schema",
+                old_field_id
+            ))
+        })?;
         field.id = *new_field_id;
         for child in field.children.iter_mut() {
             child.parent_id = *new_field_id;
@@ -1358,13 +1372,20 @@ pub(crate) async fn do_commit_detached_transaction(
                 let prepared =
                     prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
                         .await?;
-                transaction.build_manifest_prepared(
+                let (mut manifest, indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
                     &build_config,
                     None,
-                )?
+                )?;
+                crate::dataset::write::seeds::apply_seed_feature_flags(
+                    &mut manifest,
+                    &indices,
+                    dataset,
+                )
+                .await?;
+                (manifest, indices)
             }
         };
 
@@ -1864,13 +1885,20 @@ pub(crate) async fn commit_transaction(
                 let prepared =
                     prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
                         .await?;
-                attempt_transaction.build_manifest_prepared(
+                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &build_config,
                     read_version_state,
-                )?
+                )?;
+                crate::dataset::write::seeds::apply_seed_feature_flags(
+                    &mut manifest,
+                    &indices,
+                    &dataset,
+                )
+                .await?;
+                (manifest, indices)
             }
         };
 

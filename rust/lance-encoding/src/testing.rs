@@ -6,7 +6,7 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 use crate::{
     decoder::DecoderConfig,
     encodings::physical::block::CompressionScheme,
-    format::pb21::{
+    format::metadata::{
         BufferCompression, CompressiveEncoding, PageLayout, compressive_encoding::Compression,
     },
 };
@@ -24,6 +24,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use lance_core::{Error, Result, datatypes::Field as LanceField, utils::bit::pad_bytes};
 use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
+use crate::compression::PerValueGeneralCompression;
 use crate::compression::try_packed_struct_per_value;
 use crate::{
     EncodingsIo,
@@ -170,6 +171,12 @@ impl CompressionStrategy for TestCompressionStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
         let params = self.field_params(field);
+        if self.encoding == TestEncoding::StructuralSparse
+            && let Some(compressor) =
+                crate::compression::try_tensor_per_value(field, data, &params)?
+        {
+            return Ok(compressor);
+        }
         if let Some(compressor) = try_raw_per_value(data) {
             return Ok(compressor);
         }
@@ -184,7 +191,14 @@ impl CompressionStrategy for TestCompressionStrategy {
         if let Some(compressor) = packed {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_variable_width_per_value(field, data, &params)? {
+        let general_compression = if self.encoding == TestEncoding::StructuralSparse {
+            PerValueGeneralCompression::Any
+        } else {
+            PerValueGeneralCompression::ZstdOnly
+        };
+        if let Some(compressor) =
+            try_variable_width_per_value(field, data, &params, general_compression)?
+        {
             return Ok(compressor);
         }
         Err(lance_core::Error::not_supported_source(
@@ -202,6 +216,11 @@ impl CompressionStrategy for TestCompressionStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
+        if self.encoding == TestEncoding::StructuralSparse
+            && let Some(compressor) = crate::compression::try_fixed_size_list_block(data, &params)?
+        {
+            return Ok(compressor);
+        }
         let rle = match self.encoding {
             TestEncoding::Array | TestEncoding::StructuralU16 => None,
             TestEncoding::StructuralU32 => try_fixed_u8_rle_block(data, &params)?,
@@ -253,6 +272,14 @@ impl FieldEncodingStrategy for TestFieldEncodingStrategy {
         column_index: &mut ColumnIndexSequence,
         context: &FieldEncodingContext<'_>,
     ) -> Result<Box<dyn FieldEncoder>> {
+        if self.encoding == TestEncoding::StructuralSparse
+            && field.is_blob()
+            && matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+        {
+            return Err(Error::invalid_input(
+                "Lance 2.3 does not write Blob v1 pages; use a Blob v2 descriptor struct",
+            ));
+        }
         if let Some(encoder) =
             try_create_binary_blob(&self.primitive, field, column_index, context)?
         {
@@ -337,11 +364,7 @@ pub fn test_encoding_strategy(encoding: TestEncoding) -> Box<dyn FieldEncodingSt
             PrimitivePageEncoding::constant(),
             PrimitivePageEncoding::dense_u32(compression),
         ],
-        TestEncoding::StructuralSparse => vec![
-            PrimitivePageEncoding::sparse(compression.clone()),
-            PrimitivePageEncoding::constant(),
-            PrimitivePageEncoding::dense_u32(compression),
-        ],
+        TestEncoding::StructuralSparse => vec![PrimitivePageEncoding::planar(compression)],
         TestEncoding::Array => unreachable!(),
     };
     Box::new(TestFieldEncodingStrategy {
@@ -917,6 +940,8 @@ fn tag(e: &Compression) -> &'static str {
         VariablePackedStruct(_) => "variable_packed_struct",
         Range(_) => "range",
         Delta(_) => "delta",
+        AxisDelta(_) => "axis_delta",
+        Alp(_) => "alp",
     }
 }
 
@@ -1010,7 +1035,7 @@ pub fn extract_array_encoding_chain(enc: &CompressiveEncoding) -> Vec<String> {
 
 fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) -> Result<()> {
     // Extract encodings from the page layout
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     if let Some(ref layout_type) = layout.layout {
         match layout_type {
             Layout::MiniBlockLayout(mini_block) => {
@@ -1036,11 +1061,6 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
             Layout::BlobLayout(blob) => {
                 if let Some(inner_layout) = &blob.inner_layout {
                     collect_page_encoding(inner_layout.as_ref(), actual_chain)?
-                }
-            }
-            Layout::SparseLayout(sparse) => {
-                if let Some(value_compression) = &sparse.value_compression {
-                    actual_chain.extend(extract_array_encoding_chain(value_compression));
                 }
             }
         }
@@ -1069,11 +1089,38 @@ fn verify_page_encoding(
             // (and rep/def compression is not currently described in the page layout).
             if actual_chain.is_empty()
                 && page.data.is_empty()
-                && let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
+                && let Some(crate::format::metadata::page_layout::Layout::ConstantLayout(cl)) =
                     layout.layout.as_ref()
                 && cl.inline_value.is_none()
             {
                 return Ok(());
+            }
+        }
+        PageEncoding::Planar(layout) => {
+            use crate::format::pb23::value_plane::Codec;
+            match layout.values.as_ref().and_then(|v| v.codec.as_ref()) {
+                Some(Codec::Chunked(v)) => {
+                    if v.dictionary.is_some() {
+                        actual_chain.push("dictionary".to_string());
+                    }
+                    if let Some(c) = &v.compression {
+                        actual_chain.extend(extract_array_encoding_chain(c));
+                    }
+                }
+                Some(Codec::Zipped(v)) => {
+                    if let Some(c) = &v.compression {
+                        actual_chain.extend(extract_array_encoding_chain(c));
+                    }
+                }
+                Some(Codec::Indexed(v)) => {
+                    actual_chain.push("indexed".to_string());
+                    actual_chain.push("dictionary".to_string());
+                    if let Some(c) = &v.indices {
+                        actual_chain.extend(extract_array_encoding_chain(c));
+                    }
+                }
+                Some(Codec::Constant(_)) | Some(Codec::None(_)) => return Ok(()),
+                None => return Err(Error::invalid_input("Missing planar value plane")),
             }
         }
         PageEncoding::Legacy(_) => {
@@ -1327,7 +1374,10 @@ async fn check_round_trip_encoding_inner(
     let scheduler = Arc::new(SimulatedScheduler::new(encoded_data)) as Arc<dyn EncodingsIo>;
 
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
-    let concat_data = if test_cases.skip_validation {
+    // The caller can supply the expected array; in that case skip deriving it,
+    // because building it here may itself fail (e.g. `concat` on dictionaries
+    // that Arrow's lossy merge cannot combine).
+    let concat_data = if test_cases.skip_validation || expected_override.is_some() {
         None
     } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
         // TODO(tsaucer) When arrow upgrades to 56, remove this if statement

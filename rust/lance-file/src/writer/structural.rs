@@ -14,7 +14,6 @@ use lance_core::{
     utils::bit::pad_bytes,
 };
 use lance_encoding::{
-    decoder::PageEncoding,
     encoder::{
         BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
         OutOfLineBuffers,
@@ -212,10 +211,7 @@ impl StructuralFileSink {
             buffer_sizes.push(buffer.len() as u64);
             self.write_aligned_buffer(&buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = crate::writer::encode_page_encoding(&encoded_page.description)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -532,13 +528,43 @@ impl EncodingPipeline {
         Ok(())
     }
 
-    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (column, field) in batch
-            .columns()
+    /// Select, by name, the array that will be encoded for each schema field.
+    ///
+    /// A batch may order its columns differently from the schema or carry extra
+    /// ones, so each field's array is pulled by name rather than by position. A
+    /// column the schema names but the batch lacks is an error. Selecting once
+    /// here lets the nullability check and the encoder share the result, so each
+    /// field is resolved by name a single time per batch rather than once for the
+    /// check and again for the encoder, as the v2.0 writer already does.
+    fn field_arrays(&self, batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
+        self.schema
+            .as_ref()
+            .unwrap()
+            .fields
             .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(column.as_ref(), field)?;
+            .enumerate()
+            .map(|(field_index, field)| {
+                let array = batch.column_by_name(&field.name).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Cannot write batch.  The batch was missing the column `{}`",
+                            field.name
+                        )
+                        .into(),
+                    )
+                })?;
+                Ok((field_index, array.clone()))
+            })
+            .collect()
+    }
+
+    /// Verify each selected array against its field's nullability, on the same
+    /// `(field_index, array)` pairs the encoder writes, so the check and the
+    /// encoder never disagree about which array belongs to a field.
+    fn verify_nullability(&self, field_arrays: &[(usize, ArrayRef)]) -> Result<()> {
+        let fields = &self.schema.as_ref().unwrap().fields;
+        for (field_index, array) in field_arrays {
+            Self::verify_field_nullability(array.as_ref(), &fields[*field_index])?;
         }
         Ok(())
     }
@@ -567,34 +593,6 @@ impl EncodingPipeline {
             .collect()
     }
 
-    fn encode_batch(
-        &mut self,
-        batch: &RecordBatch,
-        external_buffers: &mut OutOfLineBuffers,
-    ) -> Result<Vec<Vec<EncodeTask>>> {
-        let field_arrays = self
-            .schema
-            .as_ref()
-            .unwrap()
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(field_index, field)| {
-                let array = batch.column_by_name(&field.name).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                    )
-                })?;
-                Ok((field_index, array.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.encode_columns(&field_arrays, external_buffers)
-    }
-
     #[instrument(skip_all, level = "debug")]
     pub async fn write_batch(
         &mut self,
@@ -614,7 +612,6 @@ impl EncodingPipeline {
         self.expected_types
             .get_or_insert_with(|| ExpectedTypes::new(schema))
             .check_batch(batch)?;
-        self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -625,9 +622,15 @@ impl EncodingPipeline {
             ));
         }
 
+        // Resolve each field's array by name once, then both check nullability
+        // and encode from the same arrays: a batch may reorder or duplicate
+        // columns, so the check must see exactly what the encoder writes.
+        let field_arrays = self.field_arrays(batch)?;
+        self.verify_nullability(&field_arrays)?;
+
         let mut external_buffers =
             OutOfLineBuffers::new(sink.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
-        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         for external_buffer in external_buffers.take_buffers() {
             sink.write_aligned_buffer(&external_buffer).await?;
         }
@@ -856,14 +859,7 @@ pub fn encode_batch_body(batch: &EncodedBatch, write_schema: bool) -> Result<Enc
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = crate::writer::encode_page_encoding(&page_info.encoding)?;
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
                     page_info.buffer_offsets_and_sizes.iter().copied().unzip();
                 Ok(pbfile::column_metadata::Page {

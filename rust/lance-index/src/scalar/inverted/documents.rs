@@ -2433,6 +2433,15 @@ mod tests {
             }
         }
 
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_buffer_size(bytes),
+                target: self.target.clone(),
+                counts: self.counts.clone(),
+                fault: self.fault.clone(),
+            })
+        }
+
         fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
             Arc::new(Self {
                 inner: self.inner.with_io_priority(io_priority),

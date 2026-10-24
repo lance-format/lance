@@ -551,6 +551,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.paginated_lister.is_some(), keep_pushdown);
+        assert!(!store.supports_conditional_multipart_put);
         // Both halves of the store are labelled with the same prefix.
         assert_eq!(
             *wrapper.prefixes.lock().unwrap(),

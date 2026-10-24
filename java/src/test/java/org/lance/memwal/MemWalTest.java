@@ -394,6 +394,7 @@ public class MemWalTest {
 
         WriteStats stats = writer.stats();
         assertEquals(1, stats.putCount());
+        assertEquals(0, stats.memtableFlushFailures());
 
         MemTableStats memtableStats = writer.memtableStats();
         assertTrue(memtableStats.generation() >= 0);
