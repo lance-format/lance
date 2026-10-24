@@ -22,6 +22,7 @@ use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_optimizer::output_requirements::OutputRequirementExec;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -42,7 +43,9 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::expressions::{Column, Literal};
-use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
+use datafusion_physical_expr::{
+    Distribution, LexOrdering, Partitioning, PhysicalExpr, create_physical_expr,
+};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -82,7 +85,7 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, ProbeParams, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_select::IndexExprResult;
@@ -113,7 +116,7 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::io::exec::filtered_read::{
-    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
+    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode, filter_read_columns,
 };
 use crate::io::exec::fts::{
     BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
@@ -230,6 +233,23 @@ fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
     let mut seen = HashSet::new();
     visit(query, &mut columns, &mut seen);
     columns
+}
+
+/// The multiple of the exact distance a vector index ranks by. Lance indexes
+/// cosine on SQ and PQ as L2 over normalized vectors, twice `1 - cos`; FLAT
+/// and RQ rank it, and every other metric, on its own scale.
+fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
+    let quantized_as_l2 = segments.iter().any(|segment| {
+        segment.index_details.as_ref().is_some_and(|details| {
+            let index_type = crate::index::vector::details::derive_vector_index_type(details);
+            index_type.ends_with("PQ") || index_type.ends_with("SQ")
+        })
+    });
+    if metric == MetricType::Cosine && quantized_as_l2 {
+        2.0
+    } else {
+        1.0
+    }
 }
 
 fn collect_phrase_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
@@ -466,7 +486,7 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
 /// unindexed rows. AUTO activation is deferred until OSS-2105 lands that
 /// current-row preparation atomically. Until then, recursively rewrite AUTO to
 /// exact while preserving explicit positive fuzziness.
-fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
+pub(crate) fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
     match query {
         FtsQuery::Match(query) => {
             query.fuzziness.get_or_insert(0);
@@ -1185,6 +1205,7 @@ pub struct Scanner {
     ordering: Option<Vec<ColumnOrdering>>,
 
     nearest: Option<Query>,
+    probe_params: ProbeParams,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -1679,6 +1700,7 @@ impl Scanner {
             offset: None,
             ordering: None,
             nearest: None,
+            probe_params: ProbeParams::default(),
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -2224,6 +2246,10 @@ impl Scanner {
     /// Overrides the default (`get_num_compute_intensive_cpus()`). Used by
     /// `EnforceDistribution` and similar rules to decide how many parallel
     /// partitions to use. Set to 1 in tests that assert specific plan shapes.
+    ///
+    /// A scan that reads in order (see [`Self::scan_in_order`]) and has no sort
+    /// does not split its filters and projections across partitions, because
+    /// merging the partitions would lose the order.
     pub fn target_parallelism(&mut self, n: usize) -> &mut Self {
         self.target_parallelism = Some(n);
         self
@@ -2354,7 +2380,10 @@ impl Scanner {
                     } else {
                         list_array.len()
                     };
-                    (list_array.values().clone(), query_count)
+                    let offsets = list_array.value_offsets();
+                    let start = offsets[0] as usize;
+                    let end = offsets[list_array.len()] as usize;
+                    (list_array.values().slice(start, end - start), query_count)
                 } else {
                     let fsl = q.as_fixed_size_list();
                     if fsl.value_length() as usize != dim {
@@ -2412,6 +2441,7 @@ impl Scanner {
             }
         };
 
+        self.probe_params = ProbeParams::default();
         self.nearest = Some(Query {
             column: column.to_string(),
             key,
@@ -2420,6 +2450,7 @@ impl Scanner {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: None,
@@ -2453,28 +2484,67 @@ impl Scanner {
 
     /// Configures how many partitions are searched in the vector index.
     ///
-    /// This sets both [`Self::minimum_nprobes`] and [`Self::maximum_nprobes`]
-    /// to the same value. With neither setter called, adaptive defaults apply.
+    /// Used only when [`Self::search_effort`] has not been set. Explicit minimum
+    /// and maximum probe bounds override the corresponding fixed-count bounds.
+    /// With none of these options set, adaptive defaults apply.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
-            q.maximum_nprobes = Some(n);
+            self.probe_params.nprobes = Some(n);
+            (q.minimum_nprobes, q.maximum_nprobes, q.search_effort) = self.probe_params.resolve();
         } else {
             log::warn!("nprobes is not set because nearest has not been called yet");
         }
         self
     }
 
+    /// Set the initial IVF search effort to a finite value in [0, 1].
+    ///
+    /// Unset effort resolves to 0.5 and preserves Auto probing. Smaller values reduce the
+    /// initial partition budget toward [`Self::minimum_nprobes`]; larger values
+    /// increase it toward all available partitions, subject to
+    /// [`Self::maximum_nprobes`]. At 0, at least one available partition is
+    /// searched. Later expansion to find enough candidates remains unchanged.
+    /// This is independent of refinement, HNSW ef and approximation mode, and
+    /// is not a recall guarantee. Setting any effort, including 0.5, ignores
+    /// [`Self::nprobes`] regardless of setter order. Explicit minimum and maximum
+    /// bounds remain effective. Call [`Self::nearest`] first.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset, vector: &Float32Array) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("vector", vector, 10)?.search_effort(0.75)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn search_effort(&mut self, effort: f64) -> Result<&mut Self> {
+        let query = self.nearest.as_mut().ok_or_else(|| {
+            Error::invalid_input("search_effort requires nearest to be called first")
+        })?;
+        let previous = self.probe_params;
+        self.probe_params.search_effort = Some(effort);
+        (
+            query.minimum_nprobes,
+            query.maximum_nprobes,
+            query.search_effort,
+        ) = self.probe_params.resolve();
+        if let Err(error) = query.validate_search_effort() {
+            self.probe_params = previous;
+            (
+                query.minimum_nprobes,
+                query.maximum_nprobes,
+                query.search_effort,
+            ) = previous.resolve();
+            return Err(error);
+        }
+        Ok(self)
+    }
+
     /// Configures how many partitions are searched in the vector index.
     #[deprecated(note = "Use nprobes instead")]
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
-        if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
-            q.maximum_nprobes = Some(n);
-        } else {
-            log::warn!("nprobes is not set because nearest has not been called yet");
-        }
-        self
+        self.nprobes(n)
     }
 
     /// Configures the minimum number of partitions to search in the vector index.
@@ -2486,7 +2556,8 @@ impl Scanner {
     /// The default value is 1.
     pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.minimum_nprobes = n;
+            self.probe_params.minimum_nprobes = Some(n);
+            (q.minimum_nprobes, q.maximum_nprobes, q.search_effort) = self.probe_params.resolve();
         } else {
             log::warn!("minimum_nprobes is not set because nearest has not been called yet");
         }
@@ -2495,27 +2566,31 @@ impl Scanner {
 
     /// Configures the maximum number of partitions to search in the vector index.
     ///
-    /// These partitions will only be searched if we have not found `k` results after
-    /// searching the minimum number of partitions.  Setting this to None (the default)
-    /// will search all partitions if needed.
-    ///
-    /// This setting only takes effect when a prefilter is in place.  In that case we
-    /// can spend more effort to try and find results when the filter is highly selective.
-    ///
-    /// If there is no prefilter, or the results are not highly selective, this value will
-    /// have no effect.
+    /// This bounds both the initial budget and later probing per index segment,
+    /// without disabling Auto probing. An unset maximum (the default) allows all
+    /// available partitions.
+    /// With [`Self::search_effort`] set to 1, all partitions up to this limit are
+    /// included in the initial search. At lower efforts, additional partitions
+    /// may be searched if the initial budget does not find enough candidates.
     pub fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.maximum_nprobes = Some(n);
+            self.probe_params.maximum_nprobes = Some(n);
+            (q.minimum_nprobes, q.maximum_nprobes, q.search_effort) = self.probe_params.resolve();
         } else {
             log::warn!("maximum_nprobes is not set because nearest has not been called yet");
         }
         self
     }
 
+    /// Set the beam width used when searching an HNSW graph.
+    ///
+    /// Defaults to `1.5 * k * refine_factor`, floored at
+    /// [`lance_index::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub fn ef(&mut self, ef: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.ef = Some(ef);
+        } else {
+            log::warn!("ef is not set because nearest has not been called yet");
         }
         self
     }
@@ -2952,6 +3027,31 @@ impl Scanner {
         Ok(output_expr)
     }
 
+    /// The `order_by` keys as columns of the final projection's output, or `None`
+    /// when a key does not pass through the projection unchanged.
+    fn ordering_in_output(
+        ordering: &[ColumnOrdering],
+        projection: &[(Arc<dyn PhysicalExpr>, String)],
+    ) -> Option<LexOrdering> {
+        let sort_exprs = ordering
+            .iter()
+            .map(|col| {
+                let index = projection.iter().position(|(expr, _)| {
+                    expr.downcast_ref::<Column>()
+                        .is_some_and(|column| column.name() == col.column_name)
+                })?;
+                Some(PhysicalSortExpr {
+                    expr: Arc::new(Column::new(&projection[index].1, index)),
+                    options: SortOptions {
+                        descending: !col.ascending,
+                        nulls_first: col.nulls_first,
+                    },
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        LexOrdering::new(sort_exprs)
+    }
+
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
     pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
@@ -3267,7 +3367,11 @@ impl Scanner {
         // Either that column is covered by an exact filter (e.g. string with bitmap/btree) and there is no
         // need for late materialization or that column is covered by an inexact filter (e.g. ngram) in which
         // case we are going to load the column anyways for the recheck.
-        let filter_columns = filter_plan.all_columns();
+        let filter_columns = filter_plan
+            .full_expr
+            .as_ref()
+            .map(|expr| filter_read_columns(expr, desired_projection))
+            .unwrap_or_default();
 
         let filter_schema = self
             .dataset
@@ -3305,6 +3409,12 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if let Some(query) = &self.nearest {
+            query.validate_search_effort()?;
+        }
+        if let Some(QueryFilter::Vector(query)) = &self.filter.query_filter {
+            query.validate_search_effort()?;
+        }
         if self.batch_readahead == 0 {
             return Err(Error::invalid_input_source(
                 "batch_readahead must be greater than 0, got 0".into(),
@@ -3842,6 +3952,10 @@ impl Scanner {
 
         // Final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+        let output_sort = self
+            .ordering
+            .as_ref()
+            .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
@@ -3855,6 +3969,39 @@ impl Scanner {
         options.execution.target_partitions = self
             .target_parallelism
             .unwrap_or_else(get_num_compute_intensive_cpus);
+        // Rows must come back in plan order unless the caller opted out and
+        // nothing ranks them.
+        let order_matters = self.ordered
+            || self.ordering.is_some()
+            || self.nearest.is_some()
+            || self.full_text_query.is_some()
+            || self.minhash_query.is_some();
+        // The order the output declares. With `order_by` it must cover every sort
+        // key, which it cannot if the projection drops or changes one.
+        let properties = plan.properties();
+        let visible_order = match (&self.ordering, output_sort) {
+            (None, _) => properties.output_ordering().cloned(),
+            (Some(_), Some(output_sort)) => properties
+                .equivalence_properties()
+                .ordering_satisfy(output_sort.clone())?
+                .then_some(output_sort),
+            (Some(_), None) => None,
+        };
+        // Round-robin partitions are merged back in order only by an ordering the
+        // output declares; otherwise they arrive in whichever order they finish.
+        options.optimizer.enable_round_robin_repartition =
+            !order_matters || visible_order.is_some();
+        if let Some(order) = visible_order {
+            // `EnforceDistribution` then merges any partitions back in this order
+            plan = Arc::new(OutputRequirementExec::new(
+                plan,
+                Some(order.into()),
+                Distribution::SinglePartition,
+                None,
+            ));
+            // Otherwise the merge is replaced by a coalesce and a full re-sort
+            options.optimizer.prefer_existing_sort = true;
+        }
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -4013,6 +4160,37 @@ impl Scanner {
         }
     }
 
+    // Read options carrying the scanner's batch size, readahead and I/O settings.
+    fn read_options(&self, projection: Projection) -> Result<FilteredReadOptions> {
+        // Bound the decode fan-out by `batch_readahead`.
+        let mut read_options = FilteredReadOptions::new(projection).with_threading_mode(
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
+        );
+
+        if let Some(batch_size) = self.batch_size {
+            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
+        }
+
+        if let Some(file_reader_options) = self.resolved_file_reader_options() {
+            read_options = read_options.with_file_reader_options(file_reader_options);
+        }
+
+        if let Some(fragment_readahead) = self.fragment_readahead {
+            read_options = read_options.with_fragment_readahead(fragment_readahead);
+        }
+
+        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
+        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
+            read_options =
+                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
+        }
+
+        Ok(read_options)
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -4030,9 +4208,9 @@ impl Scanner {
         let use_external_mask = self.use_external_mask();
         let effective_filter = self.effective_filter_plan(filter_plan);
 
-        let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
-            .with_filter_plan(effective_filter)
-            .with_projection(projection);
+        let mut read_options = self
+            .read_options(projection)?
+            .with_filter_plan(effective_filter);
 
         if let Some(rows) = &self.physical_row_addr_prefilter {
             read_options = read_options.with_physical_row_addr_prefilter(rows.clone());
@@ -4046,34 +4224,8 @@ impl Scanner {
             read_options = read_options.with_scan_range_before_filter(scan_range)?;
         }
 
-        if let Some(batch_size) = self.batch_size {
-            read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
-        }
-
-        // Bound the decode fan-out by `batch_readahead`.
-        read_options = read_options.with_threading_mode(
-            FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
-        );
-
-        if let Some(file_reader_options) = self.resolved_file_reader_options() {
-            read_options = read_options.with_file_reader_options(file_reader_options);
-        }
-
-        if let Some(fragment_readahead) = self.fragment_readahead {
-            read_options = read_options.with_fragment_readahead(fragment_readahead);
-        }
-
         if make_deletions_null {
             read_options = read_options.with_deleted_rows()?;
-        }
-
-        if let Some(io_buffer_size_bytes) = self.io_buffer_size {
-            read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
-        }
-
-        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
-            read_options =
-                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
         }
 
         if self.fast_search && filter_plan.has_index_query() {
@@ -4259,10 +4411,31 @@ impl Scanner {
         self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
     }
 
+    // The columns the source read must produce. If we have an aggregate, we only need the
+    // columns referenced by the aggregate, not all the columns from the projection plan.
+    fn source_projection(&self) -> Result<Projection> {
+        let Some(agg) = &self.aggregate else {
+            return Ok(self.projection_plan.physical_projection.clone());
+        };
+        let required_columns = agg.required_columns();
+        if required_columns.is_empty() {
+            // COUNT(*) or similar - no columns needed
+            Ok(self.dataset.empty_projection())
+        } else {
+            // Aggregate needs specific columns
+            self.dataset
+                .empty_projection()
+                .union_columns(&required_columns, OnMissing::Error)
+        }
+    }
+
     async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
         // We generally assume that late materialization does not make sense for take operations
-        // so we can just use the physical projection
-        let projection = self.projection_plan.physical_projection.clone();
+        // so we can just use the source projection
+        let mut projection = self.source_projection()?;
+        // Later stages take filter, aggregate and ordering columns by row address, and
+        // an empty projection still needs an output column. The address is synthesized.
+        projection.with_row_addr = true;
 
         let input = match take_op {
             TakeOperation::RowIds(ids) => {
@@ -4277,7 +4450,7 @@ impl Scanner {
             }
         }?;
 
-        let mut filtered_read_options = FilteredReadOptions::new(projection);
+        let mut filtered_read_options = self.read_options(projection)?;
         if let Some(fragment) = self.fragments.as_ref() {
             filtered_read_options =
                 filtered_read_options.with_fragments(Arc::new(fragment.clone()));
@@ -4301,23 +4474,16 @@ impl Scanner {
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
-        // Compute the effective projection based on what's actually needed.
-        // If we have an aggregate, we only need the columns referenced by the aggregate,
-        // not all the columns from the projection plan.
-        let effective_projection = if let Some(agg) = &self.aggregate {
-            let required_columns = agg.required_columns();
-            if required_columns.is_empty() {
-                // COUNT(*) or similar - no columns needed
-                self.dataset.empty_projection()
-            } else {
-                // Aggregate needs specific columns
-                self.dataset
-                    .empty_projection()
-                    .union_columns(&required_columns, OnMissing::Error)?
-            }
-        } else {
-            self.projection_plan.physical_projection.clone()
-        };
+        let mut effective_projection = self.source_projection()?;
+
+        // A single-stage read may omit row identifiers, so it must also load
+        // unprojected sort columns instead of relying on a later take.
+        if let Some(ordering) = &self.ordering {
+            effective_projection = effective_projection.union_columns(
+                ordering.iter().map(|col| &col.column_name),
+                OnMissing::Error,
+            )?;
+        }
 
         // Plan against the effective filter: with an external mask the SQL filter
         // becomes a refine, so its columns must be retained even when the original
@@ -6587,61 +6753,82 @@ impl Scanner {
                         None
                     }
                 }
-            }
-            // An index can only answer a query on the column it is keyed on, which is
-            // always `fields[0]`. Not `contains`: `fields` also lists columns the index
-            // merely carries values for, which it cannot search. Not a boundary derived
-            // from `covering_fields` either -- that is computed from a field older
-            // writers drop, so it would widen to the carried columns exactly when the
-            // declaration is lost.
-            else if let Some(index) = indices.iter().find(|i| {
-                i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
-            }) {
-                // Try to get metric type from index metadata first (fast path for newer indices)
-                let index_metric = if let Some(metric) =
-                    crate::index::vector::details::metric_type_from_index_metadata(index)
-                {
-                    metric
-                } else {
-                    // Fall back to opening the index for legacy indices without details
-                    let idx = self
-                        .dataset
-                        .open_vector_index(q.column.as_str(), &index.uuid, &NoOpMetricsCollector)
-                        .await?;
-                    idx.metric_type()
-                };
+            } else {
+                // An index can only answer a query on the column it is keyed on, which
+                // is always `fields[0]`. Not `contains`: `fields` also lists columns the
+                // index merely carries values for, which it cannot search. Not a boundary
+                // derived from `covering_fields` either -- that is computed from a field
+                // older writers drop, so it would widen to the carried columns exactly
+                // when the declaration is lost.
+                let candidates = indices.iter().filter(|i| {
+                    i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+                });
 
-                let use_this_index = match q.metric_type {
-                    Some(user_metric) => {
-                        if user_metric == index_metric {
-                            true
+                // A column may carry several vector indices with different metrics. The
+                // query's metric has to take part in *selecting* one, not merely veto the
+                // first candidate: picking the first keyed index and then rejecting it on
+                // a metric mismatch brute-forced the whole column even when another index
+                // on it had exactly the requested metric (issue #9873).
+                let mut selected: Option<(&IndexMetadata, MetricType)> = None;
+                let mut saw_candidate = false;
+                for index in candidates {
+                    saw_candidate = true;
+                    // Resolve the metric from index metadata first (fast path for newer
+                    // indices); open the index only for legacy candidates without details.
+                    let index_metric = if let Some(metric) =
+                        crate::index::vector::details::metric_type_from_index_metadata(index)
+                    {
+                        metric
+                    } else {
+                        self.dataset
+                            .open_vector_index(
+                                q.column.as_str(),
+                                &index.uuid,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?
+                            .metric_type()
+                    };
+                    match q.metric_type {
+                        // No metric requested: the first keyed index answers, as before.
+                        None => {
+                            selected = Some((index, index_metric));
+                            break;
+                        }
+                        Some(user_metric) if user_metric == index_metric => {
+                            selected = Some((index, index_metric));
+                            break;
+                        }
+                        // Metric mismatch: keep looking at the column's other indices.
+                        Some(_) => continue,
+                    }
+                }
+
+                match selected {
+                    Some((index, index_metric)) => {
+                        let index_segments = self.retain_relevant_index_segments(
+                            self.dataset.load_indices_by_name(&index.name).await?,
+                        );
+                        let index_frags = self.get_indexed_frags(&index_segments);
+                        if !index_segments.is_empty() && !index_frags.is_empty() {
+                            Some((index.name.clone(), index_segments, index_metric))
                         } else {
-                            log::warn!(
-                                "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
-                                user_metric,
-                                index_metric
-                            );
-                            false
+                            None
                         }
                     }
-                    None => true,
-                };
-
-                if use_this_index {
-                    let index_segments = self.retain_relevant_index_segments(
-                        self.dataset.load_indices_by_name(&index.name).await?,
-                    );
-                    let index_frags = self.get_indexed_frags(&index_segments);
-                    if !index_segments.is_empty() && !index_frags.is_empty() {
-                        Some((index.name.clone(), index_segments, index_metric))
-                    } else {
+                    None => {
+                        if saw_candidate {
+                            // Every index on this column uses a different metric than the
+                            // query asked for, so none can accelerate it.
+                            log::warn!(
+                                "Requested metric {:?} does not match any index on column '{}', falling back to brute-force search",
+                                q.metric_type,
+                                q.column
+                            );
+                        }
                         None
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
             }
         } else {
             None
@@ -6707,8 +6894,28 @@ impl Scanner {
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    self.ann(&q, &index_segments, filter_plan, overlay_block.clone())
-                        .await?
+                    // Refine applies the distance range to exact distances, but
+                    // the search still has to, or a lower bound leaves it only
+                    // candidates refine then drops. It ranks on the index's own
+                    // scale, so it gets the range on that scale.
+                    let ann_query = match q.refine_factor {
+                        Some(_) => {
+                            let scale = index_distance_scale(index_metric, &index_segments);
+                            Query {
+                                lower_bound: q.lower_bound.map(|lower| lower * scale),
+                                upper_bound: q.upper_bound.map(|upper| upper * scale),
+                                ..q.clone()
+                            }
+                        }
+                        None => q.clone(),
+                    };
+                    self.ann(
+                        &ann_query,
+                        &index_segments,
+                        filter_plan,
+                        overlay_block.clone(),
+                    )
+                    .await?
                 }
                 DataType::List(_) => {
                     self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
@@ -8369,33 +8576,14 @@ impl Scanner {
             let mut projection = output_projection;
             projection.with_row_id |= has_row_id;
             projection.with_row_addr |= has_row_addr;
-            let mut read_options = FilteredReadOptions::new(projection);
+            let mut read_options = self.read_options(projection)?;
             if self.include_deleted_rows {
                 // Forwarded so the row-stream read rejects it: deleted rows
                 // carry a null row id, which the take would silently drop
                 read_options = read_options.with_deleted_rows()?;
             }
-            if let Some(batch_size) = self.batch_size {
-                read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
-            }
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
-            }
-            read_options = read_options.with_threading_mode(
-                FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
-            );
-            if let Some(file_reader_options) = self.resolved_file_reader_options() {
-                read_options = read_options.with_file_reader_options(file_reader_options);
-            }
-            if let Some(fragment_readahead) = self.fragment_readahead {
-                read_options = read_options.with_fragment_readahead(fragment_readahead);
-            }
-            if let Some(io_buffer_size_bytes) = self.io_buffer_size {
-                read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
-            }
-            if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
-                read_options = read_options
-                    .with_materialization_readahead_bytes(materialization_readahead_bytes);
             }
             return Ok(Arc::new(FilteredReadExec::try_new(
                 self.dataset.clone(),
@@ -8705,6 +8893,17 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index_with_metric(&mut self, metric: MetricType) -> Result<()> {
+            self.make_named_vector_index_with_metric("idx", metric)
+                .await
+        }
+
+        /// Build an IVF_PQ index on the `vec` column under an explicit name, so a
+        /// test can place several indices with different metrics on one column.
+        pub async fn make_named_vector_index_with_metric(
+            &mut self,
+            name: &str,
+            metric: MetricType,
+        ) -> Result<()> {
             let mut params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
             // Two partitions over 400 vectors only holds at a sample rate this
             // fixture can cover: the trained count is capped at the vectors
@@ -8716,7 +8915,7 @@ pub mod test_dataset {
                 .create_index(
                     &["vec"],
                     IndexType::Vector,
-                    Some("idx".to_string()),
+                    Some(name.to_string()),
                     &params,
                     true,
                 )
@@ -8910,11 +9109,13 @@ mod test {
 
     use arrow::array::as_primitive_array;
     use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray,
-        PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array, UInt32Array,
+        ListArray, PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array,
+        UInt32Array,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -11911,6 +12112,113 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn test_sliced_list_batch_nearest() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let query_values = (0..4)
+            .map(|query| {
+                (query * 32..(query + 1) * 32)
+                    .map(|value| Some(value as f32))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let queries = ListArray::from_iter_primitive::<Float32Type, _, _>(
+            query_values.iter().cloned().map(Some),
+        );
+
+        for (start, length) in [(0, 4), (0, 2), (1, 2), (2, 2)] {
+            let sliced = queries.slice(start, length);
+            let equivalent = ListArray::from_iter_primitive::<Float32Type, _, _>(
+                query_values[start..start + length]
+                    .iter()
+                    .cloned()
+                    .map(Some),
+            );
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &sliced, 5).unwrap();
+            assert_eq!(scanner.nearest_query_count, length);
+            assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), length * 32);
+            assert_eq!(
+                scanner.nearest.as_ref().unwrap().key.as_ref(),
+                equivalent.values().as_ref()
+            );
+
+            for use_index in [false, true] {
+                let search = |query: &ListArray| {
+                    let mut scanner = dataset.scan();
+                    scanner.nearest("vec", query, 5).unwrap();
+                    scanner.use_index(use_index).nprobes(2);
+                    scanner.project(&["i"]).unwrap();
+                    scanner
+                };
+                let actual = search(&sliced).try_into_batch().await.unwrap();
+                let expected = search(&equivalent).try_into_batch().await.unwrap();
+                assert_eq!(
+                    actual[QUERY_INDEX_COL].as_ref(),
+                    expected[QUERY_INDEX_COL].as_ref()
+                );
+                assert_eq!(actual["i"].as_ref(), expected["i"].as_ref());
+                assert_eq!(actual[DIST_COL].as_ref(), expected[DIST_COL].as_ref());
+                assert_eq!(actual.num_rows(), length * 5);
+                let row_numbers = actual["i"].as_primitive::<Int32Type>();
+                assert!(row_numbers.iter().flatten().any(|value| value < 200));
+                assert!(row_numbers.iter().flatten().any(|value| value >= 200));
+            }
+        }
+
+        let fixed_size_queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..128).map(|value| value as f32).collect::<Vec<_>>()),
+            32,
+        )
+        .unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &fixed_size_queries.slice(1, 2), 5)
+            .unwrap();
+        assert_eq!(scanner.nearest_query_count, 2);
+        assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn test_sliced_list_multivector_nearest_key() {
+        let mut vectors = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 2));
+        for value in [0.0, 1.0] {
+            vectors.values().values().append_value(value);
+            vectors.values().values().append_value(value);
+            vectors.values().append(true);
+            vectors.append(true);
+        }
+        let vectors = vectors.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            vectors.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let queries = ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+            Some(vec![Some(0.0), Some(0.0)]),
+            Some(vec![Some(1.0), Some(1.0)]),
+            Some(vec![Some(2.0), Some(2.0)]),
+            Some(vec![Some(3.0), Some(3.0)]),
+        ]);
+        let sliced = queries.slice(1, 2);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &sliced, 1).unwrap();
+        assert!(!scanner.is_batch_nearest);
+        assert_eq!(scanner.nearest_query_count, 1);
+        assert_eq!(
+            scanner.nearest.as_ref().unwrap().key.as_ref(),
+            &Float32Array::from(vec![1.0, 1.0, 2.0, 2.0])
+        );
+    }
+
     async fn dataset_with_query_index_column() -> (TempStrDir, Dataset) {
         let path = TempStrDir::default();
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -12023,6 +12331,101 @@ mod test {
             None,
         )
         .await;
+    }
+
+    /// A cosine SQ index ranks as twice `1 - cos`, so a refined search that also
+    /// applied the range inside the index would drop rows whose exact distance
+    /// is in range.
+    #[tokio::test]
+    async fn test_refined_knn_applies_distance_range_to_exact_distances() {
+        use lance_linalg::distance::cosine_distance;
+
+        const DIM: usize = 16;
+        const ROWS: usize = 2000;
+        let mut seed: u64 = 42;
+        let values: Vec<f32> = (0..ROWS * DIM)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    Float32Array::from(values.clone()),
+                    DIM as i32,
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &tmp,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_hnsw_sq_params(
+                    DistanceType::Cosine,
+                    IvfBuildParams::new(1),
+                    HnswBuildParams::default(),
+                    SQBuildParams::default(),
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let query = values[..DIM].to_vec();
+        let mut exact: Vec<f32> = values
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .map(|row| cosine_distance(&query, row))
+            .collect();
+        exact.sort_by(f32::total_cmp);
+        // Rows from the 20th nearest out, capped so that `upper <= 2 * lower`:
+        // no row is in range on both the exact and the doubled scale.
+        let lower = exact[20];
+        let upper = exact[60].min(2.0 * lower);
+        assert!(upper > lower);
+
+        let batch = dataset
+            .scan()
+            .nearest("vec", &Float32Array::from(query), 5)
+            .unwrap()
+            .distance_metric(DistanceType::Cosine)
+            .refine(1)
+            .distance_range(Some(lower), Some(upper))
+            .try_into_batch()
+            .await
+            .unwrap();
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>().values();
+        assert!(!distances.is_empty(), "no rows within the exact range");
+        for distance in distances {
+            assert!(
+                (lower..upper).contains(distance),
+                "{distance} is outside [{lower}, {upper})"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12257,6 +12660,73 @@ mod test {
             result.is_err(),
             "refine(0) must error rather than fall through to an empty batch result"
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_effort_validation_after_probe_setters() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let mut scan = test_ds.dataset.scan();
+        let error = scan.search_effort(0.75).err().unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("requires nearest"));
+        let (queries, _) = batch_knn_two_queries();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.search_effort(0.75).unwrap();
+        let error = scan.search_effort(f64::NAN).err().unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("must be finite"));
+        assert_eq!(scan.nearest.as_ref().unwrap().search_effort, 0.75);
+        scan.nprobes(2);
+        scan.validate_options().unwrap();
+        assert_eq!(scan.nearest.as_ref().unwrap().minimum_nprobes, 1);
+        assert_eq!(scan.nearest.as_ref().unwrap().maximum_nprobes, None);
+        scan.search_effort(0.5).unwrap();
+        scan.validate_options().unwrap();
+        scan.search_effort(1.0).unwrap();
+        assert_eq!(scan.nearest.as_ref().unwrap().search_effort, 1.0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_search_effort_nprobes_precedence(
+        #[values(0.0, 0.25, 0.5, 0.75, 1.0)] effort: f64,
+        #[values(false, true)] effort_first: bool,
+    ) {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let (queries, _) = batch_knn_two_queries();
+        let mut scan = test_ds.dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        assert_eq!(scan.probe_params.search_effort, None);
+        assert_eq!(scan.nearest.as_ref().unwrap().search_effort, 0.5);
+        if effort_first {
+            scan.search_effort(effort).unwrap().nprobes(2);
+        } else {
+            scan.nprobes(2);
+            assert_eq!(scan.nearest.as_ref().unwrap().maximum_nprobes, Some(2));
+            scan.search_effort(effort).unwrap();
+        }
+        let mut reference = test_ds.dataset.scan();
+        reference
+            .nearest("vec", &queries, 2)
+            .unwrap()
+            .search_effort(effort)
+            .unwrap();
+        assert_eq!(
+            scan.try_into_batch().await.unwrap(),
+            reference.try_into_batch().await.unwrap()
+        );
+        assert_eq!(scan.nearest.as_ref().unwrap().minimum_nprobes, 1);
+        assert_eq!(scan.nearest.as_ref().unwrap().maximum_nprobes, None);
+        // Bounds supplied by the caller remain effective, even when equal.
+        scan.minimum_nprobes(2).maximum_nprobes(2).nprobes(9);
+        let query = scan.nearest.as_ref().unwrap();
+        assert_eq!(query.minimum_nprobes, 2);
+        assert_eq!(query.maximum_nprobes, Some(2));
+        assert_eq!(query.search_effort, effort);
     }
 
     /// Without pinned nprobes the shared-scan fast path is not equivalent to
@@ -13242,6 +13712,103 @@ mod test {
         );
     }
 
+    // More rows than one batch, so the row count alone does not keep the
+    // optimizer from splitting the read across partitions.
+    async fn scan_order_dataset() -> Dataset {
+        gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .col(
+                "grp",
+                array::cycle::<Int32Type>((0..12_288).map(|idx| idx / 1_000).collect()),
+            )
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(4_096))
+            .await
+            .unwrap()
+    }
+
+    #[rstest]
+    #[case::computed_column(None, &[], &[], false)]
+    // Row 1 of fragments 2, 1 and 0
+    #[case::take_with_filter(
+        Some("_rowid IN (8589934593, 4294967297, 1) AND idx >= 0"),
+        &[],
+        &[],
+        false
+    )]
+    #[case::sort_column_projected_away(None, &["idx"], &[], false)]
+    // The sorted partitions are merged back in order, so they may run in parallel.
+    #[case::sort_column_kept(None, &["idx"], &[("idx", "idx")], true)]
+    #[case::sort_key_partly_projected(None, &["grp", "idx"], &[("grp", "grp")], false)]
+    // `idx > 0` keeps an ordering on its second column, but a weaker one than `idx`.
+    #[case::sort_key_weakened(
+        None,
+        &["grp", "idx"],
+        &[("grp", "grp"), ("flag", "idx > 0")],
+        false
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_order_survives_parallelism(
+        #[case] filter: Option<&str>,
+        #[case] descending_by: &[&str],
+        #[case] extra_columns: &[(&str, &str)],
+        #[case] round_robin: bool,
+    ) {
+        let dataset = scan_order_dataset().await;
+        let mut scan = dataset.scan();
+        scan.target_parallelism(8);
+        let mut columns = vec![("foo", "idx * 2")];
+        columns.extend_from_slice(extra_columns);
+        scan.project_with_transform(&columns).unwrap();
+        if let Some(filter) = filter {
+            scan.filter(filter).unwrap();
+        }
+        if !descending_by.is_empty() {
+            let ordering = descending_by
+                .iter()
+                .map(|column| ColumnOrdering::desc_nulls_first(column.to_string()))
+                .collect();
+            scan.order_by(Some(ordering)).unwrap();
+        }
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("RoundRobinBatch"), round_robin, "{plan}");
+        // The plan merges its own partitions back in order.
+        assert_eq!(
+            plan.contains("SortPreservingMergeExec"),
+            round_robin,
+            "{plan}"
+        );
+        let mut expected = match filter {
+            Some(_) => vec![1, 4_097, 8_193],
+            None => (0..12_288).collect::<Vec<i32>>(),
+        };
+        if !descending_by.is_empty() {
+            expected.reverse();
+        }
+        let expected = expected.iter().map(|idx| idx * 2).collect::<Vec<_>>();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["foo"].as_primitive::<Int32Type>().values(),
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unordered_scan_keeps_parallelism() {
+        let dataset = scan_order_dataset().await;
+        let mut scan = dataset.scan();
+        scan.target_parallelism(8);
+        scan.scan_in_order(false);
+        scan.project_with_transform(&[("foo", "idx * 2")]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("RoundRobinBatch"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut values = batch["foo"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (0..12_288).map(|idx| idx * 2).collect::<Vec<_>>());
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_refine_factor(
@@ -13439,6 +14006,54 @@ mod test {
         );
     }
 
+    /// A column can carry more than one vector index. The query's metric has to
+    /// take part in selecting which index answers, not merely veto the first one
+    /// keyed on the column: a cosine query on a column holding both an L2 and a
+    /// cosine index must reach the cosine index instead of brute-forcing.
+    /// Regression test for https://github.com/lance-format/lance/issues/9873
+    #[tokio::test]
+    async fn test_knn_selects_index_matching_requested_metric() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        // Two indices on the same `vec` column: L2 created first, cosine second.
+        test_ds
+            .make_named_vector_index_with_metric("idx_l2", MetricType::L2)
+            .await
+            .unwrap();
+        test_ds
+            .make_named_vector_index_with_metric("idx_cos", MetricType::Cosine)
+            .await
+            .unwrap();
+
+        let dataset = &test_ds.dataset;
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        // The cosine query must use the cosine index. Before the fix the first
+        // keyed index (idx_l2) was selected, vetoed on the metric mismatch, and
+        // the whole column brute-forced even though idx_cos matched.
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.distance_metric(MetricType::Cosine);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex") && plan.to_lowercase().contains("cosine"),
+            "Expected the cosine index to answer a cosine query, got plan:\n{}",
+            plan
+        );
+
+        // An L2 query still selects the L2 index.
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.distance_metric(MetricType::L2);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex") && plan.to_lowercase().contains("l2"),
+            "Expected the L2 index to answer an L2 query, got plan:\n{}",
+            plan
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_only_row_id(
@@ -13590,6 +14205,27 @@ mod test {
 
         // Make sure we can reference * fields in exprs and add new columns
         check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
+
+        // A system column inside a larger expression is requested just like a
+        // bare reference.
+        for expr in [
+            "_rowid + 1",
+            "_rowaddr + 1",
+            "_rowoffset + 1",
+            "_row_last_updated_at_version + 1",
+            "_row_created_at_version + 1",
+        ] {
+            check_exprs(&[expr], &[expr]).await;
+        }
+        let mut scan = data.scan();
+        scan.project_with_transform(&[("o", "_rowoffset + 1")])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let offsets = arrow::compute::cast(&batch["o"], &DataType::Int64).unwrap();
+        assert_eq!(
+            offsets.as_primitive::<Int64Type>().values(),
+            &(1..=100).collect::<Vec<i64>>()[..]
+        );
 
         let check_fails = |projection: &[&str]| {
             let mut scan = data.scan();
@@ -13763,6 +14399,94 @@ mod test {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+    }
+
+    #[rstest]
+    #[case::equals("category = 'x'")]
+    #[case::not_equals("category != 'y'")]
+    #[tokio::test]
+    async fn test_scalar_indexed_filter_with_unprojected_sort(
+        #[case] filter: &str,
+        #[values(BuiltinIndexType::Bitmap, BuiltinIndexType::BTree)] index_type: BuiltinIndexType,
+        #[values(false, true)] has_full_index_coverage: bool,
+        #[values(false, true)] has_stable_row_ids: bool,
+    ) {
+        let data = arrow_array::record_batch!(
+            ("id", Utf8, ["a", "b", "c", "d", "e", "f"]),
+            (
+                "category",
+                Utf8,
+                [Some("x"), Some("x"), Some("y"), Some("x"), Some("x"), None]
+            ),
+            (
+                "t",
+                Int32,
+                [Some(3), Some(1), Some(2), Some(0), None, Some(4)]
+            )
+        )
+        .unwrap();
+        let indexed_rows = if has_full_index_coverage { 6 } else { 3 };
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, indexed_rows))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids: has_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::for_builtin(index_type),
+                false,
+            )
+            .await
+            .unwrap();
+        if !has_full_index_coverage {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(data.slice(3, 3))], data.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("t".to_string())]))
+            .unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(
+            batch["id"].as_string::<i32>(),
+            &StringArray::from(vec!["e", "d", "b", "a"])
+        );
+
+        let mut unindexed_scanner = scanner.clone();
+        unindexed_scanner.use_scalar_index(false);
+        assert_eq!(unindexed_scanner.try_into_batch().await.unwrap(), batch);
+
+        scanner.limit(Some(2), Some(1)).unwrap();
+        let limited = scanner.try_into_batch().await.unwrap();
+        assert_eq!(limited.num_columns(), 1);
+        assert_eq!(
+            limited["id"].as_string::<i32>(),
+            &StringArray::from(vec!["d", "b"])
+        );
     }
 
     #[rstest]
@@ -14253,7 +14977,9 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count().await,
-                5 + dataset.versions().await.unwrap().len()
+                // the index, its partitions and the segment ownership mask, plus
+                // the index metadata of every version
+                6 + dataset.versions().await.unwrap().len()
             );
             assert_eq!(results.len(), 1);
             let batch = &results[0];
@@ -15266,6 +15992,107 @@ mod test {
         );
     }
 
+    /// Zone map pruning over NaN-bearing float zones returns exactly what the
+    /// unindexed scan returns, for every filter shape, while really going
+    /// through the index.
+    #[tokio::test]
+    async fn test_zonemap_nan_scan_matches_unindexed_scan() {
+        use arrow_array::Float32Array;
+
+        let pos_nan = f32::from_bits(0x7FC0_0000);
+        let pos_nan_payload = f32::from_bits(0x7FFF_FFFF);
+        let neg_nan = f32::from_bits(0xFFC0_0000);
+        let neg_nan_payload = f32::from_bits(0xFFFF_FFFF);
+
+        // One fragment (= one zone) per value class: all positive NaNs, all
+        // negative NaNs, NaN plus null, finite plus NaN, finite only.
+        let values: Vec<Option<f32>> = vec![
+            Some(pos_nan),
+            Some(pos_nan_payload),
+            Some(neg_nan),
+            Some(neg_nan_payload),
+            Some(neg_nan),
+            None,
+            Some(1.0),
+            Some(pos_nan),
+            Some(-5.0),
+            Some(7.0),
+        ];
+        let ids: Vec<i32> = (0..values.len() as i32).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new("val", DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Float32Array::from(values)),
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::ZoneMap,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for filter in [
+            "val < 0.0",
+            "val > 0.0",
+            "val >= 0.0 AND val <= 5.0",
+            "val <= -1.0",
+            "val > 100.0",
+            "val = 7.0",
+            "val IS NULL",
+        ] {
+            let mut full_scan = dataset.scan();
+            full_scan
+                .use_scalar_index(false)
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let full = full_scan.try_into_batch().await.unwrap();
+            let full_ids: Vec<i32> = full["id"].as_primitive::<Int32Type>().values().to_vec();
+
+            let mut indexed_scan = dataset.scan();
+            indexed_scan
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let plan = indexed_scan.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+                "filter {filter} must go through the zone map index: {plan}"
+            );
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+            let indexed_ids: Vec<i32> = indexed["id"].as_primitive::<Int32Type>().values().to_vec();
+            assert_eq!(
+                indexed_ids, full_ids,
+                "indexed and unindexed scans disagree for filter {filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_fm_index_with_stable_row_ids() {
         let batch = arrow_array::record_batch!(
@@ -15584,32 +16411,53 @@ mod test {
         assert_eq!(count(&dataset, "regexp_like(text, 'a.b')").await, 20);
     }
 
+    #[rstest]
+    #[case::short_unicode("éé", vec![0, 1], false)]
+    #[case::tokenizable_unicode("ééb", vec![0], true)]
+    #[case::punctuation("_k7", vec![5, 6, 7, 8], true)]
+    #[case::all_windows_filtered("_k7_", vec![8], true)]
+    #[case::partly_tokenizable("_k77", vec![6], true)]
+    #[case::only_punctuation("!!!", vec![9], true)]
+    #[case::no_matches("_x7", vec![], true)]
     #[tokio::test]
-    async fn test_ngram_contains_untokenizable_needle() {
-        // A needle the tokenizer cannot turn into a trigram must fall back to a
-        // full recheck rather than silently matching nothing.  Byte length is
-        // not a usable proxy for this: "éé" is two characters but four bytes.
-        let unit = ["ééb", "aéé", "abc", "dog", "éab"];
-        let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
-        let array = StringArray::from_iter_values(values);
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "text",
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    async fn test_ngram_contains_untokenizable_needle(
+        #[case] needle: &str,
+        #[case] expected_ids: Vec<u32>,
+        #[case] is_index_used: bool,
+        #[values(false, true)] has_stable_row_ids: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", UInt32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            (
+                "text",
+                Utf8,
+                vec![
+                    Some("ééb"),
+                    Some("aéé"),
+                    Some("abc"),
+                    Some("dog"),
+                    Some("éab"),
+                    Some("user_k7"),
+                    Some("user_k77"),
+                    Some("_k7"),
+                    Some("_k7_"),
+                    Some("!!!"),
+                    Some(""),
+                    None,
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            max_rows_per_file: 20, // 60 rows -> 3 fragments
+            max_rows_per_file: 4,
+            enable_stable_row_ids: has_stable_row_ids,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(
-            reader,
-            "memory://test_ngram_contains_utf8",
-            Some(write_params),
-        )
-        .await
-        .unwrap();
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
         dataset
             .create_index(
                 &["text"],
@@ -15621,46 +16469,29 @@ mod test {
             .await
             .unwrap();
 
-        async fn count(dataset: &Dataset, filter: &str) -> usize {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let batches = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            batches.iter().map(|b| b.num_rows()).sum()
+        let filter = format!("contains(text, '{needle}')");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(&filter).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), is_index_used, "{plan}");
+        if is_index_used {
+            assert!(plan.contains("NGram"), "{plan}");
         }
 
-        async fn plan_of(dataset: &Dataset, filter: &str) -> String {
-            let mut scan = dataset.scan();
-            scan.filter(filter).unwrap();
-            let plan = scan.create_plan().await.unwrap();
-            format!(
-                "{}",
-                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-            )
-        }
-
-        // Each unit value appears 12 times in the 60 rows.
-        // Two characters (four bytes): shorter than a trigram, so the index is
-        // bypassed and "ééb" / "aéé" are still found.
-        assert_eq!(count(&dataset, "contains(text, 'éé')").await, 24);
-        let plan_str = plan_of(&dataset, "contains(text, 'éé')").await;
-        assert!(
-            !plan_str.contains("ScalarIndexQuery"),
-            "expected NO ngram index usage for a two character needle, got plan:\n{plan_str}"
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        let unindexed = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter(&filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            unindexed["id"].as_primitive::<UInt32Type>().values(),
+            &expected_ids,
         );
-
-        // Three characters: long enough to tokenize, so the index is used.
-        assert_eq!(count(&dataset, "contains(text, 'ééb')").await, 12);
-        let plan_str = plan_of(&dataset, "contains(text, 'ééb')").await;
-        assert!(
-            plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
-            "expected ngram index usage for a three character needle, got plan:\n{plan_str}"
-        );
+        assert_eq!(indexed, unindexed);
     }
 
     #[tokio::test]
@@ -15966,6 +16797,79 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             starts_with_names,
             BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
         );
+    }
+
+    /// A LIKE whose escape consumes an ordinary character (`a\b%` means "starts
+    /// with ab") or that runs escapes together (`\\\%` is the literal `\%`) must
+    /// return the same rows through an index as without one. The BTree answer
+    /// has no recheck, and a multi-fragment zone map prunes before its recheck.
+    #[rstest]
+    #[case::btree(IndexType::BTree, ScalarIndexParams::default())]
+    #[case::zonemap(
+        IndexType::Scalar,
+        ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+    )]
+    #[tokio::test]
+    async fn test_like_prefix_escapes_match_unindexed_scan(
+        #[case] index_type: IndexType,
+        #[case] params: ScalarIndexParams,
+    ) {
+        // Two rows per fragment: the first holds only the "ab" rows, so a zone map
+        // pruning on the wrong prefix skips it before its recheck can see them.
+        let names = ["ab1", "ab2", r"a\b1", r"\%", r"\%x", "zz"];
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "name",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(names.to_vec()))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://test_like_prefix_escapes",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        dataset
+            .create_index(&["name"], index_type, None, &params, true)
+            .await
+            .unwrap();
+
+        let matched = async |filter: &str, use_index: bool| -> BTreeSet<String> {
+            let batch = dataset
+                .scan()
+                .use_scalar_index(use_index)
+                .filter(filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            batch["name"]
+                .as_string::<i32>()
+                .iter()
+                .map(|name| name.unwrap().to_string())
+                .collect()
+        };
+        for (filter, expected) in [
+            (r"name LIKE 'a\b%'", vec!["ab1", "ab2"]),
+            (r"name LIKE '\\\%'", vec![r"\%"]),
+        ] {
+            let expected: BTreeSet<String> = expected.into_iter().map(String::from).collect();
+            assert_eq!(
+                matched(filter, false).await,
+                expected,
+                "{filter} without index"
+            );
+            assert_eq!(matched(filter, true).await, expected, "{filter} with index");
+        }
     }
 
     #[tokio::test]
@@ -16786,6 +17690,564 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 .collect::<Vec<_>>()
         });
         assert_eq!(eager_children, Some(vec!["count"]), "{schema:?}");
+    }
+
+    #[tokio::test]
+    async fn test_null_filter_on_wide_nested_column_reads_narrow_leaf() {
+        // A structural column carries its validity in every leaf's definition levels, so a
+        // null check on `cells` is served by the narrow `idx` leaf without reading `data`.
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields.clone()),
+            true,
+        ));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("cells", DataType::List(item_field.clone()), true),
+        ]));
+        // Rows cycle through: null list, empty list, one null item, one item with a null idx,
+        // one plain item.  Only the first shape is `cells IS NULL`.
+        let num_rows = 200usize;
+        let value_len = 32 * 1024;
+        let mut offsets = vec![0i32];
+        let mut list_valid = Vec::with_capacity(num_rows);
+        let mut item_valid = vec![];
+        let mut idx = vec![];
+        let mut data: Vec<Vec<u8>> = vec![];
+        // Incompressible payload, so bytes read track bytes on disk.
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for row in 0..num_rows {
+            let kind = row % 5;
+            list_valid.push(kind != 0);
+            if kind >= 2 {
+                item_valid.push(kind != 2);
+                idx.push((kind != 3).then_some(row as i32));
+                data.push(
+                    std::iter::repeat_with(|| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        rng as u8
+                    })
+                    .take(value_len)
+                    .collect(),
+                );
+            }
+            offsets.push(idx.len() as i32);
+        }
+        // Values under a null struct item are not written, so only count the rest.
+        let data_bytes = (item_valid.iter().filter(|valid| **valid).count() * value_len) as u64;
+        let items = StructArray::new(
+            struct_fields,
+            vec![
+                Arc::new(Int32Array::from(idx)) as ArrayRef,
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(data.iter())),
+            ],
+            Some(arrow_buffer::NullBuffer::from(item_valid)),
+        );
+        let cells = arrow_array::ListArray::new(
+            item_field,
+            arrow_buffer::OffsetBuffer::new(offsets.into()),
+            Arc::new(items),
+            Some(arrow_buffer::NullBuffer::from(list_valid)),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(cells),
+            ],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let params = WriteParams {
+            max_rows_per_file: 50,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+
+        // Baseline: materializing the column costs at least its payload.
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+        dataset.object_store.io_stats_incremental();
+        let full = dataset
+            .scan()
+            .project(&["cells"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(full.num_rows(), num_rows);
+        let full_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+        assert!(full_bytes >= data_bytes, "{full_bytes} < {data_bytes}");
+
+        for (filter, wants_null) in [("cells IS NULL", true), ("cells IS NOT NULL", false)] {
+            let dataset = Dataset::open(&test_dir).await.unwrap();
+            let mut scan = dataset.scan();
+            scan.project(&["id"]).unwrap().filter(filter).unwrap();
+            let plan = scan.explain_plan(true).await.unwrap();
+            assert!(plan.contains("projection=[id, cells.item.idx]"), "{plan}");
+            dataset.object_store.io_stats_incremental();
+            let batch = scan.try_into_batch().await.unwrap();
+            let read_bytes = dataset.object_store.io_stats_incremental().read_bytes;
+            assert_eq!(batch.schema().fields().len(), 1, "{:?}", batch.schema());
+            let mut ids = batch
+                .column(0)
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            let expected = (0..num_rows as i32)
+                .filter(|id| (id % 5 == 0) == wants_null)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "{filter}");
+            assert!(
+                read_bytes * 10 < full_bytes,
+                "{filter}: read {read_bytes} bytes of a {full_bytes} byte column"
+            );
+        }
+    }
+
+    /// Columns whose validity sits above a fixed-width leaf, with the rows that are null.
+    /// `null_structs` is off for formats that cannot encode struct validity (2.0).
+    fn null_check_shape_columns(
+        num_rows: usize,
+        null_structs: bool,
+    ) -> Vec<(ArrowField, ArrayRef, Vec<i32>)> {
+        let payload = |row: usize| vec![row as u8; 64];
+        let rows = 0..num_rows;
+        let valid = |pred: &dyn Fn(usize) -> bool| {
+            Some(arrow_buffer::NullBuffer::from(
+                rows.clone()
+                    .map(|r| !null_structs || pred(r))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let binary = |rows: &[usize]| {
+            Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                rows.iter().map(|r| payload(*r)),
+            )) as ArrayRef
+        };
+        let all_rows = rows.clone().collect::<Vec<_>>();
+
+        // list<struct<idx, data>>: null list, empty list, null item, null idx, plain item
+        let item_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(item_fields.clone()),
+            true,
+        ));
+        let mut offsets = vec![0i32];
+        let mut list_valid = vec![];
+        let mut item_valid = vec![];
+        let mut idx = vec![];
+        let mut item_rows = vec![];
+        for row in rows.clone() {
+            let kind = row % 5;
+            list_valid.push(kind != 0);
+            if kind >= 2 {
+                item_valid.push(!null_structs || kind != 2);
+                idx.push((kind != 3).then_some(row as i32));
+                item_rows.push(row);
+            }
+            offsets.push(idx.len() as i32);
+        }
+        let items = StructArray::new(
+            item_fields,
+            vec![Arc::new(Int32Array::from(idx)), binary(&item_rows)],
+            Some(arrow_buffer::NullBuffer::from(item_valid)),
+        );
+        let los = arrow_array::ListArray::new(
+            item_field.clone(),
+            arrow_buffer::OffsetBuffer::new(offsets.into()),
+            Arc::new(items),
+            Some(arrow_buffer::NullBuffer::from(list_valid)),
+        );
+
+        // struct<inner: struct<idx, data>, wide>: null outer, null inner, null idx, plain
+        let inner_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let outer_fields = Fields::from(vec![
+            ArrowField::new("inner", DataType::Struct(inner_fields.clone()), true),
+            ArrowField::new("wide", DataType::LargeBinary, true),
+        ]);
+        let inner = StructArray::new(
+            inner_fields,
+            vec![
+                Arc::new(Int32Array::from_iter(
+                    rows.clone().map(|r| (r % 4 != 2).then_some(r as i32)),
+                )),
+                binary(&all_rows),
+            ],
+            valid(&|r| r % 4 != 1),
+        );
+        let sos = StructArray::new(
+            outer_fields,
+            vec![Arc::new(inner), binary(&all_rows)],
+            valid(&|r| r % 4 != 0),
+        );
+
+        // struct<idx NOT NULL, data>: a null struct whose non-nullable child has values
+        let nn_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, false),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let nn = StructArray::new(
+            nn_fields,
+            vec![
+                Arc::new(Int32Array::from_iter_values(rows.clone().map(|r| r as i32))),
+                binary(&all_rows),
+            ],
+            valid(&|r| r % 3 != 0),
+        );
+
+        // list<struct<idx, data> NOT NULL>: nullable list, non-nullable item
+        let lnn_item_fields = Fields::from(vec![
+            ArrowField::new("idx", DataType::Int32, true),
+            ArrowField::new("data", DataType::LargeBinary, true),
+        ]);
+        let lnn_item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(lnn_item_fields.clone()),
+            false,
+        ));
+        let mut offsets = vec![0i32];
+        let mut list_valid = vec![];
+        let mut idx = vec![];
+        let mut item_rows = vec![];
+        for row in rows.clone() {
+            let kind = row % 3;
+            list_valid.push(kind != 0);
+            if kind == 2 {
+                idx.push(Some(row as i32));
+                item_rows.push(row);
+            }
+            offsets.push(idx.len() as i32);
+        }
+        let lnn_items = StructArray::new(
+            lnn_item_fields,
+            vec![Arc::new(Int32Array::from(idx)), binary(&item_rows)],
+            None,
+        );
+        let lnn = arrow_array::ListArray::new(
+            lnn_item_field,
+            arrow_buffer::OffsetBuffer::new(offsets.into()),
+            Arc::new(lnn_items),
+            Some(arrow_buffer::NullBuffer::from(list_valid)),
+        );
+
+        let nulls = |pred: &dyn Fn(usize) -> bool| {
+            rows.clone()
+                .filter(|r| pred(*r))
+                .map(|r| r as i32)
+                .collect::<Vec<_>>()
+        };
+        let struct_nulls = |pred: &dyn Fn(usize) -> bool| {
+            if null_structs { nulls(pred) } else { vec![] }
+        };
+        vec![
+            (
+                ArrowField::new("los", DataType::List(item_field), true),
+                Arc::new(los) as ArrayRef,
+                nulls(&|r| r % 5 == 0),
+            ),
+            (
+                ArrowField::new("sos", sos.data_type().clone(), true),
+                Arc::new(sos),
+                struct_nulls(&|r| r % 4 == 0),
+            ),
+            (
+                ArrowField::new("nn", nn.data_type().clone(), true),
+                Arc::new(nn),
+                struct_nulls(&|r| r % 3 == 0),
+            ),
+            (
+                ArrowField::new("lnn", lnn.data_type().clone(), true),
+                Arc::new(lnn),
+                nulls(&|r| r % 3 == 0),
+            ),
+        ]
+    }
+
+    /// Sorted `id`s matching `filter`, asserting the batch carries nothing but `id`.
+    async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.schema().fields().len(),
+            1,
+            "{filter}: {:?}",
+            batch.schema()
+        );
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn null_check_read_columns(dataset: &Arc<Dataset>, filter: &str) -> Vec<String> {
+        let planner = Planner::new(Arc::new(dataset.schema().into()));
+        let expr = planner.parse_filter(filter).unwrap();
+        filter_read_columns(&expr, &dataset.empty_projection())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_null_check_narrow_leaf_across_formats(
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2
+        )]
+        version: LanceFileVersion,
+    ) {
+        // The narrow leaf must answer the null check exactly as the whole column does.  From
+        // 2.1 on every validity layer is stored, so both also match the written data.
+        let num_rows = 60usize;
+        let stores_struct_validity =
+            !matches!(version, LanceFileVersion::Legacy | LanceFileVersion::V2_0);
+        let shapes = null_check_shape_columns(num_rows, version != LanceFileVersion::V2_0);
+        let mut fields = vec![ArrowField::new("id", DataType::Int32, true)];
+        let mut columns =
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32)) as ArrayRef];
+        for (field, array, _) in &shapes {
+            fields.push(field.clone());
+            columns.push(array.clone());
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let params = WriteParams {
+            max_rows_per_file: 25,
+            max_rows_per_group: 10,
+            data_storage_version: Some(version),
+            ..Default::default()
+        };
+        Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+        let dataset = Arc::new(Dataset::open(&test_dir).await.unwrap());
+
+        for (field, _, written_nulls) in &shapes {
+            let name = field.name();
+            if version == LanceFileVersion::Legacy && name == "lnn" {
+                // The v1 reader cannot read back a list with a non-nullable item at all.
+                continue;
+            }
+            let read_columns = null_check_read_columns(&dataset, &format!("{name} IS NULL"));
+            assert_eq!(read_columns.len(), 1, "{name}: {read_columns:?}");
+            assert!(
+                read_columns[0].ends_with(".idx"),
+                "{name}: {read_columns:?}"
+            );
+
+            let full = dataset
+                .scan()
+                .project(&["id", name])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let full_col = full.column_by_name(name).unwrap();
+            let full_ids = full.column(0).as_primitive::<Int32Type>();
+            let mut nulls = (0..full.num_rows())
+                .filter(|i| full_col.is_null(*i))
+                .map(|i| full_ids.value(i))
+                .collect::<Vec<_>>();
+            nulls.sort_unstable();
+            if stores_struct_validity {
+                assert_eq!(
+                    &nulls, written_nulls,
+                    "{version:?} {name}: full column read"
+                );
+            }
+            let not_nulls = (0..num_rows as i32)
+                .filter(|id| !nulls.contains(id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids_matching(&dataset, &format!("{name} IS NULL")).await,
+                nulls,
+                "{version:?} {name} IS NULL"
+            );
+            assert_eq!(
+                ids_matching(&dataset, &format!("{name} IS NOT NULL")).await,
+                not_nulls,
+                "{version:?} {name} IS NOT NULL"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_null_check_atomic_columns_read_whole() {
+        // Blobs, packed structs and maps are one physical column each, so a null check on
+        // them is not rewritten and still answers correctly.
+        let num_rows = 30usize;
+        let packed_fields = Fields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::LargeBinary, true),
+        ]);
+        let packed = StructArray::new(
+            packed_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)) as ArrayRef,
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                    (0..num_rows).map(|r| vec![r as u8; 16]),
+                )),
+            ],
+            Some(arrow_buffer::NullBuffer::from(
+                (0..num_rows).map(|r| r % 3 != 0).collect::<Vec<_>>(),
+            )),
+        );
+        let mut blobs = BlobArrayBuilder::new(num_rows);
+        for r in 0..num_rows {
+            if r % 3 == 0 {
+                blobs.push_null().unwrap();
+            } else {
+                blobs.push_bytes(vec![r as u8; 16]).unwrap();
+            }
+        }
+        let legacy_blob = arrow_array::LargeBinaryArray::from_iter(
+            (0..num_rows).map(|r| (r % 3 != 0).then(|| vec![r as u8; 16])),
+        );
+        let map_keys = (0..num_rows).map(|r| r.to_string()).collect::<Vec<_>>();
+        let map_values = Int32Array::from_iter_values(0..num_rows as i32);
+        let map = arrow_array::MapArray::new_from_strings(
+            map_keys.iter().map(|s| s.as_str()),
+            &map_values,
+            &(0..=num_rows as u32).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("ps", DataType::Struct(packed_fields), true).with_metadata(
+                HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+            ),
+            blob_field("blobs", true),
+            ArrowField::new("lb", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                "lance-encoding:blob".to_string(),
+                "true".to_string(),
+            )])),
+            ArrowField::new("m", map.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(packed),
+                blobs.finish().unwrap(),
+                Arc::new(legacy_blob),
+                Arc::new(map),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        Dataset::write(reader, &test_dir, None).await.unwrap();
+        let dataset = Arc::new(Dataset::open(&test_dir).await.unwrap());
+
+        let nulls = (0..num_rows as i32)
+            .filter(|r| r % 3 == 0)
+            .collect::<Vec<_>>();
+        for (name, expected) in [
+            ("ps", &nulls),
+            ("blobs", &nulls),
+            ("lb", &nulls),
+            ("m", &vec![]),
+        ] {
+            let filter = format!("{name} IS NULL");
+            assert_eq!(null_check_read_columns(&dataset, &filter), vec![name]);
+            assert_eq!(&ids_matching(&dataset, &filter).await, expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_null_check_with_late_materialized_column() {
+        // The null-checked column is also projected: the narrow leaf is read eagerly, the
+        // rest is taken after the filter, and the two halves merge back into the column.
+        let num_rows = 60usize;
+        let (field, array, nulls) = null_check_shape_columns(num_rows, true).remove(0);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                array.clone(),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let params = WriteParams {
+            max_rows_per_file: 25,
+            ..Default::default()
+        };
+        Dataset::write(reader, &test_dir, Some(params))
+            .await
+            .unwrap();
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+
+        for (filter, wants_null) in [
+            ("los IS NULL", true),
+            ("los IS NOT NULL", false),
+            ("los IS NOT NULL AND id > 10", false),
+        ] {
+            let mut scan = dataset.scan();
+            scan.project(&["id", "los"])
+                .unwrap()
+                .filter(filter)
+                .unwrap();
+            let plan = scan.explain_plan(true).await.unwrap();
+            assert!(
+                plan.contains("projection=[id, los.item.idx]")
+                    && plan.contains("projection=[los], source=stream(_rowid)"),
+                "{filter}:\n{plan}"
+            );
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch.column(0).as_primitive::<Int32Type>();
+            let los = batch.column(1);
+            assert_eq!(los.data_type(), array.data_type(), "{filter}");
+            let expected_rows = (0..num_rows as i32)
+                .filter(|id| {
+                    nulls.contains(id) == wants_null && (!filter.contains("id >") || *id > 10)
+                })
+                .count();
+            assert_eq!(batch.num_rows(), expected_rows, "{filter}");
+            for i in 0..batch.num_rows() {
+                let id = ids.value(i) as usize;
+                assert_eq!(
+                    los.slice(i, 1).as_ref(),
+                    array.slice(id, 1).as_ref(),
+                    "{filter} row {id}"
+                );
+            }
+        }
     }
 
     #[rstest]
@@ -19173,6 +20635,100 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await;
     }
 
+    #[rstest]
+    #[case::address_offset_only(false, false)]
+    #[case::address_with_id(false, true)]
+    #[case::stable_offset_only(true, false)]
+    #[case::stable_with_id(true, true)]
+    #[tokio::test]
+    async fn test_ann_row_offset_projection(
+        #[case] has_stable_row_ids: bool,
+        #[case] has_id_projection: bool,
+    ) {
+        let mut dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col(
+                "vec",
+                array::cycle_vec(array::step::<Float32Type>(), Dimension::from(2)),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    enable_stable_row_ids: has_stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, 1.0]), 2).unwrap(),
+        );
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams::try_with_centroids(1, centroids).unwrap(),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset.delete("id IN (1, 5)").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &Float32Array::from(vec![14.5, 15.5]), 4)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(1);
+        let projection = if has_id_projection {
+            vec!["id", ROW_OFFSET]
+        } else {
+            vec![ROW_OFFSET]
+        };
+        scanner.project(&projection).unwrap();
+        // Keep the default distance projection and ordering: they cause the
+        // physical optimizer to request statistics above AddRowOffsetExec.
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNSubIndex"), "{plan}");
+        assert!(plan.contains("AddRowOffsetExec"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut expected_columns = projection;
+        expected_columns.push(DIST_COL);
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            expected_columns
+        );
+
+        // Vectors are [2 * id, 2 * id + 1]. The exact neighbors are 7, 8, 6, 9;
+        // deleting 1 and 5 shifts their logical offsets by two.
+        let expected_offsets = [5, 6, 4, 7];
+        let offsets = batch[ROW_OFFSET].as_primitive::<UInt64Type>().values();
+        let recall = offsets
+            .iter()
+            .filter(|offset| expected_offsets.contains(offset))
+            .count() as f64
+            / expected_offsets.len() as f64;
+        assert_eq!(recall, 1.0);
+        assert_eq!(offsets.as_ref(), expected_offsets);
+        assert_eq!(
+            batch[DIST_COL].as_primitive::<Float32Type>().values(),
+            &[0.5, 4.5, 12.5, 24.5]
+        );
+        if has_id_projection {
+            assert_eq!(
+                batch["id"].as_primitive::<Int32Type>().values(),
+                &[7, 8, 6, 9]
+            );
+        }
+    }
+
     // Unit-level companion to the NOT IN case in
     // test_filter_to_take_with_stable_row_ids: exercises the lowering directly,
     // independent of the expression simplifier's InList expansion threshold
@@ -19349,6 +20905,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     async fn test_filter_to_take() {
         let mut ds = lance_datagen::gen_batch()
             .col("idx", array::step::<Int32Type>())
+            .col("other", array::step_custom::<Int32Type>(1000, 1))
             .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
             .await
             .unwrap();
@@ -19485,6 +21042,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         check_no_opt("_rowid = 50 AND _rowid = 51", &[]).await;
         check_no_opt("(_rowid = 50 AND idx < 100) OR _rowid = 51", &[50, 51]).await;
 
+        // The take's row count is inexact, so the plan must keep the remainder
+        // filter from splitting the take's batches across partitions
+        let mut scanner = ds.scan();
+        scanner
+            .target_parallelism(4)
+            .filter(&format!(
+                "_rowid IN ({}, {}, {}) AND idx >= 0",
+                row_ids.value(250),
+                row_ids.value(101),
+                row_ids.value(1)
+            ))
+            .unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(!plan.contains("RepartitionExec"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["idx"].as_primitive::<Int32Type>().values(),
+            &[1, 101, 250]
+        );
+
         // Dynamic projection
         let mut scanner = ds.scan();
         scanner.filter("_rowoffset = 77").unwrap();
@@ -19496,6 +21073,41 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(batches[0].schema().field(0).name(), "foo");
         let val = batches[0].column(0).as_primitive::<Int32Type>().values()[0];
         assert_eq!(val, 154);
+
+        // The remainder filter reads `idx`, which the projection leaves out
+        let mut scanner = ds.scan();
+        scanner
+            .project(&["other"])
+            .unwrap()
+            .filter("_rowid IN (5, 10, 15) AND idx > 10")
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.schema().fields().len(), 1, "{:?}", batch.schema());
+        assert_eq!(batch["other"].as_primitive::<Int32Type>().values(), &[1015]);
+
+        // A count reads no data columns, and the take keeps the scanner's batch size
+        let mut scanner = ds.scan();
+        scanner
+            .batch_size(1)
+            .filter("_rowid IN (5, 10, 15)")
+            .unwrap();
+        let plan = scanner.analyze_count_plan().await.unwrap();
+        assert!(plan.contains("projection=[], "), "{plan}");
+        assert_eq!(scanner.count_rows().await.unwrap(), 3);
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
     }
 
     #[tokio::test]
@@ -19525,8 +21137,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         check("_rowaddr NOT IN (2, 4, 6, 8)", complement).await;
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_nested_field_ordering() {
+    async fn test_nested_field_ordering(#[values(false, true)] is_sort_column_projected: bool) {
         use arrow_array::StructArray;
 
         // Create test data with nested structs
@@ -19560,6 +21173,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         // Test ordering by nested field
         let mut scanner = dataset.scan();
+        if !is_sort_column_projected {
+            scanner.project(&["id"]).unwrap();
+        }
         scanner
             .order_by(Some(vec![ColumnOrdering {
                 column_name: "nested.value".to_string(),
@@ -19568,11 +21184,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             }]))
             .unwrap(); // ascending order
 
-        let stream = scanner.try_into_stream().await.unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.num_columns(),
+            if is_sort_column_projected { 2 } else { 1 }
+        );
 
         // Check that results are sorted by nested.value
-        let sorted_ids = batches[0].column(0).as_primitive::<Int32Type>().values();
+        let sorted_ids = batch["id"].as_primitive::<Int32Type>().values();
         assert_eq!(sorted_ids[0], 1); // id=1 has nested.value=10
         assert_eq!(sorted_ids[1], 2); // id=2 has nested.value=20
         assert_eq!(sorted_ids[2], 3); // id=3 has nested.value=30

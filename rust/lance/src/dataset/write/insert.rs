@@ -25,8 +25,7 @@ use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{
-    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
-    write_fragments_internal_to_file,
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal_impl,
 };
 use crate::{Error, Result};
 use tracing::info;
@@ -55,6 +54,7 @@ pub struct InsertBuilder<'a> {
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
     preassigned_data_file_name: Option<Arc<String>>,
+    keep_field_ids: bool,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -64,6 +64,7 @@ impl<'a> InsertBuilder<'a> {
             params: None,
             write_progress: None,
             preassigned_data_file_name: None,
+            keep_field_ids: false,
         }
     }
 
@@ -77,6 +78,15 @@ impl<'a> InsertBuilder<'a> {
         preassigned_data_file_name: impl Into<String>,
     ) -> Self {
         self.preassigned_data_file_name = Some(Arc::new(preassigned_data_file_name.into()));
+        self
+    }
+
+    /// Keep the field ids the input schema carries when creating a dataset,
+    /// instead of numbering its fields afresh.
+    ///
+    /// For a MemWAL generation, whose columns must keep the base table's ids.
+    pub(crate) fn with_table_field_ids(mut self) -> Self {
+        self.keep_field_ids = true;
         self
     }
 
@@ -97,7 +107,7 @@ impl<'a> InsertBuilder<'a> {
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_impl(data).await?;
-        Self::do_commit(&context, transaction).await
+        self.do_commit(&context, transaction).await
     }
 
     /// Execute the insert operation with the given stream.
@@ -114,7 +124,7 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
     ) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
-        Self::do_commit(&context, transaction).await
+        self.do_commit(&context, transaction).await
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -145,7 +155,11 @@ impl<'a> InsertBuilder<'a> {
         self.write_uncommitted_impl(data).await.map(|(t, _)| t)
     }
 
-    async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
+    async fn do_commit(
+        &self,
+        context: &WriteContext<'_>,
+        transaction: Transaction,
+    ) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_exact_storage_format(context.storage_version)
@@ -160,6 +174,9 @@ impl<'a> InsertBuilder<'a> {
 
         if let Some(session) = context.params.session.as_ref() {
             commit_builder = commit_builder.with_session(session.clone());
+        }
+        if self.keep_field_ids {
+            commit_builder = commit_builder.with_table_field_ids();
         }
 
         commit_builder.execute(transaction).await
@@ -225,37 +242,25 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let (written_fragments, written_schema) =
-            if let Some(preassigned_data_file_name) = &self.preassigned_data_file_name {
-                if target_base_info.is_some() {
-                    return Err(Error::invalid_input(
-                        "a fixed data file name cannot be combined with target bases",
-                    ));
-                }
-                Box::pin(write_fragments_internal_to_file(
-                    context.storage_version,
-                    context.dest.dataset(),
-                    context.object_store.clone(),
-                    &context.base_path,
-                    schema.clone(),
-                    stream,
-                    context.params.clone(),
-                    preassigned_data_file_name.clone(),
-                ))
-                .await?
-            } else {
-                Box::pin(write_fragments_internal(
-                    context.storage_version,
-                    context.dest.dataset(),
-                    context.object_store.clone(),
-                    &context.base_path,
-                    schema.clone(),
-                    stream,
-                    context.params.clone(),
-                    target_base_info,
-                ))
-                .await?
-            };
+        if self.preassigned_data_file_name.is_some() && target_base_info.is_some() {
+            return Err(Error::invalid_input(
+                "a fixed data file name cannot be combined with target bases",
+            ));
+        }
+        let (written_fragments, written_schema) = Box::pin(write_fragments_internal_impl(
+            context.storage_version,
+            context.dest.dataset(),
+            context.object_store.clone(),
+            &context.base_path,
+            schema.clone(),
+            stream,
+            context.params.clone(),
+            target_base_info,
+            None,
+            self.preassigned_data_file_name.clone(),
+            self.keep_field_ids,
+        ))
+        .await?;
 
         let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
 
@@ -879,18 +884,16 @@ mod test {
     #[case::row_offset("_rowoffset")]
     #[case::row_created_at_version("_row_created_at_version")]
     #[case::row_last_updated_at_version("_row_last_updated_at_version")]
+    #[case::empty_name("")]
     #[tokio::test]
-    async fn rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+    async fn rejects_unwritable_top_level_column_names(#[case] name: &str) {
         // Every system column name must be rejected on write. The row-version
         // columns (`_row_created_at_version`, `_row_last_updated_at_version`) are
         // computed at read time and appended by `Projection::to_schema`; a user
         // data column sharing one of those names would otherwise pass ingest and
-        // later collide with the appended field.
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            reserved_name,
-            DataType::Int32,
-            false,
-        )]));
+        // later collide with the appended field. An empty top-level name cannot
+        // be addressed as a field path after the dataset is written.
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
 
@@ -898,10 +901,16 @@ mod test {
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = result.expect_err("writing a reserved system column name should fail");
+        let err = result.expect_err("writing an unwritable top-level column name should fail");
+        assert!(matches!(&err, crate::Error::InvalidInput { .. }), "{err}");
+        let expected_message = if name.is_empty() {
+            "empty name"
+        } else {
+            "reserved name"
+        };
         assert!(
-            err.to_string().contains("reserved name"),
-            "unexpected error for {reserved_name}: {err}"
+            err.to_string().contains(expected_message),
+            "unexpected error for {name:?}: {err}"
         );
     }
 

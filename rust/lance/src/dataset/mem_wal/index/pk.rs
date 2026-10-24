@@ -13,7 +13,7 @@ use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 
 use super::pk_key::{encode_pk_batch, encode_pk_tuple};
-use super::{BTreeMemIndex, IndexStore, PrimaryKeyIndex, RowPosition};
+use super::{BTreeMemIndex, IndexStore, MemIndex, PrimaryKeyIndex, RowPosition};
 
 /// The column a composite key index is keyed on: the order-preserving encoded
 /// tuple, stored as `Binary` so a [`BTreeMemIndex`] indexes it directly.
@@ -172,11 +172,24 @@ impl IndexStore {
             "a primary-key index must be enabled before any row is inserted"
         );
         self.pk_index = PkIndex::new(self, pk_columns);
+        if let Some(PkIndex::Owned(OwnedPk::Single(index))) = &self.pk_index {
+            self.filter_catalog.add_own_key_index(index.column_name());
+        }
     }
 
     /// Whether the memtable has a primary-key index.
     pub fn has_pk_index(&self) -> bool {
         self.pk_index.is_some()
+    }
+
+    /// The primary-key index's key columns, in the order its lookups take
+    /// values.
+    pub fn pk_columns(&self) -> Option<&[String]> {
+        match self.pk_index.as_ref()? {
+            PkIndex::Shared { entry, .. } => self.indexes.get(entry).map(|index| index.columns()),
+            PkIndex::Owned(OwnedPk::Single(index)) => Some(index.columns()),
+            PkIndex::Owned(OwnedPk::Composite { columns, .. }) => Some(columns),
+        }
     }
 
     /// Sorted `(key, row id)` batches for training the generation's on-disk

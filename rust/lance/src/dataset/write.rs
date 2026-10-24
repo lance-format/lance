@@ -31,7 +31,8 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
 use lance_io::traits::Writer;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
+use lance_table::feature_flags::managed_blobs_enabled;
+use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
@@ -52,8 +53,6 @@ use crate::dataset::blob::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata,
 };
-use crate::index::scalar::{IndexDetails, fetch_index_details};
-use crate::index::{index_is_usable, load_all_indices};
 use crate::session::Session;
 
 use super::fragment::write::generate_random_filename;
@@ -68,6 +67,7 @@ pub mod delete;
 mod insert;
 pub mod merge_insert;
 mod retry;
+pub(crate) mod seeds;
 pub mod update;
 
 pub use super::progress::{WriteProgressFn, WriteStats};
@@ -118,20 +118,24 @@ impl Dataset {
 
     /// Encode one managed part and return its serializable description.
     ///
-    /// Lance generates a unique staging name in the target's base. Managed Blob
-    /// payloads use independent `_blobs/<uuid>.blob` objects in that base. Every
+    /// Lance generates a unique staging name in the target's base. With schema
+    /// metadata `lance.blob.managed=true`, Managed Blob payloads use independent
+    /// `_blobs/<uuid>.blob` objects in that base. Otherwise payloads use sidecars
+    /// addressed relative to the final data file. Every
     /// non-empty logical Inline value is spilled so final concatenation never
-    /// copies Blob payload bytes. Parts still require disjoint `blob_ids`
-    /// reservations; Managed descriptors encode base IDs rather than these IDs.
+    /// copies Blob payload bytes. Managed parts accept `blob_ids=None`; only
+    /// file-relative sidecars require disjoint reservations. Supplied ranges
+    /// are ignored for Managed parts.
     /// Every use of `target` must refer to the same dataset and resolved base;
     /// associating a target with that storage context is the caller's
     /// responsibility.
     /// Persist the target before writing. A failed write may leave files; after
     /// stopping all users of the target, [`DataFileTarget::cleanup`] removes
     /// staging files and file-relative sidecars without a completed part description.
-    /// Retries must use fresh, disjoint Blob ID ranges, including ranges from
-    /// failed writes. Independent Managed objects follow ordinary dataset GC
-    /// rules, which must be coordinated with uncommitted writes and checkpoints.
+    /// File-relative retries must use fresh, disjoint Blob ID ranges, including
+    /// ranges from failed writes. Independent Managed objects follow ordinary
+    /// dataset GC rules, which must be coordinated with uncommitted writes
+    /// and checkpoints.
     ///
     /// # Example
     ///
@@ -161,18 +165,19 @@ impl Dataset {
     ) -> Result<DataFilePart> {
         self.validate_data_file_target(target)?;
         validate_blob_v2_write_schema(target.schema.as_ref())?;
-        let part_blob_ids = blob_ids.clone();
+        let managed = managed_blobs_enabled(target.schema.as_ref())?;
+        let part_blob_ids = if managed { None } else { blob_ids.clone() };
         let has_blob = target
             .schema
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
-        if has_blob && blob_ids.is_none() {
+        if has_blob && !managed && blob_ids.is_none() {
             return Err(Error::invalid_input(
                 "write_data_file_part requires a non-empty Blob ID range for a schema containing Blob v2 fields",
             ));
         }
 
-        let mut preprocessor = if let Some(blob_ids) = blob_ids {
+        let mut preprocessor = if has_blob || blob_ids.is_some() {
             let data_dir = self.data_file_dir_for_base(target.base_id)?;
             let object_store = self.object_store(target.base_id).await?;
             let external_base_resolver = blob_v2_external_base_resolver(
@@ -194,12 +199,12 @@ impl Dataset {
                     self.store_params().cloned().unwrap_or_default(),
                     None,
                 )?
-                .with_part_blob_ids(blob_ids)?,
+                .with_part_blob_ids(if managed { None } else { blob_ids })?,
             )
         } else {
             None
         };
-        if let Some(writer) = preprocessor.take() {
+        if managed && let Some(writer) = preprocessor.take() {
             let root = self.blob_base_path(target.base_id)?;
             preprocessor = Some(writer.with_managed_base(target.base_id, root));
         }
@@ -932,7 +937,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     open_writer: OpenWriter,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-    mut seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
+    mut seeds: seeds::SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>>
@@ -1024,13 +1029,8 @@ where
                     Error::internal("Writer was not initialized before writing a batch")
                 })?;
                 active_writer.write(&batch_chunk).await?;
-                for seed_writer in seed_writers.iter_mut() {
-                    let col_name = seed_writer.column_name().to_owned();
-                    for batch in &batch_chunk {
-                        if let Some(col) = batch.column_by_name(&col_name) {
-                            seed_writer.observe_batch(col)?;
-                        }
-                    }
+                for batch in &batch_chunk {
+                    seeds.observe(batch)?;
                 }
                 let batch_chunk_rows =
                     batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
@@ -1110,7 +1110,7 @@ where
                     let mut w = writer.take().ok_or_else(|| {
                         Error::internal("Writer disappeared before completing a file")
                     })?;
-                    flush_seed_writers(w.as_mut(), &mut seed_writers).await?;
+                    seeds.flush(w.as_mut()).await?;
                     let (num_rows, data_file) = w.finish().await?;
                     info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
                     debug_assert_eq!(num_rows, num_rows_in_current_file);
@@ -1166,7 +1166,7 @@ where
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
+        if let Err(e) = seeds.flush(writer.as_mut()).await {
             drop(writer);
             cleanup_data_fragments(
                 &object_store,
@@ -1209,23 +1209,6 @@ where
     }
 
     Ok(fragments)
-}
-
-/// Flush all seed writers into the given file writer, embedding seed buffers
-/// and schema metadata before `finish()` is called.
-async fn flush_seed_writers(
-    writer: &mut dyn GenericWriter,
-    seed_writers: &mut [Box<dyn lance_index::scalar::seed::IndexSeedWriter>],
-) -> Result<()> {
-    for seed_writer in seed_writers.iter_mut() {
-        if let Some(bytes) = seed_writer.finish()? {
-            let buf_index = writer.add_global_buffer(bytes).await?;
-            let key = seed_writer.schema_metadata_key();
-            let value = seed_writer.schema_metadata_value(buf_index);
-            writer.add_schema_metadata(key, value);
-        }
-    }
-    Ok(())
 }
 
 /// Best-effort cleanup of data files for fragments that were written but not committed.
@@ -1779,38 +1762,13 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         target_bases_info,
         file_row_counts,
         None,
+        false,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_fragments_internal_to_file(
-    storage_version: ConcreteFileVersion,
-    dataset: Option<&Dataset>,
-    object_store: Arc<ObjectStore>,
-    base_dir: &Path,
-    schema: Schema,
-    data: SendableRecordBatchStream,
-    params: WriteParams,
-    preassigned_data_file_name: Arc<String>,
-) -> Result<(Vec<Fragment>, Schema)> {
-    write_fragments_internal_impl(
-        storage_version,
-        dataset,
-        object_store,
-        base_dir,
-        schema,
-        data,
-        params,
-        None,
-        None,
-        Some(preassigned_data_file_name),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn write_fragments_internal_impl(
+pub(crate) async fn write_fragments_internal_impl(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -1821,6 +1779,7 @@ async fn write_fragments_internal_impl(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    keep_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1840,6 +1799,7 @@ async fn write_fragments_internal_impl(
         target_bases_info,
         file_row_counts,
         preassigned_data_file_name,
+        keep_field_ids,
     )
     .await
 }
@@ -1858,10 +1818,15 @@ pub(super) fn prepare_write_schema(
     normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
+    keep_field_ids: bool,
 ) -> Result<Schema> {
     let schema = if dataset.is_none() {
         let mut schema = normalized_converted_schema;
-        schema.try_reassign_field_ids(None)?;
+        if keep_field_ids {
+            schema.try_set_field_id(None)?;
+        } else {
+            schema.try_reassign_field_ids(None)?;
+        }
         schema
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
@@ -1969,54 +1934,6 @@ pub(super) fn validate_blob_v2_write_schema(schema: &Schema) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-pub(crate) async fn create_seed_writers_current(
-    dataset: Option<&Dataset>,
-    params: &WriteParams,
-) -> Result<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> {
-    // Seeds only make sense when appending to an existing dataset.
-    if !matches!(params.mode, WriteMode::Append) {
-        return Ok(Vec::new());
-    }
-    let Some(dataset) = dataset else {
-        return Ok(Vec::new());
-    };
-
-    // Seeds depend on index configuration, not FRI-derived query coverage.
-    let indices: Arc<Vec<IndexMetadata>> = load_all_indices(dataset).await?;
-    let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
-
-    for index in indices.iter().filter(|index| index_is_usable(index)) {
-        // A covered index lists its carried columns in `fields` too; the seed
-        // writer keys on the single keyed column. System indices commit no
-        // fields at all, so this also skips them.
-        let Some(field_id) = index.keyed_field() else {
-            continue;
-        };
-        let Ok(field_path) = dataset.schema().field_path(field_id) else {
-            continue;
-        };
-        let Some(data_type) = dataset.schema().field(&field_path).map(|f| f.data_type()) else {
-            continue;
-        };
-
-        let Ok(index_details) = fetch_index_details(dataset, &field_path, index).await else {
-            continue;
-        };
-        let details = IndexDetails(index_details.clone());
-        let Ok(plugin) = details.get_plugin() else {
-            continue;
-        };
-        if let Some(writer) = plugin
-            .create_seed_writer(&field_path, &data_type, &index_details)
-            .await?
-        {
-            writers.push(writer);
-        }
-    }
-
-    Ok(writers)
 }
 
 fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
@@ -2136,38 +2053,9 @@ pub(in crate::dataset) struct FilePromotion {
 
 impl FilePromotion {
     async fn promote(&self) -> Result<()> {
-        match self
-            .object_store
-            .inner
+        self.object_store
             .copy_if_not_exists(&self.staging_path, &self.final_path)
-            .await
-        {
-            Ok(()) => {}
-            Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            ) => {
-                let staged = self
-                    .object_store
-                    .inner
-                    .head(&self.staging_path)
-                    .await
-                    .map_err(|error| Error::io(error.to_string()))?;
-                let existing = self
-                    .object_store
-                    .inner
-                    .head(&self.final_path)
-                    .await
-                    .map_err(|error| Error::io(error.to_string()))?;
-                if staged.size != existing.size {
-                    return Err(Error::io(format!(
-                        "fixed data file {} already exists with size {}, but the staged retry has size {}",
-                        self.final_path, existing.size, staged.size
-                    )));
-                }
-            }
-            Err(error) => return Err(Error::io(error.to_string())),
-        }
+            .await?;
         self.object_store
             .inner
             .delete(&self.staging_path)
@@ -2477,10 +2365,12 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
     )?;
-    if matches!(
-        version,
-        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-    ) {
+    if managed_blobs_enabled(schema)?
+        && matches!(
+            version,
+            ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+        )
+    {
         preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());
     }
     Ok(Box::new(V2WriterAdapter::new(
@@ -4984,7 +4874,7 @@ mod tests {
             stream,
             WriteParams::default(),
             None,
-            Vec::new(),
+            seeds::SeedCollector::disabled(),
             None,
             None,
         )
@@ -5047,7 +4937,7 @@ mod tests {
                 ..Default::default()
             },
             None,
-            Vec::new(),
+            seeds::SeedCollector::disabled(),
             None,
             None,
         )
@@ -5277,7 +5167,7 @@ mod tests {
                 ..Default::default()
             },
             Some(target_bases),
-            vec![],
+            seeds::SeedCollector::disabled(),
             None,
             None,
         )
@@ -5721,6 +5611,213 @@ mod tests {
         assert_eq!(frags.len(), 2, "Index should cover both fragments");
     }
 
+    /// Counts the `plan_run` execution events emitted while it is the default
+    /// subscriber. A seed harvest never executes a plan; the fallback column
+    /// scan does, so the count tells which path an index update took.
+    #[derive(Clone, Default)]
+    struct PlanRunCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PlanRunCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use lance_core::utils::tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION};
+
+            #[derive(Default)]
+            struct TypeField(Option<String>);
+            impl tracing::field::Visit for TypeField {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "type" {
+                        self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
+                    }
+                }
+            }
+
+            if event.metadata().target() != TRACE_EXECUTION {
+                return;
+            }
+            let mut ty = TypeField::default();
+            event.record(&mut ty);
+            if ty.0.as_deref() == Some(EXECUTION_PLAN_RUN) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Seeds for a nested column record parent-level nulls only, so after an
+    /// incremental update the index answers `IS NULL` exactly and agrees with
+    /// a plain scan, even when lists carry null or NaN children. With seeds
+    /// the update harvests them (no column scan is executed); the same
+    /// scenario without seeds is the control that proves the scan is visible.
+    #[rstest]
+    #[case::seeds(true)]
+    #[case::scan(false)]
+    #[tokio::test]
+    async fn test_zone_map_seeds_for_nested_column_track_parent_nulls(#[case] use_seeds: bool) {
+        use crate::Dataset;
+        use crate::index::DatasetIndexExt;
+        use crate::index::scalar::open_scalar_index;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{Array, UInt64Array};
+        use lance_core::ROW_ADDR;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        use lance_select::RowAddrTreeMap;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const DIM: i32 = 4;
+        // Row `i` is a null vector when `null_at(i)`; other rows carry NaN and
+        // null children on purpose, which must not count as null rows.
+        fn null_at(i: usize) -> bool {
+            i % 7 == 3 || (20..26).contains(&i)
+        }
+        fn vectors(rows: usize) -> RecordBatch {
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), DIM);
+            for i in 0..rows {
+                if null_at(i) {
+                    for _ in 0..DIM {
+                        builder.values().append_null();
+                    }
+                    builder.append(false);
+                    continue;
+                }
+                builder.values().append_value(i as f32);
+                builder
+                    .values()
+                    .append_value(if i % 5 == 0 { f32::NAN } else { 1.0 });
+                if i % 4 == 0 {
+                    builder.values().append_null();
+                } else {
+                    builder.values().append_value(2.0);
+                }
+                builder.values().append_value(3.0);
+                builder.append(true);
+            }
+            let array = builder.finish();
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "vec",
+                array.data_type().clone(),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
+        }
+        fn reader(batch: RecordBatch) -> impl RecordBatchReader + Send + 'static {
+            let schema = batch.schema();
+            RecordBatchIterator::new(vec![Ok(batch)], schema)
+        }
+
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmpdir.as_str();
+        let mut dataset = Dataset::write(reader(vectors(40)), uri, None)
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": use_seeds, "rows_per_zone": 8}));
+        dataset
+            .create_index(&["vec"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+
+        // Appending writes a seed for the new fragment when seeds are on.
+        Dataset::write(
+            reader(vectors(60)),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Count plan executions during the update: a harvest runs none, the
+        // fallback scan runs at least one. tracing caches each callsite's
+        // interest from the firing thread's default dispatcher while exactly
+        // one dispatcher is registered; a second live dispatcher makes it
+        // consult every registered dispatcher, including this thread-local one.
+        let plan_runs = PlanRunCounter::default();
+        let subscriber = tracing_subscriber::registry().with(plan_runs.clone());
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            dataset.optimize_indices(&Default::default()).await.unwrap();
+        }
+        let plan_runs = plan_runs.0.load(std::sync::atomic::Ordering::SeqCst);
+        if use_seeds {
+            assert_eq!(plan_runs, 0, "seed harvest must not scan the column");
+        } else {
+            assert!(plan_runs >= 1, "fallback update must scan the column");
+        }
+        let dataset = Dataset::open(uri).await.unwrap();
+
+        // Ground truth from a scan without the index.
+        async fn row_addrs(dataset: &Dataset, filter: &str, use_index: bool) -> Vec<u64> {
+            let batches = dataset
+                .scan()
+                .filter(filter)
+                .unwrap()
+                .with_row_address()
+                .project::<&str>(&[])
+                .unwrap()
+                .use_scalar_index(use_index)
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut addrs: Vec<u64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name(ROW_ADDR)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            addrs.sort_unstable();
+            addrs
+        }
+        let null_rows = row_addrs(&dataset, "vec IS NULL", false).await;
+        let expected_nulls =
+            (0..40).filter(|i| null_at(*i)).count() + (0..60).filter(|i| null_at(*i)).count();
+        assert_eq!(null_rows.len(), expected_nulls);
+        assert_eq!(row_addrs(&dataset, "vec IS NULL", true).await, null_rows);
+        assert_eq!(
+            row_addrs(&dataset, "vec IS NOT NULL", true).await,
+            row_addrs(&dataset, "vec IS NOT NULL", false).await
+        );
+
+        // The merged index knows the exact null rows of both fragments.
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|i| i.name.contains("vec")).unwrap();
+        let scalar_index = open_scalar_index(&dataset, "vec", index, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_index.calculate_included_frags().await.unwrap().len(),
+            2
+        );
+        let result = scalar_index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let expected = RowAddrTreeMap::from_iter(null_rows.iter().copied());
+        assert_eq!(result, SearchResult::exact(expected));
+    }
+
     /// Seed observers see the values the data file stores, so appending a
     /// view array to a seeded string column succeeds.
     #[tokio::test]
@@ -5748,15 +5845,16 @@ mod tests {
             .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
             .await
             .unwrap();
-        let append_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
         assert!(
-            !create_seed_writers_current(Some(&dataset), &append_params)
-                .await
-                .unwrap()
-                .is_empty(),
+            !seeds::SeedCollector::for_write(
+                dataset.manifest.data_storage_format.lance_file_format(),
+                Some(&dataset),
+                dataset.schema(),
+                true,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
             "the append must observe seeds for this test to cover them"
         );
 
@@ -5773,7 +5871,10 @@ mod tests {
         let dataset = Dataset::write(
             RecordBatchIterator::new([Ok(view_batch)], view_schema),
             Arc::new(dataset),
-            Some(append_params),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -5821,14 +5922,14 @@ mod tests {
             .await
             .unwrap();
 
-        let append_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
-
-        let baseline = create_seed_writers_current(Some(&dataset), &append_params)
-            .await
-            .unwrap();
+        let baseline = seeds::SeedCollector::for_write(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            Some(&dataset),
+            dataset.schema(),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(
             !baseline.is_empty(),
             "a plain scalar index should produce a seed writer; if this is empty \
@@ -5856,9 +5957,14 @@ mod tests {
             .await
             .unwrap();
 
-        let covered_writers = create_seed_writers_current(Some(&dataset), &append_params)
-            .await
-            .unwrap();
+        let covered_writers = seeds::SeedCollector::for_write(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            Some(&dataset),
+            dataset.schema(),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             covered_writers.len(),
             baseline.len(),

@@ -28,7 +28,11 @@ impl FromPyObject<'_, '_> for PyLance<IndexFile> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let path = ob.getattr("path")?.extract()?;
         let size_bytes = ob.getattr("size_bytes")?.extract()?;
-        Ok(Self(IndexFile { path, size_bytes }))
+        Ok(Self(IndexFile {
+            path,
+            size_bytes,
+            file_metadata_size_bytes: None,
+        }))
     }
 }
 

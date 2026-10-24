@@ -17,9 +17,9 @@ use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
     MiniBlockCompressionContext, MiniBlockCompressor,
 };
-use crate::format::ProtobufUtils21;
-use crate::format::pb21::compressive_encoding::Compression;
-use crate::format::pb21::{self, CompressiveEncoding};
+use crate::format::EncodingUtils;
+use crate::format::metadata::compressive_encoding::Compression;
+use crate::format::metadata::{self, CompressiveEncoding};
 
 use lance_core::{Error, Result};
 
@@ -139,11 +139,11 @@ struct MiniblockFslLayer {
 /// the copies is better than paying the price at read time to do the bit slicing.
 impl ValueEncoder {
     fn make_fsl_encoding(layers: &[MiniblockFslLayer], bits_per_value: u64) -> CompressiveEncoding {
-        let mut encoding = ProtobufUtils21::flat(bits_per_value, None);
+        let mut encoding = EncodingUtils::flat(bits_per_value, None);
         for layer in layers.iter().rev() {
             let has_validity = layer.validity.is_some();
             let dimension = layer.dimension;
-            encoding = ProtobufUtils21::fsl(dimension, has_validity, encoding);
+            encoding = EncodingUtils::fsl(dimension, has_validity, encoding);
         }
         encoding
     }
@@ -333,10 +333,10 @@ impl ValueEncoder {
             // constant(None) signals that every stored item decodes to null.
             DataBlock::AllNull(_) => {
                 has_validity = true;
-                ProtobufUtils21::constant(None)
+                EncodingUtils::constant(None)
             }
             DataBlock::FixedWidth(fixed_width) => {
-                ProtobufUtils21::flat(fixed_width.bits_per_value, None)
+                EncodingUtils::flat(fixed_width.bits_per_value, None)
             }
             DataBlock::FixedSizeList(inner) => Self::fsl_to_encoding(inner),
             _ => unreachable!(
@@ -344,38 +344,20 @@ impl ValueEncoder {
                 inner.name()
             ),
         };
-        ProtobufUtils21::fsl(fsl.dimension, has_validity, inner_encoding)
+        EncodingUtils::fsl(fsl.dimension, has_validity, inner_encoding)
     }
 
     fn simple_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
         // The simple case is zero-copy, we just return the flattened inner buffer
         let encoding = Self::fsl_to_encoding(&fsl);
-        let num_values = fsl.num_values();
-        let mut child = *fsl.child;
-        let mut cum_dim = 1;
-        loop {
-            cum_dim *= fsl.dimension;
-            match child {
-                DataBlock::Nullable(nullable) => {
-                    child = *nullable.data;
-                }
-                DataBlock::FixedSizeList(inner) => {
-                    child = *inner.child;
-                }
-                DataBlock::FixedWidth(inner) => {
-                    let data = FixedWidthDataBlock {
-                        bits_per_value: inner.bits_per_value * cum_dim,
-                        num_values,
-                        data: inner.data,
-                        block_info: BlockInfo::new(),
-                    };
-                    return (PerValueDataBlock::Fixed(data), encoding);
-                }
-                _ => unreachable!(
-                    "Unexpected data block type in value encoder's simple_per_value_fsl"
-                ),
-            }
-        }
+        let Some(flat) = fsl.try_into_flat() else {
+            unreachable!("per_value_fsl only sends FSL blocks without nullable children here")
+        };
+        let data = FixedWidthDataBlock {
+            block_info: BlockInfo::new(),
+            ..flat
+        };
+        (PerValueDataBlock::Fixed(data), encoding)
     }
 
     fn nullable_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
@@ -475,6 +457,16 @@ impl ValueEncoder {
 
 impl BlockCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        if matches!(data, DataBlock::FixedSizeList(_)) {
+            let (PerValueDataBlock::Fixed(values), encoding) =
+                PerValueCompressor::compress(self, data)?
+            else {
+                return Err(Error::internal(
+                    "Fixed-size-list block has variable row width",
+                ));
+            };
+            return Ok((Some(values.data), encoding));
+        }
         let DataBlock::FixedWidth(fixed_width) = data else {
             return Err(Error::invalid_input(format!(
                 "ValueEncoder cannot compress a {} block",
@@ -483,7 +475,7 @@ impl BlockCompressor for ValueEncoder {
         };
         Ok((
             Some(fixed_width.data),
-            ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+            EncodingUtils::flat(fixed_width.bits_per_value, None),
         ))
     }
 }
@@ -496,7 +488,7 @@ impl MiniBlockCompressor for ValueEncoder {
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
-                let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
+                let encoding = EncodingUtils::flat(fixed_width.bits_per_value, None);
                 Ok((Self::chunk_data(fixed_width)?, encoding))
             }
             DataBlock::FixedSizeList(_) => Self::miniblock_fsl(chunk),
@@ -532,7 +524,7 @@ pub struct ValueDecompressor {
 }
 
 impl ValueDecompressor {
-    pub fn from_flat(description: &pb21::Flat) -> Self {
+    pub fn from_flat(description: &metadata::Flat) -> Self {
         Self {
             bits_per_item: description.bits_per_value,
             bits_per_value: description.bits_per_value,
@@ -540,7 +532,7 @@ impl ValueDecompressor {
         }
     }
 
-    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Result<Self> {
+    pub fn from_fsl(mut description: &metadata::FixedSizeList) -> Result<Self> {
         let mut layers = Vec::new();
         let mut cum_dim = 1_u64;
         let mut bytes_per_value = 0_u64;
@@ -624,6 +616,28 @@ impl ValueDecompressor {
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Flat block")?;
+        if !self.layers.is_empty() {
+            let expected = num_values
+                .checked_mul(self.bits_per_value)
+                .and_then(|bits| usize::try_from(bits.div_ceil(8)).ok())
+                .ok_or_else(|| Error::invalid_input("Fixed-size-list block length overflows"))?;
+            if data.len() != expected {
+                return Err(Error::invalid_input(format!(
+                    "Fixed-size-list block has {} bytes, expected {expected}",
+                    data.len()
+                )));
+            }
+            return FixedPerValueDecompressor::decompress(
+                self,
+                FixedWidthDataBlock {
+                    data,
+                    bits_per_value: self.bits_per_value,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                },
+                num_values,
+            );
+        }
         let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
@@ -873,7 +887,7 @@ impl PerValueCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let (data, encoding) = match data {
             DataBlock::FixedWidth(fixed_width) => {
-                let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
+                let encoding = EncodingUtils::flat(fixed_width.bits_per_value, None);
                 (PerValueDataBlock::Fixed(fixed_width), encoding)
             }
             DataBlock::FixedSizeList(fixed_size_list) => Self::per_value_fsl(fixed_size_list),
@@ -892,15 +906,19 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
-        make_array, new_null_array, types::UInt32Type,
+        Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, NullArray,
+        UInt8Array, make_array, new_null_array, types::UInt32Type,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
     use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, Seed, array, gen_batch};
 
     use crate::{
-        compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
+        compression::{
+            DecompressionStrategy, DefaultDecompressionStrategy, FixedPerValueDecompressor,
+            MiniBlockDecompressor, try_fixed_size_list_block,
+        },
+        compression_config::CompressionFieldParams,
         data::DataBlock,
         encodings::{
             logical::primitive::{
@@ -909,13 +927,56 @@ mod tests {
             },
             physical::value::ValueDecompressor,
         },
-        format::pb21::compressive_encoding::Compression,
+        format::metadata::compressive_encoding::Compression,
         testing::{
             TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
         },
     };
 
     use super::ValueEncoder;
+
+    #[rstest::rstest]
+    #[case::raw("none", false)]
+    #[case::lz4("lz4", false)]
+    #[case::zstd("zstd", false)]
+    #[case::all_null_children("lz4", true)]
+    #[test]
+    fn test_vector_dictionary_block_lengths(#[case] compression: &str, #[case] all_null: bool) {
+        let array = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            3,
+            Arc::new(if all_null {
+                Int32Array::new_null(6)
+            } else {
+                Int32Array::from(vec![Some(1), None, Some(3), Some(4), Some(5), None])
+            }),
+            None,
+        );
+        let data_type = array.data_type().clone();
+        let data = DataBlock::from_array(array.clone());
+        let params = CompressionFieldParams {
+            compression: Some(compression.to_string()),
+            ..Default::default()
+        };
+        let encoder = try_fixed_size_list_block(&data, &params).unwrap().unwrap();
+        let (payload, encoding) = encoder.compress(data).unwrap();
+        let decoder = DefaultDecompressionStrategy::default()
+            .create_block_decompressor(&encoding)
+            .unwrap();
+        let decoded = decoder.decompress(payload.clone(), 2).unwrap();
+        assert_eq!(
+            decoded.into_arrow(data_type, true).unwrap(),
+            array.to_data()
+        );
+        assert!(decoder.decompress(payload.clone(), 1).is_err());
+        assert!(decoder.decompress(payload.clone(), 3).is_err());
+        let payload = payload.unwrap();
+        assert!(
+            decoder
+                .decompress(Some(payload.slice_with_length(0, payload.len() - 1)), 2)
+                .is_err()
+        );
+    }
 
     fn miniblock_context() -> MiniBlockCompressionContext {
         MiniBlockCompressionContext::new(0, true, true)
@@ -1247,6 +1308,58 @@ mod tests {
         assert_eq!(decompressed.as_ref(), &sample_list);
     }
 
+    /// A null-free nested FSL is flattened by `simple_per_value_fsl`; each value
+    /// spans `outer * inner` leaves.
+    #[rstest::rstest]
+    #[case::outer_wider(22, 3)]
+    #[case::inner_wider(3, 22)]
+    fn test_nested_fsl_simple_per_value(#[case] outer_dim: i32, #[case] inner_dim: i32) {
+        let num_rows = 3;
+        let inner_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let leaf = Arc::new(Int32Array::from_iter_values(
+            0..num_rows * outer_dim * inner_dim,
+        )) as ArrayRef;
+        let inner = Arc::new(FixedSizeListArray::new(
+            inner_field.clone(),
+            inner_dim,
+            leaf,
+            None,
+        )) as ArrayRef;
+        let outer = Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(inner_field, inner_dim),
+                false,
+            )),
+            outer_dim,
+            inner,
+            None,
+        )) as ArrayRef;
+
+        let encoder = ValueEncoder::default();
+        let (data, compression) =
+            PerValueCompressor::compress(&encoder, DataBlock::from_array(outer.clone())).unwrap();
+        let PerValueDataBlock::Fixed(data) = data else {
+            panic!()
+        };
+        assert_eq!(data.num_values, num_rows as u64);
+        assert_eq!(data.bits_per_value, 32 * (outer_dim * inner_dim) as u64);
+
+        let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
+            panic!()
+        };
+        let decompressor = ValueDecompressor::from_fsl(fsl.as_ref()).unwrap();
+        let num_values = data.num_values;
+        let decompressed =
+            FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
+        let decompressed = make_array(
+            decompressed
+                .into_arrow(outer.data_type().clone(), true)
+                .unwrap(),
+        );
+        assert_eq!(decompressed.as_ref(), outer.as_ref());
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_fsl_all_null() {
         let items = new_null_array(&DataType::Int32, 12);
@@ -1254,6 +1367,22 @@ mod tests {
         let list_nulls = BooleanBuffer::from(vec![true, false, false, false, true, true]);
         let list_array =
             FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
+
+        let test_cases = TestCases::default().with_structural_encodings();
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    // A FixedSizeList of the Null type wrote fine but failed to read back, because the
+    // decoder gave the Null child a validity buffer, which arrow-rs rejects.
+    #[rstest::rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_of_null_type(#[values(false, true)] has_outer_nulls: bool) {
+        let items_field = Arc::new(Field::new("item", DataType::Null, true));
+        let outer_nulls = has_outer_nulls.then(|| NullBuffer::from(vec![true, false, true]));
+        let list_array =
+            FixedSizeListArray::new(items_field, 2, Arc::new(NullArray::new(6)), outer_nulls);
 
         let test_cases = TestCases::default().with_structural_encodings();
 

@@ -39,10 +39,9 @@ use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
-/// Default-plugin registry, used only to load the standalone PK BTree by its
-/// `BTreeIndexDetails` type. Built once.
+/// Use the dataset registry when opening the standalone primary-key BTree.
 static PK_BTREE_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(|| crate::index::scalar::SCALAR_INDEX_PLUGIN_REGISTRY.clone());
 
 /// One newer generation's PK membership, used to decide whether it shadows an
 /// older source's row.
@@ -176,9 +175,11 @@ pub async fn compute_source_block_lists(
                 index_store,
                 shard_id,
                 generation,
+                visible_batch_count,
                 ..
             } => {
-                let membership = in_memory_membership(batch_store, index_store);
+                let membership =
+                    in_memory_membership(batch_store, index_store, *visible_batch_count);
                 by_shard
                     .entry(*shard_id)
                     .or_default()
@@ -257,10 +258,15 @@ pub async fn fresh_tier_block_list(
                 index_store,
                 shard_id,
                 generation,
+                visible_batch_count,
                 ..
             } => {
                 let membership = match watermarks.and_then(|m| m.get(shard_id)) {
-                    None => Some(in_memory_membership(batch_store, index_store)),
+                    None => Some(in_memory_membership(
+                        batch_store,
+                        index_store,
+                        *visible_batch_count,
+                    )),
                     Some(watermark) => {
                         let g = generation.as_u64();
                         if g > watermark.active_generation {
@@ -275,7 +281,11 @@ pub async fn fresh_tier_block_list(
                             ))
                         } else {
                             // Lower (frozen) generations are immutable — include all.
-                            Some(in_memory_membership(batch_store, index_store))
+                            Some(in_memory_membership(
+                                batch_store,
+                                index_store,
+                                *visible_batch_count,
+                            ))
                         }
                     }
                 };
@@ -321,14 +331,16 @@ pub async fn fresh_tier_block_list(
 }
 
 /// Cross-source membership of an in-memory (active / frozen) memtable: a
-/// snapshot-bounded probe of its maintained primary-key index. A memtable
-/// without a primary-key index can't be probed, so it blocks nothing — the
-/// production vector-search path always enables the index.
+/// probe of its maintained primary-key index, bounded to the source's
+/// `visible_batch_count` snapshot. A memtable without a primary-key index can't be
+/// probed, so it blocks nothing — the production vector-search path always
+/// enables the index.
 fn in_memory_membership(
     batch_store: &Arc<BatchStore>,
     index_store: &Arc<IndexStore>,
+    visible_batch_count: usize,
 ) -> GenMembership {
-    let max_visible_row = batch_store.max_visible_row(index_store.visible_count());
+    let max_visible_row = batch_store.max_visible_row(visible_batch_count);
     GenMembership::InMemory {
         index_store: index_store.clone(),
         max_visible_row,
@@ -410,7 +422,13 @@ async fn open_pk_index(
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
     let index = plugin
-        .load_index(store.clone(), &details, 0, None, &index_cache)
+        .load_index(
+            store.clone(),
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &index_cache,
+        )
         .await?;
     plugin
         .put_in_cache(store, &index_cache, index.clone())
@@ -499,6 +517,7 @@ mod tests {
             index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
         }
         LsmDataSource::ActiveMemTable {
+            visible_batch_count: index.visible_count(),
             batch_store: Arc::new(store),
             index_store: Arc::new(index),
             schema: id_batch(&[1]).schema(),
@@ -671,6 +690,7 @@ mod tests {
             .insert_with_batch_position(&b1, off1, None) // index updated, watermark unchanged
             .unwrap();
         let g2 = LsmDataSource::ActiveMemTable {
+            visible_batch_count: g2_index.visible_count(),
             batch_store: Arc::new(g2_store),
             index_store: Arc::new(g2_index),
             schema,

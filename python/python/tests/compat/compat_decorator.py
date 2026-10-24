@@ -171,6 +171,20 @@ class UpgradeDowngradeTest:
     - check_write(): Verify data can be written/modified
     """
 
+    #: True for the duration of a method body executing inside the pinned
+    #: old venv (see VenvExecutor.execute_method). A subclass that needs to
+    #: tell "the old build is running this" from "the current build is
+    #: running this" must read this flag, not compare `lance.__version__`
+    #: against `self.compat_version`: the current build's own version is not
+    #: a fixed marker distinct from every pinned release -- it tracks
+    #: whatever beta number the release automation has most recently cut on
+    #: main, which a long-lived PR branch can coincidentally match exactly
+    #: (both derive the "next" beta number from the same counter). When that
+    #: happens, a version-string comparison silently picks the wrong branch
+    #: with no error, which is far worse than this flag being technically
+    #: redundant with compat_version the rest of the time.
+    _running_in_old_venv: bool = False
+
     def create(self):
         pass
 

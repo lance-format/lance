@@ -9,7 +9,7 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::{ColumnAlteration, InsertBuilder, NewColumnTransform};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
-use crate::{Dataset, Result};
+use crate::{Dataset, Error, Result};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
@@ -23,7 +23,7 @@ use arrow_array::{
     Array, ArrayRef, Float32Array, Int32Array, Int64Array, ListArray, RecordBatchIterator,
     StructArray, UInt32Array,
 };
-use arrow_array::{RecordBatch, record_batch};
+use arrow_array::{RecordBatch, cast::AsArray, record_batch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_file::version::LanceFileVersion;
 
@@ -768,6 +768,74 @@ async fn test_v6_0_1_miniblock_level_count_overflow() {
     assert!(captions.is_valid(66_047));
     assert_eq!(captions.value(66_047).len(), 0);
     assert!(captions.is_null(66_048));
+}
+
+fn int8_dictionary_strings(array: &ArrayRef) -> Vec<Option<String>> {
+    assert_eq!(
+        array.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+    );
+    arrow::compute::cast(array, &DataType::Utf8)
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect()
+}
+
+/// Lance 10.0.0 appended a null slot at index 128 to this full Int8 dictionary
+/// and stored its indices as 32 bits under the declared Int8 key type.
+#[tokio::test]
+async fn test_v10_0_0_dictionary_null_slot_past_key_type() {
+    let test_dir = copy_test_data_to_tmp("v10.0.0/null_slot_v2_0.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+
+    let expected = (0..128)
+        .map(|i| Some(format!("v{i:03}")))
+        .chain([None, Some("v005".to_owned()), None])
+        .collect::<Vec<_>>();
+    assert_eq!(int8_dictionary_strings(&batch["d"]), expected);
+}
+
+/// Lance 10.0.0 merged two chunks of 100 distinct Int8 dictionary values into one
+/// page and stored its indices as 32 bits under the declared Int8 key type.
+#[tokio::test]
+async fn test_v10_0_0_dictionary_merged_past_key_type() {
+    let test_dir = copy_test_data_to_tmp("v10.0.0/disjoint_v2_1.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    // One batch of the whole page references 192 distinct values, more than Int8
+    // keys can address.
+    let error = dataset.scan().try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("more than the 128 distinct values that Int8 keys can address"),
+        "unexpected error: {error}"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner.batch_size(128);
+    // Each batch carries its own Int8 dictionary, and together they do not fit one.
+    let batches = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let actual = batches
+        .iter()
+        .flat_map(|batch| int8_dictionary_strings(&batch["d"]))
+        .collect::<Vec<_>>();
+
+    let expected = (0..200)
+        .map(|i| (i % 100 % 25 != 3).then(|| format!("v{i:03}")))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
 }
 
 // Helper: create a simple dataset with one fragment of `n` rows at the given URI.
@@ -1541,4 +1609,76 @@ fn test_migration_allocates_from_the_given_mark(
         .collect();
     let expected: Vec<Vec<u64>> = expected.into_iter().map(|r| r.collect()).collect();
     assert_eq!(sequences, expected);
+}
+
+#[tokio::test]
+async fn test_count_rows_falls_back_to_files() {
+    // Three fragments of 10 rows, 2 rows deleted from each.
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..30))],
+    )
+    .unwrap();
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://count_rows_partial_counts",
+        Some(write_params),
+    )
+    .await
+    .unwrap();
+    dataset.delete("id % 10 < 2").await.unwrap();
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
+
+    // Drop the physical row count from one fragment and the deletion count
+    // from another, as manifests written by old versions may have; those
+    // are counted from their files and the third from the manifest.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[0].physical_rows = None;
+    fragments[1]
+        .deletion_file
+        .as_mut()
+        .unwrap()
+        .num_deleted_rows = None;
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
+
+    // A fragment without data files is valid when the manifest carries a
+    // trustworthy row count (as when the only physical column is dropped);
+    // the cached count then supplies the length.
+    let mut no_files = dataset.clone();
+    let mut manifest = no_files.manifest.as_ref().clone();
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[2].files.clear();
+    manifest.fragments = Arc::new(fragments);
+    no_files.manifest = Arc::new(manifest);
+    assert_eq!(no_files.count_rows(None).await.unwrap(), 24);
+
+    // Without a writer version the cached count of a file-less fragment is not
+    // trusted (#1531), so count_rows reports an error.
+    let mut manifest = no_files.manifest.as_ref().clone();
+    manifest.writer_version = None;
+    no_files.manifest = Arc::new(manifest);
+    let err = no_files.count_rows(None).await.unwrap_err();
+    assert!(matches!(err, Error::NotFound { .. }), "{err}");
+
+    // Without a writer version no physical row count in the manifest is
+    // trusted (#1531), not even one smaller than the deletion count.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.writer_version = None;
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[2].physical_rows = Some(1);
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
 }

@@ -72,7 +72,8 @@ pub(crate) struct RabitQuantizedBatch {
 }
 
 #[inline]
-fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
+#[doc(hidden)]
+pub fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
     codes.fill(0);
     for (bit_idx, value) in rotated.iter().enumerate() {
         if value.is_sign_positive() {
@@ -126,7 +127,7 @@ fn quantization_min_len(num_rows: usize) -> usize {
 
 /// Sort packed `(positive_f32_bits, index)` values by their floating-point key.
 ///
-/// All thresholds emitted by [`best_ex_rescale_factor`] are positive and finite,
+/// All thresholds emitted by [`best_ex_rescale_factor_with_scratch`] are positive and finite,
 /// so their IEEE-754 bit patterns have the same order as the represented values.
 /// Four stable byte-wise passes avoid the comparison-heavy tuple sort on every
 /// vector while preserving the exact threshold order.
@@ -212,7 +213,17 @@ fn sort_ex_thresholds(
     }
 }
 
-fn best_ex_rescale_factor(scratch: &mut ExQuantizationScratch, ex_bits: u8) -> f32 {
+/// Select the native ex-code rescale factor for normalized magnitudes.
+#[doc(hidden)]
+pub fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
+    let mut scratch = ExQuantizationScratch {
+        abs_normalized: abs_normalized.to_vec(),
+        ..Default::default()
+    };
+    best_ex_rescale_factor_with_scratch(&mut scratch, ex_bits)
+}
+
+fn best_ex_rescale_factor_with_scratch(scratch: &mut ExQuantizationScratch, ex_bits: u8) -> f32 {
     let ExQuantizationScratch {
         abs_normalized,
         current_codes,
@@ -288,6 +299,18 @@ fn best_ex_rescale_factor(scratch: &mut ExQuantizationScratch, ex_bits: u8) -> f
     best_t
 }
 
+/// `|v_d| / ||v||` for every dimension, or `None` for a zero / non-finite
+/// vector (which encodes as all-zero ex codes).
+#[doc(hidden)]
+pub fn ex_abs_normalized(rotated: &[f32]) -> Option<Vec<f32>> {
+    let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
+    if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
+        return None;
+    }
+    let norm = norm_squared.sqrt();
+    Some(rotated.iter().map(|value| value.abs() / norm).collect())
+}
+
 fn quantize_ex_code<F>(
     rotated: &[f32],
     ex_bits: u8,
@@ -315,7 +338,57 @@ where
     scratch
         .abs_normalized
         .extend(rotated.iter().map(|value| value.abs() / norm));
-    let t = best_ex_rescale_factor(scratch, ex_bits);
+    let t = best_ex_rescale_factor_with_scratch(scratch, ex_bits);
+    quantize_ex_code_with_scale_and_visit(
+        rotated,
+        &scratch.abs_normalized,
+        ex_bits,
+        t,
+        ex_code_dst,
+        ex_code_values_dst,
+        visit,
+    )
+}
+
+/// Quantize the ex codes of one rotated residual with an explicit rescale
+/// factor `t` (normally the output of [`best_ex_rescale_factor`]). Writes the
+/// blocked-layout codes into `ex_code_dst`, the per-dim code values into
+/// `ex_code_values_dst`, and returns `sum_d rotated[d] * (full_code[d] + code_bias)`.
+#[doc(hidden)]
+pub fn quantize_ex_code_with_scale(
+    rotated: &[f32],
+    abs_normalized: &[f32],
+    ex_bits: u8,
+    t: f32,
+    ex_code_dst: &mut [u8],
+    ex_code_values_dst: &mut [u8],
+) -> f32 {
+    quantize_ex_code_with_scale_and_visit(
+        rotated,
+        abs_normalized,
+        ex_bits,
+        t,
+        ex_code_dst,
+        ex_code_values_dst,
+        |_, _, _, _| {},
+    )
+}
+
+#[inline]
+fn quantize_ex_code_with_scale_and_visit<F>(
+    rotated: &[f32],
+    abs_normalized: &[f32],
+    ex_bits: u8,
+    t: f32,
+    ex_code_dst: &mut [u8],
+    ex_code_values_dst: &mut [u8],
+    mut visit: F,
+) -> f32
+where
+    F: FnMut(usize, f32, u8, u8),
+{
+    debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
+    debug_assert_eq!(rotated.len(), abs_normalized.len());
     let max_code = ((1u16 << ex_bits) - 1) as u8;
     let mask = max_code;
     let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
@@ -323,7 +396,7 @@ where
 
     for (idx, ((&value, &abs_value), ex_code_value)) in rotated
         .iter()
-        .zip(scratch.abs_normalized.iter())
+        .zip(abs_normalized.iter())
         .zip(ex_code_values_dst.iter_mut())
         .enumerate()
     {
@@ -1125,7 +1198,7 @@ impl From<RabitQuantizer> for Quantizer {
 
 fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
     let mut rng = rand::rng();
-    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let normal = rand_distr::Normal::new(0.0, 1.0).expect("standard normal distribution");
     ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
 }
 
@@ -1195,6 +1268,47 @@ mod tests {
     use rstest::rstest;
 
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
+
+    #[rstest::rstest]
+    #[case::one(1)]
+    #[case::three(3)]
+    #[case::five(5)]
+    #[case::seven(7)]
+    fn test_explicit_ex_scale_matches_native(#[case] ex_bits: u8) {
+        let rotated: Vec<f32> = (0..128).map(|i| ((i as f32 + 0.5) * 0.17).sin()).collect();
+        let abs_normalized = ex_abs_normalized(&rotated).unwrap();
+        let mut native_codes = vec![0; rotated.len() * ex_bits as usize / 8];
+        let mut native_values = vec![0; rotated.len()];
+        let native_dot = quantize_ex_code(
+            &rotated,
+            ex_bits,
+            &mut native_codes,
+            &mut native_values,
+            &mut ExQuantizationScratch::new(rotated.len(), ex_bits),
+            |_, _, _, _| {},
+        );
+        let mut explicit_codes = vec![0; native_codes.len()];
+        let mut explicit_values = vec![0; native_values.len()];
+        let explicit_dot = quantize_ex_code_with_scale(
+            &rotated,
+            &abs_normalized,
+            ex_bits,
+            best_ex_rescale_factor(&abs_normalized, ex_bits),
+            &mut explicit_codes,
+            &mut explicit_values,
+        );
+        assert_eq!(explicit_codes, native_codes);
+        assert_eq!(explicit_values, native_values);
+        assert_eq!(explicit_dot, native_dot);
+    }
+
+    #[rstest::rstest]
+    #[case::zero(0.0)]
+    #[case::nan(f32::NAN)]
+    #[case::infinite(f32::INFINITY)]
+    fn test_ex_abs_normalized_rejects_invalid_norms(#[case] value: f32) {
+        assert!(ex_abs_normalized(&[value; 128]).is_none());
+    }
 
     #[test]
     fn test_rabit_build_params_default_num_bits() {
@@ -1294,7 +1408,8 @@ mod tests {
                 scratch.abs_normalized.clear();
                 scratch.abs_normalized.extend_from_slice(&values[..len]);
                 let expected = reference_best_ex_rescale_factor(&values[..len], ex_bits);
-                let actual = best_ex_rescale_factor(&mut scratch, ex_bits);
+                let actual = best_ex_rescale_factor_with_scratch(&mut scratch, ex_bits);
+                assert_eq!(best_ex_rescale_factor(&values[..len], ex_bits), actual);
                 assert_eq!(
                     actual.to_bits(),
                     expected.to_bits(),
@@ -1306,7 +1421,7 @@ mod tests {
             scratch.abs_normalized.clear();
             scratch.abs_normalized.extend_from_slice(&sparse);
             let expected = reference_best_ex_rescale_factor(&sparse, ex_bits);
-            let actual = best_ex_rescale_factor(&mut scratch, ex_bits);
+            let actual = best_ex_rescale_factor_with_scratch(&mut scratch, ex_bits);
             assert_eq!(actual.to_bits(), expected.to_bits(), "ex_bits={ex_bits}");
         }
     }
@@ -1410,7 +1525,7 @@ mod tests {
             scratch.abs_normalized.resize(dim, ratio);
             scratch.abs_normalized[0] = 1.0;
             let expected = reference_best_ex_rescale_factor(&scratch.abs_normalized, ex_bits);
-            let actual = best_ex_rescale_factor(&mut scratch, ex_bits);
+            let actual = best_ex_rescale_factor_with_scratch(&mut scratch, ex_bits);
             assert_eq!(actual.to_bits(), expected.to_bits(), "ratio={ratio}");
             assert_eq!(scratch.thresholds.capacity(), capacity);
             assert_eq!(scratch.radix.capacity(), capacity);
@@ -1432,7 +1547,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let expected = reference_best_ex_rescale_factor(&abs_normalized, 7);
-        let actual = best_ex_rescale_factor(
+        let actual = best_ex_rescale_factor_with_scratch(
             &mut ExQuantizationScratch {
                 abs_normalized,
                 ..Default::default()

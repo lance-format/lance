@@ -489,6 +489,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+            supports_conditional_multipart_put: false,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(false),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),

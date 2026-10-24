@@ -48,7 +48,7 @@
 #![allow(clippy::type_complexity)]
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -66,7 +66,7 @@ use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_table::format::IndexMetadata;
-use lance_tokenizer::TokenStream;
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, TokenStream};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -171,6 +171,9 @@ pub enum FtsQueryExpr {
         prefix_length: u32,
         /// Maximum number of terms to expand to.
         max_expansions: usize,
+        /// `Or` unions every expansion; `And` requires a match from each query
+        /// term's expansions.
+        operator: Operator,
         /// Boost factor applied to the score (default 1.0).
         boost: f32,
     },
@@ -308,6 +311,7 @@ impl FtsQueryExpr {
         }
     }
 
+    /// Fuzzy leaf with AUTO distance, OR semantics, and default options.
     pub fn fuzzy(query: impl Into<String>) -> Self {
         Self::Fuzzy {
             column: None,
@@ -315,10 +319,12 @@ impl FtsQueryExpr {
             fuzziness: None,
             prefix_length: 0,
             max_expansions: DEFAULT_MAX_EXPANSIONS,
+            operator: Operator::Or,
             boost: 1.0,
         }
     }
 
+    /// Fuzzy leaf with a fixed edit distance and OR semantics.
     pub fn fuzzy_with_distance(query: impl Into<String>, fuzziness: u32) -> Self {
         Self::Fuzzy {
             column: None,
@@ -326,10 +332,12 @@ impl FtsQueryExpr {
             fuzziness: Some(fuzziness),
             prefix_length: 0,
             max_expansions: DEFAULT_MAX_EXPANSIONS,
+            operator: Operator::Or,
             boost: 1.0,
         }
     }
 
+    /// Fuzzy leaf with OR semantics; `fuzziness: None` selects AUTO distance.
     pub fn fuzzy_with_options(
         query: impl Into<String>,
         fuzziness: Option<u32>,
@@ -342,6 +350,7 @@ impl FtsQueryExpr {
             fuzziness,
             prefix_length,
             max_expansions,
+            operator: Operator::Or,
             boost: 1.0,
         }
     }
@@ -366,6 +375,43 @@ impl FtsQueryExpr {
         }
     }
 
+    /// Set how a `Match` or `Fuzzy` leaf combines its terms; compound shapes
+    /// carry no operator and are returned unchanged.
+    pub fn with_operator(self, operator: Operator) -> Self {
+        match self {
+            Self::Match {
+                column,
+                query,
+                boost,
+                ..
+            } => Self::Match {
+                column,
+                query,
+                operator,
+                boost,
+            },
+            Self::Fuzzy {
+                column,
+                query,
+                fuzziness,
+                prefix_length,
+                max_expansions,
+                boost,
+                ..
+            } => Self::Fuzzy {
+                column,
+                query,
+                fuzziness,
+                prefix_length,
+                max_expansions,
+                operator,
+                boost,
+            },
+            other => other,
+        }
+    }
+
+    /// Set a leaf's boost; compound shapes are returned unchanged.
     pub fn with_boost(self, boost: f32) -> Self {
         match self {
             Self::Match {
@@ -396,6 +442,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 ..
             } => Self::Fuzzy {
                 column,
@@ -403,6 +450,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
             },
             // Compound nodes don't carry a top-level boost field today.
@@ -440,6 +488,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
                 ..
             } => Self::Fuzzy {
@@ -448,6 +497,7 @@ impl FtsQueryExpr {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
             },
             other @ (Self::Boolean { .. } | Self::Boost { .. } | Self::MultiMatch { .. }) => other,
@@ -666,28 +716,40 @@ fn has_grouped_positions(tokens: &Tokens) -> bool {
     (0..tokens.len()).any(|idx| !seen.insert(tokens.position(idx)))
 }
 
-fn query_position_groups(tokens: &Tokens) -> Vec<Vec<String>> {
-    let mut groups = Vec::new();
+struct QueryPositionGroup {
+    position: u32,
+    tokens: Vec<String>,
+}
+
+fn query_position_groups(tokens: &Tokens) -> Vec<QueryPositionGroup> {
+    let mut groups = Vec::with_capacity(tokens.len());
     let mut current_position = None;
     for idx in 0..tokens.len() {
         let position = tokens.position(idx);
         if current_position != Some(position) {
             current_position = Some(position);
-            groups.push(Vec::new());
+            groups.push(QueryPositionGroup {
+                position,
+                tokens: Vec::new(),
+            });
         }
         let group = groups
             .last_mut()
             .expect("a group should exist after pushing for position");
         let token = tokens.get_token(idx).to_string();
-        if !group.contains(&token) {
-            group.push(token);
+        if !group.tokens.contains(&token) {
+            group.tokens.push(token);
         }
     }
     groups
 }
 
-fn position_groups_to_tokens(groups: &[Vec<String>]) -> Vec<String> {
-    groups.iter().flatten().cloned().collect()
+fn position_groups_to_tokens(groups: &[QueryPositionGroup]) -> Vec<String> {
+    groups
+        .iter()
+        .flat_map(|group| &group.tokens)
+        .cloned()
+        .collect()
 }
 
 /// Builder for constructing Boolean queries.
@@ -888,12 +950,12 @@ impl BatchMeta {
 /// the tail's term map. An estimate — the node layout is crossbeam-internal.
 const SKIPMAP_ENTRY_OVERHEAD: usize = 32;
 
-/// Size of a sealed batch block. Small enough that copying the partial tail
-/// block on append stays cheap; large enough that sealing (which clones the
+/// Size of a frozen batch block. Small enough that copying the partial tail
+/// block on append stays cheap; large enough that freezing (which clones the
 /// block-pointer vec) is rare.
 const BATCH_BLOCK: usize = 64;
 
-/// Append-only, structurally-shared log of visible batch metadata. Sealed full
+/// Append-only, structurally-shared log of visible batch metadata. Frozen full
 /// blocks are immutable and shared across snapshots; only the current partial
 /// block is copied on append, so publishing a batch is amortized O(1) (instead
 /// of copying every batch pointer per publish — O(batches²) per generation)
@@ -901,7 +963,7 @@ const BATCH_BLOCK: usize = 64;
 #[derive(Debug, Clone)]
 struct BatchLog {
     /// Immutable full blocks (each `BATCH_BLOCK` long), shared across snapshots.
-    sealed: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
+    frozen: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
     /// The current partial block (`< BATCH_BLOCK` entries).
     tail: Arc<[Arc<BatchMeta>]>,
     len: usize,
@@ -910,28 +972,28 @@ struct BatchLog {
 impl BatchLog {
     fn empty() -> Self {
         Self {
-            sealed: Arc::new(Vec::new()),
+            frozen: Arc::new(Vec::new()),
             tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
             len: 0,
         }
     }
 
-    /// A new log with `meta` appended; shares every sealed block with `self`,
+    /// A new log with `meta` appended; shares every frozen block with `self`,
     /// copying only the partial tail block.
     fn pushed(&self, meta: Arc<BatchMeta>) -> Self {
         let mut tail: Vec<Arc<BatchMeta>> = self.tail.to_vec();
         tail.push(meta);
         if tail.len() == BATCH_BLOCK {
-            let mut sealed = (*self.sealed).clone();
-            sealed.push(Arc::from(tail.into_boxed_slice()));
+            let mut frozen = (*self.frozen).clone();
+            frozen.push(Arc::from(tail.into_boxed_slice()));
             Self {
-                sealed: Arc::new(sealed),
+                frozen: Arc::new(frozen),
                 tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
                 len: self.len + 1,
             }
         } else {
             Self {
-                sealed: Arc::clone(&self.sealed),
+                frozen: Arc::clone(&self.frozen),
                 tail: Arc::from(tail.into_boxed_slice()),
                 len: self.len + 1,
             }
@@ -941,15 +1003,15 @@ impl BatchLog {
     fn get(&self, i: usize) -> Option<&Arc<BatchMeta>> {
         let block = i / BATCH_BLOCK;
         let off = i % BATCH_BLOCK;
-        match self.sealed.get(block) {
+        match self.frozen.get(block) {
             Some(b) => b.get(off),
-            None if block == self.sealed.len() => self.tail.get(off),
+            None if block == self.frozen.len() => self.tail.get(off),
             None => None,
         }
     }
 
     fn iter(&self) -> impl Iterator<Item = &Arc<BatchMeta>> {
-        self.sealed
+        self.frozen
             .iter()
             .flat_map(|b| b.iter())
             .chain(self.tail.iter())
@@ -1079,6 +1141,25 @@ impl<'a> Drop for PooledTokenizer<'a> {
 // FtsMemIndex
 // ============================================================================
 
+/// Heap bytes of the writer's term cache at `capacity`: its hash table only,
+/// since its keys and values are clones of `Arc`s the `SkipMap` already owns.
+///
+/// Mirrors the table `std::collections::HashMap` allocates: a power-of-two
+/// bucket count kept at most 7/8 full (fully usable below 8 buckets), one
+/// entry and one control byte per bucket, plus a trailing control group.
+fn term_cache_bytes(capacity: usize) -> usize {
+    const CONTROL_GROUP_BYTES: usize = 16;
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 {
+        capacity + 1
+    } else {
+        capacity / 7 * 8
+    };
+    buckets * (std::mem::size_of::<(Arc<str>, Arc<ArcSwap<TermSlice>>)>() + 1) + CONTROL_GROUP_BYTES
+}
+
 /// In-memory full-text search index. See module docs for the concurrency
 /// model and visibility contract.
 /// The bounded mutable accumulator: recent inserts since the last freeze, in
@@ -1156,6 +1237,7 @@ impl TailIndex {
             .lock()
             .expect("writer term cache poisoned — single-writer invariant violated");
         // Mirrors `memory_size`'s per-term arithmetic; keep the two in step.
+        let cache_before = term_cache_bytes(cache.capacity());
         let mut added = 0;
         for (term, builder) in term_builders {
             let chunk = builder.build(batch_position, with_position);
@@ -1180,6 +1262,9 @@ impl TailIndex {
             let cur = slot.load_full();
             slot.store(TermSlice::push(cur, chunk));
         }
+        // The cache only grows within a tail generation, so this never goes
+        // negative; a freeze drops it along with the tail.
+        added += term_cache_bytes(cache.capacity()) - cache_before;
         drop(cache);
         let document_count = documents.len() as u64;
         let new_meta = Arc::new(BatchMeta {
@@ -1201,6 +1286,12 @@ impl TailIndex {
 
     fn resident_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>();
+        total += term_cache_bytes(
+            self.writer_term_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capacity(),
+        );
         for entry in self.terms.iter() {
             let term: &Arc<str> = entry.key();
             total += std::mem::size_of::<Arc<str>>() + term.len() + SKIPMAP_ENTRY_OVERHEAD;
@@ -2154,9 +2245,8 @@ impl FtsMemIndex {
         }
     }
 
-    /// Expand a term to fuzzy matches within the specified edit distance.
-    /// Returns `(matched_term, distance)` pairs sorted by distance, capped
-    /// at `max_expansions`.
+    /// The `max_expansions` lexicographically smallest terms within
+    /// `max_distance` of `term`, as `(term, distance)` pairs in term order.
     pub fn expand_fuzzy(
         &self,
         term: &str,
@@ -2175,8 +2265,16 @@ impl FtsMemIndex {
         max_expansions: usize,
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let tokens = self.tokenize_for_search(query);
-        self.search_fuzzy_tokens(&st, &tokens, fuzziness, 0, max_expansions, true)
+        let tokens = self.tokenize_fuzzy_query(query, fuzziness);
+        self.search_fuzzy_tokens(
+            &st,
+            &tokens,
+            Operator::Or,
+            fuzziness,
+            0,
+            max_expansions,
+            true,
+        )
     }
 
     /// BM25 OR-search over the query tokens, scored with one corpus-wide
@@ -2283,7 +2381,7 @@ impl FtsMemIndex {
             let mut result_map: Option<HashMap<DocumentKey, f32>> = None;
             for group in query_position_groups(query_tokens) {
                 let group_results =
-                    self.search_match_strings_with_scorer(st, &group, Operator::Or, scorer);
+                    self.search_match_strings_with_scorer(st, &group.tokens, Operator::Or, scorer);
                 let group_map = group_results
                     .into_iter()
                     .map(|entry| (entry.key(), entry.score))
@@ -2342,6 +2440,7 @@ impl FtsMemIndex {
         results
     }
 
+    /// Conjunction over the query's position groups; see [`Self::search_groups_and`].
     fn search_grouped_and(
         &self,
         st: &IndexState,
@@ -2350,8 +2449,30 @@ impl FtsMemIndex {
         include_tail: bool,
         tail_skip: bool,
     ) -> Vec<FtsEntry> {
+        self.search_groups_and(
+            st,
+            query_position_groups(query_tokens)
+                .into_iter()
+                .map(|group| group.tokens)
+                .collect(),
+            limit,
+            include_tail,
+            tail_skip,
+        )
+    }
+
+    /// Conjunction over term groups: a document must match at least one term of
+    /// every group, and its score is the sum of the per-group OR scores.
+    fn search_groups_and(
+        &self,
+        st: &IndexState,
+        groups: Vec<Vec<String>>,
+        limit: Option<usize>,
+        include_tail: bool,
+        tail_skip: bool,
+    ) -> Vec<FtsEntry> {
         let mut result_map: Option<HashMap<DocumentKey, f32>> = None;
-        for group in query_position_groups(query_tokens) {
+        for group in groups {
             let group_results =
                 self.search_match_strings(st, &group, Operator::Or, None, include_tail, tail_skip);
             let group_map = group_results
@@ -2413,7 +2534,7 @@ impl FtsMemIndex {
             // A single-token phrase reduces to a regular term search.
             return self.search_match_strings(
                 st,
-                &groups[0],
+                &groups[0].tokens,
                 Operator::Or,
                 None,
                 include_tail,
@@ -2426,7 +2547,7 @@ impl FtsMemIndex {
         if !self.params.has_positions() {
             return Vec::new();
         }
-        let has_grouped_terms = groups.iter().any(|group| group.len() > 1);
+        let has_grouped_terms = groups.iter().any(|group| group.tokens.len() > 1);
         let tokens = position_groups_to_tokens(&groups);
         let tail_snap = st.tail.snapshot();
         let scan_tail = include_tail && tail_snap.visible_count > 0;
@@ -2439,7 +2560,7 @@ impl FtsMemIndex {
             if has_grouped_terms {
                 results.extend(p.search_phrase_groups(&groups, slop, &scorer));
             } else {
-                results.extend(p.search_phrase(&tokens, slop, &scorer));
+                results.extend(p.search_phrase(&tokens, &groups, slop, &scorer));
             }
         }
         if scan_tail {
@@ -2456,6 +2577,7 @@ impl FtsMemIndex {
                     &tail_snap,
                     &st.tail.terms,
                     &tokens,
+                    &groups,
                     slop,
                     &scorer,
                 ));
@@ -2479,12 +2601,17 @@ impl FtsMemIndex {
             return Vec::new();
         }
         if groups.len() == 1 {
-            return self.search_match_strings_with_scorer(st, &groups[0], Operator::Or, scorer);
+            return self.search_match_strings_with_scorer(
+                st,
+                &groups[0].tokens,
+                Operator::Or,
+                scorer,
+            );
         }
         if !self.params.has_positions() {
             return Vec::new();
         }
-        let has_grouped_terms = groups.iter().any(|group| group.len() > 1);
+        let has_grouped_terms = groups.iter().any(|group| group.tokens.len() > 1);
         let tokens = position_groups_to_tokens(&groups);
         let tail = st.tail.snapshot();
         let mut results = Vec::new();
@@ -2492,7 +2619,7 @@ impl FtsMemIndex {
             if has_grouped_terms {
                 results.extend(partition.search_phrase_groups(&groups, slop, scorer));
             } else {
-                results.extend(partition.search_phrase(&tokens, slop, scorer));
+                results.extend(partition.search_phrase(&tokens, &groups, slop, scorer));
             }
         }
         if has_grouped_terms {
@@ -2508,6 +2635,7 @@ impl FtsMemIndex {
                 &tail,
                 &st.tail.terms,
                 &tokens,
+                &groups,
                 slop,
                 scorer,
             ));
@@ -2515,10 +2643,15 @@ impl FtsMemIndex {
         results
     }
 
+    /// Expand each token within its edit distance, then combine per `operator`:
+    /// `Or` is one BM25 OR over all expansions; `And` requires a term from each
+    /// token's expansions and scores like [`Self::search_groups_and`].
+    #[allow(clippy::too_many_arguments)]
     fn search_fuzzy_tokens(
         &self,
         st: &IndexState,
         tokens: &[String],
+        operator: Operator,
         fuzziness: Option<u32>,
         prefix_length: u32,
         max_expansions: usize,
@@ -2527,31 +2660,45 @@ impl FtsMemIndex {
         if tokens.is_empty() {
             return Vec::new();
         }
-        let mut expanded: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        // One leaf-wide budget spent in token order, matching the committed
+        // index's `expand_fuzzy_tokens`.
+        let mut remaining = max_expansions;
+        let mut groups: Vec<Vec<String>> = Vec::with_capacity(tokens.len());
         for tok in tokens {
             let max_dist = fuzziness.unwrap_or_else(|| auto_fuzziness(tok));
-            for (matched, _) in self.expand_fuzzy_term(
-                st,
-                tok,
-                max_dist,
-                prefix_length,
-                max_expansions,
-                include_tail,
-            ) {
-                if seen.insert(matched.clone()) {
-                    expanded.push(matched);
+            let group: Vec<String> = self
+                .expand_fuzzy_term(st, tok, max_dist, prefix_length, remaining, include_tail)
+                .into_iter()
+                .map(|(matched, _)| matched)
+                .collect();
+            remaining -= group.len();
+            // A token with no expansions (none in range or budget spent) makes
+            // the conjunction unsatisfiable.
+            if group.is_empty() && operator == Operator::And {
+                return Vec::new();
+            }
+            groups.push(group);
+        }
+        match operator {
+            Operator::And => self.search_groups_and(st, groups, None, include_tail, true),
+            Operator::Or => {
+                let mut seen: HashSet<String> = HashSet::new();
+                let expanded: Vec<String> = groups
+                    .into_iter()
+                    .flatten()
+                    .filter(|term| seen.insert(term.clone()))
+                    .collect();
+                if expanded.is_empty() {
+                    return Vec::new();
                 }
+                self.search_match_strings(st, &expanded, Operator::Or, None, include_tail, true)
             }
         }
-        if expanded.is_empty() {
-            return Vec::new();
-        }
-        self.search_match_strings(st, &expanded, Operator::Or, None, include_tail, true)
     }
 
-    /// Expand `term` against the term dictionaries of every partition (and the
-    /// visible tail, when `include_tail`).
+    /// Expand `term` against every partition's dictionary (and the visible tail,
+    /// when `include_tail`), keeping the `max_expansions` lexicographically
+    /// smallest matches, as the committed index does.
     fn expand_fuzzy_term(
         &self,
         st: &IndexState,
@@ -2561,6 +2708,9 @@ impl FtsMemIndex {
         max_expansions: usize,
         include_tail: bool,
     ) -> Vec<(String, u32)> {
+        if max_expansions == 0 {
+            return Vec::new();
+        }
         let tail_snap = st.tail.snapshot();
         if max_distance == 0 {
             let in_tail = include_tail
@@ -2577,8 +2727,7 @@ impl FtsMemIndex {
                 Vec::new()
             };
         }
-        let mut matches: Vec<(String, u32)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut matches: BTreeMap<String, u32> = BTreeMap::new();
         let prefix = char_prefix(term, prefix_length);
         for entry in st.tail.terms.iter() {
             if !include_tail || !has_visible_chunk(&entry.value().load(), tail_snap.visible_count) {
@@ -2589,8 +2738,8 @@ impl FtsMemIndex {
                 continue;
             }
             let dist = levenshtein_distance(term, key);
-            if dist <= max_distance && seen.insert(key.to_string()) {
-                matches.push((key.to_string(), dist));
+            if dist <= max_distance {
+                matches.insert(key.to_string(), dist);
             }
         }
         for p in st.partitions.iter() {
@@ -2599,14 +2748,12 @@ impl FtsMemIndex {
                     continue;
                 }
                 let dist = levenshtein_distance(term, key.as_ref());
-                if dist <= max_distance && seen.insert(key.to_string()) {
-                    matches.push((key.to_string(), dist));
+                if dist <= max_distance {
+                    matches.insert(key.to_string(), dist);
                 }
             }
         }
-        matches.sort_by_key(|(_, d)| *d);
-        matches.truncate(max_expansions);
-        matches
+        matches.into_iter().take(max_expansions).collect()
     }
 
     /// Execute a query expression and return matching documents with scores.
@@ -2686,13 +2833,15 @@ impl FtsMemIndex {
                 fuzziness,
                 prefix_length,
                 max_expansions,
+                operator,
                 boost,
                 ..
             } => {
-                let tokens = self.tokenize_for_search(query);
+                let tokens = self.tokenize_fuzzy_query(query, *fuzziness);
                 let mut results = self.search_fuzzy_tokens(
                     st,
                     &tokens,
+                    *operator,
                     *fuzziness,
                     *prefix_length,
                     *max_expansions,
@@ -2752,6 +2901,22 @@ impl FtsMemIndex {
 
     fn tokenize_for_search(&self, text: &str) -> Vec<String> {
         query_tokens_to_vec(&self.analyze_for_search(text))
+    }
+
+    /// Tokenize like the committed index's `tokenizer_for_match_query`: an
+    /// explicit positive distance uses a bare `SimpleTokenizer` (no stop words
+    /// or stemming); otherwise the index analyzer.
+    fn tokenize_fuzzy_query(&self, text: &str, fuzziness: Option<u32>) -> Vec<String> {
+        if !matches!(fuzziness, Some(distance) if distance > 0) {
+            return self.tokenize_for_search(text);
+        }
+        let mut analyzer = TextAnalyzer::from(SimpleTokenizer::default());
+        let mut stream = analyzer.token_stream(text);
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        tokens
     }
 
     fn analyze_for_search(&self, text: &str) -> Tokens {
@@ -3259,6 +3424,7 @@ fn phrase_search_tail(
     snap: &Snapshot,
     terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     tokens: &[String],
+    query_groups: &[QueryPositionGroup],
     slop: u32,
     scorer: &MemBM25Scorer,
 ) -> Vec<FtsEntry> {
@@ -3325,7 +3491,7 @@ fn phrase_search_tail(
                     }
                 }
             }
-            if !all_present || !phrase_matches(&all_positions, slop) {
+            if !all_present || !phrase_matches(&all_positions, query_groups, slop) {
                 continue;
             }
             let dl = lookup_dl(snap, document_position).unwrap_or(1);
@@ -3401,13 +3567,13 @@ where
 fn phrase_search_tail_groups(
     snap: &Snapshot,
     terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
-    groups: &[Vec<String>],
+    groups: &[QueryPositionGroup],
     slop: u32,
     scorer: &MemBM25Scorer,
 ) -> Vec<FtsEntry> {
     let mut candidates: Option<HashMap<DocumentKey, PhraseCandidate>> = None;
     for (group_idx, group) in groups.iter().enumerate() {
-        let group_docs = tail_phrase_group_docs(snap, terms, group, scorer);
+        let group_docs = tail_phrase_group_docs(snap, terms, &group.tokens, scorer);
         if group_docs.is_empty()
             || !merge_phrase_group(&mut candidates, group_idx, groups.len(), group_docs)
         {
@@ -3418,7 +3584,7 @@ fn phrase_search_tail_groups(
     candidates
         .unwrap_or_default()
         .into_iter()
-        .filter(|(_, candidate)| phrase_matches(&candidate.positions_by_group, slop))
+        .filter(|(_, candidate)| phrase_matches(&candidate.positions_by_group, groups, slop))
         .map(|(key, candidate)| FtsEntry {
             row_position: key.row_position,
             doc_index: public_doc_index(&key.doc_index),
@@ -3470,27 +3636,48 @@ fn tail_phrase_group_docs(
     docs
 }
 
-fn phrase_matches<T: AsRef<[u32]>>(positions: &[T], slop: u32) -> bool {
+fn phrase_matches<T: AsRef<[u32]>>(
+    positions: &[T],
+    query_groups: &[QueryPositionGroup],
+    slop: u32,
+) -> bool {
+    debug_assert_eq!(
+        positions.len(),
+        query_groups.len(),
+        "each query group must have one document position list"
+    );
     if positions.is_empty() {
         return false;
     }
     for &first_pos in positions[0].as_ref() {
-        if phrase_from_position(positions, first_pos, slop) {
+        if phrase_from_position(positions, query_groups, first_pos, slop) {
             return true;
         }
     }
     false
 }
 
-fn phrase_from_position<T: AsRef<[u32]>>(positions: &[T], first_pos: u32, slop: u32) -> bool {
+fn phrase_from_position<T: AsRef<[u32]>>(
+    positions: &[T],
+    query_groups: &[QueryPositionGroup],
+    first_pos: u32,
+    slop: u32,
+) -> bool {
     let mut expected = first_pos;
-    for token_positions in positions.iter().skip(1) {
-        let min = expected.saturating_add(1);
-        let max = expected.saturating_add(1 + slop);
+    for (idx, token_positions) in positions.iter().enumerate().skip(1) {
+        // Query filters remove tokens without collapsing their positions.
+        let Some(query_delta) = query_groups[idx]
+            .position
+            .checked_sub(query_groups[idx - 1].position)
+        else {
+            return false;
+        };
+        let min = u64::from(expected) + u64::from(query_delta);
+        let max = min + u64::from(slop);
         match token_positions
             .as_ref()
             .iter()
-            .filter(|&&p| p >= min && p <= max)
+            .filter(|&&p| u64::from(p) >= min && u64::from(p) <= max)
             .min()
         {
             Some(&p) => expected = p,
@@ -4651,7 +4838,13 @@ impl Partition {
     /// Phrase-search by intersecting posting lists: drive from the rarest
     /// token, require every other token to contain the doc, and verify the
     /// token positions satisfy the phrase. `tokens.len() >= 2`.
-    fn search_phrase(&self, tokens: &[String], slop: u32, scorer: &MemBM25Scorer) -> Vec<FtsEntry> {
+    fn search_phrase(
+        &self,
+        tokens: &[String],
+        query_groups: &[QueryPositionGroup],
+        slop: u32,
+        scorer: &MemBM25Scorer,
+    ) -> Vec<FtsEntry> {
         let mut term_ids: Vec<u32> = Vec::with_capacity(tokens.len());
         for token in tokens {
             match self.term_id(token) {
@@ -4687,7 +4880,7 @@ impl Partition {
                     break;
                 }
             }
-            if present && phrase_matches(&all_positions, slop) {
+            if present && phrase_matches(&all_positions, query_groups, slop) {
                 let dl = self.docs.num_tokens(doc);
                 let score: f32 = tokens
                     .iter()
@@ -4708,13 +4901,13 @@ impl Partition {
 
     fn search_phrase_groups(
         &self,
-        groups: &[Vec<String>],
+        groups: &[QueryPositionGroup],
         slop: u32,
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
         let mut candidates: Option<HashMap<u32, PhraseCandidate>> = None;
         for (group_idx, group) in groups.iter().enumerate() {
-            let group_docs = self.phrase_group_docs(group, scorer);
+            let group_docs = self.phrase_group_docs(&group.tokens, scorer);
             if group_docs.is_empty()
                 || !merge_phrase_group(&mut candidates, group_idx, groups.len(), group_docs)
             {
@@ -4725,7 +4918,7 @@ impl Partition {
         candidates
             .unwrap_or_default()
             .into_iter()
-            .filter(|(_, candidate)| phrase_matches(&candidate.positions_by_group, slop))
+            .filter(|(_, candidate)| phrase_matches(&candidate.positions_by_group, groups, slop))
             .map(|(doc, candidate)| FtsEntry {
                 row_position: self.docs.row_id(doc),
                 doc_index: public_doc_index(&self.docs.doc_index(doc)),
@@ -5302,6 +5495,8 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use lance_index::scalar::inverted::DocumentGranularity;
+    use lance_index::scalar::inverted::query::PhraseQuery;
+    use rstest::rstest;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -5840,6 +6035,95 @@ mod tests {
             rows(index.search_with_options(&query, partition_only)),
             vec![0, 1]
         );
+    }
+
+    #[rstest]
+    #[case::long_token("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false)]
+    #[case::stop_word("the", true)]
+    fn test_code_analyzer_phrase_preserves_query_gaps(
+        #[case] removed_token: &str,
+        #[case] remove_stop_words: bool,
+        #[values(false, true)] split_identifiers: bool,
+    ) {
+        let index = FtsMemIndex::with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::code()
+                .with_position(true)
+                .split_identifiers(split_identifiers)
+                .remove_stop_words(remove_stop_words),
+        );
+        let batch = arrow_array::record_batch!((
+            "description",
+            Utf8,
+            vec![
+                format!("foo {removed_token} bar"),
+                format!("getUserName {removed_token} bar"),
+                "foo bar getUserName baz".to_string(),
+                format!("foo {removed_token} extra bar"),
+                format!("getUserName {removed_token} extra bar"),
+                format!("foo {removed_token} {removed_token} qux"),
+                "foo qux".to_string(),
+            ]
+        ))
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        for stage in 0..3 {
+            if stage > 0 {
+                index.flush();
+            }
+            if stage == 1 {
+                index.insert(&batch, 100).unwrap();
+            }
+            for (text, slop, expected) in [
+                (format!("foo {removed_token} bar"), 0, vec![0]),
+                (format!("getUserName {removed_token} bar"), 0, vec![1]),
+                ("foo bar".to_string(), 0, vec![2]),
+                ("getUserName baz".to_string(), 0, vec![2]),
+                (format!("foo {removed_token} bar"), 1, vec![0, 3]),
+                (format!("getUserName {removed_token} bar"), 1, vec![1, 4]),
+                (
+                    format!("foo {removed_token} {removed_token} qux"),
+                    0,
+                    vec![5],
+                ),
+                (
+                    format!("{removed_token} foo {removed_token} bar"),
+                    0,
+                    vec![0],
+                ),
+            ] {
+                let mut all_expected = expected.clone();
+                if stage > 0 {
+                    all_expected.extend(expected.iter().map(|row| row + 100));
+                }
+                let query = FtsQueryExpr::phrase_with_slop(&text, slop);
+                assert_eq!(rows(index.search_phrase(&text, slop)), all_expected);
+                assert_eq!(rows(index.search_query(&query)), all_expected);
+                let partition_expected = match stage {
+                    0 => vec![],
+                    1 => expected,
+                    _ => all_expected.clone(),
+                };
+                assert_eq!(
+                    rows(index.search_with_options(
+                        &query,
+                        SearchOptions::new().with_include_tail(false),
+                    )),
+                    partition_expected,
+                );
+
+                let st = index.state.load_full();
+                let tokens = query_tokens_to_vec(&index.analyze_for_search(&text));
+                let scorer = build_scorer(&st, &st.tail.snapshot(), &tokens, true);
+                let query = FtsQuery::Phrase(PhraseQuery::new(text).with_slop(slop));
+                let leaves = index.exact_leaf_results(&query, &scorer).unwrap();
+                let mut leaf_rows = leaves[0].iter().map(|(row, _)| *row).collect::<Vec<_>>();
+                leaf_rows.sort_unstable();
+                assert_eq!(leaf_rows, all_expected);
+            }
+        }
     }
 
     #[test]
@@ -6465,6 +6749,63 @@ mod tests {
         assert!(!entries.is_empty());
     }
 
+    /// `alpho beta` at distance 1 expands to {alpha, alpho} and {beta, zeta};
+    /// AND keeps only rows with a term from each group.
+    #[test]
+    fn test_search_fuzzy_and_requires_every_term() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        index.insert(&create_fuzzy_test_batch(&schema), 0).unwrap();
+        let st = index.state.load_full();
+        let tokens = ["alpho".to_string(), "beta".to_string()];
+        let rows = |operator: Operator| {
+            let mut rows: Vec<RowPosition> = index
+                .search_fuzzy_tokens(&st, &tokens, operator, Some(1), 0, 50, true)
+                .into_iter()
+                .map(|entry| entry.row_position)
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(rows(Operator::And), vec![0, 1]);
+        assert_eq!(rows(Operator::Or), vec![0, 1, 2, 3]);
+
+        // `alpho` spends the whole two-term budget, leaving `beta` none.
+        assert!(
+            index
+                .search_fuzzy_tokens(&st, &tokens, Operator::And, Some(1), 0, 2, true)
+                .is_empty()
+        );
+
+        // A term that expands to nothing empties the conjunction.
+        let unmatched = ["alpho".to_string(), "xyz".to_string()];
+        assert!(
+            index
+                .search_fuzzy_tokens(&st, &unmatched, Operator::And, Some(1), 0, 50, true)
+                .is_empty()
+        );
+    }
+
+    /// AUTO leaves `xy` exact, but it still needs budget: `alpha` spends the
+    /// only slot, so the conjunction fails.
+    #[test]
+    fn test_search_fuzzy_and_zero_distance_term_respects_exhausted_budget() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["alpha xy"])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        let query =
+            FtsQueryExpr::fuzzy_with_options("alpha xy", None, 0, 1).with_operator(Operator::And);
+        assert!(index.search_query(&query).is_empty());
+    }
+
     #[test]
     fn test_search_fuzzy_no_match() {
         let schema = create_test_schema();
@@ -6520,10 +6861,17 @@ mod tests {
         );
     }
 
+    /// `prefix_length` counts characters, not bytes.
     #[test]
     fn test_search_query_fuzzy_prefix_length_uses_char_boundaries() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        // Explicit fuzziness skips the index analyzer, so the stored term must
+        // keep its `é` for the query's raw `é` prefix to reach it.
+        let index = FtsMemIndex::with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default().ascii_folding(false),
+        );
 
         let batch = RecordBatch::try_new(
             schema,
@@ -6987,6 +7335,34 @@ mod tests {
             after_two > after_one,
             "memory should grow after second insert"
         );
+    }
+
+    /// The term cache is charged for the table `HashMap` allocates: a
+    /// power-of-two bucket count whose usable share is what `capacity()`
+    /// reports. Checked against real maps across every growth step.
+    #[test]
+    fn test_term_cache_bytes_follows_the_table() {
+        let entry = std::mem::size_of::<(Arc<str>, Arc<ArcSwap<TermSlice>>)>() + 1;
+        assert_eq!(term_cache_bytes(0), 0);
+        let mut cache: FxHashMap<Arc<str>, Arc<ArcSwap<TermSlice>>> = FxHashMap::default();
+        for i in 0..5_000 {
+            cache.insert(Arc::from(i.to_string()), TermSlice::empty_arc_swap());
+            let capacity = cache.capacity();
+            let buckets = (term_cache_bytes(capacity) - 16) / entry;
+            assert!(
+                buckets.is_power_of_two(),
+                "{buckets} buckets at capacity {capacity}"
+            );
+            let usable = if buckets <= 8 {
+                buckets - 1
+            } else {
+                buckets / 8 * 7
+            };
+            assert_eq!(
+                usable, capacity,
+                "{buckets} buckets do not hold capacity {capacity}"
+            );
+        }
     }
 
     /// The tail's running byte counter must stay exactly in step with the walk

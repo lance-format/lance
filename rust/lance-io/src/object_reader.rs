@@ -202,14 +202,28 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let object_store = self.object_store.clone();
-        let path = self.path.clone();
         let range = Range {
             start: range.start as u64,
             end: range.end as u64,
         };
+        // Downloading a range is the same two layers as downloading the whole
+        // object, so it goes through the same retry loop: `do_with_retry`
+        // retries the request, and the outer loop retries a body that stops
+        // partway.
+        let get_request = Arc::new(GetRequest {
+            object_store: self.object_store.clone(),
+            path: self.path.clone(),
+            options: GetOptions {
+                range: Some(range.clone().into()),
+                ..Default::default()
+            },
+        });
+        let download_retry_count = self.download_retry_count;
         Box::pin(async move {
-            do_with_retry(|| Box::pin(object_store.get_range(&path, range.clone()))).await
+            do_get_with_outer_retry(download_retry_count, get_request, move || {
+                format!("range {}..{}", range.start, range.end)
+            })
+            .await
         })
     }
 
@@ -296,7 +310,7 @@ impl std::fmt::Debug for SmallReaderState {
                 write!(f, "Finished({} bytes)", data.len())
             }
             Self::Finished(Err(err)) => {
-                write!(f, "Finished({})", err.0)
+                write!(f, "Finished({})", err.inner())
             }
         }
     }
@@ -314,11 +328,11 @@ impl SmallReader {
             Box::pin(async move {
                 let object_reader =
                     CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
-                        .map_err(CloneableError)?;
+                        .map_err(CloneableError::new)?;
                 object_reader
                     .get_all()
                     .await
-                    .map_err(|err| CloneableError(Error::from(err)))
+                    .map_err(|err| CloneableError::new(Error::from(err)))
             })
             .boxed()
             .shared(),
@@ -340,13 +354,13 @@ impl SmallReaderInner {
             match &*state {
                 SmallReaderState::Loading(future) => future.clone(),
                 SmallReaderState::Finished(result) => {
-                    return result.clone().map_err(|err| err.0.into());
+                    return result.clone().map_err(|err| err.into_inner().into());
                 }
             }
         };
 
         let result = future.await;
-        let result_to_return = result.clone().map_err(|err| err.0.into());
+        let result_to_return = result.clone().map_err(|err| err.into_inner().into());
         let mut state = self.state.lock().unwrap();
         if matches!(*state, SmallReaderState::Loading(_)) {
             *state = SmallReaderState::Finished(result);
@@ -459,5 +473,154 @@ impl DeepSizeOf for SmallReader {
         }
 
         size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::{Display, Formatter};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::stream::BoxStream;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use object_store::memory::InMemory;
+    use object_store::{
+        Attributes, CopyOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+        ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as OSResult, path::Path,
+    };
+    use rstest::rstest;
+
+    use super::*;
+    use crate::utils::tracking_store::{IoStats, IoTrackingStore};
+
+    /// Answers every read with a body that fails partway: the request
+    /// succeeded and the download did not. Reads are all these tests do.
+    #[derive(Debug)]
+    struct PartialBodyStore;
+
+    impl Display for PartialBodyStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PartialBodyStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PartialBodyStore {
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _payload: PutPayload,
+            _opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            unimplemented!("put_opts is not used by these tests")
+        }
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            unimplemented!("put_multipart_opts is not used by these tests")
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            let range = options
+                .range
+                .expect("the reader asks for a range")
+                .as_range(1024)
+                .expect("the range fits the object");
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    futures::stream::once(async {
+                        Err(object_store::Error::Generic {
+                            store: "PartialBodyStore",
+                            source: "connection reset".into(),
+                        })
+                    })
+                    .boxed(),
+                ),
+                meta: ObjectMeta {
+                    location: location.clone(),
+                    last_modified: Default::default(),
+                    size: 1024,
+                    e_tag: None,
+                    version: None,
+                },
+                range,
+                attributes: Attributes::default(),
+                extensions: Default::default(),
+            })
+        }
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            unimplemented!("delete_stream is not used by these tests")
+        }
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            unimplemented!("list is not used by these tests")
+        }
+        async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> OSResult<ListResult> {
+            unimplemented!("list_with_delimiter is not used by these tests")
+        }
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            unimplemented!("copy_opts is not used by these tests")
+        }
+    }
+
+    fn reader(store: Arc<dyn ObjectStore>, download_retry_count: usize) -> CloudObjectReader {
+        CloudObjectReader::new(
+            store,
+            Path::from("test/data.lance"),
+            4096,
+            None,
+            download_retry_count,
+        )
+        .unwrap()
+    }
+
+    /// A body that stops partway is what `download_retry_count` documents, and
+    /// `get_range` has to honor it like `get_all` already did.
+    #[rstest]
+    #[case::no_retries(0, 1)]
+    #[case::one_retry(1, 2)]
+    #[case::default(3, 4)]
+    #[case::raised(10, 11)]
+    #[tokio::test]
+    async fn get_range_retries_a_partial_download_as_configured(
+        #[case] download_retry_count: usize,
+        #[case] expected_requests: u64,
+    ) {
+        let stats = Arc::new(Mutex::new(IoStats::default()));
+        let store = IoTrackingStore::new(Arc::new(PartialBodyStore), stats.clone());
+        let reader = reader(Arc::new(store), download_retry_count);
+
+        reader.get_range(0..128).await.unwrap_err();
+
+        assert_eq!(stats.lock().unwrap().read_iops, expected_requests);
+    }
+
+    /// `do_with_retry` gives the request its own fixed retries, so the
+    /// configured download count does not stretch or shrink them.
+    #[tokio::test]
+    async fn get_range_leaves_the_request_retries_alone() {
+        // Counted by the policy: `IoTrackingStore` records only requests that
+        // succeed, and none of these do.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = requests.clone();
+        let mut policy = ProxyObjectStorePolicy::new();
+        policy.set_before_policy(
+            "fail_every_request",
+            Arc::new(move |_, _| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err(Error::io("connection reset"))
+            }),
+        );
+        let store = ProxyObjectStore::new(Arc::new(InMemory::new()), Arc::new(Mutex::new(policy)));
+        let reader = reader(Arc::new(store), 10);
+
+        reader.get_range(0..128).await.unwrap_err();
+
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
 }

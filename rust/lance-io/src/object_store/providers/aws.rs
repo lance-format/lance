@@ -152,6 +152,7 @@ impl AwsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
+        aws_credentials: Option<&AwsCredentialProvider>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         let bucket = base_path
             .host_str()
@@ -169,6 +170,16 @@ impl AwsStoreProvider {
                 "OpendalStore does not currently support an explicit provider_scheme (currently set to {:?})",
                 provider_scheme
             )));
+        }
+
+        // The provider reaches the native store through the params, which this
+        // arm does not pass on, so a request here would be signed with whatever
+        // credentials OpenDAL resolves for itself instead.
+        if aws_credentials.is_some() {
+            return Result::Err(Error::not_supported(
+                "OpendalStore does not currently support an explicit aws_credentials provider"
+                    .to_string(),
+            ));
         }
 
         // Set required OpenDAL configuration
@@ -227,8 +238,12 @@ impl ObjectStoreProvider for AwsStoreProvider {
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
             (
-                self.build_opendal_s3_store(&base_path, &storage_options)
-                    .await?,
+                self.build_opendal_s3_store(
+                    &base_path,
+                    &storage_options,
+                    params.aws_credentials.as_ref(),
+                )
+                .await?,
                 None,
             )
         } else {
@@ -258,6 +273,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
+            supports_conditional_multipart_put: !use_opendal,
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
@@ -614,29 +630,35 @@ impl AwsCredentialAdapter {
 impl StorageOptions {
     /// Add values from the environment to storage options.
     ///
-    /// Only adds keys that are not already present, so explicitly-set options
-    /// (including empty-string sentinels) always take precedence over env vars.
+    /// Explicitly-set options (including aliases, case variants, and empty-string
+    /// sentinels) always take precedence over env vars.
     pub fn with_env_s3(&mut self) {
-        for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
-                && let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase())
-                && !self.0.contains_key(config_key.as_ref())
-            {
-                self.0
-                    .insert(config_key.as_ref().to_string(), value.to_string());
-            }
-        }
+        self.merge_env_options(std::env::vars_os(), |key| {
+            AmazonS3ConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
     }
 
-    /// Subset of options relevant for s3 storage
+    /// Return options recognized by [`AmazonS3ConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as `aws_region`)
+    /// wins, followed by case variants of that name. Remaining ties use the
+    /// lexicographically smallest original key. Empty values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::aws::AmazonS3ConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("region".into(), "us-east-1".into()),
+    ///     ("aws_region".into(), "eu-west-1".into()),
+    /// ]));
+    /// assert_eq!(options.as_s3_options()[&AmazonS3ConfigKey::Region], "eu-west-1");
+    /// ```
     pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((s3_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 
     /// Parse the `aws_provider_scheme` storage option, if set.
@@ -688,6 +710,36 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::canonical("aws_region", "region")]
+    #[case::canonical_over_case_variant("aws_region", "AWS_REGION")]
+    #[case::canonical_case_tie("AWS_REGION", "Aws_Region")]
+    #[case::case_variant_over_alias("AWS_REGION", "region")]
+    #[case::lexical_alias("REGION", "region")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_s3_options(),
+                HashMap::from([(AmazonS3ConfigKey::Region, preferred_value.to_string())])
+            );
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MockAwsCredentialsProvider {
@@ -1073,6 +1125,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
+        assert!(!store.supports_conditional_multipart_put);
+    }
+
+    /// A credential provider handed to the OpenDAL arm would be dropped, and
+    /// the requests signed from the environment instead.
+    #[tokio::test]
+    async fn test_use_opendal_rejects_an_explicit_credential_provider() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AwsStoreProvider;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let params = ObjectStoreParams {
+            aws_credentials: Some(
+                Arc::new(MockAwsCredentialsProvider::default()) as AwsCredentialProvider
+            ),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let err = provider.new_store(url, &params).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "got: {err:?}, expected NotSupported"
+        );
+        assert!(err.to_string().contains("aws_credentials"), "got: {err}");
     }
 
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back
@@ -1103,6 +1184,10 @@ mod tests {
 
         assert!(!store.list_is_lexically_ordered);
         assert_eq!(store.paginated_lister.is_some(), paginated);
+        assert_eq!(
+            store.supports_conditional_multipart_put,
+            use_opendal == "false"
+        );
     }
 
     #[derive(Debug)]

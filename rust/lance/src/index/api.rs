@@ -378,6 +378,32 @@ pub trait DatasetIndexExt {
     ) -> Result<IndexMetadata>;
 
     /// Commit one or more existing physical index segments as a logical index.
+    ///
+    /// `column` names the first field in each segment. Built-in indices require
+    /// exactly one keyed field. A registered scalar plugin that returns `false`
+    /// from [`ScalarIndexPlugin::supports_optimization`](lance_index::scalar::registry::ScalarIndexPlugin::supports_optimization) may declare multiple
+    /// distinct field IDs if its fragment bitmap and covering fields are empty.
+    /// The plugin builds and refreshes its own payload; this does not enable
+    /// multi-column training through [`Self::create_index_builder`].
+    ///
+    /// For such plugins, declare every input, grouping, and predicate dependency
+    /// in `fields`, in a stable order with `column` first. This order is persisted unchanged
+    /// and must match across all segments and replacements of the same name.
+    /// Deleting any declared field removes the index; changing its type requires
+    /// dropping the index first. Renaming a field preserves its ID and the index.
+    /// Scope semantics and payload coverage remain the plugin's responsibility.
+    /// Discover these indices by name or with unfiltered [`Self::describe_indices`];
+    /// single-column query lookup does not select them.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::{DatasetIndexExt, IndexSegment}};
+    /// # async fn commit(dataset: &mut Dataset, segment: IndexSegment) -> Result<()> {
+    /// // An externally built segment can declare [user_id, country] field IDs
+    /// // for a profile of user_id grouped by country, with an empty bitmap.
+    /// dataset.commit_existing_index_segments("users_by_country", "user_id", vec![segment]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,

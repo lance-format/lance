@@ -12,7 +12,7 @@ use crate::{
     compression::{BlockDecompressor, create_fixed_width_block_decompressor},
     data::DataBlock,
     encodings::physical::range::checked_range_last,
-    format::pb21::{CompressiveEncoding, compressive_encoding::Compression},
+    format::metadata::{CompressiveEncoding, compressive_encoding::Compression},
 };
 
 /// Validated metadata that a container can use without materializing values.

@@ -6,6 +6,7 @@
 
 pub mod arena_skiplist;
 mod btree;
+mod filter;
 mod fts;
 mod hnsw;
 mod pk;
@@ -35,8 +36,12 @@ use super::wal::WriterCursors;
 use pk::{OwnedPk, PkIndex};
 
 pub use btree::{BTreeMemIndex, BTreeMemIndexPlugin};
+pub(crate) use filter::{
+    IndexedFilter, MemIndexCatalog, evaluate as evaluate_index_filter, plan_filter,
+};
 pub use fts::{FtsEntry, FtsMemIndex, FtsMemIndexPlugin, FtsParams, FtsQueryExpr, SearchOptions};
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats, search_cross_column};
+pub(crate) use hnsw::DEFAULT_SEARCH_EF as HNSW_DEFAULT_SEARCH_EF;
 pub use hnsw::{HnswMemIndex, HnswMemIndexPlugin, HnswParams};
 pub use pk_key::encode_pk_tuple;
 pub use plugin::{
@@ -44,8 +49,8 @@ pub use plugin::{
     MemIndexPlugin, MemIndexRegistry, MemIndexSpec, PrimaryKeyIndex, ResolveContext, ResolvedIndex,
 };
 pub use query::{
-    FtsMemQuery, MemMatches, MemQuery, MemSearchResult, PositionSet, RankedMatch, SearchContext,
-    VectorMemQuery,
+    FtsMemQuery, MemMatches, MemQuery, MemSearchResult, PositionSet, RankedMatch, ScalarQuery,
+    SearchContext, VectorMemQuery,
 };
 
 /// Row position in a memtable: the row's position across all its batches,
@@ -164,6 +169,8 @@ pub enum MemTableVisibility {
 pub struct IndexStore {
     /// Sorted by name, so the same query always reaches the same index.
     indexes: BTreeMap<String, Arc<dyn MemIndex>>,
+    /// How a filter expression reaches these indexes.
+    filter_catalog: MemIndexCatalog,
     pk_index: Option<PkIndex>,
     /// Batches every index holds, as an exclusive count. Not a visibility
     /// bound: readers use [`Self::visible_count`].
@@ -253,10 +260,12 @@ impl IndexStore {
                 spec.build(schema, max_rows, max_batches)?,
             );
         }
+        store.filter_catalog = MemIndexCatalog::new(specs, schema);
         Ok(store)
     }
 
     /// Add a built index. Indexes are added before any row is inserted.
+    /// Filters reach only indexes built by [`Self::from_specs`].
     pub fn add_index(&mut self, name: String, index: Arc<dyn MemIndex>) {
         assert!(
             !self.has_rows.load(Ordering::Acquire),
@@ -265,7 +274,8 @@ impl IndexStore {
         self.indexes.insert(name, index);
     }
 
-    /// Add a B-tree over one column.
+    /// Add a B-tree over one column. Filters do not reach it; build with
+    /// [`Self::from_specs`] for that.
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.add_index(name, Arc::new(BTreeMemIndex::new(field_id, column)));
     }
@@ -417,24 +427,34 @@ impl IndexStore {
         self.indexed_count.fetch_max(count, Ordering::AcqRel);
     }
 
+    /// How a filter expression reaches these indexes.
+    pub(crate) fn filter_catalog(&self) -> &MemIndexCatalog {
+        &self.filter_catalog
+    }
+
     /// The index named `name`.
     pub fn get_index(&self, name: &str) -> Option<&Arc<dyn MemIndex>> {
         self.indexes.get(name)
     }
 
-    /// The first index, by name, covering `column` that can answer `query`;
-    /// the memtable's own key index last.
-    pub fn index_answering(&self, column: &str, query: &dyn MemQuery) -> Option<Arc<dyn MemIndex>> {
-        let owned_pk = match &self.pk_index {
+    /// The B-tree the memtable keeps over a single key column, when no
+    /// maintained index serves as the key index.
+    pub(crate) fn own_key_index(&self) -> Option<Arc<dyn MemIndex>> {
+        match &self.pk_index {
             Some(PkIndex::Owned(OwnedPk::Single(index))) => {
                 Some(index.clone() as Arc<dyn MemIndex>)
             }
             _ => None,
-        };
+        }
+    }
+
+    /// The first index, by name, covering `column` that can answer `query`;
+    /// the memtable's own key index last.
+    pub fn index_answering(&self, column: &str, query: &dyn MemQuery) -> Option<Arc<dyn MemIndex>> {
         self.indexes
             .values()
             .cloned()
-            .chain(owned_pk)
+            .chain(self.own_key_index())
             .find(|index| {
                 index.columns().iter().any(|covered| covered == column) && index.can_answer(query)
             })

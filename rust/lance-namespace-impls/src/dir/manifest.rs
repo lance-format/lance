@@ -31,7 +31,7 @@ use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
-use lance_core::{Error, ROW_ID, Result, box_error};
+use lance_core::{Error, ROW_ADDR, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -1090,10 +1090,17 @@ impl ManifestNamespace {
         Self::string_list_array(values, "object_id")
     }
 
-    fn value_row_id_schema(value_field: Field) -> SchemaRef {
+    /// Schema for a manifest index training stream: BTree, Bitmap, and
+    /// LabelList all read their id column as `ROW_ADDR`, never `ROW_ID` (see
+    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`, `BITMAP_ROW_ADDR_DOMAIN_VERSION`, and
+    /// `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
+    /// rows with is already an address, not a row id -- see the single
+    /// fragment id 0 invariant in `rewrite_manifest` -- so only the column
+    /// name matters, not the values.
+    fn value_row_addr_schema(value_field: Field) -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![
             value_field,
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]))
     }
 
@@ -1129,7 +1136,7 @@ impl ManifestNamespace {
 
     fn object_id_index_stream(object_ids: BTreeMap<Arc<str>, u64>) -> SendableRecordBatchStream {
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (object_ids.into_iter(), false, schema),
@@ -1167,8 +1174,12 @@ impl ManifestNamespace {
     fn object_type_index_stream(
         object_types: BTreeMap<&'static str, RoaringBitmap>,
     ) -> SendableRecordBatchStream {
+        // Like `object_id_index_stream`, but for Bitmap: Bitmap training also
+        // reads its id column as `ROW_ADDR`, never `ROW_ID` (see
+        // `BITMAP_ROW_ADDR_DOMAIN_VERSION`). Only the column name needs to
+        // change, not the values -- see `value_row_addr_schema`.
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let entries = object_types
             .into_iter()
@@ -1225,7 +1236,11 @@ impl ManifestNamespace {
         base_objects_values: Vec<Option<Vec<String>>>,
         base_objects_row_ids: Vec<u64>,
     ) -> SendableRecordBatchStream {
-        let schema = Self::value_row_id_schema(BASE_OBJECTS_VALUE_FIELD.clone());
+        // Like `object_type_index_stream`, but for LabelList: LabelList
+        // training also reads its id column as `ROW_ADDR`, never `ROW_ID`
+        // (see `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). Only the column name
+        // needs to change, not the values -- see `value_row_addr_schema`.
+        let schema = Self::value_row_addr_schema(BASE_OBJECTS_VALUE_FIELD.clone());
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (
@@ -2307,7 +2322,7 @@ impl ManifestNamespace {
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
-        match err {
+        match err.find_root() {
             LanceError::NotFound { .. } => true,
             LanceError::IO { source, .. } => source
                 .downcast_ref::<ObjectStoreError>()
@@ -2442,7 +2457,11 @@ impl ManifestNamespace {
         for i in 1..=namespace_path.len() {
             let partial_path = &namespace_path[..i];
             let object_id = partial_path.join(DELIMITER);
-            if !self.manifest_contains_object(&object_id).await? {
+            if self
+                .query_manifest_for_namespace(&object_id)
+                .await?
+                .is_none()
+            {
                 return Err(NamespaceError::NamespaceNotFound {
                     message: format!("parent namespace '{}'", object_id),
                 }
@@ -2986,7 +3005,7 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         let object_id = Self::str_object_id(table_id);
-        let exists = self.manifest_contains_object(&object_id).await?;
+        let exists = self.query_manifest_for_table(&object_id).await?.is_some();
         if exists {
             Ok(())
         } else {
@@ -3023,6 +3042,14 @@ impl LanceNamespace for ManifestNamespace {
         self.ensure_manifest_writable().await?;
 
         let existing_table = self.query_manifest_for_table(&object_id).await?;
+        // Tables and namespaces share object ids. We refuse an id that a
+        // namespace holds before we write any data.
+        if existing_table.is_none() && self.manifest_contains_object(&object_id).await? {
+            return Err(NamespaceError::TableAlreadyExists {
+                message: table_name,
+            }
+            .into());
+        }
         let existing_has_manifests = if let Some(existing_table) = &existing_table {
             Some(
                 self.location_has_actual_manifests(&existing_table.location)
@@ -3427,8 +3454,14 @@ impl LanceNamespace for ManifestNamespace {
 
         let object_id = namespace_id.join(DELIMITER);
 
-        // Check if namespace exists
-        if !self.manifest_contains_object(&object_id).boxed().await? {
+        // Check if namespace exists. A table's id is not a namespace, and
+        // dropping it here would delete the table's entry.
+        if self
+            .query_manifest_for_namespace(&object_id)
+            .boxed()
+            .await?
+            .is_none()
+        {
             return Err(NamespaceError::NamespaceNotFound {
                 message: object_id.to_string(),
             }
@@ -3482,7 +3515,11 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         let object_id = namespace_id.join(DELIMITER);
-        if self.manifest_contains_object(&object_id).await? {
+        if self
+            .query_manifest_for_namespace(&object_id)
+            .await?
+            .is_some()
+        {
             Ok(())
         } else {
             Err(NamespaceError::NamespaceNotFound {
@@ -3509,9 +3546,9 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
-        // Check if table already exists in manifest
-        let existing = self.query_manifest_for_table(&object_id).await?;
-        if existing.is_some() {
+        // Tables and namespaces share object ids. We refuse an id that either
+        // one holds before we write the marker.
+        if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::TableAlreadyExists {
                 message: table_name.to_string(),
             }
@@ -5053,6 +5090,19 @@ mod tests {
         request.id = Some(vec!["test_table".to_string()]);
         let result = dir_namespace.table_exists(request).await;
         assert!(result.is_ok());
+
+        // A namespace's id is not a table. A root id would be answered from
+        // the directory listing, so check a child id.
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["ns".to_string()]);
+        dir_namespace.create_namespace(create_ns_req).await.unwrap();
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["ns".to_string(), "child".to_string()]);
+        dir_namespace.create_namespace(create_ns_req).await.unwrap();
+        let mut request = TableExistsRequest::new();
+        request.id = Some(vec!["ns".to_string(), "child".to_string()]);
+        let err = dir_namespace.table_exists(request).await.unwrap_err();
+        assert!(err.to_string().contains("Table not found"), "{err}");
     }
 
     #[rstest]
@@ -5487,6 +5537,21 @@ mod tests {
         create_req.id = Some(vec!["nonexistent_parent".to_string(), "child".to_string()]);
         let result = dir_namespace.create_namespace(create_req).await;
         assert!(result.is_err(), "Should fail when parent doesn't exist");
+
+        // A table is not a parent namespace.
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["t".to_string()]);
+        dir_namespace
+            .create_table(create_table_req, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["t".to_string(), "child".to_string()]);
+        let err = dir_namespace
+            .create_namespace(create_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Namespace not found"), "{err}");
     }
 
     #[rstest]
@@ -5536,7 +5601,9 @@ mod tests {
     #[case::without_optimization(false)]
     #[tokio::test]
     async fn test_drop_namespace_with_children_fails(#[case] inline_optimization: bool) {
-        use lance_namespace::models::{CreateNamespaceRequest, DropNamespaceRequest};
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DropNamespaceRequest, NamespaceExistsRequest,
+        };
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -5561,6 +5628,32 @@ mod tests {
         drop_req.id = Some(vec!["parent".to_string()]);
         let result = dir_namespace.drop_namespace(drop_req).await;
         assert!(result.is_err(), "Should fail when namespace has children");
+
+        // A table's id is not a namespace. Dropping it as one must leave the
+        // table in place.
+        let table_id = vec!["parent".to_string(), "t".to_string()];
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(table_id.clone());
+        dir_namespace
+            .create_table(create_table_req, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+        let mut drop_req = DropNamespaceRequest::new();
+        drop_req.id = Some(table_id.clone());
+        let err = dir_namespace.drop_namespace(drop_req).await.unwrap_err();
+        assert!(err.to_string().contains("Namespace not found"), "{err}");
+        let exists_req = NamespaceExistsRequest {
+            id: Some(table_id.clone()),
+            ..Default::default()
+        };
+        let err = dir_namespace
+            .namespace_exists(exists_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Namespace not found"), "{err}");
+        let mut request = TableExistsRequest::new();
+        request.id = Some(table_id);
+        dir_namespace.table_exists(request).await.unwrap();
     }
 
     #[rstest]
@@ -5611,6 +5704,24 @@ mod tests {
         let tables = result.unwrap();
         assert_eq!(tables.tables.len(), 1);
         assert_eq!(tables.tables[0], "table1");
+
+        // We refuse a name that a namespace holds, before we write any data.
+        let taken = vec!["ns1".to_string(), "taken".to_string()];
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(taken.clone());
+        dir_namespace.create_namespace(create_ns_req).await.unwrap();
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(taken);
+        let err = dir_namespace
+            .create_table(create_table_req, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Table already exists"), "{err}");
+        assert!(
+            !dir_entry_names(temp_path)
+                .iter()
+                .any(|name| name.ends_with("_ns1$taken"))
+        );
     }
 
     #[rstest]

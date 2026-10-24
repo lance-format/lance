@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Reading a sealed generation under the table's current schema.
+//! Reading a flushed generation under the table's current schema.
 //!
-//! A sealed generation is a Lance dataset of its own, written under whatever
+//! A flushed generation is a Lance dataset of its own, written under whatever
 //! the table's schema was at the time. The names it stores are therefore its
-//! own: a rename since the seal moved the table's name and left the file
+//! own: a rename since the freeze moved the table's name and left the file
 //! holding the old one, and only field ids relate the two. Every read path —
 //! scan, point lookup, vector search, full-text search — goes through
 //! [`GenerationRead`] so they resolve a generation the same way.
@@ -30,7 +30,7 @@ use super::projection::{is_auto_managed, resolve_data_fields_or_drop};
 use crate::dataset::mem_wal::reconcile::{Plan, field_id_of, without_field_id};
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
-/// One sealed generation, read under the table's schema.
+/// One flushed generation, read under the table's schema.
 ///
 /// Answers what to project ([`Self::stored_projection`]), whether a predicate
 /// can be pushed down and under which names ([`Self::to_stored`]), and how to
@@ -38,12 +38,12 @@ use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 ///
 /// # Invariant
 ///
-/// A field id must keep identifying the same column while any generation holds
-/// it. Lance does not enforce this: `max_field_id` is a maximum over the current
-/// schema and base fragments, so dropping a column can lower it and let the next
-/// added column reuse the id. Reads then serve the dropped column's values as
-/// the new one. Callers that retain generations must drain them before a
-/// drop/add can reuse an id.
+/// A field id must name the same column for as long as any generation holds it.
+/// A dataset migrated with
+/// [`Dataset::migrate_to_non_reusable_field_ids`](crate::Dataset::migrate_to_non_reusable_field_ids)
+/// never reuses ids. Without that, a column added after a drop can get the
+/// dropped column's id, and reads then return the dropped column's values for
+/// it. Drain generations before such a drop and add.
 pub(super) struct GenerationRead {
     /// The generation's own schema, carrying its field ids.
     stored_schema: Schema,
@@ -611,7 +611,7 @@ mod tests {
         )
     }
 
-    /// The generation was sealed as `value`; the table has since renamed it.
+    /// The generation was frozen as `value`; the table has since renamed it.
     fn renamed() -> GenerationRead {
         generation(
             schema(vec![
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn a_field_id_taken_back_after_a_drop_is_read_as_the_column_that_took_it() {
         let read = generation(
-            // Sealed while id 1 was `retired`.
+            // Frozen while id 1 was `retired`.
             schema(vec![
                 with_id("id", DataType::Int64, 0),
                 with_id("retired", DataType::Int64, 1),

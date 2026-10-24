@@ -786,18 +786,20 @@ class MergeInsertBuilder(_MergeInsertBuilder):
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
                   RepartitionExec: ...
-                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
                         DataSourceExec: ..., metrics=[]
-                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
 
         The reported plan follows how the source was passed. `new_data` above is a
         `pa.Table`, so it is wrapped in an in-memory table that reports exact
-        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
-        which side of the join to collect from those statistics and from the two
-        sides' sizes, so the same merge can plan differently depending on which one
-        you hand it. Use `explain_plan` only for the streaming shape: it takes a
-        schema rather than data, so it cannot know how the source would be wrapped.
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion picks
+        the side it collects from those statistics and from the two sides' sizes.
+        The target here is three rows, so it is the collected side either way; with
+        a larger target the same merge can plan differently depending on which
+        source you hand it. Use `explain_plan` only for the streaming shape: it
+        takes a schema rather than data, so it cannot know how the source would be
+        wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -2098,6 +2100,25 @@ class LanceDataset(pa.dataset.Dataset):
             for f in self._ds.get_fragments()
         ]
 
+    def fragment_ids(self) -> Bitmap:
+        """Get the ids of all fragments in the currently checked out version.
+
+        Unlike :meth:`get_fragments`, this does not create an object for every
+        fragment.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": range(4)})
+        >>> dataset = lance.write_dataset(
+        ...     data, "memory://fragment_ids", max_rows_per_file=2
+        ... )
+        >>> list(dataset.fragment_ids())
+        [0, 1]
+        """
+        return self._ds.fragment_ids()
+
     def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""
         raw_fragment = self._ds.get_fragment(fragment_id)
@@ -2313,6 +2334,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         row_ids: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        ignore_deletions: bool = False,
         **kargs,
     ) -> pa.Table:
         """Select rows by row_ids.
@@ -2327,6 +2350,15 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
+        ignore_deletions: bool, default False
+            Take the rows as if the dataset had no deletions. Deletion files
+            are read only where a row id could name more than one physical
+            copy (fragments whose id spans overlap, as after an update), which
+            on a table with many fragments saves one request per fragment. A
+            deleted row may come back with its stored values or be dropped, so
+            the result is only complete for live ids: use it only for ids known
+            to be live, for example ids read from an index built after the
+            last deletion.
         **kwargs : dict, optional
             See scanner() method for full parameter description.
 
@@ -2339,7 +2371,14 @@ class LanceDataset(pa.dataset.Dataset):
             columns_with_transform = list(columns.items())
             columns = None
         return pa.Table.from_batches(
-            [self._ds.take_rows(row_ids, columns, columns_with_transform)]
+            [
+                self._ds.take_rows(
+                    row_ids,
+                    columns,
+                    columns_with_transform,
+                    ignore_deletions=ignore_deletions,
+                )
+            ]
         )
 
     def take_blobs(
@@ -3391,6 +3430,7 @@ class LanceDataset(pa.dataset.Dataset):
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
+        delete_concurrency: Optional[int] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3431,6 +3471,11 @@ class LanceDataset(pa.dataset.Dataset):
             be ignored without any error and only untagged versions will be
             cleaned up.
 
+        delete_concurrency: int, optional
+            Maximum concurrent file deletions across this cleanup and its cascaded
+            branches. Defaults to the object store's I/O parallelism.
+            Must be positive (at most 2**61 - 1 on 64-bit platforms).
+
         delete_rate_limit: int, optional
             Maximum number of delete operations per second. When not set (default),
             deletions run at full speed. Set this to a positive integer to avoid
@@ -3452,6 +3497,7 @@ class LanceDataset(pa.dataset.Dataset):
             error_if_tagged_old_versions,
             delete_rate_limit,
             versions,
+            delete_concurrency,
         )
 
     def explain_cleanup_old_versions(
@@ -3487,8 +3533,7 @@ class LanceDataset(pa.dataset.Dataset):
             match the parameters. Otherwise, tagged versions will be ignored.
 
         delete_rate_limit: int, optional
-            Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
-            issued by explain.
+            Retained for compatibility; ignored because explain does not delete files.
 
         versions: list[int], optional
             Explain cleanup only for the specified dataset versions.
@@ -3549,12 +3594,13 @@ class LanceDataset(pa.dataset.Dataset):
                 "FTS",
                 "BLOOMFILTER",
                 "RTREE",
+                "MINHASHLSH",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
+                        '"INVERTED", "BLOOMFILTER", "RTREE" or "MINHASHLSH" are '
+                        f"supported for scalar columns.  Received {index_type}",
                     )
                 )
 
@@ -3656,6 +3702,7 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASHLSH",
         }
 
     @classmethod
@@ -3671,6 +3718,7 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASHLSH",
         }
 
     def create_scalar_index(
@@ -3686,6 +3734,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
+            Literal["MINHASHLSH"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3790,7 +3839,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3864,6 +3913,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
+            * "code": splits code-like text. Requires FTS format v3 and enables
+              the code analyzer options below.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
@@ -3888,6 +3939,34 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+        analyzer: str, optional
+            This is for the ``INVERTED`` index. Selects an analyzer profile:
+            ``"text"`` (the default) or ``"code"``. The ``"code"`` profile sets
+            ``base_tokenizer="code"`` and applies code-oriented defaults:
+            ``split_identifiers=False``, ``split_on_numerics=True``,
+            ``preserve_original=True``, ``stem=False``, and
+            ``remove_stop_words=False``. If unset, the profile is inferred from
+            ``base_tokenizer="code"``. Explicit arguments override the profile
+            defaults. Code analysis requires FTS format v3.
+        split_identifiers: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifiers such as ``getUserName`` are split into subwords
+            (``get``, ``User``, ``Name``) so each subword is searchable. When
+            False, an identifier is only indexed as a whole, so ``getUserName``
+            is not matched by ``user``.
+        split_on_numerics: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifier subwords are split at letter/number boundaries, for
+            example ``value42`` into ``value`` and ``42``. Only takes effect
+            when ``split_identifiers=True``.
+        preserve_original: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            the complete identifier is indexed in addition to its subwords.
+            Only takes effect when ``split_identifiers=True``.
+        index_operators: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            code operators such as ``::``, ``->``, and ``!=`` are indexed.
+            Other punctuation is still dropped.
 
         Examples
         --------
@@ -4191,7 +4270,6 @@ class LanceDataset(pa.dataset.Dataset):
                 fs, path = FileSystem.from_uri(ivf_centroids_file)
                 with fs.open_input_file(path) as f:
                     ivf_centroids = np.load(f)
-                num_partitions = ivf_centroids.shape[0]
 
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
@@ -4257,8 +4335,7 @@ class LanceDataset(pa.dataset.Dataset):
                             f"got {ivf_centroids.shape}"
                         )
                     if ivf_centroids.shape[0] == 0:
-                        # num_partitions was derived from shape[0] above, and
-                        # zero partitions panics in the Rust residual step.
+                        # Zero partitions panics in the Rust residual step.
                         raise ValueError(
                             "Ivf centroids must have at least one cluster, "
                             f"got {ivf_centroids.shape}"
@@ -4426,6 +4503,11 @@ class LanceDataset(pa.dataset.Dataset):
             A ``num_clusters x dimension`` array of existing K-mean centroids
             for IVF clustering. The row count determines the number of IVF
             partitions. If not provided, a new KMeans model will be trained.
+        ivf_centroids_file : str, optional
+            Path to a ``.npy`` file holding the same array as ``ivf_centroids``.
+            Mutually exclusive with it. The file's row count sets the number of
+            IVF partitions, so passing a ``num_partitions`` that disagrees with
+            it is an error.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
@@ -4677,7 +4759,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, and MINHASHLSH
+        scalar index construction.
         Unlike :meth:`create_index`, this method does not publish the index into
         the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4693,9 +4776,10 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
-        LABEL_LIST segments may be merged with
-        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER,
+        LABEL_LIST, and MINHASHLSH segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. MINHASHLSH
+        segments of one index must share parameters. NGRAM segments
         built before a deferred compaction must be merged before commit so
         their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
@@ -5512,18 +5596,16 @@ class LanceDataset(pa.dataset.Dataset):
             # Or using explicit version range
             delta = ds_append.delta(begin_version=1, end_version=2)
         """
-        has_compared_against = compared_against is not None
-
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
-        if has_compared_against:
+        # Forward every argument as given: the Rust builder rejects conflicting
+        # or half-set selections, which filtering here would hide.
+        if compared_against is not None:
             builder = builder.compared_against_version(compared_against)
-        else:
-            if begin_version is not None:
-                builder = builder.with_begin_version(begin_version)
-
-            if end_version is not None:
-                builder = builder.with_end_version(end_version)
+        if begin_version is not None:
+            builder = builder.with_begin_version(begin_version)
+        if end_version is not None:
+            builder = builder.with_end_version(end_version)
 
         return builder.build()
 
@@ -7064,7 +7146,9 @@ class ScannerBuilder:
         if isinstance(filter, FullTextQuery):
             self._search_filter = PySearchFilter.from_full_text_query(filter.inner)
         elif isinstance(filter, VectorSearchQuery):
-            self._search_filter = PySearchFilter.from_vector_search_query(filter.inner)
+            self._search_filter = PySearchFilter.from_vector_search_query(
+                filter.inner()
+            )
         elif isinstance(filter, str):
             self._filter = filter
         elif isinstance(filter, pa.compute.Expression):
@@ -7201,6 +7285,7 @@ class ScannerBuilder:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+        search_effort: Optional[float] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7216,6 +7301,9 @@ class ScannerBuilder:
             When ``use_index`` is true and a vector index is available, each query
             vector is searched through the index path; otherwise the flat batch path
             is used.
+        ef: int, optional
+            Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
+            floored at 256.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -7223,6 +7311,15 @@ class ScannerBuilder:
             the CPU pool size. Value 1 uses the single-worker sequential path.
             Values >= 2 use the partition-parallel path and are clamped to the
             CPU pool size.
+        search_effort: float, optional
+            Initial IVF search budget, a finite value in [0, 1]. None resolves
+            to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
+            available partition); one starts at all available partitions, subject
+            to maximum_nprobes. Intermediate values interpolate geometrically.
+            Later expansion to find enough candidates is unchanged. This is
+            independent of approx_mode, ef and refinement, and is not a recall
+            guarantee. When supplied, effort ignores nprobes, including an explicit
+            0.5. With None, an explicitly supplied nprobes remains effective.
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently only affects
@@ -7245,6 +7342,7 @@ class ScannerBuilder:
             ef=ef,
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
+            search_effort=search_effort,
             distance_range=distance_range,
         )
         return self
@@ -7557,10 +7655,69 @@ class LanceScanner(pa.dataset.Scanner):
         return lst
 
     def take(self, indices):
+        """Select rows of data by their position in the scan results.
+
+        ``indices`` are 0-based positions within this scanner's output — the
+        rows that survive the scanner's filter, in scan order. This matches
+        ``pyarrow.dataset.Scanner.take()`` and is different from
+        :meth:`LanceDataset.take`, which ignores the scanner filter and takes
+        rows by absolute dataset row number.
+
+        Parameters
+        ----------
+        indices : int or array-like
+            Positions of the matching rows to select. A large index requires
+            scanning through the matching rows up to it, so the cost is
+            proportional to the largest index, not to the number of indices.
+
+        Returns
+        -------
+        Table
         """
-        Not implemented
-        """
-        raise NotImplementedError("take")
+        if isinstance(indices, int):
+            indices = [indices]
+        elif isinstance(indices, pa.Array):
+            # pyarrow Scanner.take() also accepts pa.Array; list() on one
+            # yields pyarrow Scalars, so normalize to python ints.
+            indices = indices.to_pylist()
+        indices = list(indices)
+        if not indices:
+            raise ValueError("take requires at least one index")
+        if any(not isinstance(i, (int, np.integer)) or i < 0 for i in indices):
+            raise ValueError(f"indices must be non-negative integers, got {indices}")
+
+        # Collect the rows at the requested filtered-relative positions. Rows
+        # are gathered in scan order first and re-ordered to the caller's
+        # index order at the end, so repeated and unsorted indices work.
+        max_index = max(indices)
+        sorted_unique = sorted(set(indices))
+        batches = []
+        matched = 0  # number of matching rows consumed so far
+        exhausted = False
+        for batch in self.to_batches():
+            batch_end = matched + batch.num_rows
+            positions = [i - matched for i in sorted_unique if matched <= i < batch_end]
+            if positions:
+                batches.append(batch.take(positions))
+            matched = batch_end
+            if matched > max_index:
+                exhausted = True
+                break
+        if not exhausted:
+            # The stream ended before covering max_index, so matched is the
+            # full row count of the scan output. (count_rows is unavailable
+            # here anyway when the scanner has a limit/offset.)
+            raise IndexError(
+                f"index {max_index} is out of bounds for a scan with {matched} rows"
+            )
+
+        # Reaching here means max_index was covered by the scan, so at least
+        # one row was collected.
+        table = pa.Table.from_batches(batches)
+        # rows are in sorted-unique index order; map back to the caller's order.
+        row_lookup = {idx: i for i, idx in enumerate(sorted_unique)}
+        take_order = [row_lookup[i] for i in indices]
+        return table.take(take_order)
 
     def head(self, num_rows):
         """
@@ -8484,6 +8641,7 @@ def _build_vector_search_query(
     query_parallelism: Optional[int] = None,
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+    search_effort: Optional[float] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8510,19 +8668,30 @@ def _build_vector_search_query(
     minimum_nprobes: int, optional
         The minimum number of partitions to search.
     maximum_nprobes: int, optional
-        The maximum number of partitions to search.
+        The maximum number of partitions to search per index segment. This bounds
+        both initial and later probing without disabling Auto probing.
     refine_factor: int, optional
         The refine factor for the search.
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
-        The ef parameter for HNSW search.
+        Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
+        floored at 256.
     query_parallelism: int, optional
         Maximum partition-search concurrency for a single vector query.
         The default is 0. Value 0 uses the automatic policy, which currently
         maps to the single-worker sequential path. Value -1 uses the CPU pool
         size. Value 1 uses the single-worker sequential path. Values >= 2 use
         the partition-parallel path and are clamped to the CPU pool size.
+    search_effort: float, optional
+        Initial IVF search budget, a finite value in [0, 1]. None resolves
+        to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
+        available partition); one starts at all available partitions, subject
+        to maximum_nprobes. Intermediate values interpolate geometrically.
+        Later expansion to find enough candidates is unchanged. This is
+        independent of approx_mode, ef and refinement, and is not a recall
+        guarantee. When supplied, effort ignores nprobes, including an explicit
+        0.5. With None, an explicitly supplied nprobes remains effective.
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently only affects
@@ -8543,33 +8712,34 @@ def _build_vector_search_query(
     """
     q, q_dim = _coerce_query_vector(q)
 
-    lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
-    if lance_field is None:
-        raise ValueError(f"Embedding column {column} is not in the dataset")
+    if dataset is not None:
+        lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
+        if lance_field is None:
+            raise ValueError(f"Embedding column {column} is not in the dataset")
 
-    column_field = lance_field.to_arrow()
-    column_type = column_field.type
-    if hasattr(column_type, "storage_type"):
-        column_type = column_type.storage_type
-    if pa.types.is_fixed_size_list(column_type):
-        dim = column_type.list_size
-    elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
-        column_type.value_type
-    ):
-        dim = column_type.value_type.list_size
-    else:
-        raise TypeError(
-            f"Query column {column} must be a vector. Got {column_field.type}."
-        )
+        column_field = lance_field.to_arrow()
+        column_type = column_field.type
+        if hasattr(column_type, "storage_type"):
+            column_type = column_type.storage_type
+        if pa.types.is_fixed_size_list(column_type):
+            dim = column_type.list_size
+        elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
+            column_type.value_type
+        ):
+            dim = column_type.value_type.list_size
+        else:
+            raise TypeError(
+                f"Query column {column} must be a vector. Got {column_field.type}."
+            )
 
-    if q_dim != dim:
-        raise ValueError(
-            f"Query vector size {len(q)} does not match index column size {dim}"
-        )
+        if q_dim != dim:
+            raise ValueError(
+                f"Query vector size {len(q)} does not match index column size {dim}"
+            )
 
     if k is not None and int(k) <= 0:
         raise ValueError(f"Nearest-K must be > 0 but got {k}")
-    if nprobes is not None and int(nprobes) <= 0:
+    if search_effort is None and nprobes is not None and int(nprobes) <= 0:
         raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
     if minimum_nprobes is not None and int(minimum_nprobes) < 0:
         raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum_nprobes}")
@@ -8619,6 +8789,7 @@ def _build_vector_search_query(
         "ef": ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
+        "search_effort": search_effort,
         "distance_range": distance_range,
     }
 
@@ -8760,6 +8931,13 @@ class VectorIndexReader:
 
 
 class VectorSearchQuery:
+    """Vector search parameters, including continuous ``search_effort`` in [0, 1].
+
+    Effort defaults to None, which resolves to 0.5 (Auto). Explicit effort
+    ignores nprobes. See :meth:`ScannerBuilder.nearest` for probe bounds and
+    other search parameters.
+    """
+
     _inner: dict
 
     def __init__(
@@ -8776,6 +8954,7 @@ class VectorSearchQuery:
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
+        search_effort: Optional[float] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -8790,6 +8969,7 @@ class VectorSearchQuery:
             ef=ef,
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
+            search_effort=search_effort,
         )
 
     def inner(self):

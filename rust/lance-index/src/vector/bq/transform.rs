@@ -6,9 +6,9 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type};
-#[cfg(test)]
-use arrow_array::UInt32Array;
-use arrow_array::{Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_array::{
+    Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
+};
 use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
@@ -178,13 +178,13 @@ impl RQTransformer {
     }
 }
 
-#[cfg(test)]
-struct RabitRawQueryFactors {
-    add_factors: Float32Array,
-    scale_factors: Float32Array,
-    error_factors: Float32Array,
-    ex_add_factors: Option<Float32Array>,
-    ex_scale_factors: Option<Float32Array>,
+#[doc(hidden)]
+pub struct RabitRawQueryFactors {
+    pub add_factors: Float32Array,
+    pub scale_factors: Float32Array,
+    pub error_factors: Float32Array,
+    pub ex_add_factors: Option<Float32Array>,
+    pub ex_scale_factors: Option<Float32Array>,
 }
 
 pub(crate) struct RabitRowFactors<'c, 'o> {
@@ -264,7 +264,6 @@ fn factor_ratio(numerator: f32, denominator: f32) -> f32 {
     }
 }
 
-#[cfg(test)]
 #[inline]
 fn binary_factor_value(rotated_residual: f32) -> f32 {
     if rotated_residual.is_sign_positive() {
@@ -296,9 +295,9 @@ fn error_factor_value(
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn compute_raw_query_factors(
+#[doc(hidden)]
+pub fn compute_raw_query_factors(
     distance_type: DistanceType,
     res_norm_square: &Float32Array,
     rotated_residuals: &[f32],

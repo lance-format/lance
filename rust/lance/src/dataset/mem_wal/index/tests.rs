@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use super::plugin::{FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin};
 use super::query::{MemMatches, MemQuery, SearchContext};
-use crate::dataset::mem_wal::memtable::scanner::ScalarPredicate;
 use lance_index::IndexType;
 use lance_index::pbold;
 use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::SargableQuery;
+use lance_index::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_table::format::IndexMetadata;
@@ -75,8 +76,8 @@ impl MemIndex for StubMemIndex {
 
     fn can_answer(&self, query: &dyn MemQuery) -> bool {
         matches!(
-            query.as_any().downcast_ref::<ScalarPredicate>(),
-            Some(ScalarPredicate::Eq { .. } | ScalarPredicate::In { .. })
+            query.as_any().downcast_ref::<SargableQuery>(),
+            Some(SargableQuery::Equals(_) | SargableQuery::IsIn(_))
         )
     }
 
@@ -105,16 +106,16 @@ impl MemIndex for StubMemIndex {
     }
 
     fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>> {
-        let Some(query) = query.as_any().downcast_ref::<ScalarPredicate>() else {
+        let Some(query) = query.as_any().downcast_ref::<SargableQuery>() else {
             return Ok(None);
         };
         let postings = self.postings.read().unwrap();
         let hits: Vec<RowPosition> = match query {
-            ScalarPredicate::Eq { value, .. } => postings
+            SargableQuery::Equals(value) => postings
                 .get(&value.to_string())
                 .cloned()
                 .unwrap_or_default(),
-            ScalarPredicate::In { values, .. } => values
+            SargableQuery::IsIn(values) => values
                 .iter()
                 .filter_map(|value| postings.get(&value.to_string()))
                 .flatten()
@@ -150,6 +151,17 @@ impl MemIndexPlugin for StubPlugin {
     fn training_criteria(&self) -> TrainingCriteria {
         TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
     }
+    fn query_parser(
+        &self,
+        index_name: String,
+        _params: &dyn MemIndexParams,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            "Stub".to_string(),
+            false,
+        )))
+    }
     fn validate(&self, ctx: &MemIndexBuildContext<'_>) -> Result<()> {
         ctx.single_column().map(|_| ())
     }
@@ -160,13 +172,7 @@ impl MemIndexPlugin for StubPlugin {
 }
 
 fn add_stub(store: &mut IndexStore, name: &str, column: &str) {
-    let spec = MemIndexSpec {
-        name: name.to_string(),
-        field_ids: vec![0],
-        columns: vec![column.to_string()],
-        plugin: Arc::new(StubPlugin("StubIndexDetails")),
-        params: Arc::new(()),
-    };
+    let spec = MemIndexSpec::for_plugin(name, 0, column, Arc::new(StubPlugin("StubIndexDetails")));
     store.add_index(
         name.to_string(),
         spec.build(&LanceSchema::default(), 1_000, 16).unwrap(),
@@ -287,10 +293,7 @@ fn an_index_is_found_by_the_question_not_by_its_type() {
     ];
     let store = IndexStore::from_specs(&specs, &lance, 1_000, 16).unwrap();
 
-    let equality = ScalarPredicate::Eq {
-        column: "id".to_string(),
-        value: ScalarValue::Int32(Some(1)),
-    };
+    let equality = SargableQuery::Equals(ScalarValue::Int32(Some(1)));
     assert!(
         store.index_answering("id", &equality).is_some(),
         "the B-tree answers equality on its column"
@@ -869,7 +872,7 @@ fn fts_from_metadata_accepts_v3_with_256_block_size() {
     assert_eq!(config.params.posting_block_size(), 256);
 }
 
-/// HNSW reports its graph before the first insert allocates it.
+/// HNSW reports its graph's fixed part before the first insert allocates it.
 #[test]
 fn test_resident_bytes_charges_hnsw_before_first_insert() {
     let max_rows = 100_000;
@@ -895,8 +898,8 @@ fn test_resident_bytes_charges_hnsw_before_first_insert() {
     )
     .unwrap();
     assert!(
-        with_hnsw.resident_bytes() > max_rows * 128,
-        "HNSW must report its preallocated graph, got {}",
+        with_hnsw.resident_bytes() > max_rows * 64,
+        "HNSW must report its graph's fixed part, got {}",
         with_hnsw.resident_bytes()
     );
 }
@@ -992,6 +995,10 @@ fn vector_schema() -> Arc<ArrowSchema> {
 #[case::hnsw_missing_column(
     MemIndexSpec::hnsw("idx", 9, "nope", DistanceType::L2),
     Some("not in the shard schema")
+)]
+#[case::flush_params_rejected(
+    wrapped(MemIndexSpec::btree("idx", 0, "id"), Deviation::RejectsFlushParams),
+    Some("flush parameters rejected")
 )]
 fn test_validate_index_specs(#[case] spec: MemIndexSpec, #[case] expected_error: Option<&str>) {
     let schema = vector_schema();
@@ -1187,10 +1194,7 @@ fn test_insert_batches_indexes_every_row_once(#[case] num_rows: usize) {
 
     let stub = store.get_index("id_stub").unwrap();
     for id in 0..num_rows as i32 {
-        let query = ScalarPredicate::Eq {
-            column: "id".to_string(),
-            value: ScalarValue::Int32(Some(id)),
-        };
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(id)));
         let found = stub
             .search(&query, &SearchContext::new(u64::MAX))
             .unwrap()
@@ -1252,9 +1256,9 @@ fn a_stand_in_full_text_index_reports_its_granularity() {
     );
 }
 
-/// Settings that differ only in a cached schema lookup are the same index; a
-/// plugin of another type with the same name, or another column or field, is
-/// not.
+/// Settings that differ only in a cached schema lookup are the same index;
+/// other settings, a plugin of another type with the same name, or another
+/// column or field are not.
 #[test]
 fn same_index_compares_what_an_index_is_built_from() {
     let arrow = ArrowSchema::new(vec![Field::new("text", DataType::Utf8, true)]);
@@ -1377,10 +1381,7 @@ fn a_shared_key_index_tracks_rewrites_through_a_fresh_capability() {
 /// one, or beside one that cannot serve, the store keeps its own B-tree.
 #[test]
 fn the_key_index_is_shared_or_owned() {
-    let equality = ScalarPredicate::Eq {
-        column: "id".to_string(),
-        value: ScalarValue::Int32(Some(2)),
-    };
+    let equality = SargableQuery::Equals(ScalarValue::Int32(Some(2)));
 
     let mut shared = IndexStore::new();
     shared.add_btree("id_idx".to_string(), 0, "id".to_string());

@@ -20,6 +20,7 @@ use lance_core::{
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
 use rstest::rstest;
 
@@ -783,10 +784,13 @@ async fn complete_logical_blob_schema_and_external_range_survive_assembly() {
 
 #[tokio::test]
 async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        blob_field("blob", true),
-    ]));
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field("blob", true),
+        ],
+        HashMap::from([(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string())]),
+    ));
     let make_batch = |ids: Vec<i32>, values: Vec<&'static [u8]>| {
         let mut blobs = BlobArrayBuilder::new(values.len());
         for value in values {

@@ -8,6 +8,7 @@ package lance.table;
 import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "file.proto";
+import "clustering.proto";
 import public "fragment_metadata.proto";
 
 /*
@@ -156,6 +157,14 @@ message Manifest {
    *   legacy-form entry in the same manifest -- or set the bit only when no
    *   entry declares covering fields -- and manifests derived from it must keep
    *   the bit set until a reverse conversion is likewise atomic.
+   * * 1 << 16: a referenced data file contains version 1 zone-level statistics
+   *   seeds. Their min/max exclude NaNs, which are counted separately by sign.
+   *   This does not change the ZoneMap index format. Both feature words
+   *   must carry the bit, atomically with the first reference. Unsupported
+   *   readers and writers must refuse the dataset. The bits remain set in
+   *   derived snapshots, including clone and restore, because data files may
+   *   retain version 1 seeds. Legacy seeds may coexist and must be decoded
+   *   with their original semantics.
    */
   uint64 reader_feature_flags = 9;
 
@@ -170,6 +179,9 @@ message Manifest {
    * * 1 << 15: the manifest also sets max_allocated_field_id. A writer must
    *   assign new field IDs above that value and advance it in the same commit.
    *   The field and flag must either both be set or both be absent.
+   * * 1 << 16: paired with the reader bit for version 1 zone-level statistics
+   *   seeds. Writers must preserve the seed contract and the required bits
+   *   during data writes, index maintenance, cleanup, clone, and restore.
    */
   uint64 writer_feature_flags = 10;
 
@@ -290,6 +302,20 @@ message Manifest {
    * both be set or both be absent. A mismatch is invalid.
    */
   optional int32 max_allocated_field_id = 24;
+
+  /* Immutable definitions referenced by fragment and index segment clustering_id.
+   * IDs are unique and non-zero. Keep every referenced definition in this snapshot.
+   * Requires writer flag 1 << 17; no clustering reader flag.
+   */
+  repeated Clustering clustering = 25;
+
+  /* Highest clustering ID ever allocated in this lineage; zero before the first.
+   * Allocate max_clustering_id + 1 and update this value in the same commit.
+   * Never decreases, including after definition removal or restore.
+   * u32::MAX exhausts the ID space. A nonzero value requires FLAG_OBJECT_METADATA.
+   */
+  uint32 max_clustering_id = 26;
+
 } // Manifest
 
 // external dataset base path
@@ -322,6 +348,11 @@ message IndexMetadata {
   UUID uuid = 1;
 
   /* The columns the index is keyed on, in key order. These refer to file.Field.id.
+   *
+   * On a stable-row-ID table, -3 may reference the logical _rowid column even
+   * though it is absent from the user schema. This identity is independent of
+   * whether a fragment stores its row IDs inline or in a hidden data column.
+   * An index on this field must store physical row addresses as its payload.
    *
    * When the manifest has feature flag 1 << 13, this list contains only key
    * fields. `covering_fields` independently declares the values the index
@@ -415,6 +446,19 @@ message IndexMetadata {
    * withdraw the payload while leaving this declaration in place.
    */
   repeated int32 covering_fields = 11;
+
+  /* Optional reference to a clustering definition in the same manifest.
+   * When present, the ID must be non-zero. Requires FLAG_OBJECT_METADATA (1 << 17)
+   * in writer_feature_flags; no clustering reader flag is required.
+   */
+  optional uint32 clustering_id = 12;
+
+  /* Arbitrary metadata associated with this index segment, like Manifest.table_metadata.
+   * Entries must remain valid after changes to the segment. Changes to the same
+   * segment preserve all entries, including unknown keys. New segments do not
+   * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
+   */
+  map<string, string> metadata = 13;
 }
 
 // Metadata about a single file within an index segment.
@@ -423,6 +467,20 @@ message IndexFile {
   string path = 1;
   // Size of the file in bytes
   uint64 size_bytes = 2;
+  /* Size in bytes of the file's metadata suffix, or 0 if unknown.
+   *
+   * For a Lance file of format version 2.0 or later, this is the file size minus
+   * the position of global buffer 0, which holds the file's `FileDescriptor`.
+   * That position is stored in the first entry of the global buffer offset
+   * table, which the footer locates. It is always 0 for legacy (0.1) Lance files
+   * and for files in other formats. Writers record either this exact value or 0.
+   *
+   * This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+   * bytes of the file before decoding the footer. The footer stays
+   * authoritative: readers must ignore a value larger than the file and read
+   * any metadata the footer references outside the hinted range.
+   */
+  uint64 file_metadata_size_bytes = 3;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.
