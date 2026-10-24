@@ -1142,6 +1142,13 @@ impl DocVisibility {
     }
 }
 
+/// A request's row-ID translation, excluded from reader-free cache snapshots.
+#[derive(Clone)]
+pub(super) enum DocumentRemapping {
+    Sync(Arc<dyn RowIdRemapper>),
+    Batch(Arc<dyn BatchRowIdRemapper>),
+}
+
 /// Modern query-side document state for one partition.
 pub(super) struct PartitionDocuments {
     store: Arc<dyn IndexStore>,
@@ -1517,8 +1524,13 @@ impl PartitionDocuments {
     pub(crate) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapping: Option<DocumentRemapping>,
     ) -> Self {
+        let (remapper, batch_remapper) = match remapping {
+            Some(DocumentRemapping::Sync(remapper)) => (Some(remapper), None),
+            Some(DocumentRemapping::Batch(remapper)) => (None, Some(remapper)),
+            None => (None, None),
+        };
         Self {
             store,
             path: self.path.clone(),
@@ -1529,7 +1541,7 @@ impl PartitionDocuments {
             persisted_total_tokens: self.persisted_total_tokens,
             quantized_scoring: self.quantized_scoring,
             remapper,
-            batch_remapper: None,
+            batch_remapper,
             lengths: self.lengths.clone(),
             projection: self.projection.clone(),
             shared_addresses: self.shared_addresses.clone(),
