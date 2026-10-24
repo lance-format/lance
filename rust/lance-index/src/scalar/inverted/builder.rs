@@ -495,6 +495,8 @@ impl InvertedIndexBuilder {
                     progress
                         .stage_progress("tokenize_docs", tokenized_count)
                         .await?;
+                    // A ready async-channel receiver does not consume Tokio's cooperative budget.
+                    tokio::task::yield_now().await;
                 }
                 worker.finish().await
             });
@@ -4652,8 +4654,15 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::single_worker(1)]
+    #[case::multiple_workers(3)]
     #[tokio::test]
-    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats(
+        #[case] workers: usize,
+        #[values(false, true)] with_position: bool,
+        #[values(128, 256)] block_size: usize,
+    ) -> Result<()> {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -4669,14 +4678,18 @@ mod tests {
             None,
             Some("hello"),
         ]);
-        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let batches = (0..batch.num_rows())
+            .map(|row| Ok(batch.slice(row, 1)))
+            .collect::<Vec<_>>();
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(batches));
         let params =
             InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
-                .with_position(false)
+                .with_position(with_position)
                 .remove_stop_words(true)
                 .stem(false)
                 .max_token_length(Some(6))
-                .num_workers(1);
+                .block_size(block_size)?
+                .num_workers(workers);
 
         let mut builder = InvertedIndexBuilder::new(params);
         builder
