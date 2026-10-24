@@ -45,16 +45,25 @@ fn validate_packed_array_length(array_type: &str, byte_len: usize, width: usize)
 /// `SegmentStats::n_holes` derives the hole count by subtracting the value
 /// count from the slot span, which underflows once a value is repeated.
 fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
-    let mut values = array.iter();
-    let previous = values.next()?;
-    values
-        .scan(previous, |previous, value| {
-            let pair = (*previous, value);
-            *previous = value;
-            Some(pair)
-        })
-        .enumerate()
-        .find_map(|(index, (previous, next))| (previous >= next).then_some((index, previous, next)))
+    // Offsets share one base, so their order is the values' order. The common
+    // case is a sorted array: a branch-free reduction over the packed slice
+    // vectorizes, and only an array that fails it is scanned for the index.
+    fn find<T: Ord>(values: &[T]) -> Option<usize> {
+        let sorted = values
+            .iter()
+            .zip(&values[1.min(values.len())..])
+            .fold(true, |sorted, (previous, next)| sorted & (previous < next));
+        if sorted {
+            return None;
+        }
+        values.windows(2).position(|pair| pair[0] >= pair[1])
+    }
+    let index = match array {
+        EncodedU64Array::U16 { offsets, .. } => find(offsets),
+        EncodedU64Array::U32 { offsets, .. } => find(offsets),
+        EncodedU64Array::U64(values) => find(values),
+    }?;
+    Some((index, array.get(index)?, array.get(index + 1)?))
 }
 
 /// Add a non-empty range to the run of consecutive, sorted, disjoint `Range`
@@ -62,7 +71,7 @@ fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64
 /// one and flushing the run first when `range` does not continue it.
 ///
 /// A table whose deletions cluster is written as many small `Range` segments
-/// (see `RowIdSequence::use_range_segments`). Kept as separate segments they
+/// (see `RowIdSequence::reencode`). Kept as separate segments they
 /// would cost a heap-allocated enum each and linear scans in every lookup;
 /// folded, they are two `u32` per range and a binary search.
 fn push_range(pending: &mut Vec<Range<u64>>, out: &mut Vec<U64Segment>, range: Range<u64>) {
@@ -298,6 +307,16 @@ impl From<U64Segment> for pb::U64Segment {
     }
 }
 
+/// Little-endian bytes of packed `values`, `width` bytes each, written in one
+/// pass into a buffer of the final size.
+fn le_bytes<T: Copy + Into<u64>>(values: &[T], width: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * width);
+    for &value in values {
+        bytes.extend_from_slice(&value.into().to_le_bytes()[..width]);
+    }
+    bytes
+}
+
 impl From<EncodedU64Array> for pb::EncodedU64Array {
     fn from(array: EncodedU64Array) -> Self {
         match array {
@@ -305,10 +324,7 @@ impl From<EncodedU64Array> for pb::EncodedU64Array {
                 array: Some(pb::encoded_u64_array::Array::U16Array(
                     pb::encoded_u64_array::U16Array {
                         base,
-                        offsets: offsets
-                            .iter()
-                            .flat_map(|&offset| offset.to_le_bytes().to_vec())
-                            .collect(),
+                        offsets: le_bytes(&offsets, 2),
                     },
                 )),
             },
@@ -316,20 +332,14 @@ impl From<EncodedU64Array> for pb::EncodedU64Array {
                 array: Some(pb::encoded_u64_array::Array::U32Array(
                     pb::encoded_u64_array::U32Array {
                         base,
-                        offsets: offsets
-                            .iter()
-                            .flat_map(|&offset| offset.to_le_bytes().to_vec())
-                            .collect(),
+                        offsets: le_bytes(&offsets, 4),
                     },
                 )),
             },
             EncodedU64Array::U64(values) => Self {
                 array: Some(pb::encoded_u64_array::Array::U64Array(
                     pb::encoded_u64_array::U64Array {
-                        values: values
-                            .iter()
-                            .flat_map(|&value| value.to_le_bytes().to_vec())
-                            .collect(),
+                        values: le_bytes(&values, 8),
                     },
                 )),
             },
