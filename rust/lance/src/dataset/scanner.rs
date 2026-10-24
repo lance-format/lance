@@ -236,13 +236,13 @@ fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
 }
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
-/// cosine on SQ and PQ as L2 over normalized vectors, twice `1 - cos`; FLAT
-/// and RQ rank it, and every other metric, on its own scale.
+/// cosine on SQ, PQ, and RQ as L2 over normalized vectors, twice `1 - cos`;
+/// FLAT ranks it, and every other metric, on its own scale.
 fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
     let quantized_as_l2 = segments.iter().any(|segment| {
         segment.index_details.as_ref().is_some_and(|details| {
             let index_type = crate::index::vector::details::derive_vector_index_type(details);
-            index_type.ends_with("PQ") || index_type.ends_with("SQ")
+            index_type.ends_with("PQ") || index_type.ends_with("SQ") || index_type.ends_with("RQ")
         })
     });
     if metric == MetricType::Cosine && quantized_as_l2 {
@@ -7333,6 +7333,21 @@ impl Scanner {
         let keep_quantized_distances =
             self.quantized_refine_factor.is_some() && q.refine_factor.is_none();
 
+        // Retained RQ scores use the index's native distance scale. Convert the
+        // flat arms' bounds before filtering, then their scores before merging;
+        // fetching indexed vectors just to recompute distances defeats quantized refinement.
+        let flat_distance_scale = if keep_quantized_distances {
+            q.metric_type
+                .map_or(1.0, |metric| index_distance_scale(metric, indexed_segments))
+        } else {
+            1.0
+        };
+        let flat_query = Query {
+            lower_bound: q.lower_bound.map(|bound| bound / flat_distance_scale),
+            upper_bound: q.upper_bound.map(|bound| bound / flat_distance_scale),
+            ..q.clone()
+        };
+
         // Ensure the vector column is present for distance computation.
         if !keep_quantized_distances && knn_node.schema().column_with_name(&q.column).is_none() {
             let vector_projection = self
@@ -7380,7 +7395,7 @@ impl Scanner {
                 Some(mask) => Arc::new(RowAddrMaskFilterExec::new(scan_node, mask)) as _,
                 None => scan_node,
             };
-            let topk_fallback = self.flat_knn(scan_node, &q)?;
+            let topk_fallback = self.flat_knn(scan_node, &flat_query)?;
             let topk_fallback: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_fallback);
@@ -7405,10 +7420,38 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
-            let topk_stale = self.flat_knn(stale_node, &q)?;
+            let topk_stale = self.flat_knn(stale_node, &flat_query)?;
             let topk_stale: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_stale, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_stale);
+        }
+
+        if flat_distance_scale != 1.0 {
+            for input in &mut flat_inputs {
+                let exprs: Vec<_> = input
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        let column =
+                            Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>;
+                        let expr = if field.name() == DIST_COL {
+                            Arc::new(expressions::BinaryExpr::new(
+                                column,
+                                datafusion::logical_expr::Operator::Multiply,
+                                Arc::new(Literal::new(ScalarValue::Float32(Some(
+                                    flat_distance_scale,
+                                )))),
+                            )) as Arc<dyn PhysicalExpr>
+                        } else {
+                            column
+                        };
+                        (expr, field.name().clone())
+                    })
+                    .collect();
+                *input = Arc::new(ProjectionExec::try_new(exprs, input.clone())?);
+            }
         }
 
         // Union: flat paths first (matching original order), then ANN results.
@@ -9246,6 +9289,8 @@ mod test {
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+    use lance_index::vector::bq::builder::RabitQuantizer;
+    use lance_index::vector::bq::{RQBuildParams, RQRotationType};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -20671,6 +20716,177 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert!(plan.contains("KNNVectorDistance"), "{plan}");
         let quantized_then_exact_results = quantized_then_exact.try_into_batch().await.unwrap();
         assert_eq!(quantized_then_exact_results, exact_results);
+    }
+
+    #[rstest]
+    #[case::rq4(4)]
+    #[case::rq8(8)]
+    #[tokio::test]
+    async fn test_quantized_refinement_merges_unindexed_distance_scales(
+        #[case] num_bits: u8,
+        #[values(DistanceType::Cosine, DistanceType::L2, DistanceType::Dot)] metric: DistanceType,
+        #[values(false, true)] exact_refine: bool,
+        #[values(None, Some((0.15, 0.25)), Some((0.28, 0.32)))] range: Option<(f32, f32)>,
+    ) {
+        const DIM: usize = 32;
+        let make_batch = |rows: usize, first: f32, nearest_boost: f32| {
+            let mut values = Vec::with_capacity(rows * DIM);
+            for row in 0..rows {
+                // Separate the nearest ten so recall measures the merge rather
+                // than approximation noise among nearly tied RQ4 scores.
+                let boost = if row < 10 { nearest_boost } else { 0.0 };
+                let x = first + boost + row as f32 * 0.0001;
+                let tail: Vec<f32> = (1..DIM)
+                    .map(|dim| ((row * 37 + dim * 19) as f32).sin())
+                    .collect();
+                let norm = tail.iter().map(|value| value * value).sum::<f32>().sqrt();
+                values.push(x);
+                values.extend(tail.iter().map(|value| value / norm * (1.0 - x * x).sqrt()));
+            }
+            RecordBatch::try_from_iter([(
+                "vec",
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                        .unwrap(),
+                ) as ArrayRef,
+            )])
+            .unwrap()
+        };
+        let indexed = make_batch(128, 0.8, 0.04);
+        let centroids = indexed["vec"].as_fixed_size_list().slice(0, 4);
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(indexed.clone())], indexed.schema()),
+            &tmp,
+            Some(WriteParams {
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut rq_params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
+        let mut rotation = RabitQuantizer::new::<Float32Type>(num_bits, DIM as i32)
+            .metadata_ref()
+            .clone();
+        // Reuse a fixed rotation so recall assertions are deterministic.
+        for (index, signs) in rotation
+            .fast_rotation_signs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            *signs = (index * 37 + 19) as u8;
+        }
+        rq_params.rotation = Some(rotation);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_rq_params(
+                    metric,
+                    IvfBuildParams::try_with_centroids(4, Arc::new(centroids)).unwrap(),
+                    rq_params,
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+        let appended = make_batch(16, 0.7, 0.0);
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+
+        let mut query = vec![0.0; DIM];
+        query[0] = 1.0;
+        let query = Float32Array::from(query);
+        let scale = if metric == DistanceType::Cosine && !exact_refine {
+            2.0
+        } else {
+            1.0
+        };
+        // Fixture ranges are expressed as 1 - cos. L2 on unit vectors is twice
+        // that, as are native RQ cosine scores without exact refinement.
+        let metric_scale = if metric == DistanceType::L2 { 2.0 } else { 1.0 };
+        let mut exact = dataset.scan();
+        exact
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(metric)
+            .use_index(false)
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        if let Some((lower, upper)) = range {
+            exact.distance_range(Some(lower * metric_scale), Some(upper * metric_scale));
+        }
+        let expected = exact.try_into_batch().await.unwrap();
+        let expected_ids = BTreeSet::from_iter(batch_row_ids(&expected));
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(metric)
+            .nprobes(4)
+            .quantized_refine(64)
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        if exact_refine {
+            scanner.refine(2);
+        }
+        if let Some((lower, upper)) = range {
+            scanner.distance_range(
+                Some(lower * metric_scale * scale),
+                Some(upper * metric_scale * scale),
+            );
+        }
+        let plan = scanner.explain_plan(false).await.unwrap();
+        if !exact_refine {
+            // Only the unindexed scan computes vector distances. Indexed rows
+            // retain their RQ scores without taking their original vectors.
+            assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
+            assert!(!plan.contains("Take:"), "{plan}");
+        }
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(results.num_rows(), 10);
+        let ids = batch_row_ids(&results);
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count();
+        assert!(
+            recall >= 5,
+            "recall={recall}/10, metric={metric:?}, ids={ids:?}"
+        );
+        for (row, distance) in results[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .enumerate()
+        {
+            if let Some((lower, upper)) = range {
+                assert!(
+                    (lower * metric_scale * scale..upper * metric_scale * scale).contains(distance)
+                );
+            }
+            if RowAddress::from(ids[row]).fragment_id() == 4 {
+                let offset = RowAddress::from(ids[row]).row_offset();
+                let expected_distance =
+                    (1.0 - (0.7 + offset as f32 * 0.0001)) * metric_scale * scale;
+                assert!((distance - expected_distance).abs() < 1e-5);
+            } else {
+                assert!(
+                    range != Some((0.28, 0.32)),
+                    "indexed row passed appended-only bounds"
+                );
+            }
+        }
     }
 
     #[tokio::test]
