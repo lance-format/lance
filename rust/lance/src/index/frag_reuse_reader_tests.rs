@@ -53,9 +53,10 @@ async fn vector_fragment_search_requires_every_contributor(
         .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
         .await
         .unwrap();
+    // Not L2: the column default would hide a flat fallback that drops the index's metric.
     let params = crate::index::vector::VectorIndexParams::ivf_flat(
         1,
-        lance_linalg::distance::DistanceType::L2,
+        lance_linalg::distance::DistanceType::Cosine,
     );
     let fragments: Vec<_> = dataset
         .fragments()
@@ -199,6 +200,10 @@ async fn vector_fragment_search_requires_every_contributor(
     }
     let plan = scan.explain_plan(false).await.unwrap();
     assert_eq!(plan.contains("ANN"), selection != "partial", "{plan}");
+    if selection == "partial" {
+        // The query names no metric, so the flat fallback ranks by the index's.
+        assert!(plan.contains("KNNVectorDistance: metric=cosine"), "{plan}");
+    }
     let result = scan.try_into_batch().await.unwrap();
     assert_eq!(result.num_rows(), expected_rows);
     if expected_rows == 8 {
