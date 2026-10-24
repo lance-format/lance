@@ -89,9 +89,9 @@ pub(super) fn restore_chunk64(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        // `i64 -> f64` conversion needs AVX-512; older x86 falls back.
+        // `i64 -> f64` conversion needs AVX-512DQ as well as AVX-512F.
         let host = CpuFeatures::host();
-        if host.contains(CpuFeatures::AVX512F) {
+        if host.contains(CpuFeatures::AVX512F.union(CpuFeatures::AVX512DQ)) {
             return unsafe { restore_chunk64_avx512(offsets, base, div, e, f, out) };
         }
         restore_chunk64_scalar(offsets, base, div, e, f, out)
@@ -205,8 +205,9 @@ pub(super) fn restore_delta_chunk64(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        // `i64 -> f64` conversion needs AVX-512DQ as well as AVX-512F.
         let host = CpuFeatures::host();
-        if host.contains(CpuFeatures::AVX512F) {
+        if host.contains(CpuFeatures::AVX512F.union(CpuFeatures::AVX512DQ)) {
             return unsafe {
                 restore_delta_chunk64_avx512(offsets, base, delta_base, div, e, f, out)
             };
@@ -519,7 +520,7 @@ unsafe fn restore_delta_chunk32_neon(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,avx512dq")]
 unsafe fn restore_delta_chunk64_avx512(
     offsets: &[u64],
     base: i64,
@@ -807,7 +808,7 @@ unsafe fn restore_chunk32_neon(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,avx512dq")]
 unsafe fn restore_chunk64_avx512(
     offsets: &[u64],
     base: i64,
@@ -1417,13 +1418,23 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_avx512_matches_scalar() {
+    fn test_avx512_f32_matches_scalar() {
         if !std::arch::is_x86_feature_detected!("avx512f") {
             return;
         }
         assert_restore32_equivalent(restore_chunk32_avx512);
-        assert_restore64_equivalent(restore_chunk64_avx512);
         assert_delta32_equivalent(restore_delta_chunk32_avx512);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_f64_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx512f")
+            || !std::arch::is_x86_feature_detected!("avx512dq")
+        {
+            return;
+        }
+        assert_restore64_equivalent(restore_chunk64_avx512);
         assert_delta64_equivalent(restore_delta_chunk64_avx512);
     }
 }
