@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::{
+    compression::{DecompressionStrategy, DefaultDecompressionStrategy},
     decoder::ColumnInfo,
     encodings::physical::binary::BinaryMiniBlockDecompressor,
     format::{metadata, pb23},
@@ -108,6 +109,25 @@ fn validate_compressive_encoding(
             required(split.values.as_deref(), "byte-stream-split values")?,
             position.child(),
         ),
+        Some(Compression::Alp(alp)) => {
+            if !matches!(alp.bits_per_value, 32 | 64) {
+                return Err(Error::invalid_input_source(
+                    "Lance v2.3 ALP requires 32 or 64-bit values".into(),
+                ));
+            }
+            Ok(())
+        }
+        Some(Compression::AxisDelta(_)) => {
+            if position != EncodingPosition::PerValue {
+                return Err(Error::invalid_input(format!(
+                    "Tensor transform is not supported in {} positions",
+                    position.name()
+                )));
+            }
+            DefaultDecompressionStrategy::default()
+                .create_fixed_per_value_decompressor(encoding)
+                .map(|_| ())
+        }
         Some(Compression::General(general)) => validate_compressive_encoding(
             required(general.values.as_deref(), "general-compression values")?,
             position.child(),
@@ -408,6 +428,41 @@ mod grammar_tests {
                 bits_per_value,
                 data: None,
             })),
+        }
+    }
+
+    #[rstest::rstest]
+    fn axis_delta_requires_per_value_position(
+        #[values(
+            EncodingPosition::OptionalPayloadBlock,
+            EncodingPosition::BufferBackedBlock,
+            EncodingPosition::MiniBlock,
+            EncodingPosition::PerValue
+        )]
+        position: EncodingPosition,
+    ) {
+        let encoding = CompressiveEncoding {
+            compression: Some(Compression::AxisDelta(Box::new(metadata::AxisDelta {
+                values: Some(Box::new(lance_encoding::format::EncodingUtils::fsl(
+                    64,
+                    false,
+                    flat(16),
+                ))),
+                axis_length: 8,
+                inner_stride: 1,
+            }))),
+        };
+        let result = validate_compressive_encoding(&encoding, position);
+        if position == EncodingPosition::PerValue {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Tensor transform is not supported")
+            );
         }
     }
 

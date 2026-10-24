@@ -4,16 +4,18 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result, datatypes::Field};
+use lance_encoding::compression::PerValueGeneralCompression;
 use lance_encoding::compression::try_packed_struct_per_value;
 use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
-        try_bitpacking_block, try_bitpacking_miniblock, try_byte_stream_split_miniblock,
-        try_child_rle_miniblock, try_fixed_packed_struct_miniblock, try_fixed_size_list_block,
-        try_fixed_u8_rle_miniblock, try_general_block, try_raw_block,
-        try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock, try_raw_per_value,
-        try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
-        try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
+        try_alp_miniblock, try_bitpacking_block, try_bitpacking_miniblock,
+        try_byte_stream_split_miniblock, try_child_rle_miniblock,
+        try_fixed_packed_struct_miniblock, try_fixed_size_list_block, try_fixed_u8_rle_miniblock,
+        try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
+        try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
+        try_variable_rle_block, try_variable_width_miniblock_with_generic_offsets,
+        try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -66,6 +68,8 @@ impl CompressionStrategy for Strategy {
         let compressor =
             if let Some(compressor) = try_uncompressed_fixed_width_miniblock(data, &params) {
                 compressor
+            } else if let Some(compressor) = try_alp_miniblock(field, data, &params) {
+                compressor
             } else if let Some(compressor) = try_byte_stream_split_miniblock(data, &params) {
                 compressor
             } else if let Some(compressor) = try_child_rle_miniblock(data, &params) {
@@ -100,6 +104,11 @@ impl CompressionStrategy for Strategy {
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
         let params = self.field_params(field);
+        if let Some(compressor) =
+            lance_encoding::compression::try_tensor_per_value(field, data, &params)?
+        {
+            return Ok(compressor);
+        }
         if let Some(compressor) = try_raw_per_value(data) {
             return Ok(compressor);
         }
@@ -107,7 +116,9 @@ impl CompressionStrategy for Strategy {
         {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_variable_width_per_value(field, data, &params)? {
+        if let Some(compressor) =
+            try_variable_width_per_value(field, data, &params, PerValueGeneralCompression::Any)?
+        {
             return Ok(compressor);
         }
         Err(Error::not_supported_source(

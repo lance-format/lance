@@ -81,9 +81,18 @@ where
 
     let vectors_slice = vectors.values();
     let centroids_slice = centroids.values();
+    let num_centroids = centroids_slice.len() / dimension;
     let mut residuals = Vec::with_capacity(vectors.len());
     for (idx, vector) in vectors_slice.chunks_exact(dimension).enumerate() {
         let part_id = part_ids[idx] as usize;
+        // A precomputed partitions file is user data, so an id beyond the
+        // centroid count has to be an error rather than a slice panic.
+        if part_id >= num_centroids {
+            return Err(Error::invalid_input(format!(
+                "Compute residual vector: partition id {part_id} is out of range for \
+                 {num_centroids} centroids"
+            )));
+        }
         let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
         residuals.extend(iter::zip(vector, c).map(|(v, cent)| *v - *cent));
     }
@@ -447,5 +456,31 @@ mod tests {
         assert_eq!(field.data_type(), residual.data_type());
         assert_eq!(residual.value_type(), DataType::Float32);
         assert_eq!(f32_values(residual), vec![3.5, 7.5]);
+    }
+
+    /// Partition ids can come from a user-supplied precomputed partitions
+    /// dataset, which nothing range-checks on the way in, so an id beyond the
+    /// centroid count has to surface as an error rather than a slice panic.
+    #[test]
+    fn test_compute_residual_rejects_out_of_range_partition() {
+        let centroids = fsl(Float32Array::from(vec![0.0f32, 0.0, 1.0, 1.0]), 2);
+        let vectors = fsl(Float32Array::from(vec![0.5f32, 0.5]), 2);
+        let part_ids = UInt32Array::from(vec![5u32]);
+        let error = compute_residual(
+            &centroids,
+            &vectors,
+            Some(DistanceType::L2),
+            Some(&part_ids),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("partition id 5") && message.contains("2 centroids"),
+            "the error must name the id and the centroid count: {message}"
+        );
     }
 }

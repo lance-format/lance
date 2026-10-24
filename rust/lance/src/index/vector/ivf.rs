@@ -83,7 +83,7 @@ use lance_index::vector::pq::storage::{
 };
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
-use lance_index::vector::v3::shuffler::create_ivf_shuffler;
+use lance_index::vector::v3::shuffler::create_owned_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
@@ -805,9 +805,7 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let format_version = dataset_format_version(dataset);
 
-    let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
-    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
+    let shuffler = create_owned_ivf_shuffler(num_partitions, format_version, None)?;
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let summary = match index_type {
@@ -1117,6 +1115,7 @@ async fn optimize_ivf_pq_indices(
         IndexFile {
             path: INDEX_FILE_NAME.to_string(),
             size_bytes,
+            file_metadata_size_bytes: None,
         },
     ))
 }
@@ -1276,10 +1275,12 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_size,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: aux_size,
+                file_metadata_size_bytes: None,
             },
         ],
     ))
@@ -2425,6 +2426,7 @@ pub(crate) async fn remap_index_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -2493,6 +2495,7 @@ async fn write_ivf_pq_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -3042,6 +3045,7 @@ async fn write_root_vector_index_from_auxiliary(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -4989,6 +4993,85 @@ fn weighted_subset<T: StreamingKMeansArrowType>(
     ))
 }
 
+/// Splits `cluster` in two by L2 around the row farthest from its centroid and
+/// the row farthest from that one, or returns `None` when all its rows are
+/// identical. Each seed row is nearest to itself, so both halves are non-empty
+/// whenever the rows differ.
+fn bisect_weighted_cluster<T: StreamingKMeansArrowType>(
+    cluster: &WeightedCluster<T>,
+    data_values: &[T::Native],
+    weights: &[f64],
+    losses: &[f64],
+    dimension: usize,
+    metric_policy: &dyn StreamingFloatKMeansMetricPolicy<T>,
+    next_cluster_id: &mut usize,
+) -> Result<Option<[WeightedCluster<T>; 2]>> {
+    let row = |idx: usize| &data_values[idx * dimension..(idx + 1) * dimension];
+    let farthest_from = |anchor: &[T::Native]| {
+        cluster
+            .indices
+            .iter()
+            .copied()
+            .max_by(|&a, &b| squared_l2(row(a), anchor).total_cmp(&squared_l2(row(b), anchor)))
+    };
+    let Some(first) = farthest_from(&cluster.centroid) else {
+        return Ok(None);
+    };
+    let Some(second) = farthest_from(row(first)) else {
+        return Ok(None);
+    };
+    if squared_l2(row(first), row(second)) == 0.0 {
+        return Ok(None);
+    }
+    let (near_first, near_second): (Vec<usize>, Vec<usize>) = cluster
+        .indices
+        .iter()
+        .partition(|&&idx| squared_l2(row(idx), row(first)) <= squared_l2(row(idx), row(second)));
+    let mut make_half = |indices: Vec<usize>| -> Result<WeightedCluster<T>> {
+        let weight = indices.iter().map(|&idx| weights[idx]).sum::<f64>();
+        let mut centroid = vec![T::Native::default(); dimension];
+        for &idx in &indices {
+            let row_weight = cast_weight::<T>(weights[idx], format_args!("bisected row {idx}"))?;
+            for (sum, value) in centroid.iter_mut().zip(row(idx)) {
+                *sum += *value * row_weight;
+            }
+        }
+        if weight > 0.0 {
+            let weight = cast_weight::<T>(weight, "bisected cluster")?;
+            centroid
+                .iter_mut()
+                .for_each(|value| *value = *value / weight);
+        } else {
+            centroid.copy_from_slice(row(indices[0]));
+        }
+        let loss = indices
+            .iter()
+            .map(|&idx| losses[idx] + weights[idx] * squared_l2(row(idx), &centroid))
+            .sum();
+        let split_priority = metric_policy.split_priority(
+            data_values,
+            weights,
+            &indices,
+            &centroid,
+            dimension,
+            loss,
+        );
+        let id = *next_cluster_id;
+        *next_cluster_id += 1;
+        Ok(WeightedCluster {
+            id,
+            indices,
+            centroid,
+            weight,
+            split_priority,
+            finalized: true,
+        })
+    };
+    let first = make_half(near_first)?;
+    let second = make_half(near_second)?;
+    Ok(Some([first, second]))
+}
+
 fn train_weighted_hierarchical_kmeans<T: StreamingKMeansArrowType>(
     data: &FixedSizeListArray,
     weights: &[f64],
@@ -5059,10 +5142,16 @@ fn train_weighted_hierarchical_kmeans<T: StreamingKMeansArrowType>(
         let mut cluster = heap
             .pop()
             .ok_or_else(|| Error::index("No weighted cluster can be further split"))?;
-        if cluster.finalized || cluster.indices.len() <= 1 {
-            cluster.finalized = true;
+        if cluster.finalized {
             heap.push(cluster);
             break;
+        }
+        if cluster.indices.len() <= 1 {
+            // A singleton can retain a large coreset loss while other clusters
+            // still have multiple summaries to split.
+            cluster.finalized = true;
+            heap.push(cluster);
+            continue;
         }
 
         let remaining_k = target_k - heap.len();
@@ -5129,25 +5218,70 @@ fn train_weighted_hierarchical_kmeans<T: StreamingKMeansArrowType>(
         }
     }
 
+    // The split loop can stop with multi-row clusters left: a k-means split can
+    // leave every row on one side even when the rows differ, which happens
+    // under Dot, and a singleton at the top of the heap ends the loop. Bisect
+    // the remaining multi-row clusters by L2 until `target_k` is reached, so
+    // the count falls short only when the coreset holds fewer distinct rows.
     let mut clusters = heap.into_vec();
-    clusters.sort_by_key(|cluster| cluster.id);
-    while clusters.len() < target_k {
-        let duplicate = clusters
-            .iter()
-            .max_by(|left, right| {
-                left.weight
-                    .partial_cmp(&right.weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .cloned()
-            .ok_or_else(|| Error::index("No weighted clusters were trained"))?;
-        clusters.push(WeightedCluster {
-            id: next_cluster_id,
-            ..duplicate
-        });
-        next_cluster_id += 1;
+    let mut unsplittable = Vec::new();
+    while clusters.len() + unsplittable.len() < target_k {
+        let Some(position) = (0..clusters.len())
+            .filter(|&position| clusters[position].indices.len() > 1)
+            .max_by(|&a, &b| clusters[a].cmp(&clusters[b]))
+        else {
+            break;
+        };
+        let cluster = clusters.swap_remove(position);
+        match bisect_weighted_cluster(
+            &cluster,
+            data_values,
+            weights,
+            losses,
+            dimension,
+            metric_policy,
+            &mut next_cluster_id,
+        )? {
+            Some(halves) => clusters.extend(halves),
+            None => unsplittable.push(cluster),
+        }
     }
-    clusters.truncate(target_k);
+    clusters.append(&mut unsplittable);
+    clusters.sort_by_key(|cluster| cluster.id);
+    if clusters.len() < target_k {
+        // Padding the count with clones of the heaviest cluster left partitions
+        // whose centroid ties exactly with the original, which assignment keeps,
+        // so they started empty. Reject instead, like the flat hierarchical
+        // trainer: after the bisection above, the coreset has fewer distinct
+        // rows than `target_k`.
+        if data.len() < target_k {
+            // Not the data's fault: the coreset summarizing the training sample
+            // is smaller than the partition count, as Dot's can be when its only
+            // chunk samples exactly `num_partitions` rows.
+            return Err(Error::invalid_input(format!(
+                "Cannot create {target_k} IVF partitions from {} weighted coreset rows: the \
+                 coreset summarizing the training sample is smaller than the partition \
+                 count. Increase sample_rate or reduce num_partitions.",
+                data.len()
+            )));
+        }
+        return Err(Error::invalid_input(format!(
+            "Cannot create {target_k} IVF partitions: weighted k-means could only form {} \
+             non-empty clusters from {} weighted coreset rows, and the rest could not be \
+             split further. Reduce num_partitions to <= {} or provide more diverse data.",
+            clusters.len(),
+            data.len(),
+            clusters.len()
+        )));
+    }
+    // The split loop stops at `target_k`, and every `cluster_k` it takes is
+    // bounded by what is left, so the count lands exactly on `target_k`.
+    debug_assert_eq!(
+        clusters.len(),
+        target_k,
+        "weighted kmeans formed {} clusters for target_k {target_k}",
+        clusters.len()
+    );
 
     let mut values = Vec::with_capacity(target_k * dimension);
     for cluster in clusters {
@@ -5683,6 +5817,7 @@ mod tests {
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::progress::noop_progress;
     use lance_index::scalar::OldIndexDataFilter;
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch_into;
     use lance_testing::datagen::{
@@ -6280,6 +6415,79 @@ mod tests {
             .unwrap();
         assert_eq!(1, results.len());
         assert_eq!(5, results[0].num_rows());
+    }
+
+    /// A precomputed partitions file is user data. Its ids index the centroids
+    /// in the transform, so IVF_PQ's residual step and IVF_RQ's distance to the
+    /// chosen centroid reach a bad id before the shuffler's own range check
+    /// (`v3/shuffler.rs`) can run.
+    #[rstest]
+    #[case::ivf_pq(IndexType::IvfPq)]
+    #[case::ivf_rq(IndexType::IvfRq)]
+    #[tokio::test]
+    async fn test_create_index_rejects_out_of_range_precomputed_partition(
+        #[case] index_type: IndexType,
+    ) {
+        let test_dir = TempStrDir::default();
+        let test_uri = format!("{}/ds", test_dir.as_str());
+        let partitions_uri = format!("{}/parts", test_dir.as_str());
+
+        let (mut dataset, _) = generate_test_dataset(&test_uri, 0.0..1.0).await;
+        let num_rows = dataset.count_rows(None).await.unwrap() as u64;
+
+        // Partition 7 does not exist in a 2-partition index.
+        let parts_schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("partition", DataType::UInt32, false),
+        ]));
+        let parts_batch = RecordBatch::try_new(
+            parts_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..num_rows).map(|i| if i == 3 { 7 } else { 0 }),
+                )),
+            ],
+        )
+        .unwrap();
+        let parts_reader =
+            RecordBatchIterator::new(vec![parts_batch].into_iter().map(Ok), parts_schema);
+        Dataset::write(parts_reader, &partitions_uri, None)
+            .await
+            .unwrap();
+
+        let centroids = generate_random_array(2 * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+        ivf_params.precomputed_partitions_file = Some(partitions_uri);
+        let params = match index_type {
+            IndexType::IvfPq => {
+                let pq_params =
+                    PQBuildParams::with_codebook(4, 8, Arc::new(generate_random_array(256 * DIM)));
+                VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfRq => VectorIndexParams::with_ivf_rq_params(
+                MetricType::L2,
+                ivf_params,
+                RQBuildParams::default(),
+            ),
+            _ => unreachable!("not a case of this test"),
+        };
+
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect_err("an out-of-range precomputed partition must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("partition id 7") && message.contains("out of range for 2"),
+            "the error must name the id and the partition count: {message}"
+        );
     }
 
     fn partition_ids(mut ids: Vec<u64>, num_parts: u32) -> Vec<Vec<u64>> {
@@ -7293,6 +7501,105 @@ mod tests {
         );
     }
 
+    /// Padding the partition count with clones of the heaviest cluster left
+    /// partitions that started empty; reject like the flat hierarchical
+    /// trainer. A coreset smaller than the partition count and a coreset whose
+    /// rows are identical both reach the shortfall, and each gets its own
+    /// advice.
+    #[rstest::rstest]
+    #[case::fewer_rows_than_partitions(6, 16, "Increase sample_rate")]
+    #[case::enough_rows_all_identical(32, 16, "provide more diverse data")]
+    #[test]
+    fn test_weighted_hierarchical_rejects_padding_with_duplicates(
+        #[case] num_points: usize,
+        #[case] target_k: usize,
+        #[case] advice: &str,
+    ) {
+        let dimension = 8;
+        // Every row identical in the second case, a ramp in the first: either
+        // way the trainer cannot reach `target_k` non-empty clusters.
+        let values: Vec<f32> = if num_points < target_k {
+            (0..num_points * dimension)
+                .map(|i| i as f32 * 0.01)
+                .collect()
+        } else {
+            vec![0.5; num_points * dimension]
+        };
+        let data = streaming_kmeans_fsl_from_values::<Float32Type>(values, dimension).unwrap();
+        let params = WeightedHierarchicalKMeansParams {
+            dimension,
+            target_k,
+            metric_policy: &L2_METRIC_POLICY,
+            max_iters: 2,
+            on_progress: Arc::new(|_, _| {}),
+        };
+        let err = train_weighted_hierarchical_kmeans::<Float32Type>(
+            &data,
+            &vec![1.0; num_points],
+            &vec![0.1; num_points],
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("Cannot create {target_k} IVF partitions")),
+            "got: {msg}"
+        );
+        // The row count belongs in the message: it is the coreset size, not
+        // the dataset's, so a reader can tell the two shortfalls apart.
+        assert!(
+            msg.contains(&format!("{num_points} weighted coreset rows")),
+            "got: {msg}"
+        );
+        assert!(msg.contains(advice), "got: {msg}");
+    }
+
+    /// Under Dot, positive 1-D rows all go to the largest centroid, so every
+    /// k-means split leaves its rows on one side. The rows are distinct, so the
+    /// trainer must still reach `target_k` distinct centroids rather than
+    /// reject the request, for f32 and f64 centroids alike.
+    fn bisects_clusters_kmeans_cannot_split<T: StreamingKMeansArrowType>() {
+        let num_points = 8;
+        let target_k = 4;
+        let values = (1..=num_points)
+            .map(|i| T::Native::from_f64(i as f64).unwrap())
+            .collect::<Vec<_>>();
+        let data = streaming_kmeans_fsl_from_values::<T>(values, 1).unwrap();
+        let params = WeightedHierarchicalKMeansParams {
+            dimension: 1,
+            target_k,
+            metric_policy: &DOT_METRIC_POLICY,
+            max_iters: 5,
+            on_progress: Arc::new(|_, _| {}),
+        };
+
+        let centroids = train_weighted_hierarchical_kmeans::<T>(
+            &data,
+            &vec![1.0; num_points],
+            &vec![0.0; num_points],
+            &params,
+        )
+        .unwrap();
+        let mut values = centroids
+            .values()
+            .as_primitive::<T>()
+            .values()
+            .iter()
+            .map(|value| value.as_())
+            .collect::<Vec<f64>>();
+        values.sort_by(f64::total_cmp);
+        values.dedup();
+        assert_eq!(values.len(), target_k, "centroids: {values:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::f32(bisects_clusters_kmeans_cannot_split::<Float32Type> as fn())]
+    #[case::f64(bisects_clusters_kmeans_cannot_split::<Float64Type> as fn())]
+    fn test_weighted_hierarchical_bisects_clusters_kmeans_cannot_split(#[case] check: fn()) {
+        check();
+    }
+
     #[tokio::test]
     async fn test_build_ivf_model_streaming_dot_coreset_training() {
         const DIMENSION: usize = 4;
@@ -8196,16 +8503,26 @@ mod tests {
         assert!(error.to_string().contains("input lengths do not match"));
     }
 
-    #[test]
-    fn test_weighted_hierarchical_splits_until_target_k() {
+    #[rstest]
+    #[case::zero_loss(17, 0.0)]
+    #[case::lossy_coreset(32, 1_000.0)]
+    #[case::exhausted_splits(33, 1_000.0)]
+    fn test_weighted_hierarchical_splits_until_target_k(
+        #[case] target_k: usize,
+        #[case] base_loss: f64,
+    ) {
         let values = (0..16)
             .flat_map(|value| [value as f32, value as f32 + 0.1])
             .collect::<Vec<_>>();
         let data = streaming_kmeans_fsl_from_values::<Float32Type>(values, 1).unwrap();
+        // A singleton summary can retain a large loss from the raw vectors it
+        // represents, even though that summary cannot be split any further.
+        let mut losses = vec![0.0; data.len()];
+        losses[0] = base_loss;
         let progress = Arc::new(|_: u32, _: u32| {});
         let params = WeightedHierarchicalKMeansParams {
             dimension: 1,
-            target_k: 17,
+            target_k,
             metric_policy: &L2_METRIC_POLICY,
             max_iters: 3,
             on_progress: progress,
@@ -8213,21 +8530,34 @@ mod tests {
         let result = train_weighted_hierarchical_kmeans::<Float32Type>(
             &data,
             &vec![1.0; 32],
-            &vec![0.0; 32],
+            &losses,
             &params,
-        )
-        .unwrap();
-        assert_eq!(result.len(), 17);
+        );
+        if target_k > data.len() {
+            let Err(error) = result else {
+                panic!(
+                    "a coreset of {} rows cannot serve {target_k} partitions",
+                    data.len()
+                );
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("smaller than the partition count"),
+                "unexpected error: {error}"
+            );
+            return;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.len(), target_k);
         let values = result.values().as_primitive::<Float32Type>().values();
         let mut sorted = values.to_vec();
         sorted.sort_by(|left, right| left.total_cmp(right));
-        assert!(
-            sorted
-                .windows(2)
-                .filter(|pair| (pair[0] - pair[1]).abs() > 0.001)
-                .count()
-                >= 16
-        );
+        let distinct_centroids = 1 + sorted
+            .windows(2)
+            .filter(|pair| (pair[0] - pair[1]).abs() > 0.001)
+            .count();
+        assert_eq!(distinct_centroids, target_k.min(data.len()));
     }
 
     #[test]

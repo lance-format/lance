@@ -762,7 +762,7 @@ impl InvertedIndex {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mask = prefilter.mask();
+        let mask = self.restrict_mask(prefilter.mask());
         if self.is_legacy() {
             let (row_ids, scores) = self
                 .bm25_search_legacy(
@@ -1046,6 +1046,8 @@ impl InvertedIndex {
             initial_score_floor.unwrap_or(f32::NEG_INFINITY).to_bits(),
         ));
         let shared_norm_addends = SharedNormAddends::default();
+        let search_guard = super::scheduling::MODERN_SEARCHES.enter();
+        let workers = get_num_compute_intensive_cpus().min(32);
         let io_parallelism = self.store.io_parallelism();
         let is_phrase_query = params.phrase_slop.is_some();
         // With dictionary lookups already resolved, drop partitions that
@@ -1065,8 +1067,15 @@ impl InvertedIndex {
                 })
             })
             .collect::<Vec<_>>();
+        let chunk_size = search_guard.chunk_size(searched_partitions.len(), workers);
+        let buffered_chunks = super::scheduling::buffered_search_chunks(
+            searched_partitions.len(),
+            chunk_size,
+            workers,
+            io_parallelism,
+        );
         let parts = searched_partitions
-            .chunks(fts_search_chunk())
+            .chunks(chunk_size)
             .map(|chunk| {
                 let chunk = chunk
                     .iter()
@@ -1207,7 +1216,7 @@ impl InvertedIndex {
 
         let mut ranked = BinaryHeap::new();
         let mut parts = stream::iter(parts)
-            .buffer_unordered(get_num_compute_intensive_cpus().min(32))
+            .buffer_unordered(buffered_chunks)
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
         while let Some((partition_ordinal, scored)) = parts.try_next().await? {

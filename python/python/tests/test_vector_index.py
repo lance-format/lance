@@ -959,6 +959,55 @@ def test_index_with_no_centroid_movement(tmp_path):
     validate_vector_index(dataset, "vector", sample_size=8)
 
 
+def test_torch_cosine_ivf_pq_recall(tmp_path):
+    """Accelerated cosine IVF_PQ must be as accurate as the CPU build.
+
+    The torch path used to train the PQ codebook with cosine (unit codewords)
+    on residuals of unnormalized vectors, while the index searches it as an L2
+    codebook over residuals of normalized vectors.
+    """
+    torch = pytest.importorskip("torch")
+
+    rng = np.random.default_rng(42)
+    num_rows, dim = 4096, 32
+    centers = rng.standard_normal((32, dim), dtype=np.float32)
+    mat = centers[rng.integers(0, 32, num_rows)]
+    mat += 0.5 * rng.standard_normal((num_rows, dim), dtype=np.float32)
+    # cosine ignores the norm, so give the rows different norms
+    mat *= rng.uniform(0.5, 5.0, (num_rows, 1)).astype(np.float32)
+    tbl = vec_to_table(data=mat).append_column("id", pa.array(np.arange(num_rows)))
+
+    unit = mat / np.linalg.norm(mat, axis=1, keepdims=True)
+    queries = mat[rng.choice(num_rows, 100, replace=False)]
+    k = 10
+
+    def recall(accelerator, uri):
+        ds = lance.write_dataset(tbl, uri)
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            metric="cosine",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator=accelerator,
+        )
+        hits = 0
+        for q in queries:
+            gt = np.argsort(-(unit @ q))[:k]
+            res = ds.to_table(
+                columns=["id"],
+                nearest={"column": "vector", "q": q, "k": k, "nprobes": 4},
+            )
+            hits += len(set(gt.tolist()) & set(res["id"].to_pylist()))
+        return hits / (len(queries) * k)
+
+    cpu_recall = recall(None, tmp_path / "cpu")
+    torch_recall = recall(torch.device("cpu"), tmp_path / "torch")
+    assert torch_recall >= cpu_recall - 0.1, (
+        f"torch recall {torch_recall} vs cpu recall {cpu_recall}"
+    )
+
+
 def test_index_with_pq_codebook(tmp_path):
     dim = 16
     rng = np.random.default_rng(42)
@@ -1967,6 +2016,35 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             # Otherwise the duplicate-name check intercepts first.
             replace=True,
         )
+
+
+def test_ivf_centroids_file_num_partitions_mismatch(dataset, tmp_path: Path):
+    centroids = np.random.randn(4, 128).astype(np.float32)
+    centroids_dir = tmp_path / "centroids"
+    centroids_dir.mkdir()
+    centroids_file = centroids_dir / "centroids.npy"
+    np.save(centroids_file, centroids)
+
+    with pytest.raises(ValueError, match="has 4 clusters, but num_partitions=8"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            ivf_centroids_file=str(centroids_file),
+            num_partitions=8,
+            num_sub_vectors=8,
+        )
+
+    # Omitting num_partitions is the case that shows the file's count is what
+    # sets the partition count; with num_partitions=4 the assertion would hold
+    # either way.
+    indexed = dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        ivf_centroids_file=str(centroids_file),
+        num_sub_vectors=8,
+    )
+    stats = indexed.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["num_partitions"] == 4
 
 
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):

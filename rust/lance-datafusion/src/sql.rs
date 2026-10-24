@@ -69,14 +69,19 @@ pub(crate) fn parse_sql_expr(expr: &str) -> Result<Expr> {
 
     if let Statement::Query(query) = statement
         && let SetExpr::Select(select) = *query.body
-        && let Some(SelectItem::UnnamedExpr(expr)) = select.projection.into_iter().next()
     {
-        Ok(expr)
-    } else {
-        Err(Error::invalid_input(format!(
-            "Expression is not valid: {expr}"
-        )))
+        let mut projection = select.projection.into_iter();
+        // Exactly one unnamed expression: a comma-separated list must not be
+        // silently truncated to its first item.
+        if let Some(SelectItem::UnnamedExpr(expr)) = projection.next()
+            && projection.next().is_none()
+        {
+            return Ok(expr);
+        }
     }
+    Err(Error::invalid_input(format!(
+        "Expression is not valid: {expr}"
+    )))
 }
 
 fn parse_statement(statement: &str) -> Result<Statement> {

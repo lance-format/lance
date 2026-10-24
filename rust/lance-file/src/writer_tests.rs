@@ -61,6 +61,101 @@ mod tests {
             .map(Into::into)
     }
 
+    fn create_v2_3_writer_with_compression(
+        object_writer: Box<dyn Writer>,
+        schema: LanceSchema,
+        options: FileWriterOptions,
+        compression: CompressionParams,
+    ) -> lance_core::Result<FileWriter> {
+        versions::v2_3::create_writer_with_compression(object_writer, schema, options, compression)
+            .map(Into::into)
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_alp_rd_single_dictionary_default_compression() {
+        // A slow linear drift whose pages collapse to a one-entry ALP-RD
+        // dictionary writes an empty index stream (index_bits == 0). The files
+        // must still read back end-to-end through the default Compress-All path;
+        // this is the integration-level companion to the ALP-RD unit test.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            DataType::Float64,
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let n = 65536usize;
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = SmallRng::seed_from_u64(0x05ee_da1b_2026_1023);
+        let mut gauss = || {
+            let u1: f64 = rng.random_range(1e-12..1.0);
+            let u2: f64 = rng.random();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let vals: Vec<f64> = (0..n)
+            .map(|i| 1_000_000.0 + i as f64 * 0.1 + gauss() * 0.01)
+            .collect();
+        let expected_sum: f64 = vals.iter().sum();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema,
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        let arr = Arc::new(arrow_array::Float64Array::from(vals));
+        let batch = RecordBatch::try_new(arrow_schema, vec![arr]).unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stream = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        assert_eq!(total, n as u64);
+        let read_sum: f64 = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .sum();
+        assert_eq!(read_sum, expected_sum);
+    }
+
     fn reader_projection_from_column_names(
         version: ConcreteFileVersion,
         schema: &LanceSchema,
@@ -1701,6 +1796,8 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -1973,6 +2070,244 @@ mod tests {
             status_encoding.contains("RLE") || status_encoding.contains("Rle"),
             "status column should use RLE encoding due to metadata threshold, but got: {}",
             status_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_default_alp_auto_gate() {
+        // With no ALP metadata, the v2.3 writer defaults to AlpMode::Auto: finite
+        // decimal floats pass the entropy gate, high-entropy floats stay flat.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("prices", DataType::Float64, false),
+            ArrowField::new("random", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        // Reuse a fixed LCG so the test is deterministic across platforms. The
+        // [-1e12, 1e12) range matches the high-entropy fixture used by the
+        // `should_use_alp` unit test: near-uniform bytes in every position.
+        let mut state = 0x05ee_da1b_2026_1023_u64;
+        let random = arrow_array::Float64Array::from_iter_values((0..n).map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 * (2e12 / (1u64 << 53) as f64)) - 1e12
+        }));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(random)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        let prices_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        let random_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        assert!(
+            prices_encoding.contains("Alp"),
+            "prices column should use ALP via the Auto gate, got: {prices_encoding}"
+        );
+        assert!(
+            !random_encoding.contains("Alp"),
+            "random column should stay flat under the Auto gate, got: {random_encoding}"
+        );
+
+        // Both columns must round-trip bitwise; this also exercises the reader.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["prices", "random"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_alp_round_trip() {
+        use futures::TryStreamExt;
+        use lance_encoding::constants::ALP_META_KEY;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata.clone()),
+            ArrowField::new("sensor", DataType::Float64, false).with_metadata(metadata),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices =
+            Float32Array::from_iter_values((0..n).map(|i| ((i * 73) % 10000) as f32 / 100.0));
+        let sensors = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(sensors)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Both float columns should have been written with the ALP codec.
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        for (i, column) in ["price", "sensor"].iter().enumerate() {
+            let encoding = describe_encoding(&column_metadatas[i].pages[0]);
+            assert!(
+                encoding.contains("Alp"),
+                "column {column} should use ALP encoding, got: {encoding}"
+            );
+        }
+
+        // Full pipeline round-trip must be bitwise identical.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["price", "sensor"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        let got_sensors: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f32 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got_sensors,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
         );
     }
 
