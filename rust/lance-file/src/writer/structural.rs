@@ -6,6 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
 use arrow_buffer::BooleanBuffer;
+use arrow_schema::DataType;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{StreamExt, stream::FuturesOrdered};
 use lance_core::{
@@ -387,6 +388,8 @@ pub struct EncodingPipeline {
     field_rows_written: Vec<u64>,
     schema_metadata: HashMap<String, String>,
     options: FileWriterOptions,
+    /// Resolved once, so the encoders and the batch splitting agree on it.
+    max_page_bytes: u64,
 }
 
 impl EncodingPipeline {
@@ -399,6 +402,7 @@ impl EncodingPipeline {
             rows_written: 0,
             field_rows_written: Vec::new(),
             schema_metadata: HashMap::new(),
+            max_page_bytes: resolve_max_page_bytes(&options),
             options,
         }
     }
@@ -413,23 +417,9 @@ impl EncodingPipeline {
         } else {
             8 * 1024 * 1024
         };
-        let max_page_bytes = self.options.max_page_bytes.unwrap_or_else(|| {
-            std::env::var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES)
-                .map(|value| {
-                    value.parse::<u64>().unwrap_or_else(|error| {
-                        warn!(
-                            "Failed to parse {}: {}, using default",
-                            ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, error
-                        );
-                        MAX_PAGE_BYTES as u64
-                    })
-                })
-                .unwrap_or(MAX_PAGE_BYTES as u64)
-        });
-
         EncodingOptions {
             cache_bytes_per_column,
-            max_page_bytes,
+            max_page_bytes: self.max_page_bytes,
             keep_original_array: self.options.keep_original_array.unwrap_or(false),
             buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
         }
@@ -582,13 +572,22 @@ impl EncodingPipeline {
             .iter()
             .zip(row_numbers)
             .map(|((field_index, array), row_number)| {
-                self.field_encoders[*field_index].maybe_encode(
-                    array.clone(),
-                    external_buffers,
-                    RepDefBuilder::default(),
-                    row_number,
-                    array.len() as u64,
-                )
+                // Readers load a page whole, so a page as wide as the batch
+                // makes every reader hold the whole batch. A wide column goes
+                // to its encoder in page-sized row slices; a narrow one passes
+                // through whole and accumulates as before.
+                let mut tasks = Vec::new();
+                for (offset, slice) in page_sized_slices(array, self.max_page_bytes) {
+                    let num_rows = slice.len() as u64;
+                    tasks.extend(self.field_encoders[*field_index].maybe_encode(
+                        slice,
+                        external_buffers,
+                        RepDefBuilder::default(),
+                        row_number + offset as u64,
+                        num_rows,
+                    )?);
+                }
+                Ok(tasks)
             })
             .collect()
     }
@@ -825,6 +824,53 @@ fn make_file_descriptor(schema: &Schema, num_rows: u64) -> Result<pb::FileDescri
 }
 
 /// Structural file body produced before an exact version appends its footer.
+/// The page size limit the options set, or else the environment's, or else
+/// the default.
+fn resolve_max_page_bytes(options: &FileWriterOptions) -> u64 {
+    options.max_page_bytes.unwrap_or_else(|| {
+        std::env::var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES)
+            .map(|value| {
+                value.parse::<u64>().unwrap_or_else(|error| {
+                    warn!(
+                        "Failed to parse {}: {}, using default",
+                        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, error
+                    );
+                    MAX_PAGE_BYTES as u64
+                })
+            })
+            .unwrap_or(MAX_PAGE_BYTES as u64)
+    })
+}
+
+/// Row slices of `array`, each with its row offset, that hold about
+/// `max_page_bytes` apiece.
+///
+/// The structural encoders flush what they have accumulated as one page once
+/// it passes the column's cache size, so a single wide array -- a batch of
+/// multi-MiB binary values, say -- would otherwise become one page however
+/// large it is. Rows are split evenly, as the 2.0 writer splits them; a row
+/// wider than the limit still gets a page of its own. Dictionary arrays pass
+/// through whole, since every slice would carry the whole dictionary.
+fn page_sized_slices(array: &ArrayRef, max_page_bytes: u64) -> Vec<(usize, ArrayRef)> {
+    let len = array.len();
+    if len <= 1 || max_page_bytes == 0 || matches!(array.data_type(), DataType::Dictionary(..)) {
+        return vec![(0, array.clone())];
+    }
+    let size = array
+        .to_data()
+        .get_slice_memory_size()
+        .unwrap_or_else(|_| array.get_buffer_memory_size()) as u64;
+    let parts = size.div_ceil(max_page_bytes).min(len as u64) as usize;
+    if parts <= 1 {
+        return vec![(0, array.clone())];
+    }
+    let rows_per_part = len.div_ceil(parts);
+    (0..len)
+        .step_by(rows_per_part)
+        .map(|offset| (offset, array.slice(offset, rows_per_part.min(len - offset))))
+        .collect()
+}
+
 pub struct EncodedBatchBody {
     pub data: BytesMut,
     pub column_metadata_start: u64,

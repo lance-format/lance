@@ -218,6 +218,91 @@ mod tests {
         assert_eq!(read, batch);
     }
 
+    /// A batch of wide values must not become one page: readers load a page
+    /// whole, so a page as large as the batch makes every reader of the file
+    /// hold the whole batch, whatever its batch size or I/O buffer.
+    #[rstest]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_wide_values_respect_max_page_bytes(#[case] version: ConcreteFileVersion) {
+        const ROWS: usize = 64;
+        const WIDTH: usize = 256 * 1024;
+        const MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+        // Incompressible, so the page holds what the values decode to.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let values: Vec<Vec<u8>> = (0..ROWS)
+            .map(|_| {
+                (0..WIDTH)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect()
+            })
+            .collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)) as ArrayRef,
+            ),
+            (
+                "blob",
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                    values.iter().map(Vec::as_slice),
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let fs = FsFixture::default();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(MAX_PAGE_BYTES),
+            ..Default::default()
+        };
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        crate::testing::write_lance_file(reader, &fs, version, options).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let blob_pages = &file_reader.metadata().column_metadatas[1].pages;
+        let largest = blob_pages
+            .iter()
+            .map(|page| page.buffer_sizes.iter().sum::<u64>())
+            .max()
+            .unwrap();
+        // One row's width of slack: rows split evenly, not at exact bytes.
+        assert!(
+            largest <= MAX_PAGE_BYTES + WIDTH as u64 + 4096,
+            "a {ROWS}-row batch of {WIDTH}-byte values wrote a {largest}-byte page \
+             across {} page(s); the limit is {MAX_PAGE_BYTES}",
+            blob_pages.len()
+        );
+
+        let read = crate::testing::read_lance_file(
+            &fs,
+            Arc::new(DecoderPlugins::default()),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read, batch);
+    }
+
     #[tokio::test]
     async fn test_write_empty() {
         let tmp_path = TempObjFile::default();
