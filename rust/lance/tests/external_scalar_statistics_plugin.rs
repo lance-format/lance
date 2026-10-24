@@ -270,6 +270,33 @@ async fn assert_external_index(dataset: &Dataset, rows: u64, coverage: RoaringBi
         .await
         .unwrap();
     assert!(Arc::ptr_eq(&first, &second));
+    let segment_statistics = dataset
+        .index_segment_statistics(&metadata.name, &[metadata.uuid])
+        .await
+        .unwrap();
+    assert_eq!(segment_statistics.len(), 1);
+    assert_eq!(
+        segment_statistics[0].read_version,
+        dataset.version().version
+    );
+    assert_eq!(
+        segment_statistics[0].index_type_uri,
+        ExampleIndexDetails::type_url()
+    );
+    assert_eq!(
+        segment_statistics[0].statistics,
+        serde_json::json!({ "rows": rows })
+    );
+    let expected: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(&metadata.name).await.unwrap()).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments(&metadata.name, segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -690,6 +717,19 @@ async fn multi_field_scope_preserves_order_on_reopen_rename_and_replace() {
         serde_json::from_str(&dataset.index_statistics("profile").await.unwrap()).unwrap();
     assert_eq!(statistics["indices"][0]["rows"], 4);
     assert_eq!(statistics["num_indexed_rows"], 0);
+    let segment_statistics = dataset
+        .index_segment_statistics("profile", &[before[0].uuid])
+        .await
+        .unwrap();
+    assert_eq!(segment_statistics[0].statistics["rows"], 4);
+    let aggregated: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments("profile", segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(aggregated, statistics);
     let info = dataset.scalar_index_info().await.unwrap();
     assert!(info.get_index("other").is_none());
     assert!(info.get_index("value").is_none());
