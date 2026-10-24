@@ -689,6 +689,28 @@ async fn blob_part_requires_an_id_lease_before_writing() {
     );
 }
 
+/// A part writes into a target named before its rows, so a prepared Dedicated
+/// row naming an ID in the part's lease is kept.
+#[tokio::test]
+async fn blob_part_keeps_a_prepared_sidecar_reference_in_its_lease() {
+    let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
+    let mut blobs = BlobArrayBuilder::new(1);
+    blobs.push_bytes(b"old").unwrap();
+    let original = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
+    let dataset = dataset_of(original, LanceFileVersion::V2_2).await;
+    let target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        dataset.manifest.data_storage_format.lance_file_format(),
+    )
+    .unwrap();
+    let mut prepared = BlobDescriptorArrayBuilder::new("blob");
+    prepared.push_dedicated(3, 4).unwrap();
+    let (field, array) = prepared.finish().unwrap().into_parts();
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![array]).unwrap();
+    write_part(&dataset, &target, Some(1..10), batch).await;
+}
+
 #[tokio::test]
 async fn data_file_part_rejects_non_empty_file_relative_inline_blob() {
     let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));

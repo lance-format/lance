@@ -452,6 +452,417 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     assert!(values[3].as_ref().unwrap().read().await.unwrap().is_empty());
 }
 
+/// Assert the latest commit came from merge_insert's row-rewrite path. Blob
+/// input in a layout other than the table's must not reach the column updater,
+/// which cannot write it; which path a merge takes depends on how many rows of
+/// each fragment it updates, so a passing result alone does not show it.
+async fn assert_rewrote_rows(dataset: &Dataset) {
+    use crate::dataset::transaction::UpdateMode;
+    let transaction = dataset.read_transaction().await.unwrap().unwrap();
+    assert!(
+        matches!(
+            transaction.operation,
+            Operation::Update {
+                update_mode: Some(UpdateMode::RewriteRows),
+                ..
+            }
+        ),
+        "{:?}",
+        transaction.operation
+    );
+}
+
+/// `column`, a blob column named `blob`, as written: inside a `meta` struct
+/// when `nested`.
+fn place_blob(nested: bool, field: Field, column: ArrayRef) -> (Field, ArrayRef) {
+    if !nested {
+        return (field, column);
+    }
+    let fields: arrow_schema::Fields = vec![field].into();
+    (
+        Field::new("meta", DataType::Struct(fields.clone()), true),
+        Arc::new(StructArray::new(fields, vec![column], None)),
+    )
+}
+
+/// A table with managed blobs of rows `id` 0 and 1, each with blob bytes
+/// "seed" in the minimal or `complete` logical layout, and `other` = 6, 7 when
+/// `other`.
+async fn seed_blob_table(
+    dir: &str,
+    complete: bool,
+    nested: bool,
+    other: bool,
+    params: WriteParams,
+) -> Dataset {
+    let (blob, seed) = if complete {
+        let seed = complete_blob_v2_array(
+            vec![Some(b"seed".to_vec()); 2],
+            vec![None; 2],
+            vec![None; 2],
+            vec![None; 2],
+            None,
+        );
+        (complete_blob_v2_field("blob", true), seed)
+    } else {
+        let mut seed = BlobArrayBuilder::new(2);
+        seed.push_bytes(b"seed").unwrap();
+        seed.push_bytes(b"seed").unwrap();
+        (blob_field("blob", true), seed.finish().unwrap())
+    };
+    let (blob, seed) = place_blob(nested, blob, seed);
+    let mut fields = vec![Field::new("id", DataType::Int32, false), blob];
+    let mut columns = vec![Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef, seed];
+    if other {
+        fields.push(Field::new("other", DataType::Int32, true));
+        columns.push(Arc::new(Int32Array::from(vec![6, 7])));
+    }
+    let schema = Arc::new(managed_blob_schema(fields));
+    let seed = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(seed)], schema),
+        dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..params
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// Merge `source` by `id`, inserting unmatched rows.
+async fn try_merge_by_id(
+    dataset: Dataset,
+    source: RecordBatch,
+    matched: crate::dataset::WhenMatched,
+) -> Result<(
+    Arc<Dataset>,
+    crate::dataset::write::merge_insert::MergeStats,
+)> {
+    use crate::dataset::{MergeInsertBuilder, WhenNotMatched};
+    let schema = source.schema();
+    let mut builder = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])?;
+    builder
+        .when_matched(matched)
+        .when_not_matched(WhenNotMatched::InsertAll);
+    builder
+        .try_build()?
+        .execute_reader(RecordBatchIterator::new(vec![Ok(source)], schema))
+        .await
+}
+
+/// Upsert `source` by `id`, checking the merge took the row-rewrite path.
+async fn merge_by_id(
+    dataset: Dataset,
+    source: RecordBatch,
+) -> (
+    Arc<Dataset>,
+    crate::dataset::write::merge_insert::MergeStats,
+) {
+    let merged = try_merge_by_id(dataset, source, crate::dataset::WhenMatched::UpdateAll)
+        .await
+        .unwrap();
+    assert_rewrote_rows(&merged.0).await;
+    merged
+}
+
+/// Each row's blob bytes and `other` value (`None` when null or absent), by id.
+async fn rows_by_id(dataset: &Dataset, nested: bool) -> HashMap<i32, (Vec<u8>, Option<i32>)> {
+    use arrow_array::types::Int32Type;
+    let mut scan = dataset.scan();
+    scan.blob_handling(BlobHandling::AllBinary);
+    let rows = scan.try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<Int32Type>();
+    let blobs = if nested {
+        rows["meta"].as_struct()["blob"].as_binary::<i64>()
+    } else {
+        rows["blob"].as_binary::<i64>()
+    };
+    let other = rows
+        .column_by_name("other")
+        .map(|other| other.as_primitive::<Int32Type>());
+    (0..rows.num_rows())
+        .map(|row| {
+            let other = other.and_then(|other| other.is_valid(row).then(|| other.value(row)));
+            (ids.value(row), (blobs.value(row).to_vec(), other))
+        })
+        .collect()
+}
+
+/// Whether a merge of `source` by `id` takes the indexed join, the one route
+/// with no plan to explain.
+async fn takes_indexed_join(
+    dataset: &Dataset,
+    source: &RecordBatch,
+    matched: crate::dataset::WhenMatched,
+) -> bool {
+    use crate::dataset::{MergeInsertBuilder, WhenNotMatched};
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()]).unwrap();
+    builder
+        .when_matched(matched)
+        .when_not_matched(WhenNotMatched::InsertAll);
+    builder
+        .try_build()
+        .unwrap()
+        .explain_plan(Some(source.schema().as_ref()), false)
+        .await
+        .is_err()
+}
+
+/// A BTree index on `id`, which routes a merge by `id` through the indexed join.
+async fn index_id(dataset: &mut Dataset) {
+    use crate::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+}
+
+/// Rows `ids`, each a prepared `Managed` reference to its `(offset, size)` of a
+/// 1000-byte object of `v`s placed under the table's `_blobs/`; the blob sits
+/// inside a `meta` struct when `nested`.
+fn managed_source(
+    dir: &TempStrDir,
+    nested: bool,
+    ids: Vec<i32>,
+    ranges: &[(u64, u64)],
+) -> RecordBatch {
+    let blobs_dir = std::path::Path::new(dir.as_ref()).join("_blobs");
+    std::fs::create_dir_all(&blobs_dir).unwrap();
+    std::fs::write(blobs_dir.join("adopted.blob"), vec![b'v'; 1000]).unwrap();
+    let mut prepared = BlobDescriptorArrayBuilder::new("blob");
+    for &(offset, size) in ranges {
+        prepared
+            .push(BlobDescriptor::Managed {
+                base_id: None,
+                uri: "_blobs/adopted.blob".to_string(),
+                offset,
+                size,
+            })
+            .unwrap();
+    }
+    let (blob, prepared) = prepared.finish().unwrap().into_parts();
+    let (blob, prepared) = place_blob(nested, blob, prepared);
+    RecordBatch::try_new(
+        Arc::new(managed_blob_schema(vec![
+            Field::new("id", DataType::Int32, false),
+            blob,
+        ])),
+        vec![Arc::new(Int32Array::from(ids)), prepared],
+    )
+    .unwrap()
+}
+
+/// merge_insert takes writer-prepared input as append does, so a Managed
+/// reference to an object already under the table is adopted, for an
+/// updated row and an inserted one, without its bytes passing through the
+/// writer. A source may also leave out table columns, which then keep their
+/// values, the table may declare the blob in either logical layout, the blob
+/// may sit inside a struct, and an index on the key may route the merge
+/// through the indexed join.
+#[rstest]
+#[tokio::test]
+async fn merge_insert_adopts_prepared_managed_references(
+    #[values(false, true)] partial: bool,
+    #[values(false, true)] complete: bool,
+    #[values(false, true)] nested: bool,
+    #[values(false, true)] indexed: bool,
+) {
+    let test_dir = TempStrDir::default();
+    let mut dataset =
+        seed_blob_table(&test_dir, complete, nested, partial, WriteParams::default()).await;
+    if indexed {
+        index_id(&mut dataset).await;
+    }
+    // Two rows share one object, as rows from one packed file do.
+    let source = managed_source(&test_dir, nested, vec![1, 2], &[(0, 400), (400, 200)]);
+    // A partial source that updates rows is planned whatever the index.
+    assert_eq!(
+        takes_indexed_join(&dataset, &source, crate::dataset::WhenMatched::UpdateAll).await,
+        indexed && !partial
+    );
+    let (dataset, stats) = merge_by_id(dataset, source).await;
+    assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (1, 1));
+
+    let other = |value| partial.then_some(value);
+    assert_eq!(
+        rows_by_id(&dataset, nested).await,
+        HashMap::from([
+            (0, (b"seed".to_vec(), other(6))),
+            (1, (vec![b'v'; 400], other(7))),
+            (2, (vec![b'v'; 200], None)),
+        ])
+    );
+    let path = if nested { "meta.blob" } else { "blob" };
+    for blob in dataset.take_blobs_by_indices(&[1, 2], path).await.unwrap() {
+        let blob = blob.unwrap();
+        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.uri(), Some("_blobs/adopted.blob"));
+    }
+}
+
+/// A prepared Packed or Dedicated row names a sidecar of the data file it sits
+/// beside, which a merge or an append names only as it writes, so both refuse it.
+#[rstest]
+#[tokio::test]
+async fn prepared_sidecar_blobs_are_refused(
+    #[values(false, true)] packed: bool,
+    #[values(false, true)] merge: bool,
+) {
+    let test_dir = TempStrDir::default();
+    let dataset = seed_blob_table(&test_dir, false, false, false, WriteParams::default()).await;
+    let version = dataset.version().version;
+    let mut prepared = BlobDescriptorArrayBuilder::new("blob");
+    prepared
+        .push(if packed {
+            BlobDescriptor::Packed {
+                blob_id: 1,
+                offset: 0,
+                size: 4,
+            }
+        } else {
+            BlobDescriptor::Dedicated {
+                blob_id: 1,
+                size: 4,
+            }
+        })
+        .unwrap();
+    let (blob, prepared) = prepared.finish().unwrap().into_parts();
+    let source = RecordBatch::try_new(
+        Arc::new(managed_blob_schema(vec![
+            Field::new("id", DataType::Int32, false),
+            blob,
+        ])),
+        vec![Arc::new(Int32Array::from(vec![1])), prepared],
+    )
+    .unwrap();
+
+    let err = if merge {
+        try_merge_by_id(dataset, source, crate::dataset::WhenMatched::UpdateAll)
+            .await
+            .unwrap_err()
+    } else {
+        let schema = source.schema();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source)], schema),
+            test_dir.as_ref(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err()
+    };
+    let kind = if packed { "Packed" } else { "Dedicated" };
+    assert!(
+        err.to_string().contains(&format!("prepared {kind} blob")),
+        "{err}"
+    );
+    let dataset = Dataset::open(test_dir.as_ref()).await.unwrap();
+    assert_eq!(dataset.version().version, version, "nothing is committed");
+}
+
+/// An insert-only merge on an indexed key writes inserted rows from a partial
+/// source on their own; a prepared reference is adopted there too, and the
+/// matched row is left alone.
+#[tokio::test]
+async fn merge_insert_inserts_prepared_references_through_the_index() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = seed_blob_table(&test_dir, false, false, true, WriteParams::default()).await;
+    index_id(&mut dataset).await;
+    let source = managed_source(&test_dir, false, vec![1, 2], &[(0, 400), (400, 200)]);
+    assert!(takes_indexed_join(&dataset, &source, crate::dataset::WhenMatched::DoNothing).await);
+    let (dataset, stats) = try_merge_by_id(dataset, source, crate::dataset::WhenMatched::DoNothing)
+        .await
+        .unwrap();
+    assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (0, 1));
+    assert_eq!(
+        rows_by_id(&dataset, false).await,
+        HashMap::from([
+            (0, (b"seed".to_vec(), Some(6))),
+            (1, (b"seed".to_vec(), Some(7))),
+            (2, (vec![b'v'; 200], None)),
+        ])
+    );
+}
+
+/// Descriptors say where a blob already sits in some data file, not what to
+/// write, so a merge refuses a source holding them.
+#[tokio::test]
+async fn merge_insert_refuses_a_descriptor_source() {
+    let test_dir = TempStrDir::default();
+    let dataset = seed_blob_table(&test_dir, false, false, true, WriteParams::default()).await;
+    let source = crate::dataset::blob::prepared_blob_batch_to_descriptors(&managed_source(
+        &test_dir,
+        false,
+        vec![1],
+        &[(0, 4)],
+    ))
+    .unwrap();
+    let err = try_merge_by_id(dataset, source, crate::dataset::WhenMatched::UpdateAll)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("descriptor layout"), "{err}");
+}
+
+/// A logical blob's byte range survives a merge_insert that leaves out other
+/// table columns: the row reads back only its range of the object.
+#[tokio::test]
+async fn merge_insert_keeps_a_logical_blob_range() {
+    let test_dir = TempStrDir::default();
+    let external_dir = TempDir::default();
+    let external = external_dir.std_path().join("external.bin");
+    std::fs::write(&external, b"0123456789").unwrap();
+    let base = BasePath {
+        id: 1,
+        name: Some("external".to_string()),
+        path: format!("file://{}", external_dir.std_path().display()),
+        is_dataset_root: false,
+    };
+    let params = WriteParams {
+        initial_bases: Some(vec![base]),
+        ..Default::default()
+    };
+    let dataset = seed_blob_table(&test_dir, false, false, true, params).await;
+
+    let source = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            complete_blob_v2_field("blob", true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            complete_blob_v2_array(
+                vec![None],
+                vec![Some(format!("file://{}", external.display()))],
+                vec![Some(2)],
+                vec![Some(3)],
+                None,
+            ),
+        ],
+    )
+    .unwrap();
+    let (dataset, _) = merge_by_id(dataset, source).await;
+    assert_eq!(
+        rows_by_id(&dataset, false).await,
+        HashMap::from([
+            (0, (b"seed".to_vec(), Some(6))),
+            (1, (b"234".to_vec(), Some(7)))
+        ])
+    );
+}
+
 #[tokio::test]
 async fn managed_flag_survives_restore_of_unflagged_snapshot() {
     let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();

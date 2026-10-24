@@ -2373,6 +2373,9 @@ where
     {
         preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());
     }
+    if preassigned_data_file_name.is_some() {
+        preprocessor = preprocessor.with_preassigned_data_file();
+    }
     Ok(Box::new(V2WriterAdapter::new(
         file_writer,
         Some(data_file),
