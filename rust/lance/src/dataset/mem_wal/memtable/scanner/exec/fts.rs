@@ -8,19 +8,22 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use arrow_array::builder::{ListBuilder, UInt32Builder};
-use arrow_array::{BooleanArray, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{BooleanArray, Float32Array, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::ScalarValue;
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
@@ -37,6 +40,11 @@ use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Score column name in output.
 pub const SCORE_COLUMN: &str = "_score";
+
+/// Metric: visible rows the index matched.
+const INDEX_MATCHES_METRIC: &str = "index_matches";
+/// Metric: matched rows whose columns were materialized, after the prefilter.
+const MATERIALIZED_ROWS_METRIC: &str = "rows_materialized";
 
 /// Batch range info for efficient row position lookup.
 #[derive(Debug, Clone)]
@@ -323,132 +331,93 @@ impl FtsIndexExec {
 
     /// Materialize rows from batch store preserving input order (for sorted results).
     ///
-    /// This method processes results one at a time to preserve the score-sorted order,
-    /// then combines them into a single batch.
-    fn materialize_rows_sorted(&self, results: &[FtsHit]) -> DataFusionResult<Vec<RecordBatch>> {
+    /// Each column is gathered for every kept hit at once, in score order. A
+    /// prefilter is evaluated first, on only the columns it reads, so a search
+    /// whose term matches most of the memtable but whose predicate keeps a few
+    /// rows gathers those few rather than every hit: the index cannot apply the
+    /// predicate, so it returns every match, and taking each one's every column
+    /// a row at a time took seconds on a large memtable.
+    fn materialize_rows_sorted(
+        &self,
+        results: &[FtsHit],
+        materialized: &Count,
+    ) -> DataFusionResult<Vec<RecordBatch>> {
         if results.is_empty() {
             return Ok(vec![]);
         }
+        let Some(first) = self.batch_store.get(0) else {
+            return Ok(vec![]);
+        };
+        let source_schema = scan_record_batch(&first.data)?.schema();
 
-        // Process each result in order to preserve sorting
-        let mut all_rows: Vec<u32> = Vec::with_capacity(results.len());
-        let mut all_scores: Vec<f32> = Vec::with_capacity(results.len());
-        let mut all_row_positions: Vec<u64> = Vec::with_capacity(results.len());
-        let mut all_doc_indices: Vec<Option<Vec<u32>>> = Vec::with_capacity(results.len());
-        let mut all_columns: Vec<Vec<Arc<dyn arrow_array::Array>>> = Vec::new();
-        let mut scan_batches = HashMap::<usize, RecordBatch>::new();
-
-        // Initialize column vectors based on first batch's schema
-        let first_batch = self.batch_store.get(0);
-        if let Some(stored) = first_batch {
-            for _ in 0..stored.data.num_columns() {
-                all_columns.push(Vec::with_capacity(results.len()));
-            }
-        }
-
-        for (pos, doc_index, score) in results {
-            let pos = *pos;
-            let score = *score;
-            if let Some(batch_range) = self.find_batch(pos as usize)
+        // Where each hit lives. A hit past the store is dropped.
+        let mut hits = HitRows::default();
+        for (hit, (pos, _, _)) in results.iter().enumerate() {
+            if let Some(batch_range) = self.find_batch(*pos as usize)
                 && let Some(stored) = self.batch_store.get(batch_range.batch_id)
             {
-                let data = match scan_batches.entry(batch_range.batch_id) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => entry.insert(scan_record_batch(&stored.data)?),
-                };
-                let row_in_batch = (pos as usize - batch_range.start) as u32;
-                let indices = UInt32Array::from(vec![row_in_batch]);
-
-                // Take each column value
-                for (col_idx, col) in data.columns().iter().enumerate() {
-                    let taken = arrow_select::take::take(col.as_ref(), &indices, None).unwrap();
-                    if all_columns.len() <= col_idx {
-                        all_columns.push(Vec::new());
-                    }
-                    all_columns[col_idx].push(taken);
-                }
-
-                all_rows.push(row_in_batch);
-                all_scores.push(score);
-                all_row_positions.push(pos);
-                all_doc_indices.push(doc_index.clone());
+                hits.push(
+                    hit,
+                    batch_range,
+                    *pos as usize - batch_range.start,
+                    &stored.data,
+                )?;
             }
         }
-
-        if all_scores.is_empty() {
+        if hits.is_empty() {
             return Ok(vec![]);
         }
 
-        // Concatenate all column arrays
-        let mut final_columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
-
-        for col_arrays in &all_columns {
-            if !col_arrays.is_empty() {
-                let refs: Vec<&dyn arrow_array::Array> =
-                    col_arrays.iter().map(|a| a.as_ref()).collect();
-                let concatenated = arrow_select::concat::concat(&refs)?;
-                final_columns.push(concatenated);
-            }
-        }
-
-        // Prefilter: evaluate the predicate against the full-schema hits and drop
+        // Prefilter: evaluate the predicate against the hits and drop
         // non-matching rows before applying the query limit and projection (a
         // NULL result excludes the row, matching SQL). When a predicate exists,
         // query_index deliberately avoids pushing the limit into the index so
         // this remains an exact prefilter, not a lossy post-filter.
-        let (final_columns, all_scores, all_row_positions, all_doc_indices) =
-            if let Some(ref predicate) = self.filter {
-                let Some(first) = self.batch_store.get(0) else {
-                    return Ok(vec![]);
-                };
-                let data_batch =
-                    RecordBatch::try_new(scan_record_batch(&first.data)?.schema(), final_columns)?;
-                let mask = predicate
-                    .evaluate(&data_batch)?
-                    .into_array(data_batch.num_rows())?;
-                let mask = mask
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(
-                            "FTS prefilter predicate did not evaluate to boolean".to_string(),
-                        )
-                    })?;
-                let filtered_columns = data_batch
-                    .columns()
-                    .iter()
-                    .map(|c| arrow_select::filter::filter(c.as_ref(), mask))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                let filtered_scores: Vec<f32> = all_scores
-                    .iter()
-                    .zip(mask.iter())
-                    .filter_map(|(s, keep)| keep.unwrap_or(false).then_some(*s))
-                    .collect();
-                let filtered_positions: Vec<u64> = all_row_positions
-                    .iter()
-                    .zip(mask.iter())
-                    .filter_map(|(p, keep)| keep.unwrap_or(false).then_some(*p))
-                    .collect();
-                let filtered_doc_indices: Vec<Option<Vec<u32>>> = all_doc_indices
-                    .iter()
-                    .zip(mask.iter())
-                    .filter(|(_, keep)| keep.unwrap_or(false))
-                    .map(|(index, _)| index.clone())
-                    .collect();
-                (
-                    filtered_columns,
-                    filtered_scores,
-                    filtered_positions,
-                    filtered_doc_indices,
-                )
-            } else {
-                (
-                    final_columns,
-                    all_scores,
-                    all_row_positions,
-                    all_doc_indices,
-                )
-            };
+        if let Some(ref predicate) = self.filter {
+            let mut referenced: Vec<usize> = collect_columns(predicate)
+                .iter()
+                .map(|column| column.index())
+                .collect();
+            referenced.sort_unstable();
+            referenced.dedup();
+            let schema = Arc::new(source_schema.project(&referenced)?);
+            let columns = referenced
+                .iter()
+                .map(|&column| hits.gather(column))
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            let batch = RecordBatch::try_new_with_options(
+                schema.clone(),
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(hits.len())),
+            )?;
+            let mask = reassign_expr_columns(predicate.clone(), &schema)?
+                .evaluate(&batch)?
+                .into_array(batch.num_rows())?;
+            let mask = mask
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(
+                        "FTS prefilter predicate did not evaluate to boolean".to_string(),
+                    )
+                })?;
+            hits.retain(|i| arrow_array::Array::is_valid(mask, i) && mask.value(i));
+            if hits.is_empty() {
+                return Ok(vec![]);
+            }
+        }
+
+        materialized.add(hits.len());
+        let final_columns = (0..source_schema.fields().len())
+            .map(|column| hits.gather(column))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let all_scores: Vec<f32> = hits.hits.iter().map(|&hit| results[hit].2).collect();
+        let all_row_positions: Vec<u64> = hits.hits.iter().map(|&hit| results[hit].0).collect();
+        let all_doc_indices: Vec<Option<Vec<u32>>> = hits
+            .hits
+            .iter()
+            .map(|&hit| results[hit].1.clone())
+            .collect();
 
         let (mut final_columns, mut all_scores, mut all_row_positions, mut all_doc_indices) = self
             .filter_to_newest_pk(
@@ -647,6 +616,66 @@ impl FtsIndexExec {
     }
 }
 
+/// The rows behind a list of hits, kept in hit order: which source batch and
+/// row each one is, so a column can be gathered for all of them at once.
+#[derive(Default)]
+struct HitRows {
+    /// Index of each kept hit in the caller's hit list.
+    hits: Vec<usize>,
+    /// `(source, row)` of each kept hit, `source` indexing `sources`.
+    rows: Vec<(usize, usize)>,
+    /// The source batches the hits are in, prepared for scanning.
+    sources: Vec<RecordBatch>,
+    /// Batch id to its position in `sources`.
+    source_of: HashMap<usize, usize>,
+}
+
+impl HitRows {
+    fn push(
+        &mut self,
+        hit: usize,
+        range: &BatchRange,
+        row: usize,
+        data: &RecordBatch,
+    ) -> DataFusionResult<()> {
+        let source = match self.source_of.entry(range.batch_id) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                self.sources.push(scan_record_batch(data)?);
+                *entry.insert(self.sources.len() - 1)
+            }
+        };
+        self.hits.push(hit);
+        self.rows.push((source, row));
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.hits.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+
+    /// Keep the hits whose position in this list passes `keep`.
+    fn retain(&mut self, keep: impl Fn(usize) -> bool) {
+        let kept: Vec<usize> = (0..self.hits.len()).filter(|&i| keep(i)).collect();
+        self.hits = kept.iter().map(|&i| self.hits[i]).collect();
+        self.rows = kept.iter().map(|&i| self.rows[i]).collect();
+    }
+
+    /// `column` for every kept hit, in hit order.
+    fn gather(&self, column: usize) -> DataFusionResult<Arc<dyn arrow_array::Array>> {
+        let arrays: Vec<&dyn arrow_array::Array> = self
+            .sources
+            .iter()
+            .map(|batch| batch.column(column).as_ref())
+            .collect();
+        Ok(arrow_select::interleave::interleave(&arrays, &self.rows)?)
+    }
+}
+
 impl DisplayAs for FtsIndexExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         match t {
@@ -699,7 +728,7 @@ impl ExecutionPlan for FtsIndexExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Query the index
@@ -707,12 +736,17 @@ impl ExecutionPlan for FtsIndexExec {
 
         // Filter by visibility
         let mut visible_results = self.filter_by_visibility(results);
+        MetricBuilder::new(&self.metrics)
+            .counter(INDEX_MATCHES_METRIC, partition)
+            .add(visible_results.len());
 
         // Sort by score descending (best matches first)
         visible_results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
         // Materialize the rows (preserving sort order)
-        let batches = self.materialize_rows_sorted(&visible_results)?;
+        let materialized =
+            MetricBuilder::new(&self.metrics).counter(MATERIALIZED_ROWS_METRIC, partition);
+        let batches = self.materialize_rows_sorted(&visible_results, &materialized)?;
 
         let stream = stream::iter(batches.into_iter().map(Ok)).boxed();
 
@@ -927,6 +961,179 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 4); // "hello" in both batches
+    }
+
+    /// A memtable whose every row holds `common`, `rows_per_batch` rows a
+    /// batch; `id` counts up from 0 and `tag` is null on every third row.
+    fn common_term_memtable(
+        batches: usize,
+        rows_per_batch: usize,
+    ) -> (Arc<BatchStore>, Arc<IndexStore>, Arc<Schema>) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("tag", DataType::Int32, true),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(batches + 1));
+        let mut registry = IndexStore::new();
+        registry.add_fts("text_idx".to_string(), 1, "text".to_string());
+        for b in 0..batches {
+            let ids: Vec<i32> = (0..rows_per_batch)
+                .map(|r| (b * rows_per_batch + r) as i32)
+                .collect();
+            // Varying length, so scores differ and the output order is by score.
+            let text: Vec<String> = ids
+                .iter()
+                .map(|id| format!("common r{id}{}", " pad".repeat(*id as usize % 4)))
+                .collect();
+            let tag: Vec<Option<i32>> = ids
+                .iter()
+                .map(|id| (id % 3 != 0).then_some(id % 10))
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(text)),
+                    Arc::new(Int32Array::from(tag)),
+                ],
+            )
+            .unwrap();
+            registry
+                .insert(&batch, (b * rows_per_batch) as u64)
+                .unwrap();
+            batch_store.append(batch).unwrap();
+        }
+        (batch_store, Arc::new(registry), schema)
+    }
+
+    fn compile(schema: &Arc<Schema>, filter: datafusion::prelude::Expr) -> PhysicalExprRef {
+        let planner = lance_datafusion::planner::Planner::new(schema.clone());
+        planner
+            .create_physical_expr(&planner.optimize_expr(filter).unwrap())
+            .unwrap()
+    }
+
+    fn metric(exec: &FtsIndexExec, name: &str) -> usize {
+        exec.metrics()
+            .unwrap()
+            .sum_by_name(name)
+            .map(|v| v.as_usize())
+            .unwrap_or(0)
+    }
+
+    /// A prefiltered search on a term every row holds materializes the rows
+    /// the predicate keeps, not every row the index matched.
+    #[tokio::test]
+    async fn prefiltered_common_term_materializes_only_matching_rows() {
+        use datafusion::prelude::{col, lit};
+
+        let (batch_store, indexes, schema) = common_term_memtable(20, 500);
+        let exec = FtsIndexExec::new(
+            batch_store,
+            indexes,
+            FtsQuery::match_query("text", "common").with_limit(Some(2)),
+            20,
+            None,
+            schema.clone(),
+            false,
+        )
+        .unwrap()
+        .with_filter(Some(compile(&schema, col("id").eq(lit(4321)))));
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b["id"]
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![4321]);
+        assert_eq!(
+            metric(&exec, INDEX_MATCHES_METRIC),
+            10_000,
+            "every row matches"
+        );
+        assert_eq!(
+            metric(&exec, MATERIALIZED_ROWS_METRIC),
+            1,
+            "only the row the predicate keeps is materialized"
+        );
+    }
+
+    /// The gathered rows are the rows a row-at-a-time take returns: every
+    /// column, in score order, a NULL predicate result dropping the row.
+    #[tokio::test]
+    async fn prefiltered_search_keeps_score_order_and_drops_null_predicates() {
+        use datafusion::prelude::{col, lit};
+
+        let (batch_store, indexes, schema) = common_term_memtable(4, 7);
+        let run = |filter: Option<PhysicalExprRef>| {
+            let exec = FtsIndexExec::new(
+                batch_store.clone(),
+                indexes.clone(),
+                FtsQuery::match_query("text", "common"),
+                4,
+                None,
+                schema.clone(),
+                false,
+            )
+            .unwrap()
+            .with_filter(filter);
+            async move {
+                let batches: Vec<RecordBatch> = exec
+                    .execute(0, Arc::new(TaskContext::default()))
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
+            }
+        };
+        let all = run(None).await;
+        assert_eq!(all.num_rows(), 28);
+        let scores = all[SCORE_COLUMN].as_primitive::<arrow::datatypes::Float32Type>();
+        assert!(
+            scores.values().windows(2).all(|w| w[0] >= w[1]),
+            "best first"
+        );
+
+        // `tag > 4` is NULL on every third row: those rows are dropped too.
+        let filtered = run(Some(compile(&schema, col("tag").gt(lit(4))))).await;
+        let tags = all["tag"].as_primitive::<arrow::datatypes::Int32Type>();
+        let keep = BooleanArray::from(
+            (0..all.num_rows())
+                .map(|i| tags.is_valid(i) && tags.value(i) > 4)
+                .collect::<Vec<_>>(),
+        );
+        let expected = arrow_select::filter::filter_record_batch(&all, &keep).unwrap();
+        assert!(expected.num_rows() > 0 && expected.num_rows() < all.num_rows());
+        // Rows of equal score may come back in either order, so compare each
+        // row whole, sorted, and check the order by score separately.
+        let rows = |batch: &RecordBatch| {
+            let mut rows: Vec<String> = (0..batch.num_rows())
+                .map(|i| {
+                    let row = batch.slice(i, 1);
+                    format!("{:?}", row.columns())
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(filtered.schema(), expected.schema());
+        assert_eq!(rows(&filtered), rows(&expected), "same rows and columns");
+        let scores = filtered[SCORE_COLUMN].as_primitive::<arrow::datatypes::Float32Type>();
+        assert!(
+            scores.values().windows(2).all(|w| w[0] >= w[1]),
+            "best first"
+        );
     }
 
     #[test]
