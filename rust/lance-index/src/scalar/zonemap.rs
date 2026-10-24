@@ -3460,6 +3460,18 @@ mod tests {
         expected.insert_range(0..500); // All rows since NaN is in every zone
         assert_eq!(result, SearchResult::at_most(expected));
 
+        // The planner uses this raw total-order range to retrieve negative NaNs.
+        // The index file does not record NaN signs, so every NaN-bearing zone
+        // must remain a conservative candidate.
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float32(Some(f32::NEG_INFINITY))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::at_most(expected));
+
         // Test search for a specific finite value that exists in the data
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(5.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
