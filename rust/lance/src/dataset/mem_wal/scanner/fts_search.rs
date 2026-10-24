@@ -66,7 +66,8 @@ use super::data_source::LsmDataSource;
 use super::exec::{FirstByPkExec, PkBlockFilterExec};
 use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
-    project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
+    project_to_canonical, resolve_data_fields, search_projection, top_level_of,
+    validate_projection_names,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::index::FtsMemQuery;
@@ -1265,7 +1266,8 @@ impl LsmFtsSearchPlanner {
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
+                scanner.disable_scoring_autoprojection();
+                scanner.project_with_schema(&search_projection(dataset, &cols, SCORE_COLUMN)?)?;
                 if let Some(ref filter) = self.filter {
                     // `prefilter(true)` is required: without it the scanner
                     // post-filters the unfiltered BM25 top-k, dropping matching
@@ -1310,9 +1312,12 @@ impl LsmFtsSearchPlanner {
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(
-                    &dataset.schema().project(&generation.stored_projection())?,
-                )?;
+                scanner.disable_scoring_autoprojection();
+                scanner.project_with_schema(&search_projection(
+                    &dataset,
+                    &generation.stored_projection(),
+                    SCORE_COLUMN,
+                )?)?;
                 if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.
@@ -2278,6 +2283,13 @@ mod tests {
         }
         assert!(ids.contains(&1), "missing base hit id=1; got ids={ids:?}");
         assert!(ids.contains(&3), "missing active hit id=3; got ids={ids:?}");
+        for b in &batches {
+            assert_eq!(
+                b[SCORE_COLUMN].null_count(),
+                0,
+                "every hit, the base arm's included, carries the score its source computed"
+            );
+        }
     }
 
     /// A prefilter on a full-text search must drop hits failing the predicate

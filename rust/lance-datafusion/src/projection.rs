@@ -287,7 +287,8 @@ impl ProjectionPlan {
     pub fn from_schema(base: Arc<dyn Projectable>, projection: &Schema) -> Result<Self> {
         // Separate data columns from system columns
         // System columns (_rowid, _rowaddr, etc.) are handled via flags in Projection,
-        // not as fields in the Schema
+        // not as fields in the Schema, and a scoring column the dataset does not
+        // store (_distance, _score) is computed by the search, so it is output only
         let mut data_fields = Vec::new();
         let mut with_row_id = false;
         let mut with_row_addr = false;
@@ -313,6 +314,10 @@ impl ProjectionPlan {
                 } else if field.name == ROW_CREATED_AT_VERSION {
                     with_row_created_at_version = true;
                 }
+            } else if SCORING_COLUMNS.contains(&field.name.as_str())
+                && base.schema().field(&field.name).is_none()
+            {
+                // Output only; nothing to read.
             } else {
                 // Regular data column - validate it exists in base schema
                 if base.schema().field(&field.name).is_none() {
@@ -669,6 +674,40 @@ mod tests {
                     "unexpected result for {scoring_column}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_schema_projection_with_scoring_column() {
+        let id = ArrowField::new("id", DataType::Int64, false);
+        for scoring_column in ["_distance", "_score"] {
+            let requested = Schema::try_from(&ArrowSchema::new(vec![
+                id.clone(),
+                ArrowField::new(scoring_column, DataType::Float32, true),
+            ]))
+            .unwrap();
+
+            // Not stored: an output column the search computes, with nothing to read.
+            let base = Arc::new(Schema::try_from(&ArrowSchema::new(vec![id.clone()])).unwrap());
+            let plan = ProjectionPlan::from_schema(base, &requested).unwrap();
+            let output: Vec<_> = plan
+                .requested_output_expr
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            assert_eq!(output, ["id", scoring_column]);
+            assert_eq!(plan.physical_projection.to_schema().fields.len(), 1);
+
+            // Stored under the same name: a data column, read like any other.
+            let base = Arc::new(
+                Schema::try_from(&ArrowSchema::new(vec![
+                    id.clone(),
+                    ArrowField::new(scoring_column, DataType::Float32, true),
+                ]))
+                .unwrap(),
+            );
+            let plan = ProjectionPlan::from_schema(base, &requested).unwrap();
+            assert_eq!(plan.physical_projection.to_schema().fields.len(), 2);
         }
     }
 
