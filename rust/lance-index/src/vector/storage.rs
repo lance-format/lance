@@ -2677,6 +2677,33 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         centroid: ArrayRef,
         spill_store: &dyn SpillStore,
     ) -> Result<PairwisePartition> {
+        if partition_id >= self.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.num_partitions()
+            )));
+        }
+        self.prepare_pairwise_partition_range(
+            partition_id,
+            0..self.partition_size(partition_id),
+            batch_size,
+            memory_limit,
+            centroid,
+            spill_store,
+        )
+        .await
+    }
+
+    /// Stage a storage-order shard without reading the rest of its partition.
+    pub async fn prepare_pairwise_partition_range(
+        &self,
+        partition_id: usize,
+        rows: std::ops::Range<usize>,
+        batch_size: usize,
+        memory_limit: usize,
+        centroid: ArrayRef,
+        spill_store: &dyn SpillStore,
+    ) -> Result<PairwisePartition> {
         if batch_size == 0 || !batch_size.is_multiple_of(32) {
             return Err(Error::invalid_input(format!(
                 "pairwise batch_size={batch_size} must be a positive multiple of 32"
@@ -2688,7 +2715,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 self.num_partitions()
             )));
         }
-        let num_rows = self.partition_size(partition_id);
+        if rows.start > rows.end || rows.end > self.partition_size(partition_id) {
+            return Err(Error::invalid_input(format!(
+                "pairwise rows {rows:?} outside partition {partition_id} of size {}",
+                self.partition_size(partition_id)
+            )));
+        }
+        let num_rows = rows.len();
         let quantizer = self.quantizer()?;
         let scorer = {
             let quantizer = quantizer.clone();
@@ -2700,9 +2733,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             )
         };
         let row_bytes = scorer.row_bytes();
-        let rows = PAIRWISE_VECTOR_BATCH_BYTES / row_bytes;
-        let batch_size = if rows < batch_size {
-            1usize << rows.max(32).ilog2()
+        let rows_per_batch = PAIRWISE_VECTOR_BATCH_BYTES / row_bytes;
+        let batch_size = if rows_per_batch < batch_size {
+            1usize << rows_per_batch.max(32).ilog2()
         } else {
             batch_size
         };
@@ -2714,7 +2747,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             EncodedPartition::Memory(Vec::new())
         } else if fits {
             let source = self
-                .read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
+                .read_pairwise_codes(partition_id, rows.clone(), &quantizer)
                 .await?;
             EncodedPartition::Memory(
                 stage_pairwise_batches(
@@ -2731,8 +2764,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             // Align source reads to whole vector batches so each spill range
             // still corresponds to exactly one staged batch during replay.
             let read_batch_size = PAIRWISE_READ_BATCH_SIZE.div_ceil(batch_size) * batch_size;
-            for start in (0..num_rows).step_by(read_batch_size) {
-                let end = start.saturating_add(read_batch_size).min(num_rows);
+            for start in (rows.start..rows.end).step_by(read_batch_size) {
+                let end = start.saturating_add(read_batch_size).min(rows.end);
                 let source = self
                     .read_pairwise_codes(partition_id, start..end, &quantizer)
                     .await?;
@@ -2753,6 +2786,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             scorer,
             batch_size,
             num_rows,
+            row_offset: rows.start,
         })
     }
 

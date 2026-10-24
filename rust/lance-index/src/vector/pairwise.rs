@@ -68,6 +68,7 @@ pub struct PairwiseVectorBatch {
     /// Quantizer-specific staged payload, including the row IDs.
     pub codes: RecordBatch,
     batch_id: usize,
+    row_offset: usize,
     selected: Vec<bool>,
 }
 
@@ -252,7 +253,7 @@ fn collect_pairs<K: PairKernel>(
     candidates: &PairwiseVectorBatch,
     threshold: f32,
 ) -> PairwiseHits {
-    let is_diagonal = anchor.batch_id == candidates.batch_id;
+    let is_diagonal = anchor.row_offset == candidates.row_offset;
     let num_candidates = candidates.num_rows();
     let first = if is_diagonal {
         anchor_rows.start + 1
@@ -406,6 +407,7 @@ pub struct PairwisePartition {
     pub(crate) scorer: Arc<PairwiseScorer>,
     pub(crate) batch_size: usize,
     pub(crate) num_rows: usize,
+    pub(crate) row_offset: usize,
 }
 
 impl PairwisePartition {
@@ -433,6 +435,7 @@ impl PairwisePartition {
             num_rows: sources.iter().map(RecordBatch::num_rows).sum(),
             encoded: EncodedPartition::Memory(batches),
             scorer: Arc::new(scorer),
+            row_offset: 0,
         })
     }
 
@@ -478,6 +481,7 @@ impl PairwisePartition {
             row_ids,
             codes,
             batch_id,
+            row_offset: self.row_offset + batch_id * self.batch_size,
             selected,
         })
     }
@@ -502,7 +506,7 @@ impl PairwisePartition {
         candidates: &PairwiseVectorBatch,
         threshold: f32,
     ) -> Result<PairwiseHits> {
-        if candidates.batch_id < anchor.batch_id {
+        if candidates.row_offset < anchor.row_offset {
             return Err(Error::invalid_input(format!(
                 "pairwise candidate batch_id={} precedes anchor batch_id={}",
                 candidates.batch_id, anchor.batch_id
@@ -656,6 +660,7 @@ mod tests {
             scorer: Arc::new(scorer),
             batch_size: 32,
             num_rows: 33,
+            row_offset: 0,
         };
         assert_eq!(prepared.num_batches(), 2);
         for _ in 0..3 {
@@ -707,6 +712,7 @@ mod tests {
             row_ids,
             codes,
             batch_id,
+            row_offset: batch_id * 1_000_000,
             selected,
         }
     }
@@ -794,6 +800,7 @@ mod tests {
             scorer: Arc::new(scorer),
             batch_size: 16,
             num_rows: 32,
+            row_offset: 0,
         };
         let first = prepared.read_vectors(0).await.unwrap();
         let second = prepared.read_vectors(1).await.unwrap();

@@ -295,6 +295,25 @@ impl VectorIndex for PreTransformIndex {
             .await
     }
 
+    async fn prepare_pairwise_partition_range(
+        &self,
+        partition_id: usize,
+        rows: std::ops::Range<usize>,
+        batch_size: usize,
+        memory_limit: usize,
+        spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<super::pairwise::PairwisePartition> {
+        self.inner
+            .prepare_pairwise_partition_range(
+                partition_id,
+                rows,
+                batch_size,
+                memory_limit,
+                spill_store,
+            )
+            .await
+    }
+
     fn stored_fragments(&self) -> Option<RoaringBitmap> {
         self.inner.stored_fragments()
     }

@@ -553,6 +553,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         ))
     }
 
+    /// Stage only the specified storage-order row range of an IVF partition.
+    /// Disjoint ranges retain their original positions for code-to-code scoring.
+    async fn prepare_pairwise_partition_range(
+        &self,
+        _partition_id: usize,
+        _rows: std::ops::Range<usize>,
+        _batch_size: usize,
+        _memory_limit: usize,
+        _spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<pairwise::PairwisePartition> {
+        Err(lance_core::Error::not_supported(
+            "this vector index does not support pairwise row-range staging",
+        ))
+    }
+
     // for SubIndex only
     async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream>;
 

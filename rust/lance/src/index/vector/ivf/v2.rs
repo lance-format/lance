@@ -3474,12 +3474,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 self.ivf.num_partitions()
             )));
         }
+        self.prepare_pairwise_partition_range(
+            partition_id,
+            0..self.partition_size(partition_id),
+            batch_size,
+            memory_limit,
+            spill_store,
+        )
+        .await
+    }
+
+    async fn prepare_pairwise_partition_range(
+        &self,
+        partition_id: usize,
+        rows: std::ops::Range<usize>,
+        batch_size: usize,
+        memory_limit: usize,
+        spill_store: &dyn lance_io::spill::SpillStore,
+    ) -> Result<lance_index::vector::pairwise::PairwisePartition> {
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.ivf.num_partitions()
+            )));
+        }
         let centroid = self.ivf.centroid(partition_id).ok_or_else(|| {
             Error::invalid_input(format!("partition_id={partition_id} has no centroid"))
         })?;
         self.storage
-            .prepare_pairwise_partition(
+            .prepare_pairwise_partition_range(
                 partition_id,
+                rows,
                 batch_size,
                 memory_limit,
                 centroid,
