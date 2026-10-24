@@ -29,6 +29,7 @@ use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+use std::ops::Bound;
 use std::sync::LazyLock;
 
 use arrow_array::{
@@ -63,22 +64,25 @@ const SEED_VERSION_META_KEY: &str = "version";
 const SEED_FORMAT_VERSION: &str = "1";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
-/// Basic stats about zonemap index
+/// Value bounds and counts for one zone in a fragment.
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct ZoneMapStatistics {
-    min: ScalarValue,
-    max: ScalarValue,
-    null_count: u32,
-    // only apply to float type
-    nan_count: u32,
+pub struct ZoneMapStatistics {
+    /// The stored lower bound, or a typed null when unavailable.
+    pub min: ScalarValue,
+    /// The stored upper bound, including legacy NaN markers when present.
+    pub max: ScalarValue,
+    /// Number of null values summarized.
+    pub null_count: u32,
+    /// Number of NaN values summarized; zero for non-floating-point types.
+    pub nan_count: u32,
     /// NaNs with the sign bit set (`<= nan_count`). `None` when the source
     /// cannot split the sign: zones loaded from ZoneMap index files (the file
     /// format has no column for it) and version 0 seeds. Version 1 seeds and
     /// freshly computed zones carry `Some`.
-    negative_nan_count: Option<u32>,
-    // Bound of this zone within the fragment. Persisted as three separate columns
-    // (fragment_id, zone_start, zone_length) in the index file.
-    bound: ZoneBound,
+    pub negative_nan_count: Option<u32>,
+    /// Location of this zone within its fragment. Persisted as fragment id,
+    /// start offset, and length in the index file.
+    pub bound: ZoneBound,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -297,10 +301,30 @@ impl ZoneMapIndex {
         zone: &ZoneMapStatistics,
         query: &SargableQuery,
     ) -> Result<bool> {
-        use std::ops::Bound;
+        zone.may_match(&self.data_type, query)
+    }
+}
+
+impl ZoneMapStatistics {
+    /// Test whether this summary may contain a value matching `query`.
+    ///
+    /// Uses the same predicate evaluation as the ZoneMap index. A `true`
+    /// result is only a candidate and still needs data-level rechecking.
+    /// Callers must first verify that the summary applies to the current data.
+    ///
+    /// ```
+    /// # use arrow_schema::DataType;
+    /// # use lance_core::Result;
+    /// # use lance_index::scalar::{SargableQuery, zonemap::ZoneMapStatistics};
+    /// # fn evaluate(stats: &ZoneMapStatistics, query: &SargableQuery) -> Result<bool> {
+    /// stats.may_match(&DataType::Int64, query)
+    /// # }
+    /// ```
+    pub fn may_match(&self, data_type: &DataType, query: &SargableQuery) -> Result<bool> {
+        let zone = self;
 
         // For nested types we only track null_count; prune only when certain.
-        if self.data_type.is_nested() {
+        if data_type.is_nested() {
             let all_null = zone.null_count as usize == zone.bound.length;
             return match query {
                 SargableQuery::IsNull() => Ok(zone.null_count > 0),
@@ -343,15 +367,15 @@ impl ZoneMapIndex {
                 };
 
                 if is_nan {
-                    return Ok(if Self::scalar_is_negative_nan(target) {
-                        Self::zone_negative_nan_possible(zone)
+                    return Ok(if ZoneMapIndex::scalar_is_negative_nan(target) {
+                        ZoneMapIndex::zone_negative_nan_possible(zone)
                     } else {
-                        Self::zone_positive_nan_possible(zone)
+                        ZoneMapIndex::zone_positive_nan_possible(zone)
                     });
                 }
 
-                if Self::zone_has_missing_extrema(zone) {
-                    return Ok(Self::zone_has_comparable_values(zone));
+                if ZoneMapIndex::zone_has_missing_extrema(zone) {
+                    return Ok(ZoneMapIndex::zone_has_comparable_values(zone));
                 }
 
                 Ok(target >= &zone.min && target <= &zone.max)
@@ -369,52 +393,52 @@ impl ZoneMapIndex {
                 // side of the bound NaN": whenever a same-sign NaN is
                 // possible, the zone stays and the predicate recheck decides.
                 match start {
-                    Bound::Included(s) if Self::scalar_is_nan(s) => {
-                        return Ok(if Self::scalar_is_negative_nan(s) {
+                    Bound::Included(s) if ZoneMapIndex::scalar_is_nan(s) => {
+                        return Ok(if ZoneMapIndex::scalar_is_negative_nan(s) {
                             // x >= -NaN: every finite value and positive NaN
                             // sorts above any -NaN; other -NaNs depend on
                             // payload, which the counts cannot rule out.
-                            Self::zone_non_null_possible(zone)
+                            ZoneMapIndex::zone_non_null_possible(zone)
                         } else {
                             // x >= +NaN: only positive NaNs can sort there.
-                            Self::zone_positive_nan_possible(zone)
+                            ZoneMapIndex::zone_positive_nan_possible(zone)
                         });
                     }
-                    Bound::Excluded(s) if Self::scalar_is_nan(s) => {
-                        return Ok(if Self::scalar_is_negative_nan(s) {
+                    Bound::Excluded(s) if ZoneMapIndex::scalar_is_nan(s) => {
+                        return Ok(if ZoneMapIndex::scalar_is_negative_nan(s) {
                             // x > -NaN: every finite value and positive NaN;
                             // other -NaNs depend on payload.
-                            Self::zone_non_null_possible(zone)
+                            ZoneMapIndex::zone_non_null_possible(zone)
                         } else {
                             // x > +NaN: a positive NaN with a larger payload
                             // still sorts above the bound, so a positive NaN
                             // count keeps the zone.
-                            Self::zone_positive_nan_possible(zone)
+                            ZoneMapIndex::zone_positive_nan_possible(zone)
                         });
                     }
                     _ => {}
                 }
                 match end {
-                    Bound::Included(e) if Self::scalar_is_nan(e) => {
-                        return Ok(if Self::scalar_is_negative_nan(e) {
+                    Bound::Included(e) if ZoneMapIndex::scalar_is_nan(e) => {
+                        return Ok(if ZoneMapIndex::scalar_is_negative_nan(e) {
                             // x <= -NaN: only negative NaNs can sort there.
-                            Self::zone_negative_nan_possible(zone)
+                            ZoneMapIndex::zone_negative_nan_possible(zone)
                         } else {
                             // x <= +NaN: every finite value and negative NaN;
                             // other +NaNs depend on payload.
-                            Self::zone_non_null_possible(zone)
+                            ZoneMapIndex::zone_non_null_possible(zone)
                         });
                     }
-                    Bound::Excluded(e) if Self::scalar_is_nan(e) => {
-                        return Ok(if Self::scalar_is_negative_nan(e) {
+                    Bound::Excluded(e) if ZoneMapIndex::scalar_is_nan(e) => {
+                        return Ok(if ZoneMapIndex::scalar_is_negative_nan(e) {
                             // x < -NaN: a negative NaN with a larger payload
                             // still sorts below the bound, so a negative NaN
                             // count keeps the zone.
-                            Self::zone_negative_nan_possible(zone)
+                            ZoneMapIndex::zone_negative_nan_possible(zone)
                         } else {
                             // x < +NaN: every finite value and negative NaN;
                             // other +NaNs depend on payload.
-                            Self::zone_non_null_possible(zone)
+                            ZoneMapIndex::zone_non_null_possible(zone)
                         });
                     }
                     _ => {}
@@ -433,33 +457,33 @@ impl ZoneMapIndex {
                 // bound (legacy NaN marker) means unknown and keeps the zone.
                 // Counts decide only when no bound was recorded: remapped
                 // legacy zones inherit inexact counts.
-                let ordinary_possible = if Self::zone_has_missing_extrema(zone) {
-                    Self::zone_has_comparable_values(zone)
+                let ordinary_possible = if ZoneMapIndex::zone_has_missing_extrema(zone) {
+                    ZoneMapIndex::zone_has_comparable_values(zone)
                 } else {
                     let above_start = match start {
                         Bound::Unbounded => true,
                         Bound::Included(s) => {
-                            !Self::scalar_is_finite_bound(&zone.max) || &zone.max >= s
+                            !ZoneMapIndex::scalar_is_finite_bound(&zone.max) || &zone.max >= s
                         }
                         Bound::Excluded(s) => {
-                            !Self::scalar_is_finite_bound(&zone.max) || &zone.max > s
+                            !ZoneMapIndex::scalar_is_finite_bound(&zone.max) || &zone.max > s
                         }
                     };
                     let below_end = match end {
                         Bound::Unbounded => true,
                         Bound::Included(e) => {
-                            !Self::scalar_is_finite_bound(&zone.min) || &zone.min <= e
+                            !ZoneMapIndex::scalar_is_finite_bound(&zone.min) || &zone.min <= e
                         }
                         Bound::Excluded(e) => {
-                            !Self::scalar_is_finite_bound(&zone.min) || &zone.min < e
+                            !ZoneMapIndex::scalar_is_finite_bound(&zone.min) || &zone.min < e
                         }
                     };
                     above_start && below_end
                 };
-                let positive_nan_matches =
-                    Self::zone_positive_nan_possible(zone) && matches!(end, Bound::Unbounded);
-                let negative_nan_matches =
-                    Self::zone_negative_nan_possible(zone) && matches!(start, Bound::Unbounded);
+                let positive_nan_matches = ZoneMapIndex::zone_positive_nan_possible(zone)
+                    && matches!(end, Bound::Unbounded);
+                let negative_nan_matches = ZoneMapIndex::zone_negative_nan_possible(zone)
+                    && matches!(start, Bound::Unbounded);
 
                 Ok(ordinary_possible || positive_nan_matches || negative_nan_matches)
             }
@@ -473,13 +497,13 @@ impl ZoneMapIndex {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
                                     if f.is_sign_negative() {
-                                        Self::zone_negative_nan_possible(zone)
+                                        ZoneMapIndex::zone_negative_nan_possible(zone)
                                     } else {
-                                        Self::zone_positive_nan_possible(zone)
+                                        ZoneMapIndex::zone_positive_nan_possible(zone)
                                     }
-                                } else if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
-                                } else if !Self::zone_has_finite_min(zone) {
+                                } else if ZoneMapIndex::zone_has_missing_extrema(zone) {
+                                    ZoneMapIndex::zone_has_comparable_values(zone)
+                                } else if !ZoneMapIndex::zone_has_finite_min(zone) {
                                     false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
@@ -488,13 +512,13 @@ impl ZoneMapIndex {
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
                                     if f.is_sign_negative() {
-                                        Self::zone_negative_nan_possible(zone)
+                                        ZoneMapIndex::zone_negative_nan_possible(zone)
                                     } else {
-                                        Self::zone_positive_nan_possible(zone)
+                                        ZoneMapIndex::zone_positive_nan_possible(zone)
                                     }
-                                } else if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
-                                } else if !Self::zone_has_finite_min(zone) {
+                                } else if ZoneMapIndex::zone_has_missing_extrema(zone) {
+                                    ZoneMapIndex::zone_has_comparable_values(zone)
+                                } else if !ZoneMapIndex::zone_has_finite_min(zone) {
                                     false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
@@ -503,23 +527,23 @@ impl ZoneMapIndex {
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
                                     if f.is_sign_negative() {
-                                        Self::zone_negative_nan_possible(zone)
+                                        ZoneMapIndex::zone_negative_nan_possible(zone)
                                     } else {
-                                        Self::zone_positive_nan_possible(zone)
+                                        ZoneMapIndex::zone_positive_nan_possible(zone)
                                     }
-                                } else if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
-                                } else if !Self::zone_has_finite_min(zone) {
+                                } else if ZoneMapIndex::zone_has_missing_extrema(zone) {
+                                    ZoneMapIndex::zone_has_comparable_values(zone)
+                                } else if !ZoneMapIndex::zone_has_finite_min(zone) {
                                     false
                                 } else {
                                     value >= &zone.min && value <= &zone.max
                                 }
                             }
                             _ => {
-                                if Self::zone_has_missing_extrema(zone) {
-                                    Self::zone_has_comparable_values(zone)
+                                if ZoneMapIndex::zone_has_missing_extrema(zone) {
+                                    ZoneMapIndex::zone_has_comparable_values(zone)
                                 } else {
-                                    Self::zone_has_finite_extrema(zone)
+                                    ZoneMapIndex::zone_has_finite_extrema(zone)
                                         && value >= &zone.min
                                         && value <= &zone.max
                                 }
@@ -580,7 +604,9 @@ impl ZoneMapIndex {
             }
         }
     }
+}
 
+impl ZoneMapIndex {
     /// Additive sibling of [`Self::load`] for mappings that require
     /// asynchronous batch row-ID translation.
     async fn load_with_remapping(
@@ -1404,13 +1430,26 @@ enum ZoneStatsAccumulator {
 /// parent-level null_count without inspecting child values; min and max are
 /// stored as typed null values.
 #[derive(Debug)]
-struct ZoneMapProcessor {
+pub struct ZoneMapProcessor {
     data_type: DataType,
     statistics: ZoneStatsAccumulator,
 }
 
 impl ZoneMapProcessor {
-    fn new(data_type: DataType) -> Result<Self> {
+    /// Create an accumulator for values of `data_type`.
+    ///
+    /// Feed values through [`ZoneProcessor::process_chunk`] and obtain a
+    /// summary through [`ZoneProcessor::finish_zone`].
+    ///
+    /// ```
+    /// # use arrow_schema::DataType;
+    /// # use lance_core::Result;
+    /// # fn processor() -> Result<()> {
+    /// let processor = lance_index::scalar::zonemap::ZoneMapProcessor::new(DataType::Int64)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(data_type: DataType) -> Result<Self> {
         let statistics = if data_type.is_nested() {
             ZoneStatsAccumulator::NullOnly { null_count: 0 }
         } else {
@@ -1892,7 +1931,7 @@ impl ZoneMapSeedWriter {
     /// Returns zone statistics (zones located by their cumulative lengths) and an
     /// optional `RoaringBitmap` of null row offsets within the fragment. The bitmap is absent
     /// for seeds written by older code that did not track null positions.
-    pub(crate) fn deserialize_seed(
+    pub fn deserialize_seed(
         fragment_id: u64,
         bytes: &bytes::Bytes,
     ) -> Result<(Vec<ZoneMapStatistics>, Option<RoaringBitmap>)> {
