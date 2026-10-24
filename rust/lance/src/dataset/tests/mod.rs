@@ -23,3 +23,5 @@ mod dataset_zone_map_seeds;
 mod fragment_validate_tombstones;
 mod fragment_write_columns;
 mod merge_coverage;
+mod seed_commit_io;
+mod seed_versions;

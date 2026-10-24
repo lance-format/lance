@@ -4177,8 +4177,12 @@ mod tests {
     /// The other Bitmap merge tests go through `optimize_indices` and build one
     /// segment per fragment, so this is the only coverage of the distributed-build
     /// entry point, and of a segment whose coverage is wider than one fragment.
-    /// Stable row ids make the filter an exact row-id allow-list, so the deleted
-    /// rows reach it rather than being masked at scan time.
+    /// Bitmap is now address-domain (see `BITMAP_ROW_ADDR_DOMAIN_VERSION`), so
+    /// -- like BTree -- its old-data filter is the coarse `Fragments` kind: a
+    /// fragment with any live rows still contributes every one of its postings,
+    /// deleted or not (masked at scan time instead, via the deletion vector).
+    /// The delete below empties a whole fragment so the filter still has
+    /// something real to exclude.
     #[tokio::test]
     async fn test_bitmap_merge_existing_index_segments_multi_fragment() {
         async fn count_value(dataset: &Dataset, segment: &IndexMetadata, value: &str) -> usize {
@@ -4249,8 +4253,9 @@ mod tests {
             .await
             .unwrap();
 
-        // One B from each segment's coverage, so both filters have work to do.
-        dataset.delete("id = 1 OR id = 9").await.unwrap();
+        // Empties fragment 0 entirely (one of each category), so the coarse
+        // Fragments filter actually excludes something.
+        dataset.delete("id < 4").await.unwrap();
 
         let merged = dataset
             .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())
@@ -4258,17 +4263,38 @@ mod tests {
             .unwrap();
         assert_eq!(
             merged.fragment_bitmap.as_ref(),
-            Some(&(0..4u32).collect::<RoaringBitmap>()),
-            "the merged segment must cover every fragment the sources did"
+            Some(&(1..4u32).collect::<RoaringBitmap>()),
+            "the merged segment must cover every fragment the sources did, minus the one emptied"
         );
 
-        for (value, expected) in [("A", 4), ("B", 2), ("C", 4), ("D", 4)] {
+        for (value, expected) in [("A", 3), ("B", 3), ("C", 3), ("D", 3)] {
             assert_eq!(
                 count_value(&dataset, &merged, value).await,
                 expected,
                 "wrong row count for cat = {value} after merging multi-fragment segments"
             );
         }
+
+        // A partial delete -- one row out of a fragment (2) that otherwise
+        // stays live -- is the case the coarse `Fragments` filter does NOT
+        // exclude from the merged postings: row 9 (cat = 'B') stays in
+        // `merged`'s bitmap for 'B', so this only passes end to end if the
+        // scanner's own deletion vector, not the index, is what masks it.
+        dataset.delete("id = 9").await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter("cat = 'B'").unwrap();
+        scanner.project(&["id"]).unwrap();
+        scanner.use_scalar_index(true);
+        let ids = scanner.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![5, 13],
+            "the scanner must mask row 9 via the deletion vector even though the coarse \
+             Fragments filter leaves its posting in the merged segment"
+        );
     }
 
     #[tokio::test]

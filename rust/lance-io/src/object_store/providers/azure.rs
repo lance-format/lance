@@ -368,15 +368,16 @@ impl StorageOptions {
         self.as_cloud_options()
     }
 
-    #[allow(clippy::manual_map)]
+    /// The account name as the rest of the stack reads it.
+    ///
+    /// Resolving it through [`Self::as_azure_options`] is what keeps the
+    /// prefix naming the account the store connects to: that resolver takes
+    /// keys in any case and settles conflicting spellings in the order it
+    /// documents, and a prefix derived any other way can disagree with it.
     fn find_configured_storage_account(map: &HashMap<String, String>) -> Option<String> {
-        if let Some(account) = map.get("azure_storage_account_name") {
-            Some(account.clone())
-        } else if let Some(account) = map.get("account_name") {
-            Some(account.clone())
-        } else {
-            None
-        }
+        Self(map.clone())
+            .as_azure_options()
+            .remove(&AzureConfigKey::AccountName)
     }
 }
 
@@ -415,6 +416,11 @@ mod tests {
             assert_eq!(
                 options.as_azure_options(),
                 HashMap::from([(AzureConfigKey::AccountName, preferred_value.to_string())])
+            );
+            // The store prefix has to name the account the store connects to.
+            assert_eq!(
+                StorageOptions::find_configured_storage_account(&options.0),
+                Some(preferred_value.to_string())
             );
         }
     }
@@ -512,6 +518,23 @@ mod tests {
         );
     }
 
+    /// Mixed-case keys name an account for every other parser, so the prefix
+    /// has to resolve one from them as well.
+    #[rstest::rstest]
+    #[case::canonical_upper(&[("AZURE_STORAGE_ACCOUNT_NAME", "myaccount")])]
+    #[case::alias_upper(&[("ACCOUNT_NAME", "myaccount")])]
+    #[case::alias_mixed(&[("Account_Name", "myaccount")])]
+    fn test_find_configured_storage_account_ignores_key_case(#[case] options: &[(&str, &str)]) {
+        let options: HashMap<String, String> = options
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        assert_eq!(
+            Some("myaccount".to_string()),
+            StorageOptions::find_configured_storage_account(&options)
+        );
+    }
+
     #[test]
     fn test_calculate_object_store_prefix_from_url_and_options() {
         let provider = AzureBlobStoreProvider;
@@ -554,6 +577,21 @@ mod tests {
                     Some(&options)
                 )
                 .unwrap()
+        );
+    }
+
+    /// A prefix for a URI without an account in it, from an upper-case key.
+    #[test]
+    fn test_calculate_object_store_prefix_from_upper_case_account_key() {
+        let options = HashMap::from_iter([("ACCOUNT_NAME".to_string(), "bob".to_string())]);
+        assert_eq!(
+            "az$container@bob",
+            AzureBlobStoreProvider::calculate_object_store_prefix_with_env(
+                &Url::parse("az://container/path").unwrap(),
+                Some(&options),
+                &HashMap::new(),
+            )
+            .unwrap()
         );
     }
 

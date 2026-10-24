@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::blob::{PyDedicatedBlobWriter, PyPackedBlobWriter};
+use crate::blob::{PyDedicatedBlobWriter, PyManagedBlobWriter, PyPackedBlobWriter};
 use crate::namespace::extract_namespace_arc;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
@@ -553,6 +553,26 @@ impl LanceFileSession {
                 version,
                 keep_original_array,
                 max_page_bytes,
+            ),
+        )?
+    }
+
+    /// Create an independently addressed packed object under this session's base.
+    ///
+    /// Open the session at the table root, or at a registered base's root and
+    /// pass its ``base_id``. Finish the upload before writing its descriptors
+    /// with ``lance.write_dataset`` and schema metadata
+    /// ``lance.blob.managed=true``. Reuse descriptors with
+    /// ``BlobDescriptorArrayBuilder.append`` to share payloads across rows and
+    /// fragments. This does not register bases or commit a dataset version.
+    #[pyo3(signature=(*, base_id=None))]
+    pub fn open_managed_blob_writer(&self, base_id: Option<u32>) -> PyResult<PyManagedBlobWriter> {
+        rt().block_on(
+            None,
+            PyManagedBlobWriter::try_new(
+                self.object_store.clone(),
+                self.base_path.clone(),
+                base_id,
             ),
         )?
     }

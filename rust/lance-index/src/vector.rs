@@ -28,13 +28,16 @@ use v3::subindex::SubIndexType;
 
 pub mod bq;
 pub mod distributed;
+pub(crate) mod exact_buffers;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
 pub mod pairwise;
+pub mod pca;
 pub mod pq;
+pub mod pretransform;
 pub mod quantizer;
 pub mod residual;
 pub mod shared;
@@ -186,6 +189,8 @@ pub struct Query {
 
     /// The number of candidates to reserve while searching.
     /// this is an optional parameter for HNSW related index types.
+    /// Unset defaults to `1.5 * k * refine_factor`, floored at
+    /// [`crate::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub ef: Option<usize>,
 
     /// If presented, apply a refine step.
@@ -348,6 +353,25 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// not benefit from the sequential fast path.
     fn auto_query_parallelism(&self, _cpu_pool_size: usize) -> usize {
         1
+    }
+
+    /// Prepare a query and index pair for the partition-search stage.
+    ///
+    /// Decorators can transform the query once and return their wrapped index,
+    /// allowing both sequential and partition-parallel execution to reuse the
+    /// prepared query. The default returns `None` to keep the original pair.
+    ///
+    /// Decorators such as [`crate::vector::pretransform::PreTransformIndex`]
+    /// must override every method that receives a query. A new method that keeps
+    /// this default will skip the pre-transform and search the original vectors.
+    fn prepare_partition_query(
+        self: Arc<Self>,
+        _query: &Query,
+    ) -> Result<Option<(Arc<dyn VectorIndex>, Query)>>
+    where
+        Self: 'static,
+    {
+        Ok(None)
     }
 
     /// Search a range of partitions and return a stream of per-partition result batches.
