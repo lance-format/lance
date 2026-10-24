@@ -26,6 +26,30 @@ from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
 
+def test_fragment_storage_stats(tmp_path: Path):
+    table = pa.table({"x": list(range(20)), "y": ["a"] * 20})
+    dataset = write_dataset(
+        table,
+        tmp_path / "stats",
+        max_rows_per_file=10,
+        data_storage_version="2.1",
+    )
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 2
+
+    totals: dict[int, int] = {}
+    for fragment in fragments:
+        pairs = fragment.storage_stats()
+        assert pairs == sorted(pairs)
+        assert pairs
+        for field_id, nbytes in pairs:
+            assert nbytes > 0
+            totals[field_id] = totals.get(field_id, 0) + nbytes
+
+    data_stats = dataset.stats.data_stats()
+    assert {field.id: field.bytes_on_disk for field in data_stats.fields} == totals
+
+
 def test_write_fragment(tmp_path: Path):
     with pytest.raises(OSError):
         LanceFragment.create(tmp_path, pd.DataFrame([]))
