@@ -926,6 +926,7 @@ fn version_to_py(py: Python<'_>, version: &Version) -> PyResult<Py<PyAny>> {
     )?;
     let tup: Vec<(&String, &String)> = version.metadata.iter().collect();
     dict.set_item("metadata", tup.into_py_dict(py)?)?;
+    dict.set_item("manifest_size", version.manifest_size)?;
     dict.into_py_any(py)
 }
 

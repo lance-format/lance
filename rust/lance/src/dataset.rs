@@ -300,6 +300,14 @@ pub struct Version {
 
     /// Key-value pairs of metadata.
     pub metadata: BTreeMap<String, String>,
+
+    /// Size of the manifest file for this version, in bytes, if known.
+    ///
+    /// On wide tables (many columns and/or fragments) the manifest is rewritten
+    /// in full on every commit; exposing its size per version makes metadata
+    /// growth observable via `list_versions`.
+    #[serde(default)]
+    pub manifest_size: Option<u64>,
 }
 
 /// A lightweight reference to an attached dataset version, which could be used to uniquely identify a version.
@@ -317,6 +325,7 @@ impl From<&Manifest> for Version {
             version: m.version,
             timestamp: m.timestamp(),
             metadata: m.summary().into(),
+            manifest_size: None,
         }
     }
 }
@@ -2739,7 +2748,13 @@ impl Dataset {
     /// This constructs a full [Version], including summary metadata derived
     /// from the loaded manifest fragments.
     pub fn version(&self) -> Version {
-        Version::from(self.manifest.as_ref())
+        let mut version = Version::from(self.manifest.as_ref());
+        // `Version::from` only sees the manifest itself, not where it was read
+        // from. This dataset already knows the on-disk size, so report it here
+        // too; otherwise `get_version()` would disagree with `versions()`,
+        // which takes the size from the manifest location.
+        version.manifest_size = self.manifest_location().size;
+        version
     }
 
     /// Get the number of entries currently in the index cache.
@@ -2763,8 +2778,13 @@ impl Dataset {
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
             .try_filter_map(|location| async move {
-                match read_manifest(&self.object_store, &location.path, location.size).await {
-                    Ok(manifest) => Ok(Some(Version::from(&manifest))),
+                let manifest_size = location.size;
+                match read_manifest(&self.object_store, &location.path, manifest_size).await {
+                    Ok(manifest) => {
+                        let mut version = Version::from(&manifest);
+                        version.manifest_size = manifest_size;
+                        Ok(Some(version))
+                    }
                     Err(e) => Err(e),
                 }
             })
