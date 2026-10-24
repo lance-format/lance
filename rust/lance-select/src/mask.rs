@@ -864,7 +864,22 @@ impl std::ops::BitOr<&Self> for RowAddrTreeMap {
 
 impl std::ops::BitOrAssign<Self> for RowAddrTreeMap {
     fn bitor_assign(&mut self, rhs: Self) {
-        *self |= &rhs;
+        for (fragment, rhs_set) in rhs.inner {
+            match (self.inner.get_mut(&fragment), rhs_set) {
+                (None, rhs_set) => {
+                    self.inner.insert(fragment, rhs_set);
+                }
+                (Some(RowAddrSelection::Full), _) => {}
+                (Some(lhs_set), RowAddrSelection::Full) => *lhs_set = RowAddrSelection::Full,
+                (
+                    Some(RowAddrSelection::Partial(lhs_bitmap)),
+                    RowAddrSelection::Partial(rhs_bitmap),
+                ) => {
+                    // Keep Roaring's borrowed merge path for occupied fragments.
+                    *lhs_bitmap |= &rhs_bitmap;
+                }
+            }
+        }
     }
 }
 
@@ -2277,25 +2292,41 @@ mod tests {
 
     #[test]
     fn test_bitor_assign_full_fragment() {
-        // Test BitOrAssign when LHS has Full and RHS has Partial
-        let mut map1 = RowAddrTreeMap::default();
-        map1.insert_fragment(0);
-        let mut map2 = RowAddrTreeMap::default();
-        map2.insert(5);
+        let addr = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
+        let mut left = rows(&[addr(1, 1), addr(2, 1)]);
+        left.insert_fragment(0);
+        left.insert_fragment(3);
+        left.insert_bitmap(6, RoaringBitmap::new());
 
-        map1 |= &map2;
-        // Full | Partial = Full
-        assert!(map1.contains(0) && map1.contains(5) && map1.contains(100));
+        let mut right = rows(&[addr(0, 5), addr(2, 1), addr(2, 2), addr(4, 1)]);
+        right.insert_fragment(1);
+        right.insert_fragment(3);
+        right.insert_fragment(5);
+        right.insert_bitmap(7, RoaringBitmap::new());
 
-        // Test BitOrAssign when LHS has Partial and RHS has Full
-        let mut map3 = RowAddrTreeMap::default();
-        map3.insert(5);
-        let mut map4 = RowAddrTreeMap::default();
-        map4.insert_fragment(0);
+        // Cover Full/Partial in both directions, Full/Full, overlapping
+        // partials, disjoint fragments, and empty partial bitmaps.
+        let mut expected = rows(&[addr(2, 1), addr(2, 2), addr(4, 1)]);
+        for fragment in [0, 1, 3, 5] {
+            expected.insert_fragment(fragment);
+        }
+        for fragment in [6, 7] {
+            expected.insert_bitmap(fragment, RoaringBitmap::new());
+        }
 
-        map3 |= &map4;
-        // Partial | Full = Full
-        assert!(map3.contains(0) && map3.contains(5) && map3.contains(100));
+        let mut borrowed = left.clone();
+        borrowed |= &right;
+        assert_eq!(borrowed, expected);
+
+        let mut owned = left.clone();
+        owned |= right.clone();
+        assert_eq!(owned, expected);
+        assert_eq!(left.clone() | &right, expected);
+        assert_eq!(left.clone() | right.clone(), expected);
+
+        assert_eq!(left.clone() | RowAddrTreeMap::new(), left);
+        assert_eq!(RowAddrTreeMap::new() | right.clone(), right);
+        assert_eq!(left.clone() | left.clone(), left);
     }
 
     #[test]

@@ -225,6 +225,23 @@ fn split_row_lineage_fields(schema: Schema) -> Result<(Schema, Vec<Field>)> {
     ))
 }
 
+/// Zero row limits cannot be honored: a zero `max_rows_per_file` panics when
+/// a V2 stream is split into files, and on V1 a zero `max_rows_per_group`
+/// chunks the input into no batches, so nothing is written.
+pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -> Result<()> {
+    if params.max_rows_per_file == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_file must be greater than zero",
+        ));
+    }
+    if matches!(version, ConcreteFileVersion::V1) && params.max_rows_per_group == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_group must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn write_fragments_direct(
     version: ConcreteFileVersion,
@@ -239,6 +256,7 @@ pub async fn write_fragments_direct(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
 ) -> Result<Vec<Fragment>> {
+    validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
         if file_row_counts.contains(&0) {
             return Err(Error::invalid_input(
@@ -247,11 +265,6 @@ pub async fn write_fragments_direct(
         }
         match version {
             ConcreteFileVersion::V1 => {
-                if params.max_rows_per_group == 0 {
-                    return Err(Error::invalid_input(
-                        "max_rows_per_group must be greater than zero when file row counts are specified",
-                    ));
-                }
                 let max_rows_per_group = params.max_rows_per_group;
                 let batch_row_counts =
                     file_row_counts

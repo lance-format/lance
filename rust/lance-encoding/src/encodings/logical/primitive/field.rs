@@ -7,14 +7,14 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{Array, make_array};
+use arrow_array::{Array, cast::AsArray, make_array};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::FuturesOrdered;
 use futures::{FutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_arrow::DataTypeExt;
+use lance_arrow::{DataTypeExt, r#struct::StructArrayExt};
 use lance_core::Result;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Field;
@@ -882,13 +882,21 @@ impl StructuralCompositeDecodeArrayTask {
         }
         // SAFETY: The array buffers have already been validated and the null buffer length
         // matches the array. We are only attaching the null buffer here.
-        Ok(make_array(unsafe {
+        let array = make_array(unsafe {
             array
                 .to_data()
                 .into_builder()
                 .nulls(Some(validity))
                 .build_unchecked()
-        }))
+        });
+        if let Some(struct_array) = array.as_struct_opt() {
+            // Packed structs (including blob descriptors) restore validity at the
+            // parent level. Field access reads the child arrays directly, so those
+            // arrays must also mask values beneath a null parent.
+            Ok(Arc::new(struct_array.pushdown_nulls()?))
+        } else {
+            Ok(array)
+        }
     }
 }
 
@@ -1094,7 +1102,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use arrow_array::Array;
+    use arrow_array::{Array, ArrayRef, Int32Array, StructArray, cast::AsArray};
     use arrow_schema::{DataType, Field as ArrowField};
     use bytes::Bytes;
 
@@ -1108,15 +1116,39 @@ mod tests {
         StructuralPageScheduler,
     };
     use crate::format::metadata;
+    use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler};
     use crate::testing::SimulatedScheduler;
 
     use super::{
-        PageInfoAndScheduler, StructuralPrimitiveFieldDecoder, StructuralPrimitiveFieldScheduler,
-        map_ranges_to_pages, pages_overlapping_ranges,
+        PageInfoAndScheduler, StructuralCompositeDecodeArrayTask, StructuralPrimitiveFieldDecoder,
+        StructuralPrimitiveFieldScheduler, map_ranges_to_pages, pages_overlapping_ranges,
     };
 
     #[derive(Debug)]
     struct CacheMarker(u8);
+
+    #[test]
+    fn test_packed_struct_restores_child_validity() {
+        let array = StructArray::new(
+            vec![Arc::new(ArrowField::new("value", DataType::Int32, false))].into(),
+            vec![Arc::new(Int32Array::from(vec![5, 0, 7])) as ArrayRef],
+            None,
+        );
+        let mut repdef = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(vec![0, 1, 0]),
+            vec![DefinitionInterpretation::NullableItem].into(),
+            3,
+        )]);
+        let result =
+            StructuralCompositeDecodeArrayTask::restore_validity(Arc::new(array), &mut repdef)
+                .unwrap();
+        let result = result.as_struct();
+        assert_eq!(result.null_count(), 1);
+        assert_eq!(result.column(0).nulls(), result.nulls());
+        assert!(result.column(0).is_null(1));
+        result.to_data().validate_full().unwrap();
+    }
 
     impl lance_core::cache::DeepSizeOf for CacheMarker {
         fn deep_size_of_children(&self, _context: &mut lance_core::cache::Context) -> usize {

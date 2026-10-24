@@ -517,7 +517,11 @@ impl Planner {
             Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone())), None),
             Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v)), None),
             Value::Null => Expr::Literal(ScalarValue::Null, None),
-            _ => todo!(),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Unsupported SQL value: {value:?}"
+                )));
+            }
         })
     }
 
@@ -544,6 +548,12 @@ impl Planner {
                     return Err(Error::invalid_input(format!(
                         "Function name must have 1 part, got: {:?}",
                         func.name.0
+                    )));
+                }
+                if args.args.len() != 1 {
+                    return Err(Error::invalid_input(format!(
+                        "is_valid() takes exactly one argument, got {}",
+                        args.args.len()
                     )));
                 }
                 Ok(Expr::IsNotNull(Box::new(
@@ -807,6 +817,16 @@ impl Planner {
             SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
+            SQLExpr::IsNotDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsNotDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
             SQLExpr::InList {
                 expr,
                 list,
@@ -1212,6 +1232,75 @@ mod tests {
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
     use rstest::rstest;
+
+    /// Literal spellings the planner has no mapping for, such as placeholders
+    /// and national strings, used to reach a `todo!()`.
+    #[rstest]
+    #[case::named_placeholder("i = :id")]
+    #[case::numbered_placeholder("i = $1")]
+    #[case::question_placeholder("i = ?")]
+    #[case::national_string("s = N'abc'")]
+    #[case::in_array_literal("s = [N'abc']")]
+    fn test_parse_filter_rejects_unsupported_literals(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i", DataType::Int32, false),
+        ]));
+        let planner = Planner::new(schema);
+
+        let err = planner.parse_filter(filter).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput for {filter}, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Unsupported SQL value"),
+            "error should name the unsupported value for {filter}, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_filter_checks_is_valid_arity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // Zero arguments used to panic on `args[0]`; extra ones were dropped.
+        for filter in ["is_valid()", "is_valid(s, s)"] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected InvalidInput for {filter}, got {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("is_valid() takes exactly one argument"),
+                "unexpected error for {filter}: {err}"
+            );
+        }
+        assert_eq!(
+            planner.parse_filter("is_valid(s)").unwrap(),
+            col("s").is_not_null()
+        );
+    }
+
+    #[test]
+    fn test_parse_expr_rejects_multiple_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A misplaced parenthesis turns `coalesce(s, 'x')` into two items;
+        // keeping only the first would silently compute `coalesce(s)`.
+        let err = planner.parse_expr("coalesce(s), 'x'").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Expression is not valid"),
+            "unexpected error: {err}"
+        );
+        assert!(planner.parse_expr("coalesce(s, 'x')").is_ok());
+    }
 
     #[test]
     fn test_parse_filter_simple() {
@@ -1706,6 +1795,54 @@ mod tests {
         );
     }
 
+    /// A literal under NOT or IS [NOT] TRUE/FALSE is narrowed to the column
+    /// type like one outside it. Otherwise the Float32 column is cast to
+    /// Float64, `0.1f32` no longer equals `0.1`, and the wrapped predicate
+    /// disagrees with the bare one on that row.
+    #[rstest]
+    #[case::eq("f = 0.1", vec![true, false])]
+    #[case::gt("f > 0.1", vec![false, true])]
+    #[case::between("f BETWEEN 0.0 AND 0.1", vec![true, false])]
+    #[case::in_list("f IN (0.1, 0.2)", vec![true, false])]
+    fn test_parse_filter_narrows_under_not_and_is(
+        #[case] filter: &str,
+        #[case] expected: Vec<bool>,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "f",
+            Arc::new(Float32Array::from(vec![0.1, 0.5])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let evaluate = |filter: &str| {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+
+        let negated = BooleanArray::from(expected.iter().map(|m| !m).collect::<Vec<_>>());
+        let expected = BooleanArray::from(expected);
+        assert_eq!(evaluate(filter).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("NOT ({filter})")).as_ref(), &negated);
+        assert_eq!(evaluate(&format!("({filter}) IS TRUE")).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("({filter}) IS FALSE")).as_ref(), &negated);
+        assert_eq!(
+            evaluate(&format!("({filter}) IS NOT TRUE")).as_ref(),
+            &negated
+        );
+        assert_eq!(
+            evaluate(&format!("({filter}) IS NOT FALSE")).as_ref(),
+            &expected
+        );
+    }
+
     #[rstest]
     #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
     #[case::left(
@@ -1915,6 +2052,22 @@ mod tests {
                 true, false, false, true, false, false, true, false, false, true,
             ])
         );
+    }
+
+    #[rstest]
+    #[case::distinct("a IS DISTINCT FROM b", [false, true, true, false])]
+    #[case::not_distinct("a IS NOT DISTINCT FROM b", [true, false, false, true])]
+    fn test_sql_is_distinct_from(#[case] filter: &str, #[case] expected: [bool; 4]) {
+        let batch = arrow_array::record_batch!(
+            ("a", Int32, [Some(1), None, Some(2), None]),
+            ("b", Int32, [Some(1), Some(2), None, None])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.optimize_expr(planner.parse_filter(filter).unwrap());
+        let physical = planner.create_physical_expr(&expr.unwrap()).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(4).unwrap();
+        assert_eq!(result.as_ref(), &BooleanArray::from(expected.to_vec()));
     }
 
     #[test]

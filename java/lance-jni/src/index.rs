@@ -213,6 +213,8 @@ fn determine_index_type<'local>(
             Some("RTREE")
         } else if lower.contains("minhashlsh") {
             Some("MINHASH_LSH")
+        } else if lower.contains("fmindex") {
+            Some("FM")
         } else if lower.contains("ivfhnsw") {
             if lower.contains("sq") {
                 Some("IVF_HNSW_SQ")

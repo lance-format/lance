@@ -25,6 +25,7 @@ use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnaps
 use lance::dataset::mem_wal::{
     LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids, evaluate_sharding_spec,
 };
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
@@ -36,6 +37,7 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
+use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::LanceSchema as PyLanceSchema;
 
@@ -393,9 +395,11 @@ impl PyShardWriter {
         memtable_stats_to_pydict(py, &stats, bytes.as_ref())
     }
 
-    /// Create an LSM scanner that includes the active MemTable for strong consistency.
+    /// Create an LSM scanner that includes this writer's in-memory MemTables
+    /// for strong consistency.
     ///
-    /// The scanner covers: base table + given SSTables + current active MemTable.
+    /// The scanner covers: base table + given SSTables + the active MemTable
+    /// and every frozen MemTable still awaiting flush.
     #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
@@ -412,18 +416,21 @@ impl PyShardWriter {
         let dataset = self.dataset.clone();
         let shard_id = self.shard_id;
 
-        let (active_ref, writer_snapshot) = rt()
+        let (in_memory_memtables, writer_snapshot) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
                     Some(w) => {
-                        let active_ref = w.active_memtable_ref().await?;
+                        // Capture the active memtable *and* any frozen-awaiting-flush
+                        // memtables so a concurrent flush rollover cannot hide
+                        // acknowledged writes from this read-your-writes scanner.
+                        let in_memory_memtables = w.in_memory_memtable_refs().await?;
                         let writer_snapshot = w
                             .manifest()
                             .await?
                             .map(shard_snapshot_from_manifest)
                             .unwrap_or_else(|| ShardSnapshot::new(shard_id));
-                        Ok((active_ref, writer_snapshot))
+                        Ok((in_memory_memtables, writer_snapshot))
                     }
                     None => Err(lance_core::Error::invalid_input(
                         "ShardWriter is already closed",
@@ -435,7 +442,7 @@ impl PyShardWriter {
         snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
-            .with_active_memtable(shard_id, active_ref);
+            .with_in_memory_memtables(shard_id, in_memory_memtables);
 
         Ok(PyLsmScanner {
             inner: Some(scanner),
@@ -685,6 +692,25 @@ impl PyLsmScanner {
             })
             .collect::<PyResult<_>>()?;
         PyList::new(py, py_batches)
+    }
+
+    /// Execute the scan and return a PyArrow RecordBatchReader that yields
+    /// batches as the scan produces them, instead of collecting them first.
+    pub fn to_reader(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let scanner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
+        let stream = rt()
+            .block_on(Some(py), scanner.try_into_stream())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
     }
 
     /// Return the row count without loading all data.

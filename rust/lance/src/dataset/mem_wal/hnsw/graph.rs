@@ -219,7 +219,10 @@ struct LevelLinks {
     /// it, so the repeated publishes of an incremental build do not accumulate
     /// (the prior manual `AtomicPtr` + retired-`Vec` scheme leaked every old
     /// snapshot until graph drop, growing O(N^2/batch) and OOMing at ~1M rows).
-    published: ArcSwap<Vec<u32>>,
+    ///
+    /// `None` on level 0, which searchers read from the packed level-0
+    /// snapshot; one `ArcSwap` per node makes a large graph slow to drop.
+    published: Option<ArcSwap<Vec<u32>>>,
     /// Empty until the node is inserted or first linked to, then sized to
     /// exactly `max_neighbors` once and reused (see [`size_ranked`]).
     ranked: Mutex<Vec<ScoredPoint>>,
@@ -228,29 +231,34 @@ struct LevelLinks {
 impl LevelLinks {
     /// `empty` is one empty list the whole graph shares until a level first
     /// publishes, so an unfilled slot allocates nothing per level.
-    fn new(empty: &Arc<Vec<u32>>) -> Self {
+    fn new(level: u16, empty: &Arc<Vec<u32>>) -> Self {
         Self {
-            published: ArcSwap::new(Arc::clone(empty)),
+            published: (level > 0).then(|| ArcSwap::new(Arc::clone(empty))),
             ranked: Mutex::new(Vec::new()),
         }
     }
 
     /// Heap bytes a level adds once its node is in the graph: `ranked` at
-    /// exactly `max_neighbors`, and a published list counted at full width
-    /// (a publish may hold fewer) plus its `Arc` block (refcounts and the Vec
-    /// header), rounded to the 16-byte granule allocators hand out for a
-    /// block that small.
-    fn linked_bytes(max_neighbors: usize) -> usize {
+    /// exactly `max_neighbors`, and above level 0 a published list counted at
+    /// full width (a publish may hold fewer) plus its `Arc` block (refcounts
+    /// and the Vec header), rounded to the 16-byte granule allocators hand out
+    /// for a block that small.
+    fn linked_bytes(level: u16, max_neighbors: usize) -> usize {
+        let ranked = max_neighbors * std::mem::size_of::<ScoredPoint>();
+        if level == 0 {
+            return ranked;
+        }
         let published_block = (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Vec<u32>>())
             .next_multiple_of(16);
-        published_block
-            + max_neighbors * (std::mem::size_of::<ScoredPoint>() + std::mem::size_of::<u32>())
+        published_block + ranked + max_neighbors * std::mem::size_of::<u32>()
     }
 
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
-        self.published.store(Arc::new(
-            ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
-        ));
+        if let Some(published) = &self.published {
+            published.store(Arc::new(
+                ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
+            ));
+        }
     }
 }
 
@@ -262,7 +270,9 @@ struct Node {
 
 impl Node {
     fn new(target_level: u16, empty: &Arc<Vec<u32>>) -> Self {
-        let levels = (0..=target_level).map(|_| LevelLinks::new(empty)).collect();
+        let levels = (0..=target_level)
+            .map(|level| LevelLinks::new(level, empty))
+            .collect();
         Self {
             target_level,
             levels,
@@ -279,7 +289,7 @@ impl Node {
     /// Heap bytes a node of `target_level` adds once it is in the graph.
     fn linked_bytes(target_level: u16, m: usize) -> usize {
         (0..=target_level)
-            .map(|level| LevelLinks::linked_bytes(max_neighbors(m, level)))
+            .map(|level| LevelLinks::linked_bytes(level, max_neighbors(m, level)))
             .sum()
     }
 
@@ -584,7 +594,8 @@ impl HnswGraph {
             });
         }
 
-        let ef = params.ef.max(params.k);
+        // A beam wider than the graph finds nothing more; cap what it allocates.
+        let ef = params.ef.max(params.k).min(visible_len);
         let limits = BeamLimits {
             ef,
             output_limit: params.k,
@@ -1018,7 +1029,10 @@ impl HnswGraph {
                 return;
             }
         }
-        let published = node.levels[level as usize].published.load();
+        let Some(published) = &node.levels[level as usize].published else {
+            return;
+        };
+        let published = published.load();
         if visible_len == usize::MAX {
             for neighbor in published.iter().copied() {
                 visit(neighbor);
@@ -1360,12 +1374,25 @@ mod tests {
 
         graph.insert_batch(ids, &snapshot).unwrap();
         assert_eq!(graph.len(), rows);
+        for node in &graph.nodes {
+            assert!(node.levels[0].published.is_none());
+            assert!(
+                node.levels[1..]
+                    .iter()
+                    .all(|links| links.published.is_some())
+            );
+        }
 
         let query = snapshot.vector(42);
         let result = graph
             .search(query, SearchParams::new(5, 32), &snapshot)
             .unwrap();
         assert!(result.iter().any(|point| point.id == 42));
+
+        let widest = graph
+            .search(query, SearchParams::new(5, usize::MAX), &snapshot)
+            .unwrap();
+        assert!(widest.iter().any(|point| point.id == 42));
     }
 
     /// Each node's neighbor lists are charged as it is inserted and hold
@@ -1554,6 +1581,13 @@ mod tests {
         let mut exports = 0;
         let mut edges_checked = 0;
         while writing.load(Ordering::Acquire) || exports < 5 {
+            // Read as a search does: every visible node is in the packed level 0.
+            let visible = graph.len() as u32;
+            let packed = graph.packed_level0.load();
+            assert!(
+                (0..visible).all(|id| packed.neighbors(id).is_some()),
+                "a visible node is missing from the packed level-0 snapshot"
+            );
             let batch = graph.to_lance_hnsw_batch(None).unwrap();
             let rows = batch.num_rows();
             let neighbors = batch
@@ -1619,5 +1653,55 @@ mod tests {
         let batch = graph.to_lance_hnsw_batch(None).unwrap();
         let loaded = HNSW::load(batch).unwrap();
         assert_eq!(loaded.len(), rows);
+    }
+
+    /// Rows written again under new keys repeat their vectors exactly; each
+    /// distinct vector must keep a reachable copy, including one stored more
+    /// often than a level-0 list holds (8 at `m = 4`). Not every copy is
+    /// reachable: a list holds one copy of a vector, so a search for many
+    /// identical rows may return only some of them. Not run under dot product,
+    /// where a vector's nearest row need not hold the same vector.
+    #[rstest::rstest]
+    fn test_each_repeated_vector_keeps_a_reachable_copy(
+        #[values(2, 12)] copies: usize,
+        #[values(DistanceType::L2, DistanceType::Cosine)] distance_type: DistanceType,
+    ) {
+        let (distinct, dim) = (100, 8);
+        let values = generate_random_array_with_seed::<Float32Type>(distinct * dim, [3; 32]);
+        let rows = distinct * copies;
+        let repeated: Vec<f32> = values
+            .values()
+            .iter()
+            .copied()
+            .cycle()
+            .take(rows * dim)
+            .collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(repeated), dim as i32)
+                .unwrap();
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(rows, 4, dim, distance_type).unwrap());
+        let ids = store.append_batch(Arc::new(vectors), 0).unwrap();
+        let snapshot = store.snapshot();
+        let params = BuildParams::mem_wal_default()
+            .num_edges(4)
+            .ef_construction(16)
+            .seed(1);
+        let graph = HnswGraph::try_new(rows, params).unwrap();
+        graph.insert_batch_serial(ids, &snapshot).unwrap();
+
+        let unreachable = (0..distinct as u32)
+            .filter(|&id| {
+                let query = snapshot.vector(id);
+                let found = graph
+                    .search(query, SearchParams::new(1, rows), &snapshot)
+                    .unwrap();
+                !found.iter().any(|point| snapshot.vector(point.id) == query)
+            })
+            .count();
+        assert_eq!(
+            unreachable, 0,
+            "{unreachable} of {distinct} vectors have no reachable copy"
+        );
     }
 }

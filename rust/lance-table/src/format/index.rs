@@ -4,6 +4,7 @@
 //! Metadata for index
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZero;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -19,12 +20,25 @@ use lance_core::cache::{CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 
 /// Metadata about a single file within an index segment.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexFile {
     /// Path relative to the index directory (e.g., "index.idx", "auxiliary.idx")
     pub path: String,
     /// Size of the file in bytes
     pub size_bytes: u64,
+    /// The metadata suffix size in bytes, if known.
+    ///
+    /// The suffix starts at global buffer 0, which holds the `FileDescriptor`,
+    /// and ends at EOF. Readers treat this as an advisory hint and use the file
+    /// footer as authoritative. `None` also represents legacy (0.1) Lance files
+    /// and index files that use another format.
+    pub file_metadata_size_bytes: Option<NonZero<u64>>,
+}
+
+impl DeepSizeOf for IndexFile {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.path.deep_size_of_children(context)
+    }
 }
 
 /// Index metadata
@@ -147,6 +161,7 @@ impl IndexMetadata {
     /// Currently this is a rather short list.  We will soon be migrating the remaining
     /// row-id-domain indexes to use row addresses.  At that point this list will grow and
     /// likely turn from an allow-list into a block-list.
+    /// A false result does not prove that an unrecognized plugin stores stable row IDs.
     pub fn results_are_row_addrs(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             let is_fm = details
@@ -159,7 +174,47 @@ impl IndexMetadata {
                 || details.type_url.ends_with("BloomFilterIndexDetails")
                 || is_fm
                 || Self::is_btree_addr_domain(details, self.index_version)
+                || Self::is_bitmap_addr_domain(details, self.index_version)
+                || Self::is_label_list_addr_domain(details, self.index_version)
         })
+    }
+
+    /// Whether the metadata proves that stored identifiers survive a physical
+    /// row rewrite without remapping. Unknown plugin types must lose coverage
+    /// of rewritten rows instead of being assumed to store stable row IDs.
+    /// Missing details retain the historical native-index behavior.
+    pub(crate) fn can_follow_stable_row_ids(&self) -> bool {
+        if self.results_are_row_addrs() {
+            return false;
+        }
+        let Some(details) = &self.index_details else {
+            return true;
+        };
+        let type_url = details.type_url.to_ascii_lowercase();
+        let Some((package, name)) = type_url
+            .rsplit_once('/')
+            .and_then(|(_, name)| name.rsplit_once('.'))
+        else {
+            return false;
+        };
+        match (package, name) {
+            ("lance.table" | "lance.index.pb", "btreeindexdetails") => self.index_version < 1,
+            ("lance.table" | "lance.index.pb", "bitmapindexdetails") => self.index_version < 1,
+            ("lance.table" | "lance.index.pb", "labellistindexdetails") => self.index_version < 2,
+            ("lance.table" | "lance.index.pb", "ngramindexdetails" | "invertedindexdetails") => {
+                true
+            }
+            (
+                "lance.index.pb",
+                "vectorindexdetails"
+                | "jsonindexdetails"
+                | "rtreeindexdetails"
+                | "minhashlshindexdetails",
+            ) => true,
+            // MemWAL flush briefly emitted this native vector identity.
+            ("lance.index", "vectorindexdetails") => true,
+            _ => false,
+        }
     }
 
     // A BTree segment stores row addresses only from format version 1
@@ -171,22 +226,34 @@ impl IndexMetadata {
         details.type_url.ends_with("BTreeIndexDetails") && index_version >= 1
     }
 
+    // A bitmap segment stores row addresses only from format version 1 onward
+    fn is_bitmap_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("BitmapIndexDetails") && index_version >= 1
+    }
+
+    // A label list segment stores row addresses only from format version 2 onward
+    fn is_label_list_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
+        details.type_url.ends_with("LabelListIndexDetails") && index_version >= 2
+    }
+
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
     /// and its type actively supports being remapped in place onto a rewrite's new
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
-    /// Of the address-domain types, only BTree's index supports this today
-    /// (`ScalarIndex::can_remap`); ZoneMap, BloomFilter and FM always report
-    /// `RemapResult::Drop`, so remapping is never worth attempting for them.
+    /// Of the address-domain types, BTree, Bitmap and LabelList's indexes support
+    /// this today (`ScalarIndex::can_remap`); ZoneMap, BloomFilter and FM always
+    /// report `RemapResult::Drop`, so remapping is never worth attempting for them.
     /// `can_remap()` lives on the opened index and can vary per instance in
     /// principle, but every implementation today is a type-level constant, so
     /// this metadata-only check -- answering whether a remap is worth
     /// attempting, not whether one will succeed opening the index -- is exact
     /// in practice, not just a cheap approximation.
     pub fn supports_eager_remap(&self) -> bool {
-        self.index_details
-            .as_ref()
-            .is_some_and(|details| Self::is_btree_addr_domain(details, self.index_version))
+        self.index_details.as_ref().is_some_and(|details| {
+            Self::is_btree_addr_domain(details, self.index_version)
+                || Self::is_bitmap_addr_domain(details, self.index_version)
+                || Self::is_label_list_addr_domain(details, self.index_version)
+        })
     }
 
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
@@ -329,6 +396,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
                     .map(|f| IndexFile {
                         path: f.path,
                         size_bytes: f.size_bytes,
+                        file_metadata_size_bytes: NonZero::new(f.file_metadata_size_bytes),
                     })
                     .collect(),
             )
@@ -393,6 +461,9 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
                     .map(|f| pb::IndexFile {
                         path: f.path.clone(),
                         size_bytes: f.size_bytes,
+                        file_metadata_size_bytes: f
+                            .file_metadata_size_bytes
+                            .map_or(0, NonZero::get),
                     })
                     .collect()
             })
@@ -487,6 +558,7 @@ pub async fn list_index_files_with_sizes(
         files.push(IndexFile {
             path: relative_path,
             size_bytes: meta.size,
+            file_metadata_size_bytes: None,
         });
     }
     Ok(files)
@@ -601,6 +673,7 @@ mod tests {
                 files: Some(vec![IndexFile {
                     path: "index.idx".to_string(),
                     size_bytes: 1024,
+                    file_metadata_size_bytes: NonZero::new(256),
                 }]),
             },
             IndexMetadata {
@@ -743,13 +816,37 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
-    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
-    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
-    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
-    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
-    #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
-    fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true, false)]
+    #[case::bloom_filter(
+        "type.googleapis.com/lance.index.pb.BloomFilterIndexDetails",
+        true,
+        false
+    )]
+    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true, false)]
+    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true, false)]
+    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false, false)]
+    #[case::custom("type.googleapis.com/example.ExampleIndexDetails", false, false)]
+    #[case::foreign_bitmap("type.googleapis.com/example.BitmapIndexDetails", false, false)]
+    #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false, true)]
+    #[case::bitmap("type.googleapis.com/lance.table.BitmapIndexDetails", false, true)]
+    #[case::bitmap_alias("type.googleapis.com/LANCE.INDEX.PB.BITMAPINDEXDETAILS", false, true)]
+    #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", false, true)]
+    #[case::ngram("type.googleapis.com/lance.table.NGramIndexDetails", false, true)]
+    #[case::inverted("type.googleapis.com/lance.table.InvertedIndexDetails", false, true)]
+    #[case::vector("type.googleapis.com/lance.index.pb.VectorIndexDetails", false, true)]
+    #[case::vector_legacy("type.googleapis.com/lance.index.VectorIndexDetails", false, true)]
+    #[case::json("type.googleapis.com/lance.index.pb.JsonIndexDetails", false, true)]
+    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", false, true)]
+    #[case::minhash_lsh(
+        "type.googleapis.com/lance.index.pb.MinHashLshIndexDetails",
+        false,
+        true
+    )]
+    fn test_results_are_row_addrs(
+        #[case] type_url: &str,
+        #[case] expected: bool,
+        #[case] can_follow_stable_row_ids: bool,
+    ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: type_url.to_string(),
@@ -758,11 +855,16 @@ mod tests {
         metadata.index_version = 0;
 
         assert_eq!(metadata.results_are_row_addrs(), expected);
+        assert_eq!(
+            metadata.can_follow_stable_row_ids(),
+            can_follow_stable_row_ids
+        );
     }
 
     #[test]
     fn test_results_are_row_addrs_btree_is_version_gated() {
         let mut metadata = index_metadata_with(vec![0], vec![]);
+        assert!(metadata.can_follow_stable_row_ids());
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: "type.googleapis.com/lance.table.BTreeIndexDetails".to_string(),
             value: Vec::new(),
@@ -773,11 +875,48 @@ mod tests {
             !metadata.results_are_row_addrs(),
             "a legacy BTree segment stores row ids directly"
         );
+        assert!(metadata.can_follow_stable_row_ids());
+        assert!(!metadata.supports_eager_remap());
 
         metadata.index_version = 1;
         assert!(
             metadata.results_are_row_addrs(),
             "a BTree segment built with address-domain support stores row addresses"
+        );
+        assert!(!metadata.can_follow_stable_row_ids());
+        assert!(metadata.supports_eager_remap());
+    }
+
+    #[rstest]
+    #[case::bitmap("type.googleapis.com/lance.table.BitmapIndexDetails", 1)]
+    #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", 2)]
+    fn test_results_are_row_addrs_is_version_gated(
+        #[case] type_url: &str,
+        #[case] addr_domain_version: i32,
+    ) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: type_url.to_string(),
+            value: Vec::new(),
+        }));
+
+        metadata.index_version = addr_domain_version - 1;
+        assert!(
+            !metadata.results_are_row_addrs(),
+            "a segment persisted before the address-domain format version stores row ids directly"
+        );
+        assert!(metadata.can_follow_stable_row_ids());
+        assert!(!metadata.supports_eager_remap());
+
+        metadata.index_version = addr_domain_version;
+        assert!(
+            metadata.results_are_row_addrs(),
+            "a segment built with address-domain support stores row addresses"
+        );
+        assert!(!metadata.can_follow_stable_row_ids());
+        assert!(
+            metadata.supports_eager_remap(),
+            "BitmapIndex and LabelListIndex both support can_remap(), same as BTree"
         );
     }
 

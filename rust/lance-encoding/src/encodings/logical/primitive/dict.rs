@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 /// Bits per value for FixedWidth dictionary values (legacy default for 128-bit values)
 pub const DICT_FIXED_WIDTH_BITS_PER_VALUE: u64 = 128;
@@ -437,6 +440,66 @@ pub fn dictionary_encode(
     }
 }
 
+/// Deduplicate byte-aligned rows, including the validity bytes of zipped vectors.
+///
+/// Keys borrow the input and compare the full row, so hash collisions cannot merge
+/// distinct values. The original scalar dictionary paths retain their typed keys.
+pub(super) fn encode_fixed_rows(
+    data: &FixedWidthDataBlock,
+    max_dict_entries: u32,
+    max_encoded_size: usize,
+) -> Option<(DataBlock, FixedWidthDataBlock)> {
+    let width = usize::try_from(data.bits_per_value / 8).ok()?;
+    let count = usize::try_from(data.num_values).ok()?;
+    if width == 0
+        || !data.bits_per_value.is_multiple_of(8)
+        || count.checked_mul(width)? != data.data.len()
+    {
+        return None;
+    }
+    let indices_bytes = count.checked_mul(4)?;
+    if indices_bytes > max_encoded_size {
+        return None;
+    }
+    let mut map = HashMap::new();
+    let mut items = Vec::new();
+    let mut indices = Vec::with_capacity(count);
+    for value in data.data.chunks_exact(width) {
+        let next = u32::try_from(map.len()).ok()?;
+        let index = match map.entry(U8SliceKey(value)) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                if next >= max_dict_entries.min(i32::MAX as u32)
+                    || items.len().checked_add(width)?.checked_add(indices_bytes)?
+                        > max_encoded_size
+                {
+                    return None;
+                }
+                items.extend_from_slice(value);
+                entry.insert(next);
+                next
+            }
+        };
+        indices.push(index);
+    }
+    let mut indices = DataBlock::FixedWidth(FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(indices),
+        bits_per_value: 32,
+        num_values: data.num_values,
+        block_info: BlockInfo::new(),
+    });
+    indices.compute_stat();
+    Some((
+        indices,
+        FixedWidthDataBlock {
+            data: LanceBuffer::from(items),
+            bits_per_value: data.bits_per_value,
+            num_values: map.len() as u64,
+            block_info: BlockInfo::new(),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +510,37 @@ mod tests {
     use arrow_array::{Array, StringArray};
     use std::sync::Arc;
 
+    #[test]
+    fn test_fixed_row_dictionary_preserves_float_bits_and_budgets() {
+        let patterns = [0u32, 0x8000_0000, 0x7fc0_0001, 0x7fc0_0002];
+        let data = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(
+                (0..128)
+                    .flat_map(|i| [patterns[i % 4], 1.0f32.to_bits()])
+                    .collect::<Vec<_>>(),
+            ),
+            bits_per_value: 64,
+            num_values: 128,
+            block_info: BlockInfo::new(),
+        };
+        let size = 128 * 4 + 4 * 8;
+        assert!(encode_fixed_rows(&data, 3, size).is_none());
+        assert!(encode_fixed_rows(&data, 4, size - 1).is_none());
+        let (indices, items) = encode_fixed_rows(&data, 4, size).unwrap();
+        assert_eq!(items.num_values, 4);
+        let values = items.data.borrow_to_typed_slice::<u32>();
+        for (i, pattern) in patterns.iter().enumerate() {
+            assert_eq!(values[i * 2], *pattern);
+        }
+        let indices = indices
+            .as_fixed_width_ref()
+            .unwrap()
+            .data
+            .borrow_to_typed_slice::<u32>();
+        for (i, index) in indices.iter().enumerate() {
+            assert_eq!(*index, (i % 4) as u32);
+        }
+    }
     #[test]
     fn test_dictionary_encode_abort_fixed_width() {
         // Create a u128 block with very high cardinality where dict encoding

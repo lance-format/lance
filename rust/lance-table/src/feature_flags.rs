@@ -119,8 +119,6 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// Required for data files containing version 1 zone-level statistics seeds.
 /// Their min/max exclude NaNs, which are counted separately by sign. Set in
 /// both reader and writer feature flags and preserve across commits.
-///
-/// Reserved: support for these seeds is not implemented yet.
 pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 /// Writer-only protection for clustering definitions, ID allocation, references,
 /// and generic fragment/index segment metadata maintenance.
@@ -344,7 +342,7 @@ fn supported_flags_when(
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
-    mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, false);
+    mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, false);
     supported
 }
@@ -547,19 +545,21 @@ mod tests {
         assert!(!can_read_dataset(FLAG_OBJECT_METADATA));
         assert!(!can_write_dataset(FLAG_OBJECT_METADATA));
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
-        // Neither reserved bit is supported, and bits above them remain unknown.
-        assert!(!can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert!(!can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        // The zone seed bit below it is supported; bits above remain unknown.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
         assert_eq!(FLAG_UNKNOWN, 1 << 18);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
     }
 
     #[test]
-    fn test_zone_write_seed_flag_is_reserved_and_sticky() {
+    fn test_zone_write_seed_flag_is_supported_and_sticky() {
         assert_eq!(FLAG_ZONE_WRITE_SEEDS, 1 << 16);
-        assert!(!can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert!(!can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        // This build implements version 1 seeds: flagged datasets stay
+        // readable and writable here, while pre-flag builds refuse them.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
 
         let mut manifest = empty_manifest();
         manifest.reader_feature_flags = FLAG_ZONE_WRITE_SEEDS;
@@ -568,12 +568,8 @@ mod tests {
         assert_eq!(manifest.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
         assert_eq!(manifest.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
 
-        let read_error = ensure_can_read_manifest(&manifest).unwrap_err();
-        assert!(matches!(read_error, Error::NotSupported { .. }));
-        assert!(read_error.to_string().contains("Please upgrade"));
-        let write_error = ensure_can_write_manifest(&manifest).unwrap_err();
-        assert!(matches!(write_error, Error::NotSupported { .. }));
-        assert!(write_error.to_string().contains("Please upgrade"));
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
 
         let mut destination = empty_manifest();
         inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();

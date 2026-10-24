@@ -42,7 +42,7 @@ use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
-use tracing::info;
+use tracing::{debug, info};
 use url::Url;
 
 #[cfg(feature = "dynamodb")]
@@ -224,7 +224,13 @@ pub fn write_manifest_file_to_path<'a>(
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
         let res = Writer::shutdown(&mut object_writer).await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string(), size_bytes = res.size, version = manifest.version);
+        debug!(
+            version = manifest.version,
+            size_bytes = res.size,
+            path = path.to_string(),
+            "wrote dataset manifest"
+        );
         Ok(res)
     })
 }
@@ -931,6 +937,29 @@ pub trait CommitHandler: Debug + Send + Sync {
             Ok(_) => Ok(true),
             Err(ObjectStoreError::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether `path` is the handler's authoritative location for `version`.
+    ///
+    /// Cleanup uses this to revalidate staging-shaped manifest candidates that
+    /// may not appear in [`Self::list_manifest_locations`]. The default uses
+    /// the handler's version resolver; handlers whose resolver performs repair
+    /// should override this with a read-only authority lookup.
+    async fn is_manifest_path_authoritative(
+        &self,
+        base_path: &Path,
+        version: u64,
+        path: &Path,
+        object_store: &dyn OSObjectStore,
+    ) -> Result<bool> {
+        match self
+            .resolve_version_location(base_path, version, object_store)
+            .await
+        {
+            Ok(location) => Ok(location.path == *path),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
