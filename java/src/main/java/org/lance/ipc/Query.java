@@ -26,6 +26,8 @@ public class Query {
   private final float[] key;
   private final int queryVectorDim;
   private final int k;
+  private final Optional<Float> lowerBound;
+  private final Optional<Float> upperBound;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
   private final Optional<Double> searchEffort;
@@ -58,6 +60,8 @@ public class Query {
         !maximumNprobes.isPresent() || maximumNprobes.get() >= minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
+    this.lowerBound = builder.lowerBound;
+    this.upperBound = builder.upperBound;
     this.searchEffort = builder.searchEffort;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
@@ -87,6 +91,24 @@ public class Query {
 
   public int getK() {
     return k;
+  }
+
+  /**
+   * Returns the inclusive lower distance bound.
+   *
+   * @return The lower bound, or empty if the query has no lower distance bound.
+   */
+  public Optional<Float> getLowerBound() {
+    return lowerBound;
+  }
+
+  /**
+   * Returns the exclusive upper distance bound.
+   *
+   * @return The upper bound, or empty if the query has no upper distance bound.
+   */
+  public Optional<Float> getUpperBound() {
+    return upperBound;
   }
 
   public int getMinimumNprobes() {
@@ -151,6 +173,8 @@ public class Query {
         .add("key", key)
         .add("queryVectorDim", queryVectorDim)
         .add("k", k)
+        .add("lowerBound", lowerBound.orElse(null))
+        .add("upperBound", upperBound.orElse(null))
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
         .add("searchEffort", searchEffort.orElse(null))
@@ -168,6 +192,8 @@ public class Query {
     private float[] key;
     private int queryVectorDim = 0;
     private int k = 10;
+    private Optional<Float> lowerBound = Optional.empty();
+    private Optional<Float> upperBound = Optional.empty();
     private Optional<Integer> nprobes = Optional.empty();
     private Optional<Integer> minimumNprobes = Optional.empty();
     private Optional<Integer> maximumNprobes = Optional.empty();
@@ -261,6 +287,34 @@ public class Query {
     }
 
     /**
+     * Sets the inclusive lower bound for distances returned by the nearest-neighbor search.
+     *
+     * <p>This can be set independently of {@link #setUpperBound(float)}. A query with lower bound
+     * {@code lower} retains results whose distance satisfies {@code distance >= lower}.
+     *
+     * @param lowerBound The inclusive lower distance bound.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setLowerBound(float lowerBound) {
+      this.lowerBound = Optional.of(lowerBound);
+      return this;
+    }
+
+    /**
+     * Sets the exclusive upper bound for distances returned by the nearest-neighbor search.
+     *
+     * <p>This can be set independently of {@link #setLowerBound(float)}. A query with upper bound
+     * {@code upper} retains results whose distance satisfies {@code distance < upper}.
+     *
+     * @param upperBound The exclusive upper distance bound.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setUpperBound(float upperBound) {
+      this.upperBound = Optional.of(upperBound);
+      return this;
+    }
+
+    /**
      * Sets the number of probes to load and search.
      *
      * <p>Used only when search effort is absent. Explicit minimum and maximum bounds override the
@@ -328,7 +382,7 @@ public class Query {
 
     /**
      * Sets the number of candidates to reserve while searching. This is an optional parameter for
-     * HNSW related index types.
+     * HNSW related index types. Defaults to {@code 1.5 * k * refineFactor}, floored at 256.
      *
      * @param ef The number of candidates to reserve.
      * @return The Builder instance for method chaining.

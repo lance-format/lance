@@ -88,9 +88,19 @@ impl IndexRemapper for DatasetIndexRemapper {
         // The compaction remap is fully materialized: one shared synchronous
         // translator serves every index.
         let mapping = RowAddrTranslator::sync(mapping);
+        // On a stable-row-id table a row-id-domain index's ids survive the
+        // rewrite untouched; translating them through an address map would
+        // corrupt them. Of the address-domain indices, only a type that
+        // supports an eager remap is worth opening here: ZoneMap, BloomFilter
+        // and FM always report `RemapResult::Drop` below, so opening one
+        // only to immediately discard it would be wasted I/O; their fragment
+        // bitmaps are fixed up from manifest metadata alone instead (see
+        // `manifest_build.rs`'s stable-row-id `Operation::Rewrite` handler).
+        let uses_stable_row_ids = self.dataset.manifest.uses_stable_row_ids();
         let mut remapped = Vec::with_capacity(self.indices.len());
         for index in self.indices.iter() {
             let needs_remapped = !is_system_index(index)
+                && (!uses_stable_row_ids || index.supports_eager_remap())
                 && match &index.fragment_bitmap {
                     None => true,
                     Some(fragment_bitmap) => fragment_bitmap

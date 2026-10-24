@@ -26,8 +26,9 @@ use super::external::{
     ExternalBaseResolver, collect_external_blob_uris, normalize_external_absolute_uri,
 };
 use crate::blob::{
-    BlobDescriptor, BlobDescriptorArrayBuilder, BlobIdAllocator, BlobRange, PackedBlobWriter,
-    blob_v2_layout, blob_v2_shape_error, validate_prepared_blob_array,
+    BlobDescriptor, BlobDescriptorArrayBuilder, BlobIdAllocator, BlobObjectWriter, BlobRange,
+    ManagedBlobLocation, blob_v2_layout, blob_v2_shape_error, sidecar_path_for_data_file,
+    validate_prepared_blob_array,
 };
 use crate::dataset::write::ExternalBlobMode;
 use lance_core::datatypes::{BlobKind, BlobV2Layout, Schema};
@@ -112,99 +113,35 @@ pub(in crate::dataset) fn validate_blob_threshold_metadata(schema: &Schema) -> R
     Ok(())
 }
 
-struct RollingPackedBlobWriter {
-    current: Option<PackedBlobWriter>,
-    current_size: usize,
-    current_max_pack_size: Option<usize>,
+enum BlobPackAddress {
+    Sidecar(u32),
+    Managed(ManagedBlobLocation),
 }
 
-impl RollingPackedBlobWriter {
-    fn new() -> Self {
-        Self {
-            current: None,
-            current_size: 0,
-            current_max_pack_size: None,
-        }
-    }
+struct BlobPack {
+    writer: BlobObjectWriter,
+    address: BlobPackAddress,
+    max_size: usize,
+}
 
-    async fn start_new_pack(
-        &mut self,
-        object_store: ObjectStore,
-        data_file_path: Path,
-        managed_base: Option<&(Option<u32>, Path)>,
-        blob_id_allocator: BlobIdAllocator,
-        max_pack_size: usize,
-    ) -> Result<()> {
-        self.finish().await?;
-        let blob_id = blob_id_allocator.next()?;
-        self.current = Some(if let Some((_, root)) = managed_base {
-            let path = root
-                .clone()
-                .join("_blobs")
-                .join(format!("{}.blob", uuid::Uuid::new_v4()));
-            PackedBlobWriter::try_new_at(object_store, path, blob_id).await?
-        } else {
-            PackedBlobWriter::try_new(object_store, data_file_path, blob_id).await?
-        });
-        self.current_size = 0;
-        self.current_max_pack_size = Some(max_pack_size);
-        Ok(())
-    }
-
-    async fn write(
-        &mut self,
-        object_store: ObjectStore,
-        data_file_path: Path,
-        managed_base: Option<&(Option<u32>, Path)>,
-        blob_id_allocator: BlobIdAllocator,
-        max_pack_size: usize,
-        source: BlobWriteSource<'_>,
-    ) -> Result<BlobDescriptor> {
-        let len = source.size();
-        let needs_new_pack = match (self.current.as_ref(), self.current_max_pack_size) {
-            (Some(_), Some(current_max_pack_size)) => {
-                current_max_pack_size != max_pack_size
-                    || self.current_size + len > current_max_pack_size
-            }
-            _ => true,
-        };
-        if needs_new_pack {
-            self.start_new_pack(
-                object_store,
-                data_file_path,
-                managed_base,
-                blob_id_allocator,
-                max_pack_size,
-            )
-            .await?;
-        }
-
-        let writer = self.current.as_mut().expect("pack writer is initialized");
-        let value = match source {
-            BlobWriteSource::Bytes(data) => writer.write_blob_bytes(data).await?,
+impl BlobPack {
+    async fn write(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
+        let range = match source {
+            BlobWriteSource::Bytes(data) => self.writer.write_blob(data).await?,
             BlobWriteSource::External(source) => {
-                writer
+                self.writer
                     .write_blob_from_reader(source.reader.as_ref(), source.reader_range()?)
                     .await?
             }
         };
-        self.current_size += len;
-        BlobPreprocessor::managed_descriptor(value, managed_base, writer.path())
-    }
-
-    async fn finish(&mut self) -> Result<()> {
-        if let Some(writer) = self.current.take() {
-            writer.finish().await?;
-        }
-        self.current_size = 0;
-        self.current_max_pack_size = None;
-        Ok(())
-    }
-
-    fn abort(&mut self) {
-        self.current.take();
-        self.current_size = 0;
-        self.current_max_pack_size = None;
+        Ok(match &self.address {
+            BlobPackAddress::Sidecar(blob_id) => BlobDescriptor::Packed {
+                blob_id: *blob_id,
+                offset: range.offset,
+                size: range.size,
+            },
+            BlobPackAddress::Managed(location) => location.descriptor(range),
+        })
     }
 }
 
@@ -220,8 +157,8 @@ pub struct BlobPreprocessor {
     data_dir: Path,
     data_file_key: String,
     blob_id_allocator: BlobIdAllocator,
-    part_blob_ids: Option<Range<u32>>,
-    pack_writer: RollingPackedBlobWriter,
+    is_part: bool,
+    current_pack: Option<BlobPack>,
     /// Write-param override for the pack-file roll size. When set, it takes
     /// precedence over each field's `blob-pack-file-size-threshold` metadata for
     /// this write job only; it is not persisted into the dataset schema.
@@ -417,7 +354,6 @@ impl BlobPreprocessor {
         source_store_params: ObjectStoreParams,
         pack_file_size_override: Option<usize>,
     ) -> Result<Self> {
-        let pack_writer = RollingPackedBlobWriter::new();
         let arrow_schema = arrow_schema::Schema::from(schema);
         let field_processors = arrow_schema
             .fields()
@@ -430,8 +366,8 @@ impl BlobPreprocessor {
             data_dir,
             data_file_key,
             blob_id_allocator: BlobIdAllocator::new(1),
-            part_blob_ids: None,
-            pack_writer,
+            is_part: false,
+            current_pack: None,
             pack_file_size_override,
             field_processors,
             external_base_resolver,
@@ -451,38 +387,14 @@ impl BlobPreprocessor {
         self
     }
 
-    fn managed_descriptor(
-        descriptor: BlobDescriptor,
-        managed_base: Option<&(Option<u32>, Path)>,
-        path: &Path,
-    ) -> Result<BlobDescriptor> {
-        let Some((base_id, root)) = managed_base else {
-            return Ok(descriptor);
-        };
-        let (offset, size) = match descriptor {
-            BlobDescriptor::Packed { offset, size, .. } => (offset, size),
-            BlobDescriptor::Dedicated { size, .. } => (0, size),
-            other => return Ok(other),
-        };
-        let relative = path
-            .prefix_match(root)
-            .ok_or_else(|| {
-                Error::internal(format!("Blob object {path} is outside writer base {root}"))
-            })?
-            .map(|part| part.as_ref().to_string())
-            .collect::<Vec<_>>()
-            .join("/");
-        Ok(BlobDescriptor::Managed {
-            base_id: *base_id,
-            uri: relative,
-            offset,
-            size,
-        })
-    }
-
-    pub(in crate::dataset) fn with_part_blob_ids(mut self, blob_ids: Range<u32>) -> Result<Self> {
-        self.blob_id_allocator = BlobIdAllocator::from_range(blob_ids.clone())?;
-        self.part_blob_ids = Some(blob_ids);
+    pub(in crate::dataset) fn with_part_blob_ids(
+        mut self,
+        blob_ids: Option<Range<u32>>,
+    ) -> Result<Self> {
+        if let Some(blob_ids) = blob_ids {
+            self.blob_id_allocator = BlobIdAllocator::from_range(blob_ids)?;
+        }
+        self.is_part = true;
         for processor in &mut self.field_processors {
             processor.force_non_empty_inline_to_sidecar();
         }
@@ -504,26 +416,32 @@ impl BlobPreprocessor {
     }
 
     async fn write_dedicated(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
-        let blob_id = self.blob_id_allocator.next()?;
-        let mut writer = if let Some((_, root)) = &self.managed_base {
-            let path = root
-                .clone()
-                .join("_blobs")
-                .join(format!("{}.blob", uuid::Uuid::new_v4()));
-            crate::blob::DedicatedBlobWriter::try_new_at(self.object_store.clone(), path, blob_id)
-                .await?
-        } else {
-            let data_file_path = self
-                .data_dir
-                .clone()
-                .join(format!("{}.lance", self.data_file_key));
-            crate::blob::DedicatedBlobWriter::try_new(
-                self.object_store.clone(),
-                data_file_path,
-                blob_id,
-            )
-            .await?
-        };
+        if let Some((base_id, root)) = &self.managed_base {
+            let location = ManagedBlobLocation::new(*base_id);
+            let mut writer =
+                BlobObjectWriter::try_new(self.object_store.clone(), location.path(root)).await?;
+            let range = match source {
+                BlobWriteSource::Bytes(data) => writer.write_blob(data).await?,
+                BlobWriteSource::External(source) => {
+                    writer
+                        .write_blob_from_reader(source.reader.as_ref(), source.reader_range()?)
+                        .await?
+                }
+            };
+            writer.finish().await?;
+            return Ok(location.descriptor(range));
+        }
+
+        let data_file_path = self
+            .data_dir
+            .clone()
+            .join(format!("{}.lance", self.data_file_key));
+        let mut writer = crate::blob::DedicatedBlobWriter::try_new(
+            self.object_store.clone(),
+            data_file_path,
+            self.blob_id_allocator.next()?,
+        )
+        .await?;
         match source {
             BlobWriteSource::Bytes(data) => writer.write(data).await?,
             BlobWriteSource::External(source) => {
@@ -532,8 +450,7 @@ impl BlobPreprocessor {
                     .await?;
             }
         }
-        let path = writer.path().clone();
-        Self::managed_descriptor(writer.finish().await?, self.managed_base.as_ref(), &path)
+        writer.finish().await
     }
 
     async fn write_packed(
@@ -544,17 +461,44 @@ impl BlobPreprocessor {
         let max_pack_size = self
             .pack_file_size_override
             .unwrap_or(field_pack_file_threshold);
-        self.pack_writer
-            .write(
-                self.object_store.clone(),
-                self.data_dir
+        let len = source.size() as u64;
+        let needs_new_pack = self.current_pack.as_ref().is_none_or(|pack| {
+            pack.max_size != max_pack_size
+                || pack
+                    .writer
+                    .size()
+                    .checked_add(len)
+                    .is_none_or(|size| size > max_pack_size as u64)
+        });
+        if needs_new_pack {
+            if let Some(pack) = self.current_pack.take() {
+                pack.writer.finish().await?;
+            }
+            let (address, path) = if let Some((base_id, root)) = &self.managed_base {
+                let location = ManagedBlobLocation::new(*base_id);
+                let path = location.path(root);
+                (BlobPackAddress::Managed(location), path)
+            } else {
+                let blob_id = self.blob_id_allocator.next()?;
+                let data_file_path = self
+                    .data_dir
                     .clone()
-                    .join(format!("{}.lance", self.data_file_key)),
-                self.managed_base.as_ref(),
-                self.blob_id_allocator.clone(),
-                max_pack_size,
-                source,
-            )
+                    .join(format!("{}.lance", self.data_file_key));
+                (
+                    BlobPackAddress::Sidecar(blob_id),
+                    sidecar_path_for_data_file(&data_file_path, blob_id)?,
+                )
+            };
+            self.current_pack = Some(BlobPack {
+                writer: BlobObjectWriter::try_new(self.object_store.clone(), path).await?,
+                address,
+                max_size: max_pack_size,
+            });
+        }
+        self.current_pack
+            .as_mut()
+            .ok_or_else(|| Error::internal("Blob pack was not initialized"))?
+            .write(source)
             .await
     }
 
@@ -844,7 +788,7 @@ impl BlobPreprocessor {
                     }
                 }
 
-                if self.part_blob_ids.is_some()
+                if self.is_part
                     && let BlobPreprocessFieldKind::BlobV2 {
                         pack_file_threshold,
                         writer_metadata,
@@ -1223,11 +1167,14 @@ impl BlobPreprocessor {
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
-        self.pack_writer.finish().await
+        if let Some(pack) = self.current_pack.take() {
+            pack.writer.finish().await?;
+        }
+        Ok(())
     }
 
     pub(in crate::dataset) fn abort(&mut self) {
-        self.pack_writer.abort();
+        self.current_pack.take();
     }
 }
 

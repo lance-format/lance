@@ -70,6 +70,10 @@ pub fn mem_wal_hnsw_default() -> HnswBuildParams {
         .ef_construction(100)
 }
 
+/// Search breadth a memtable graph uses when the query sets no `ef` (raised to
+/// `k` when `k` is larger).
+pub const DEFAULT_SEARCH_EF: usize = 64;
+
 /// In-memory HNSW index queryable while building.
 pub struct HnswMemIndex {
     field_id: i32,
@@ -391,7 +395,7 @@ impl HnswMemIndex {
             )));
         };
 
-        let ef_actual = ef.unwrap_or(k.max(64)).max(k);
+        let ef_actual = ef.unwrap_or(k.max(DEFAULT_SEARCH_EF)).max(k);
         let snapshot = state.storage.snapshot();
         let mut out: Vec<_> = state
             .graph

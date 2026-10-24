@@ -545,6 +545,11 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         "NOT (value = 99 OR value = 7)",
         "NOT (NOT (value = 7))",
         "value = 99 OR value = 7",
+        // Float operands are rewritten exactly onto the integer column.
+        "value > 6.5",
+        "value = 6.5",
+        "value BETWEEN 6.5 AND 7.5",
+        "value IN (6.5, 7)",
     ] {
         let mut indexed_scan = dataset.scan();
         indexed_scan
@@ -6515,14 +6520,14 @@ fn json_batch(values: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
 }
 
-async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
+async fn json_btree_dataset(initial_values: Vec<&str>, path: &str) -> Dataset {
     let initial = json_batch(initial_values);
     let initial_schema = initial.schema();
     let reader = RecordBatchIterator::new([Ok(initial)], initial_schema);
     let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
     let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
         "target_index_type": "btree",
-        "path": "val",
+        "path": path,
     }));
     dataset
         .create_index(
@@ -6539,11 +6544,10 @@ async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
 
 #[tokio::test]
 async fn test_json_btree_index_statistics() {
-    let dataset = json_btree_dataset(vec![
-        r#"{"val": 1000}"#,
-        r#"{"val": 2000}"#,
-        r#"{"val": 3000}"#,
-    ])
+    let dataset = json_btree_dataset(
+        vec![r#"{"val": 1000}"#, r#"{"val": 2000}"#, r#"{"val": 3000}"#],
+        "val",
+    )
     .await;
 
     let stats: serde_json::Value =
@@ -6562,7 +6566,7 @@ async fn test_json_btree_index_statistics() {
 #[case::append_rebuild(true)]
 #[tokio::test]
 async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
-    let mut dataset = json_btree_dataset(vec![r#"{"val": 1000}"#]).await;
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1000}"#], "val").await;
 
     for values in [
         vec![r#"{"val": null}"#, r#"{"val": 2000}"#],
@@ -6604,7 +6608,7 @@ async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
 
 #[tokio::test]
 async fn test_optimize_append_json_btree_preserves_float_type() {
-    let mut dataset = json_btree_dataset(vec![r#"{"val": 1.5}"#]).await;
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1.5}"#], "val").await;
     let appended = json_batch(vec![r#"{"val": 2}"#]);
     let schema = appended.schema();
     dataset
@@ -6684,7 +6688,7 @@ async fn test_json_extract_matches_unindexed_results() {
     }
 
     for (values, predicate) in cases {
-        let dataset = json_btree_dataset(values).await;
+        let dataset = json_btree_dataset(values, "val").await;
 
         let indexed = dataset
             .scan()
@@ -6710,6 +6714,37 @@ async fn test_json_extract_matches_unindexed_results() {
             "index changed results for {predicate}"
         );
     }
+}
+
+/// Regression test for https://github.com/lance-format/lance/issues/9257.
+#[tokio::test]
+async fn test_nested_json_path_typed_accessor_matches_unindexed_results() {
+    let path = "$.user.age";
+    let dataset = json_btree_dataset(
+        vec![r#"{"user": {"age": 30}}"#, r#"{"user": {"age": 40}}"#],
+        path,
+    )
+    .await;
+    let predicate = format!("json_get_int(json, '{path}') = 30");
+
+    let indexed = dataset
+        .scan()
+        .filter(&predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(&predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 0);
+    assert_eq!(indexed.num_rows(), baseline.num_rows());
 }
 
 async fn prepare_json_dataset() -> (Dataset, String) {
@@ -7201,6 +7236,21 @@ async fn test_sql_contains_tokens() {
         .await
         .unwrap();
 
+    // A NULL query matches no row, with or without an index.
+    let count_null_query_matches = |dataset: Dataset| async move {
+        execute_sql(
+            "select * from foo where contains_tokens(text, NULL)",
+            "foo".to_string(),
+            Arc::new(dataset),
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>()
+    };
+    assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
+
     // Test without fts index
     let results = execute_sql(
         "select * from foo where contains_tokens(text, 'cat catch fish')",
@@ -7314,6 +7364,7 @@ async fn test_sql_contains_tokens() {
     .unwrap();
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "ScalarIndexQuery");
+    assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
 }
 
 #[tokio::test]

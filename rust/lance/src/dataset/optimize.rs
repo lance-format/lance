@@ -132,7 +132,10 @@ use lance_core::datatypes::{
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::{
+    version::{ConcreteFileVersion, LanceFileVersion},
+    writer::FileWriterOptions,
+};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -244,8 +247,8 @@ pub struct CompactionOptions {
     /// Setting above 1.0 will never materialize deletions.
     pub materialize_deletions_threshold: f32,
     /// The number of threads to use (how many compaction tasks to run in parallel).
-    /// Defaults to the number of compute-intensive CPUs.  Not used when running
-    /// tasks manually using [`plan_compaction`]
+    /// Must be greater than 0. Defaults to the number of compute-intensive CPUs.
+    /// Not used when running tasks manually using [`plan_compaction`]
     pub num_threads: Option<usize>,
     /// The batch size to use when scanning the input fragments.  If not
     /// specified then the default (see
@@ -265,6 +268,12 @@ pub struct CompactionOptions {
     /// With stable row IDs, every rewritten group's row-address moves are recorded,
     /// indexed or not. Every index must store row addresses and apply the fragment reuse
     /// index, and keeps its coverage through it. Not yet supported in release builds.
+    ///
+    /// When this is false (eager, the default) and the dataset uses stable row ids then
+    /// the behavior depends on the index.  Some legacy indexes store row ids.  These
+    /// indexes remain valid and their fragment bitmaps are updated.  Modern indexes
+    /// store row addresses and these indexes need to be remapped as if we were not using
+    /// stable row ids.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
@@ -345,6 +354,29 @@ pub struct CompactionOptions {
     /// (e.g., job_id for tracking completed compaction jobs).
     #[serde(skip)]
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Internal: cached result of `has_eager_remappable_index` for the
+    /// dataset state the plan was computed against. Not meant to be set by
+    /// callers; `pub` only because `CompactionOptions` is constructed with
+    /// struct literal syntax outside this crate, which requires every field
+    /// to be visible even when filled in via `..Default::default()`.
+    ///
+    /// [`DefaultCompactionPlanner::plan`] fills this in once, and
+    /// `rewrite_files` reuses it instead of reloading index metadata for
+    /// every task. Left as `None` by any options a caller builds directly
+    /// (including via [`Default`]), which makes `rewrite_files` fall back to
+    /// loading it itself. `commit_compaction` never reads this: it always
+    /// reloads live, since its dataset handle can have moved past the plan's
+    /// read version by the time it runs.
+    #[doc(hidden)]
+    #[serde(default)]
+    pub has_eager_remappable_index: Option<bool>,
+
+    /// How many bytes to use for buffering column data.
+    ///
+    /// The budget is divided evenly across columns. The default is 8 MiB per
+    /// column.
+    /// See [`FileWriterOptions::data_cache_bytes`].
+    pub data_cache_bytes: Option<u64>,
 }
 
 #[allow(deprecated)]
@@ -373,6 +405,8 @@ impl Default for CompactionOptions {
             max_overlays_per_fragment: Some(10),
             data_storage_version: None,
             transaction_properties: None,
+            has_eager_remappable_index: None,
+            data_cache_bytes: None,
         }
     }
 }
@@ -611,15 +645,15 @@ impl CompactionOptions {
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
 ///
-/// Preconditions checked in order:
+/// Preconditions:
 /// - Compaction mode is not `Reencode`
 /// - Dataset storage format is non-legacy
-/// - Fragment list is non-empty
+/// - Fragment list is non-empty and every fragment has at least one data file
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
-///   TODO: Need to support schema evolution case like add column and drop column
+/// - No fragment has data overlays
 /// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
-///   order
+///   order, with the current schema's expected physical-column count
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -677,10 +711,10 @@ pub(super) async fn can_use_binary_copy_current(
         return Ok(false);
     }
 
-    if fragments[0].files.is_empty() {
+    if let Some(fragment) = fragments.iter().find(|fragment| fragment.files.is_empty()) {
         log::debug!(
             "Binary copy disabled: fragment {} has no data files",
-            fragments[0].id
+            fragment.id
         );
         return Ok(false);
     }
@@ -697,6 +731,12 @@ pub(super) async fn can_use_binary_copy_current(
         );
         return Ok(false);
     }
+    let expected_column_count: usize = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| lance_file::versions::physical_column_count(version, field))
+        .sum();
     for fragment in fragments {
         // Binary copy only reads base files; overlays must be materialized by the scanner.
         if !fragment.overlays.is_empty() {
@@ -736,15 +776,34 @@ pub(super) async fn can_use_binary_copy_current(
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            // Binary copy only preserves page and column-buffer bytes. The output file's footer
-            // (including global buffers) is re-generated, not copied from inputs.
-            //
-            // Therefore, we reject input files that contain any additional global buffers beyond
-            // the required schema / file descriptor global buffer (global buffer index 0).
-            if file_meta.file_buffers.len() > 1 {
+            if file_meta.column_infos.len() != expected_column_count {
                 log::debug!(
-                    "Binary copy disabled: data file has extra global buffers (len={})",
-                    file_meta.file_buffers.len()
+                    "Binary copy disabled: data file '{}' in fragment {} has {} physical columns, expected {} for the current schema",
+                    data_file.path,
+                    fragment.id,
+                    file_meta.column_infos.len(),
+                    expected_column_count
+                );
+                return Ok(false);
+            }
+            // Binary copy only preserves page and column-buffer bytes; the
+            // output footer (including global buffers) is re-generated. Extra
+            // global buffers are allowed only when every one of them is a
+            // recognized zone write seed, which the copy then carries or
+            // drops by explicit per-column rules. Anything unrecognized keeps
+            // disqualifying the file, so no unknown buffer is ever silently
+            // dropped.
+            if file_meta.file_buffers.len() > 1
+                && let Err(e) = binary_copy::seed_carry::extract_source_seeds(
+                    &file_meta,
+                    &file_scheduler,
+                    data_file,
+                )
+                .await
+            {
+                log::debug!(
+                    "Binary copy disabled: extra global buffers cannot be handled safely: {}",
+                    e
                 );
                 return Ok(false);
             }
@@ -833,6 +892,18 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 &load_all_indices(dataset).await?,
             )?;
         }
+        // Computed at most once here, rather than reloaded by every task in
+        // `rewrite_files` and the planner above: see the doc comment on
+        // `CompactionOptions::has_eager_remappable_index`.
+        let eager_remap_capable =
+            if !self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
+                Some(has_eager_remappable_index(dataset).await?)
+            } else {
+                None
+            };
+        if eager_remap_capable == Some(true) {
+            reject_eager_remap_over_undrained_fri(dataset).await?;
+        }
 
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
@@ -844,10 +915,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         );
         // Without stable row ids a rewrite moves every row address, so the
         // indices over the rewritten fragments have to be remapped in the same
-        // commit. An index this build cannot open cannot be remapped, so its
-        // fragments join the caller's own exclusions and are left uncompacted -
-        // taking the same path, which terminates the current bin rather than
-        // letting the candidates on either side of the gap be planned together.
+        // commit, and an index this build cannot open cannot be remapped. With
+        // stable row ids this never applies: every index's coverage is fixed
+        // up from manifest metadata alone (follow the data, or drop the
+        // rewritten fragments), which needs no reader for the index at all.
+        // An unremappable index's fragments join the caller's own exclusions
+        // and are left uncompacted - taking the same path, which terminates
+        // the current bin rather than letting the candidates on either side
+        // of the gap be planned together.
         let mut excluded_fragment_ids = self.excluded_fragment_ids.clone();
         if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
             let unremappable = unremappable_index_coverage(dataset)
@@ -1019,6 +1094,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let mut options = self.options.clone();
         options.data_storage_version = Some(write_version.to_selector());
+        options.has_eager_remappable_index = eager_remap_capable;
         let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
         compaction_plan.extend_tasks(tasks);
 
@@ -1052,6 +1128,16 @@ pub async fn compact_files_with_planner(
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+
+    // `buffer_unordered(0)` below never pulls a task from the stream and
+    // returns `Pending` with nothing left to wake it, so zero threads would
+    // leave compaction waiting forever. Checked against the plan so plans from
+    // a custom planner are covered too.
+    if compaction_plan.options.num_threads == Some(0) {
+        return Err(Error::invalid_input(
+            "CompactionOptions::num_threads must be greater than 0 (use None for the default)",
+        ));
+    }
 
     // A tagged FRI history is maintained by appending transitions to the
     // tagged entry, which only the deferred-remap commit path does; eager
@@ -1811,7 +1897,7 @@ impl BlobV2FieldRewritePlan {
                         Some(BlobV2Layout::Logical) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
                             if matches!(output_field.data_type(), ArrowDataType::Struct(fields) if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Prepared)) {
-                                return super::blob::preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
+                                return super::blob::preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field, None).await;
                             }
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
@@ -2345,9 +2431,13 @@ async fn index_fragment_coverage(
 /// They are held out of the plan instead, and the rest of the table still
 /// compacts.
 ///
-/// Only the eager remap path needs this. Stable row ids keep the addresses
-/// across a rewrite, and `defer_index_remap` hands the repair to a build that
-/// can read the index, through the fragment-reuse index it writes.
+/// Only the non-stable-row-id eager remap path needs this: there, a rewrite
+/// group fixes up an index's coverage by remapping it or not at all, so an
+/// index this build cannot open is left stranded on deleted fragment ids. On
+/// a stable-row-id table every index's coverage is instead fixed up from
+/// manifest metadata alone (follow the data, or drop the rewritten
+/// fragments), which needs no reader for the index at all, so this check
+/// does not apply there; callers only run it for non-stable-row-id tables.
 async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, RoaringBitmap)>> {
     let mut coverage = Vec::new();
     for index in load_all_indices(dataset).await?.iter() {
@@ -2369,7 +2459,8 @@ async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, R
 /// planner, [`CompactionPlan`] is public and serializable, and a distributed
 /// driver hands [`commit_compaction`] results planned elsewhere. Committing such
 /// a plan strands the index on fragment ids the rewrite deleted, so the commit
-/// boundary refuses it rather than the planner alone.
+/// boundary refuses it rather than the planner alone. Only relevant without
+/// stable row ids; see [`unremappable_index_coverage`].
 async fn reject_unremappable_rewrite(
     dataset: &Dataset,
     completed_tasks: &[RewriteResult],
@@ -2420,7 +2511,7 @@ pub struct RewriteResult {
     /// fragments that were read during compaction.
     ///
     /// - `None` when nothing consumes them; with stable row IDs, whenever
-    ///   `defer_index_remap` is unset.
+    ///   neither `defer_index_remap` nor an address-domain index applies.
     /// - `Some` then these addresses are either (1) written to storage for
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
@@ -2464,8 +2555,54 @@ async fn reserve_fragment_ids(
     Ok(manifest.version)
 }
 
-/// The fragment reuse index pairs these addresses, sorted, with the rewritten rows,
-/// which keep task order, so the task's fragments must be in ascending id order.
+/// Whether any non-system index on `dataset` both stores row addresses and
+/// its type supports being eagerly remapped onto them
+/// (`IndexMetadata::supports_eager_remap`). Metadata-only, no index opened:
+/// an index whose type can never remap (ZoneMap, BloomFilter, FM) does not
+/// count, since an eager remap would do nothing for it but materialize and
+/// then discard an old-to-new move for every rewritten row -- on a large
+/// compaction, table-scale memory the rewrite files have already been
+/// written to produce.
+async fn has_eager_remappable_index(dataset: &Dataset) -> Result<bool> {
+    let Some(indices) = load_indices_for_remapping(dataset).await? else {
+        return Ok(false);
+    };
+    Ok(indices
+        .iter()
+        .any(|index| !is_system_index(index) && index.supports_eager_remap()))
+}
+
+/// Refuse an eager remap of an address-domain index while this stable-row-id
+/// table's fragment reuse index is not fully drained.
+///
+/// A remappable index (e.g. BTree) is remapped by reading its persisted
+/// pages' stored addresses directly and translating them with this
+/// compaction's own old-to-new move map; it never composes that read with a
+/// fragment reuse index's pending moves. If the table still carries one -- a
+/// prior deferred compaction left addresses that only the FRI translates --
+/// remapping now would write those untranslated addresses into the rebuilt
+/// index and the manifest would then claim full coverage, silently dropping
+/// every row the FRI still had to translate. Draining it first, with
+/// `optimize_indices`, or compacting with `defer_index_remap` set instead,
+/// keeps the index's pages in step with its coverage.
+async fn reject_eager_remap_over_undrained_fri(dataset: &Dataset) -> Result<()> {
+    if let Some(fri) = dataset.frag_reuse_index().await?
+        && !fri.is_empty()
+    {
+        return Err(Error::not_supported(
+            "Cannot eagerly compact: defer_index_remap was activated by an earlier
+            compaction. Please run optimize_indices first or continue compacting
+            with defer_index_remap activated.",
+        ));
+    }
+    Ok(())
+}
+
+/// The old row addresses of `fragments`' live (non-deleted) rows, reconstructed
+/// from fragment metadata and deletion files alone -- no data scan. Callers
+/// (the deferred/FRI path and the eager address-domain remap path) pair these
+/// addresses, sorted, with the rewritten rows, which keep task order, so the
+/// task's fragments must be in ascending id order.
 async fn live_row_addrs(
     dataset: &Dataset,
     fragments: &[Fragment],
@@ -2560,8 +2697,18 @@ async fn rewrite_files(
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
     let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
-    // A scan captures stable row ids, not row addresses.
-    let records_from_fragment_metadata = uses_stable_row_ids && options.defer_index_remap;
+    // A scan captures stable row ids, not row addresses; derive old addresses
+    // from fragment metadata instead, whenever something will consume them.
+    let records_from_fragment_metadata = uses_stable_row_ids
+        && (options.defer_index_remap || {
+            // The planner precomputes this once for the whole plan (see
+            // `CompactionOptions::has_eager_remappable_index`); fall back to
+            // loading it here for options built outside the planner.
+            match options.has_eager_remappable_index {
+                Some(value) => value,
+                None => has_eager_remappable_index(dataset.as_ref()).await?,
+            }
+        });
     // Capturing row addresses is only useful if something will consume them:
     // an index to remap now, or a deferred remap through the FRI.
     let capture_row_addrs = !uses_stable_row_ids
@@ -2702,6 +2849,12 @@ async fn rewrite_files(
             .collect::<Result<Vec<_>>>()?
     };
     let max_rows_per_file = file_row_counts.first().copied().unwrap_or(1);
+
+    let file_writer_options = FileWriterOptions {
+        data_cache_bytes: options.data_cache_bytes,
+        ..Default::default()
+    };
+
     let mut params = WriteParams {
         max_rows_per_file,
         max_rows_per_group: options.max_rows_per_group,
@@ -2711,6 +2864,7 @@ async fn rewrite_files(
         // the writer would reject such blobs.
         allow_external_blob_outside_bases: true,
         data_storage_version: Some(write_version.to_selector()),
+        file_writer_options: Some(file_writer_options),
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
@@ -3239,10 +3393,17 @@ fn append_row_lineage_columns(
 
 /// The tasks carry the recording intent, so those that recorded moves keep them even
 /// when the commit options omit `defer_index_remap`.
+///
+/// `remapping_eagerly` is true when this commit is about to remap an
+/// address-domain index immediately with these recorded addresses (no
+/// deferral, no FRI). That consumption never writes or extends a fragment
+/// reuse index, so it is kept out of the FRI-with-stable-row-ids gate, and
+/// the caller never folds it into a fragment-reuse record.
 async fn records_stable_row_id_moves(
     dataset: &Dataset,
     completed_tasks: &[RewriteResult],
     options: &CompactionOptions,
+    remapping_eagerly: bool,
 ) -> Result<bool> {
     let recorded = completed_tasks
         .iter()
@@ -3254,6 +3415,9 @@ async fn records_stable_row_id_moves(
              moves: run every task with the same defer_index_remap",
             completed_tasks.len()
         )));
+    }
+    if remapping_eagerly {
+        return Ok(false);
     }
     if !options.defer_index_remap && recorded == 0 {
         return Ok(false);
@@ -3305,23 +3469,46 @@ pub async fn commit_compaction(
         ));
     }
 
-    // Before anything is written or committed. The condition is the planner's,
-    // not `has_address_style`: a dataset whose only index is one this build
-    // cannot read captures no row addresses at all, which is exactly the plan
-    // that has to be refused here.
+    // Before anything is written or committed. The condition mirrors the
+    // planner's: see `unremappable_index_coverage` for why this only applies
+    // without stable row ids.
     let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
     if !uses_stable_row_ids && !options.defer_index_remap {
         reject_unremappable_rewrite(dataset, &completed_tasks).await?;
     }
+
+    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    // Address-style results require immediate index remapping unless it is
+    // deferred. On a stable-row-id table, only an index whose type actually
+    // supports an eager remap (today, BTree) makes this worth attempting:
+    // ZoneMap/BloomFilter/FM always report `RemapResult::Drop`, so creating a
+    // remapper for them would materialize an old-to-new move for every
+    // rewritten row only to discard it -- on a large compaction, table-scale
+    // memory the rewrite files have already been written to produce.
+    // `rewrite_files`'s capture decision already applies this same test
+    // (`has_eager_remappable_index`), so this mostly re-confirms it; it
+    // matters on its own in distributed mode, where a task can record moves
+    // under `defer_index_remap` at plan time and then commit under
+    // different, eager options with no remappable index at all -- there
+    // `needs_remapping` must stay false so the recorded moves fall through
+    // to the fragment-reuse index below instead of being silently discarded.
+    let needs_remapping = !options.defer_index_remap
+        && has_address_style
+        && (!uses_stable_row_ids || has_eager_remappable_index(dataset).await?);
+
+    // On a non-stable-row-id table `needs_remapping` is never the kind of
+    // eager remap the FRI-drain gate and `records_stable_row_id_moves` care
+    // about; `uses_stable_row_ids` narrows it to that case.
+    let remapping_eagerly = uses_stable_row_ids && needs_remapping;
+    if remapping_eagerly {
+        reject_eager_remap_over_undrained_fri(dataset).await?;
+    }
+
     let records_row_addrs = if uses_stable_row_ids {
-        records_stable_row_id_moves(dataset, &completed_tasks, options).await?
+        records_stable_row_id_moves(dataset, &completed_tasks, options, remapping_eagerly).await?
     } else {
         options.defer_index_remap
     };
-
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
-    // Address-style results require immediate index remapping unless it is deferred.
-    let needs_remapping = !uses_stable_row_ids && !options.defer_index_remap && has_address_style;
 
     // Confirm there is a remapper before materializing the potentially very large row address map.
     let index_remapper = if needs_remapping {
@@ -3843,6 +4030,7 @@ mod tests {
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
+    use lance_file::reader::FileReader as LFReader;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::CompactFragReuseIndexHandle;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
@@ -3853,6 +4041,7 @@ mod tests {
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
     use lance_io::object_store::ObjectStore;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::feature_flags::{
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_SPILLED_ROW_LINEAGE,
@@ -4763,6 +4952,93 @@ mod tests {
         assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
     }
 
+    /// Compaction is a read->write roundtrip and the decoder materializes the
+    /// children of null structs as nulls. A dataset containing null structs
+    /// with non-nullable children (e.g. GeoArrow point columns, where the
+    /// children must be non-nullable and validity is carried by the struct)
+    /// must therefore stay compactable.
+    ///
+    /// Reproduces <https://github.com/lance-format/lance/issues/7826>
+    ///
+    /// 2.1+ only: the 2.0 encoding does not store struct validity, so masked
+    /// child nulls stay rejected at write time there.
+    #[tokio::test]
+    async fn test_compact_null_structs_with_non_nullable_children() {
+        let data_storage_version = LanceFileVersion::V2_1;
+        use arrow_array::{Float64Array, StructArray, cast::AsArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let child_fields = Fields::from(vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Float64, false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("position", DataType::Struct(child_fields.clone()), true),
+        ]));
+
+        // Every third row is a null struct; the children physically hold 0.0
+        // fillers at those slots ("validity-first" layout).
+        let num_rows = 100_usize;
+        let ids = Int64Array::from_iter_values(0..num_rows as i64);
+        let is_valid = |i: usize| !i.is_multiple_of(3);
+        let xs = Float64Array::from_iter_values(
+            (0..num_rows).map(|i| if is_valid(i) { i as f64 } else { 0.0 }),
+        );
+        let ys = Float64Array::from_iter_values(
+            (0..num_rows).map(|i| if is_valid(i) { i as f64 * 10.0 } else { 0.0 }),
+        );
+        let position = StructArray::try_new(
+            child_fields,
+            vec![Arc::new(xs) as ArrayRef, Arc::new(ys) as ArrayRef],
+            Some(NullBuffer::from_iter((0..num_rows).map(is_valid))),
+        )
+        .unwrap();
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(position) as ArrayRef],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let write_params = WriteParams {
+            max_rows_per_file: 25,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 4);
+        assert_eq!(metrics.fragments_added, 1);
+
+        // The rewritten data is intact: null structs stay null and valid rows
+        // keep their values.
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), num_rows);
+        let ids = batch.column_by_name("id").unwrap();
+        let ids = ids.as_primitive::<Int64Type>();
+        let position = batch.column_by_name("position").unwrap().as_struct();
+        let xs = position.column(0).as_primitive::<Float64Type>();
+        let ys = position.column(1).as_primitive::<Float64Type>();
+        for row in 0..num_rows {
+            let i = ids.value(row) as usize;
+            assert_eq!(position.is_valid(row), is_valid(i));
+            if is_valid(i) {
+                assert_eq!((xs.value(row), ys.value(row)), (i as f64, i as f64 * 10.0));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_compact_blob_columns() {
         let test_dir = TempStrDir::default();
@@ -5586,6 +5862,72 @@ mod tests {
     }
 
     #[rstest]
+    #[case::default_cache(None, 1)]
+    // 1k-row Int64 batches (8 KiB) overflow a 4 KiB cache, so each batch becomes a page.
+    #[case::small_cache(Some(4 * 1024), 10)]
+    #[tokio::test]
+    async fn test_compact_with_data_cache_bytes(
+        #[case] data_cache_bytes: Option<u64>,
+        #[case] expected_pages: usize,
+    ) {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 5_000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let options = CompactionOptions {
+            batch_size: Some(1_000),
+            data_cache_bytes,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        // Tasks may run on another machine, so the option must survive serialization.
+        let tasks = plan
+            .compaction_tasks()
+            .map(|task| {
+                let json = serde_json::to_string(&task).unwrap();
+                serde_json::from_str::<CompactionTask>(&json).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].options.data_cache_bytes, data_cache_bytes);
+
+        let result = tasks[0].execute(&dataset).await.unwrap();
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let data_file = &fragments[0].metadata().files[0];
+        let path = dataset
+            .data_file_dir(data_file)
+            .unwrap()
+            .join(data_file.path.as_str());
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let file_scheduler = scheduler
+            .open_file(&path, &data_file.file_size_bytes)
+            .await
+            .unwrap();
+        let metadata = LFReader::read_all_metadata(&file_scheduler).await.unwrap();
+        assert_eq!(metadata.column_infos[0].page_infos.len(), expected_pages);
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_compact_deletions(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
@@ -5730,14 +6072,33 @@ mod tests {
         }
     }
 
-    /// Eager (non-deferred) compaction on a stable-row-id dataset never remaps
-    /// an index by address -- stable row ids keep an index's row ids valid
-    /// across the rewrite (see `commit_compaction`'s `needs_remapping`, which
-    /// is unconditionally false under stable row ids unless deferred) -- so it
-    /// must not pay to capture addresses that nothing will consume, even when
-    /// a remappable index is present.
+    #[derive(Debug, Clone, Copy)]
+    enum IndexPresence {
+        None,
+        /// BTree: address-domain and its type supports an eager remap.
+        RemapCapable,
+        /// ZoneMap: address-domain, but its type always reports
+        /// `RemapResult::Drop`, so it can never be an eager-remap consumer.
+        AddressDomainOnly,
+    }
+
+    /// Eager (non-deferred) compaction on a stable-row-id dataset captures row
+    /// addresses only when something will consume them: an index this build
+    /// can remap in place (see `commit_compaction`'s `needs_remapping`).
+    /// A dataset with no index, only row-id-domain ones (whose ids survive
+    /// the rewrite on their own), or only an address-domain index whose type
+    /// can never remap (ZoneMap, BloomFilter, FM) must not pay for a capture
+    /// nothing will use -- on a large compaction, that capture is an
+    /// old-to-new move for every rewritten row.
+    #[rstest::rstest]
+    #[case::no_index(IndexPresence::None, false)]
+    #[case::remap_capable_index(IndexPresence::RemapCapable, true)]
+    #[case::address_domain_only_index(IndexPresence::AddressDomainOnly, false)]
     #[tokio::test]
-    async fn test_stable_row_ids_eager_compaction_skips_row_addr_capture() {
+    async fn test_stable_row_ids_eager_compaction_captures_row_addrs_only_when_needed(
+        #[case] index_presence: IndexPresence,
+        #[case] expect_capture: bool,
+    ) {
         let data = sample_data();
         let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
         let mut dataset = Dataset::write(
@@ -5753,7 +6114,23 @@ mod tests {
         .await
         .unwrap();
 
-        create_scalar_index(&mut dataset, "a", false).await;
+        match index_presence {
+            IndexPresence::None => {}
+            // Defaults to BTree, which is address-domain under stable row ids.
+            IndexPresence::RemapCapable => create_scalar_index(&mut dataset, "a", false).await,
+            IndexPresence::AddressDomainOnly => {
+                dataset
+                    .create_index(
+                        &["a"],
+                        IndexType::ZoneMap,
+                        Some("a_idx".into()),
+                        &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
 
         let options = CompactionOptions {
             target_rows_per_fragment: 9_000,
@@ -5766,9 +6143,77 @@ mod tests {
         let result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
             .await
             .unwrap();
+        assert_eq!(
+            result.row_addrs.is_some(),
+            expect_capture,
+            "eager stable-row-id compaction must capture row addresses exactly when an \
+             eager-remap-capable index needs them to remap"
+        );
+    }
+
+    /// `DefaultCompactionPlanner::plan` computes `has_eager_remappable_index`
+    /// once and stashes it on `CompactionPlan::options`; `rewrite_files` must
+    /// trust that cached value instead of reloading index metadata itself,
+    /// and must fall back to a live reload only when a caller hands it
+    /// options that were never produced by the planner.
+    #[tokio::test]
+    async fn test_rewrite_files_trusts_planners_cached_eager_remap_capability() {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3_000,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 9_000,
+            defer_index_remap: false,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        assert_eq!(
+            plan.options().has_eager_remappable_index,
+            Some(false),
+            "no index existed at plan time, so the planner should have cached a negative answer"
+        );
+
+        // Diverge from the planned state: a remap-capable index now exists,
+        // but the plan's cached answer still says it doesn't.
+        create_scalar_index(&mut dataset, "a", false).await;
+
+        let stale_cached_result = rewrite_files(
+            Cow::Borrowed(&dataset),
+            plan.tasks()[0].clone(),
+            plan.options(),
+        )
+        .await
+        .unwrap();
         assert!(
-            result.row_addrs.is_none(),
-            "eager stable-row-id compaction must not capture row addresses it will never use"
+            stale_cached_result.row_addrs.is_none(),
+            "rewrite_files must trust the plan's cached capability instead of reloading, even \
+             though reloading now would (incorrectly, for this plan) say an index needs it"
+        );
+
+        // Options a caller builds directly, bypassing the planner, carry no
+        // cached answer and so fall back to a live reload that does see the
+        // new index.
+        assert_eq!(options.has_eager_remappable_index, None);
+        let live_reload_result =
+            rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+                .await
+                .unwrap();
+        assert!(
+            live_reload_result.row_addrs.is_some(),
+            "without a cached answer, rewrite_files must fall back to loading index metadata live"
         );
     }
 
@@ -5903,16 +6348,19 @@ mod tests {
             .await
             .unwrap();
 
-        async fn index_set(dataset: &Dataset) -> HashSet<Uuid> {
-            dataset
-                .load_indices()
-                .await
-                .unwrap()
-                .iter()
-                .map(|index| index.uuid)
-                .collect()
+        async fn index_by_name(dataset: &Dataset) -> HashMap<String, Uuid> {
+            let mut by_name = HashMap::new();
+            for index in dataset.load_indices().await.unwrap().iter() {
+                if let Some(existing) = by_name.insert(index.name.clone(), index.uuid) {
+                    panic!(
+                        "index name {:?} is not unique: segments {existing} and {} share it",
+                        index.name, index.uuid
+                    );
+                }
+            }
+            by_name
         }
-        let indices = index_set(&dataset).await;
+        let indices = index_by_name(&dataset).await;
 
         async fn vector_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
@@ -5944,10 +6392,31 @@ mod tests {
         };
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
-        // The indices should be unchanged after compaction, since we are using
-        // stable row ids.
-        let current_indices = index_set(&dataset).await;
-        assert_eq!(indices, current_indices);
+        // The vector index is row-id-domain: stable row ids survive the
+        // rewrite on their own, so it follows its data for free and keeps its
+        // uuid. The scalar index defaults to BTree, which is address-domain
+        // under stable row ids and supports remap, so eager compaction remaps
+        // it in place (a new uuid, but full coverage of the live fragments) --
+        // unlike an index whose type cannot remap (ZoneMap, BloomFilter, FM;
+        // see `test_addr_domain_index_after_compaction_with_stable_row_ids`).
+        let current_indices = index_by_name(&dataset).await;
+        assert_eq!(current_indices["vector"], indices["vector"]);
+        assert_ne!(current_indices["scalar"], indices["scalar"]);
+
+        let live_fragments: RoaringBitmap =
+            dataset.fragments().iter().map(|f| f.id as u32).collect();
+        let scalar_index = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.name == "scalar")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            scalar_index.effective_fragment_bitmap(&live_fragments),
+            Some(live_fragments)
+        );
 
         let after_vec_result = vector_query(&dataset).await;
         assert_eq!(before_vec_result, after_vec_result);
@@ -6307,9 +6776,18 @@ mod tests {
         }
     }
 
+    /// `cat` is a Utf8 column alongside the numeric `i` one so a test can build
+    /// a row-id-domain index (e.g. NGram) over it -- every remaining
+    /// row-id-domain scalar index type requires a text column, unlike BTree,
+    /// Bitmap, and LabelList, which moved to row-address domain and no longer
+    /// serve as that fixture.
     async fn stable_row_id_dataset(uri: &str, num_fragments: u32) -> Dataset {
         lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "cat",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_dataset_with_params(
                 uri,
                 FragmentCount::from(num_fragments),
@@ -6564,6 +7042,7 @@ mod tests {
             // Recording reads fragment metadata, not a row-id index of the table.
             let row_id_index = RowIdIndexKey {
                 version: worker.manifest.version,
+                with_deletions: true,
                 e_tag: worker.manifest_location.e_tag.as_deref(),
             };
             assert!(
@@ -6685,12 +7164,16 @@ mod tests {
             );
         }
         if matches!(mismatch, RecordingMismatch::IncompatibleIndexCreated) {
+            // NGram, not Bitmap: Bitmap now always creates an address-domain
+            // segment on a stable-row-id dataset (safe alongside the recorded
+            // moves by construction), so it can no longer illustrate this
+            // mismatch. NGram still stores row ids directly here.
             dataset
                 .create_index(
-                    &["i"],
-                    IndexType::Bitmap,
+                    &["cat"],
+                    IndexType::NGram,
                     Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                     false,
                 )
                 .await
@@ -6725,6 +7208,137 @@ mod tests {
         assert!(error.to_string().contains(expected), "{error}");
         dataset.checkout_latest().await.unwrap();
         assert_eq!(dataset.version().version, version);
+    }
+
+    /// An address-domain index is remapped by reading its persisted pages'
+    /// stored addresses directly, never composed with a fragment reuse
+    /// index's pending moves. Eagerly remapping one while a prior deferred
+    /// compaction's FRI is still undrained would write those untranslated,
+    /// pre-FRI addresses into the rebuilt index, and the manifest would then
+    /// claim it fully covers fragments the FRI alone can still resolve --
+    /// silently losing the rows the FRI has to translate. Eager compaction
+    /// must refuse instead, until the FRI is drained.
+    #[tokio::test]
+    async fn test_eager_remap_refuses_undrained_fri_over_address_domain_index() {
+        let mut dataset = stable_row_id_dataset("memory://", 5).await;
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BTree,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A deferred compaction merges every fragment, leaving the btree's
+        // pages stale and a non-empty FRI as the only thing resolving them.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !dataset
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+
+        let error = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("defer_index_remap"), "{error}");
+        assert!(error.to_string().contains("optimize_indices"), "{error}");
+
+        // Catch the btree up to the FRI's moves (a segment merge, not a
+        // rescan), then trim the now-caught-up version: this lets eager
+        // compaction proceed again.
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        assert!(
+            dataset
+                .frag_reuse_index()
+                .await
+                .unwrap()
+                .is_none_or(|fri| fri.is_empty())
+        );
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+    }
+
+    /// A table whose only index can never consume an eager remap (ZoneMap
+    /// always reports `RemapResult::Drop`) still has to honor row-address
+    /// moves its tasks recorded under `defer_index_remap` at plan/execution
+    /// time, even when the commit uses different, eager options --
+    /// distributed mode may commit with options other than it planned with
+    /// (see `records_stable_row_id_moves`). Discarding them instead of
+    /// folding them into a fragment reuse index would silently lose track of
+    /// rows no bitmap-follow path ever sees again.
+    #[tokio::test]
+    async fn test_recorded_moves_over_unremappable_index_still_commit_as_fri() {
+        let mut dataset = stable_row_id_dataset("memory://", 3).await;
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::ZoneMap,
+                Some("i_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut results = Vec::new();
+        for task in plan.compaction_tasks() {
+            let result = task.execute(&dataset).await.unwrap();
+            assert!(result.row_addrs.is_some());
+            results.push(result);
+        }
+        assert!(!results.is_empty());
+
+        // Committed with the default (eager) options, unlike the deferred
+        // ones the tasks were planned and executed with.
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &CompactionOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "recorded addresses have no eager consumer and must be committed as an FRI"
+        );
     }
 
     #[tokio::test]
@@ -7001,6 +7615,135 @@ mod tests {
             panic!("scalar index must be available");
         };
         assert_eq!(current_scalar_index.uuid, original_scalar_uuid);
+    }
+
+    /// A merge translates its sources through the fragment-reuse index, so the merged segment
+    /// is caught up with the manifest it read and must be stamped with it. Stamped with the
+    /// oldest source instead, the trim keeps every reuse version that source predates, forever.
+    #[tokio::test]
+    async fn test_segment_merge_is_stamped_with_the_version_it_was_built_from() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_str().to_string();
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(4_000),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A deferred-remap compaction leaves a reuse version that the base segment predates.
+        dataset.delete("id % 10 == 0").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("a deferred-remap compaction leaves a reuse index");
+        let reuse_details = load_frag_reuse_index_details(&dataset, &reuse_meta)
+            .await
+            .unwrap();
+        assert_eq!(reuse_details.versions.len(), 1);
+        let base_version = dataset.load_indices_by_name("id_idx").await.unwrap()[0].dataset_version;
+        assert!(
+            base_version < reuse_details.versions[0].dataset_version,
+            "the base segment must predate the reuse version for the stamp to matter"
+        );
+
+        // New rows for the merge to fold into the base segment.
+        Dataset::write(
+            data_gen.batch(1_000),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let filter = "id >= 1500 and id < 4500".to_owned();
+        let mut oracle = dataset.scan();
+        oracle.filter(&filter).unwrap();
+        oracle.use_scalar_index(false);
+        let expected = oracle.count_rows().await.unwrap();
+
+        let built_from = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let merged = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(
+            merged.len(),
+            1,
+            "the new rows must merge into the base segment"
+        );
+        assert_eq!(
+            merged[0].dataset_version, built_from,
+            "a merged segment is caught up with the manifest it was built from"
+        );
+
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        dataset.checkout_latest().await.unwrap();
+        let reuse_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the reuse index survives cleanup, trimmed to zero versions");
+        let details = load_frag_reuse_index_details(&dataset, &reuse_meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            details.versions.len(),
+            0,
+            "the trim must drop the reuse version the merged segment is past"
+        );
+
+        // Nothing translates addresses any more, so only a correct merge answers right, and the
+        // plan must show the merged index answering for every fragment rather than a scan.
+        let fresh = Dataset::open(&uri).await.unwrap();
+        let mut scanner = fresh.scan();
+        scanner.filter(&filter).unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "the merged index must answer the query: {plan}"
+        );
+        assert!(
+            !plan.contains("LanceScan"),
+            "no fragment may fall back to a scan: {plan}"
+        );
+        assert_eq!(scanner.count_rows().await.unwrap(), expected);
     }
 
     #[tokio::test]
@@ -9134,6 +9877,72 @@ mod tests {
         assert_zonemap_answers_match_scan(&dataset).await;
     }
 
+    /// When a remap-capable index (BTree) shares a stable-row-id table with a
+    /// ZoneMap, an eager compaction must still remap the BTree in place and
+    /// drop the ZoneMap's coverage of the rewritten fragments -- the same
+    /// outcome as each index alone -- even though `DatasetIndexRemapper`
+    /// never opens the ZoneMap to find that out (it isn't
+    /// `supports_eager_remap`, so it's excluded up front rather than opened
+    /// and found to report `RemapResult::Drop`).
+    #[tokio::test]
+    async fn test_eager_compaction_remaps_btree_and_drops_zonemap_coverage_together() {
+        let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let id_idx_before = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(id_idx_before.len(), 1);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 512,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "an eager compaction writes no fragment-reuse index"
+        );
+
+        let id_idx_after = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(id_idx_after.len(), 1);
+        assert_ne!(
+            id_idx_before[0].uuid, id_idx_after[0].uuid,
+            "the BTree must be remapped onto the rewritten fragments"
+        );
+        assert!(
+            zonemap_coverage(&dataset).await.is_empty(),
+            "the ZoneMap's coverage should have been dropped rather than remapped"
+        );
+
+        assert_zonemap_answers_match_scan(&dataset).await;
+        let mut by_id = dataset.scan();
+        by_id.filter("id = 7").unwrap();
+        by_id.project(&["id"]).unwrap();
+        assert_eq!(
+            by_id.try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values(),
+            &[7],
+        );
+    }
+
     /// The same compaction with `defer_index_remap` keeps the zone map covering
     /// its data: the FRI records the address moves and the index applies them on
     /// load, then bakes them in when the segments are merged.
@@ -9192,7 +10001,7 @@ mod tests {
     /// An FRI and a row-id-domain index cannot coexist on a stable-row-id
     /// dataset: the FRI is applied to every index on load, and a stable row id
     /// is numerically indistinguishable from an address into fragment 0, so it
-    /// would silently rewrite the bitmap index's valid row ids.
+    /// would silently rewrite the NGram index's valid row ids.
     ///
     /// Compaction refuses to create that pair, at the plan boundary and again at
     /// the commit boundary.
@@ -9201,10 +10010,10 @@ mod tests {
         let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
         dataset
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -9258,10 +10067,10 @@ mod tests {
 
         let err = dataset
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -9299,9 +10108,9 @@ mod tests {
     /// at a snapshot taken before the other committed.
     ///
     /// The compaction plans and rewrites while no row-id-domain index exists, so
-    /// its plan-time guard passes. A bitmap index is then created and commits: no
+    /// its plan-time guard passes. An NGram index is then created and commits: no
     /// FRI exists yet, so its guard passes too. The compaction finally commits
-    /// from the handle it planned on, which still cannot see the bitmap index,
+    /// from the handle it planned on, which still cannot see the NGram index,
     /// and the rewrite rebases on top of the `CreateIndex`.
     ///
     /// The result is the combination both guards exist to prevent: stable row
@@ -9332,10 +10141,10 @@ mod tests {
         let mut concurrent = Dataset::open(test_uri).await.unwrap();
         concurrent
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -9420,16 +10229,16 @@ mod tests {
         // `create_index` sees no FRI at its own version, so its guard passes and
         // the transaction reaches the rebase.
         //
-        // Bitmap, not BTree: BTree now always creates an address-domain
+        // NGram, not BTree/Bitmap: both now always create an address-domain
         // segment on a stable-row-id dataset (safe alongside an FRI by
-        // construction), so it can no longer illustrate this race. Bitmap
-        // still stores row ids directly here.
+        // construction), so neither can illustrate this race any longer.
+        // NGram still stores row ids directly here.
         let err = concurrent
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -9537,6 +10346,12 @@ mod tests {
     }
 
     /// 12 rows over 3 fragments with a zone map on `value`, stable row ids on.
+    ///
+    /// `cat` is a Utf8 column alongside the numeric `id`/`value` ones so a test
+    /// can build a row-id-domain index (e.g. NGram) over it -- every remaining
+    /// row-id-domain scalar index type requires a text column, unlike BTree and
+    /// Bitmap, which moved to row-address domain and no longer serve as that
+    /// fixture.
     async fn zonemap_stable_row_id_dataset(uri: &str) -> Dataset {
         let batch = arrow_array::record_batch!(
             ("id", Int32, (0..12).collect::<Vec<_>>()),
@@ -9557,6 +10372,11 @@ mod tests {
                     Some(100),
                     Some(110)
                 ]
+            ),
+            (
+                "cat",
+                Utf8,
+                (0..12).map(|i| format!("cat-{i}")).collect::<Vec<_>>()
             )
         )
         .unwrap();
@@ -9748,7 +10568,11 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
-        #[values(IndexType::Bitmap, IndexType::ZoneMap)] index_type: IndexType,
+        // NGram, not Bitmap: Bitmap now always creates an address-domain
+        // segment on a stable-row-id dataset (safe alongside an FRI by
+        // construction), so it can no longer illustrate this race. NGram
+        // still stores row ids directly here.
+        #[values(IndexType::NGram, IndexType::ZoneMap)] index_type: IndexType,
         #[values(false, true)] index_commits_first: bool,
         #[values(false, true)] is_disjoint: bool,
         #[values(
@@ -9762,9 +10586,23 @@ mod tests {
         let is_separate_session = first_commit_seen_as == FirstCommitSeenAs::SeparateSession;
         // How the rebase sees the compaction does not matter: an index rebasing
         // past it finds the moves recorded in the latest manifest's reuse index.
+        //
+        // This is a real, NGram-specific rebase difference, not an artifact of
+        // swapping out Bitmap: `check_create_index_txn`'s deferred-remap branch
+        // in conflict_resolver.rs carries an extra check solely for a new
+        // NGram index (`ngram_coverage`, mirroring `ngram_requires_rebuild` in
+        // append.rs) -- unlike every other index type, it cannot simply keep
+        // covering a fragment a concurrent deferred-remap rewrite just
+        // consumed, so overlapping coverage (`is_disjoint = false`) always
+        // retries there, regardless of commit order. That is exactly the raw
+        // retryable conflict the `index_commits_first = true` order already
+        // handles below; `false` with overlapping coverage now needs the same
+        // one extra manual retry to reach the domain rejection.
+        let ngram_overlap_retries = index_type == IndexType::NGram && !is_disjoint;
         let expected = match (index_type, index_commits_first) {
-            (IndexType::Bitmap, true) => RaceOutcome::ConflictThenRejected,
-            (IndexType::Bitmap, false) => RaceOutcome::Rejected,
+            (IndexType::NGram, true) => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) if ngram_overlap_retries => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) => RaceOutcome::Rejected,
             _ => RaceOutcome::Committed,
         };
         let dir = TempStrDir::default();
@@ -9785,14 +10623,22 @@ mod tests {
             excluded_fragment_ids: if is_disjoint { vec![2] } else { vec![] },
             ..Default::default()
         };
-        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::Bitmap {
-            BuiltinIndexType::Bitmap
+        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::NGram {
+            BuiltinIndexType::NGram
         } else {
             BuiltinIndexType::ZoneMap
         });
+        // NGram only applies to the text `cat` column; ZoneMap stays on the
+        // numeric `i` column the filters below query.
+        let index_column = if index_type == IndexType::NGram {
+            "cat"
+        } else {
+            "i"
+        };
         let create_index = async |dataset: &mut Dataset| {
+            let columns = [index_column];
             let builder = dataset
-                .create_index_builder(&["i"], index_type, &params)
+                .create_index_builder(&columns, index_type, &params)
                 .name("i_idx".into());
             if is_disjoint {
                 builder.fragments(vec![2]).await.map(|_| ())
@@ -9919,7 +10765,16 @@ mod tests {
                 ),
                 is_in_memory
             );
-            result
+            if matches!(expected, RaceOutcome::ConflictThenRejected) {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "{result:?}"
+                );
+                other.checkout_latest().await.unwrap();
+                create_index(&mut other).await
+            } else {
+                result
+            }
         };
 
         let latest = Dataset::open(dir.as_str()).await.unwrap();
@@ -11920,6 +12775,41 @@ mod tests {
         assert_eq!(plan.read_version, dataset.manifest.version);
         // make sure options.validate() worked
         assert!(!plan.options.materialize_deletions);
+    }
+
+    /// `num_threads` caps how many rewrite tasks run at once, and a cap of zero
+    /// never starts one, so compaction would wait forever instead of failing.
+    #[tokio::test]
+    async fn test_compact_files_rejects_zero_threads() {
+        let test_dir = TempStrDir::default();
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 2000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, &test_dir, Some(write_params))
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            num_threads: Some(0),
+            ..Default::default()
+        };
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            compact_files(&mut dataset, options, None),
+        )
+        .await
+        .expect("compaction with zero threads must fail instead of hanging")
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("num_threads must be greater than 0"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -14407,8 +15297,11 @@ mod tests {
         assert_eq!(values.get(&1), Some(&Some(1001)));
     }
 
+    #[rstest]
+    #[case::eager_remap(false)]
+    #[case::deferred_remap(true)]
     #[tokio::test]
-    async fn test_overlay_compaction_reconciles_stale_index() {
+    async fn test_overlay_compaction_reconciles_stale_index(#[case] defer_index_remap: bool) {
         let mut dataset = create_base_dataset("memory://").await;
         // Index `val` before any overlay -> the index is stale once val is overlaid.
         dataset
@@ -14442,12 +15335,16 @@ mod tests {
                 .contains(0)
         );
 
-        compact_files(&mut dataset, overlay_only_options(2), None)
-            .await
-            .unwrap();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..overlay_only_options(2)
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
 
         // The stale val index no longer covers the compacted fragment, so its
-        // rows fall back to a flat scan instead of serving stale values.
+        // rows fall back to a flat scan instead of serving stale values. A
+        // deferred remap leaves the old fragment id in the bitmap for the
+        // reuse index to translate later, so it must be gone too.
         let indices = dataset.load_indices().await.unwrap();
         let val_index = indices
             .iter()
@@ -14466,6 +15363,10 @@ mod tests {
                 .unwrap()
                 .contains(compacted_id),
             "stale index must drop the compacted fragment from its coverage"
+        );
+        assert!(
+            !val_index.fragment_bitmap.as_ref().unwrap().contains(0),
+            "stale index must drop the source fragment from its coverage"
         );
 
         // The indexed query is correct: the materialized value is found and the

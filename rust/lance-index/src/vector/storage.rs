@@ -3,21 +3,33 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
+use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
+use crate::vector::bq::planes::{EntryColumns, PlaneBatch, PlaneKey, plane_columns};
+use crate::vector::bq::resident::{
+    ResidentColumnStore, ResidentLoadTrigger, ResidentRows, is_resident,
+};
+use crate::vector::bq::scan_stats;
+use crate::vector::bq::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQueryEstimator};
+use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, cast::AsArray, types::UInt8Type,
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array, cast::AsArray,
+    types::UInt8Type,
 };
 use arrow_schema::SchemaRef;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::cache::{CacheTier, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
-use lance_file::reader::FileReader;
+use lance_file::reader::{FileReader, ReaderProjection};
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
 use lance_io::ReadBatchParams;
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
 use lance_io::spill::SpillStore;
 use lance_linalg::distance::DistanceType;
@@ -25,10 +37,12 @@ use prost::Message;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashMap},
+    hash::Hash,
     mem::size_of,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex, OnceLock, Weak},
+    time::Instant,
 };
 
 use crossbeam_queue::ArrayQueue;
@@ -43,6 +57,7 @@ use crate::{
     },
 };
 
+use super::exact_buffers::exact_batch;
 use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
 use super::pairwise::{
@@ -50,6 +65,12 @@ use super::pairwise::{
 };
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
+
+pub use crate::vector::bq::resident::{
+    ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, ResidentStoreViews,
+    resident_columns_bytes, resident_store_charge, resident_store_count, resident_store_is_live,
+    resident_store_views, shares_resident_store,
+};
 
 /// Coalesce source-index reads independently of the scoring vector batch size.
 const PAIRWISE_READ_BATCH_SIZE: usize = 8192;
@@ -88,25 +109,20 @@ where
     spawn_cpu(materialize).await
 }
 
+/// A prewarm's rows of one partition, slices of a read of several, copied
+/// once into buffers of their own, so that the entry keeps neither the
+/// whole read nor more than its values (see [`exact_batch`]).
 fn compact_prewarm_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
     let schema = batches
         .first()
         .ok_or_else(|| Error::internal("prewarm partition has no storage batches"))?
         .schema();
-    if batches.len() == 1 {
-        let batch = batches.into_iter().next().ok_or_else(|| {
-            Error::internal("prewarm partition storage batch unexpectedly missing")
-        })?;
-        if batch.num_rows() == 0 {
-            Ok(batch)
-        } else {
-            Ok(batch.shrink_to_fit()?)
-        }
-    } else {
-        // Concatenation allocates compact output buffers already; do not
-        // deep-copy them a second time with `shrink_to_fit`.
-        Ok(concat_batches(&schema, batches.iter())?)
+    if let [batch] = batches.as_slice()
+        && batch.num_rows() == 0
+    {
+        return Ok(batch.clone());
     }
+    exact_batch(&schema, &batches, true)
 }
 
 /// <section class="warning">
@@ -601,6 +617,605 @@ impl<Q: Quantization> StorageBuilder<Q> {
     }
 }
 
+/// Identifies an index file across the process: the index's UUID, and the
+/// prefix of the object store that holds the file (its scheme and bucket, or
+/// whatever else tells the store apart; see [`ObjectStore::store_prefix`])
+/// with the file's path in that store. Every open of the file binds to the
+/// runtime handles registered under it, so that indexes opened at once, a
+/// re-open while an older index still runs, and a state read back from a
+/// persistent cache tier share them: the resident store
+/// ([`ResidentColumns::in_index_cache`]) and the lazy scan's far gather
+/// permits (selected by its installed session factory).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexFileKey(Arc<IndexFileLocation>);
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct IndexFileLocation {
+    index_uuid: String,
+    store_prefix: String,
+    path: String,
+}
+
+impl IndexFileKey {
+    /// The file at `path` in the object store with prefix `store_prefix`,
+    /// of the index with UUID `index_uuid`.
+    pub fn new(index_uuid: &str, store_prefix: &str, path: &str) -> Self {
+        Self(Arc::new(IndexFileLocation {
+            index_uuid: index_uuid.to_owned(),
+            store_prefix: store_prefix.to_owned(),
+            path: path.to_owned(),
+        }))
+    }
+
+    /// The UUID of the index the file belongs to.
+    pub(crate) fn index_uuid(&self) -> &str {
+        &self.0.index_uuid
+    }
+
+    /// The prefix of the object store that holds the file.
+    pub(crate) fn store_prefix(&self) -> &str {
+        &self.0.store_prefix
+    }
+
+    /// The file's path in its object store.
+    pub(crate) fn path(&self) -> &str {
+        &self.0.path
+    }
+}
+
+/// Values shared process-wide by key and held weakly: a value lives while
+/// anything outside the registry holds it.
+pub(crate) type WeakRegistry<K, V> = Mutex<HashMap<K, Weak<V>>>;
+
+/// The value `registry` holds for `key` while anything else still holds it,
+/// else the one `create` makes, registered for the next caller. Entries of
+/// dropped values are pruned whenever a value is registered.
+pub(crate) fn shared_by_key<K: Eq + Hash + Clone, V>(
+    registry: &LazyLock<WeakRegistry<K, V>>,
+    key: &K,
+    create: impl FnOnce() -> Arc<V>,
+) -> Arc<V> {
+    let mut values = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = values.get(key).and_then(Weak::upgrade) {
+        return value;
+    }
+    let value = create();
+    values.retain(|_, held| held.strong_count() > 0);
+    values.insert(key.clone(), Arc::downgrade(&value));
+    value
+}
+
+/// Benchmark knob (`0` or `1`, default `0`): `1` loads a RaBitQ partition's
+/// sign plane before its ex planes on backends that do not gate plane
+/// admission too, as gated backends always do, instead of loading all three
+/// planes at once. Read once per process.
+pub const SEQUENTIAL_PLANE_LOADS_ENV: &str = "LANCE_RQ_SEQUENTIAL_PLANE_LOADS";
+
+/// [`SEQUENTIAL_PLANE_LOADS_ENV`], read once per process.
+static SEQUENTIAL_PLANE_LOADS: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
+    sequential_plane_loads_from(std::env::var(SEQUENTIAL_PLANE_LOADS_ENV).ok().as_deref())
+        .map_err(|err| err.to_string())
+});
+
+/// Whether RaBitQ partition loads read the sign plane before the ex planes on
+/// every backend ([`SEQUENTIAL_PLANE_LOADS_ENV`]). The variable is read once
+/// per process; an invalid value fails here and every RaBitQ partition load.
+/// Call it at startup to fail before serving.
+pub fn sequential_plane_loads() -> Result<bool> {
+    SEQUENTIAL_PLANE_LOADS.clone().map_err(Error::invalid_input)
+}
+
+fn sequential_plane_loads_from(value: Option<&str>) -> Result<bool> {
+    value.map_or(Ok(false), |value| {
+        parse_flag(SEQUENTIAL_PLANE_LOADS_ENV, value)
+    })
+}
+
+/// Latency class of an IVF_RQ index's origin reads, those that no cache tier
+/// serves: `auto` (default), `low` or `high`. `auto` takes the class the
+/// session opening the index declares, and without one the class of its
+/// object store: high for a cloud object store ([`ObjectStore::is_cloud`]) and
+/// low for local files and memory. A process whose object store is wrapped in
+/// a local cache that also caches index files declares `low` on its session
+/// instead, since the wrapper hides that from the store's scheme; `low` or
+/// `high` here overrides every session. Read once per process; the class is
+/// resolved when an index opens, see [`OriginLatencyClass::resolve_with_hint`].
+pub const ORIGIN_LATENCY_ENV: &str = "LANCE_RQ_ORIGIN_LATENCY";
+
+/// How slow an index's origin reads are. Reader policies that trade extra
+/// bytes or background work for fewer origin requests default to on only for
+/// [`Self::High`]. Whether an index keeps its small columns resident does
+/// not depend on the class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum OriginLatencyClass {
+    /// Local files and memory.
+    #[default]
+    Low,
+    /// Cloud object stores, where every request costs a network round trip.
+    High,
+}
+
+impl OriginLatencyClass {
+    /// The class `auto` resolves to for an index read from `object_store`.
+    pub fn of_store(object_store: &ObjectStore) -> Self {
+        if object_store.is_cloud() {
+            Self::High
+        } else {
+            Self::Low
+        }
+    }
+
+    /// The class of an index read from `object_store` under `setting`, the
+    /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, when no session
+    /// declares one.
+    pub fn resolve(setting: Option<Self>, object_store: &ObjectStore) -> Self {
+        Self::resolve_with_hint(setting, None, object_store)
+    }
+
+    /// The class of an index read from `object_store` under `setting`, the
+    /// value of [`ORIGIN_LATENCY_ENV`] with `None` for `auto`, opened by a
+    /// session that declares `hint` for the indexes it opens (`None` when it
+    /// declares none). An explicit setting wins over the hint, and the hint
+    /// over the store's own class ([`Self::of_store`]): only the serving
+    /// process knows whether a wrapper around the store serves index reads
+    /// from a local cache.
+    pub fn resolve_with_hint(
+        setting: Option<Self>,
+        hint: Option<Self>,
+        object_store: &ObjectStore,
+    ) -> Self {
+        setting
+            .or(hint)
+            .unwrap_or_else(|| Self::of_store(object_store))
+    }
+
+    /// The knob's spelling of the class: `low` or `high`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+        }
+    }
+
+    /// Whether reading planes that the index cache holds in `tiers` makes a
+    /// request to a slow origin: this class is [`Self::High`] and some plane
+    /// is [`CacheTier::Absent`]. A lazy probe whose ex planes are such is
+    /// counted in `s3_bound_probes`.
+    pub fn reads_slow_origin(self, tiers: &[CacheTier]) -> bool {
+        self == Self::High && tiers.contains(&CacheTier::Absent)
+    }
+}
+
+impl std::fmt::Display for OriginLatencyClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`ORIGIN_LATENCY_ENV`], read once per process.
+static ORIGIN_LATENCY: LazyLock<std::result::Result<Option<OriginLatencyClass>, String>> =
+    LazyLock::new(|| {
+        origin_latency_from(std::env::var(ORIGIN_LATENCY_ENV).ok().as_deref())
+            .map_err(|err| err.to_string())
+    });
+
+/// The class [`ORIGIN_LATENCY_ENV`] sets, `None` for `auto`. The variable is
+/// read once per process; an invalid value fails here and every IVF_RQ index
+/// open.
+pub fn origin_latency_setting() -> Result<Option<OriginLatencyClass>> {
+    ORIGIN_LATENCY.clone().map_err(Error::invalid_input)
+}
+
+fn origin_latency_from(value: Option<&str>) -> Result<Option<OriginLatencyClass>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim() {
+        "auto" => Ok(None),
+        "low" => Ok(Some(OriginLatencyClass::Low)),
+        "high" => Ok(Some(OriginLatencyClass::High)),
+        _ => Err(Error::invalid_input(format!(
+            "{ORIGIN_LATENCY_ENV}={value:?} is invalid, expected auto, low or high"
+        ))),
+    }
+}
+
+/// Whether an index keeps its small native columns resident: auto, on or off.
+pub const RESIDENT_COLUMNS_ENV: &str = "LANCE_RQ_RESIDENT_COLUMNS";
+
+/// The size of an IVF_RQ storage file's resident store, known without
+/// reading it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResidentStoreSize {
+    /// Bytes of values the store holds ([`resident_columns_bytes`]).
+    pub bytes: u64,
+    /// Bytes an index cache charges for the loaded store
+    /// ([`resident_store_charge`]).
+    pub charge: u64,
+}
+
+/// Whether a resident store an index cache charges `charge` bytes for fits
+/// the largest entry the cache admits, `max_entry_bytes`
+/// ([`lance_core::cache::CacheBackend::max_entry_bytes`]; `None`: the backend reports no limit). Live index handles keep their allocation even when
+/// the cache evicts the entry, so this is not a bound on process memory.
+pub fn resident_store_fits(charge: u64, max_entry_bytes: Option<u64>) -> bool {
+    max_entry_bytes.is_none_or(|max| charge <= max)
+}
+
+/// The value of [`RESIDENT_COLUMNS_ENV`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ResidentColumnsSetting {
+    /// On when the store's charge fits the ordinary cache entry limit
+    /// ([`resident_store_fits`]), whatever the origin; off otherwise.
+    #[default]
+    Auto,
+    /// On whatever the store's size or cache. Cache entries stay evictable
+    /// while index handles hold the store through an `Arc`. An index
+    /// opened without an index cache shares an uncharged store with the
+    /// file's live indexes.
+    On,
+    /// Off: reads fetch every column they return from the file.
+    Off,
+}
+
+impl ResidentColumnsSetting {
+    /// The setting an index opens with: `env`, the value of
+    /// [`RESIDENT_COLUMNS_ENV`], when it is `on` or `off`, and otherwise
+    /// `session`, what the opening session sets for the IVF_RQ indexes it
+    /// opens (`auto` unless it sets one).
+    pub fn resolve_with_session(env: Self, session: Self) -> Self {
+        match env {
+            Self::Auto => session,
+            Self::On | Self::Off => env,
+        }
+    }
+
+    /// Whether a resident store of `store`'s size may be kept in an index
+    /// cache whose largest admissible entry is `max_entry_bytes`: never when
+    /// `off`, and only a store with some columns otherwise; `auto` also
+    /// requires the bytes the cache charges for it to fit its entry limit
+    /// ([`resident_store_fits`]). The origin latency does not affect admission.
+    pub fn admits(self, store: ResidentStoreSize, max_entry_bytes: Option<u64>) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => store.bytes > 0,
+            Self::Auto => store.bytes > 0 && resident_store_fits(store.charge, max_entry_bytes),
+        }
+    }
+
+    /// The knob's spelling of the setting: `auto`, `on` or `off`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentColumnsSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`RESIDENT_COLUMNS_ENV`], read once per process.
+static RESIDENT_COLUMNS: LazyLock<std::result::Result<ResidentColumnsSetting, String>> =
+    LazyLock::new(|| {
+        resident_columns_from(std::env::var(RESIDENT_COLUMNS_ENV).ok().as_deref())
+            .map_err(|err| err.to_string())
+    });
+
+/// The setting of [`RESIDENT_COLUMNS_ENV`]. The variable is read once per
+/// process; an invalid value fails here and every IVF_RQ index open.
+pub fn resident_columns_setting() -> Result<ResidentColumnsSetting> {
+    RESIDENT_COLUMNS.clone().map_err(Error::invalid_input)
+}
+
+fn resident_columns_from(value: Option<&str>) -> Result<ResidentColumnsSetting> {
+    let Some(value) = value else {
+        return Ok(ResidentColumnsSetting::default());
+    };
+    match value.trim() {
+        "auto" => Ok(ResidentColumnsSetting::Auto),
+        "on" => Ok(ResidentColumnsSetting::On),
+        "off" => Ok(ResidentColumnsSetting::Off),
+        _ => Err(Error::invalid_input(format!(
+            "{RESIDENT_COLUMNS_ENV}={value:?} is invalid, expected auto, on or off"
+        ))),
+    }
+}
+
+/// How long an IVF_RQ index file's resident store is kept in RAM: `index`
+/// (default) or `process`. Read once per process; an invalid value fails
+/// every IVF_RQ index open.
+pub const RESIDENT_LIFETIME_ENV: &str = "LANCE_RQ_RESIDENT_LIFETIME";
+
+/// The value of [`RESIDENT_LIFETIME_ENV`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ResidentLifetime {
+    /// Held by the live indexes of the file and by an ordinary cache entry.
+    /// Eviction frees the store after its last index handle drops.
+    #[default]
+    Index,
+    /// Also held by a process-wide strong reference after loading. The
+    /// cache entry remains evictable; process ownership is outside its budget.
+    Process,
+}
+
+impl ResidentLifetime {
+    /// The knob's spelling of the lifetime: `index` or `process`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Process => "process",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentLifetime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`RESIDENT_LIFETIME_ENV`], read once per process.
+static RESIDENT_LIFETIME: LazyLock<std::result::Result<ResidentLifetime, String>> =
+    LazyLock::new(|| {
+        resident_lifetime_from(std::env::var(RESIDENT_LIFETIME_ENV).ok().as_deref())
+            .map_err(|err| err.to_string())
+    });
+
+/// The setting of [`RESIDENT_LIFETIME_ENV`].
+pub fn resident_lifetime_setting() -> Result<ResidentLifetime> {
+    RESIDENT_LIFETIME.clone().map_err(Error::invalid_input)
+}
+
+fn resident_lifetime_from(value: Option<&str>) -> Result<ResidentLifetime> {
+    let Some(value) = value else {
+        return Ok(ResidentLifetime::default());
+    };
+    match value.trim() {
+        "index" => Ok(ResidentLifetime::Index),
+        "process" => Ok(ResidentLifetime::Process),
+        _ => Err(Error::invalid_input(format!(
+            "{RESIDENT_LIFETIME_ENV}={value:?} is invalid, expected index or process"
+        ))),
+    }
+}
+
+/// What an IVF_RQ index's cache entries hold while its small columns are
+/// resident (see [`RESIDENT_COLUMNS_ENV`]): `codes` (default) or `all`. With
+/// `codes`, a RaBitQ index's sign, high and low plane entries and a native
+/// flat index's partition entries ([`PartitionCodes`]) hold only the columns
+/// reads fetch from the file, and every read attaches the resident rows:
+/// views of the store for whole partitions and planes, copies for gathered
+/// rows (see [`ResidentAttach`]), so the cache keeps no second copy of
+/// the row ids and factors. An index without a resident store keeps `all`,
+/// whatever the setting (see [`EntryColumns::resolve`]). Results are the
+/// same either way. Read once per process; resolved when an index opens.
+pub const ENTRY_COLUMNS_ENV: &str = "LANCE_RQ_ENTRY_COLUMNS";
+
+/// The setting of [`ENTRY_COLUMNS_ENV`] when it is unset.
+pub const DEFAULT_ENTRY_COLUMNS: EntryColumns = EntryColumns::Codes;
+
+/// [`ENTRY_COLUMNS_ENV`], read once per process.
+static ENTRY_COLUMNS: LazyLock<std::result::Result<EntryColumns, String>> = LazyLock::new(|| {
+    entry_columns_from(std::env::var(ENTRY_COLUMNS_ENV).ok().as_deref())
+        .map_err(|err| err.to_string())
+});
+
+/// The setting of [`ENTRY_COLUMNS_ENV`]. The variable is read once per
+/// process; an invalid value fails here and every IVF_RQ index open.
+pub fn entry_columns_setting() -> Result<EntryColumns> {
+    ENTRY_COLUMNS.clone().map_err(Error::invalid_input)
+}
+
+fn entry_columns_from(value: Option<&str>) -> Result<EntryColumns> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_ENTRY_COLUMNS);
+    };
+    match value.trim() {
+        "codes" => Ok(EntryColumns::Codes),
+        "all" => Ok(EntryColumns::All),
+        _ => Err(Error::invalid_input(format!(
+            "{ENTRY_COLUMNS_ENV}={value:?} is invalid, expected codes or all"
+        ))),
+    }
+}
+
+/// How a read of an IVF_RQ index with resident small columns attaches the
+/// store's rows to a batch of a whole partition or plane that is never
+/// cached: share (default) or copy. Gathered rows, whole reads that
+/// become cache entries, and partitions streamed out of the index to its
+/// caller are always copied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ResidentAttach {
+    /// A whole partition or plane gets views of the store's buffers, each
+    /// of exactly its rows' bytes, so the read copies nothing and the batch
+    /// is charged what a copy is. A view keeps its store column's whole
+    /// allocation alive until it drops, so no view may reach a cache entry
+    /// or outlive the read that made it.
+    #[default]
+    Share,
+    /// Every attach copies the store's rows into buffers of their own, as
+    /// before the store was shared.
+    Copy,
+}
+
+impl ResidentAttach {
+    /// The mode's name in diagnostics: `share` or `copy`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Share => "share",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentAttach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Parse a `0`/`1` (or `false`/`true`) environment flag.
+fn parse_flag(name: &str, value: &str) -> Result<bool> {
+    match value.trim() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(Error::invalid_input(format!(
+            "{name}={value:?} is invalid, expected 0 or 1"
+        ))),
+    }
+}
+
+/// Bytes a cached ex-plane row stores besides its codes: add and scale factors.
+const EX_PLANE_FACTOR_BYTES: usize = 2 * size_of::<f32>();
+
+/// Where to read an ex plane of a partition from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaneSource {
+    /// The RAM-resident entry, read like a native memory hit. Falls back to
+    /// [`Self::Whole`] if the entry was evicted since it was planned.
+    Resident,
+    /// The whole plane, admitted like the eager full-precision load.
+    Whole,
+    /// Selected rows of the persistent entry (or the origin file), without
+    /// RAM admission.
+    Sparse,
+}
+
+/// Sources for the high (index 0) and low (index 1) ex planes of one gather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatherPlan {
+    pub planes: [PlaneSource; 2],
+    /// Per plane, whether a [`PlaneSource::Sparse`] read that the persistent
+    /// tier cannot serve loads the whole plane instead of reading rows from the
+    /// origin file. Backends that gate plane admission ignore it: they would
+    /// read the whole plane without admitting it, so every query would pay
+    /// for it again.
+    pub origin_whole: [bool; 2],
+}
+
+/// Physical ex-code planes available to a session-provided RaBitQ scan.
+/// Native indices have one plane containing all `num_bits - 1` ex bits;
+/// RaBitQ indices have the existing high and low planes.
+///
+/// ```
+/// use lance_index::vector::storage::RabitExLayout;
+/// let layout = RabitExLayout::Native {
+///     rotated_dim: 2048, num_bits: 7, row_bytes: 1536,
+/// };
+/// assert_eq!(layout.planes().collect::<Vec<_>>(), vec![(1, 1536)]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RabitExLayout {
+    /// Current blocked native storage. The sign plane is independent of this plane.
+    Native {
+        /// Padded vector dimension used by the quantizer.
+        rotated_dim: usize,
+        /// Total quantization width, including the sign bit (2 through 9).
+        num_bits: u8,
+        /// Bytes per persistent-cache row, respecting code-only entries.
+        row_bytes: usize,
+    },
+}
+
+impl RabitExLayout {
+    /// Existing ex-plane identifiers and their cache row strides, in file order.
+    /// No absent plane is yielded for native storage.
+    pub fn planes(self) -> impl Iterator<Item = (u8, usize)> {
+        let (rows, count) = match self {
+            Self::Native { row_bytes, .. } => ([row_bytes, 0], 1),
+        };
+        [(1, rows[0]), (2, rows[1])].into_iter().take(count)
+    }
+}
+
+/// `batch` as the cache entry of a plane. An entry holds buffers of its own:
+/// one viewing the resident store would keep the store column's whole
+/// allocation alive from the cache, charged its rows alone, so every loader
+/// of a plane entry checks it in debug builds.
+fn plane_cache_entry(batch: RecordBatch) -> PlaneBatch {
+    debug_assert!(
+        !shares_resident_store(&batch),
+        "a plane cache entry holds memory of a resident store"
+    );
+    PlaneBatch(batch)
+}
+
+/// The file rows of the sorted offsets `rows` of a partition whose rows
+/// start at file row `start`.
+fn partition_file_rows(start: usize, rows: &[u32]) -> UInt64Array {
+    let start = start as u64;
+    UInt64Array::from_iter_values(rows.iter().map(|&row| start + u64::from(row)))
+}
+
+/// How stage-2 survivors address the ex rows of [`GatheredRabitEx`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExIndex {
+    /// Whole ex rows: a survivor's ex index is its partition offset.
+    Identity,
+    /// The batches hold the gathered rows only, in gather order.
+    Compact,
+}
+
+/// Gathered full-precision ex codes, preserving the index's physical layout.
+#[derive(Debug)]
+pub enum GatheredRabitEx {
+    /// One native ex-code batch, including its full add/scale factors.
+    Native {
+        /// Whole-partition or compact ex rows, as identified by `index`.
+        batch: RecordBatch,
+        /// Whether row offsets address the partition or the compact gather.
+        index: ExIndex,
+        /// Source of the ex rows; absent for an empty gather.
+        source: Option<PlaneSource>,
+        /// Number of sparse reads served by the origin file.
+        origin_row_reads: usize,
+    },
+}
+
+impl GatheredRabitEx {
+    /// Sources for plane 1 and plane 2. Native indices never have a plane 2.
+    pub fn sources(&self) -> [Option<PlaneSource>; 2] {
+        match self {
+            Self::Native { source, .. } => [*source, None],
+        }
+    }
+
+    /// Number of sparse plane reads served by the origin file.
+    pub fn origin_row_reads(&self) -> usize {
+        match self {
+            Self::Native {
+                origin_row_reads, ..
+            } => *origin_row_reads,
+        }
+    }
+}
+
+/// One ex plane fetched for a gather.
+struct FetchedPlane {
+    batch: RecordBatch,
+    source: PlaneSource,
+    from_origin: bool,
+}
+
+/// Native partitions have a sign and an ex cache entry.
+const ENTRY_PLANES: usize = 2;
+
+/// The schemas a storage attaches code-only entries to, built once per
+/// storage rather than on every read of an entry.
+#[derive(Debug, Default)]
+struct AttachSchemas {
+    /// A projection of the file for each physical plane.
+    planes: [OnceLock<SchemaRef>; ENTRY_PLANES],
+    /// A native partition's columns, which a storage built from its
+    /// code-only entry holds.
+    partition: OnceLock<SchemaRef>,
+}
+
 /// Loader to load partitioned PQ storage from disk.
 #[derive(Debug)]
 pub struct IvfQuantizationStorage<Q: Quantization> {
@@ -615,10 +1230,27 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// See [`Self::origin_latency`].
+    origin_latency: OriginLatencyClass,
+    /// See [`Self::resident_columns`].
+    resident_columns: ResidentColumns,
+    /// See [`Self::resident_columns_enabled`].
+    resident_columns_enabled: bool,
+    /// What the index asks its cache entries to hold; see
+    /// [`Self::entry_columns`].
+    entry_columns: EntryColumns,
+    /// See [`Self::resident_attach`].
+    resident_attach: ResidentAttach,
+    /// The schemas code-only entries are attached to, built on first use:
+    /// every plane's projection of the file and a
+    /// native partition's; see [`Self::plane_schema`].
+    attach_schemas: AttachSchemas,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // The resident store is charged as its own entry of the index cache
+        // (`ResidentColumnsEntry`), not with every storage reading it.
         self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
     }
 }
@@ -700,6 +1332,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            origin_latency: OriginLatencyClass::default(),
+            resident_columns: ResidentColumns::default(),
+            resident_columns_enabled: false,
+            entry_columns: EntryColumns::default(),
+            resident_attach: ResidentAttach::default(),
+            attach_schemas: AttachSchemas::default(),
         })
     }
 
@@ -732,6 +1370,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            origin_latency: OriginLatencyClass::default(),
+            resident_columns: ResidentColumns::default(),
+            resident_columns_enabled: false,
+            entry_columns: EntryColumns::default(),
+            resident_attach: ResidentAttach::default(),
+            attach_schemas: AttachSchemas::default(),
         }
     }
 
@@ -744,6 +1388,149 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.batch_remapper = Some(remapping);
         debug_assert!(self.frag_reuse_index.is_none() || self.batch_remapper.is_none());
         self
+    }
+
+    /// Set the latency class of reads from this storage's file, resolved
+    /// when the index opened.
+    pub fn with_origin_latency(mut self, class: OriginLatencyClass) -> Self {
+        self.origin_latency = class;
+        self
+    }
+
+    /// The latency class of reads from this storage's file, see
+    /// [`ORIGIN_LATENCY_ENV`]. [`OriginLatencyClass::Low`] unless the index
+    /// set it with [`Self::with_origin_latency`].
+    pub fn origin_latency(&self) -> OriginLatencyClass {
+        self.origin_latency
+    }
+
+    /// This storage's handle on the resident store of its file, which owns
+    /// the store while the storage lives. It loads only while
+    /// [`Self::resident_columns_enabled`], when the index opens
+    /// ([`Self::load_resident_store`]).
+    pub fn resident_columns(&self) -> &ResidentColumns {
+        &self.resident_columns
+    }
+
+    /// Read the small columns through `store`, the handle an open binds to
+    /// the store every live index of the file shares
+    /// ([`ResidentColumns::in_index_cache`]), so that the store loads once.
+    pub fn with_resident_columns(mut self, store: ResidentColumns) -> Self {
+        self.resident_columns = store;
+        self
+    }
+
+    /// Set whether reads take the file's small columns from the resident
+    /// store, resolved when the index opened. Only current blocked native
+    /// storage supports resident columns.
+    pub fn with_resident_columns_enabled(mut self, enabled: bool) -> Self {
+        self.resident_columns_enabled = enabled && self.supports_rabit_planes();
+        self
+    }
+
+    /// Whether reads take the file's small columns from the resident store,
+    /// see [`RESIDENT_COLUMNS_ENV`], and fetch only the others from the file.
+    /// `false` unless the index set it with
+    /// [`Self::with_resident_columns_enabled`].
+    pub fn resident_columns_enabled(&self) -> bool {
+        self.resident_columns_enabled
+    }
+
+    /// Load the resident store through this storage's handle, admitted to
+    /// the index cache the handle is bound to, unless it is
+    /// loaded already: an index loads its store when it opens, so that no
+    /// read loads it. The load's I/O is added to `io_stats`. Nothing to load
+    /// unless [`Self::resident_columns_enabled`].
+    pub async fn load_resident_store(&self, io_stats: Option<&IoStats>) -> Result<()> {
+        if !self.resident_columns_enabled {
+            return Ok(());
+        }
+        self.resident_columns
+            .get_or_load(&self.reader, io_stats, ResidentLoadTrigger::Open)
+            .await
+            .map(|_| ())
+    }
+
+    /// Bytes the resident store holds for this storage's file, loaded or
+    /// not; see [`resident_columns_bytes`]. Zero for unsupported storage layouts.
+    pub fn resident_columns_bytes(&self) -> u64 {
+        if self.supports_rabit_planes() {
+            resident_columns_bytes(&self.schema(), self.num_rows())
+        } else {
+            0
+        }
+    }
+
+    /// The size of the resident store of this storage's file, loaded or
+    /// not, and what an index cache charges for it. Unsupported storage
+    /// layouts report zero. It reads nothing.
+    pub fn resident_store_size(&self) -> Result<ResidentStoreSize> {
+        let bytes = self.resident_columns_bytes();
+        if bytes == 0 {
+            return Ok(ResidentStoreSize::default());
+        }
+        Ok(ResidentStoreSize {
+            bytes,
+            charge: resident_store_charge(&self.reader)?,
+        })
+    }
+
+    /// Ask the cache entries to hold `entry_columns`, resolved when the
+    /// index opened ([`ENTRY_COLUMNS_ENV`]); see [`Self::entry_columns`].
+    pub fn with_entry_columns(mut self, entry_columns: EntryColumns) -> Self {
+        self.entry_columns = entry_columns;
+        self
+    }
+
+    /// What the cache entries of this storage hold: [`EntryColumns::Codes`]
+    /// when the index asked for it and reads take the small columns from
+    /// the resident store ([`Self::resident_columns_enabled`]), which every
+    /// read of a code-only entry needs; [`EntryColumns::All`] otherwise.
+    pub fn entry_columns(&self) -> EntryColumns {
+        self.entry_columns.resolve(self.resident_columns_enabled)
+    }
+
+    /// Attach the resident rows to the batches of whole partitions and
+    /// planes that reads build and never cache as `resident_attach`; see
+    /// [`Self::resident_attach`]. This lets tests compare both ownership modes.
+    pub fn with_resident_attach(mut self, resident_attach: ResidentAttach) -> Self {
+        self.resident_attach = resident_attach;
+        self
+    }
+
+    /// How reads attach the resident rows to a batch of a whole partition
+    /// or plane that is never cached: views of the store
+    /// ([`ResidentAttach::Share`]) unless the index set
+    /// [`ResidentAttach::Copy`] with [`Self::with_resident_attach`].
+    /// Gathered rows, whole reads that become cache entries, and partitions
+    /// streamed out of the index are always copied.
+    pub fn resident_attach(&self) -> ResidentAttach {
+        self.resident_attach
+    }
+
+    /// The cache key of plane `plane` of `partition` under this storage's
+    /// entry columns.
+    pub fn plane_key(&self, partition: usize, plane: u8) -> PlaneKey {
+        PlaneKey {
+            partition,
+            plane,
+            entry_columns: self.entry_columns(),
+        }
+    }
+
+    /// The tier the index cache would serve plane `plane` of `partition`
+    /// from, checked without reading the plane or counting as an access.
+    /// [`CacheTier::Absent`] means a read goes to this storage's file, whose
+    /// latency is [`Self::origin_latency`].
+    pub async fn plane_tier(
+        &self,
+        partition: usize,
+        plane: u8,
+        cache: &WeakLanceCache,
+    ) -> CacheTier {
+        cache
+            .peek_tier_with_key(&self.plane_key(partition, plane))
+            .await
     }
 
     pub fn reader(&self) -> &FileReader {
@@ -775,6 +1562,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.distance_type
     }
 
+    /// The file schema, including the metadata needed to construct its storage.
     pub fn schema(&self) -> SchemaRef {
         Arc::new(self.reader.schema().as_ref().into())
     }
@@ -784,6 +1572,23 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
+    /// Translate assembled rows without changing cached encoded columns.
+    async fn remap_partition_batch(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<(RecordBatch, Option<Arc<dyn RowIdRemapper>>)> {
+        if let Some(remapping) = &self.batch_remapper {
+            lance_index_core::remapping::check_batch_remapping_entry()?;
+            let row_id_idx = batch.schema().index_of(ROW_ID)?;
+            let (batch, remapper) =
+                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
+                    .await?;
+            Ok((batch, Some(remapper)))
+        } else {
+            Ok((batch, self.frag_reuse_index.clone()))
+        }
+    }
+
     /// Load a partition's quantization storage, optionally measuring the exact
     /// I/O it performs into `io_stats`.
     ///
@@ -791,21 +1596,45 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// scheduler also records into the sink (a cheap clone that shares all
     /// cached metadata, so no file is re-opened).  When `None`, the normal
     /// uninstrumented reader is used.
+    ///
+    /// With [`Self::resident_columns_enabled`], only code columns are read
+    /// from the file; row ids and factors come from the resident store.
     pub async fn load_partition(
         &self,
         part_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
+        let batch = self
+            .read_partition_batch(part_id, io_stats.as_ref())
+            .await?;
+        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        Q::Storage::try_from_batch_with_remapper(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            remapper,
+        )
+    }
+
+    /// Every row of partition `part_id` as [`Self::schema`]'s
+    /// columns, read through a reader that also records into `io_stats`:
+    /// what [`Self::load_partition`] builds the partition's storage from.
+    pub async fn read_partition_batch(
+        &self,
+        part_id: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
         let range = self.ivf.row_range(part_id);
-        let batch = if range.is_empty() {
-            let schema = self.reader.schema();
-            let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
-            RecordBatch::new_empty(Arc::new(arrow_schema))
+        let schema = self.schema();
+        Ok(if range.is_empty() {
+            RecordBatch::new_empty(schema)
+        } else if let Some(store) = self.resident_store(&schema, io_stats).await? {
+            let params = ReadBatchParams::Range(range.clone());
+            let reader = self.file_reader(io_stats, None);
+            self.read_with_resident_columns(store, schema, range, None, params, &reader)
+                .await?
         } else {
-            let reader = match &io_stats {
-                Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
-                None => Cow::Borrowed(&self.reader),
-            };
+            let reader = self.file_reader(io_stats, None);
             let batches = reader
                 .read_stream(
                     ReadBatchParams::Range(range),
@@ -816,30 +1645,979 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .await?
                 .try_collect::<Vec<_>>()
                 .await?;
-            let schema = Arc::new(self.reader.schema().as_ref().into());
-            concat_batches(&schema, batches.iter())?
-        };
-        if let Some(remapping) = &self.batch_remapper {
-            // Tagged asynchronous path.
-            lance_index_core::remapping::check_batch_remapping_entry()?;
-            let row_id_idx = batch.schema().index_of(ROW_ID)?;
-            let (batch, remapper) =
-                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
-                    .await?;
-            return Q::Storage::try_from_batch_with_remapper(
-                batch,
-                self.metadata(),
-                self.distance_type,
-                Some(remapper),
-            );
+            if self.supports_rabit_planes() {
+                // Keep cache charges independent of excess decoder buffer capacity.
+                exact_batch(&schema, &batches, false)?
+            } else {
+                concat_batches(&schema, batches.iter())?
+            }
+        })
+    }
+
+    /// The file columns a native partition's code-only entry
+    /// ([`PartitionCodes`]) holds, in the file's order: those the resident
+    /// store does not keep: the codes.
+    fn partition_code_columns(&self) -> Result<Vec<String>> {
+        Ok(self
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| !is_resident(field))
+            .map(|field| field.name().clone())
+            .collect())
+    }
+
+    /// Project the partition's code columns from a column-layout file, excluding
+    /// columns kept in the resident store.
+    pub fn partition_codes_projection(&self) -> Result<ReaderProjection> {
+        let columns = self.partition_code_columns()?;
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        lance_file::versions::reader_projection_from_column_names(
+            self.reader.metadata().version(),
+            self.reader.schema(),
+            &columns,
+        )
+    }
+
+    /// Read the code-only entry of native partition `part_id` from the file,
+    /// through a reader that also records into `io_stats`: its code columns
+    /// alone, which an object store serves in one request each.
+    pub async fn read_partition_codes(
+        &self,
+        part_id: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<PartitionCodes> {
+        let columns = self.partition_code_columns()?;
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        Ok(PartitionCodes(
+            self.read_file_columns(self.ivf.row_range(part_id), &columns, io_stats)
+                .await?,
+        ))
+    }
+
+    /// The code-only entry of a native partition from `batches`, its rows of
+    /// the [`Self::partition_codes_projection`] columns that a prewarm read
+    /// of several partitions decoded: copied into buffers of its own, so the
+    /// entry does not keep the whole read.
+    pub fn partition_codes_from_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<PartitionCodes> {
+        Ok(PartitionCodes(compact_prewarm_batches(batches)?))
+    }
+
+    /// The storage of native partition `part_id` built from `codes`, its
+    /// code-only entry: the columns the resident store keeps are the store's
+    /// rows, attached as `attach` says, the others the entry's, in the order
+    /// a storage built from a read of the file holds them, so the storage is
+    /// that one, bit for bit and byte for byte. A read's own storage takes
+    /// [`Self::resident_attach`] (views of the store by default); one handed
+    /// out of the index, which may outlive the index and its lease on the
+    /// store, takes [`ResidentAttach::Copy`]. The storage is built for one
+    /// read and never cached: views of the store must not reach the cache.
+    /// The index loaded the store when it opened; a storage built outside an
+    /// index open loads it on its first build, as a fallback, and adds the
+    /// load's I/O to `load_stats`. Counted in `code_only_partition_builds`.
+    pub async fn partition_from_codes(
+        &self,
+        part_id: usize,
+        codes: &PartitionCodes,
+        attach: ResidentAttach,
+        load_stats: Option<&IoStats>,
+    ) -> Result<Q::Storage> {
+        let range = self.ivf.row_range(part_id);
+        let entry = &codes.0;
+        if entry.num_rows() != range.len() {
+            return Err(Error::internal(format!(
+                "code-only entry of partition {part_id} holds {} rows of its {}",
+                entry.num_rows(),
+                range.len()
+            )));
         }
-        // Legacy synchronous remapping path.
+        // The entries of a file all hold the same columns, so the schema
+        // built for the first one serves every other.
+        let schema = self
+            .attach_schemas
+            .partition
+            .get_or_init(|| self.schema())
+            .clone();
+        // As a read of no rows, which loads no store.
+        let store = if range.is_empty() {
+            None
+        } else {
+            let store = self.resident_store(&schema, load_stats).await?;
+            Some(store.ok_or_else(|| {
+                Error::internal(format!(
+                    "the code-only entry of partition {part_id} needs the resident store"
+                ))
+            })?)
+        };
+        // The build alone, without a fallback load of the store.
+        let started = Instant::now();
+        let batch = match store {
+            None => RecordBatch::new_empty(schema),
+            Some(store) => store.attach(schema, Some(entry), ResidentRows::Range(range), attach)?,
+        };
+        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let storage = Q::Storage::try_from_batch_with_remapper(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            remapper,
+        )?;
+        let stats = scan_stats::counters();
+        stats.code_only_partition_builds.incr();
+        stats.code_only_partition_build_ns.add_elapsed(started);
+        Ok(storage)
+    }
+
+    /// The storage of native partition `part_id` read through its code-only
+    /// entry in `cache` ([`PartitionCodesKey`]), loaded from the file on a
+    /// miss and admitted when `write_cache`, and whether the entry was a hit.
+    /// Every read attaches the resident columns as `attach` says
+    /// ([`Self::partition_from_codes`]); the index loaded them when it
+    /// opened, so a hit reads nothing from the file. The entry holds the
+    /// codes alone; the storage, which views the store's rows under
+    /// [`ResidentAttach::Share`], is built for this read and never cached.
+    pub async fn load_partition_cached(
+        &self,
+        part_id: usize,
+        cache: &WeakLanceCache,
+        write_cache: bool,
+        attach: ResidentAttach,
+        io_stats: Option<IoStats>,
+    ) -> Result<(Q::Storage, bool)> {
+        let key = PartitionCodesKey { partition: part_id };
+        let (codes, hit) = if write_cache {
+            cache
+                .get_or_insert_with_key_hit(key, || async {
+                    let codes = self
+                        .read_partition_codes(part_id, io_stats.as_ref())
+                        .await?;
+                    debug_assert!(
+                        !shares_resident_store(&codes.0),
+                        "a code-only partition entry holds memory of a resident store"
+                    );
+                    Ok(codes)
+                })
+                .await?
+        } else if let Some(codes) = cache.get_with_key(&key).await {
+            (codes, true)
+        } else {
+            let codes = self
+                .read_partition_codes(part_id, io_stats.as_ref())
+                .await?;
+            (Arc::new(codes), false)
+        };
+        let storage = self
+            .partition_from_codes(part_id, &codes, attach, io_stats.as_ref())
+            .await?;
+        Ok((storage, hit))
+    }
+
+    /// Warm every plane entry a full-precision scan reads. Backend admission
+    /// enforces its byte budget.
+    ///
+    /// A backend that gates lower planes on their sign plane is warmed plane
+    /// by plane: all sign planes first, then the other planes of partitions
+    /// whose sign plane stayed resident. Other backends admit plane entries
+    /// like any entry, so they are warmed partition by partition, which loads
+    /// (and persists) every plane whatever fits in RAM, as the native
+    /// partition prewarm does.
+    pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
+        let planes = [0, 1];
+        if !cache.plane_admission_gated() {
+            for part_id in 0..self.num_partitions() {
+                for &plane in &planes {
+                    cache
+                        .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
+                            Ok(plane_cache_entry(
+                                self.read_plane_entry(part_id, plane, None).await?,
+                            ))
+                        })
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+        for &plane in &planes {
+            for part_id in 0..self.num_partitions() {
+                if plane > 0
+                    && cache
+                        .get_resident_with_key(&self.plane_key(part_id, 0))
+                        .await
+                        .is_none()
+                {
+                    continue;
+                }
+                cache
+                    .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
+                        Ok(plane_cache_entry(
+                            self.read_plane_entry(part_id, plane, None).await?,
+                        ))
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this file exposes the current RaBitQ sign/ex plane primitives.
+    /// Historical native encodings and one-bit indices keep their ordinary
+    /// partition reader; they are not adapted into the new scan path.
+    pub fn supports_rabit_planes(&self) -> bool {
+        let Ok(Quantizer::Rabit(rq)) = self.quantizer() else {
+            return false;
+        };
+        let metadata = rq.metadata_ref();
+        (2..=9).contains(&metadata.num_bits)
+            && metadata.packed
+            && metadata.query_estimator == RabitQueryEstimator::RawQuery
+            && self
+                .reader
+                .schema()
+                .field(RABIT_BLOCKED_EX_CODE_COLUMN)
+                .is_some()
+            && self.reader.schema().field(ERROR_FACTORS_COLUMN).is_some()
+    }
+
+    /// Project a real plane of this file, without inventing a native low plane.
+    fn rabit_plane_columns(&self, plane: u8) -> Result<&'static [&'static str]> {
+        if !self.supports_rabit_planes() {
+            return Err(Error::invalid_input(
+                "plane reads require current blocked native multi-bit RaBitQ storage",
+            ));
+        }
+        let columns = plane_columns(plane);
+        if columns.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "native RaBitQ storage has no plane {plane}"
+            )));
+        }
+        Ok(columns)
+    }
+
+    /// Read an entire native partition through its sign/ex entries.
+    /// This is a storage primitive for explicitly installed scan strategies;
+    /// ordinary native scans keep using the partition cache.
+    pub async fn load_rabit_partition_planes(
+        &self,
+        part_id: usize,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        let after_sign = [1];
+        let load_plane = |plane| self.load_plane(part_id, plane, cache, io_stats.clone());
+        let planes = if sequential_plane_loads()? || cache.plane_admission_gated() {
+            // Admit the sign dependency first. The other reads can then
+            // overlap without changing admission policy or assembled column order.
+            let sign = load_plane(0).await?;
+            let rest =
+                futures::future::try_join_all(after_sign.iter().copied().map(load_plane)).await?;
+            std::iter::once(sign).chain(rest).collect()
+        } else {
+            // Admission does not depend on the sign plane's residency, so a
+            // missed partition reads its planes in one round trip.
+            // `try_join_all` returns them in the order requested.
+            futures::future::try_join_all(std::iter::once(0).chain(after_sign).map(load_plane))
+                .await?
+        };
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        for batch in planes {
+            fields.extend(batch.schema().fields().iter().cloned());
+            columns.extend(batch.columns().iter().cloned());
+        }
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new_with_metadata(
+                fields,
+                self.schema().metadata().clone(),
+            )),
+            columns,
+        )?;
+        let (batch, remapper) = self.remap_partition_batch(batch).await?;
         Q::Storage::try_from_batch_with_remapper(
             batch,
             self.metadata(),
             self.distance_type,
-            self.frag_reuse_index.clone(),
+            remapper,
         )
+    }
+
+    /// Remappers can remove physical rows, so candidate offsets require an identity mapping.
+    pub fn supports_candidate_reads(&self) -> bool {
+        self.frag_reuse_index.is_none() && self.batch_remapper.is_none()
+    }
+
+    /// Load one whole plane entry of a RaBitQ partition, which holds the
+    /// plane or, under [`EntryColumns::Codes`], its file columns alone (see
+    /// [`Self::read_plane_entry`]); [`Self::load_plane`] attaches the
+    /// resident columns.
+    ///
+    /// A backend that gates lower planes on their sign plane admits a lower
+    /// plane only while the partition's sign plane is resident; otherwise the
+    /// plane is read without admission, from the persistent entry or the
+    /// origin file. Other backends admit every plane through their ordinary
+    /// policy, as native partitions are.
+    pub async fn load_plane_entry(
+        &self,
+        part_id: usize,
+        plane: u8,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Arc<PlaneBatch>> {
+        let key = self.plane_key(part_id, plane);
+        if !cache.plane_admission_gated() {
+            return cache
+                .get_or_insert_with_key(key, || async {
+                    Ok(plane_cache_entry(
+                        self.read_plane_entry(part_id, plane, io_stats.clone())
+                            .await?,
+                    ))
+                })
+                .await;
+        }
+        let sign_resident = plane == 0
+            || cache
+                .get_resident_with_key(&self.plane_key(part_id, 0))
+                .await
+                .is_some();
+        let batch = if sign_resident {
+            cache
+                .get_or_insert_with_key_hit(key, || async {
+                    Ok(plane_cache_entry(
+                        self.read_plane_entry(part_id, plane, io_stats.clone())
+                            .await?,
+                    ))
+                })
+                .await?
+                .0
+        } else if let Some(batch) = cache.get_without_promotion_with_key(&key).await {
+            batch
+        } else {
+            // An oversized sign plane falls back to partition streaming; do
+            // not admit smaller ex entries without their sign dependency.
+            Arc::new(PlaneBatch(
+                self.read_plane_entry(part_id, plane, io_stats.clone())
+                    .await?,
+            ))
+        };
+        Ok(batch)
+    }
+
+    /// One whole plane of a RaBitQ partition, read through the cache: its
+    /// entry ([`Self::load_plane_entry`]) with the resident columns attached
+    /// ([`Self::attach_resident`]), so the batch is the plane a read of the
+    /// file returns whatever the entry holds.
+    pub async fn load_plane(
+        &self,
+        part_id: usize,
+        plane: u8,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<RecordBatch> {
+        let entry = self
+            .load_plane_entry(part_id, plane, cache, io_stats.clone())
+            .await?;
+        self.attach_resident(part_id, plane, &entry.0, None, io_stats.as_ref())
+            .await
+    }
+
+    /// What the cache entry of plane `plane` of `part_id` holds, read from
+    /// the file: the whole plane ([`Self::read_plane`]) or, under
+    /// [`EntryColumns::Codes`], only its file columns
+    /// (the plane's non-resident columns), with the sign codes packed. Every loader
+    /// of a plane entry reads it here.
+    pub async fn read_plane_entry(
+        &self,
+        part_id: usize,
+        plane: u8,
+        io_stats: Option<IoStats>,
+    ) -> Result<RecordBatch> {
+        self.read_plane_entry_with(part_id, plane, self.entry_columns(), io_stats)
+            .await
+    }
+
+    /// What a cache entry of plane `plane` of `part_id` holding
+    /// `entry_columns` holds, read from the file whatever this storage's own
+    /// entries hold ([`Self::entry_columns`]); see [`Self::read_plane_entry`].
+    pub async fn read_plane_entry_with(
+        &self,
+        part_id: usize,
+        plane: u8,
+        entry_columns: EntryColumns,
+        io_stats: Option<IoStats>,
+    ) -> Result<RecordBatch> {
+        if entry_columns == EntryColumns::All {
+            return self.read_plane(part_id, plane, None, io_stats).await;
+        }
+        let columns: Vec<_> = self
+            .rabit_plane_columns(plane)?
+            .iter()
+            .copied()
+            .filter(|name| super::bq::resident::is_file_column(name))
+            .collect();
+        self.read_file_columns(self.ivf.row_range(part_id), &columns, io_stats.as_ref())
+            .await
+    }
+
+    /// Plane `plane`'s projection, including the file schema metadata.
+    fn plane_schema(&self, plane: u8) -> Result<SchemaRef> {
+        let build = || -> Result<SchemaRef> {
+            let projection = lance_file::versions::reader_projection_from_column_names(
+                self.reader.metadata().version(),
+                self.reader.schema(),
+                self.rabit_plane_columns(plane)?,
+            )?;
+            Ok(Arc::new(arrow_schema::Schema::from(
+                projection.schema.as_ref(),
+            )))
+        };
+        let Some(slot) = self.attach_schemas.planes.get(usize::from(plane)) else {
+            return build();
+        };
+        if let Some(schema) = slot.get() {
+            return Ok(schema.clone());
+        }
+        let schema = build()?;
+        Ok(slot.get_or_init(|| schema).clone())
+    }
+
+    /// Plane `plane` of partition `part_id` at the sorted partition offsets
+    /// `rows` (every row when `None`), assembled from `entry`, a cache entry
+    /// of the plane at those rows. A full entry is the plane. A code-only
+    /// entry ([`EntryColumns::Codes`]) gets the resident store's rows at the
+    /// rows' file offsets, in the plane's column order, so the batch is the
+    /// one, bit for bit and byte for byte, that a read of the file returns
+    /// (see [`Self::read_plane`]): a whole plane as [`Self::resident_attach`]
+    /// says (views of the store by default), selected rows as copies. The
+    /// batch is for this read alone and must never be cached, since a view
+    /// keeps its store column's whole allocation alive. The index loaded the
+    /// store when it opened; a storage built outside an index open loads it
+    /// on its first attach, as a fallback, and adds the load's I/O to
+    /// `load_stats`.
+    pub async fn attach_resident(
+        &self,
+        part_id: usize,
+        plane: u8,
+        entry: &RecordBatch,
+        rows: Option<&[u32]>,
+        load_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
+        if self.entry_columns() == EntryColumns::All {
+            // Row-addressable ex bodies omit schema metadata. Reads restore
+            // it from the index file, as the origin projection does.
+            return RecordBatch::try_new(self.plane_schema(plane)?, entry.columns().to_vec())
+                .map_err(Into::into);
+        }
+        let range = self.ivf.row_range(part_id);
+        let expected_rows = rows.map_or(range.len(), <[u32]>::len);
+        if entry.num_rows() != expected_rows {
+            return Err(Error::internal(format!(
+                "code-only entry of partition {part_id} plane {plane} holds {} rows, the read needs {expected_rows}",
+                entry.num_rows()
+            )));
+        }
+        let schema = self.plane_schema(plane)?;
+        if expected_rows == 0 {
+            // As a read of no rows, which loads no store.
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        let Some(store) = self.resident_store(&schema, load_stats).await? else {
+            // No resident columns need attaching for this projection.
+            return Ok(entry.clone());
+        };
+        let file_rows = rows.map(|rows| partition_file_rows(range.start, rows));
+        let rows = match &file_rows {
+            Some(file_rows) => ResidentRows::Rows(file_rows),
+            None => ResidentRows::Range(range),
+        };
+        store
+            .attach(schema, Some(entry), rows, self.resident_attach)
+            .map_err(|error| {
+                Error::internal(format!(
+                    "attaching the resident columns of partition {part_id} plane {plane}: {error}"
+                ))
+            })
+    }
+
+    /// Geometry of the physical ex planes available to a session scan.
+    pub fn rabit_ex_layout(&self) -> Result<RabitExLayout> {
+        if !self.supports_rabit_planes() {
+            return Err(Error::invalid_input(
+                "native ex-plane layout requires current blocked multi-bit RaBitQ storage",
+            ));
+        }
+        let Quantizer::Rabit(rq) = self.quantizer()? else {
+            return Err(Error::invalid_input(
+                "ex-plane layout requires RaBitQ storage",
+            ));
+        };
+        let metadata = rq.metadata_ref();
+        let rotated_dim = metadata.rotated_dim();
+        let factors = if self.entry_columns() == EntryColumns::All {
+            EX_PLANE_FACTOR_BYTES
+        } else {
+            0
+        };
+        Ok(RabitExLayout::Native {
+            rotated_dim,
+            num_bits: metadata.num_bits,
+            row_bytes: blocked_ex_code_bytes(rotated_dim, metadata.num_bits - 1) + factors,
+        })
+    }
+
+    /// Stage-1 storage of the lazy full-precision scan: the partition's sign
+    /// plane alone, loaded (and admitted) like the eager load's sign plane.
+    pub async fn load_sign_stage(
+        &self,
+        part_id: usize,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        if !self.supports_candidate_reads() {
+            return Err(Error::invalid_input(
+                "the lazy full-precision scan requires an index without a row-id remapper",
+            ));
+        }
+        let sign = self.load_plane(part_id, 0, cache, io_stats).await?;
+        Q::Storage::try_from_sign_plane_for_full(sign, self.metadata(), self.distance_type)
+    }
+
+    /// Gather full-precision ex rows from the index's actual physical planes.
+    /// Native storage consumes only slot 0 of `plan`; RaBitQ storage preserves
+    /// the requested ex rows. Empty gathers perform no I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn gather_rabit_ex_rows(
+        &self,
+        part_id: usize,
+        rows: &[u32],
+        plan: GatherPlan,
+        coalesce_gap: Option<u64>,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<GatheredRabitEx> {
+        self.rabit_ex_layout()?;
+        let partition_rows = self.partition_size(part_id);
+        if rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows
+                .last()
+                .is_some_and(|&row| row as usize >= partition_rows)
+        {
+            return Err(Error::invalid_input(format!(
+                "gathered offsets of partition {part_id} must be sorted, unique and below its {partition_rows} rows"
+            )));
+        }
+        if rows.is_empty() {
+            return Ok(GatheredRabitEx::Native {
+                batch: self.read_plane(part_id, 1, Some(Vec::new()), None).await?,
+                index: ExIndex::Compact,
+                source: None,
+                origin_row_reads: 0,
+            });
+        }
+        let fetched = self
+            .fetch_ex_plane(
+                part_id,
+                1,
+                rows,
+                plan.planes[0],
+                plan.origin_whole[0],
+                coalesce_gap,
+                cache,
+                io_stats,
+            )
+            .await?;
+        Ok(GatheredRabitEx::Native {
+            batch: fetched.batch,
+            index: if fetched.source == PlaneSource::Sparse {
+                ExIndex::Compact
+            } else {
+                ExIndex::Identity
+            },
+            source: Some(fetched.source),
+            origin_row_reads: usize::from(fetched.from_origin),
+        })
+    }
+
+    /// Fetch one ex plane from `source`; `origin_whole` is the plan's
+    /// [`GatherPlan::origin_whole`] for the plane.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_ex_plane(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: &[u32],
+        source: PlaneSource,
+        origin_whole: bool,
+        coalesce_gap: Option<u64>,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<FetchedPlane> {
+        let stats = scan_stats::counters();
+        let started = Instant::now();
+        let key = self.plane_key(part_id, plane);
+        if source == PlaneSource::Resident
+            && let Some(entry) = cache.get_resident_with_key(&key).await
+        {
+            let batch = self
+                .attach_resident(part_id, plane, &entry.0, None, io_stats.as_ref())
+                .await?;
+            stats.fetch_resident_ns.add_elapsed(started);
+            return Ok(FetchedPlane {
+                batch,
+                source: PlaneSource::Resident,
+                from_origin: false,
+            });
+        }
+        if source == PlaneSource::Sparse {
+            let persisted = cache.get_rows_with_key(&key, rows).await;
+            if persisted.is_some() || !origin_whole || cache.plane_admission_gated() {
+                let (batch, from_origin) = match persisted {
+                    Some(entry) => (
+                        self.attach_resident(
+                            part_id,
+                            plane,
+                            &entry.0,
+                            Some(rows),
+                            io_stats.as_ref(),
+                        )
+                        .await?,
+                        false,
+                    ),
+                    // An origin read returns every column of the plane.
+                    None => (
+                        self.read_origin_rows(
+                            part_id,
+                            plane,
+                            rows,
+                            coalesce_gap,
+                            io_stats.as_ref(),
+                        )
+                        .await?,
+                        true,
+                    ),
+                };
+                if batch.num_rows() != rows.len() {
+                    return Err(Error::internal(format!(
+                        "sparse gather of partition {part_id} plane {plane} returned {} rows for {} offsets",
+                        batch.num_rows(),
+                        rows.len()
+                    )));
+                }
+                stats.fetch_sparse_ns.add_elapsed(started);
+                return Ok(FetchedPlane {
+                    batch,
+                    source: PlaneSource::Sparse,
+                    from_origin,
+                });
+            }
+            // Too many origin row runs: load the whole plane instead, which
+            // this backend admits like the eager load, so later queries find
+            // it cached.
+            stats.origin_whole_fallbacks.incr();
+        }
+        let batch = self.load_plane(part_id, plane, cache, io_stats).await?;
+        stats.fetch_whole_ns.add_elapsed(started);
+        Ok(FetchedPlane {
+            batch,
+            source: PlaneSource::Whole,
+            from_origin: false,
+        })
+    }
+
+    /// Read only selected rows of a plane; sorted indices are coalesced by the reader.
+    /// With [`Self::resident_columns_enabled`], only the plane's code (or
+    /// code) column is read from the file.
+    pub async fn read_plane(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: Option<Vec<u32>>,
+        io_stats: Option<IoStats>,
+    ) -> Result<RecordBatch> {
+        self.read_plane_with_coalesce_gap(part_id, plane, rows, io_stats, None)
+            .await
+    }
+
+    /// [`Self::read_plane`], reading the file through
+    /// [`FileReader::with_coalesce_gap`] when `coalesce_gap` is set: the
+    /// ranges of the selected rows that are at most that many bytes apart
+    /// share one request, instead of those within the object store's block
+    /// size. The batch is the same for every gap; only the requests and the
+    /// bytes read differ.
+    pub async fn read_plane_with_coalesce_gap(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: Option<Vec<u32>>,
+        io_stats: Option<IoStats>,
+        coalesce_gap: Option<u64>,
+    ) -> Result<RecordBatch> {
+        self.read_plane_with_stats(
+            part_id,
+            plane,
+            rows,
+            coalesce_gap,
+            io_stats.as_ref(),
+            io_stats.as_ref(),
+        )
+        .await
+    }
+
+    /// Read the sorted partition offsets `rows` of ex plane `plane` from the
+    /// origin file for a sparse gather, merging row runs within `config`'s
+    /// origin gap for the index's origin, and count the read's requests and
+    /// bytes after coalescing and the rows it gathers. A first-use load of the
+    /// resident store that the read starts is not counted; its I/O, like the
+    /// read's, is added to `io_stats`.
+    async fn read_origin_rows(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: &[u32],
+        coalesce_gap: Option<u64>,
+        io_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
+        let origin = IoStats::new();
+        let batch = self
+            .read_plane_with_stats(
+                part_id,
+                plane,
+                Some(rows.to_vec()),
+                coalesce_gap,
+                Some(&origin),
+                io_stats,
+            )
+            .await;
+        let read = origin.snapshot();
+        let stats = scan_stats::counters();
+        stats.origin_sparse_requests.add(read.iops);
+        stats.origin_sparse_bytes.add(read.bytes_read);
+        stats.origin_sparse_rows.add(rows.len() as u64);
+        if let Some(io_stats) = io_stats {
+            io_stats.add_scan_stats(&read);
+        }
+        batch
+    }
+
+    /// [`Self::read_plane_with_coalesce_gap`], recording the plane's reads
+    /// from the file into `read_stats` and a first-use load of the resident
+    /// store into `load_stats`, so that a caller can count them apart.
+    async fn read_plane_with_stats(
+        &self,
+        part_id: usize,
+        plane: u8,
+        rows: Option<Vec<u32>>,
+        coalesce_gap: Option<u64>,
+        read_stats: Option<&IoStats>,
+        load_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
+        let columns = self.rabit_plane_columns(plane)?;
+        let (projection, schema) = self.read_projection(columns)?;
+        let range = self.ivf.row_range(part_id);
+        if range.is_empty() || rows.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        let params = if let Some(rows) = &rows {
+            let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+            for &row in rows {
+                if row as usize >= range.len() {
+                    return Err(Error::invalid_input(
+                        "candidate offset exceeds partition length",
+                    ));
+                }
+                let start = range.start as u64 + u64::from(row);
+                if let Some(last) = ranges.last_mut()
+                    && last.end == start
+                {
+                    last.end += 1;
+                } else {
+                    ranges.push(start..start + 1);
+                }
+            }
+            ReadBatchParams::Ranges(ranges.into())
+        } else {
+            ReadBatchParams::Range(range.clone())
+        };
+        let reader = self.file_reader(read_stats, coalesce_gap);
+        if let Some(store) = self.resident_store(&schema, load_stats).await? {
+            return self
+                .read_with_resident_columns(store, schema, range, rows.as_deref(), params, &reader)
+                .await;
+        }
+        self.read_projected(&reader, params, projection, &schema, rows.is_none())
+            .await
+    }
+
+    /// Project file columns and retain the schema metadata for the returned batch.
+    fn read_projection(&self, columns: &[&str]) -> Result<(ReaderProjection, SchemaRef)> {
+        let projection = lance_file::versions::reader_projection_from_column_names(
+            self.reader.metadata().version(),
+            self.reader.schema(),
+            columns,
+        )?;
+        let schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
+        Ok((projection, schema))
+    }
+
+    /// Read `projection` ([`Self::read_projection`]) at `params` through
+    /// `reader` into one batch of `schema`. A whole-partition read, which
+    /// cache entries hold, returns buffers of exactly its values; a read
+    /// of selected rows keeps the decoder's buffers.
+    async fn read_projected(
+        &self,
+        reader: &FileReader,
+        params: ReadBatchParams,
+        projection: ReaderProjection,
+        schema: &SchemaRef,
+        whole: bool,
+    ) -> Result<RecordBatch> {
+        let batches = reader
+            .read_stream_projected(
+                params,
+                u32::MAX,
+                1,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        if whole {
+            exact_batch(schema, &batches, false)
+        } else {
+            concat_batches(schema, batches.iter()).map_err(Into::into)
+        }
+    }
+
+    /// This storage's file reader, also recording its I/O into `io_stats`,
+    /// and merging requested ranges at most `coalesce_gap` bytes apart
+    /// instead of those within the object store's block size.
+    fn file_reader(
+        &self,
+        io_stats: Option<&IoStats>,
+        coalesce_gap: Option<u64>,
+    ) -> Cow<'_, FileReader> {
+        let reader = match io_stats {
+            Some(stats) => Cow::Owned(self.reader.with_io_stats(stats.recorder())),
+            None => Cow::Borrowed(&self.reader),
+        };
+        match coalesce_gap {
+            Some(gap) => Cow::Owned(reader.with_coalesce_gap(gap)),
+            None => reader,
+        }
+    }
+
+    /// The resident store, when [`Self::resident_columns_enabled`] and it
+    /// keeps some of `schema`'s columns. The index loaded it when it opened
+    /// ([`Self::load_resident_store`]); a read loads it only as a fallback,
+    /// for a storage built outside an index open, which counts
+    /// `resident_columns_read_loads` and adds the load's I/O to that read's
+    /// `io_stats`.
+    async fn resident_store(
+        &self,
+        schema: &arrow_schema::Schema,
+        io_stats: Option<&IoStats>,
+    ) -> Result<Option<&ResidentColumnStore>> {
+        let reads_resident = schema.fields().iter().any(|field| is_resident(field));
+        if !self.resident_columns_enabled || !reads_resident {
+            return Ok(None);
+        }
+        self.resident_columns
+            .get_or_load(&self.reader, io_stats, ResidentLoadTrigger::Read)
+            .await
+            .map(Some)
+    }
+
+    /// Read `schema`'s columns at the file rows `range` of a partition,
+    /// either every row or the sorted partition offsets `rows`, as `params`
+    /// selects them. Columns `store` keeps are copies of its rows, and only
+    /// the others are read from the file, through `reader`, so the batch is
+    /// the one a read of every column from the file returns. Whole reads
+    /// become cache entries (plane entries holding every column, and
+    /// partition entries), so they copy too: a view of the store would keep
+    /// its whole column alive from the cache.
+    async fn read_with_resident_columns(
+        &self,
+        store: &ResidentColumnStore,
+        schema: SchemaRef,
+        range: std::ops::Range<usize>,
+        rows: Option<&[u32]>,
+        params: ReadBatchParams,
+        reader: &FileReader,
+    ) -> Result<RecordBatch> {
+        if range.end as u64 > store.num_rows() {
+            return Err(Error::invalid_input(format!(
+                "partition rows {range:?} exceed the {} rows of the storage file",
+                store.num_rows()
+            )));
+        }
+        let file_columns: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .filter(|name| store.column(name).is_none())
+            .collect();
+        let file_batch = if file_columns.is_empty() {
+            None
+        } else {
+            let projection = lance_file::versions::reader_projection_from_column_names(
+                self.reader.metadata().version(),
+                self.reader.schema(),
+                &file_columns,
+            )?;
+            let file_schema = Arc::new(arrow_schema::Schema::from(projection.schema.as_ref()));
+            let batches = reader
+                .read_stream_projected(
+                    params,
+                    u32::MAX,
+                    1,
+                    projection,
+                    FilterExpression::no_filter(),
+                )
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            Some(if rows.is_none() {
+                // A whole read, which entries hold: see `read_projected`.
+                exact_batch(&file_schema, &batches, false)?
+            } else {
+                concat_batches(&file_schema, batches.iter())?
+            })
+        };
+        let file_rows = rows.map(|rows| partition_file_rows(range.start, rows));
+        let rows = match &file_rows {
+            Some(file_rows) => ResidentRows::Rows(file_rows),
+            None => ResidentRows::Range(range),
+        };
+        // Always copied: a whole read becomes a plane entry or a partition
+        // entry (`IVFPartitionKey`), which must not hold views of the store.
+        store.attach(schema, file_batch.as_ref(), rows, ResidentAttach::Copy)
+    }
+
+    /// `columns` of the file at every row of the partition rows `range`,
+    /// read through a reader that also records into `io_stats`: what a
+    /// code-only entry holds before its codes are normalized.
+    async fn read_file_columns(
+        &self,
+        range: std::ops::Range<usize>,
+        columns: &[&str],
+        io_stats: Option<&IoStats>,
+    ) -> Result<RecordBatch> {
+        let (projection, schema) = self.read_projection(columns)?;
+        if range.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        let reader = self.file_reader(io_stats, None);
+        self.read_projected(
+            &reader,
+            ReadBatchParams::Range(range),
+            projection,
+            &schema,
+            true,
+        )
+        .await
     }
 
     /// Read only `columns` of the given rows; the batch keeps file schema order.

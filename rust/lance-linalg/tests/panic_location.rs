@@ -11,7 +11,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use lance_linalg::distance::{dot_u8::dot_u8, l2::l2_distance_batch};
+use lance_linalg::distance::{dot_u8::dot_u8, l2::l2_distance_batch_into};
 
 /// Runs `f`, which must panic, and returns where the panic was reported and
 /// what it said.
@@ -58,7 +58,7 @@ fn length_contract_panics_name_the_distance_function() {
     );
 
     let (file, line, message) = panic_details(|| {
-        l2_distance_batch(&[1.0f32, 2.0], &[1.0f32, 2.0, 3.0], 2).for_each(drop);
+        l2_distance_batch_into(&[1.0f32, 2.0], &[1.0f32, 2.0, 3.0], 2, &mut [0.0]);
     });
     assert_eq!(
         Path::new(&file).file_name(),

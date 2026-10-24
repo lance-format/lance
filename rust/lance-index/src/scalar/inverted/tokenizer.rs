@@ -1153,10 +1153,11 @@ impl InvertedIndexParams {
                 }
                 Ok(builder)
             }
-            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
-            "icu/split" => {
-                Ok(TextAnalyzer::builder(IcuTokenizer::default().with_simple_split()).dynamic())
-            }
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default().into_streaming()).dynamic()),
+            "icu/split" => Ok(TextAnalyzer::builder(
+                IcuTokenizer::default().with_simple_split().into_streaming(),
+            )
+            .dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
@@ -1832,7 +1833,7 @@ mod tests {
         );
     }
 
-    // Common Chinese function words/particles (了 是 在 的 和 有 我) are the
+    // Common Chinese function words/particles (了 是 在 的 有 我) are the
     // highest-frequency Chinese tokens; like the English pronouns they must be
     // removed by the ICU `all()` stop-word path so they don't build huge
     // posting lists. Real content words (英语 = "English", 数据 = "data") must
@@ -1851,7 +1852,7 @@ mod tests {
         let mut stream = tokenizer.token_stream_for_search("我 在 有 了 是 的 和 英语 数据");
         let tokens: Vec<String> =
             std::iter::from_fn(|| stream.next().map(|t| t.text.clone())).collect();
-        let stop = ["我", "在", "有", "了", "是", "的", "和"];
+        let stop = ["我", "在", "有", "了", "是", "的"];
         let leaked: Vec<&String> = tokens
             .iter()
             .filter(|t| stop.contains(&t.as_str()))
@@ -1860,10 +1861,93 @@ mod tests {
             leaked.is_empty(),
             "common Chinese stop words leaked through the icu pipeline: {leaked:?} (all tokens: {tokens:?})"
         );
+        // 和 also denotes a Japanese sum, so the language-blind union retains it.
+        assert!(
+            tokens.iter().any(|token| token == "和"),
+            "Han content word 和 was dropped: {tokens:?}"
+        );
         // The real content words must still be indexed.
         assert!(
             tokens.iter().any(|t| t == "英语"),
             "content word 英语 was dropped: {tokens:?}"
         );
+    }
+
+    #[rstest]
+    #[case::retrieved_data("取得したデータを全部表示", &["取得", "全部", "表示"])]
+    #[case::start_processing("以上の場合は処理を開始する", &["以上", "場合", "処理", "開始"])]
+    #[case::change_settings("以下の方法で設定を変更", &["以下", "方法", "設定", "変更"])]
+    #[case::read_book("本を読む", &["本"])]
+    #[case::morning_run("朝に走る", &["朝"])]
+    #[case::have_business("用がある", &["用"])]
+    #[case::end_of_earth("地の果て", &["地"])]
+    #[case::bring_forward("前面に出す", &["前面"])]
+    #[case::enough_time("十分な時間がある", &["十分"])]
+    #[case::large_amount("大量のデータ", &["大量"])]
+    #[case::move_sideways("左右に動く", &["左右"])]
+    #[case::last_day("最後の日", &["最後"])]
+    #[case::many_opinions("多数の意見", &["多数"])]
+    #[case::agree("意見が一致した", &["一致"])]
+    #[case::introduce_self("自己紹介をする", &["自己"])]
+    #[case::very_many("非常に多い", &["非常"])]
+    #[case::own_land("土地を所有する", &["所有"])]
+    #[case::all_users("从数据库获取所有用户信息并返回结果", &["所有", "结果"])]
+    #[case::no_permission("没有权限", &["没有", "权限"])]
+    #[case::not_an_error("不是错误", &["不是", "错误"])]
+    #[case::feed_cat("他喂猫", &["喂", "猫"])]
+    #[case::cough("他咳了一夜", &["咳"])]
+    #[case::vomit("呕了两次", &["呕", "两次"])]
+    #[case::tell_lie("嘘をつく", &["嘘", "つく"])]
+    #[case::benefit("得をする", &["得"])]
+    #[case::passing_grade("可か不可か", &["可", "不可"])]
+    #[case::military_general("将を討つ", &["将", "討つ"])]
+    #[case::clothing_counter("三着の服", &["三", "着", "服"])]
+    #[case::place("所が変わる", &["所", "変わる"])]
+    #[case::reason("由を尋ねる", &["由", "尋ねる"])]
+    #[case::rank("等を上げる", &["等", "上げる"])]
+    #[case::return_home("うちに帰る", &["うち", "帰る"])]
+    #[case::time("ときが来た", &["とき"])]
+    #[case::choose_place("ところを選ぶ", &["ところ", "選ぶ"])]
+    #[case::emphasis("特に安い商品", &["特に", "安い", "商品"])]
+    #[case::objects("欲しいもの", &["欲しい", "もの"])]
+    #[case::boyfriend("彼ができる", &["彼", "できる"])]
+    #[case::girlfriend("彼女ができる", &["彼女", "できる"])]
+    #[case::restriction("読み取りのみ", &["読み取り", "のみ"])]
+    #[case::chinese_prohibition("别执行删除", &["别", "执行", "删除"])]
+    #[case::japanese_prohibition("実行するな", &["実行", "な"])]
+    #[case::japanese_negative("できん", &["でき", "ん"])]
+    #[case::ants("ありの巣", &["あり", "巣"])]
+    #[case::cage("鳥をおりに入れる", &["鳥", "おり", "入れる"])]
+    #[case::noun_particle_combination("もののかたち", &["ものの", "かたち"])]
+    #[case::cause("因を探る", &["因", "探る"])]
+    #[case::picture_kanji("絵をかく", &["絵", "かく"])]
+    #[case::tree_kanji("木に登る", &["木", "登る"])]
+    #[case::poem_kanji("詩を読む", &["詩", "読む"])]
+    fn test_icu_keeps_cjk_content_words(
+        #[case] text: &str,
+        #[case] content_words: &[&str],
+        #[values("icu", "icu/split")] base_tokenizer: &str,
+        #[values(false, true)] stem: bool,
+    ) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer(base_tokenizer.to_string())
+            .stem(stem)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search(text);
+        let tokens: Vec<String> =
+            std::iter::from_fn(|| stream.next().map(|token| token.text.clone())).collect();
+        for word in content_words {
+            assert!(
+                tokens.iter().any(|token| token == word),
+                "content word {word} was filtered from {text}: {tokens:?}"
+            );
+        }
+        for particle in ["の", "を", "は"] {
+            assert!(
+                !tokens.iter().any(|token| token == particle),
+                "function particle {particle} was retained: {tokens:?}"
+            );
+        }
     }
 }

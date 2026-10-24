@@ -28,6 +28,7 @@ fsst.workspace = true
 hex.workspace = true
 itertools.workspace = true
 log.workspace = true
+serde_json.workspace = true
 num-traits.workspace = true
 prost.workspace = true
 hyperloglogplus.workspace = true
