@@ -86,5 +86,9 @@ harness = false
 name = "take"
 harness = false
 
+[[bench]]
+name = "compression_levels"
+harness = false
+
 [lints]
 workspace = true
