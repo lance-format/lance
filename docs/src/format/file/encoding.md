@@ -636,6 +636,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
 | ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
+| ALP             | ❓                    | ❌                       | ✅ (2.3)                   |
 | General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
@@ -803,6 +804,71 @@ only applied if general compression is also applied on the column.
 We currently determine whether or not to apply BSS by looking at an entropy statistics. There is a configurable
 sensitivity parameter. A sensitivity of 0.0 means never apply BSS and a sensitivity of 1.0 means always apply BSS.
 
+### ALP
+
+ALP (Adaptive Lossless floating-Point) is a lossless compression technique for floating point data. It is most
+effective when a column stores values with few significant decimal digits (prices, sensor readings, timestamps
+scaled to a fixed precision) and is used in the mini-block context of the unstable Lance 2.3 format. It is not
+transparent (the chunk layout is not a single value buffer), so it cannot be used in the full zip context.
+
+ALP maps each finite-decimal floating point value onto an integer with a base-10 exponent transform, then
+bit-packs the Frame-of-Reference (FOR) or Delta stream. Two reconstruction paths are supported per chunk:
+
+- **Multiply** (classic `(e, f)` pair): `enc = round_ties_even(v * 10^e * 10^-f)` and
+  `v = enc * 10^f * 10^-e`.
+- **Divide** (`use_div`): `enc = round_ties_even(v * 10^e)` and `v = enc / 10^e`. The single correctly-rounded
+  division repairs the `f32` truncation failures of the multiply chain.
+
+Every value is validated with a bitwise round-trip check before it is admitted to the integer stream. Values that
+cannot be reconstructed bitwise are stored verbatim as exceptions, which preserves NaN payloads, signed zeros and
+subnormals.
+
+Each chunk uses the same four-buffer shape as other mini-block codecs:
+
+```text
+chunk buffer
+├── Buffer 0: bitpacked integer offsets (payload)
+├── Buffer 1: per-chunk header
+├── Buffer 2: exception positions (u16, chunk-relative)
+└── Buffer 3: exception values (original IEEE-754 bit patterns)
+```
+
+The header is a single byte with two extra mode bits, followed by the mode-specific fields:
+
+```text
+header
+├── mode: bit 0 = Delta, bit 1 = use_div, bit 2 = ALP-RD
+├── e / f: base-10 exponents (f is ignored when use_div is set)
+├── bit_width: bits per packed offset
+├── FOR: min  |  Delta: first then min_delta
+└── ALP-RD: right_width d, index_bits, then dict_len (u32)
+```
+
+`mode`, `d`, `index_bits` and a reserved zero byte are single-byte fields; the ALP-RD `dict_len` is a little-endian
+`u32` that follows them, keeping the header self-describing. The payload packs `enc - min` (FOR) or
+`delta - min_delta` (Delta). The out-of-line bitpack layout pads chunks to 1024-value blocks, so the encoder emits
+chunks of at most 1024 values.
+
+For `f64` the encoder additionally tries **ALP-RD**: it splits each word into a dictionary-coded left part (high
+bits) and a bit-packed right part, sweeping right widths of 8, 16, 24, 32, 40, 48 and 56 bits and keeping the
+cheapest split that is smaller than the raw bytes. An ALP-RD chunk reinterprets the four buffers:
+
+```text
+ALP-RD chunk buffer
+├── Buffer 0: bitpacked right parts
+├── Buffer 1: [mode RD][d][index_bits][0][dict_len u32]
+├── Buffer 2: dictionary of left parts (8 bytes per entry)
+└── Buffer 3: bitpacked index stream (omitted when index_bits == 0)
+```
+
+When every value shares the same left part the dictionary has one entry, `index_bits` is 0, and no index stream is
+written.
+
+ALP is selected with `AlpMode` (`off`, `on`, `auto`). The default for v2.3 float columns is `auto`, which runs a
+cheap byte-position entropy pre-gate (threshold 4.6 bits per byte position) to reject incompressible pages before
+the candidate scan. A page that cannot be encoded (no encodable values, packed size at or above the raw size, or
+any chunk exceeding the mini-block byte budget) falls back to the flat encoding, so ALP never enlarges data.
+
 ### General
 
 General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
@@ -835,6 +901,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression` | `lz4`, `zstd`, `none`             | `lz4`            | Select general compression scheme for dictionary values                                 |
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
+| `lance-encoding:alp`                 | `off`, `on`, `auto`                  | `auto`           | Whether to apply ALP for floating point data (unstable 2.3 format only).                |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
 | `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural policy; `sparse` requires Lance 2.3 and retains canonical dense all-valid pages.                                |
 
@@ -906,6 +973,26 @@ compress more effectively.
 
 BSS is particularly effective for:
 - Floating-point measurements with similar ranges
+
+#### ALP
+
+The `lance-encoding:alp` variable controls the ALP codec for floating point data. A value of `off` never applies
+ALP, `on` always runs the ALP candidate scan on supported data, and `auto` (the default) gates the candidate scan
+behind a byte-position entropy check with a threshold of 4.6 bits per byte position. The mode is only honored by
+the unstable Lance 2.3 format.
+
+**Key points:**
+- Supported types: `f32` and `f64`
+- Maximum chunk size: 1024 values
+- `auto` mode: Uses the `BytePositionEntropy` statistic; pages whose average entropy is below the threshold enter
+  the ALP candidate scan, the rest skip it
+- ALP never enlarges data: pages that cannot be encoded (or where the packed size is not smaller) fall back to the
+  flat encoding
+- `f64` additionally tries the ALP-RD dictionary split (see the ALP section above)
+
+ALP is particularly effective for:
+- Finite-decimal values such as prices and rounded sensor readings
+- Columns where the raw floating point bytes are high-entropy but the values have few significant digits
 - Time-series data with consistent precision
 - Scientific data with correlated mantissa patterns
 

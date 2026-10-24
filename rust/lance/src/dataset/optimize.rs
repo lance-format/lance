@@ -6776,9 +6776,18 @@ mod tests {
         }
     }
 
+    /// `cat` is a Utf8 column alongside the numeric `i` one so a test can build
+    /// a row-id-domain index (e.g. NGram) over it -- every remaining
+    /// row-id-domain scalar index type requires a text column, unlike BTree,
+    /// Bitmap, and LabelList, which moved to row-address domain and no longer
+    /// serve as that fixture.
     async fn stable_row_id_dataset(uri: &str, num_fragments: u32) -> Dataset {
         lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "cat",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_dataset_with_params(
                 uri,
                 FragmentCount::from(num_fragments),
@@ -7155,12 +7164,16 @@ mod tests {
             );
         }
         if matches!(mismatch, RecordingMismatch::IncompatibleIndexCreated) {
+            // NGram, not Bitmap: Bitmap now always creates an address-domain
+            // segment on a stable-row-id dataset (safe alongside the recorded
+            // moves by construction), so it can no longer illustrate this
+            // mismatch. NGram still stores row ids directly here.
             dataset
                 .create_index(
-                    &["i"],
-                    IndexType::Bitmap,
+                    &["cat"],
+                    IndexType::NGram,
                     Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                     false,
                 )
                 .await
@@ -9988,7 +10001,7 @@ mod tests {
     /// An FRI and a row-id-domain index cannot coexist on a stable-row-id
     /// dataset: the FRI is applied to every index on load, and a stable row id
     /// is numerically indistinguishable from an address into fragment 0, so it
-    /// would silently rewrite the bitmap index's valid row ids.
+    /// would silently rewrite the NGram index's valid row ids.
     ///
     /// Compaction refuses to create that pair, at the plan boundary and again at
     /// the commit boundary.
@@ -9997,10 +10010,10 @@ mod tests {
         let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
         dataset
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10054,10 +10067,10 @@ mod tests {
 
         let err = dataset
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10095,9 +10108,9 @@ mod tests {
     /// at a snapshot taken before the other committed.
     ///
     /// The compaction plans and rewrites while no row-id-domain index exists, so
-    /// its plan-time guard passes. A bitmap index is then created and commits: no
+    /// its plan-time guard passes. An NGram index is then created and commits: no
     /// FRI exists yet, so its guard passes too. The compaction finally commits
-    /// from the handle it planned on, which still cannot see the bitmap index,
+    /// from the handle it planned on, which still cannot see the NGram index,
     /// and the rewrite rebases on top of the `CreateIndex`.
     ///
     /// The result is the combination both guards exist to prevent: stable row
@@ -10128,10 +10141,10 @@ mod tests {
         let mut concurrent = Dataset::open(test_uri).await.unwrap();
         concurrent
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10216,16 +10229,16 @@ mod tests {
         // `create_index` sees no FRI at its own version, so its guard passes and
         // the transaction reaches the rebase.
         //
-        // Bitmap, not BTree: BTree now always creates an address-domain
+        // NGram, not BTree/Bitmap: both now always create an address-domain
         // segment on a stable-row-id dataset (safe alongside an FRI by
-        // construction), so it can no longer illustrate this race. Bitmap
-        // still stores row ids directly here.
+        // construction), so neither can illustrate this race any longer.
+        // NGram still stores row ids directly here.
         let err = concurrent
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10333,6 +10346,12 @@ mod tests {
     }
 
     /// 12 rows over 3 fragments with a zone map on `value`, stable row ids on.
+    ///
+    /// `cat` is a Utf8 column alongside the numeric `id`/`value` ones so a test
+    /// can build a row-id-domain index (e.g. NGram) over it -- every remaining
+    /// row-id-domain scalar index type requires a text column, unlike BTree and
+    /// Bitmap, which moved to row-address domain and no longer serve as that
+    /// fixture.
     async fn zonemap_stable_row_id_dataset(uri: &str) -> Dataset {
         let batch = arrow_array::record_batch!(
             ("id", Int32, (0..12).collect::<Vec<_>>()),
@@ -10353,6 +10372,11 @@ mod tests {
                     Some(100),
                     Some(110)
                 ]
+            ),
+            (
+                "cat",
+                Utf8,
+                (0..12).map(|i| format!("cat-{i}")).collect::<Vec<_>>()
             )
         )
         .unwrap();
@@ -10544,7 +10568,11 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
-        #[values(IndexType::Bitmap, IndexType::ZoneMap)] index_type: IndexType,
+        // NGram, not Bitmap: Bitmap now always creates an address-domain
+        // segment on a stable-row-id dataset (safe alongside an FRI by
+        // construction), so it can no longer illustrate this race. NGram
+        // still stores row ids directly here.
+        #[values(IndexType::NGram, IndexType::ZoneMap)] index_type: IndexType,
         #[values(false, true)] index_commits_first: bool,
         #[values(false, true)] is_disjoint: bool,
         #[values(
@@ -10558,9 +10586,23 @@ mod tests {
         let is_separate_session = first_commit_seen_as == FirstCommitSeenAs::SeparateSession;
         // How the rebase sees the compaction does not matter: an index rebasing
         // past it finds the moves recorded in the latest manifest's reuse index.
+        //
+        // This is a real, NGram-specific rebase difference, not an artifact of
+        // swapping out Bitmap: `check_create_index_txn`'s deferred-remap branch
+        // in conflict_resolver.rs carries an extra check solely for a new
+        // NGram index (`ngram_coverage`, mirroring `ngram_requires_rebuild` in
+        // append.rs) -- unlike every other index type, it cannot simply keep
+        // covering a fragment a concurrent deferred-remap rewrite just
+        // consumed, so overlapping coverage (`is_disjoint = false`) always
+        // retries there, regardless of commit order. That is exactly the raw
+        // retryable conflict the `index_commits_first = true` order already
+        // handles below; `false` with overlapping coverage now needs the same
+        // one extra manual retry to reach the domain rejection.
+        let ngram_overlap_retries = index_type == IndexType::NGram && !is_disjoint;
         let expected = match (index_type, index_commits_first) {
-            (IndexType::Bitmap, true) => RaceOutcome::ConflictThenRejected,
-            (IndexType::Bitmap, false) => RaceOutcome::Rejected,
+            (IndexType::NGram, true) => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) if ngram_overlap_retries => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) => RaceOutcome::Rejected,
             _ => RaceOutcome::Committed,
         };
         let dir = TempStrDir::default();
@@ -10581,14 +10623,22 @@ mod tests {
             excluded_fragment_ids: if is_disjoint { vec![2] } else { vec![] },
             ..Default::default()
         };
-        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::Bitmap {
-            BuiltinIndexType::Bitmap
+        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::NGram {
+            BuiltinIndexType::NGram
         } else {
             BuiltinIndexType::ZoneMap
         });
+        // NGram only applies to the text `cat` column; ZoneMap stays on the
+        // numeric `i` column the filters below query.
+        let index_column = if index_type == IndexType::NGram {
+            "cat"
+        } else {
+            "i"
+        };
         let create_index = async |dataset: &mut Dataset| {
+            let columns = [index_column];
             let builder = dataset
-                .create_index_builder(&["i"], index_type, &params)
+                .create_index_builder(&columns, index_type, &params)
                 .name("i_idx".into());
             if is_disjoint {
                 builder.fragments(vec![2]).await.map(|_| ())
@@ -10715,7 +10765,16 @@ mod tests {
                 ),
                 is_in_memory
             );
-            result
+            if matches!(expected, RaceOutcome::ConflictThenRejected) {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "{result:?}"
+                );
+                other.checkout_latest().await.unwrap();
+                create_index(&mut other).await
+            } else {
+                result
+            }
         };
 
         let latest = Dataset::open(dir.as_str()).await.unwrap();

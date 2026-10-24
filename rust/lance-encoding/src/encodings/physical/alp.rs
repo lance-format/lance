@@ -182,12 +182,25 @@ fn candidate_params(max_exp: u8) -> impl Iterator<Item = AlpParams> {
     multiply.chain(divide)
 }
 
-fn sample_positions(num_values: usize, sample_size: usize) -> Vec<usize> {
-    if num_values <= sample_size {
-        return (0..num_values).collect();
+const SAMPLE_SIZE: usize = 32;
+
+/// Copy a strided sample of `words` into `out`, returning the sample length.
+///
+/// Pages smaller than the sample size are copied in full so the estimator
+/// sees every value; larger pages are sampled at a fixed stride.
+#[inline]
+fn fill_sample<T: Copy>(words: &[T], out: &mut [T; SAMPLE_SIZE]) -> usize {
+    let n = words.len();
+    if n <= SAMPLE_SIZE {
+        out[..n].copy_from_slice(words);
+        n
+    } else {
+        let step = n / SAMPLE_SIZE;
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = words[i * step];
+        }
+        SAMPLE_SIZE
     }
-    let step = num_values / sample_size;
-    (0..sample_size).map(|i| i * step).collect()
 }
 
 #[inline]
@@ -251,14 +264,13 @@ fn try_encode_f64(v: f64, params: AlpParams) -> Option<i64> {
 /// exception cost alone reaches the current best: the full-page estimate is a
 /// superset of the partial one, so the pruned candidate cannot win.
 fn select_params_f32(words: &[u32]) -> Option<AlpParams> {
-    let sample: Vec<u32> = sample_positions(words.len(), 32)
-        .into_iter()
-        .map(|i| words[i])
-        .collect();
+    let mut sample_buf = [0u32; SAMPLE_SIZE];
+    let sample_len = fill_sample(words, &mut sample_buf);
+    let sample = &sample_buf[..sample_len];
     let mut best = None;
     let mut best_cost = usize::MAX;
     for params in candidate_params(MAX_EXP_F32) {
-        let Some(cost) = sample_cost_f32(&sample, params, best_cost) else {
+        let Some(cost) = sample_cost_f32(sample, params, best_cost) else {
             continue;
         };
         if cost < best_cost {
@@ -270,14 +282,13 @@ fn select_params_f32(words: &[u32]) -> Option<AlpParams> {
 }
 
 fn select_params_f64(words: &[u64]) -> Option<AlpParams> {
-    let sample: Vec<u64> = sample_positions(words.len(), 32)
-        .into_iter()
-        .map(|i| words[i])
-        .collect();
+    let mut sample_buf = [0u64; SAMPLE_SIZE];
+    let sample_len = fill_sample(words, &mut sample_buf);
+    let sample = &sample_buf[..sample_len];
     let mut best = None;
     let mut best_cost = usize::MAX;
     for params in candidate_params(MAX_EXP_F64) {
-        let Some(cost) = sample_cost_f64(&sample, params, best_cost) else {
+        let Some(cost) = sample_cost_f64(sample, params, best_cost) else {
             continue;
         };
         if cost < best_cost {
@@ -302,6 +313,16 @@ fn sample_cost_f32(words: &[u32], params: AlpParams, cutoff: usize) -> Option<us
                 any = true;
                 min = min.min(enc);
                 max = max.max(enc);
+                // min/max only grow, so the byte estimate is a lower bound on
+                // the final cost: a candidate that already cannot beat the
+                // current best is pruned exactly as if it finished scanning.
+                let data_bytes = (bits_required_u128((max as i128 - min as i128) as u128).max(1)
+                    as usize
+                    * words.len())
+                .div_ceil(8);
+                if data_bytes + exceptions * EXCEPTION_COST >= cutoff {
+                    return None;
+                }
             }
             None => {
                 exceptions += 1;
@@ -334,6 +355,13 @@ fn sample_cost_f64(words: &[u64], params: AlpParams, cutoff: usize) -> Option<us
                 any = true;
                 min = min.min(enc);
                 max = max.max(enc);
+                let data_bytes = (bits_required_u128((max as i128 - min as i128) as u128).max(1)
+                    as usize
+                    * words.len())
+                .div_ceil(8);
+                if data_bytes + exceptions * EXCEPTION_COST >= cutoff {
+                    return None;
+                }
             }
             None => {
                 exceptions += 1;
@@ -667,7 +695,9 @@ fn encode_chunk_f32(words: &[u32], params: AlpParams) -> Result<Option<EncodedCh
     let Some(first) = state.first_encodable else {
         return Ok(None);
     };
-    backfill_exceptions(&mut state.encoded, &state.exception_positions);
+    if !state.exception_positions.is_empty() {
+        backfill_exceptions(&mut state.encoded, &state.exception_positions);
+    }
     if state.exception_positions.first() == Some(&0) {
         state.encoded[0] = first;
     }
@@ -762,7 +792,9 @@ fn encode_chunk_f64(words: &[u64], params: AlpParams) -> Result<Option<EncodedCh
     let Some(first) = state.first_encodable else {
         return Ok(None);
     };
-    backfill_exceptions(&mut state.encoded, &state.exception_positions);
+    if !state.exception_positions.is_empty() {
+        backfill_exceptions(&mut state.encoded, &state.exception_positions);
+    }
     if state.exception_positions.first() == Some(&0) {
         state.encoded[0] = first;
     }
@@ -803,9 +835,21 @@ fn pack_chunk_f32(
     let n = encoded.len();
     let mut min = i32::MAX;
     let mut max = i32::MIN;
-    for &v in &encoded {
+    let mut delta_min = 0i128;
+    let mut delta_bit_width = 0u8;
+    let mut delta_usable = false;
+    let mut lo = i64::MAX as i128;
+    let mut hi = i64::MIN as i128;
+    let mut prev = 0i32;
+    for (i, &v) in encoded.iter().enumerate() {
         min = min.min(v);
         max = max.max(v);
+        if i > 0 {
+            let delta = v as i128 - prev as i128;
+            lo = lo.min(delta);
+            hi = hi.max(delta);
+        }
+        prev = v;
     }
     let for_bit_width = bits_required_u128((max as i128 - min as i128) as u128);
     if for_bit_width >= 32 {
@@ -814,17 +858,7 @@ fn pack_chunk_f32(
     let for_width = for_bit_width.max(1);
 
     // Delta range is computed in i128 so extreme pairs cannot wrap.
-    let mut delta_min = 0i128;
-    let mut delta_bit_width = 0u8;
-    let mut delta_usable = false;
     if n > 1 {
-        let mut lo = i64::MAX as i128;
-        let mut hi = i64::MIN as i128;
-        for pair in encoded.windows(2) {
-            let delta = pair[1] as i128 - pair[0] as i128;
-            lo = lo.min(delta);
-            hi = hi.max(delta);
-        }
         let width = bits_required_u128((hi - lo) as u128);
         if width < 32 {
             delta_min = lo;
@@ -896,9 +930,21 @@ fn pack_chunk_f64(
     let n = encoded.len();
     let mut min = i64::MAX;
     let mut max = i64::MIN;
-    for &v in &encoded {
+    let mut delta_min = 0i128;
+    let mut delta_bit_width = 0u8;
+    let mut delta_usable = false;
+    let mut lo = i64::MAX as i128;
+    let mut hi = i64::MIN as i128;
+    let mut prev = 0i64;
+    for (i, &v) in encoded.iter().enumerate() {
         min = min.min(v);
         max = max.max(v);
+        if i > 0 {
+            let delta = v as i128 - prev as i128;
+            lo = lo.min(delta);
+            hi = hi.max(delta);
+        }
+        prev = v;
     }
     let for_bit_width = bits_required_u128((max as i128 - min as i128) as u128);
     if for_bit_width >= 63 {
@@ -906,17 +952,7 @@ fn pack_chunk_f64(
     }
     let for_width = for_bit_width.max(1);
 
-    let mut delta_min = 0i128;
-    let mut delta_bit_width = 0u8;
-    let mut delta_usable = false;
     if n > 1 {
-        let mut lo = i64::MAX as i128;
-        let mut hi = i64::MIN as i128;
-        for pair in encoded.windows(2) {
-            let delta = pair[1] as i128 - pair[0] as i128;
-            lo = lo.min(delta);
-            hi = hi.max(delta);
-        }
         let width = bits_required_u128((hi - lo) as u128);
         if width < 64 {
             delta_min = lo;
