@@ -34,7 +34,7 @@ async fn write_two_column_schema_evolution_dataset(uri: &str) -> Dataset {
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_merge_small_files(version).await;
+        Box::pin(do_test_binary_copy_merge_small_files(version)).await;
     }
 }
 
@@ -446,7 +446,7 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
 #[case(LanceFileVersion::V2_3)]
 #[tokio::test]
 async fn test_binary_copy_preserves_stable_row_ids(#[case] version: LanceFileVersion) {
-    do_binary_copy_preserves_stable_row_ids(version).await;
+    Box::pin(do_binary_copy_preserves_stable_row_ids(version)).await;
 }
 
 async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
