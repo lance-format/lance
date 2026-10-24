@@ -42,6 +42,15 @@ pub trait Index: Send + Sync + DeepSizeOf {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap>;
 }
 
+/// Manifest version reserved for vector indices that store a pre-transform.
+///
+/// The number is part of the format contract. This build does not advertise
+/// it as readable: a reader applies it only after the build and query path can
+/// project query vectors with the stored model. Readers older than this
+/// version must skip such indices. The stored model may change incompatibly,
+/// in which case the index must be rebuilt. The source data is not rewritten.
+pub const VECTOR_PRE_TRANSFORM_INDEX_VERSION: u32 = 3;
+
 /// Index Type
 ///
 /// Do not add further entries to this enum except as a last resort.  We are attempting

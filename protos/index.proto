@@ -230,6 +230,43 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+
+  /* EXPERIMENTAL: optional vector pre-transform. Present means vectors are
+   * transformed by the referenced trained model before indexing; absent means
+   * vectors are indexed in their original dimension. An index applies at most
+   * one. See PcaParameters. Datasets that do not set this field are unaffected.
+   */
+  oneof pre_transform {
+    PcaParameters pca = 10;
+  }
+}
+
+/*
+ * EXPERIMENTAL: PCA vector pre-transform is an experimental format feature.
+ * This message and the stored model may change incompatibly without a
+ * separate vote, in which case the index must be rebuilt (the data is never
+ * rewritten), and the feature is removed if its stabilization vote does not
+ * pass. Datasets that do not use the pre-transform are not affected either
+ * way.
+ */
+message PcaParameters {
+  /* Number of dimensions produced by PCA. A present PCA configuration must
+   * have a non-zero dimension.
+   */
+  uint32 dimension = 1;
+  // Target number of valid rows used for training.
+  uint32 sample_size = 2;
+  // Seed used by dataset-aware sampling.
+  uint64 sampling_seed = 3;
+  /* BLAKE3 fingerprint of the exact trained model applied by the index.
+   * This must contain exactly 32 raw bytes and is required whenever this
+   * message is present.
+   *
+   * This message does not store whitening, an epsilon, a random rotation, a
+   * rotation seed, or a training memory budget. A reader must not infer any of
+   * those from a missing field number.
+   */
+  bytes model_fingerprint = 4;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

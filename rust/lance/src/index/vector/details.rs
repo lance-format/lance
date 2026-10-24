@@ -14,10 +14,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use lance_file::reader::FileReaderOptions;
-use lance_index::pb::VectorIndexDetails;
-use lance_index::pb::VectorMetricType;
 use lance_index::pb::index::Implementation;
 use lance_index::pb::vector_index_details::{Compression, FlatCompression, rabit_quantization};
+use lance_index::pb::{VectorIndexDetails, VectorMetricType};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -82,8 +81,7 @@ enum CompressionDetailsJson {
     },
 }
 
-/// Build a `VectorIndexDetails` proto from build params at index creation time.
-pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
+fn vector_index_details_proto(params: &VectorIndexParams) -> VectorIndexDetails {
     let metric_type = match params.metric_type {
         lance_linalg::distance::DistanceType::L2 => VectorMetricType::L2,
         lance_linalg::distance::DistanceType::Cosine => VectorMetricType::Cosine,
@@ -156,14 +154,19 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
 
     let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
 
-    let details = VectorIndexDetails {
+    VectorIndexDetails {
         metric_type: metric_type.into(),
         target_partition_size,
         hnsw_index_config,
         compression,
         runtime_hints,
-    };
-    prost_types::Any::from_msg(&details).unwrap()
+        pre_transform: None,
+    }
+}
+
+/// Build a `VectorIndexDetails` proto from build params at index creation time.
+pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
+    prost_types::Any::from_msg(&vector_index_details_proto(params)).unwrap()
 }
 
 pub fn vector_index_details_default() -> prost_types::Any {
@@ -564,6 +567,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
+        pre_transform: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -703,6 +707,7 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
+        pre_transform: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -752,6 +757,7 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
+            pre_transform: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -901,6 +907,7 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
+                pre_transform: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
