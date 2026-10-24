@@ -83,6 +83,10 @@ name = "buffer"
 harness = false
 
 [[bench]]
+name = "compression_levels"
+harness = false
+
+[[bench]]
 name = "synthetic_distributions"
 harness = false
 
