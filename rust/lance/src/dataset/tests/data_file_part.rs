@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, fs, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    ops::Range,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use arrow::array::AsArray;
 use arrow_array::{
@@ -15,13 +24,18 @@ use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
 use lance_core::{
     Error,
     datatypes::{BLOB_V2_LOGICAL_FIELDS, BlobHandling},
-    utils::{blob::blob_path, tempfile::TempDir},
+    utils::{
+        blob::blob_path,
+        tempfile::TempDir,
+        testing::{ProxyObjectStore, ProxyObjectStorePolicy},
+    },
 };
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
@@ -153,6 +167,94 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
 }
 
 #[tokio::test]
+async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order() {
+    let batch = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+    let mut dataset = dataset_of(batch, LanceFileVersion::V2_2).await;
+    let target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        ConcreteFileVersion::V2_2,
+    )
+    .unwrap();
+    let mut parts = Vec::new();
+    for row_count in (1..=24).rev() {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::from(dataset.schema())),
+            vec![Arc::new(arrow_array::Int32Array::from(vec![0; row_count]))],
+        )
+        .unwrap();
+        parts.push(write_part(&dataset, &target, None, batch).await);
+    }
+
+    let active_heads = Arc::new(AtomicUsize::new(0));
+    let peak_heads = Arc::new(AtomicUsize::new(0));
+    let delayed = Arc::new(ThrottledStore::new(
+        dataset.object_store.inner.clone(),
+        ThrottleConfig::default(),
+    ));
+    let first_part = parts[0].file_name.clone();
+    let started = Mutex::new(HashSet::new());
+    let mut policy = ProxyObjectStorePolicy::new();
+    let active = active_heads.clone();
+    let peak = peak_heads.clone();
+    let throttle = delayed.clone();
+    policy.set_before_policy(
+        "observe_part_heads",
+        Arc::new(move |method, path| {
+            if method == "get_opts" {
+                // Force later parts to finish opening before the first input.
+                throttle.config_mut(|config| {
+                    config.wait_get_per_call = if path.as_ref().ends_with(&first_part) {
+                        Duration::from_millis(15)
+                    } else {
+                        Duration::from_millis(1)
+                    };
+                });
+                // The first request for each part is its size-validation HEAD.
+                if started.lock().unwrap().insert(path.clone()) {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                }
+            }
+            Ok(())
+        }),
+    );
+    let active = active_heads.clone();
+    policy.set_obj_meta_policy(
+        "complete_part_head",
+        Arc::new(move |method, metadata| {
+            if method == "head" {
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(metadata)
+        }),
+    );
+    Arc::make_mut(&mut dataset.object_store).inner =
+        Arc::new(ProxyObjectStore::new(delayed, Arc::new(Mutex::new(policy))));
+
+    let opened = DataFilePart::open_all(&dataset, &target, &parts)
+        .await
+        .unwrap();
+    assert_eq!(
+        opened
+            .iter()
+            .map(|part| part.num_rows())
+            .collect::<Vec<_>>(),
+        (1..=24).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(active_heads.load(Ordering::SeqCst), 0);
+    let peak = peak_heads.load(Ordering::SeqCst);
+    assert!(
+        peak > 1 || dataset.object_store.io_parallelism() == 1,
+        "independent part HEAD requests stayed serial"
+    );
+    assert!(
+        peak <= 8,
+        "part HEAD fanout exceeded its memory bound: {peak}"
+    );
+}
+
+#[tokio::test]
 async fn target_uses_an_ordinary_generated_data_file_name() {
     let original = arrow_array::record_batch!(("id", Int32, [0, 1])).unwrap();
     let dataset = dataset_of(original, LanceFileVersion::V2_1).await;
@@ -262,12 +364,13 @@ async fn managed_part_checks_real_file_before_creating_output(
         ConcreteFileVersion::V2_2,
     )
     .unwrap();
-    let part = write_part(&dataset, &target, None, batch).await;
+    let part = write_part(&dataset, &target, None, batch.clone()).await;
     let mut description = serde_json::to_value(&part).unwrap();
     description[field] = value;
     let invalid = serde_json::from_value::<DataFilePart>(description).unwrap();
+    let valid = write_part(&dataset, &target, None, batch).await;
     let error = dataset
-        .concat_data_file_parts(&target, &[invalid])
+        .concat_data_file_parts(&target, &[valid, invalid])
         .await
         .unwrap_err();
     if field == "file_name" {
