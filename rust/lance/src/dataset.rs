@@ -140,7 +140,7 @@ use crate::io::commit::{
     default_commit_retry_timeout, detect_overlapping_fragments, fix_schema,
 };
 use crate::session::Session;
-use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
+use crate::utils::temporal::{SystemTime, monotonic_timestamp_nanos, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
     BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
@@ -4427,6 +4427,7 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
     may_change_schema: bool,
+    prev_timestamp_nanos: Option<u128>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     manifest.update_max_field_id();
     validate_paired_feature_flags(manifest)?;
@@ -4488,7 +4489,10 @@ pub(crate) async fn write_manifest_file(
     validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     versions::finalize_manifest_storage_version(manifest)?;
 
-    manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+    manifest.set_timestamp(monotonic_timestamp_nanos(
+        config.timestamp,
+        prev_timestamp_nanos,
+    )?);
 
     manifest.update_max_fragment_id();
 

@@ -653,6 +653,7 @@ async fn test_inline_transaction() {
         None,
         // Previously classified from a None inline copy, which validated.
         true,
+        None,
     )
     .await
     .unwrap();

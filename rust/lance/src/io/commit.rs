@@ -656,6 +656,7 @@ async fn do_commit_new_dataset(
         manifest_naming_scheme,
         inline_transaction.then(|| pb_transaction.into()),
         may_change_schema,
+        None,
     )
     .await;
 
@@ -1439,6 +1440,7 @@ pub(crate) async fn do_commit_detached_transaction(
             ManifestNamingScheme::V2,
             inline_tx.take(),
             may_change_schema,
+            Some(dataset.manifest.timestamp_nanos),
         )
         .await;
 
@@ -1958,6 +1960,7 @@ pub(crate) async fn commit_transaction(
             manifest_naming_scheme,
             inline_transaction.then(|| pb_transaction.into()),
             may_change_schema,
+            Some(dataset.manifest.timestamp_nanos),
         )
         .await;
 
@@ -2139,6 +2142,7 @@ mod tests {
     };
     use lance_table::transaction::resolve_arrow_field_ids;
     use lance_testing::datagen::generate_random_array;
+    use mock_instant::thread_local::MockClock;
 
     use super::*;
 
@@ -2369,6 +2373,70 @@ mod tests {
         Arc::new(InjectForeignCommitHandler {
             foreign: Mutex::new(Some((manifest, transaction))),
         })
+    }
+
+    #[tokio::test]
+    async fn retry_uses_the_concurrent_manifest_timestamp() {
+        MockClock::set_system_time(Duration::from_secs(100));
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let mut foreign_manifest = dataset.manifest.as_ref().clone();
+        foreign_manifest.timestamp_nanos = Duration::from_secs(200).as_nanos();
+        let foreign_timestamp = foreign_manifest.timestamp_nanos;
+        let foreign_transaction = Transaction::new(
+            dataset.version().version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        );
+        let handler = inject_foreign_commit_handler(foreign_manifest, &foreign_transaction);
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        );
+        MockClock::set_system_time(Duration::from_secs(90));
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(handler)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, 3);
+        assert!(
+            committed.manifest.timestamp_nanos
+                >= foreign_timestamp + Duration::from_millis(1).as_nanos()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::same_clock(100)]
+    #[case::clock_regresses(90)]
+    #[case::clock_advances(200)]
+    #[tokio::test]
+    async fn append_and_restore_have_monotonic_timestamps(#[case] now_seconds: u64) {
+        MockClock::set_system_time(Duration::from_secs(100));
+        let reader = || {
+            gen_batch()
+                .col("i", array::step::<Int32Type>())
+                .into_reader_rows(RowCount::from(1), BatchCount::from(1))
+        };
+        let mut dataset = Dataset::write(reader(), "memory://", None).await.unwrap();
+        let first_timestamp = dataset.manifest.timestamp_nanos;
+        assert_eq!(first_timestamp, Duration::from_secs(100).as_nanos());
+
+        MockClock::set_system_time(Duration::from_secs(now_seconds));
+        dataset.append(reader(), None).await.unwrap();
+        let second_timestamp = dataset.manifest.timestamp_nanos;
+        assert!(second_timestamp >= first_timestamp + Duration::from_millis(1).as_nanos());
+
+        let mut restored = dataset.checkout_version(1).await.unwrap();
+        restored.restore().await.unwrap();
+        assert_eq!(restored.version().version, 3);
+        assert!(
+            restored.manifest.timestamp_nanos
+                >= second_timestamp + Duration::from_millis(1).as_nanos()
+        );
     }
 
     #[tokio::test]

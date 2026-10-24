@@ -1765,6 +1765,7 @@ async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
         dataset.manifest_location.naming_scheme,
         None,
         false,
+        None,
     )
     .await
     .unwrap();
