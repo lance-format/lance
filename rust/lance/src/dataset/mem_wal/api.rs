@@ -15,7 +15,7 @@
 //! A writer that is already open keeps the set it opened with until something
 //! calls [`DatasetMemWalExt::refresh_mem_wal_index_configs`].
 //!
-//! A rename reaches every MemTable, sealed generation and replayed entry: each
+//! A rename reaches every MemTable, flushed generation and replayed entry: each
 //! is read by field id.
 //!
 //! # Upgrading
@@ -36,15 +36,15 @@
 //! generations with no value for it.
 //!
 //! A generation frozen before an index joined the maintained set is flushed
-//! without a vector or full-text index for it, and search over both is
-//! index-only, so its rows answer neither until compaction folds them into the
-//! base table.
+//! without a vector or full-text index for it. Vector search scans such a
+//! generation flat; full-text search over it is index-only, so its rows do not
+//! answer one until compaction folds them into the base table.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
@@ -63,12 +63,13 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use super::index::{
     MemIndexRegistry, MemIndexSpec, ResolveContext, unsupported_index_type, validate_index_specs,
 };
+use super::scanner::exec::validate_pk_types;
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
 use super::schema_with_tombstone;
 use super::util::derived_store_params;
 use super::write::ShardWriter;
-use super::{SealFence, ShardWriterConfig};
+use super::{FreezeFence, ShardWriterConfig};
 
 /// Spec id of the sole sharding spec installed by [`InitializeMemWalBuilder`].
 const SHARDING_SPEC_ID: u32 = 1;
@@ -282,6 +283,15 @@ impl<'a> InitializeMemWalBuilder<'a> {
         let (sharding_specs, num_shards) = resolve_sharding(dataset, sharding)?;
 
         dataset.schema().verify_primary_key()?;
+        // The primary key is immutable, and every LSM read and flush hashes it,
+        // so an unhashable key would accept writes that then cannot be read.
+        let pk_columns: Vec<String> = dataset
+            .schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        validate_pk_types(&ArrowSchema::from(dataset.schema()), &pk_columns)?;
 
         let indices = dataset.load_indices().await?;
         if indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
@@ -643,7 +653,7 @@ pub trait DatasetMemWalExt {
     ) -> Result<ShardWriter>;
 
     /// Re-resolve the maintained set from this dataset and install it on
-    /// `writer`, sealing so the next MemTable carries it.
+    /// `writer`, freezing so the next MemTable carries it.
     ///
     /// This is how a change reaches a writer that is already open: a replaced
     /// `maintained_indexes`, or, for a table that maintains all of them, an
@@ -655,7 +665,7 @@ pub trait DatasetMemWalExt {
     async fn refresh_mem_wal_index_configs(
         &self,
         writer: &ShardWriter,
-    ) -> Result<Option<SealFence>>;
+    ) -> Result<Option<FreezeFence>>;
 }
 
 /// Prewarm every index of `dataset` into its session caches. A no-op when the
@@ -835,7 +845,7 @@ impl DatasetMemWalExt for Dataset {
     async fn refresh_mem_wal_index_configs(
         &self,
         writer: &ShardWriter,
-    ) -> Result<Option<SealFence>> {
+    ) -> Result<Option<FreezeFence>> {
         let details = require_mem_wal_details(self).await?;
         let index_specs = maintained_index_specs(self, &details, writer.config()).await?;
         writer.replace_index_configs(index_specs).await
@@ -868,7 +878,7 @@ impl ShardWriter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<SealFence>> {
+    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<FreezeFence>> {
         let details = require_mem_wal_details(dataset).await?;
         let index_specs = maintained_index_specs(dataset, &details, self.config()).await?;
         self.evolve_schema(
@@ -1575,6 +1585,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_initialize_mem_wal_rejects_unhashable_primary_key() {
+        // A Float64 key can be installed through field metadata, but LSM
+        // reads cannot hash it; initialization must refuse it up front.
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Float64,
+            false,
+        )]));
+        let reader = RecordBatchIterator::new(Vec::new(), schema);
+        let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .update_field_metadata()
+            .update(
+                "id",
+                [(
+                    lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+                    "1",
+                )],
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        let error = dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .expect_err("a Float64 primary key cannot be hashed");
+        assert!(
+            error.to_string().contains("unsupported type Float64"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            dataset.mem_wal_index_details().await.unwrap().is_none(),
+            "a rejected MemWAL must not be committed"
+        );
+    }
+
     /// "Maintain everything" is an intent, not a list: an index built after the
     /// spec is maintained without anyone updating it, and a dropped one falls
     /// out. The set is resolved from the table each time it is asked for.
@@ -1980,7 +2034,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "a second pass over an unchanged table seals nothing"
+            "a second pass over an unchanged table freezes nothing"
         );
         writer.close().await.unwrap();
     }
@@ -1989,7 +2043,7 @@ mod tests {
     /// from is the same maintained index, so the writer keeps its memtable;
     /// one rebuilt with another distance type is not.
     #[tokio::test]
-    async fn refresh_seals_only_when_a_maintained_index_changes_its_settings() {
+    async fn refresh_freezes_only_when_a_maintained_index_changes_its_settings() {
         use crate::dataset::optimize::remapping::remap_column_index;
         use crate::dataset::optimize::{CompactionOptions, compact_files};
         use crate::index::vector::VectorIndexParams;

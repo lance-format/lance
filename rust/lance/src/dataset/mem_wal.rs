@@ -328,7 +328,7 @@ pub use sharding::{
     evaluate_sharding_spec_with_source_columns,
 };
 pub use wal::{BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer};
-pub use write::SealFence;
+pub use write::FreezeFence;
 pub use write::ShardWriter;
 pub use write::ShardWriterConfig;
 pub use write::WriteResult;
@@ -364,7 +364,7 @@ mod tests {
             stamped("id", DataType::Int64, 0),
             stamped(TOMBSTONE, DataType::Boolean, 1),
         ]);
-        // The table gave id 1 to a column added after that generation sealed.
+        // The table gave id 1 to a column added after that generation froze.
         let target = Arc::new(ArrowSchema::new(vec![
             stamped("id", DataType::Int64, 0),
             stamped("extra", DataType::Int64, 1),
@@ -384,7 +384,7 @@ mod tests {
         let out = &out[0];
         assert!(
             out.column_by_name("extra").expect("extra").is_null(0),
-            "the added column has no value in a generation sealed before it"
+            "the added column has no value in a generation frozen before it"
         );
         let tombstone = out
             .column_by_name(TOMBSTONE)

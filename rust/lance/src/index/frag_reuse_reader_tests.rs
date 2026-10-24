@@ -3867,6 +3867,94 @@ async fn optimize_is_a_no_op_under_an_unsupported_history() {
             .collect();
         assert_eq!(after, before, "no segment written");
     }
+    // A distributed driver gets nothing to run either.
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert!(plan.tasks.is_empty() && plan.merges.is_empty(), "{plan:?}");
+}
+
+// After a tagged rewrite every segment's stored bitmap names only retired
+// fragments, yet the tagged reader derives live coverage for it: a retrain
+// with nothing unindexed still rebuilds the index, as it did before
+// optimize ran as a plan.
+#[tokio::test]
+async fn retrain_rebuilds_a_tagged_index_with_nothing_unindexed() {
+    use arrow_array::types::Float32Type;
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let mut ivf = lance_index::vector::ivf::IvfBuildParams::new(1);
+    ivf.target_partition_size = Some(1);
+    let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+        lance_linalg::distance::DistanceType::L2,
+        ivf,
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+
+    let vector_segments = |indices: &[IndexMetadata]| {
+        indices
+            .iter()
+            .filter(|index| index.name == "vector_idx")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let before = vector_segments(&crate::index::load_all_indices(&dataset).await.unwrap());
+    assert!(
+        dataset
+            .unindexed_fragments("vector_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(before.iter().all(|segment| {
+        segment
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .is_some_and(|bitmap| bitmap.is_empty())
+    }));
+
+    dataset
+        .optimize_indices(&OptimizeOptions::retrain())
+        .await
+        .unwrap();
+    let after = vector_segments(&crate::index::load_all_indices(&dataset).await.unwrap());
+    assert!(
+        !after.is_empty()
+            && after
+                .iter()
+                .all(|segment| before.iter().all(|old| old.uuid != segment.uuid)),
+        "retrain did not rebuild the index: {before:?} -> {after:?}"
+    );
 }
 
 // The segment state matrix at the open layer. On one tagged snapshot

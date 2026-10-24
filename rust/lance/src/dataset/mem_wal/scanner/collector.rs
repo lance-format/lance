@@ -33,7 +33,7 @@ impl InMemoryMemTableRef {
     /// Row-data bytes: the buffered batches.
     ///
     /// This is the **flush unit**, not the memtable's footprint — it drives the
-    /// `max_memtable_size` seal trigger, so it stays a function of the rows in
+    /// `max_memtable_size` freeze trigger, so it stays a function of the rows in
     /// it. Use [`Self::resident_bytes`] to budget memory.
     pub fn row_bytes(&self) -> usize {
         self.batch_store.row_bytes()
@@ -43,8 +43,9 @@ impl InMemoryMemTableRef {
     /// indexes plus the fixed PK bloom filter.
     ///
     /// Usually the term that explains an indexed table's footprint — an HNSW
-    /// index pre-allocates its whole graph on the first insert — so it can dwarf
-    /// row bytes while [`Self::row_bytes`] reads near zero.
+    /// index allocates a fixed part sized by `max_memtable_rows` on the first
+    /// insert — so it can dwarf row bytes while [`Self::row_bytes`] reads near
+    /// zero.
     pub fn index_bytes(&self) -> usize {
         self.index_store.resident_bytes()
             + crate::dataset::mem_wal::memtable::pk_bloom_filter_bytes()
@@ -91,7 +92,7 @@ pub struct InMemoryMemTables {
 /// When the base table is omitted (see [`Self::without_base_table`]), `collect`
 /// returns only SSTable and active-memtable sources. This is used
 /// by callers that own the base read path elsewhere and only need the WAL's
-/// fresh tier (active memtable ∪ L0 SSTables).
+/// fresh tier (active memtable ∪ SSTables).
 pub struct LsmDataSourceCollector {
     /// Base Lance table (None when scanning only the fresh tier).
     base_table: Option<Arc<Dataset>>,
@@ -241,7 +242,7 @@ impl LsmDataSourceCollector {
     /// scan sources, in **ascending generation order**. The planner relies
     /// on this: it reverses sources to generation-DESC so the newest row
     /// wins the dedup tiebreaker (see `LsmScanPlanner::plan_scan`). Active
-    /// is the newest generation; frozen are older sealed ones — so without
+    /// is the newest generation; the frozen ones are older — so without
     /// this sort a stale frozen row could outrank a re-write in the active
     /// memtable for the same pk.
     fn in_memory_sources(shard_id: Uuid, mems: &InMemoryMemTables) -> Vec<LsmDataSource> {

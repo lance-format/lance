@@ -123,17 +123,19 @@ impl Dataset {
     /// `_blobs/<uuid>.blob` objects in that base. Otherwise payloads use sidecars
     /// addressed relative to the final data file. Every
     /// non-empty logical Inline value is spilled so final concatenation never
-    /// copies Blob payload bytes. Parts still require disjoint `blob_ids`
-    /// reservations; Managed descriptors encode base IDs rather than these IDs.
+    /// copies Blob payload bytes. Managed parts accept `blob_ids=None`; only
+    /// file-relative sidecars require disjoint reservations. Supplied ranges
+    /// are ignored for Managed parts.
     /// Every use of `target` must refer to the same dataset and resolved base;
     /// associating a target with that storage context is the caller's
     /// responsibility.
     /// Persist the target before writing. A failed write may leave files; after
     /// stopping all users of the target, [`DataFileTarget::cleanup`] removes
     /// staging files and file-relative sidecars without a completed part description.
-    /// Retries must use fresh, disjoint Blob ID ranges, including ranges from
-    /// failed writes. Independent Managed objects follow ordinary dataset GC
-    /// rules, which must be coordinated with uncommitted writes and checkpoints.
+    /// File-relative retries must use fresh, disjoint Blob ID ranges, including
+    /// ranges from failed writes. Independent Managed objects follow ordinary
+    /// dataset GC rules, which must be coordinated with uncommitted writes
+    /// and checkpoints.
     ///
     /// # Example
     ///
@@ -163,18 +165,19 @@ impl Dataset {
     ) -> Result<DataFilePart> {
         self.validate_data_file_target(target)?;
         validate_blob_v2_write_schema(target.schema.as_ref())?;
-        let part_blob_ids = blob_ids.clone();
+        let managed = managed_blobs_enabled(target.schema.as_ref())?;
+        let part_blob_ids = if managed { None } else { blob_ids.clone() };
         let has_blob = target
             .schema
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
-        if has_blob && blob_ids.is_none() {
+        if has_blob && !managed && blob_ids.is_none() {
             return Err(Error::invalid_input(
                 "write_data_file_part requires a non-empty Blob ID range for a schema containing Blob v2 fields",
             ));
         }
 
-        let mut preprocessor = if let Some(blob_ids) = blob_ids {
+        let mut preprocessor = if has_blob || blob_ids.is_some() {
             let data_dir = self.data_file_dir_for_base(target.base_id)?;
             let object_store = self.object_store(target.base_id).await?;
             let external_base_resolver = blob_v2_external_base_resolver(
@@ -196,14 +199,12 @@ impl Dataset {
                     self.store_params().cloned().unwrap_or_default(),
                     None,
                 )?
-                .with_part_blob_ids(blob_ids)?,
+                .with_part_blob_ids(if managed { None } else { blob_ids })?,
             )
         } else {
             None
         };
-        if managed_blobs_enabled(target.schema.as_ref())?
-            && let Some(writer) = preprocessor.take()
-        {
+        if managed && let Some(writer) = preprocessor.take() {
             let root = self.blob_base_path(target.base_id)?;
             preprocessor = Some(writer.with_managed_base(target.base_id, root));
         }

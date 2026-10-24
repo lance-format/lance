@@ -5,7 +5,7 @@
 //!
 //! Measures lookup latency against three tiers of the LSM tree:
 //!   - Base table (on-disk, compacted data)
-//!   - SSTables (on-disk L0)
+//!   - SSTables (on-disk, uncompacted)
 //!   - Active MemTable (in-memory write buffer)
 //!
 //! Two phases, selected with `--phase`:

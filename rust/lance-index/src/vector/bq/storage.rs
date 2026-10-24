@@ -68,6 +68,9 @@ use crate::vector::storage::{
     DistCalculator, DistanceCalculatorOptions, QueryResidual, RabitRawQueryContext, VectorStore,
 };
 
+mod scan;
+pub use scan::{ExRows, SignStage, StagePruneCounts, SurvivorRow, select_full_survivors};
+
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
 /// Legacy ex-code column: sequential LSB-first bit stream per row. Read-only;
@@ -138,17 +141,73 @@ fn emit_rabit_prune_stats(message: &str) {
 }
 
 /// Per-scan tallies of the raw-query lower-bound gating, reported through
-/// `record_rabit_prune_stats`.
-#[derive(Default)]
-struct RabitPruneCounters {
-    candidates: usize,
-    pruned_upper_bound: usize,
-    pruned_heap: usize,
-    exact: usize,
-    exact_rejected: usize,
+/// `record_rabit_prune_stats`. Every candidate row lands in exactly one of
+/// `pruned_upper_bound`, `pruned_heap` or `exact`; `exact_rejected` counts
+/// the exactly scored rows that fell outside the query's distance range.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RabitPruneCounters {
+    pub candidates: usize,
+    pub pruned_upper_bound: usize,
+    pub pruned_heap: usize,
+    pub exact: usize,
+    pub exact_rejected: usize,
+}
+
+/// Cumulative raw-query prune counters since process start. They advance only
+/// while `LANCE_RQ_PRUNE_STATS` is enabled (reported by `enabled`), so callers
+/// compare two snapshots instead of reading absolute values.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RabitPruneStatsSnapshot {
+    pub enabled: bool,
+    /// Gated partition scans that reported counters.
+    pub calls: u64,
+    pub candidates: u64,
+    pub pruned_upper_bound: u64,
+    pub pruned_heap: u64,
+    pub exact: u64,
+    pub exact_rejected: u64,
+    /// Partition scans that could not gate on the lower bound (Fast mode,
+    /// residual estimator, or no error factors) and scored every row.
+    pub bypass_calls: u64,
+}
+
+/// Read the process-wide prune counters without resetting them.
+pub fn rabit_prune_stats_snapshot() -> RabitPruneStatsSnapshot {
+    let mut snapshot = RabitPruneStatsSnapshot {
+        enabled: rabit_prune_stats_enabled(),
+        ..Default::default()
+    };
+    if let Some(stats) = RABIT_PRUNE_STATS.get() {
+        snapshot.calls = stats.calls.load(Ordering::Relaxed);
+        snapshot.candidates = stats.candidates.load(Ordering::Relaxed);
+        snapshot.pruned_upper_bound = stats.pruned_upper_bound.load(Ordering::Relaxed);
+        snapshot.pruned_heap = stats.pruned_heap.load(Ordering::Relaxed);
+        snapshot.exact = stats.exact.load(Ordering::Relaxed);
+        snapshot.exact_rejected = stats.exact_rejected.load(Ordering::Relaxed);
+    }
+    if let Some(stats) = RABIT_PRUNE_BYPASS_STATS.get() {
+        snapshot.bypass_calls = stats.calls.load(Ordering::Relaxed);
+    }
+    snapshot
+}
+
+// Tests compare per-partition counters of two scan paths without enabling the
+// process-wide, env-gated statistics that concurrent tests would share.
+#[cfg(test)]
+thread_local! {
+    static CAPTURED_PRUNE_COUNTERS: std::cell::RefCell<Vec<RabitPruneCounters>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the per-scan counters reported on this thread, in report order.
+#[cfg(test)]
+pub(crate) fn take_captured_prune_counters() -> Vec<RabitPruneCounters> {
+    CAPTURED_PRUNE_COUNTERS.with(|captured| std::mem::take(&mut *captured.borrow_mut()))
 }
 
 fn record_rabit_prune_stats(counters: &RabitPruneCounters) {
+    #[cfg(test)]
+    CAPTURED_PRUNE_COUNTERS.with(|captured| captured.borrow_mut().push(*counters));
     if !rabit_prune_stats_enabled() {
         return;
     }
@@ -1290,7 +1349,7 @@ impl<'a> RabitDistCalculator<'a> {
     }
 
     #[inline]
-    fn raw_query_lower_bound(&self, id: usize, binary_ip: f32) -> Option<f32> {
+    pub(crate) fn raw_query_lower_bound(&self, id: usize, binary_ip: f32) -> Option<f32> {
         let error_factors = self.error_factors?;
         Some(self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error)
     }
@@ -1409,8 +1468,11 @@ impl<'a> RabitDistCalculator<'a> {
                 *max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-            res.pop();
-            res.push(OrderedNode::new(row_id, dist));
+            {
+                let mut top = res.peek_mut().unwrap();
+                top.id = row_id;
+                top.dist = dist;
+            }
             *max_dist = res.peek().map(|node| node.dist);
         }
     }
@@ -2071,8 +2133,11 @@ fn accumulate_distances_into_heap(
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-            res.pop();
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            {
+                let mut top = res.peek_mut().unwrap();
+                top.id = row_id(id as u32);
+                top.dist = dist;
+            }
             max_dist = res.peek().map(|node| node.dist);
         }
     }
@@ -2107,8 +2172,11 @@ fn accumulate_filtered_distances_into_heap(
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-            res.pop();
-            res.push(OrderedNode::new(row_id, dist));
+            {
+                let mut top = res.peek_mut().unwrap();
+                top.id = row_id;
+                top.dist = dist;
+            }
             max_dist = res.peek().map(|node| node.dist);
         }
     }
@@ -2475,6 +2543,14 @@ fn build_frag_reuse_mapping(
 #[async_trait]
 impl QuantizerStorage for RabitQuantizationStorage {
     type Metadata = RabitQuantizationMetadata;
+
+    fn try_from_sign_plane_for_full(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+    ) -> Result<Self> {
+        Self::try_from_sign_plane_for_full(batch, metadata, distance_type)
+    }
 
     fn try_from_batch(
         batch: RecordBatch,
