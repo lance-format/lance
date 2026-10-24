@@ -872,7 +872,8 @@ fn fts_from_metadata_accepts_v3_with_256_block_size() {
     assert_eq!(config.params.posting_block_size(), 256);
 }
 
-/// HNSW reports its graph's fixed part before the first insert allocates it.
+/// HNSW reports what its first insert allocates before that insert, and no
+/// more: its graph's node slots grow with the rows, not the row cap.
 #[test]
 fn test_resident_bytes_charges_hnsw_before_first_insert() {
     let max_rows = 100_000;
@@ -897,10 +898,14 @@ fn test_resident_bytes_charges_hnsw_before_first_insert() {
         1_000,
     )
     .unwrap();
+    let reserved = with_hnsw.resident_bytes();
     assert!(
-        with_hnsw.resident_bytes() > max_rows * 64,
-        "HNSW must report its graph's fixed part, got {}",
-        with_hnsw.resident_bytes()
+        reserved > 0,
+        "HNSW must report what its first insert allocates"
+    );
+    assert!(
+        reserved < max_rows * 64,
+        "HNSW must not report node slots for the whole row cap, got {reserved}"
     );
 }
 

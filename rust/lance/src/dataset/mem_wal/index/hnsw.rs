@@ -162,8 +162,9 @@ impl HnswMemIndex {
     }
 
     /// Upper bound on heap bytes held. The first insert allocates the graph's
-    /// fixed part, sized by `capacity`, so that part is reported before the
-    /// insert too; each node's neighbor lists are charged as it is inserted.
+    /// first chunk of node slots, its visited pool and the vector store's
+    /// slabs, so those are reported before the insert too; further slots and
+    /// each node's neighbor lists are charged as rows reach them.
     pub(crate) fn resident_bytes(&self) -> usize {
         match self.state.get() {
             Some(s) => s.graph.resident_bytes() + s.storage.resident_bytes(),
@@ -903,12 +904,11 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids)), Arc::new(fsl)]).unwrap()
     }
 
-    /// The graph's fixed part is sized from `capacity` and committed by the
-    /// first row, so it is charged before that row arrives. Neighbor lists are
-    /// allocated per inserted node, so a slot never filled costs only its share
-    /// of the fixed part, and the charge grows with the rows.
+    /// The first row commits the graph's first chunk of node slots, so that is
+    /// charged before the row arrives. Further slots and the neighbor lists
+    /// are allocated as rows reach them, so the charge grows with the rows.
     #[test]
-    fn test_resident_bytes_charges_capacity_up_front_and_neighbors_per_row() {
+    fn test_resident_bytes_charges_the_first_insert_up_front_and_neighbors_per_row() {
         let dim = 8;
         let capacity = 4_000;
         let index = || {
@@ -932,7 +932,7 @@ mod tests {
         let half = filled(capacity / 2);
         let all_rows = filled(capacity);
 
-        // The fixed part is visible before the row that commits it, and close
+        // What the first row allocates is visible before that row, and close
         // enough to the real thing to admit against. The reservation walks the
         // level ladder in expectation where the graph samples it, so allow a
         // 25% band either way rather than demanding equality.
