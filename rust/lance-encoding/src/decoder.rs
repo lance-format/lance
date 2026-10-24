@@ -2003,6 +2003,22 @@ pub fn estimate_bytes_per_row(data_type: &DataType) -> f64 {
     }
 }
 
+fn has_variable_width(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_variable_width(field.data_type())),
+        DataType::FixedSizeList(field, _) => has_variable_width(field.data_type()),
+        DataType::Boolean | DataType::Null => false,
+        _ => data_type.byte_width_opt().is_none(),
+    }
+}
+
+// Bound speculative batches until actual sizes replace the schema's rough
+// estimate for strings and other variable-width values. Several batches may
+// be scheduled before the first decode completes.
+const INITIAL_BYTE_ESTIMATE_ROWS: u64 = 128;
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct StructuralBatchDecodeStream {
     context: DecoderContext,
@@ -2027,6 +2043,8 @@ pub struct StructuralBatchDecodeStream {
     /// Schema-based estimate of bytes per row, computed once at construction.
     /// Only meaningful when `batch_size_bytes` is `Some`.
     schema_bytes_per_row: f64,
+    /// Fixed-width schemas already have a usable initial size estimate.
+    has_variable_width: bool,
     /// Post-decode feedback: actual bytes-per-row measured from the most
     /// recently decoded batch.  Zero means no feedback yet (use schema estimate).
     bytes_per_row_feedback: Arc<AtomicU64>,
@@ -2055,6 +2073,8 @@ impl StructuralBatchDecodeStream {
         } else {
             0.0
         };
+        let has_variable_width =
+            batch_size_bytes.is_some() && has_variable_width(root_decoder.data_type());
         Self {
             context: DecoderContext::new(scheduled),
             root_decoder,
@@ -2067,6 +2087,7 @@ impl StructuralBatchDecodeStream {
             spawn_batch_decode_tasks,
             batch_size_bytes,
             schema_bytes_per_row,
+            has_variable_width,
             bytes_per_row_feedback: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -2119,6 +2140,11 @@ impl StructuralBatchDecodeStream {
                 self.schema_bytes_per_row
             };
             let rows = (batch_size_bytes as f64 / bpr) as u64;
+            let rows = if feedback == 0 && self.has_variable_width {
+                rows.min(INITIAL_BYTE_ESTIMATE_ROWS)
+            } else {
+                rows
+            };
             row_limit.min(rows.max(1))
         } else {
             row_limit
@@ -2174,6 +2200,7 @@ impl StructuralBatchDecodeStream {
             // Capture the per-stream policy once so every emitted batch task follows the
             // same throughput-vs-overhead choice made by the scheduler.
             let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
+            let has_variable_width = slf.has_variable_width;
             let task = async move {
                 let (batch, data_size) = if spawn_batch_decode_tasks {
                     tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
@@ -2181,6 +2208,18 @@ impl StructuralBatchDecodeStream {
                         .map_err(|err| Error::wrapped(err.into()))??
                 } else {
                     next_task.into_batch(emitted_batch_size_warning)?
+                };
+                // Dictionary blocks can expand when materialized as Arrow
+                // strings. Budget the buffers handed to the consumer instead
+                // of the smaller intermediate representation.
+                let data_size = if has_variable_width {
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| column.get_buffer_memory_size() as u64)
+                        .sum()
+                } else {
+                    data_size
                 };
                 let num_rows = batch.num_rows() as u64;
                 if let Some(bpr) = data_size.checked_div(num_rows) {
@@ -3483,6 +3522,7 @@ pub async fn decode_batch(
 mod tests {
     use super::*;
     use arrow_array::StringArray;
+    use futures::TryStreamExt;
     use std::collections::VecDeque;
 
     struct StaticArrayDecodeTask(ArrayRef);
@@ -3981,6 +4021,7 @@ mod tests {
         batch: &RecordBatch,
         batch_size: u32,
         batch_size_bytes: Option<u64>,
+        readahead: usize,
     ) -> Vec<RecordBatch> {
         use crate::{
             encoder::{EncodingOptions, encode_batch},
@@ -4025,7 +4066,7 @@ mod tests {
             io_scheduler,
         );
 
-        let mut decode_stream = create_decode_stream(
+        let decode_stream = create_decode_stream(
             &encoded.schema,
             encoded.num_rows,
             batch_size,
@@ -4037,15 +4078,19 @@ mod tests {
         )
         .unwrap();
 
-        let mut batches = Vec::new();
-        while let Some(task) = decode_stream.next().await {
-            batches.push(task.task.await.unwrap());
-        }
-        batches
+        decode_stream
+            .map(|task| task.task)
+            .buffered(readahead)
+            .try_collect()
+            .await
+            .unwrap()
     }
 
+    #[rstest::rstest]
+    #[case::small_batches(1600)]
+    #[case::large_batches(6400)]
     #[tokio::test]
-    async fn test_byte_sized_batches_fixed_width() {
+    async fn test_byte_sized_batches_fixed_width(#[case] target_bytes: u64) {
         use arrow_array::Int32Array;
 
         // 1000 rows x 4 Int32 columns = 16 bytes/row
@@ -4066,18 +4111,17 @@ mod tests {
         ]));
         let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
 
-        // 16 bytes/row, batch_size_bytes=1600 => 100 rows/batch
+        // Exact-width schemas can use the full byte target from the first batch.
         let batches =
-            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 1024, Some(1600)).await;
+            decode_batches_with_byte_limit(&input_batch, 1024, Some(target_bytes), 1).await;
 
-        // Should produce 10 batches of 100 rows each
-        assert_eq!(batches.len(), 10);
+        let rows_per_batch = target_bytes as usize / 16;
+        assert_eq!(batches.len(), (num_rows as usize).div_ceil(rows_per_batch));
         for (i, batch) in batches.iter().enumerate() {
             assert_eq!(
                 batch.num_rows(),
-                100,
-                "batch {i} should have 100 rows, got {}",
-                batch.num_rows()
+                rows_per_batch.min(num_rows as usize - i * rows_per_batch),
+                "batch {i}"
             );
         }
 
@@ -4117,7 +4161,7 @@ mod tests {
         let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
 
         // batch_size=250, batch_size_bytes=None => 4 batches of 250 rows
-        let batches = decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 250, None).await;
+        let batches = decode_batches_with_byte_limit(&input_batch, 250, None, 1).await;
         assert_eq!(batches.len(), 4);
         for (i, batch) in batches.iter().enumerate() {
             assert_eq!(
@@ -4146,8 +4190,7 @@ mod tests {
         .unwrap();
 
         // The byte limit can hold every row, so the 100-row limit must win.
-        let batches =
-            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 100, Some(10_000)).await;
+        let batches = decode_batches_with_byte_limit(&input_batch, 100, Some(10_000), 1).await;
         assert_eq!(batches.len(), 10);
         assert!(batches.iter().all(|batch| batch.num_rows() == 100));
     }
@@ -4179,6 +4222,7 @@ mod tests {
             &input_batch,
             /*batch_size=*/ 1024,
             Some(target_bytes),
+            1,
         )
         .await;
 
@@ -4213,6 +4257,59 @@ mod tests {
                 (40..=60).contains(&third_batch_rows),
                 "third batch should be near 50 rows, got {third_batch_rows}"
             );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::utf8(DataType::Utf8)]
+    #[case::large_utf8(DataType::LargeUtf8)]
+    #[tokio::test]
+    async fn test_byte_sized_batches_initial_feedback(
+        #[case] data_type: DataType,
+        #[values(0, 32, 2048)] value_bytes: usize,
+        #[values(1, 4)] readahead: usize,
+        #[values(false, true)] nested: bool,
+    ) {
+        let value = "x".repeat(value_bytes);
+        let values = arrow_array::StringArray::from_iter((0..512).map(|row| {
+            if value_bytes == 0 {
+                None
+            } else {
+                match row % 8 {
+                    0 => None,
+                    1 => Some(""),
+                    _ => Some(value.as_str()),
+                }
+            }
+        }));
+        let values = arrow_cast::cast(&values, &data_type).unwrap();
+        let values = if nested {
+            Arc::new(arrow_array::StructArray::from(vec![(
+                Arc::new(ArrowField::new("text", data_type, true)),
+                values,
+            )])) as ArrayRef
+        } else {
+            values
+        };
+        let input = RecordBatch::try_from_iter([("text", values)]).unwrap();
+        let target_bytes = 256 * 1024;
+        let batches =
+            decode_batches_with_byte_limit(&input, 512, Some(target_bytes), readahead).await;
+
+        // Long values must not produce a whole large batch based on the initial
+        // 64-byte string estimate, including tasks queued before feedback arrives.
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.get_array_memory_size() <= 2 * target_bytes as usize)
+        );
+        let concatenated = arrow_select::concat::concat_batches(&input.schema(), &batches).unwrap();
+        assert_eq!(concatenated, input);
+
+        // A smaller initial batch must not become a permanent row limit.
+        if value_bytes == 32 && readahead == 1 {
+            assert!(batches.len() >= 2);
+            assert!(batches[1].num_rows() > batches[0].num_rows());
         }
     }
 }
