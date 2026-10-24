@@ -1452,8 +1452,8 @@ impl AlpMiniBlockDecompressor {
     ) -> Result<()> {
         let delta = header.mode & MODE_DELTA != 0;
         let offset_count = if delta { n.saturating_sub(1) } else { n };
-        let offsets = if offset_count == 0 {
-            Vec::new()
+        let offsets_block = if offset_count == 0 {
+            None
         } else {
             let block = FixedWidthDataBlock {
                 data: packed,
@@ -1461,12 +1461,16 @@ impl AlpMiniBlockDecompressor {
                 num_values: n as u64,
                 block_info: BlockInfo::new(),
             };
-            unpack_out_of_line::<u32>(block, offset_count, header.bit_width as usize)
-                .data
-                .borrow_to_typed_slice::<u32>()
-                .as_ref()
-                .to_vec()
+            Some(unpack_out_of_line::<u32>(
+                block,
+                offset_count,
+                header.bit_width as usize,
+            ))
         };
+        let offsets_buf = offsets_block
+            .as_ref()
+            .map(|b| b.data.borrow_to_typed_slice::<u32>());
+        let offsets: &[u32] = offsets_buf.as_deref().unwrap_or(&[]);
 
         if delta {
             let mut cursor = header.base;
@@ -1482,13 +1486,13 @@ impl AlpMiniBlockDecompressor {
                 *pos += 4;
             };
             emit(cursor, out, &mut pos);
-            for &offset in &offsets {
+            for &offset in offsets {
                 cursor = cursor.wrapping_add(offset as i64 + header.delta_base);
                 emit(cursor, out, &mut pos);
             }
         } else {
             let mut pos = 0usize;
-            for &offset in &offsets {
+            for &offset in offsets {
                 let enc = (header.base + offset as i64) as i32;
                 let value = if header.mode & MODE_DIV != 0 {
                     (enc as f32) / F10_F32[header.e as usize]
@@ -1512,8 +1516,8 @@ impl AlpMiniBlockDecompressor {
     ) -> Result<()> {
         let delta = header.mode & MODE_DELTA != 0;
         let offset_count = if delta { n.saturating_sub(1) } else { n };
-        let offsets = if offset_count == 0 {
-            Vec::new()
+        let offsets_block = if offset_count == 0 {
+            None
         } else {
             let block = FixedWidthDataBlock {
                 data: packed,
@@ -1521,12 +1525,16 @@ impl AlpMiniBlockDecompressor {
                 num_values: n as u64,
                 block_info: BlockInfo::new(),
             };
-            unpack_out_of_line::<u64>(block, offset_count, header.bit_width as usize)
-                .data
-                .borrow_to_typed_slice::<u64>()
-                .as_ref()
-                .to_vec()
+            Some(unpack_out_of_line::<u64>(
+                block,
+                offset_count,
+                header.bit_width as usize,
+            ))
         };
+        let offsets_buf = offsets_block
+            .as_ref()
+            .map(|b| b.data.borrow_to_typed_slice::<u64>());
+        let offsets: &[u64] = offsets_buf.as_deref().unwrap_or(&[]);
 
         if delta {
             let mut cursor = header.base;
@@ -1542,13 +1550,13 @@ impl AlpMiniBlockDecompressor {
                 *pos += 8;
             };
             emit(cursor, out, &mut pos);
-            for &offset in &offsets {
+            for &offset in offsets {
                 cursor = cursor.wrapping_add(offset as i64 + header.delta_base);
                 emit(cursor, out, &mut pos);
             }
         } else {
             let mut pos = 0usize;
-            for &offset in &offsets {
+            for &offset in offsets {
                 let enc = header.base.wrapping_add(offset as i64);
                 let value = if header.mode & MODE_DIV != 0 {
                     (enc as f64) / F10_F64[header.e as usize]
