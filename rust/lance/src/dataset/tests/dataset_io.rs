@@ -3192,6 +3192,60 @@ async fn write_rejects_dictionary_null_index_outside_declared_key_range(
     );
 }
 
+/// Each batch carries the same 127-value Int8 dictionary, about 12.7 MB of values,
+/// so the writer flushes it as its own page (a column is flushed once it buffers
+/// `cache_bytes_per_column`, 8 MiB by default).  A scan batch over both pages then
+/// concatenates two decoded dictionaries.
+#[rstest]
+#[tokio::test]
+async fn scan_dictionary_batches_spanning_pages(
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+) {
+    let values = Arc::new(StringArray::from(
+        (0..127)
+            .map(|i| format!("{i:03}{}", "x".repeat(100_000)))
+            .collect::<Vec<_>>(),
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let batches = (0..2)
+        .map(|batch| {
+            let keys = Int8Array::from(
+                (0..127)
+                    .map(|i| (i % 10 != 3).then_some((i + batch) % 127))
+                    .collect::<Vec<_>>(),
+            );
+            let dictionary = Int8DictionaryArray::try_new(keys, values.clone()).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner.batch_size(254);
+    let actual = scanner.try_into_batch().await.unwrap();
+
+    let expected = concat_batches(&schema, &batches).unwrap();
+    let as_utf8 = |batch: &RecordBatch| arrow_cast::cast(&batch["d"], &DataType::Utf8).unwrap();
+    assert_eq!(actual["d"].data_type(), expected["d"].data_type());
+    assert!(
+        as_utf8(&actual).as_ref() == as_utf8(&expected).as_ref(),
+        "scanned dictionary values differ from the written ones"
+    );
+}
+
 /// `dict:{value}:{index}:false` cannot express a value type whose own logical
 /// string carries ':', so `Schema::try_from` used to panic on the way in rather
 /// than rejecting the write.
