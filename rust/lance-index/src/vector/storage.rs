@@ -2716,15 +2716,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let source = self
                 .read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
                 .await?;
+            let (source, remapper) = self.remap_partition_batch(source).await?;
             EncodedPartition::Memory(
-                stage_pairwise_batches(
-                    scorer.clone(),
-                    source,
-                    batch_size,
-                    self.frag_reuse_index.clone(),
-                )
-                .try_collect()
-                .await?,
+                stage_pairwise_batches(scorer.clone(), source, batch_size, remapper)
+                    .try_collect()
+                    .await?,
             )
         } else {
             let mut writer = PairwiseSpillWriter::new(spill_store).await?;
@@ -2736,12 +2732,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 let source = self
                     .read_pairwise_codes(partition_id, start..end, &quantizer)
                     .await?;
-                let mut batches = stage_pairwise_batches(
-                    scorer.clone(),
-                    source,
-                    batch_size,
-                    self.frag_reuse_index.clone(),
-                );
+                let (source, remapper) = self.remap_partition_batch(source).await?;
+                let mut batches =
+                    stage_pairwise_batches(scorer.clone(), source, batch_size, remapper);
                 while let Some(batch) = batches.try_next().await? {
                     writer.write(batch).await?;
                 }

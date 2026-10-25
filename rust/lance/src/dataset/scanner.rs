@@ -2626,6 +2626,12 @@ impl Scanner {
     }
 
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
+    ///
+    /// When unset, the search ranks by the metric of the vector index it chooses for the
+    /// column, also where it falls back to flat KNN over fragments that index does not
+    /// cover. A search that chooses no index, such as one with [`Self::use_index`] false
+    /// or a full-text filter under [`Self::prefilter`], uses the column type's default:
+    /// Hamming for uint8 vectors and L2 otherwise.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = Some(metric_type)
@@ -6675,6 +6681,11 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
+        // The metric of the index chosen for this query. When that index ends up unused
+        // because no searched fragment is in its coverage, or the fragment-reuse check drops
+        // it, the flat branch below still ranks by it if the query names no metric, so
+        // `_distance` keeps one scale whichever fragments are searched.
+        let mut chosen_index_metric = None;
         let mut index_and_segments = if use_index {
             if let Some(requested_segments) = self.index_segments.as_ref() {
                 let requested_segment_set =
@@ -6720,6 +6731,11 @@ impl Scanner {
                     ));
                 }
 
+                // From the details alone: opening a segment the scope may exclude would add
+                // I/O and a failure mode to what can end as a flat search.
+                chosen_index_metric = requested_index_segments
+                    .iter()
+                    .find_map(crate::index::vector::details::metric_type_from_index_metadata);
                 let selected_index_segments =
                     self.retain_relevant_index_segments(requested_index_segments);
                 if selected_index_segments.is_empty() {
@@ -6806,6 +6822,7 @@ impl Scanner {
 
                 match selected {
                     Some((index, index_metric)) => {
+                        chosen_index_metric = Some(index_metric);
                         let index_segments = self.retain_relevant_index_segments(
                             self.dataset.load_indices_by_name(&index.name).await?,
                         );
@@ -6956,9 +6973,13 @@ impl Scanner {
                     self.is_batch_nearest,
                 ))));
             }
-            // Resolve metric type for flat search (use default if not specified)
+            // Resolve metric type for flat search: the query's, else the chosen index's,
+            // else the column type's default. An untrained index can record a metric its
+            // column cannot use, so such a metric is skipped.
             let metric = q
                 .metric_type
+                .or(chosen_index_metric
+                    .filter(|metric| validate_distance_type_for(*metric, &element_type).is_ok()))
                 .unwrap_or_else(|| default_distance_type_for(&element_type));
             q.metric_type = Some(metric);
             validate_distance_type_for(metric, &element_type)?;
@@ -13866,9 +13887,29 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[rstest]
+    #[case::no_index(false)]
+    #[case::untrained_l2_index(true)]
     #[tokio::test]
-    async fn test_binary_vectors_default_to_hamming() {
-        let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
+    async fn test_binary_vectors_default_to_hamming(#[case] has_untrained_index: bool) {
+        let (_tmp_dir, mut dataset) = make_binary_vector_dataset().await.unwrap();
+        if has_untrained_index {
+            // An untrained index records its metric unchecked, and L2 cannot rank uint8.
+            dataset
+                .create_index_builder(
+                    &["bin"],
+                    IndexType::Vector,
+                    &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+                )
+                .train(false)
+                .await
+                .unwrap();
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(
+                crate::index::vector::details::metric_type_from_index_metadata(&indices[0]),
+                Some(DistanceType::L2)
+            );
+        }
         let query = UInt8Array::from(vec![0b0000_1111u8, 0, 0, 0]);
 
         let mut scan = dataset.scan();
@@ -14052,6 +14093,107 @@ mod test {
             "Expected the L2 index to answer an L2 query, got plan:\n{}",
             plan
         );
+    }
+
+    /// A query that names no metric ranks by the chosen index's metric even when its
+    /// fragment scope misses every segment of that index and the search runs flat KNN, so
+    /// `_distance` keeps one scale whichever fragments the scope selects.
+    #[rstest]
+    #[case::automatic_selection(false)]
+    #[case::explicit_segments(true)]
+    #[tokio::test]
+    async fn test_knn_no_metric_uses_index_metric_outside_index_coverage(
+        #[case] has_explicit_segments: bool,
+    ) {
+        // F0 (ids 0..3) is indexed and F1 (ids 3..6) is appended afterwards. On F1 cosine
+        // and L2 rank in reverse order: id 3 is nearest by angle and farthest by L2.
+        let vectors: [[f32; 4]; 6] = [
+            [3.0, 1.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0, 0.0],
+            [4.0, 3.0, 0.0, 0.0],
+            [10.0, 1.0, 0.0, 0.0],
+            [0.6, 0.6, 0.0, 0.0],
+            [2.0, 1.0, 0.0, 0.0],
+        ];
+        let rows_for = |ids: std::ops::Range<usize>| {
+            gen_batch()
+                .col("id", array::step_custom::<Int32Type>(ids.start as i32, 1))
+                .col(
+                    "vec",
+                    array::cycle_vec(
+                        array::cycle::<Float32Type>(vectors[ids].concat()),
+                        Dimension::from(4),
+                    ),
+                )
+        };
+        let mut dataset = rows_for(0..3)
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(1, DistanceType::Cosine),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                rows_for(3..6).into_reader_rows(RowCount::from(3), BatchCount::from(1)),
+                None,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref(),
+            Some(&RoaringBitmap::from_iter([0]))
+        );
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let norm = |vector: &[f32]| {
+            vector
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let cosine_distance = |vector: &[f32; 4]| {
+            let dot: f64 = vector
+                .iter()
+                .zip(query)
+                .map(|(value, query_value)| f64::from(*value) * f64::from(query_value))
+                .sum();
+            1.0 - dot / (norm(vector) * norm(&query))
+        };
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &Float32Array::from(query.to_vec()), 3)
+            .unwrap();
+        scan.with_fragments(vec![dataset.fragments()[1].clone()]);
+        if has_explicit_segments {
+            scan.with_index_segments(vec![indices[0].uuid]).unwrap();
+        }
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNSubIndex") && plan.contains("KNNVectorDistance: metric=cosine"),
+            "{plan}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>().values();
+        assert_eq!(ids, &[3, 5, 4], "{plan}");
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>().values();
+        for (id, distance) in ids.iter().zip(distances.iter()) {
+            let expected = cosine_distance(&vectors[*id as usize]);
+            assert!(
+                (f64::from(*distance) - expected).abs() <= 1e-6,
+                "id={id}: distance={distance}, expected={expected}"
+            );
+        }
     }
 
     #[rstest]
@@ -16167,6 +16309,44 @@ mod test {
 
         assert_eq!(unindexed_ids, BTreeSet::from([1, 3, 5, 7]));
         assert_eq!(indexed_ids, unindexed_ids);
+    }
+
+    #[tokio::test]
+    async fn test_fm_index_contains_empty_needle() {
+        // Every non-null string contains the empty string, so no text index can
+        // narrow `contains(text, '')` down; it must be left to a full scan.
+        let batch = arrow_array::record_batch!(
+            ("text", Utf8, [Some("alpha"), Some(""), None, Some("beta")]),
+            ("id", Int32, [0, 1, 2, 3])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+        dataset
+            .create_index(&["text"], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+
+        for (filter, uses_index, expected_ids) in [
+            ("contains(text, '')", false, vec![0, 1, 3]),
+            ("NOT contains(text, '')", false, vec![]),
+            // A one-character needle is still answered by the index.
+            ("contains(text, 'a')", true, vec![0, 3]),
+        ] {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            assert_eq!(ids, expected_ids, "wrong rows for {filter}");
+            assert_eq!(
+                plan.contains("ScalarIndexQuery"),
+                uses_index,
+                "unexpected plan for {filter}:\n{plan}"
+            );
+        }
     }
 
     #[tokio::test]

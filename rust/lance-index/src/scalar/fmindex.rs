@@ -2330,7 +2330,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             false,
             // supports_regex: regex acceleration is only implemented for ngram.
             false,
-            // min_contains_chars: the FM-index can match a needle of any length.
+            // min_contains_chars: the FM-index can match any non-empty needle.
             0,
         )))
     }
