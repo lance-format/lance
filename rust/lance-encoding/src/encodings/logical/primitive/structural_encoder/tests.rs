@@ -802,6 +802,113 @@ async fn test_sparse_vector_dictionary_hidden_payload(
 }
 
 #[rstest::rstest]
+#[case::rgb("u8", false)]
+#[case::depth("u16", true)]
+#[case::dense_depth("u16_dense", false)]
+#[case::nested_nullable("nested", true)]
+#[case::null_children("null_children", false)]
+#[tokio::test]
+async fn test_tensor_per_value_compression(
+    #[case] kind: &str,
+    #[case] sparse: bool,
+    #[values("zstd", "lz4", "none")] compression: &str,
+) {
+    const ROWS: usize = 32;
+    const DIMENSION: usize = 1030;
+    let child: ArrayRef = match kind {
+        "u16_dense" => Arc::new(arrow_array::UInt16Array::from_iter_values(
+            (0..ROWS * DIMENSION).map(|i| (i / DIMENSION + i % 5) as u16),
+        )),
+        "u8" => Arc::new(arrow_array::UInt8Array::from_iter_values(
+            (0..ROWS * DIMENSION).map(|i| (i / DIMENSION + i % 5) as u8),
+        )),
+        "null_children" => Arc::new(arrow_array::UInt16Array::new_null(ROWS * DIMENSION)),
+        _ => Arc::new(arrow_array::UInt16Array::from_iter(
+            (0..ROWS * DIMENSION).map(|i| (i % 7 != 0).then_some((i / DIMENSION + i % 5) as u16)),
+        )),
+    };
+    let dimension = if kind == "nested" {
+        DIMENSION / 2
+    } else {
+        DIMENSION
+    };
+    let mut array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new(
+            "item",
+            child.data_type().clone(),
+            true,
+        )),
+        dimension as i32,
+        child,
+        None,
+    ));
+    if kind == "nested" {
+        array = Arc::new(FixedSizeListArray::new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                array.data_type().clone(),
+                true,
+            )),
+            2,
+            array,
+            None,
+        ));
+    }
+    if sparse {
+        array = arrow_array::make_array(
+            array
+                .to_data()
+                .into_builder()
+                .nulls(Some(NullBuffer::from(
+                    (0..ROWS).map(|i| i % 4 == 0).collect::<Vec<_>>(),
+                )))
+                .build()
+                .unwrap(),
+        );
+    }
+    let metadata = HashMap::from([
+        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
+        (COMPRESSION_LEVEL_META_KEY.to_string(), "3".to_string()),
+        // Exercise the configured codec independently of automatic selection.
+        ("lance-encoding:axis-delta".to_string(), "off".to_string()),
+    ]);
+    let field = arrow_schema::Field::new("tensor", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let PageEncoding::Planar(layout) = page.description else {
+        panic!("expected Planar page")
+    };
+    let Some(crate::format::pb23::value_plane::Codec::Zipped(values)) =
+        layout.values.and_then(|v| v.codec)
+    else {
+        panic!("expected independently addressed tensors");
+    };
+    assert_eq!(
+        matches!(
+            values.addressing,
+            Some(crate::format::pb23::zipped_values::Addressing::BitsPerOffset(_))
+        ),
+        compression != "none"
+    );
+    assert_eq!(
+        matches!(
+            values.compression.as_ref().unwrap().compression,
+            Some(Compression::General(_))
+        ),
+        compression != "none"
+    );
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024])
+        .with_ingest_batch_counts([4])
+        .with_slicing_modes([true])
+        .with_batch_size(7)
+        .with_range(3..29)
+        .with_indices(vec![0, 3, 4, 7, 8, 17, 28, 31]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
 #[case::unique(2048, 2048, 2)]
 #[case::entry_budget(128, 64, 8)]
 fn test_planar_vector_dictionary_rejects_unhelpful_candidates(
@@ -1989,6 +2096,187 @@ async fn test_per_value_zstd_round_trip_large_values_with_nulls() {
         .await;
     }
 }
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_axis_delta_per_value_compression(
+    #[values("off", "on:1", "auto:1", "auto", "default")] mode: &str,
+    #[values("zstd", "lz4", "none")] compression: &str,
+    #[values(false, true)] nullable: bool,
+    #[values("fullzip", "sparse")] structure: &str,
+) {
+    const ROWS: usize = 16;
+    const DIM: usize = 3 * 17 * 23;
+    let child: ArrayRef = Arc::new(arrow_array::Int32Array::from(
+        (0..ROWS * DIM)
+            .map(|i| (i as i32 * 107) - 1_000_000)
+            .collect::<Vec<_>>(),
+    ));
+    let array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new(
+            "item",
+            child.data_type().clone(),
+            true,
+        )),
+        DIM as i32,
+        child,
+        nullable.then(|| NullBuffer::from((0..ROWS).map(|i| i % 3 != 0).collect::<Vec<_>>())),
+    ));
+    let mut metadata = HashMap::from([
+        (
+            "lance-encoding:structural-encoding".to_string(),
+            structure.to_string(),
+        ),
+        ("lance-encoding:axis-delta".to_string(), mode.to_string()),
+        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
+    ]);
+    if mode == "default" {
+        metadata.remove("lance-encoding:axis-delta");
+    }
+    metadata.insert(
+        "ARROW:extension:name".into(),
+        "arrow.fixed_shape_tensor".into(),
+    );
+    metadata.insert(
+        "ARROW:extension:metadata".into(),
+        r#"{"shape":[23,17,3]}"#.into(),
+    );
+    let field = arrow_schema::Field::new("pixels", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let PageEncoding::Planar(layout) = page.description else {
+        panic!("expected Planar")
+    };
+    let Some(crate::format::pb23::value_plane::Codec::Zipped(values)) =
+        layout.values.and_then(|v| v.codec)
+    else {
+        panic!("expected Zipped")
+    };
+    let mut codec = values.compression.as_ref().unwrap();
+    if let Some(Compression::General(general)) = &codec.compression {
+        codec = general.values.as_ref().unwrap();
+    }
+    assert_eq!(
+        matches!(codec.compression, Some(Compression::AxisDelta(_))),
+        mode != "off"
+            && !((mode.starts_with("auto") || mode == "default") && compression == "none")
+    );
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024])
+        .with_ingest_batch_counts([4])
+        .with_slicing_modes([true])
+        .with_batch_size(3)
+        .with_range(3..15)
+        .with_indices(vec![0, 1, 3, 8, 14, 15]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::scalar("scalar")]
+#[case::strings("strings")]
+#[case::float_vector("float")]
+#[case::noise("noise")]
+#[case::repeated_vector("repeated")]
+#[case::inner_nulls("inner_nulls")]
+#[case::small_tensor("small")]
+#[case::invalid_extension("invalid_extension")]
+#[tokio::test]
+async fn test_default_axis_delta_preserves_other_encodings(
+    #[case] kind: &str,
+    #[values("lz4", "zstd", "none", "unset")] compression: &str,
+    #[values(
+        TestEncoding::StructuralSparse,
+        TestEncoding::StructuralU32,
+        TestEncoding::StructuralU16
+    )]
+    version: TestEncoding,
+) {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    let mut rng = StdRng::seed_from_u64(601);
+    const ROWS: usize = 128;
+    let dimension = if kind == "small" { 2 } else { 1024 };
+    let array: ArrayRef = match kind {
+        "scalar" => Arc::new(arrow_array::Int32Array::from(
+            (0..ROWS as i32).collect::<Vec<_>>(),
+        )),
+        "strings" => Arc::new(StringArray::from(
+            (0..ROWS)
+                .map(|i| format!("value {i} {}", "abc".repeat(i % 7)))
+                .collect::<Vec<_>>(),
+        )),
+        _ => {
+            let values: ArrayRef = if kind == "float" {
+                Arc::new(Float32Array::from(
+                    (0..ROWS * dimension)
+                        .map(|_| rng.random::<f32>())
+                        .collect::<Vec<_>>(),
+                ))
+            } else {
+                Arc::new(arrow_array::UInt32Array::from(
+                    (0..ROWS * dimension)
+                        .map(|i| {
+                            if kind == "inner_nulls" && i % 7 == 0 {
+                                None
+                            } else {
+                                Some(if kind == "repeated" {
+                                    (i % dimension) as u32
+                                } else {
+                                    rng.random()
+                                })
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            };
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(arrow_schema::Field::new(
+                    "item",
+                    values.data_type().clone(),
+                    true,
+                )),
+                dimension as i32,
+                values,
+                None,
+            ))
+        }
+    };
+    let mut metadata = HashMap::new();
+    if compression != "unset" {
+        metadata.insert(COMPRESSION_META_KEY.into(), compression.into());
+    }
+    if kind == "invalid_extension" {
+        metadata.insert(
+            "ARROW:extension:name".into(),
+            "arrow.fixed_shape_tensor".into(),
+        );
+        metadata.insert("ARROW:extension:metadata".into(), "invalid-json".into());
+    }
+    let field = arrow_schema::Field::new("value", array.data_type().clone(), false)
+        .with_metadata(metadata.clone());
+    let automatic = encode_first_page(field, array.clone(), version).await;
+    if matches!(
+        kind,
+        "float" | "noise" | "inner_nulls" | "small" | "invalid_extension"
+    ) {
+        // Auto must preserve raw storage when compression has no sampled benefit
+        // or the tensor is unsupported. Stable writers already use raw storage.
+        metadata.remove(COMPRESSION_META_KEY);
+    }
+    metadata.insert("lance-encoding:axis-delta".into(), "off".into());
+    let field =
+        arrow_schema::Field::new("value", array.data_type().clone(), false).with_metadata(metadata);
+    let disabled = encode_first_page(field, array, version).await;
+    assert_eq!(
+        format!("{:?}", automatic.description),
+        format!("{:?}", disabled.description)
+    );
+    assert_eq!(automatic.data.len(), disabled.data.len());
+    for (automatic, disabled) in automatic.data.iter().zip(&disabled.data) {
+        assert_eq!(automatic.as_ref(), disabled.as_ref());
+    }
+}
+
 fn int8_dictionary_with_all_values() -> ArrayRef {
     let values: Vec<u16> = (0..127u16).collect();
     let keys: Vec<i8> = (0..127)

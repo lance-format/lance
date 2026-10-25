@@ -476,7 +476,7 @@ impl HNSW {
             bitset,
             &mut visited_generator,
             storage,
-            Some(2),
+            self.inner.params.prefetch_distance,
         );
 
         match self.inner.visited_generator_queue.push(visited_generator) {
@@ -520,7 +520,7 @@ impl HNSW {
             &mut visited_generator,
             &mut expanded_generator,
             storage,
-            Some(2),
+            self.inner.params.prefetch_distance,
         );
 
         // if the queue is full, we just don't push it back, so ignore the error here
@@ -1484,6 +1484,9 @@ impl DeepSizeOf for HnswGraph {
     }
 }
 
+/// Lower bound for the search-time `ef` when the caller does not set one.
+pub const DEFAULT_MIN_EF: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 pub struct HnswQueryParams {
     pub ef: usize,
@@ -1497,7 +1500,7 @@ impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
-            ef: query.ef.unwrap_or(k + k / 2),
+            ef: query.ef.unwrap_or_else(|| (k + k / 2).max(DEFAULT_MIN_EF)),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
             dist_q_c: query.dist_q_c,
@@ -1926,6 +1929,7 @@ mod tests {
     };
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::prefilter::{NoFilter, PreFilter};
+    use crate::vector::Query;
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
@@ -1934,7 +1938,7 @@ mod tests {
         graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
-            builder::{HnswBuildParams, HnswQueryParams},
+            builder::{DEFAULT_MIN_EF, HnswBuildParams, HnswQueryParams},
         },
     };
 
@@ -2707,7 +2711,7 @@ mod tests {
         }
         assert_eq!(all_results[0], all_results[1]);
 
-        // default ef (k + k/2) and a deletion-style mask (all but a few rows)
+        // the pre-floor default and a deletion-style mask
         let default_ef_params = HnswQueryParams {
             ef: k + k / 2,
             ..params
@@ -3717,5 +3721,230 @@ mod tests {
             loaded.deep_size_of(),
             builder.deep_size_of(),
         );
+    }
+
+    fn query_with(k: usize, ef: Option<usize>, refine_factor: Option<u32>) -> Query {
+        Query {
+            column: "vector".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0; 8])),
+            k,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef,
+            refine_factor,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 0,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        }
+    }
+
+    #[rstest]
+    #[case::floor_binds_at_search_shaped_k(10, None, None, DEFAULT_MIN_EF)]
+    #[case::floor_stops_binding_by_k(1000, None, None, 1500)]
+    #[case::floor_stops_binding_by_refine(10, None, Some(100), 1500)]
+    #[case::explicit_ef_wins_below_the_floor(10, Some(15), None, 15)]
+    #[case::explicit_ef_wins_above_the_floor(10, Some(4096), None, 4096)]
+    fn default_ef_is_floored_but_never_overrides_the_caller(
+        #[case] k: usize,
+        #[case] ef: Option<usize>,
+        #[case] refine_factor: Option<u32>,
+        #[case] expected: usize,
+    ) {
+        let params = HnswQueryParams::from(&query_with(k, ef, refine_factor));
+        assert_eq!(params.ef, expected);
+    }
+
+    /// Wraps [FlatFloatStorage] so tests can observe whether the search path
+    /// issued prefetches, which is otherwise invisible in the results.
+    #[derive(Clone)]
+    struct PrefetchCountingStorage {
+        inner: FlatFloatStorage,
+        prefetch_calls: Arc<AtomicUsize>,
+    }
+
+    struct PrefetchCountingCalc<'a> {
+        inner: <FlatFloatStorage as VectorStore>::DistanceCalculator<'a>,
+        prefetch_calls: &'a AtomicUsize,
+    }
+
+    impl DistCalculator for PrefetchCountingCalc<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.inner.distance(id)
+        }
+
+        fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+            self.inner.distance_all(k_hint)
+        }
+
+        fn prefetch(&self, id: u32) {
+            self.prefetch_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.prefetch(id);
+        }
+    }
+
+    impl VectorStore for PrefetchCountingStorage {
+        type DistanceCalculator<'a> = PrefetchCountingCalc<'a>;
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> &arrow_schema::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send> {
+            self.inner.to_batches()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            self.inner.distance_type()
+        }
+
+        fn row_id(&self, id: u32) -> u64 {
+            self.inner.row_id(id)
+        }
+
+        fn row_ids(&self) -> impl Iterator<Item = &u64> {
+            self.inner.row_ids()
+        }
+
+        fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+            unreachable!("not used by search tests")
+        }
+
+        fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
+            PrefetchCountingCalc {
+                inner: self.inner.dist_calculator(query, dist_q_c),
+                prefetch_calls: &self.prefetch_calls,
+            }
+        }
+
+        fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+            PrefetchCountingCalc {
+                inner: self.inner.dist_calculator_from_id(id),
+                prefetch_calls: &self.prefetch_calls,
+            }
+        }
+    }
+
+    /// `search_basic` used to hardcode its bottom-level prefetch distance to
+    /// `Some(2)`, so `prefetch_distance: None` silently kept prefetching
+    /// (issue #8275). The counting storage observes what the results cannot.
+    #[rstest]
+    #[case::disabled(None, false)]
+    #[case::enabled(Some(2), true)]
+    fn test_search_basic_honors_prefetch_distance(
+        #[case] prefetch_distance: Option<usize>,
+        #[case] expect_prefetch: bool,
+    ) {
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let storage = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &storage,
+            HnswBuildParams {
+                prefetch_distance,
+                ..HnswBuildParams::default()
+            },
+        )
+        .unwrap();
+
+        let counting = PrefetchCountingStorage {
+            inner: storage,
+            prefetch_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (results, _) = hnsw
+            .search_basic(
+                fsl.value(0),
+                10,
+                &HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                },
+                None,
+                &counting,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 10);
+        assert_eq!(
+            counting.prefetch_calls.load(Ordering::Relaxed) > 0,
+            expect_prefetch
+        );
+    }
+
+    /// Prefetch is a pure cache hint: any distance (and any `do_prefetch`
+    /// internals, such as its cache-line cap) must leave results identical.
+    #[test]
+    fn test_prefetch_distance_does_not_change_results() {
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        const K: usize = 10;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let storage = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap();
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+
+        let mut visited_generator = VisitedGenerator::new(storage.len());
+        let baseline: Vec<(u32, f32)> = hnsw
+            .search_inner(
+                fsl.value(1),
+                K,
+                &params,
+                None,
+                &mut visited_generator,
+                &storage,
+                None,
+            )
+            .unwrap()
+            .0
+            .iter()
+            .map(|node| (node.id, node.dist.0))
+            .collect();
+
+        for prefetch_distance in [Some(1), Some(2), Some(64)] {
+            let with_prefetch: Vec<(u32, f32)> = hnsw
+                .search_inner(
+                    fsl.value(1),
+                    K,
+                    &params,
+                    None,
+                    &mut visited_generator,
+                    &storage,
+                    prefetch_distance,
+                )
+                .unwrap()
+                .0
+                .iter()
+                .map(|node| (node.id, node.dist.0))
+                .collect();
+            assert_eq!(
+                baseline, with_prefetch,
+                "results changed with prefetch_distance={prefetch_distance:?}"
+            );
+        }
     }
 }

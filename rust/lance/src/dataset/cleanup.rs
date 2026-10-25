@@ -405,6 +405,9 @@ struct CleanupInspection {
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
     latest_deleted_manifest_time: Option<DateTime<Utc>>,
+    /// Set when an expired manifest was classified from the listing instead of read, so
+    /// its commit time is unknown and the listing cutoff cannot be trusted.
+    skipped_expired_manifest_read: bool,
 }
 
 impl CleanupInspection {
@@ -421,6 +424,11 @@ impl CleanupInspection {
     /// the cutoff and scan the whole subtree — the same approach already used
     /// for `_indices/`.
     fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
+        if self.skipped_expired_manifest_read {
+            // At least one deleted manifest's commit time was never read, so the
+            // comparison below cannot be made safely. Scan everything.
+            return None;
+        }
         match (
             self.earliest_retained_manifest_time,
             self.latest_deleted_manifest_time,
@@ -636,7 +644,9 @@ impl<'a> CleanupTask<'a> {
             .map(|tag_content| tag_content.version)
             .collect();
 
-        let mut inspection = self.process_manifests(&tagged_versions).await?;
+        let mut inspection = self
+            .process_manifests(&tagged_versions, &referenced_branches)
+            .await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -667,14 +677,19 @@ impl<'a> CleanupTask<'a> {
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
+        referenced_branches: &[(String, u64)],
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
+        let branch_versions: HashSet<u64> = referenced_branches
+            .iter()
+            .map(|(_, version)| *version)
+            .collect();
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
+                self.process_manifest_file(location, &inspection, tagged_versions, &branch_versions)
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -774,7 +789,42 @@ impl<'a> CleanupTask<'a> {
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
+        branch_versions: &HashSet<u64>,
     ) -> Result<()> {
+        // Reading an expired manifest only ever produced `verified_files`, the evidence
+        // that a file came from a version we are deleting. `delete_unverified` says that
+        // evidence is not required, so there is nothing left to learn from the read: the
+        // path, version, size and store identity all come from the listing.
+        //
+        // This is the whole cost on a table that has accumulated versions faster than it
+        // cleaned them, where almost every manifest is expired. Branch roots must also
+        // be read: lineage retention can rescue them and their own FRI row maps later.
+        if self.policy.delete_unverified
+            && !tagged_versions.contains(&location.version)
+            && !branch_versions.contains(&location.version)
+            && location.version < self.read_version
+            && self.policy.proven_expired(location.version)
+        {
+            let mut inspection = inspection.lock().unwrap();
+            inspection.old_manifests.insert(
+                location.path.clone(),
+                ExpiredManifest {
+                    version: location.version,
+                    size_bytes: location.size,
+                },
+            );
+            if let Some(identity) = location.identity {
+                inspection
+                    .retired_records
+                    .insert(location.version, identity);
+            }
+            // Without the commit time there is nothing to compare against the retained
+            // side, so give up the listing cutoff and scan the whole subtree. Missing a
+            // file would orphan it permanently; an extra listing only costs time.
+            inspection.skipped_expired_manifest_read = true;
+            return Ok(());
+        }
+
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
         // to ignore a manifest error because if it is a temporary I/O error and we
@@ -2143,6 +2193,30 @@ pub struct CleanupPolicy {
 }
 
 impl CleanupPolicy {
+    /// True only when the listing alone proves this manifest is expired.
+    ///
+    /// Timestamp policies require reading the logical commit time: storage clocks and
+    /// timestamp precision do not guarantee that object write time is an upper bound.
+    /// All version conditions must be satisfied, and at least one must be specified.
+    fn proven_expired(&self, version: u64) -> bool {
+        if self.before_timestamp.is_some()
+            || (self.before_version.is_none() && self.versions.is_none())
+        {
+            return false;
+        }
+        if let Some(before_version) = self.before_version
+            && version >= before_version
+        {
+            return false;
+        }
+        if let Some(versions) = self.versions.as_ref()
+            && !versions.contains(&version)
+        {
+            return false;
+        }
+        true
+    }
+
     pub fn should_clean(&self, manifest: &Manifest) -> bool {
         let mut should_clean = true;
         if let Some(before_timestamp) = self.before_timestamp {
@@ -3518,6 +3592,7 @@ mod tests {
                 old_manifest,
                 &Mutex::new(CleanupInspection::default()),
                 &HashSet::new(),
+                &HashSet::new(),
             )
             .await
             .unwrap();
@@ -4691,7 +4766,7 @@ mod tests {
             CleanupAction::Execute,
         )
         .unwrap();
-        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let inspection = task.process_manifests(&HashSet::new(), &[]).await.unwrap();
         // Queue the branch root for removal on both sides; rescuing the
         // manifest must rescue its store record with it.
         let inspection = Mutex::new(inspection);
@@ -4792,7 +4867,7 @@ mod tests {
             CleanupAction::Execute,
         )
         .unwrap();
-        let inspection = task.process_manifests(&HashSet::new()).await.unwrap();
+        let inspection = task.process_manifests(&HashSet::new(), &[]).await.unwrap();
         let kept: HashSet<&Path> = inspection
             .referenced_files
             .data_paths
@@ -6866,6 +6941,245 @@ mod tests {
         assert_eq!(expired_manifest_size(&store, &path, None).await.unwrap(), 4);
     }
 
+    /// Record the version of every manifest read, so a test can assert *which* manifests
+    /// were opened rather than how many times.
+    fn record_manifest_reads(fixture: &MockDatasetFixture) -> Arc<Mutex<HashSet<u64>>> {
+        let seen = Arc::new(Mutex::new(HashSet::new()));
+        let recorder = seen.clone();
+        let mut policy = fixture.mock_store.policy.lock().unwrap();
+        policy.set_before_policy(
+            "record_manifest_reads",
+            Arc::new(move |op, path| {
+                if op == "get_opts"
+                    && let Some(name) = path.filename()
+                    && let Some(version) = ManifestNamingScheme::detect_scheme(name)
+                        .and_then(|scheme| scheme.parse_version(name))
+                {
+                    recorder.lock().unwrap().insert(version);
+                }
+                Ok(())
+            }),
+        );
+        seen
+    }
+
+    /// Build a dataset of `versions` versions and return the fixture.
+    async fn fixture_with_versions(versions: usize) -> MockDatasetFixture {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        for _ in 1..versions {
+            fixture.overwrite_some_data().await.unwrap();
+        }
+        fixture
+    }
+
+    fn expire_below(version: u64, delete_unverified: bool) -> CleanupPolicy {
+        CleanupPolicy {
+            before_version: Some(version),
+            delete_unverified,
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_unverified_never_opens_an_expired_manifest() {
+        // Reading an expired manifest only ever built `verified_files`, the evidence that
+        // a file came from a version being deleted. `delete_unverified` says that evidence
+        // is not required, so the read has nothing left to contribute: path, version, size
+        // and store identity all come from the listing.
+        //
+        // On a table that accumulated versions faster than it cleaned them, those reads
+        // are the whole cost, and skipping them is the difference between a cleanup that
+        // finishes and one that does not.
+        let fixture = fixture_with_versions(6).await;
+        let latest = fixture.open().await.unwrap().manifest.version;
+        let cutoff = latest - 2;
+
+        let read = record_manifest_reads(&fixture);
+        let removed = fixture
+            .run_cleanup_with_policy(expire_below(cutoff, true))
+            .await
+            .unwrap();
+
+        assert_gt!(removed.old_versions, 0, "the run must expire something");
+        let read = read.lock().unwrap();
+        let opened_expired: Vec<u64> = read.iter().copied().filter(|v| *v < cutoff).collect();
+        assert!(
+            opened_expired.is_empty(),
+            "expired manifests must be classified from the listing, but these were \
+             opened: {:?}",
+            opened_expired
+        );
+    }
+
+    #[tokio::test]
+    async fn the_verifying_path_does_open_every_expired_manifest() {
+        // The counterpart to the test above: without the flag, every expired manifest is
+        // opened, which is the cost being avoided. Asserting this keeps the test above
+        // honest — otherwise it could pass because nothing was expired at all.
+        let fixture = fixture_with_versions(6).await;
+        let latest = fixture.open().await.unwrap().manifest.version;
+        let cutoff = latest - 2;
+
+        let read = record_manifest_reads(&fixture);
+        fixture
+            .run_cleanup_with_policy(expire_below(cutoff, false))
+            .await
+            .unwrap();
+
+        let read = read.lock().unwrap();
+        let opened_expired: Vec<u64> = read.iter().copied().filter(|v| *v < cutoff).collect();
+        assert!(
+            !opened_expired.is_empty(),
+            "the verifying path must open expired manifests; if it does not, the \
+             comparison with the skipping path proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unverified_removes_the_same_versions_as_the_verifying_path() {
+        // The fast path is an optimisation, not a behaviour change: both must expire the
+        // same versions. Separate fixtures, because the mock clock is thread-local and
+        // shared within a test.
+        let verifying = fixture_with_versions(6).await;
+        let reading = verifying
+            .run_cleanup_with_policy(expire_below(6, false))
+            .await
+            .unwrap();
+
+        let skipping_fixture = fixture_with_versions(6).await;
+        let skipping = skipping_fixture
+            .run_cleanup_with_policy(expire_below(6, true))
+            .await
+            .unwrap();
+
+        assert_eq!(skipping.old_versions, reading.old_versions);
+        assert_eq!(skipping.data_files_removed, reading.data_files_removed);
+        assert_eq!(
+            skipping.transaction_files_removed,
+            reading.transaction_files_removed
+        );
+        assert_gt!(
+            reading.old_versions,
+            0,
+            "the comparison must not be vacuous"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unverified_still_reads_a_tagged_manifest() {
+        // The fast path must never skip a manifest it cannot prove expired. A tagged
+        // version is retained regardless of age and its files are live, so it has to be
+        // read even with the flag set.
+        let fixture = fixture_with_versions(4).await;
+        let dataset = *(fixture.open().await.unwrap());
+        dataset.tags().create("keepme", 2).await.unwrap();
+
+        let read = record_manifest_reads(&fixture);
+        fixture
+            .run_cleanup_with_policy(expire_below(4, true))
+            .await
+            .unwrap();
+
+        assert!(
+            read.lock().unwrap().contains(&2),
+            "a tagged version must still be read, since its files are live"
+        );
+    }
+
+    #[test]
+    fn proven_expired_refuses_to_guess() {
+        assert!(!CleanupPolicy::default().proven_expired(1));
+        let by_version = CleanupPolicy {
+            before_version: Some(10),
+            ..Default::default()
+        };
+        assert!(by_version.proven_expired(9));
+        assert!(!by_version.proven_expired(10));
+        assert!(!by_version.proven_expired(11));
+
+        let listed = CleanupPolicy {
+            versions: Some(HashSet::from([3, 4])),
+            ..Default::default()
+        };
+        assert!(listed.proven_expired(3));
+        assert!(!listed.proven_expired(5));
+        let combined = CleanupPolicy {
+            before_version: Some(4),
+            ..listed
+        };
+        assert!(combined.proven_expired(3));
+        assert!(!combined.proven_expired(4));
+        assert!(!combined.proven_expired(2));
+
+        let by_time = CleanupPolicy {
+            before_timestamp: Some(DateTime::from_timestamp(100, 0).unwrap()),
+            ..Default::default()
+        };
+        assert!(!by_time.proven_expired(1));
+        let combined = CleanupPolicy {
+            before_timestamp: by_time.before_timestamp,
+            ..combined
+        };
+        assert!(!combined.proven_expired(3));
+    }
+
+    #[rstest]
+    #[case::verifying_precision(false, 100)]
+    #[case::skipping_precision(true, 100)]
+    #[case::verifying_clock_skew(false, 90)]
+    #[case::skipping_clock_skew(true, 90)]
+    #[tokio::test]
+    async fn timestamp_cleanup_preserves_retained_versions_with_older_store_time(
+        #[case] delete_unverified: bool,
+        #[case] store_seconds: i64,
+        #[values(None, Some(2))] before_version: Option<u64>,
+    ) {
+        MockClock::set_system_time(Duration::from_millis(100_900));
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let first = fixture.open().await.unwrap();
+        let cutoff = DateTime::from_timestamp(100, 500_000_000).unwrap();
+        assert!(first.manifest.timestamp() > cutoff);
+        MockClock::set_system_time(Duration::from_millis(101_900));
+        fixture.overwrite_some_data().await.unwrap();
+        fixture
+            .mock_store
+            .policy
+            .lock()
+            .unwrap()
+            .set_obj_meta_policy(
+                "add_recorded_file_time",
+                Arc::new(move |_, mut meta| {
+                    if meta.location.extension() == Some("manifest") {
+                        meta.last_modified = DateTime::from_timestamp(store_seconds, 0).unwrap();
+                    }
+                    Ok(meta)
+                }),
+            );
+        let removed = fixture
+            .run_cleanup_with_policy(CleanupPolicy {
+                before_timestamp: Some(cutoff),
+                before_version,
+                delete_unverified,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 0);
+        assert_eq!(removed.data_files_removed, 0);
+        assert_eq!(removed.transaction_files_removed, 0);
+        let retained = fixture
+            .open()
+            .await
+            .unwrap()
+            .checkout_version(1)
+            .await
+            .unwrap();
+        assert!(retained.count_rows(None).await.unwrap() > 0);
+    }
+
     #[test]
     fn test_calculate_duration() {
         // One permit is one delete request, so the interval is the reciprocal of the
@@ -7554,6 +7868,58 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn version_cleanup_keeps_maps_of_rescued_branch_roots() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+            let root_version = dataset.version().version;
+            let mut branch = fixture
+                .create_branch_and_load(&mut dataset, "child", (None, None))
+                .await
+                .unwrap();
+            branch
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            cleanup_frag_reuse_index(&mut branch).await.unwrap();
+            assert!(
+                branch
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            branch
+                .cleanup(expire_below(branch.version().version, true))
+                .execute()
+                .await
+                .unwrap();
+            fixture.overwrite_some_data().await.unwrap();
+            let latest = fixture.open().await.unwrap().version().version;
+
+            fixture
+                .run_cleanup_with_policy(expire_below(latest, true))
+                .await
+                .unwrap();
+
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+            fixture
+                .open()
+                .await
+                .unwrap()
+                .checkout_version(root_version)
+                .await
+                .unwrap();
+            assert_eq!(branch.count_rows(None).await.unwrap(), 8);
         }
 
         /// D2: a map referenced only by expiring manifests goes away in the

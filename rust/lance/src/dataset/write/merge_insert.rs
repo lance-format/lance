@@ -53,7 +53,7 @@ use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::seeds::SeedCollector;
 use super::{
-    CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
+    CommitBuilder, ExternalBlobMode, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
@@ -776,6 +776,9 @@ pub struct MergeInsertJob {
     dataset: Arc<Dataset>,
     // The parameters controlling how to merge the two streams
     params: MergeInsertParams,
+    // The caller's parameters for the data files this job writes. Kept out of
+    // `MergeInsertParams`, which the logical plan compares and hashes.
+    write_params: Arc<WriteParams>,
 }
 
 /// Build a merge insert operation.
@@ -825,6 +828,7 @@ pub struct MergeInsertJob {
 pub struct MergeInsertBuilder {
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
+    write_params: Arc<WriteParams>,
 }
 
 impl MergeInsertBuilder {
@@ -893,6 +897,7 @@ impl MergeInsertBuilder {
                 target_all_bases: None,
                 data_storage_version: None,
             },
+            write_params: Arc::new(WriteParams::default()),
         })
     }
 
@@ -1065,6 +1070,47 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Set the write parameters for the data files this merge insert writes,
+    /// as [`InsertBuilder::with_params`](super::InsertBuilder::with_params)
+    /// does for an insert.
+    ///
+    /// Every path that writes rows applies them: file size limits, file writer
+    /// options, store parameters, progress, the Blob pack size and external
+    /// Blob handling. With `allow_external_blob_outside_bases`, an external
+    /// Blob URI the source supplies outside the dataset's registered bases is
+    /// stored as an absolute reference instead of being refused.
+    ///
+    /// The file version and the bases new files go to are set on this builder
+    /// ([`Self::data_storage_version`], [`Self::target_bases`] and its
+    /// siblings), so [`Self::try_build`] refuses parameters that set them.
+    /// `mode` must stay at its default, `WriteMode::Create`: merge insert
+    /// decides how its files are written, and another mode would change the
+    /// schema they are written with (`Overwrite`) or start index seeds the
+    /// merge does not commit (`Append`). `try_build` also refuses
+    /// `ExternalBlobMode::Ingest`, which merge insert does not support. Fields
+    /// that only shape a commit or a new dataset, such as
+    /// `transaction_properties` or `enable_stable_row_ids`, do not apply.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{MergeInsertBuilder, WhenMatched, WriteParams};
+    /// # async fn test(dataset: Arc<Dataset>) -> Result<()> {
+    /// let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?
+    ///     .when_matched(WhenMatched::UpdateAll)
+    ///     .with_params(&WriteParams {
+    ///         allow_external_blob_outside_bases: true,
+    ///         ..Default::default()
+    ///     })
+    ///     .try_build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_params(&mut self, params: &WriteParams) -> &mut Self {
+        self.write_params = Arc::new(params.clone());
+        self
+    }
+
     /// Write new fragments produced by this merge insert to these base IDs.
     ///
     /// New data files are distributed across the target bases round-robin,
@@ -1136,13 +1182,53 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
+        validate_merge_insert_write_params(&self.write_params)?;
         let mut params = self.params.clone();
         params.data_storage_version = Some(PlanFileVersion(write_version));
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params,
+            write_params: self.write_params.clone(),
         })
     }
+}
+
+/// Refuse write parameters a merge insert cannot honor: the write mode, the
+/// file version and the target bases are the job's own, and the job has no
+/// ingest path for external Blob URIs.
+fn validate_merge_insert_write_params(params: &WriteParams) -> Result<()> {
+    // The fragment writers prepare their schema and index seeds by mode; merge
+    // insert has always written with `Create` and commits that result.
+    if !matches!(params.mode, WriteMode::Create) {
+        return Err(Error::invalid_input(format!(
+            "Merge insert write params set mode={:?}; leave mode at its default, WriteMode::Create, since merge insert decides how its files are written",
+            params.mode
+        )));
+    }
+    if let Some(version) = params.data_storage_version {
+        return Err(Error::invalid_input(format!(
+            "Merge insert write params set data_storage_version={version:?}; use MergeInsertBuilder::data_storage_version instead",
+        )));
+    }
+    if params.target_bases.is_some()
+        || params.target_base_names_or_paths.is_some()
+        || params.target_all_bases.is_some()
+        || params.initial_bases.is_some()
+    {
+        return Err(Error::invalid_input(format!(
+            "Merge insert write params set target_bases={:?}, target_base_names_or_paths={:?}, target_all_bases={:?} and initial_bases={}; route new files with MergeInsertBuilder::target_bases, target_base_names_or_paths or target_all_bases instead",
+            params.target_bases,
+            params.target_base_names_or_paths,
+            params.target_all_bases,
+            params.initial_bases.as_ref().map_or(0, Vec::len),
+        )));
+    }
+    if params.external_blob_mode == ExternalBlobMode::Ingest {
+        return Err(Error::invalid_input(
+            "Merge insert write params set external_blob_mode=\"ingest\", which merge insert does not support",
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the merge insert target bases against the base paths registered in
@@ -1822,6 +1908,7 @@ impl MergeInsertJob {
         target_bases_info: Option<Vec<TargetBaseInfo>>,
         write_version: ConcreteFileVersion,
         on: &[String],
+        write_params: Arc<WriteParams>,
     ) -> Result<PatchedFragments> {
         let source_schema = source.schema();
         let update_projection: Vec<usize> = source_schema
@@ -2191,6 +2278,7 @@ impl MergeInsertJob {
                 reservation_size: usize,
                 target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
                 write_version: ConcreteFileVersion,
+                write_params: Arc<WriteParams>,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -2222,7 +2310,7 @@ impl MergeInsertJob {
                     &dataset.base,
                     write_schema,
                     stream,
-                    Default::default(), // TODO: support write params.
+                    write_params.as_ref().clone(),
                     (*target_bases_info).clone(),
                 )
                 .await?;
@@ -2323,6 +2411,7 @@ impl MergeInsertJob {
                         memory_size,
                         target_bases_info.clone(),
                         write_version,
+                        write_params.clone(),
                     );
                     tasks.spawn(fut);
                 }
@@ -2828,7 +2917,9 @@ impl MergeInsertJob {
         let logical_plan = session_state.optimize(&logical_plan)?;
 
         let planner =
-            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(MergeInsertPlanner {})]);
+            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(MergeInsertPlanner {
+                write_params: self.write_params.clone(),
+            })]);
         // This method already does the optimization for us.
         let physical_plan = planner
             .create_physical_plan(&logical_plan, &session_state)
@@ -3226,6 +3317,7 @@ impl MergeInsertJob {
                 target_bases_info,
                 self.params.write_version(&self.dataset),
                 &self.params.on,
+                self.write_params.clone(),
             )
             .await?;
 
@@ -3255,7 +3347,7 @@ impl MergeInsertJob {
                 &self.dataset.base,
                 self.dataset.schema().clone(),
                 Box::pin(stream),
-                WriteParams::default(),
+                self.write_params.as_ref().clone(),
                 target_bases_info,
             )
             .await?;
@@ -3268,6 +3360,12 @@ impl MergeInsertJob {
                         .iter()
                         .map(|f| f.physical_rows.unwrap() as u64);
 
+                    // `Merger` captures IDs only for updated rows, while padding below
+                    // assigns fresh IDs at each fragment's tail. The indexed full outer
+                    // hash join must therefore emit every matched update before its
+                    // unmatched build-side inserts. Keep
+                    // `test_multi_batch_upsert_preserves_stable_row_ids` covering this
+                    // DataFusion ordering contract.
                     let sequences = lance_table::rowids::rechunk_sequences(
                         [row_id_sequence.clone()],
                         fragment_sizes,
@@ -4303,6 +4401,7 @@ mod tests {
             None,
             dataset.manifest.data_storage_format.lance_file_format(),
             &[],
+            Arc::new(WriteParams::default()),
         )
         .await
         .unwrap_err();
@@ -5384,10 +5483,10 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::indexed_slow_path(true)]
+    #[case::full_scan_fast_path(false)]
     #[tokio::test]
-    async fn test_multi_batch_upsert_preserves_stable_row_ids(
-        #[values(true, false)] use_index: bool,
-    ) {
+    async fn test_multi_batch_upsert_preserves_stable_row_ids(#[case] use_index: bool) {
         let mut dataset = (*create_test_dataset(
             "memory://test_multi_batch_upsert_row_ids",
             LanceFileVersion::default(),
@@ -5414,26 +5513,36 @@ mod tests {
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        let updated_keys = [2, 4];
+        let updated_keys = [2];
         let updated_row_ids_before = get_row_ids_for_keys(&dataset, &updated_keys).await;
 
-        // Put inserts in the first source batch and updates in the second. Stable
-        // row-id assignment still relies on the join emitting all updates first.
-        let insert_batch = record_batch!(
-            ("key", UInt32, [7, 8]),
-            ("value", UInt32, [70, 80]),
-            ("filterme", Utf8, ["inserted", "inserted"])
+        // Surround an update with inserts in separate source batches. Stable row-id
+        // assignment still relies on the join emitting the update before both inserts.
+        let first_insert_batch = record_batch!(
+            ("key", UInt32, [7]),
+            ("value", UInt32, [70]),
+            ("filterme", Utf8, ["inserted before"])
         )
         .unwrap();
         let update_batch = record_batch!(
-            ("key", UInt32, [2, 4]),
-            ("value", UInt32, [20, 40]),
-            ("filterme", Utf8, ["updated", "updated"])
+            ("key", UInt32, [2]),
+            ("value", UInt32, [20]),
+            ("filterme", Utf8, ["updated"])
         )
         .unwrap();
-        let source_schema = insert_batch.schema();
+        let second_insert_batch = record_batch!(
+            ("key", UInt32, [8]),
+            ("value", UInt32, [80]),
+            ("filterme", Utf8, ["inserted after"])
+        )
+        .unwrap();
+        let source_schema = first_insert_batch.schema();
         let source = Box::new(RecordBatchIterator::new(
-            [Ok(insert_batch), Ok(update_batch)],
+            [
+                Ok(first_insert_batch),
+                Ok(update_batch),
+                Ok(second_insert_batch),
+            ],
             source_schema,
         ));
 
@@ -5448,7 +5557,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(stats.num_updated_rows, 1);
         assert_eq!(stats.num_inserted_rows, 2);
         let updated_row_ids_after = get_row_ids_for_keys(&dataset, &updated_keys).await;
         assert_eq!(updated_row_ids_after, updated_row_ids_before);
@@ -17441,6 +17550,301 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 (2, None, b"qux".to_vec()),
             ]
         );
+    }
+
+    /// `with_params` reaches every path that writes a source's Blob values:
+    /// the v2 plan for a full-schema source and for a partial source that
+    /// updates, the indexed full-schema path, and the indexed partial-schema
+    /// insert. Each refuses a source URI outside the registered bases by
+    /// default, and stores it as an external reference when the caller allows
+    /// references outside the bases.
+    #[rstest::rstest]
+    #[case::v2_full(false, false, true)]
+    #[case::v2_partial_update(false, true, true)]
+    #[case::indexed_full(true, false, true)]
+    #[case::indexed_partial_insert(true, true, false)]
+    #[tokio::test]
+    async fn test_merge_insert_with_params_stores_external_blob_outside_bases(
+        #[case] indexed: bool,
+        #[case] partial: bool,
+        #[case] update: bool,
+        #[values(false, true)] allow: bool,
+    ) {
+        use crate::{BlobArrayBuilder, blob_field};
+        use arrow_schema::Schema as ArrowSchema;
+
+        let test_dir = TempStrDir::default();
+        let outside = format!("{test_dir}/outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_uri = |name: &str, bytes: &[u8]| {
+            let path = format!("{outside}/{name}");
+            std::fs::write(&path, bytes).unwrap();
+            format!("file://{path}")
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blobs", true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let mut managed = BlobArrayBuilder::new(2);
+        managed.push_bytes(b"foo").unwrap();
+        managed.push_bytes(b"bar").unwrap();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                managed.finish().unwrap(),
+                Arc::new(Int64Array::from(vec![0, 1])),
+                Arc::new(Int64Array::from(vec![0, 10])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema.clone()),
+            &format!("{test_dir}/dataset"),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if indexed {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut external = BlobArrayBuilder::new(2);
+        external.push_uri(outside_uri("one", b"one")).unwrap();
+        external.push_uri(outside_uri("two", b"two")).unwrap();
+        let mut source = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                external.finish().unwrap(),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        if partial {
+            source = source.project(&[0, 1]).unwrap();
+        }
+
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(if update {
+                WhenMatched::UpdateAll
+            } else {
+                WhenMatched::DoNothing
+            })
+            .when_not_matched(WhenNotMatched::InsertAll);
+        if allow {
+            builder.with_params(&WriteParams {
+                allow_external_blob_outside_bases: true,
+                ..Default::default()
+            });
+        }
+        let result = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await;
+        if !allow {
+            let error = result.expect_err("a URI outside the bases is refused by default");
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside registered external bases"),
+                "{error}"
+            );
+            return;
+        }
+        let (new_dataset, _) = result.unwrap();
+
+        let ids = new_dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = ids["id"].as_primitive::<arrow_array::types::Int64Type>();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&(0..ids.len() as u64).collect::<Vec<_>>(), "blobs")
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for (row, blob) in blobs.into_iter().enumerate() {
+            let blob = blob.unwrap();
+            let external = blob.uri().is_some();
+            actual.push((
+                ids.value(row),
+                blob.read().await.unwrap().to_vec(),
+                external,
+            ));
+        }
+        actual.sort();
+        let matched = if update {
+            (1, b"one".to_vec(), true)
+        } else {
+            (1, b"bar".to_vec(), false)
+        };
+        assert_eq!(
+            actual,
+            vec![
+                (0, b"foo".to_vec(), false),
+                matched,
+                (2, b"two".to_vec(), true)
+            ]
+        );
+    }
+
+    /// The file options of `with_params` reach every path that writes new
+    /// rows: with one row per file, three inserted rows make three fragments.
+    #[rstest::rstest]
+    #[case::v2_full(false, false)]
+    #[case::indexed_full(true, false)]
+    #[case::indexed_partial(true, true)]
+    #[tokio::test]
+    async fn test_merge_insert_with_params_applies_file_options_on_every_path(
+        #[case] indexed: bool,
+        #[case] partial: bool,
+        #[values(false, true)] with_params: bool,
+    ) {
+        let initial = record_batch!(("id", Int64, [0, 1]), ("value", Int64, [0, 10])).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        if indexed {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let before = dataset.get_fragments().len();
+        let mut source =
+            record_batch!(("id", Int64, [2, 3, 4]), ("value", Int64, [20, 30, 40])).unwrap();
+        if partial {
+            source = source.project(&[0]).unwrap();
+        }
+
+        let mut builder =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        if with_params {
+            builder.with_params(&WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            });
+        }
+        let (new_dataset, stats) = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, 3);
+        assert_eq!(
+            new_dataset.get_fragments().len() - before,
+            if with_params { 3 } else { 1 }
+        );
+    }
+
+    /// `try_build` refuses write parameters a merge insert sets on its own
+    /// builder or cannot honor.
+    #[tokio::test]
+    async fn test_merge_insert_with_params_refuses_what_merge_insert_owns() {
+        let initial = record_batch!(("id", Int64, [0])).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        for (params, needle) in [
+            (
+                WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                },
+                "mode=Overwrite",
+            ),
+            (
+                WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                },
+                "mode=Append",
+            ),
+            (
+                WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                },
+                "data_storage_version",
+            ),
+            (
+                WriteParams {
+                    target_bases: Some(vec![0]),
+                    ..Default::default()
+                },
+                "target_bases=Some([0])",
+            ),
+            (
+                WriteParams {
+                    target_all_bases: Some(true),
+                    ..Default::default()
+                },
+                "target_all_bases=Some(true)",
+            ),
+            (
+                WriteParams {
+                    external_blob_mode: ExternalBlobMode::Ingest,
+                    ..Default::default()
+                },
+                "ingest",
+            ),
+        ] {
+            let error = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                .unwrap()
+                .with_params(&params)
+                .try_build()
+                .err()
+                .unwrap_or_else(|| panic!("{needle} must be refused"));
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
     }
 
     #[tokio::test]

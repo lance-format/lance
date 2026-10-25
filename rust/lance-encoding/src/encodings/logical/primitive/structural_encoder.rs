@@ -1476,7 +1476,13 @@ impl PrimitiveStructuralEncoder {
         };
 
         let compressor = compression_strategy.create_per_value(field, &data)?;
-        let (compressed_data, value_encoding) = compressor.compress(data)?;
+        let validity = if compressor.needs_row_validity() {
+            Self::leaf_validity(&repdef, data.num_values() as usize)?
+        } else {
+            None
+        };
+        let (compressed_data, value_encoding) =
+            compressor.compress_with_validity(data, validity.as_ref())?;
 
         let description = match &compressed_data {
             PerValueDataBlock::Fixed(fixed) => EncodingUtils::fixed_full_zip_layout(
