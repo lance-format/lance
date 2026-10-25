@@ -6655,7 +6655,7 @@ mod tests {
         for name in ["plain", "räksmörgås", "growth%"] {
             let mut req = DeclareTableRequest::new();
             req.id = Some(vec![name.to_string()]);
-            let resp = dir_namespace.declare_table(req).await.unwrap();
+            dir_namespace.declare_table(req).await.unwrap();
             let mut drop = DropTableRequest::new();
             drop.id = Some(vec![name.to_string()]);
             dir_namespace.drop_table(drop).await.unwrap();
@@ -6664,7 +6664,6 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok().map(|e| e.file_name()))
                 .collect();
-            eprintln!("after drop, temp dir entries: {:?}", entries);
             assert_eq!(
                 entries.len(),
                 1,
