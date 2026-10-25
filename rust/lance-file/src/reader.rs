@@ -2618,6 +2618,13 @@ mod tests {
     #[case("binary_range")]
     #[case("binary_delta")]
     #[case("vector_dictionary")]
+    #[case("tensor_zstd")]
+    #[case("tensor_axis-on_zstd")]
+    #[case("tensor_axis-auto_zstd")]
+    #[case("tensor_axis-off_zstd")]
+    #[case("tensor_axis-auto_dense_lz4")]
+    #[case("tensor_axis-auto_noise_zstd")]
+    #[case("tensor_axis-auto_noise_dense_lz4")]
     #[tokio::test]
     async fn sparse_file_writer_reader_scan_range_and_take_roundtrip(#[case] kind: &str) {
         let fs = FsFixture::default();
@@ -2726,30 +2733,109 @@ mod tests {
             )
             .unwrap();
         }
-        if kind == "vector_dictionary" {
-            let vectors = Arc::new(FixedSizeListArray::new(
+        if kind == "vector_dictionary" || kind.starts_with("tensor_") {
+            let rows = if kind.starts_with("tensor_") {
+                32
+            } else {
+                2048
+            };
+            let mut vectors = Arc::new(FixedSizeListArray::new(
                 Arc::new(Field::new("item", DataType::Float32, true)),
                 64,
                 Arc::new(Float32Array::from(
-                    (0..2048 * 64)
+                    (0..rows * 64)
                         .map(|i| (i % 7 != 0).then_some((i % (17 * 64)) as f32 / 10.0))
                         .collect::<Vec<_>>(),
                 )),
                 Some(NullBuffer::from(
-                    (0..2048).map(|i| i % 8 != 0).collect::<Vec<_>>(),
+                    (0..rows).map(|i| i % 8 != 0).collect::<Vec<_>>(),
                 )),
             ));
-            let metadata = HashMap::from([(
+            let mut metadata = HashMap::from([(
                 STRUCTURAL_ENCODING_META_KEY.to_string(),
                 STRUCTURAL_ENCODING_SPARSE.to_string(),
             )]);
+            if kind == "tensor_zstd" {
+                metadata.insert("lance-encoding:axis-delta".into(), "off".into());
+                vectors = Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Int32, true)),
+                    64,
+                    Arc::new(arrow_array::Int32Array::from(
+                        (0..rows * 64)
+                            .map(|i| (i % 7 != 0).then_some(i % (17 * 64)))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Some(NullBuffer::from(
+                        (0..rows).map(|i| i % 8 != 0).collect::<Vec<_>>(),
+                    )),
+                ));
+            }
+            if kind.starts_with("tensor_") {
+                metadata.insert(
+                    "lance-encoding:compression".to_string(),
+                    if kind.ends_with("lz4") { "lz4" } else { "zstd" }.to_string(),
+                );
+                metadata.insert(
+                    "lance-encoding:compression-level".to_string(),
+                    "3".to_string(),
+                );
+            }
+            if kind.contains("axis-") {
+                let mode = kind
+                    .split('_')
+                    .nth(1)
+                    .unwrap()
+                    .strip_prefix("axis-")
+                    .unwrap();
+                metadata.insert(
+                    "lance-encoding:axis-delta".into(),
+                    if mode == "off" {
+                        "off".into()
+                    } else {
+                        format!("{mode}:1")
+                    },
+                );
+                metadata.insert(
+                    "ARROW:extension:name".into(),
+                    "arrow.fixed_shape_tensor".into(),
+                );
+                metadata.insert(
+                    "ARROW:extension:metadata".into(),
+                    r#"{"shape":[16,16,3]}"#.into(),
+                );
+                if kind.contains("dense") {
+                    metadata.insert(STRUCTURAL_ENCODING_META_KEY.into(), "fullzip".into());
+                }
+                let mut noise = 137_u32;
+                vectors = Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::Int32, true)),
+                    768,
+                    Arc::new(arrow_array::Int32Array::from(
+                        (0..rows * 768)
+                            .map(|i| {
+                                if kind.contains("noise") {
+                                    noise ^= noise << 13;
+                                    noise ^= noise >> 17;
+                                    noise ^= noise << 5;
+                                    noise as i32
+                                } else {
+                                    (i * 131) - 100_000
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                    Some(NullBuffer::from(
+                        (0..rows).map(|i| i % 8 != 0).collect::<Vec<_>>(),
+                    )),
+                ));
+            }
             let item = Arc::new(
                 Field::new("item", vectors.data_type().clone(), true)
                     .with_metadata(metadata.clone()),
             );
             let lists = Arc::new(ListArray::new(
                 item.clone(),
-                OffsetBuffer::new(ScalarBuffer::from((0..=2048).collect::<Vec<i32>>())),
+                OffsetBuffer::new(ScalarBuffer::from((0..=rows).collect::<Vec<i32>>())),
                 vectors.clone(),
                 None,
             ));
@@ -2787,6 +2873,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(file_reader.metadata().column_infos.len(), 2);
+        if kind.starts_with("tensor_") {
+            for column in &file_reader.metadata().column_infos {
+                for page in column.page_infos.iter() {
+                    let PageEncoding::Planar(layout) = &page.encoding else {
+                        panic!("expected Planar page")
+                    };
+                    let Some(lance_encoding::format::pb23::value_plane::Codec::Zipped(values)) =
+                        layout.values.as_ref().and_then(|v| v.codec.as_ref())
+                    else {
+                        panic!("expected zipped tensors")
+                    };
+                    if kind.contains("noise") {
+                        assert!(matches!(
+                            values.compression.as_ref().unwrap().compression,
+                            Some(metadata::compressive_encoding::Compression::FixedSizeList(
+                                _
+                            ))
+                        ));
+                        assert!(matches!(
+                            values.addressing,
+                            Some(lance_encoding::format::pb23::zipped_values::Addressing::BitsPerValue(_))
+                        ));
+                        continue;
+                    }
+                    let Some(metadata::compressive_encoding::Compression::General(general)) =
+                        &values.compression.as_ref().unwrap().compression
+                    else {
+                        panic!("expected generally compressed tensors");
+                    };
+                    assert_eq!(
+                        matches!(
+                            general.values.as_ref().unwrap().compression,
+                            Some(metadata::compressive_encoding::Compression::AxisDelta(_))
+                        ),
+                        kind.contains("axis-on") || kind.contains("axis-auto")
+                    );
+                }
+            }
+        }
         if kind == "vector_dictionary" {
             for column in &file_reader.metadata().column_infos {
                 for page in column.page_infos.iter() {
@@ -3427,6 +3552,77 @@ mod tests {
             error.to_string().contains("out of bounds"),
             "unexpected message: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_legacy_wrapped_bitpacked_levels() {
+        use arrow_array::{Array, Float16Array, Int64Array, LargeListArray};
+
+        let fs = FsFixture::default();
+        fs.object_store
+            .put(
+                &fs.tmp_path,
+                include_bytes!("../../../test_data/v6.0.1/wrapped_bitpacked_levels.lance"),
+            )
+            .await
+            .unwrap();
+        let file = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        for batch_size in [128, 2048, 8192] {
+            for range in [0..70065, 60..72, 65530..65550, 70060..70065] {
+                let batches = reader
+                    .read_stream(
+                        lance_io::ReadBatchParams::Range(range.clone()),
+                        batch_size,
+                        1,
+                        FilterExpression::no_filter(),
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let mut row = range.start;
+                for batch in batches {
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let vectors = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<LargeListArray>()
+                        .unwrap();
+                    for i in 0..batch.num_rows() {
+                        assert_eq!(ids.value(i), row as i64);
+                        assert_eq!(vectors.is_null(i), (64..70064).contains(&row));
+                        if vectors.is_valid(i) {
+                            let value = vectors.value(i);
+                            let value = value.as_any().downcast_ref::<Float16Array>().unwrap();
+                            assert_eq!(value.len(), 2048);
+                            for (j, scalar) in value.values().iter().enumerate() {
+                                assert_eq!(scalar.to_f32(), j as f32);
+                            }
+                        }
+                        row += 1;
+                    }
+                }
+                assert_eq!(row, range.end);
+            }
+        }
     }
 
     #[tokio::test]

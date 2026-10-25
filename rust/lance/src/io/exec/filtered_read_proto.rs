@@ -88,10 +88,10 @@ pub fn filtered_read_exec_to_proto_with_table(
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
-    let filter_schema = Arc::new(prune_schema_for_substrait(&dataset_schema));
+    let filter_schema = Arc::new(prune_schema_for_substrait(&exec.dataset().schema().into()));
     let options = fr_options_to_proto(exec.options(), &filter_schema, state)?;
 
-    let plan = match plan {
+    let plan = match exec.plan() {
         Some(plan) => Some(plan_to_proto(&plan, &filter_schema, state)?),
         None => None,
     };

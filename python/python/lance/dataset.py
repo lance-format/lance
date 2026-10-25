@@ -3595,11 +3595,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "BLOOMFILTER",
                 "RTREE",
                 "MINHASHLSH",
+                "FM",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER", "RTREE" or "MINHASHLSH" are '
+                        '"INVERTED", "BLOOMFILTER", "RTREE", "MINHASHLSH" or "FM" are '
                         f"supported for scalar columns.  Received {index_type}",
                     )
                 )
@@ -3703,6 +3704,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BLOOMFILTER",
             "LABEL_LIST",
             "MINHASHLSH",
+            "FM",
         }
 
     @classmethod
@@ -3719,6 +3721,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BLOOMFILTER",
             "LABEL_LIST",
             "MINHASHLSH",
+            "FM",
         }
 
     def create_scalar_index(
@@ -3735,6 +3738,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
             Literal["MINHASHLSH"],
+            Literal["FM"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3811,6 +3815,8 @@ class LanceDataset(pa.dataset.Dataset):
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
+        * ``FM``. An FM-index for substring search. It answers ``contains``
+          filters exactly, including single-character patterns.
 
         Index training sorts can spill to disk under memory pressure.
         ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
@@ -3839,7 +3845,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``, ``"FM"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3871,6 +3877,12 @@ class LanceDataset(pa.dataset.Dataset):
             If unset, Lance uses ``LANCE_FTS_FORMAT_VERSION`` when present and
             otherwise writes v2 for text analysis with ``block_size=128`` and
             v3 for code analysis or ``block_size=256``.
+
+        num_segments: int, optional
+            This is for ``index_type="FM"``. Split the fragments, in order, into
+            at most this many segments, each an independent FM-index. There are
+            never more segments than fragments. ``create_index_uncommitted``
+            ignores it and always writes one segment.
 
         document_granularity: DocumentGranularity, default ROW
             This is for the ``INVERTED`` / ``FTS`` index. ``ROW`` treats all
@@ -3913,6 +3925,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
+            * "code": splits code-like text. Requires FTS format v3 and enables
+              the code analyzer options below.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
@@ -3937,6 +3951,34 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+        analyzer: str, optional
+            This is for the ``INVERTED`` index. Selects an analyzer profile:
+            ``"text"`` (the default) or ``"code"``. The ``"code"`` profile sets
+            ``base_tokenizer="code"`` and applies code-oriented defaults:
+            ``split_identifiers=False``, ``split_on_numerics=True``,
+            ``preserve_original=True``, ``stem=False``, and
+            ``remove_stop_words=False``. If unset, the profile is inferred from
+            ``base_tokenizer="code"``. Explicit arguments override the profile
+            defaults. Code analysis requires FTS format v3.
+        split_identifiers: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifiers such as ``getUserName`` are split into subwords
+            (``get``, ``User``, ``Name``) so each subword is searchable. When
+            False, an identifier is only indexed as a whole, so ``getUserName``
+            is not matched by ``user``.
+        split_on_numerics: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifier subwords are split at letter/number boundaries, for
+            example ``value42`` into ``value`` and ``42``. Only takes effect
+            when ``split_identifiers=True``.
+        preserve_original: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            the complete identifier is indexed in addition to its subwords.
+            Only takes effect when ``split_identifiers=True``.
+        index_operators: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            code operators such as ``::``, ``->``, and ``!=`` are indexed.
+            Other punctuation is still dropped.
 
         Examples
         --------
@@ -4729,8 +4771,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, and MINHASHLSH
-        scalar index construction.
+        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, MINHASHLSH
+        scalar, and FM scalar index construction.
         Unlike :meth:`create_index`, this method does not publish the index into
         the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4747,7 +4789,7 @@ class LanceDataset(pa.dataset.Dataset):
            :meth:`commit_existing_index_segments`
 
         BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER,
-        LABEL_LIST, and MINHASHLSH segments may be merged with
+        LABEL_LIST, MINHASHLSH, and FM segments may be merged with
         :meth:`merge_existing_index_segments` before commit. MINHASHLSH
         segments of one index must share parameters. NGRAM segments
         built before a deferred compaction must be merged before commit so
@@ -6150,12 +6192,22 @@ class BulkCommitResult(TypedDict):
 
 @dataclass
 class Transaction:
+    """A dataset change based on one read version.
+
+    Attributes
+    ----------
+    tag: str, optional
+        Optional label stored with the transaction and returned by
+        :meth:`LanceDataset.read_transaction`.
+    """
+
     read_version: int
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
+    tag: Optional[str] = None
 
 
 class Tag(TypedDict):
@@ -6491,6 +6543,9 @@ class LanceOperation:
             each serialized in the portable RoaringBitmap format. Set on
             ``rewrite_columns`` updates over stable row ids so the commit
             refreshes row-level version metadata for the matched rows only.
+        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
+            MemWAL SSTables to record as compacted. An empty list changes
+            nothing. A non-empty list requires a MemWAL index on the table.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6504,6 +6559,9 @@ class LanceOperation:
         )
         update_mode: str = ""
         updated_fragment_offsets: Optional[Dict[int, bytes]] = None
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
+            default_factory=list
+        )
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -6659,6 +6717,9 @@ class LanceOperation:
             Groups of files that have been rewritten.
         rewritten_indices: list[RewrittenIndex]
             Indices that have been rewritten.
+        frag_reuse_index: Index, optional
+            Fragment reuse index entry to install with this rewrite. ``None``
+            leaves the existing entry unchanged.
 
         Warning
         -------
@@ -6666,7 +6727,8 @@ class LanceOperation:
         """
 
         groups: Iterable[LanceOperation.RewriteGroup]
-        rewritten_indices: Iterable[LanceOperation.RewrfittenIndex]
+        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+        frag_reuse_index: Optional[Index] = None
 
         def __post_init__(self):
             all_frags = [old for group in self.groups for old in group.old_fragments]
@@ -6862,6 +6924,23 @@ class LanceOperation:
         table_metadata_updates: Optional[LanceOperation.UpdateMap] = None
         schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
         field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
+
+    @dataclass
+    class UpdateMemWalState(BaseOperation):
+        """Record MemWAL SSTables compacted into the base table.
+
+        An empty list commits as a no-op. A non-empty list requires a MemWAL
+        index (``__lance_mem_wal``) and updates that index's compaction record.
+
+        Attributes
+        ----------
+        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
+            SSTables to mark compacted, one entry per shard.
+        """
+
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
+            default_factory=list
+        )
 
 
 @dataclass
@@ -7271,6 +7350,9 @@ class ScannerBuilder:
             When ``use_index`` is true and a vector index is available, each query
             vector is searched through the index path; otherwise the flat batch path
             is used.
+        ef: int, optional
+            Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
+            floored at 256.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -7622,10 +7704,69 @@ class LanceScanner(pa.dataset.Scanner):
         return lst
 
     def take(self, indices):
+        """Select rows of data by their position in the scan results.
+
+        ``indices`` are 0-based positions within this scanner's output — the
+        rows that survive the scanner's filter, in scan order. This matches
+        ``pyarrow.dataset.Scanner.take()`` and is different from
+        :meth:`LanceDataset.take`, which ignores the scanner filter and takes
+        rows by absolute dataset row number.
+
+        Parameters
+        ----------
+        indices : int or array-like
+            Positions of the matching rows to select. A large index requires
+            scanning through the matching rows up to it, so the cost is
+            proportional to the largest index, not to the number of indices.
+
+        Returns
+        -------
+        Table
         """
-        Not implemented
-        """
-        raise NotImplementedError("take")
+        if isinstance(indices, int):
+            indices = [indices]
+        elif isinstance(indices, pa.Array):
+            # pyarrow Scanner.take() also accepts pa.Array; list() on one
+            # yields pyarrow Scalars, so normalize to python ints.
+            indices = indices.to_pylist()
+        indices = list(indices)
+        if not indices:
+            raise ValueError("take requires at least one index")
+        if any(not isinstance(i, (int, np.integer)) or i < 0 for i in indices):
+            raise ValueError(f"indices must be non-negative integers, got {indices}")
+
+        # Collect the rows at the requested filtered-relative positions. Rows
+        # are gathered in scan order first and re-ordered to the caller's
+        # index order at the end, so repeated and unsorted indices work.
+        max_index = max(indices)
+        sorted_unique = sorted(set(indices))
+        batches = []
+        matched = 0  # number of matching rows consumed so far
+        exhausted = False
+        for batch in self.to_batches():
+            batch_end = matched + batch.num_rows
+            positions = [i - matched for i in sorted_unique if matched <= i < batch_end]
+            if positions:
+                batches.append(batch.take(positions))
+            matched = batch_end
+            if matched > max_index:
+                exhausted = True
+                break
+        if not exhausted:
+            # The stream ended before covering max_index, so matched is the
+            # full row count of the scan output. (count_rows is unavailable
+            # here anyway when the scanner has a limit/offset.)
+            raise IndexError(
+                f"index {max_index} is out of bounds for a scan with {matched} rows"
+            )
+
+        # Reaching here means max_index was covered by the scan, so at least
+        # one row was collected.
+        table = pa.Table.from_batches(batches)
+        # rows are in sorted-unique index order; map back to the caller's order.
+        row_lookup = {idx: i for i, idx in enumerate(sorted_unique)}
+        take_order = [row_lookup[i] for i in indices]
+        return table.take(take_order)
 
     def head(self, num_rows):
         """
@@ -8583,7 +8724,8 @@ def _build_vector_search_query(
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
-        The ef parameter for HNSW search.
+        Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
+        floored at 256.
     query_parallelism: int, optional
         Maximum partition-search concurrency for a single vector query.
         The default is 0. Value 0 uses the automatic policy, which currently

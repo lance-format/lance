@@ -4267,6 +4267,7 @@ dependencies = [
  "num-traits",
  "prost",
  "prost-build",
+ "serde_json",
  "tokio",
  "tracing",
  "xxhash-rust",

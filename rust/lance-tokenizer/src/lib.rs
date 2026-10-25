@@ -26,7 +26,7 @@ pub use alphanum_only::AlphaNumOnlyFilter;
 pub use analyzer::{TextAnalyzer, TextAnalyzerBuilder};
 pub use ascii_folding_filter::AsciiFoldingFilter;
 pub use code_tokenizer::CodeLexTokenizer;
-pub use icu::IcuTokenizer;
+pub use icu::{IcuStreamingTokenizer, IcuTokenizer};
 #[cfg(feature = "tokenizer-jieba")]
 pub use jieba::JiebaTokenizer;
 #[cfg(feature = "tokenizer-lindera")]

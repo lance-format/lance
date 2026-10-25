@@ -6,6 +6,7 @@ use std::vec;
 
 use crate::Dataset;
 use crate::dataset::tests::dataset_transactions::execute_sql;
+use crate::dataset::transaction::{Operation, Transaction, UpdateMode};
 use crate::dataset::{
     MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
     WriteParams,
@@ -15,7 +16,8 @@ use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Int64Type};
+use arrow_array::record_batch;
+use arrow_array::types::{Float64Type, Int32Type, Int64Type};
 use arrow_array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field};
 use datafusion::common::{assert_contains, assert_not_contains};
@@ -25,6 +27,8 @@ use geoarrow_array::{
     builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
 };
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
+use lance_arrow::RecordBatchExt;
+use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
@@ -236,6 +240,173 @@ async fn test_geo_rtree_index() {
         .unwrap();
 
     assert_intersects_sql(&mut dataset, true).await;
+}
+
+#[rstest]
+#[case::stale_unspecified(false, None)]
+#[case::latest_unspecified(true, None)]
+#[case::stale_rewrite_columns(false, Some(UpdateMode::RewriteColumns))]
+#[case::latest_rewrite_columns(true, Some(UpdateMode::RewriteColumns))]
+#[tokio::test]
+async fn test_staged_rtree_after_rewrite_columns(
+    #[case] checkout_latest: bool,
+    #[case] update_mode: Option<UpdateMode>,
+) {
+    let point_type = PointType::new(Dimension::XY, Default::default());
+    let mut points = PointBuilder::new(point_type.clone());
+    for point in [
+        Some(geo_types::point!(x: 0.0, y: 0.0)),
+        Some(geo_types::point!(x: 1.0, y: 1.0)),
+        None,
+        Some(geo_types::point!(x: 10.0, y: 10.0)),
+    ] {
+        points.push_point(point.as_ref());
+    }
+    let batch = record_batch!(("id", Int32, [0, 1, 2, 3]))
+        .unwrap()
+        .try_with_column(
+            point_type.to_field("point", true),
+            points.finish().to_array_ref(),
+        )
+        .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let segment = dataset
+        .create_index_builder(
+            &["point"],
+            IndexType::RTree,
+            &ScalarIndexParams::new("RTree".to_string()),
+        )
+        .name("point_rtree".to_string())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    let mut points = PointBuilder::new(point_type.clone());
+    points.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
+    let update = record_batch!((ROW_ID, UInt64, [0]))
+        .unwrap()
+        .try_with_column(
+            point_type.to_field("point", true),
+            points.finish().to_array_ref(),
+        )
+        .unwrap();
+    let update_schema = update.schema();
+    let (fragment, fields_modified) = dataset
+        .get_fragment(0)
+        .unwrap()
+        .update_columns(
+            RecordBatchIterator::new([Ok(update)], update_schema),
+            ROW_ID,
+            ROW_ID,
+        )
+        .await
+        .unwrap();
+    let point_field_id = dataset.schema().field("point").unwrap().id as u32;
+    let id_field_id = dataset.schema().field("id").unwrap().id as u32;
+    assert!(fields_modified.contains(&point_field_id));
+    assert!(!fields_modified.contains(&id_field_id));
+    let mut updated = dataset.clone();
+    updated
+        .apply_commit(
+            Transaction::new(
+                dataset.version().version,
+                Operation::Update {
+                    updated_fragments: vec![fragment],
+                    fields_modified,
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![],
+                    compacted_sstables: vec![],
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode,
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    if checkout_latest {
+        dataset = updated;
+    }
+    dataset
+        .commit_existing_index_segments("point_rtree", "point", vec![segment])
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(
+        indices[0].fragment_bitmap.as_ref().unwrap(),
+        &roaring::RoaringBitmap::from_iter([1]),
+    );
+    for (filter, expected) in [
+        (
+            "ST_Intersects(point, ST_GeomFromText('POINT (10 10)'))",
+            vec![0, 3],
+        ),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POINT (0 0)'))",
+            vec![],
+        ),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POINT (1 1)'))",
+            vec![1],
+        ),
+        ("point IS NULL", vec![2]),
+    ] {
+        for use_scalar_index in [false, true] {
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&["id"])
+                .unwrap()
+                .filter(filter)
+                .unwrap()
+                .use_scalar_index(use_scalar_index);
+            if use_scalar_index && filter.starts_with("ST_Intersects") {
+                assert_contains!(
+                    scanner.explain_plan(false).await.unwrap(),
+                    "ScalarIndexQuery"
+                );
+            }
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "{filter}, use_scalar_index={use_scalar_index}"
+            );
+        }
+        let batches = dataset
+            .sql(&format!(
+                "SELECT id FROM dataset WHERE {filter} ORDER BY id"
+            ))
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let ids = batches
+            .iter()
+            .flat_map(|batch| batch["id"].as_primitive::<Int32Type>().values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "SQL: {filter}");
+    }
 }
 
 /// The square `(0 0)-(4 4)` as a constant geometry.

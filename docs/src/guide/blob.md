@@ -3,6 +3,9 @@
 Lance can store large binary objects (images, videos, audio, model artifacts) in blob columns, where they are treated like any other column payload in the dataset.
 Blob columns support both planned full-payload reads and lazy file-like access.
 
+For the logical input contract, stored descriptors, and payload ownership rules,
+see the [Blob v2 Specification](../format/table/blob.md).
+
 !!! tip "Choosing between `read_blobs` and `take_blobs`"
     - For data loaders and batch processing that need complete byte payloads, use `read_blobs`.
     - Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
@@ -87,19 +90,20 @@ to enable new Blob v2 writes.
 
 ### Managed objects and client compatibility
 
-With Arrow schema metadata `lance.blob.managed=true`, writers store out-of-line
-Blob v2 payloads in independently named
-`_blobs/<uuid>.blob` objects and publish the Managed Blob reader and writer
-capability on the table. This works with file formats 2.2 and 2.3; it does not
-require choosing 2.3. Clients that do not understand the capability must refuse
-to open a flagged snapshot. Updating an existing table with Blob data files can
-activate it, even if that batch contains only inline values. The capability
-remains set across later writes and restores. Without this opt-in, writers use
-Inline, Packed and Dedicated storage; prepared Managed references are rejected.
+Set schema metadata `lance.blob.managed` to `"true"` to store out-of-line Blob v2
+payloads in independently named `_blobs/<uuid>.blob` objects. Without this
+opt-in, writes and compaction keep Inline/Packed/Dedicated placement, and
+prepared Managed references are rejected. This works with file formats 2.2
+and 2.3; it does not require choosing 2.3.
 
-Compaction preserves Managed payload objects and can adopt existing Packed or
-Dedicated sidecars in place. For example, compaction can replace `data/A.lance`
-with `data/B.lance` while B's Managed descriptor records the base and path of
+Committing the opt-in immediately publishes the Managed Blob reader and writer
+capability, even without new blob files. Clients that do not understand the
+capability must refuse to open a flagged snapshot. The capability remains set
+across later writes and restores, including after removing the opt-in.
+
+With the opt-in, compaction preserves Managed payload objects and can adopt
+existing Packed or Dedicated sidecars in place. For example, it can replace
+`data/A.lance` with `data/B.lance` while B's Managed descriptor records the base and path of
 the existing `data/A/0001.blob`. Cleanup can then delete `data/A.lance` without
 copying or deleting the blob that B still references. The blob's path may retain
 A's name, but resolving and retaining the blob no longer requires A's data file.
@@ -169,9 +173,10 @@ assert [data for _, data in ds.read_blobs("blob", indices=range(4))] == [b"share
 
 The four rows share one immutable payload object, including after compaction.
 Cleanup retains the whole object while any retained snapshot references it.
-Keep the source snapshot protected, for example with a tag, until the append
-commits if concurrent updates and cleanup can otherwise retire it. An open
-dataset handle alone does not protect a snapshot from cleanup.
+When reusing an object from an existing snapshot, keep that snapshot protected,
+for example with a tag, until the append commits if concurrent updates and
+cleanup can otherwise retire it. An open dataset handle alone does not protect
+a snapshot from cleanup.
 
 Use references from the same table and preserve their base identity. Kind 5
 descriptors require their registered `blob_id` as `base_id`; for kind 4, the base

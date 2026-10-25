@@ -27,7 +27,7 @@ use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
-    Error, ROW_ID, Result,
+    Error, ROW_ADDR, Result,
     cache::{
         CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
         KeyBuilder, LanceCache, WeakLanceCache,
@@ -48,6 +48,7 @@ use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
     btree::{OrderableScalarValue, filter_keeps_nothing},
 };
+use crate::cache_pb::BitmapIndexHeader;
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
@@ -97,7 +98,35 @@ const MAX_ROWS_PER_CHUNK: usize = 2 * 1024;
 // I/O over a reasonable number of rows per read.
 const MERGE_ROWS_PER_CHUNK: usize = 512;
 
-const BITMAP_INDEX_VERSION: u32 = 0;
+/// Bitmap index format version 0: the index stores row ids (`_rowid`).
+///
+/// A row id and a row address are the same value on a dataset that does not
+/// use stable row ids, so a freshly built index is still labeled this version
+/// there even though training always scans addresses -- see
+/// `build_scalar_index`'s and `build_bitmap_index_segment`'s Bitmap-specific
+/// override of the trained version. That keeps a user who never turns on
+/// stable row ids from seeing any forward-compatibility impact from the
+/// address-domain migration: old builds already understand this version.
+pub const BITMAP_ROW_ID_DOMAIN_VERSION: u32 = 0;
+/// Bitmap index format version 1: the index stores physical row addresses
+/// (`_rowaddr`).
+///
+/// The older version (0) stored row ids (`_rowid`).
+pub const BITMAP_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
+/// The latest index format version (mainly used in tests that don't want to
+/// target a specific version)
+const BITMAP_INDEX_VERSION: u32 = BITMAP_ROW_ADDR_DOMAIN_VERSION;
+
+/// The index format version for a segment of the given domain: preserve a
+/// segment's own domain (row-id or row-address) rather than always writing
+/// the latest version this build can produce.
+fn bitmap_version_for_domain(results_are_row_addresses: bool) -> u32 {
+    if results_are_row_addresses {
+        BITMAP_ROW_ADDR_DOMAIN_VERSION
+    } else {
+        BITMAP_ROW_ID_DOMAIN_VERSION
+    }
+}
 
 // We only need to open a file reader if we need to load a bitmap. If all
 // bitmaps are cached we don't open it. If we do open it we should only open it once.
@@ -160,6 +189,13 @@ pub struct BitmapIndex {
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 
     lazy_reader: LazyIndexReader,
+
+    /// Whether this segment's bitmaps hold physical row addresses (`true`)
+    /// or row ids directly (`false`, a legacy segment persisted before
+    /// [`BITMAP_ROW_ADDR_DOMAIN_VERSION`]). Passed in at load time from
+    /// `IndexMetadata::index_version`; see
+    /// [`ScalarIndex::results_are_row_addresses`].
+    results_are_row_addresses: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +260,8 @@ pub struct BitmapIndexState {
     /// Value-to-row-offset lookup. Stored as `Arc` so cloning into a new
     /// [`BitmapIndex`] is O(1).
     index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
+    /// See [`BitmapIndex::results_are_row_addresses`].
+    results_are_row_addresses: bool,
 }
 
 impl DeepSizeOf for BitmapIndexState {
@@ -238,6 +276,7 @@ impl BitmapIndexState {
             null_map: index.null_map.clone(),
             value_type: index.value_type.clone(),
             index_map: index.index_map.clone(),
+            results_are_row_addresses: index.results_are_row_addresses,
         }
     }
 
@@ -266,6 +305,7 @@ impl BitmapIndexState {
             store,
             WeakLanceCache::from(index_cache),
             frag_reuse_index,
+            self.results_are_row_addresses,
         )))
     }
 
@@ -281,6 +321,9 @@ impl BitmapIndexState {
             null_map: Arc::new(null_map),
             value_type,
             index_map: Arc::new(index_map),
+            // Every caller of this test helper (bitmap and label-list codec
+            // tests alike) exercises the row-id-domain shape.
+            results_are_row_addresses: false,
         }
     }
 
@@ -361,14 +404,25 @@ fn parse_lookup_batch(
 
 impl CacheCodecImpl for BitmapIndexState {
     const TYPE_ID: &'static str = "lance.scalar.BitmapIndexState";
-    /// Version 1 wrote the lookup as a single-batch IPC stream. Version 2
-    /// writes several bounded batches, which version-1 readers reject, so
-    /// they must see these entries as unsupported and miss. This build still
-    /// reads version 1: a one-batch stream is a multi-batch stream.
-    const CURRENT_VERSION: u32 = 2;
+    /// Version 1 wrote the lookup as a single-batch IPC stream, with no
+    /// header (every segment was still row-id domain). Version 2 writes
+    /// several bounded batches instead, which version-1 readers reject, so
+    /// they must see these entries as unsupported and miss; this build still
+    /// reads version 1, since a one-batch stream is a multi-batch stream.
+    /// Version 3 adds the header carrying `results_are_row_addresses`;
+    /// versions 1 and 2 predate the row-address migration and so have no
+    /// header section at all, and are read back as row-id domain.
+    ///
+    /// [`deserialize`](Self::deserialize) branches on `r.version()` to decide
+    /// whether the header is present, and `LabelListIndexState` embeds this
+    /// body as-is and forwards its own reader's version unchanged, so
+    /// `LabelListIndexState::CURRENT_VERSION` must stay in lockstep with this
+    /// one.
+    const CURRENT_VERSION: u32 = 3;
 
     /// Wire format:
     /// ```text
+    /// HEADER    : BitmapIndexHeader proto (results_are_row_addresses, v3+ only)
     /// RAW_BLOB  : null_map (roaring tree map, portable encoding)
     /// ARROW_IPC : one or more (keys: <value_type>, offsets: UInt64) batches
     /// ```
@@ -377,6 +431,10 @@ impl CacheCodecImpl for BitmapIndexState {
     /// key takes a batch of its own. The value type is recovered from the IPC
     /// section schema.
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let header = BitmapIndexHeader {
+            results_are_row_addresses: self.results_are_row_addresses,
+        };
+        w.write_header(&header)?;
         let mut null_bytes = Vec::with_capacity(self.null_map.serialized_size());
         self.null_map.serialize_into(&mut null_bytes)?;
         w.write_raw(&null_bytes)?;
@@ -385,6 +443,14 @@ impl CacheCodecImpl for BitmapIndexState {
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        // Versions 1 and 2 predate the header section entirely (and predate
+        // row-address-domain bitmap segments), so there is nothing to read.
+        let results_are_row_addresses = if r.version() >= 3 {
+            let header: BitmapIndexHeader = r.read_header()?;
+            header.results_are_row_addresses
+        } else {
+            false
+        };
         let null_bytes = r.read_raw()?;
         let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
         let lookup_batches = r.read_ipc_batches()?;
@@ -405,6 +471,7 @@ impl CacheCodecImpl for BitmapIndexState {
             null_map,
             value_type,
             index_map: Arc::new(index_map),
+            results_are_row_addresses,
         })
     }
 }
@@ -438,6 +505,7 @@ impl CacheKey for BitmapIndexStateKey {
 }
 
 impl BitmapIndex {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
         null_map: Arc<RowAddrTreeMap>,
@@ -445,6 +513,7 @@ impl BitmapIndex {
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        results_are_row_addresses: bool,
     ) -> Self {
         let lazy_reader = LazyIndexReader::new(store.clone());
         Self {
@@ -456,9 +525,11 @@ impl BitmapIndex {
             frag_reuse_index,
             batch_remapper: None,
             lazy_reader,
+            results_are_row_addresses,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_batch_remapping(
         index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
         null_map: Arc<RowAddrTreeMap>,
@@ -466,8 +537,17 @@ impl BitmapIndex {
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
         batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        results_are_row_addresses: bool,
     ) -> Self {
-        let mut index = Self::new(index_map, null_map, value_type, store, index_cache, None);
+        let mut index = Self::new(
+            index_map,
+            null_map,
+            value_type,
+            store,
+            index_cache,
+            None,
+            results_are_row_addresses,
+        );
         index.batch_remapper = batch_remapper;
         debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
         index
@@ -477,6 +557,7 @@ impl BitmapIndex {
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
@@ -490,6 +571,7 @@ impl BitmapIndex {
                 store,
                 WeakLanceCache::from(index_cache),
                 frag_reuse_index,
+                results_are_row_addresses,
             )));
         }
 
@@ -512,6 +594,7 @@ impl BitmapIndex {
             store,
             WeakLanceCache::from(index_cache),
             frag_reuse_index,
+            results_are_row_addresses,
         )))
     }
 
@@ -521,6 +604,7 @@ impl BitmapIndex {
         store: Arc<dyn IndexStore>,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
@@ -535,6 +619,7 @@ impl BitmapIndex {
                 store,
                 WeakLanceCache::from(index_cache),
                 remapping,
+                results_are_row_addresses,
             )));
         }
 
@@ -557,6 +642,7 @@ impl BitmapIndex {
             store,
             WeakLanceCache::from(index_cache),
             remapping,
+            results_are_row_addresses,
         )))
     }
 
@@ -750,6 +836,13 @@ impl BitmapIndex {
                     first.value_type, segment.value_type
                 )));
             }
+            if segment.results_are_row_addresses != first.results_are_row_addresses {
+                return Err(Error::index(
+                    "cannot merge bitmap segments that disagree on whether they store row \
+                     ids or row addresses -- rebuild them into one segment first"
+                        .to_string(),
+                ));
+            }
         }
 
         let new_schema = new_data.schema();
@@ -785,7 +878,12 @@ impl BitmapIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
-            index_version: BITMAP_INDEX_VERSION,
+            // Preserve the source segments' own domain (checked above to
+            // agree) rather than the latest version this build can write:
+            // merging row-id-domain segments (valid on a dataset without
+            // stable row ids) must not silently flip the result to
+            // address-domain.
+            index_version: bitmap_version_for_domain(first.results_are_row_addresses),
             files: vec![file],
         })
     }
@@ -818,7 +916,9 @@ impl BitmapTrainingRequest {
     fn new(parameters: BitmapParameters) -> Self {
         Self {
             parameters,
-            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+            // Bitmap indexes store physical row addresses rather than row
+            // ids, so an FRI can repair them after a rewrite.
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
         }
     }
 }
@@ -948,7 +1048,12 @@ impl BitmapIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
-            index_version: BITMAP_INDEX_VERSION,
+            // Preserve this segment's own domain rather than the latest
+            // version this build can write: remapping a row-id-domain
+            // segment (valid on a dataset without stable row ids, where a
+            // row id already is a row address) must not silently flip it to
+            // address-domain.
+            index_version: bitmap_version_for_domain(self.results_are_row_addresses),
             files: vec![file],
         })
     }
@@ -1142,27 +1247,27 @@ impl ScalarIndex for BitmapIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let file = BitmapIndexPlugin::streaming_build_and_write(
+        // Updating is the single-segment case of a segment merge: union this
+        // index's data with `new_data` into one segment. Delegating here (rather
+        // than duplicating the write) is what makes the result preserve this
+        // segment's own domain instead of always writing the latest version.
+        Self::merge_segments(
+            &[Arc::new(self.clone())],
             new_data,
-            vec![OldSegment {
-                index: self,
-                filter: old_data_filter.as_ref(),
-            }],
             dest_store,
-            BITMAP_LOOKUP_NAME,
+            &[old_data_filter],
         )
-        .await?;
+        .await
+    }
 
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
-                .unwrap(),
-            index_version: BITMAP_INDEX_VERSION,
-            files: vec![file],
-        })
+    fn results_are_row_addresses(&self) -> bool {
+        self.results_are_row_addresses
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
+        UpdateCriteria::only_new_data(
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+        )
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -1824,7 +1929,9 @@ impl BitmapIndexPlugin {
         let value_type = data_source.schema().field(0).data_type().clone();
         let mut writer =
             new_bitmap_batch_writer(index_store, output_file_name, &value_type).await?;
-        build_index_map(data_source, old_segments, &mut writer).await?;
+        // A genuine Bitmap index always trains on physical row addresses --
+        // see `BITMAP_ROW_ADDR_DOMAIN_VERSION`.
+        build_index_map(data_source, old_segments, &mut writer, ROW_ADDR).await?;
         writer.finish().await
     }
 
@@ -2019,6 +2126,7 @@ pub(crate) async fn build_index_map(
     mut data_source: SendableRecordBatchStream,
     old_segments: Vec<OldSegment<'_>>,
     writer: &mut BitmapBatchWriter,
+    id_column: &str,
 ) -> Result<()> {
     let value_type = data_source.schema().field(0).data_type().clone();
 
@@ -2036,7 +2144,7 @@ pub(crate) async fn build_index_map(
 
     while let Some(batch) = data_source.try_next().await? {
         let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-        let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
+        let row_ids = batch.column_by_name(id_column).expect_ok()?;
         debug_assert_eq!(row_ids.data_type(), &DataType::UInt64);
         let row_id_column = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
 
@@ -2395,7 +2503,7 @@ pub async fn merge_bitmap_indices(
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(VALUE_COLUMN_NAME, first.value_type().clone(), true),
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
     let no_new_data: SendableRecordBatchStream =
         Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty()));
@@ -2515,11 +2623,18 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        let results_are_row_addresses = index_version >= BITMAP_ROW_ADDR_DOMAIN_VERSION;
+        Ok(BitmapIndex::load(
+            index_store,
+            frag_reuse_index,
+            cache,
+            results_are_row_addresses,
+        )
+        .await? as Arc<dyn ScalarIndex>)
     }
 
     fn supports_batch_row_id_remapping(&self) -> bool {
@@ -2530,11 +2645,18 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(BitmapIndex::load_with_remapping(index_store, remapping, cache).await?)
+        let results_are_row_addresses = index_version >= BITMAP_ROW_ADDR_DOMAIN_VERSION;
+        Ok(BitmapIndex::load_with_remapping(
+            index_store,
+            remapping,
+            cache,
+            results_are_row_addresses,
+        )
+        .await?)
     }
 
     async fn get_from_cache(
@@ -2724,20 +2846,20 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
         let values = vec![Some(1u32), Some(2u32), None];
-        let row_ids: Vec<u64> = vec![
+        let row_addrs: Vec<u64> = vec![
             RowAddress::new_from_parts(1, 0).into(),
             RowAddress::new_from_parts(2, 0).into(),
             RowAddress::new_from_parts(3, 0).into(),
         ];
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::UInt32, true),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from(values)),
-                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt64Array::from(row_addrs)),
             ],
         )
         .unwrap();
@@ -2747,7 +2869,7 @@ mod tests {
         BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
             .await
             .unwrap();
-        let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -2770,6 +2892,10 @@ mod tests {
         assert_eq!(restored.index_map, state.index_map);
         assert_eq!(&*restored.null_map, &*state.null_map);
         assert_eq!(restored.value_type, state.value_type);
+        assert_eq!(
+            restored.results_are_row_addresses,
+            state.results_are_row_addresses
+        );
     }
 
     fn utf8_state(num_keys: usize, key_len: usize) -> BitmapIndexState {
@@ -2793,13 +2919,16 @@ mod tests {
         let mut null_map = RowAddrTreeMap::new();
         null_map.insert(RowAddress::new_from_parts(0, 3).into());
         null_map.insert(RowAddress::new_from_parts(0, 5).into());
-        assert_state_roundtrips(&BitmapIndexState::new_for_test(
-            index_map,
-            null_map,
-            DataType::Int32,
-        ));
+        // Row-address-domain state.
+        assert_state_roundtrips(&BitmapIndexState {
+            null_map: Arc::new(null_map),
+            value_type: DataType::Int32,
+            index_map: Arc::new(index_map),
+            results_are_row_addresses: true,
+        });
 
-        // Empty state: no keys, empty null map. Schema still carries the type.
+        // Empty, row-id-domain state: no keys, empty null map. Schema still
+        // carries the type.
         assert_state_roundtrips(&BitmapIndexState::new_for_test(
             BTreeMap::new(),
             RowAddrTreeMap::new(),
@@ -2908,7 +3037,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -2933,7 +3062,7 @@ mod tests {
         let cache = LanceCache::with_capacity(1024 * 1024); // 1MB cache
 
         // Load the index (should only load metadata, not bitmaps)
-        let index = BitmapIndex::load(store.clone(), None, &cache)
+        let index = BitmapIndex::load(store.clone(), None, &cache, true)
             .await
             .unwrap();
 
@@ -3042,7 +3171,7 @@ mod tests {
         let row_ids = (0u64..4u64).collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -3062,7 +3191,7 @@ mod tests {
         // Keep the `LanceCache` alive in test scope so the `WeakLanceCache`
         // inside `BitmapIndex` can upgrade during search.
         let cache = LanceCache::with_capacity(1024 * 1024);
-        let index = BitmapIndex::load(store.clone(), None, &cache)
+        let index = BitmapIndex::load(store.clone(), None, &cache, true)
             .await
             .unwrap();
 
@@ -3140,7 +3269,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Int32, true),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -3157,7 +3286,7 @@ mod tests {
             .unwrap();
 
         let cache = LanceCache::with_capacity(16 * 1024 * 1024);
-        let index = BitmapIndex::load(store.clone(), None, &cache)
+        let index = BitmapIndex::load(store.clone(), None, &cache, true)
             .await
             .unwrap();
 
@@ -3265,9 +3394,10 @@ mod tests {
 
         // Load the index using BitmapIndex::load
         tracing::info!("Loading index from disk...");
-        let loaded_index = BitmapIndex::load(Arc::new(test_store), None, &LanceCache::no_cache())
-            .await
-            .expect("Failed to load bitmap index");
+        let loaded_index =
+            BitmapIndex::load(Arc::new(test_store), None, &LanceCache::no_cache(), true)
+                .await
+                .expect("Failed to load bitmap index");
 
         // Verify the loaded index has the correct number of entries
         assert_eq!(
@@ -3356,7 +3486,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -3381,7 +3511,7 @@ mod tests {
         let cache = LanceCache::with_capacity(1024 * 1024); // 1MB cache
 
         // Load the index (should only load metadata, not bitmaps)
-        let index = BitmapIndex::load(store.clone(), None, &cache)
+        let index = BitmapIndex::load(store.clone(), None, &cache, true)
             .await
             .unwrap();
 
@@ -3514,7 +3644,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::UInt32, true),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -3535,7 +3665,7 @@ mod tests {
             .unwrap();
 
         // Load the index
-        let index = BitmapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), true)
             .await
             .expect("Failed to load bitmap index");
 
@@ -3547,7 +3677,7 @@ mod tests {
         index.remap(&remap, test_store.as_ref()).await.unwrap();
 
         // Reload and check
-        let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())
+        let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache(), true)
             .await
             .expect("Failed to load remapped bitmap index");
 
@@ -3649,7 +3779,7 @@ mod tests {
         BitmapIndexPlugin::train_bitmap_index(stream, src_store.as_ref())
             .await
             .unwrap();
-        let index = BitmapIndex::load(src_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(src_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -3689,7 +3819,7 @@ mod tests {
         );
 
         // The emptied key does not come back as a directory entry either.
-        let reloaded = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+        let reloaded = BitmapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         assert_eq!(reloaded.index_map.len(), 2);
@@ -3756,7 +3886,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let index = BitmapIndex::load(src_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(src_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -3818,7 +3948,7 @@ mod tests {
         // match value order.
         let batch = record_batch!(
             ("value", Int64, [None, Some(0), Some(5)]),
-            ("_rowid", UInt64, [2, 0, 1])
+            ("_rowaddr", UInt64, [2, 0, 1])
         )
         .unwrap();
         let schema = batch.schema();
@@ -3831,7 +3961,7 @@ mod tests {
             .unwrap();
 
         let cache = LanceCache::with_capacity(1024 * 1024);
-        let index = BitmapIndex::load(store.clone(), None, &cache)
+        let index = BitmapIndex::load(store.clone(), None, &cache, true)
             .await
             .unwrap();
 
@@ -3985,17 +4115,17 @@ mod tests {
 
         let (_left_dir, left_store) = build(&values[..300], 0).await;
         let (_right_dir, right_store) = build(&values[300..], 300).await;
-        let left = BitmapIndex::load(left_store, None, &LanceCache::no_cache())
+        let left = BitmapIndex::load(left_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
-        let right = BitmapIndex::load(right_store, None, &LanceCache::no_cache())
+        let right = BitmapIndex::load(right_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
         let (_dest_dir, dest_store) = test_util::index_store();
         BitmapIndex::merge_segments(
             &[left.clone(), right.clone()],
-            value_row_id_stream(&[]),
+            value_row_addr_stream(&[]),
             dest_store.as_ref(),
             &[None, None],
         )
@@ -4019,7 +4149,7 @@ mod tests {
     }
 
     /// `utf8_value_stream` over `(value, row_addr)` pairs.
-    fn value_row_id_stream(rows: &[(Option<&str>, u64)]) -> SendableRecordBatchStream {
+    fn value_row_addr_stream(rows: &[(Option<&str>, u64)]) -> SendableRecordBatchStream {
         utf8_value_stream(
             rows.iter().map(|(value, _)| *value),
             rows.iter().map(|(_, row_addr)| *row_addr),
@@ -4027,10 +4157,10 @@ mod tests {
     }
 
     /// The Boolean counterpart of [`utf8_value_stream`], likewise sorted.
-    fn bool_value_row_id_stream(rows: &[(Option<bool>, u64)]) -> SendableRecordBatchStream {
+    fn bool_value_row_addr_stream(rows: &[(Option<bool>, u64)]) -> SendableRecordBatchStream {
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Boolean, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -4059,14 +4189,14 @@ mod tests {
         BitmapIndexPlugin::train_bitmap_index(data, store.as_ref())
             .await
             .unwrap();
-        let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         (tmpdir, index)
     }
 
     async fn train_bitmap_segment(rows: &[(Option<&str>, u64)]) -> (TempObjDir, Arc<BitmapIndex>) {
-        train_bitmap_segment_from(value_row_id_stream(rows)).await
+        train_bitmap_segment_from(value_row_addr_stream(rows)).await
     }
 
     async fn search_addrs_for(index: &BitmapIndex, query: SargableQuery) -> Vec<u64> {
@@ -4146,13 +4276,13 @@ mod tests {
         let (_dest_dir, dest_store) = test_util::index_store();
         BitmapIndex::merge_segments(
             &[seg0.clone(), seg1.clone(), seg2.clone(), seg3.clone()],
-            value_row_id_stream(&new_rows),
+            value_row_addr_stream(&new_rows),
             dest_store.as_ref(),
             &filters,
         )
         .await
         .unwrap();
-        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -4205,13 +4335,13 @@ mod tests {
         let (_dest_dir, dest_store) = test_util::index_store();
         BitmapIndex::merge_segments(
             &[seg0, seg1, seg2],
-            value_row_id_stream(&[]),
+            value_row_addr_stream(&[]),
             dest_store.as_ref(),
             &[None, None, None],
         )
         .await
         .unwrap();
-        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -4254,13 +4384,13 @@ mod tests {
         let (_dest_dir, dest_store) = test_util::index_store();
         BitmapIndex::merge_segments(
             &[seg0, seg1, seg2],
-            value_row_id_stream(&new_rows),
+            value_row_addr_stream(&new_rows),
             dest_store.as_ref(),
             &filters,
         )
         .await
         .unwrap();
-        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -4281,31 +4411,32 @@ mod tests {
     /// full rescan is the most expensive relative to the index it produces.
     #[tokio::test]
     async fn test_bitmap_merge_k_segments_boolean_keys() {
-        let (_dir0, seg0) = train_bitmap_segment_from(bool_value_row_id_stream(&[
+        let (_dir0, seg0) = train_bitmap_segment_from(bool_value_row_addr_stream(&[
             (Some(true), addr(0, 0)),
             (Some(false), addr(0, 1)),
             (None, addr(0, 2)),
         ]))
         .await;
-        let (_dir1, seg1) = train_bitmap_segment_from(bool_value_row_id_stream(&[
+        let (_dir1, seg1) = train_bitmap_segment_from(bool_value_row_addr_stream(&[
             (Some(false), addr(1, 0)),
             (Some(true), addr(1, 1)),
         ]))
         .await;
         let (_dir2, seg2) =
-            train_bitmap_segment_from(bool_value_row_id_stream(&[(Some(true), addr(2, 0))])).await;
+            train_bitmap_segment_from(bool_value_row_addr_stream(&[(Some(true), addr(2, 0))]))
+                .await;
 
         let new_rows = [(Some(false), addr(3, 0)), (None, addr(3, 1))];
         let (_dest_dir, dest_store) = test_util::index_store();
         BitmapIndex::merge_segments(
             &[seg0, seg1, seg2],
-            bool_value_row_id_stream(&new_rows),
+            bool_value_row_addr_stream(&new_rows),
             dest_store.as_ref(),
             &[None, None, None],
         )
         .await
         .unwrap();
-        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -4416,13 +4547,13 @@ mod tests {
             let (_dest_dir, dest_store) = test_util::index_store();
             BitmapIndex::merge_segments(
                 &segments,
-                value_row_id_stream(&new_rows),
+                value_row_addr_stream(&new_rows),
                 dest_store.as_ref(),
                 &filters,
             )
             .await
             .unwrap();
-            let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+            let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
                 .await
                 .unwrap();
 
@@ -4468,13 +4599,13 @@ mod tests {
         let (_dest_dir, dest_store) = test_util::index_store();
         BitmapIndex::merge_segments(
             &[segment],
-            value_row_id_stream(&[]),
+            value_row_addr_stream(&[]),
             dest_store.as_ref(),
             &filters,
         )
         .await
         .unwrap();
-        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache())
+        let merged = BitmapIndex::load(dest_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -4507,12 +4638,12 @@ mod tests {
             Arc::new(cache.clone()),
         ));
         BitmapIndexPlugin::train_bitmap_index(
-            value_row_id_stream(&[(Some("red"), addr(0, 0)), (Some("blue"), addr(0, 1))]),
+            value_row_addr_stream(&[(Some("red"), addr(0, 0)), (Some("blue"), addr(0, 1))]),
             store.as_ref(),
         )
         .await
         .unwrap();
-        let segment = BitmapIndex::load(store, None, &cache).await.unwrap();
+        let segment = BitmapIndex::load(store, None, &cache, true).await.unwrap();
         // Whatever `load` itself caches is the baseline; the merge must add
         // nothing on top of it.
         let after_load = cache.size().await;
@@ -4520,7 +4651,7 @@ mod tests {
         let (_dest_dir, dest_store) = test_util::index_store();
         BitmapIndex::merge_segments(
             std::slice::from_ref(&segment),
-            value_row_id_stream(&[(Some("green"), addr(1, 0))]),
+            value_row_addr_stream(&[(Some("green"), addr(1, 0))]),
             dest_store.as_ref(),
             &[None],
         )
@@ -4559,7 +4690,7 @@ mod tests {
     ) {
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let row_addrs = (0..values.len() as u32)
             .map(|i| addr(0, i))
@@ -4612,7 +4743,7 @@ mod tests {
     ) {
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let row_addrs = (0..values.len() as u32)
             .map(|i| addr(0, i))
@@ -4670,7 +4801,7 @@ mod tests {
             BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
                 .await
                 .unwrap();
-            let index = BitmapIndex::load(store, None, &LanceCache::no_cache())
+            let index = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
                 .await
                 .unwrap();
             (tmpdir, index)
@@ -4734,7 +4865,7 @@ mod tests {
                 .unwrap();
         }
         writer.finish().await.unwrap();
-        let unsorted = BitmapIndex::load(unsorted_store, None, &LanceCache::no_cache())
+        let unsorted = BitmapIndex::load(unsorted_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         assert!(!unsorted.rows_follow_key_order());
@@ -4746,7 +4877,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let sorted = BitmapIndex::load(sorted_store, None, &LanceCache::no_cache())
+        let sorted = BitmapIndex::load(sorted_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         assert!(sorted.rows_follow_key_order());
@@ -4833,7 +4964,7 @@ mod tests {
             new_bitmap_batch_writer(store.as_ref(), BITMAP_LOOKUP_NAME, &DataType::Utf8)
                 .await
                 .unwrap();
-        build_index_map(stream, Vec::new(), &mut writer)
+        build_index_map(stream, Vec::new(), &mut writer, ROW_ADDR)
             .await
             .unwrap();
         writer
@@ -4894,7 +5025,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let old_index = BitmapIndex::load(old_store, None, &LanceCache::no_cache())
+        let old_index = BitmapIndex::load(old_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         assert!(
@@ -4914,6 +5045,7 @@ mod tests {
                 filter: None,
             }],
             &mut writer,
+            ROW_ADDR,
         )
         .await
         .unwrap();
@@ -4948,7 +5080,7 @@ mod tests {
     ) -> SendableRecordBatchStream {
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -5007,7 +5139,7 @@ mod tests {
         writer.write_record_batch(batch).await.unwrap();
         writer.finish().await.unwrap();
 
-        let error = BitmapIndex::load_with_remapping(store, None, &LanceCache::no_cache())
+        let error = BitmapIndex::load_with_remapping(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap_err();
         assert!(

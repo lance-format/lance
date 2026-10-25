@@ -660,6 +660,14 @@ impl EncodingUtils {
         }
     }
 
+    pub fn alp(bits_per_value: u32) -> metadata::CompressiveEncoding {
+        metadata::CompressiveEncoding {
+            compression: Some(metadata::compressive_encoding::Compression::Alp(
+                metadata::Alp { bits_per_value },
+            )),
+        }
+    }
+
     pub fn dictionary(
         indices: metadata::CompressiveEncoding,
         items: metadata::CompressiveEncoding,
