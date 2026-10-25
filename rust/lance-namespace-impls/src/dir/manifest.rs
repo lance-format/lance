@@ -6657,12 +6657,9 @@ mod tests {
             req.id = Some(vec![name.to_string()]);
             let resp = dir_namespace.declare_table(req).await.unwrap();
             let uri = resp.location.unwrap();
-            let fs_path = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
-            eprintln!("declared {} at {}", name, uri);
             let mut drop = DropTableRequest::new();
             drop.id = Some(vec![name.to_string()]);
             dir_namespace.drop_table(drop).await.unwrap();
-            eprintln!("after drop, {} marker exists: {}", name, fs_path.exists());
         }
     }
 }
