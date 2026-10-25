@@ -82,5 +82,21 @@ harness = false
 name = "buffer"
 harness = false
 
+[[bench]]
+name = "take"
+harness = false
+
+[[bench]]
+name = "compression_levels"
+harness = false
+
+[[bench]]
+name = "scheme_comparison"
+harness = false
+
+[[bench]]
+name = "synthetic_distributions"
+harness = false
+
 [lints]
 workspace = true
