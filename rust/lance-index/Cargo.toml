@@ -156,6 +156,10 @@ name = "zonemap"
 harness = false
 
 [[bench]]
+name = "zonemap_resident"
+harness = false
+
+[[bench]]
 name = "inverted"
 harness = false
 

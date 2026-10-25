@@ -10,8 +10,8 @@ use std::sync::Arc;
 use crate::scalar::registry::ScalarIndexPlugin;
 use crate::scalar::zoned::ZoneBound;
 use crate::scalar::zonemap::{
-    CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapIndexVersion, ZoneMapStatistics,
-    make_zone_map_index_details,
+    CarriedSeed, MergeableSeed, ZoneMapIndexBuilder, ZoneMapIndexPlugin, ZoneMapIndexVersion,
+    ZoneMapStatistics, make_zone_map_index_details, storage::ZoneMaps,
 };
 use arrow::datatypes::{ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int64Type};
 use arrow_array::{
@@ -53,7 +53,7 @@ use arrow_array::Int32Array;
 use lance_core::Error;
 
 use crate::Index;
-use crate::metrics::NoOpMetricsCollector;
+use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 
@@ -76,6 +76,570 @@ fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream 
         )?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+}
+
+/// A zone's bounds and counts for the packed-storage fixtures below.
+fn fixture_zone(
+    min: ScalarValue,
+    max: ScalarValue,
+    null_count: u32,
+    nan_count: u32,
+    negative_nan_count: u32,
+    bound: ZoneBound,
+) -> ZoneMapStatistics {
+    ZoneMapStatistics {
+        min,
+        max,
+        null_count,
+        nan_count,
+        negative_nan_count: Some(negative_nan_count),
+        bound,
+    }
+}
+
+/// Loads with `ZoneMapIndex::load` (streamed batches) and compares with
+/// the single-batch `try_from_serialized` path and a row-wise copy.
+#[rstest::rstest]
+#[case::int64(DataType::Int64, false, false, 8199)]
+#[case::int64_null_bitmap(DataType::Int64, true, false, 8199)]
+#[case::timestamp(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), false, false, 8199)]
+#[case::utf8(DataType::Utf8, false, false, 8199)]
+#[case::float64(DataType::Float64, false, false, 8199)]
+#[case::float64_nan(DataType::Float64, false, true, 8199)]
+#[case::float32_nan_null_bitmap(DataType::Float32, true, true, 8199)]
+#[case::generic(DataType::FixedSizeBinary(4), false, false, 8199)]
+#[case::empty(DataType::Int64, false, false, 0)]
+#[tokio::test]
+async fn test_streamed_zone_batches(
+    #[case] data_type: DataType,
+    #[case] store_null_bitmap: bool,
+    #[case] with_nans: bool,
+    #[case] summaries: usize,
+) {
+    let scalar = |value: i64| match &data_type {
+        DataType::Utf8 => ScalarValue::Utf8(Some(format!("value-{value:06}"))),
+        DataType::FixedSizeBinary(4) => {
+            ScalarValue::FixedSizeBinary(4, Some((value as i32).to_be_bytes().to_vec()))
+        }
+        _ => ScalarValue::Int64(Some(value)).cast_to(&data_type).unwrap(),
+    };
+    let null = ScalarValue::try_new_null(&data_type).unwrap();
+    let mut builder = ZoneMapIndexBuilder::try_new(
+        ZoneMapIndexBuilderParams::new(17).with_null_bitmap(store_null_bitmap),
+        data_type.clone(),
+    )
+    .unwrap();
+    let mut null_rows = RowAddrTreeMap::new();
+    builder.maps = (0..summaries)
+        .map(|i| {
+            let all_null = [4095, 4096, 8198].contains(&i);
+            let null_count = if all_null { 17 } else { u32::from(i % 17 == 0) };
+            // Every seventh zone holds NaNs: alternating sign splits so
+            // that both NaN count buffers carry non-zero entries.
+            let (nan_count, negative_nan_count) = if with_nans && !all_null && i % 7 == 0 {
+                match i % 3 {
+                    0 => (2, 0),
+                    1 => (2, 2),
+                    _ => (3, 1),
+                }
+            } else {
+                (0, 0)
+            };
+            let bound = ZoneBound {
+                fragment_id: (i / 64) as u64,
+                start: (i % 64) as u64 * 17,
+                length: 17,
+            };
+            let row: u64 = lance_core::utils::address::RowAddress::new_from_parts(
+                bound.fragment_id as u32,
+                bound.start as u32,
+            )
+            .into();
+            null_rows.insert_range(row..row + u64::from(null_count));
+            let (min, max) = if all_null {
+                (null.clone(), null.clone())
+            } else {
+                (scalar(i as i64), scalar(i as i64 + 1))
+            };
+            fixture_zone(min, max, null_count, nan_count, negative_nan_count, bound)
+        })
+        .collect();
+    builder.set_null_rows(Some(null_rows));
+    let expected_zones = builder.maps.clone();
+    let expected_null_rows = builder.null_rows.clone();
+    assert_eq!(expected_null_rows.is_some(), store_null_bitmap);
+    let serialized = builder.zonemap_stats_as_batch().unwrap();
+    let tmpdir = TempObjDir::default();
+    let store = local_store(&tmpdir);
+    builder.write_index(store.as_ref()).await.unwrap();
+    let index = ZoneMapIndex::load(
+        store.clone(),
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(index.rows_per_zone(), 17);
+    assert_eq!(index.zones.to_vec(), expected_zones);
+    assert_eq!(index.null_rows, expected_null_rows);
+    let expected_batches = if matches!(data_type, DataType::FixedSizeBinary(_)) {
+        vec![summaries]
+    } else if summaries == 0 {
+        vec![]
+    } else {
+        vec![4096, 4096, 7]
+    };
+    assert_eq!(index.zones.batch_lengths(), expected_batches);
+    let reference = ZoneMapIndex::try_from_serialized(
+        serialized.clone(),
+        store,
+        None,
+        &LanceCache::no_cache(),
+        17,
+        expected_null_rows,
+        false,
+        store_null_bitmap,
+        ZoneMapIndexVersion::V1,
+    )
+    .unwrap();
+    let mut row_wise = ZoneMapIndex::try_from_serialized(
+        serialized.clone(),
+        reference.store.clone(),
+        None,
+        &LanceCache::no_cache(),
+        17,
+        reference.null_rows.clone(),
+        false,
+        store_null_bitmap,
+        ZoneMapIndexVersion::V1,
+    )
+    .unwrap();
+    row_wise.zones = row_wise.zones.to_vec().into();
+    assert_eq!(index.value_range(), reference.value_range());
+    assert_eq!(index.value_range(), row_wise.value_range());
+    let float = |value: f64| {
+        ScalarValue::Float64(Some(value))
+            .cast_to(&data_type)
+            .unwrap()
+    };
+    let mut queries = vec![
+        SargableQuery::Equals(scalar(-1)),
+        SargableQuery::Equals(scalar(4097)),
+        SargableQuery::Equals(scalar(8197)),
+        SargableQuery::Range(Bound::Included(scalar(4094)), Bound::Included(scalar(4100))),
+        SargableQuery::IsIn(vec![scalar(4094), scalar(4097), scalar(8197), null]),
+        SargableQuery::IsNull(),
+        SargableQuery::Range(Bound::Unbounded, Bound::Unbounded),
+    ];
+    if with_nans {
+        queries.extend([
+            SargableQuery::Equals(float(f64::NAN)),
+            SargableQuery::Equals(float(-f64::NAN)),
+            SargableQuery::Range(Bound::Included(scalar(8000)), Bound::Unbounded),
+            SargableQuery::Range(Bound::Unbounded, Bound::Excluded(scalar(10))),
+            SargableQuery::Range(Bound::Included(float(f64::NAN)), Bound::Unbounded),
+            SargableQuery::Range(Bound::Unbounded, Bound::Included(float(-f64::NAN))),
+            SargableQuery::IsIn(vec![float(f64::NAN), scalar(4097)]),
+        ]);
+    }
+    for query in queries {
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+        assert_eq!(
+            result,
+            reference
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            "{query:?}"
+        );
+        assert_eq!(
+            result,
+            row_wise
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            "{query:?}"
+        );
+        let expected_comparisons = if store_null_bitmap && matches!(query, SargableQuery::IsNull())
+        {
+            0
+        } else {
+            summaries
+        };
+        assert_eq!(
+            metrics
+                .comparisons
+                .load(std::sync::atomic::Ordering::Relaxed),
+            expected_comparisons
+        );
+    }
+    let mut roundtrip =
+        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(17), data_type).unwrap();
+    roundtrip.maps = index.zones.to_vec();
+    assert_eq!(roundtrip.zonemap_stats_as_batch().unwrap(), serialized);
+
+    let merged_dir = TempObjDir::default();
+    let merged_store = local_store(&merged_dir);
+    let fragments = index.calculate_included_frags().await.unwrap();
+    merge_zonemap_indices(&[index.as_ref()], merged_store.as_ref(), &fragments)
+        .await
+        .unwrap();
+    let merged = ZoneMapIndex::load(
+        merged_store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(merged.zones.to_vec(), expected_zones);
+    assert_eq!(merged.value_range(), index.value_range());
+    assert_eq!(
+        ZoneMapIndex::value_range_over([index.as_ref(), merged.as_ref()]),
+        reference.value_range()
+    );
+    assert_eq!(merged.null_rows, index.null_rows);
+    assert_eq!(merged.zones.batch_lengths(), expected_batches);
+}
+
+#[rstest::rstest]
+#[case::int64(DataType::Int64)]
+#[case::timestamp_second(DataType::Timestamp(arrow_schema::TimeUnit::Second, None))]
+#[case::timestamp_millisecond(DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into())))]
+#[case::timestamp_microsecond(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("America/New_York".into())))]
+#[case::timestamp_nanosecond(DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None))]
+#[case::utf8(DataType::Utf8)]
+#[case::large_utf8(DataType::LargeUtf8)]
+#[case::int8(DataType::Int8)]
+#[case::int16(DataType::Int16)]
+#[case::int32(DataType::Int32)]
+#[case::uint8(DataType::UInt8)]
+#[case::uint16(DataType::UInt16)]
+#[case::uint32(DataType::UInt32)]
+#[case::uint64(DataType::UInt64)]
+#[case::float16(DataType::Float16)]
+#[case::float32(DataType::Float32)]
+#[case::float64(DataType::Float64)]
+#[case::boolean(DataType::Boolean)]
+#[case::decimal128(DataType::Decimal128(38, 2))]
+#[case::decimal256(DataType::Decimal256(76, 2))]
+#[case::date32(DataType::Date32)]
+#[case::date64(DataType::Date64)]
+#[case::time32_second(DataType::Time32(arrow_schema::TimeUnit::Second))]
+#[case::time32_millisecond(DataType::Time32(arrow_schema::TimeUnit::Millisecond))]
+#[case::time64_microsecond(DataType::Time64(arrow_schema::TimeUnit::Microsecond))]
+#[case::time64_nanosecond(DataType::Time64(arrow_schema::TimeUnit::Nanosecond))]
+#[case::duration_second(DataType::Duration(arrow_schema::TimeUnit::Second))]
+#[case::duration_millisecond(DataType::Duration(arrow_schema::TimeUnit::Millisecond))]
+#[case::duration_microsecond(DataType::Duration(arrow_schema::TimeUnit::Microsecond))]
+#[case::duration_nanosecond(DataType::Duration(arrow_schema::TimeUnit::Nanosecond))]
+#[case::binary(DataType::Binary)]
+#[case::large_binary(DataType::LargeBinary)]
+#[tokio::test]
+async fn test_columnar_zones_match_scalar_zones(#[case] data_type: DataType) {
+    let scalar = |value| match &data_type {
+        DataType::Utf8 => ScalarValue::Utf8(Some(format!("prefix-{value:03}-世界"))),
+        DataType::LargeUtf8 => ScalarValue::LargeUtf8(Some(format!("prefix-{value:03}-世界"))),
+        DataType::Binary => {
+            ScalarValue::Binary(Some(format!("prefix-{value:03}-世界").into_bytes()))
+        }
+        DataType::LargeBinary => {
+            ScalarValue::LargeBinary(Some(format!("prefix-{value:03}-世界").into_bytes()))
+        }
+        DataType::Time32(arrow_schema::TimeUnit::Second) => {
+            ScalarValue::Time32Second(Some(value as i32))
+        }
+        DataType::Time32(arrow_schema::TimeUnit::Millisecond) => {
+            ScalarValue::Time32Millisecond(Some(value as i32))
+        }
+        _ => ScalarValue::Int64(Some(value)).cast_to(&data_type).unwrap(),
+    };
+    let null = ScalarValue::try_new_null(&data_type).unwrap();
+    let is_float = data_type.is_floating();
+    let mut ranges = vec![
+        (scalar(0), scalar(10), 0, 0, 0),
+        (scalar(10), scalar(20), 3, 0, 0),
+        (null.clone(), null.clone(), 16, 0, 0),
+        // Missing extrema with comparable values are conservative legacy bounds.
+        (null.clone(), null.clone(), 1, 0, 0),
+        (scalar(20), null.clone(), 0, 0, 0),
+    ];
+    if is_float {
+        ranges.extend([
+            // NaNs of one sign, both signs, and an all-NaN zone with
+            // version 1 ordinary (null) bounds.
+            (scalar(30), scalar(40), 0, 2, 0),
+            (scalar(30), scalar(40), 1, 2, 2),
+            (scalar(40), scalar(50), 0, 3, 1),
+            (null.clone(), null.clone(), 0, 16, 5),
+        ]);
+    }
+    let mut builder =
+        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(16), data_type.clone())
+            .unwrap();
+    builder.maps = ranges
+        .into_iter()
+        .enumerate()
+        .map(
+            |(i, (min, max, null_count, nan_count, negative_nan_count))| {
+                fixture_zone(
+                    min,
+                    max,
+                    null_count,
+                    nan_count,
+                    negative_nan_count,
+                    ZoneBound {
+                        fragment_id: i as u64 / 2,
+                        start: (i % 2) as u64 * 16,
+                        length: 16,
+                    },
+                )
+            },
+        )
+        .collect();
+    let serialized = builder.zonemap_stats_as_batch().unwrap();
+    let tmpdir = TempObjDir::default();
+    let store = local_store(&tmpdir);
+    let mut index = ZoneMapIndex::try_from_serialized(
+        serialized.clone(),
+        store,
+        None,
+        &LanceCache::no_cache(),
+        16,
+        None,
+        false,
+        true,
+        ZoneMapIndexVersion::V1,
+    )
+    .unwrap();
+    assert_eq!(index.zones.to_vec(), builder.maps);
+    assert!(matches!(index.zones, ZoneMaps::Columnar(_)));
+
+    // Maintenance reconstructs exactly the original columns and schema.
+    builder.maps = index.zones.to_vec();
+    assert_eq!(builder.zonemap_stats_as_batch().unwrap(), serialized);
+
+    let mut candidates = vec![
+        null,
+        scalar(0),
+        scalar(5),
+        scalar(10),
+        scalar(15),
+        scalar(20),
+        scalar(25),
+    ];
+    if is_float {
+        candidates.extend([scalar(35), scalar(45), scalar(55)]);
+    }
+    candidates.extend([
+        ScalarValue::Null,
+        ScalarValue::Int32(Some(10)),
+        ScalarValue::Int64(None),
+        ScalarValue::Utf8(Some("prefix-010-世界".into())),
+        ScalarValue::LargeUtf8(Some("prefix-010-世界".into())),
+        ScalarValue::TimestampSecond(Some(10), Some("Asia/Shanghai".into())),
+        ScalarValue::TimestampMicrosecond(Some(10), Some("UTC".into())),
+        ScalarValue::Float64(Some(f64::INFINITY)),
+        ScalarValue::Float64(Some(f64::NEG_INFINITY)),
+        ScalarValue::Float64(Some(f64::NAN)),
+        ScalarValue::Float64(Some(-f64::NAN)),
+        ScalarValue::Float32(Some(f32::NAN)),
+        ScalarValue::Float32(Some(-f32::NAN)),
+    ]);
+    let mut queries = vec![
+        SargableQuery::IsNull(),
+        SargableQuery::IsIn(candidates.clone()),
+    ];
+    for candidate in candidates {
+        queries.push(SargableQuery::Equals(candidate.clone()));
+        queries.push(SargableQuery::IsIn(vec![candidate.clone()]));
+        for start in [
+            Bound::Unbounded,
+            Bound::Included(candidate.clone()),
+            Bound::Excluded(candidate.clone()),
+        ] {
+            for end in [
+                Bound::Unbounded,
+                Bound::Included(candidate.clone()),
+                Bound::Excluded(candidate.clone()),
+            ] {
+                queries.push(SargableQuery::Range(start.clone(), end));
+            }
+        }
+        queries.push(SargableQuery::LikePrefix(candidate));
+    }
+    queries.extend([
+        SargableQuery::IsIn(vec![]),
+        SargableQuery::LikePrefix(ScalarValue::Utf8(Some(String::new()))),
+        SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("prefix-010".into()))),
+    ]);
+    let mut results = Vec::with_capacity(queries.len());
+    for query in &queries {
+        results.push(index.search(query, &NoOpMetricsCollector).await.unwrap());
+    }
+    let range = index.value_range();
+    index.zones = index.zones.to_vec().into();
+    for (query, expected) in queries.iter().zip(results) {
+        assert_eq!(
+            index.search(query, &NoOpMetricsCollector).await.unwrap(),
+            expected,
+            "{data_type:?}: {query:?}"
+        );
+    }
+    assert_eq!(index.value_range(), range);
+
+    builder.maps.truncate(3);
+    let mut finite = ZoneMapIndex::try_from_serialized(
+        builder.zonemap_stats_as_batch().unwrap(),
+        index.store.clone(),
+        None,
+        &LanceCache::no_cache(),
+        16,
+        None,
+        false,
+        true,
+        ZoneMapIndexVersion::V1,
+    )
+    .unwrap();
+    let expected = Some((scalar(0), scalar(20)));
+    assert_eq!(finite.value_range(), expected);
+    finite.zones = finite.zones.to_vec().into();
+    assert_eq!(finite.value_range(), expected);
+}
+
+#[rstest::rstest]
+#[case::int32(DataType::Int32)]
+#[case::unsupported_max(DataType::Decimal32(9, 0))]
+#[case::different_timestamp_unit(DataType::Timestamp(arrow_schema::TimeUnit::Second, None))]
+#[case::different_string_width(DataType::LargeUtf8)]
+#[tokio::test]
+async fn test_mixed_bound_types_match_scalar_zones(#[case] max_type: DataType) {
+    let min_type = match max_type {
+        DataType::Timestamp(_, _) => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        DataType::LargeUtf8 => DataType::Utf8,
+        _ => DataType::Int64,
+    };
+    let bound = |data_type: &DataType, value: i64| {
+        let scalar = match data_type {
+            DataType::Utf8 | DataType::LargeUtf8 => ScalarValue::Utf8(Some(value.to_string())),
+            _ => ScalarValue::Int64(Some(value)),
+        };
+        scalar.cast_to(data_type).unwrap()
+    };
+    let mut builder =
+        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(16), min_type.clone()).unwrap();
+    builder.maps = vec![fixture_zone(
+        bound(&min_type, 10),
+        bound(&min_type, 20),
+        0,
+        0,
+        0,
+        ZoneBound {
+            fragment_id: 7,
+            start: 0,
+            length: 16,
+        },
+    )];
+    let serialized = builder.zonemap_stats_as_batch().unwrap();
+    let mut fields = serialized.schema().fields().to_vec();
+    fields[1] = Arc::new(Field::new("max", max_type.clone(), true));
+    let mut columns = serialized.columns().to_vec();
+    columns[1] = ScalarValue::iter_to_array([bound(&max_type, 20)]).unwrap();
+    let mixed = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            serialized.schema().metadata().clone(),
+        )),
+        columns,
+    )
+    .unwrap();
+    let tmpdir = TempObjDir::default();
+    let store = local_store(&tmpdir);
+    let mut index = ZoneMapIndex::try_from_serialized(
+        mixed,
+        store,
+        None,
+        &LanceCache::no_cache(),
+        16,
+        None,
+        false,
+        true,
+        ZoneMapIndexVersion::V1,
+    )
+    .unwrap();
+    assert_eq!(
+        matches!(index.zones, ZoneMaps::Columnar(_)),
+        max_type != DataType::Decimal32(9, 0)
+    );
+    let queries = [
+        SargableQuery::Equals(bound(&min_type, 15)),
+        SargableQuery::Equals(bound(&max_type, 15)),
+        SargableQuery::Range(Bound::Included(bound(&min_type, 15)), Bound::Unbounded),
+        SargableQuery::Range(Bound::Unbounded, Bound::Included(bound(&max_type, 15))),
+        SargableQuery::IsIn(vec![bound(&min_type, 15), bound(&max_type, 15)]),
+        SargableQuery::IsNull(),
+    ];
+    let mut expected = Vec::new();
+    for query in &queries {
+        expected.push(index.search(query, &NoOpMetricsCollector).await.unwrap());
+    }
+    let range = index.value_range();
+    index.zones = index.zones.to_vec().into();
+    assert_eq!(index.value_range(), range);
+    for (query, expected) in queries.iter().zip(expected) {
+        assert_eq!(
+            index.search(query, &NoOpMetricsCollector).await.unwrap(),
+            expected,
+            "{max_type:?}: {query:?}"
+        );
+    }
+}
+
+/// Columnar storage accounts for the version 1 NaN sign buffer.
+#[test]
+fn test_columnar_zones_resident_size_counts_nan_buffers() {
+    let zone = |i: u64| {
+        fixture_zone(
+            ScalarValue::Float64(Some(i as f64)),
+            ScalarValue::Float64(Some(i as f64 + 1.0)),
+            0,
+            2,
+            1,
+            ZoneBound {
+                fragment_id: 0,
+                start: i * 16,
+                length: 16,
+            },
+        )
+    };
+    let v1 = ZoneMaps::from(vec![zone(0), zone(1), zone(2), zone(3)]);
+    let batch = {
+        let mut builder =
+            ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(16), DataType::Float64)
+                .unwrap();
+        builder.maps = v1.to_vec();
+        builder.zonemap_stats_as_batch().unwrap()
+    };
+    let (columnar, _) = ZoneMaps::from_batch(&batch, ZoneMapIndexVersion::V1).unwrap();
+    assert!(matches!(columnar, ZoneMaps::Columnar(_)));
+    assert_eq!(columnar.to_vec(), v1.to_vec());
+    use lance_core::deepsize::DeepSizeOf;
+    let without_sign_buffer = {
+        let (zones, _) = ZoneMaps::from_batch(
+            &batch.project(&[0, 1, 2, 3, 5, 6, 7]).unwrap(),
+            ZoneMapIndexVersion::V0,
+        )
+        .unwrap();
+        zones
+    };
+    assert!(
+        columnar.deep_size_of() > without_sign_buffer.deep_size_of(),
+        "the negative NaN counts must be part of the resident size"
+    );
 }
 
 /// Build a single-column ZoneMap of primitive type `T` from `fragments`
@@ -240,7 +804,7 @@ async fn test_remap_nested_mixed_null_zone_keeps_non_null_candidates() {
         2,
     )
     .await;
-    let mut mixed_null_zone = index.zones[0].clone();
+    let mut mixed_null_zone = index.zones.get(0);
     mixed_null_zone.null_count = 2;
 
     let new_start = 3_u64 << 32;
@@ -298,7 +862,7 @@ fn test_remap_nested_mixed_null_singleton_without_bitmap_is_rejected() {
 async fn test_merge_legacy_decimal_mixed_null_singleton_is_rejected() {
     let mut source = train_and_load::<Decimal128Type>(vec![vec![None, Some(200)]]).await;
     let source_mut = Arc::get_mut(&mut source).unwrap();
-    let zone = &mut source_mut.zones[0];
+    let zone = &mut source_mut.zones.as_generic_mut()[0];
     zone.min = ScalarValue::Decimal128(None, 38, 10);
     zone.max = ScalarValue::Decimal128(None, 38, 10);
     source_mut.null_rows = None;
@@ -316,7 +880,7 @@ async fn test_merge_legacy_decimal_mixed_null_singleton_is_rejected() {
     for query in queries {
         assert!(
             source
-                .evaluate_zone_against_query(&source.zones[0], &query)
+                .evaluate_zone_against_query(&source.zones.get(0), &query)
                 .unwrap(),
             "legacy Decimal source must retain the non-null candidate for {query:?}"
         );
@@ -354,7 +918,7 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
     let mut source = train_and_load::<Float64Type>(vec![vec![Some(5.0), Some(f64::NAN)]]).await;
     let source_mut = Arc::get_mut(&mut source).unwrap();
     source_mut.version = ZoneMapIndexVersion::V0;
-    let zone = &mut source_mut.zones[0];
+    let zone = &mut source_mut.zones.as_generic_mut()[0];
     zone.max = ScalarValue::Float64(Some(f64::NAN));
     zone.negative_nan_count = None;
     assert_eq!(zone.nan_count, 1);
@@ -363,7 +927,7 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
     source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
 
     let remapped = remap_zone(
-        &source.zones[0],
+        &source.zones.get(0),
         source.fri.as_deref().unwrap(),
         None,
         false,
@@ -442,7 +1006,7 @@ async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
     source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
 
     let remapped = remap_zone(
-        &source.zones[0],
+        &source.zones.get(0),
         source.fri.as_deref().unwrap(),
         None,
         false,
@@ -583,7 +1147,7 @@ async fn test_value_range_over_missing_extrema() {
     // Lance v8 persisted typed-null Decimal extrema even when a zone contained
     // values. Such unknown bounds cannot be skipped like an all-null segment.
     let mut legacy = train_and_load::<Decimal128Type>(vec![vec![Some(100), Some(200)]]).await;
-    for zone in &mut Arc::get_mut(&mut legacy).unwrap().zones {
+    for zone in Arc::get_mut(&mut legacy).unwrap().zones.as_generic_mut() {
         zone.min = ScalarValue::Decimal128(None, 38, 10);
         zone.max = ScalarValue::Decimal128(None, 38, 10);
     }
@@ -745,7 +1309,7 @@ async fn test_null_zonemap_index() {
     assert_eq!(updated_index.zones.len(), 11);
 
     // Verify the new zone was added
-    let new_zone = &updated_index.zones[10]; // Last zone should be the new one
+    let new_zone = updated_index.zones.get(10); // Last zone should be the new one
     assert_eq!(new_zone.bound.fragment_id, 10u64); // New fragment ID
     assert_eq!(new_zone.bound.length, 5000);
     assert_eq!(new_zone.null_count, 0); // New data has no nulls
@@ -942,7 +1506,7 @@ async fn test_nan_zonemap_index() {
     }
 
     // Version 1 files keep the ordinary bounds and the exact sign split.
-    let zone = &index.zones[0];
+    let zone = index.zones.get(0);
     assert_eq!(zone.min, ScalarValue::Float32(Some(0.0)));
     assert_eq!(zone.max, ScalarValue::Float32(Some(99.0)));
     assert_eq!(zone.negative_nan_count, Some(0));
@@ -1998,7 +2562,7 @@ async fn test_like_prefix_query() {
     ];
 
     let index = ZoneMapIndex {
-        zones,
+        zones: zones.into(),
         data_type: DataType::Utf8,
         rows_per_zone: ROWS_PER_ZONE_DEFAULT,
         use_seeds: false,
@@ -2078,7 +2642,7 @@ async fn test_like_prefix_edge_cases() {
     ];
 
     let index = ZoneMapIndex {
-        zones,
+        zones: zones.into(),
         data_type: DataType::Utf8,
         rows_per_zone: ROWS_PER_ZONE_DEFAULT,
         use_seeds: false,
@@ -2152,7 +2716,7 @@ async fn test_like_prefix_large_utf8() {
     ];
 
     let index = ZoneMapIndex {
-        zones,
+        zones: zones.into(),
         data_type: DataType::LargeUtf8,
         rows_per_zone: ROWS_PER_ZONE_DEFAULT,
         use_seeds: false,
@@ -3774,22 +4338,22 @@ async fn test_fsl_zonemap_conservative_equals() {
     .await;
     assert_eq!(index.zones.len(), 2);
     // min/max are null for nested types
-    assert!(index.zones[0].min.is_null());
-    assert!(index.zones[0].max.is_null());
-    assert_eq!(index.zones[0].null_count, 0);
-    assert_eq!(index.zones[0].nan_count, 0);
+    assert!(index.zones.get(0).min.is_null());
+    assert!(index.zones.get(0).max.is_null());
+    assert_eq!(index.zones.get(0).null_count, 0);
+    assert_eq!(index.zones.get(0).nan_count, 0);
 
     // Non-null Equals: conservative — neither zone is pruned
     let q = SargableQuery::Equals(fsl_scalar(vec![Some(100.0), Some(200.0)]));
     assert!(
         index
-            .evaluate_zone_against_query(&index.zones[0], &q)
+            .evaluate_zone_against_query(&index.zones.get(0), &q)
             .unwrap(),
         "non-null Equals on nested type is conservative"
     );
     assert!(
         index
-            .evaluate_zone_against_query(&index.zones[1], &q)
+            .evaluate_zone_against_query(&index.zones.get(1), &q)
             .unwrap(),
         "non-null Equals on nested type is conservative"
     );
@@ -3798,13 +4362,13 @@ async fn test_fsl_zonemap_conservative_equals() {
     let q_null = SargableQuery::IsNull();
     assert!(
         !index
-            .evaluate_zone_against_query(&index.zones[0], &q_null)
+            .evaluate_zone_against_query(&index.zones.get(0), &q_null)
             .unwrap(),
         "IsNull pruned when null_count=0"
     );
     assert!(
         !index
-            .evaluate_zone_against_query(&index.zones[1], &q_null)
+            .evaluate_zone_against_query(&index.zones.get(1), &q_null)
             .unwrap(),
         "IsNull pruned when null_count=0"
     );
@@ -3861,13 +4425,13 @@ async fn test_fsl_zonemap_null_list() {
     .unwrap();
 
     assert_eq!(index.zones.len(), 1);
-    assert_eq!(index.zones[0].null_count, 1, "one null list");
+    assert_eq!(index.zones.get(0).null_count, 1, "one null list");
 
     // IsNull should match
     let q = SargableQuery::IsNull();
     assert!(
         index
-            .evaluate_zone_against_query(&index.zones[0], &q)
+            .evaluate_zone_against_query(&index.zones.get(0), &q)
             .unwrap()
     );
 
@@ -3880,7 +4444,7 @@ async fn test_fsl_zonemap_null_list() {
     let q2 = SargableQuery::Equals(null_scalar);
     assert!(
         index
-            .evaluate_zone_against_query(&index.zones[0], &q2)
+            .evaluate_zone_against_query(&index.zones.get(0), &q2)
             .unwrap()
     );
 }
@@ -3911,13 +4475,13 @@ async fn test_fsl_zonemap_is_in_conservative() {
     ]);
     assert!(
         index
-            .evaluate_zone_against_query(&index.zones[0], &q)
+            .evaluate_zone_against_query(&index.zones.get(0), &q)
             .unwrap(),
         "IsIn with non-null values is conservative for nested types"
     );
     assert!(
         index
-            .evaluate_zone_against_query(&index.zones[1], &q)
+            .evaluate_zone_against_query(&index.zones.get(1), &q)
             .unwrap(),
         "IsIn with non-null values is conservative for nested types"
     );
@@ -3977,14 +4541,17 @@ async fn test_fsl_zonemap_all_null_zone() {
     .await
     .unwrap();
 
-    assert_eq!(index.zones[0].null_count, 2);
-    assert!(index.zones[0].min.is_null(), "all-null zone: min is null");
+    assert_eq!(index.zones.get(0).null_count, 2);
+    assert!(
+        index.zones.get(0).min.is_null(),
+        "all-null zone: min is null"
+    );
 
     // When every row is null (null_count == zone length), a non-null query is pruned.
     let q = SargableQuery::Equals(fsl_scalar(vec![Some(1.0), Some(2.0)]));
     assert!(
         !index
-            .evaluate_zone_against_query(&index.zones[0], &q)
+            .evaluate_zone_against_query(&index.zones.get(0), &q)
             .unwrap(),
         "all-null zone (null_count == length) is pruned for non-null target"
     );
@@ -3993,7 +4560,7 @@ async fn test_fsl_zonemap_all_null_zone() {
     let q_range = SargableQuery::Range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
     assert!(
         !index
-            .evaluate_zone_against_query(&index.zones[0], &q_range)
+            .evaluate_zone_against_query(&index.zones.get(0), &q_range)
             .unwrap(),
         "all-null zone is pruned for Range query"
     );
@@ -4047,15 +4614,15 @@ async fn test_struct_zonemap_null_tracking() {
     .unwrap();
 
     assert_eq!(index.zones.len(), 1);
-    assert_eq!(index.zones[0].null_count, 0, "no null struct rows");
-    assert_eq!(index.zones[0].nan_count, 0);
-    assert!(index.zones[0].min.is_null());
-    assert!(index.zones[0].max.is_null());
+    assert_eq!(index.zones.get(0).null_count, 0, "no null struct rows");
+    assert_eq!(index.zones.get(0).nan_count, 0);
+    assert!(index.zones.get(0).min.is_null());
+    assert!(index.zones.get(0).max.is_null());
 
     // IsNull: no null rows → zone is pruned
     assert!(
         !index
-            .evaluate_zone_against_query(&index.zones[0], &SargableQuery::IsNull())
+            .evaluate_zone_against_query(&index.zones.get(0), &SargableQuery::IsNull())
             .unwrap()
     );
 
@@ -4063,7 +4630,7 @@ async fn test_struct_zonemap_null_tracking() {
     assert!(
         index
             .evaluate_zone_against_query(
-                &index.zones[0],
+                &index.zones.get(0),
                 &SargableQuery::Equals(SV::Int32(Some(99)))
             )
             .unwrap()
@@ -4126,7 +4693,7 @@ async fn test_list_zonemap_null_tracking() {
     .unwrap();
 
     assert_eq!(index.zones.len(), 1);
-    assert_eq!(index.zones[0].null_count, 1, "one null list row");
+    assert_eq!(index.zones.get(0).null_count, 1, "one null list row");
     // min/max are typed null ScalarValues for nested types
 
     // IsNull search: the null bitmap is populated during training so
@@ -4379,9 +4946,9 @@ async fn test_list_zonemap_training_ignores_child_nulls() {
     .await
     .unwrap();
     assert_eq!(index.zones.len(), 1);
-    assert_eq!(index.zones[0].null_count, 1, "only the null list row");
-    assert_eq!(index.zones[0].nan_count, 0);
-    assert!(index.zones[0].min.is_null() && index.zones[0].max.is_null());
+    assert_eq!(index.zones.get(0).null_count, 1, "only the null list row");
+    assert_eq!(index.zones.get(0).nan_count, 0);
+    assert!(index.zones.get(0).min.is_null() && index.zones.get(0).max.is_null());
 
     let mut exact_nulls = RowAddrTreeMap::new();
     exact_nulls.insert(0);
@@ -4395,7 +4962,7 @@ async fn test_list_zonemap_training_ignores_child_nulls() {
     assert!(
         index
             .evaluate_zone_against_query(
-                &index.zones[0],
+                &index.zones.get(0),
                 &SargableQuery::Equals(SV::Int32(Some(99)))
             )
             .unwrap()
@@ -4555,16 +5122,16 @@ async fn test_index_file_v1_round_trip_keeps_bounds_and_sign_split() {
     assert_eq!(index.version(), ZoneMapIndexVersion::V1);
     // rows_per_zone = 2: [1.0, -NaN], [3.0, 4.0], [+NaN, +inf].
     assert_eq!(index.zones.len(), 3);
-    assert_eq!(index.zones[0].min, ScalarValue::Float64(Some(1.0)));
-    assert_eq!(index.zones[0].max, ScalarValue::Float64(Some(1.0)));
-    assert_eq!(index.zones[0].nan_count, 1);
-    assert_eq!(index.zones[0].negative_nan_count, Some(1));
+    assert_eq!(index.zones.get(0).min, ScalarValue::Float64(Some(1.0)));
+    assert_eq!(index.zones.get(0).max, ScalarValue::Float64(Some(1.0)));
+    assert_eq!(index.zones.get(0).nan_count, 1);
+    assert_eq!(index.zones.get(0).negative_nan_count, Some(1));
     // The split is known: no positive NaN sorts above 2.0 here, so x > 2
     // is decided by the ordinary bounds alone.
     assert!(
         index
             .evaluate_zone_against_query(
-                &index.zones[0],
+                &index.zones.get(0),
                 &range_q(std::ops::Bound::Unbounded, std::ops::Bound::Included(0.0))
             )
             .unwrap()
@@ -4572,24 +5139,24 @@ async fn test_index_file_v1_round_trip_keeps_bounds_and_sign_split() {
     assert!(
         !index
             .evaluate_zone_against_query(
-                &index.zones[0],
+                &index.zones.get(0),
                 &range_q(std::ops::Bound::Excluded(2.0), std::ops::Bound::Unbounded)
             )
             .unwrap()
     );
-    assert!(ZoneMapIndex::zone_has_finite_extrema(&index.zones[1]));
-    assert_eq!(index.zones[1].negative_nan_count, Some(0));
+    assert!(ZoneMapIndex::zone_has_finite_extrema(&index.zones.get(1)));
+    assert_eq!(index.zones.get(1).negative_nan_count, Some(0));
     // Infinities are ordinary bounds; NaNs are counted, not marked.
     assert_eq!(
-        index.zones[2].min,
+        index.zones.get(2).min,
         ScalarValue::Float64(Some(f64::INFINITY))
     );
     assert_eq!(
-        index.zones[2].max,
+        index.zones.get(2).max,
         ScalarValue::Float64(Some(f64::INFINITY))
     );
-    assert_eq!(index.zones[2].nan_count, 1);
-    assert_eq!(index.zones[2].negative_nan_count, Some(0));
+    assert_eq!(index.zones.get(2).nan_count, 1);
+    assert_eq!(index.zones.get(2).negative_nan_count, Some(0));
 
     // The file carries the version 1 schema.
     let reader = index.store.open_index_file(ZONEMAP_FILENAME).await.unwrap();
@@ -5203,15 +5770,15 @@ async fn test_index_file_v0_read_keeps_legacy_contract() {
     .unwrap();
     assert_eq!(index.version(), ZoneMapIndexVersion::V0);
     assert_eq!(index.rows_per_zone, 2);
-    assert!(ZoneMapIndex::scalar_is_nan(&index.zones[0].max));
-    assert_eq!(index.zones[0].negative_nan_count, None);
-    assert_eq!(index.zones[1].negative_nan_count, Some(0));
+    assert!(ZoneMapIndex::scalar_is_nan(&index.zones.get(0).max));
+    assert_eq!(index.zones.get(0).negative_nan_count, None);
+    assert_eq!(index.zones.get(1).negative_nan_count, Some(0));
     // Unknown split: both signs stay possible, so x > 2 keeps the zone
     // even though its hidden ordinary max is 1.0.
     assert!(
         index
             .evaluate_zone_against_query(
-                &index.zones[0],
+                &index.zones.get(0),
                 &range_q(std::ops::Bound::Excluded(2.0), std::ops::Bound::Unbounded)
             )
             .unwrap()
@@ -5219,7 +5786,7 @@ async fn test_index_file_v0_read_keeps_legacy_contract() {
     assert!(
         index
             .evaluate_zone_against_query(
-                &index.zones[0],
+                &index.zones.get(0),
                 &range_q(std::ops::Bound::Unbounded, std::ops::Bound::Included(0.0))
             )
             .unwrap()
@@ -5374,7 +5941,7 @@ async fn test_unsupported_index_version_is_refused() {
 async fn test_merge_keeps_source_version_and_refuses_mixed_versions() {
     let v1_a = train_and_load::<Float64Type>(vec![vec![Some(1.0), Some(-f64::NAN)]]).await;
     let mut v1_b = train_and_load::<Float64Type>(vec![vec![Some(3.0), Some(4.0)]]).await;
-    for zone in &mut Arc::get_mut(&mut v1_b).unwrap().zones {
+    for zone in Arc::get_mut(&mut v1_b).unwrap().zones.as_generic_mut() {
         zone.bound.fragment_id = 1;
     }
     let tmpdir_a = TempObjDir::default();
@@ -5424,9 +5991,9 @@ async fn test_merge_keeps_source_version_and_refuses_mixed_versions() {
     .await
     .unwrap();
     assert_eq!(merged.zones.len(), 2);
-    assert!(ZoneMapIndex::scalar_is_nan(&merged.zones[0].max));
-    assert_eq!(merged.zones[0].negative_nan_count, None);
-    assert_eq!(merged.zones[1].negative_nan_count, Some(0));
+    assert!(ZoneMapIndex::scalar_is_nan(&merged.zones.get(0).max));
+    assert_eq!(merged.zones.get(0).negative_nan_count, None);
+    assert_eq!(merged.zones.get(1).negative_nan_count, Some(0));
 
     // Version 1 + version 1 -> version 1.
     let dest_tmpdir = TempObjDir::default();
@@ -5449,8 +6016,8 @@ async fn test_merge_keeps_source_version_and_refuses_mixed_versions() {
     .await
     .unwrap();
     assert_eq!(merged.zones.len(), 2);
-    assert_eq!(merged.zones[0].max, ScalarValue::Float64(Some(1.0)));
-    assert_eq!(merged.zones[0].negative_nan_count, Some(1));
+    assert_eq!(merged.zones.get(0).max, ScalarValue::Float64(Some(1.0)));
+    assert_eq!(merged.zones.get(0).negative_nan_count, Some(1));
 
     // Mixed versions are refused before any write, in either order.
     let dest_tmpdir = TempObjDir::default();
@@ -5523,7 +6090,7 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
         vec![Some(f64::NAN), Some(f64::NAN), Some(5.0)],
     )
     .await;
-    assert_eq!(source.zones[0].nan_count, 2);
+    assert_eq!(source.zones.get(0).nan_count, 2);
     let source_mut = Arc::get_mut(&mut source).unwrap();
     source_mut.fri = Some(Arc::new(TestRemapper::new([(2, new_row)])));
     let dest_tmpdir = TempObjDir::default();
@@ -5592,10 +6159,10 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
     .await
     .unwrap();
     assert_eq!(merged.zones.len(), 1);
-    assert_eq!(merged.zones[0].bound.length, 2);
-    assert_eq!(merged.zones[0].null_count, 0);
-    assert_eq!(merged.zones[0].nan_count, 0);
-    assert_eq!(merged.zones[0].negative_nan_count, Some(0));
+    assert_eq!(merged.zones.get(0).bound.length, 2);
+    assert_eq!(merged.zones.get(0).null_count, 0);
+    assert_eq!(merged.zones.get(0).nan_count, 0);
+    assert_eq!(merged.zones.get(0).negative_nan_count, Some(0));
 
     // A run that keeps every row of its zone keeps exact counts.
     let tmpdir = TempObjDir::default();
@@ -5629,9 +6196,9 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
     )
     .await
     .unwrap();
-    assert_eq!(merged.zones[0].bound.length, 3);
-    assert_eq!(merged.zones[0].nan_count, 2);
-    assert_eq!(merged.zones[0].negative_nan_count, Some(1));
+    assert_eq!(merged.zones.get(0).bound.length, 3);
+    assert_eq!(merged.zones.get(0).nan_count, 2);
+    assert_eq!(merged.zones.get(0).negative_nan_count, Some(1));
 }
 
 /// Destination runs outside the output's fragments are dropped before
@@ -5691,11 +6258,11 @@ async fn test_merge_ignores_inexact_runs_outside_the_fragment_filter() {
     .await
     .unwrap();
     assert_eq!(merged.zones.len(), 1);
-    assert_eq!(merged.zones[0].bound.fragment_id, 4);
-    assert_eq!(merged.zones[0].bound.length, 3);
-    assert_eq!(merged.zones[0].min, ScalarValue::Float64(Some(1.0)));
-    assert_eq!(merged.zones[0].max, ScalarValue::Float64(Some(3.0)));
-    assert_eq!(merged.zones[0].negative_nan_count, Some(0));
+    assert_eq!(merged.zones.get(0).bound.fragment_id, 4);
+    assert_eq!(merged.zones.get(0).bound.length, 3);
+    assert_eq!(merged.zones.get(0).min, ScalarValue::Float64(Some(1.0)));
+    assert_eq!(merged.zones.get(0).max, ScalarValue::Float64(Some(3.0)));
+    assert_eq!(merged.zones.get(0).negative_nan_count, Some(0));
     // The same excluded runs still refuse the merge once they are kept.
     let dest_tmpdir = TempObjDir::default();
     let dest_store = local_store(&dest_tmpdir);
@@ -5840,11 +6407,11 @@ async fn test_update_keeps_file_version() {
     .await
     .unwrap();
     assert_eq!(updated.zones.len(), 2);
-    assert_eq!(updated.zones[1].bound.fragment_id, 1);
-    assert_eq!(updated.zones[1].nan_count, 1);
+    assert_eq!(updated.zones.get(1).bound.fragment_id, 1);
+    assert_eq!(updated.zones.get(1).nan_count, 1);
     // Written under the version 0 contract: marker max, split unknown.
-    assert!(ZoneMapIndex::scalar_is_nan(&updated.zones[1].max));
-    assert_eq!(updated.zones[1].negative_nan_count, None);
+    assert!(ZoneMapIndex::scalar_is_nan(&updated.zones.get(1).max));
+    assert_eq!(updated.zones.get(1).negative_nan_count, None);
     assert!(
         ZoneMapIndex::load(
             dest_store,
@@ -5876,8 +6443,8 @@ async fn test_update_keeps_file_version() {
     .await
     .unwrap();
     assert_eq!(updated.zones.len(), 2);
-    assert_eq!(updated.zones[1].max, ScalarValue::Float64(Some(7.0)));
-    assert_eq!(updated.zones[1].negative_nan_count, Some(1));
+    assert_eq!(updated.zones.get(1).max, ScalarValue::Float64(Some(7.0)));
+    assert_eq!(updated.zones.get(1).negative_nan_count, Some(1));
 }
 
 /// The low-level update adds the stream's zones beside the existing
@@ -6057,13 +6624,13 @@ async fn test_update_with_seeds_version_admission() {
     .await
     .unwrap();
     assert_eq!(updated.zones.len(), 3);
-    assert_eq!(updated.zones[1].bound.fragment_id, 1);
-    assert_eq!(updated.zones[1].max, ScalarValue::Float64(Some(6.0)));
-    assert_eq!(updated.zones[1].negative_nan_count, Some(0));
-    assert_eq!(updated.zones[2].bound.fragment_id, 2);
-    assert_eq!(updated.zones[2].max, ScalarValue::Float64(Some(5.0)));
-    assert_eq!(updated.zones[2].nan_count, 1);
-    assert_eq!(updated.zones[2].negative_nan_count, Some(1));
+    assert_eq!(updated.zones.get(1).bound.fragment_id, 1);
+    assert_eq!(updated.zones.get(1).max, ScalarValue::Float64(Some(6.0)));
+    assert_eq!(updated.zones.get(1).negative_nan_count, Some(0));
+    assert_eq!(updated.zones.get(2).bound.fragment_id, 2);
+    assert_eq!(updated.zones.get(2).max, ScalarValue::Float64(Some(5.0)));
+    assert_eq!(updated.zones.get(2).nan_count, 1);
+    assert_eq!(updated.zones.get(2).negative_nan_count, Some(1));
 }
 
 #[tokio::test]
@@ -6312,7 +6879,7 @@ async fn test_build_segment_update_folds_seeds_and_scan_into_target_zones() {
         zones,
         vec![(0, 0, 2, 1), (1, 0, 4, 2), (1, 4, 2, 1), (2, 0, 2, 1)]
     );
-    let zone = &updated.zones[1];
+    let zone = updated.zones.get(1);
     assert_eq!(zone.min, ScalarValue::Int32(Some(3)));
     assert_eq!(zone.max, ScalarValue::Int32(Some(9)));
     let nulls = updated.null_rows.as_ref().unwrap();

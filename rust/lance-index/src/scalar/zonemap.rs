@@ -49,8 +49,18 @@ use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, search_zones};
+use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer};
+use futures::TryStreamExt;
 use std::collections::HashSet;
+
+mod query;
+mod storage;
+use query::{ZoneMapPredicate, ZoneMapValue};
+use storage::ZoneMaps;
+
+// Decoder batch size in summaries, independent of data rows per zone and disk layout.
+const ZONEMAP_READ_BATCH_SIZE: u64 = 4096;
+const ZONEMAP_READ_BATCH_READAHEAD: u32 = 2;
 
 /// `rows` without the positions of `fragments`.
 fn without_fragments(
@@ -128,9 +138,9 @@ const ZONEMAP_INDEX_VERSION: u32 = ZoneMapIndexVersion::CURRENT as u32;
 /// read and before one is written: the sign split fits the NaN count, the
 /// counts fit the zone, and no bound is a NaN (nested types store
 /// placeholder bounds that are never consulted). Returns the violation.
-fn v1_zone_violation(
-    min: &ScalarValue,
-    max: &ScalarValue,
+fn v1_zone_violation<V: ZoneMapValue>(
+    min: &V,
+    max: &V,
     null_count: u32,
     nan_count: u32,
     negative_nan_count: u32,
@@ -147,7 +157,7 @@ fn v1_zone_violation(
             "null_count {null_count} plus nan_count {nan_count} above its length {length}"
         ));
     }
-    if !nested && (ZoneMapIndex::scalar_is_nan(min) || ZoneMapIndex::scalar_is_nan(max)) {
+    if !nested && (min.is_nan() || max.is_nan()) {
         return Some("a NaN bound".to_string());
     }
     None
@@ -166,9 +176,9 @@ pub struct ZoneSummary {
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct ZoneMapStatistics {
-    min: ScalarValue,
-    max: ScalarValue,
+pub(crate) struct ZoneMapStatistics<V = ScalarValue> {
+    min: V,
+    max: V,
     null_count: u32,
     // only apply to float type
     nan_count: u32,
@@ -192,7 +202,7 @@ impl DeepSizeOf for ZoneMapStatistics {
     }
 }
 
-impl AsRef<ZoneBound> for ZoneMapStatistics {
+impl<V> AsRef<ZoneBound> for ZoneMapStatistics<V> {
     fn as_ref(&self) -> &ZoneBound {
         &self.bound
     }
@@ -220,7 +230,7 @@ impl AsRef<ZoneBound> for ZoneMapStatistics {
 /// 2           | 15  | 16  | 2
 /// 3           | 20  | 23  | 4
 pub struct ZoneMapIndex {
-    zones: Vec<ZoneMapStatistics>,
+    zones: ZoneMaps,
     data_type: DataType,
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
@@ -266,6 +276,84 @@ impl DeepSizeOf for ZoneMapIndex {
     }
 }
 
+struct ZoneMapQuery<'a> {
+    index: &'a ZoneMapIndex,
+    query: &'a SargableQuery,
+}
+
+// Shared by raw generic zones and transient typed folds of homogeneous columns.
+// Nothing is cached: every global-range request validates every zone's bounds.
+struct ValueRange<V> {
+    min: Option<V>,
+    max: Option<V>,
+}
+
+impl<V> Default for ValueRange<V> {
+    fn default() -> Self {
+        Self {
+            min: None,
+            max: None,
+        }
+    }
+}
+
+impl<V: PartialOrd> ValueRange<V> {
+    fn extend_bounds(&mut self, min: Option<V>, max: Option<V>) -> (bool, bool) {
+        let mut min_changed = false;
+        let mut max_changed = false;
+        if let Some(candidate) = min
+            && self.min.as_ref().is_none_or(|current| {
+                candidate
+                    .partial_cmp(current)
+                    .is_some_and(|order| order.is_lt())
+            })
+        {
+            self.min = Some(candidate);
+            min_changed = true;
+        }
+        if let Some(candidate) = max
+            && self.max.as_ref().is_none_or(|current| {
+                candidate
+                    .partial_cmp(current)
+                    .is_some_and(|order| order.is_gt())
+            })
+        {
+            self.max = Some(candidate);
+            max_changed = true;
+        }
+        (min_changed, max_changed)
+    }
+
+    /// Fold one zone into the range; `None` means no finite global range
+    /// exists (unknown bounds with comparable values, or any NaN: positive
+    /// NaNs sort above every finite value and negative NaNs below).
+    fn extend_zone(&mut self, zone: ZoneMapStatistics<V>) -> Option<(bool, bool)>
+    where
+        V: ZoneMapValue,
+    {
+        if (ZoneMapIndex::zone_has_missing_extrema(&zone)
+            && ZoneMapIndex::zone_has_comparable_values(&zone))
+            || zone.nan_count > 0
+            || zone.max.is_nan()
+        {
+            return None;
+        }
+        let min = (!zone.min.is_null() && !zone.min.is_nan()).then_some(zone.min);
+        let max = (!zone.max.is_null() && !zone.max.is_nan()).then_some(zone.max);
+        Some(self.extend_bounds(min, max))
+    }
+}
+
+impl ZoneMapPredicate for ZoneMapQuery<'_> {
+    fn evaluate<V>(&self, zone: &ZoneMapStatistics<V>) -> Result<bool>
+    where
+        V: ZoneMapValue,
+        ScalarValue: PartialOrd<V>,
+    {
+        self.index.evaluate_zone_against_query(zone, self.query)
+    }
+}
+
 impl ZoneMapIndex {
     /// Returns the rows-per-zone parameter for this index.
     pub fn rows_per_zone(&self) -> u64 {
@@ -305,8 +393,8 @@ impl ZoneMapIndex {
             .iter()
             .map(|zone| ZoneSummary {
                 bound: zone.bound.clone(),
-                min: zone.min.clone(),
-                max: zone.max.clone(),
+                min: zone.min.into_owned(),
+                max: zone.max.into_owned(),
                 null_count: zone.null_count,
                 nan_count: zone.nan_count,
             })
@@ -343,7 +431,7 @@ impl ZoneMapIndex {
     /// Whether the zone may contain a positive NaN (sorts above positive
     /// infinity under Arrow Rust ordering). Conservative `true` when the NaN
     /// sign split is unknown.
-    fn zone_positive_nan_possible(zone: &ZoneMapStatistics) -> bool {
+    fn zone_positive_nan_possible<V: ZoneMapValue>(zone: &ZoneMapStatistics<V>) -> bool {
         match zone.negative_nan_count {
             Some(negative) => zone.nan_count > negative,
             None => zone.nan_count > 0,
@@ -353,7 +441,7 @@ impl ZoneMapIndex {
     /// Whether the zone may contain a negative NaN (sorts below negative
     /// infinity under Arrow Rust ordering). Conservative `true` when the NaN
     /// sign split is unknown.
-    fn zone_negative_nan_possible(zone: &ZoneMapStatistics) -> bool {
+    fn zone_negative_nan_possible<V: ZoneMapValue>(zone: &ZoneMapStatistics<V>) -> bool {
         match zone.negative_nan_count {
             Some(negative) => negative > 0,
             None => zone.nan_count > 0,
@@ -363,28 +451,28 @@ impl ZoneMapIndex {
     /// Whether the zone may contain any non-null value (finite or NaN).
     /// Recorded bounds win over counts: a remapped legacy zone inherits its
     /// source's counts, which are not exact for the shorter run.
-    fn zone_non_null_possible(zone: &ZoneMapStatistics) -> bool {
+    fn zone_non_null_possible<V: ZoneMapValue>(zone: &ZoneMapStatistics<V>) -> bool {
         !Self::zone_has_missing_extrema(zone)
             || zone.bound.length as u64 > u64::from(zone.null_count)
     }
 
     /// Returns true if the zone has a non-null, non-NaN min value.
-    fn zone_has_finite_min(zone: &ZoneMapStatistics) -> bool {
-        !(zone.min.is_null() || Self::scalar_is_nan(&zone.min))
+    fn zone_has_finite_min<V: ZoneMapValue>(zone: &ZoneMapStatistics<V>) -> bool {
+        !(zone.min.is_null() || zone.min.is_nan())
     }
 
     /// Returns true if both min and max are non-null / non-NaN.
-    fn zone_has_finite_extrema(zone: &ZoneMapStatistics) -> bool {
-        Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
+    fn zone_has_finite_extrema<V: ZoneMapValue>(zone: &ZoneMapStatistics<V>) -> bool {
+        Self::zone_has_finite_min(zone) && !(zone.max.is_null() || zone.max.is_nan())
     }
 
-    fn zone_has_missing_extrema(zone: &ZoneMapStatistics) -> bool {
+    fn zone_has_missing_extrema<V: ZoneMapValue>(zone: &ZoneMapStatistics<V>) -> bool {
         zone.min.is_null() || zone.max.is_null()
     }
 
     /// Counts prove whether missing extrema mean "no comparable values" or
     /// "bounds unknown". Only the latter must conservatively retain the zone.
-    fn zone_has_comparable_values(zone: &ZoneMapStatistics) -> bool {
+    fn zone_has_comparable_values<V: ZoneMapValue>(zone: &ZoneMapStatistics<V>) -> bool {
         zone.bound.length as u128 > u128::from(zone.null_count) + u128::from(zone.nan_count)
     }
 
@@ -405,44 +493,20 @@ impl ZoneMapIndex {
     pub fn value_range_over<'a>(
         segments: impl IntoIterator<Item = &'a Self>,
     ) -> Option<(ScalarValue, ScalarValue)> {
-        let mut min: Option<&ScalarValue> = None;
-        let mut max: Option<&ScalarValue> = None;
+        let mut range = ValueRange::default();
         for seg in segments.into_iter() {
             // Nested types have no meaningful ordering
             if seg.data_type.is_nested() {
                 return None;
             }
-            for zone in seg.zones.iter() {
-                // Legacy Decimal zones can contain comparable values even though their
-                // extrema were never written, so skipping them would produce a subset.
-                if Self::zone_has_missing_extrema(zone) && Self::zone_has_comparable_values(zone) {
-                    return None;
-                }
-                // Any NaN breaks the fold: positive NaNs sort above every
-                // finite value and negative NaNs below, so no finite global
-                // range bounds a NaN-bearing zone. Legacy zones mark this with
-                // a NaN max; fresh zones keep finite bounds plus the counts.
-                if zone.nan_count > 0 || Self::scalar_is_nan(&zone.max) {
-                    return None;
-                }
-                if Self::scalar_is_finite_bound(&zone.min)
-                    && min.is_none_or(|cur| zone.min.partial_cmp(cur).is_some_and(|o| o.is_lt()))
-                {
-                    min = Some(&zone.min);
-                }
-                if Self::scalar_is_finite_bound(&zone.max)
-                    && max.is_none_or(|cur| zone.max.partial_cmp(cur).is_some_and(|o| o.is_gt()))
-                {
-                    max = Some(&zone.max);
-                }
-            }
+            seg.zones.extend_value_range(&mut range)?;
         }
-        Some((min?.clone(), max?.clone()))
+        Some((range.min?.into_owned(), range.max?.into_owned()))
     }
 
-    /// A scalar usable as a global-range bound: non-null and, for floats, non-NaN.
-    fn scalar_is_finite_bound(v: &ScalarValue) -> bool {
-        !v.is_null() && !Self::scalar_is_nan(v)
+    /// A bound usable for pruning: non-null and, for floats, non-NaN.
+    fn scalar_is_finite_bound<V: ZoneMapValue>(v: &V) -> bool {
+        !v.is_null() && !v.is_nan()
     }
 
     /// Evaluates whether a zone could potentially contain values matching the query.
@@ -452,11 +516,15 @@ impl ZoneMapIndex {
     /// each sign a zone holds, never their payloads, so a zone is pruned only
     /// when the statistics prove no value can match; anything short of proof
     /// keeps the zone for the predicate recheck.
-    fn evaluate_zone_against_query(
+    fn evaluate_zone_against_query<V>(
         &self,
-        zone: &ZoneMapStatistics,
+        zone: &ZoneMapStatistics<V>,
         query: &SargableQuery,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    where
+        V: ZoneMapValue,
+        ScalarValue: PartialOrd<V>,
+    {
         use std::ops::Bound;
 
         // For nested types we only track null_count; prune only when certain.
@@ -772,9 +840,6 @@ impl ZoneMapIndex {
         Self: Sized,
     {
         let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
-        let zone_maps = index_file
-            .read_range(0..index_file.num_rows(), None)
-            .await?;
         let file_schema = index_file.schema();
 
         let rows_per_zone: u64 = file_schema
@@ -797,8 +862,8 @@ impl ZoneMapIndex {
             .get(NULL_BITMAP_POLICY_META_KEY)
             .is_none_or(|value| value != "false");
 
-        Ok(Arc::new(Self::try_from_serialized(
-            zone_maps,
+        let mut index = Self::try_from_serialized(
+            RecordBatch::new_empty(Arc::new(file_schema.into())),
             store,
             fri,
             index_cache,
@@ -807,7 +872,19 @@ impl ZoneMapIndex {
             use_seeds,
             store_null_bitmap,
             version,
-        )?))
+        )?;
+        index
+            .zones
+            .reserve(index_file.num_rows(), ZONEMAP_READ_BATCH_SIZE as usize);
+        let mut batches = index_file
+            .read_record_batch_stream(ZONEMAP_READ_BATCH_SIZE, ZONEMAP_READ_BATCH_READAHEAD)
+            .await?;
+        while let Some(batch) = batches.try_next().await? {
+            index
+                .zones
+                .append(ZoneMaps::from_batch(&batch, version)?.0)?;
+        }
+        Ok(Arc::new(index))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -822,151 +899,7 @@ impl ZoneMapIndex {
         store_null_bitmap: bool,
         version: ZoneMapIndexVersion,
     ) -> Result<Self> {
-        // The RecordBatch should have columns: min, max, null_count
-        let min_col = data
-            .column_by_name("min")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'min' column"))?;
-        let max_col = data
-            .column_by_name("max")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'max' column"))?;
-        let null_count_col = data
-            .column_by_name("null_count")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'null_count' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'null_count' column is not UInt32")
-            })?;
-        let nan_count_col = data
-            .column_by_name("nan_count")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'nan_count' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'nan_count' column is not UInt32")
-            })?;
-        let zone_length = data
-            .column_by_name("zone_length")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_length' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'zone_length' column is not UInt64")
-            })?;
-
-        let fragment_id_col = data
-            .column_by_name("fragment_id")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'fragment_id' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'fragment_id' column is not UInt64")
-            })?;
-
-        let zone_start_col = data
-            .column_by_name("zone_start")
-            .ok_or_else(|| Error::invalid_input("ZoneMapIndex: missing 'zone_start' column"))?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
-            })?;
-
-        // Only version 1 stores the NaN sign split.
-        let negative_nan_count_col = match version {
-            ZoneMapIndexVersion::V1 => Some(
-                data.column_by_name("negative_nan_count")
-                    .ok_or_else(|| {
-                        Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            "ZoneMapIndex: version 1 file has no 'negative_nan_count' column",
-                        )
-                    })?
-                    .as_any()
-                    .downcast_ref::<arrow_array::UInt32Array>()
-                    .ok_or_else(|| {
-                        Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            "ZoneMapIndex: 'negative_nan_count' column is not UInt32",
-                        )
-                    })?,
-            ),
-            ZoneMapIndexVersion::V0 => None,
-        };
-
-        let data_type = min_col.data_type().clone();
-
-        if data.num_rows() == 0 {
-            return Ok(Self {
-                zones: Vec::new(),
-                data_type,
-                rows_per_zone,
-                use_seeds,
-                version,
-                store_null_bitmap,
-                store,
-                fri,
-                batch_remapper: None,
-                index_cache: WeakLanceCache::from(index_cache),
-                null_rows,
-            });
-        }
-
-        let num_zones = data.num_rows();
-        let mut zones = Vec::with_capacity(num_zones);
-
-        for i in 0..num_zones {
-            let (min, max) = if data_type.is_nested() {
-                (
-                    ScalarValue::try_new_null(&data_type)?,
-                    ScalarValue::try_new_null(&data_type)?,
-                )
-            } else {
-                (
-                    ScalarValue::try_from_array(min_col, i)?,
-                    ScalarValue::try_from_array(max_col, i)?,
-                )
-            };
-            let null_count = null_count_col.value(i);
-            let nan_count = nan_count_col.value(i);
-            let length = zone_length.value(i);
-            let negative_nan_count = match negative_nan_count_col {
-                Some(col) => {
-                    let negative = col.value(i);
-                    if let Some(violation) = v1_zone_violation(
-                        &min,
-                        &max,
-                        null_count,
-                        nan_count,
-                        negative,
-                        length,
-                        data_type.is_nested(),
-                    ) {
-                        return Err(Error::corrupt_file_named(
-                            ZONEMAP_FILENAME,
-                            format!("ZoneMapIndex: version 1 zone {i} has {violation}"),
-                        ));
-                    }
-                    Some(negative)
-                }
-                // Version 0 stores no split: unknown, unless the zone has no
-                // NaNs at all.
-                None if nan_count == 0 => Some(0),
-                None => None,
-            };
-            zones.push(ZoneMapStatistics {
-                min,
-                max,
-                null_count,
-                nan_count,
-                negative_nan_count,
-                bound: ZoneBound {
-                    fragment_id: fragment_id_col.value(i),
-                    start: zone_start_col.value(i),
-                    length: length as usize,
-                },
-            });
-        }
+        let (zones, data_type) = ZoneMaps::from_batch(&data, version)?;
 
         Ok(Self {
             zones,
@@ -1014,7 +947,7 @@ impl Index for ZoneMapIndex {
         let mut frag_ids = RoaringBitmap::new();
 
         // Loop through zones and add unique fragment IDs to the bitmap
-        for zone in &self.zones {
+        for zone in self.zones.iter() {
             frag_ids.insert(zone.bound.fragment_id as u32);
         }
 
@@ -1035,9 +968,8 @@ impl ScalarIndex for ZoneMapIndex {
         {
             SearchResult::exact(null_rows.clone())
         } else {
-            search_zones(&self.zones, metrics, |zone| {
-                self.evaluate_zone_against_query(zone, query)
-            })?
+            self.zones
+                .search(&ZoneMapQuery { index: self, query }, metrics)?
         };
 
         let (selected, nulls) = if let Some(remapper) = &self.fri {
@@ -1121,7 +1053,7 @@ impl ScalarIndex for ZoneMapIndex {
         // re-summarized fragment is the dataset builder's job
         // (`build_zonemap_segment`), which knows the refreshed fragment set
         // and the physical row counts.
-        let mut updated_zones = self.zones.clone();
+        let mut updated_zones = self.zones.to_vec();
         updated_zones.extend(new_zones);
         updated_zones.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
 
@@ -1395,7 +1327,8 @@ pub async fn merge_zonemap_indices(
                 |remapper| remapper.remap_row_addrs_tree_map(null_rows),
             )
         });
-        for zone in &source.zones {
+        for zone in source.zones.to_vec() {
+            let zone = &zone;
             let source_zones = source.fri.as_deref().map_or_else(
                 || Ok(vec![zone.clone()]),
                 |remapper| {
@@ -3448,7 +3381,7 @@ pub async fn build_zonemap_segment(
                 .zones
                 .iter()
                 .filter(|zone| !refreshed.contains(&zone.bound.fragment_id))
-                .cloned()
+                .map(|zone| zone.into_owned())
                 .collect()
         })
         .unwrap_or_default();
