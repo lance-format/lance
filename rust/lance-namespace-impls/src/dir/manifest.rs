@@ -2325,9 +2325,9 @@ impl ManifestNamespace {
         location: &str,
     ) -> Result<object_store::path::Path> {
         // Build the target path by parsing the full relative location, so that each
-        // `/`-separated segment is treated as its own path part and non-ASCII / `%`
-        // bytes are not re-encoded again.  `Path::parse` decodes percent-encoding and
-        // rejects traversal, matching how `construct_full_uri` addresses the data.
+        // `/`-separated segment is treated as its own path part.  Path::parse does
+        // not percent-decode; it validates and preserves the raw segment bytes,
+        // matching how construct_full_uri addresses the data.
         Ok(object_store::path::Path::parse(format!(
             "{base}/{location}"
         ))?)
