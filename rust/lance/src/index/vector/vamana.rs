@@ -3,10 +3,8 @@
 
 //! IVF_VAMANA_* indices: IVF partitions that each hold a Vamana graph.
 //!
-//! This module exists only in the Vamana fork of Lance. The graph and its
-//! upkeep live in [`lance_index::vector::vamana`]; this module ties them to
-//! datasets. Upstream files reach it through hooks marked `// fork(vamana)`,
-//! and `git grep 'fork(vamana)'` lists every one of them.
+//! The graph and its upkeep live in [`lance_index::vector::vamana`]; this
+//! module ties them to datasets.
 //!
 //! Every IVF_VAMANA_PQ segment keeps its product codes row-major, as the
 //! shards of an index built apart must for their merge
@@ -27,12 +25,10 @@ mod tests;
 mod vectors;
 
 use std::collections::HashMap;
-use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
 use lance_core::cache::LanceCache;
-use lance_index::IndexType;
 use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::VectorIndexDetails;
@@ -47,6 +43,7 @@ use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::shuffler::Shuffler;
 use lance_index::vector::vamana::{Vamana, VamanaBuildParams};
+use lance_index::{IVF_VAMANA_INDEX_VERSION, IndexType};
 use lance_io::object_store::ObjectStore;
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::DistanceType;
@@ -64,14 +61,6 @@ use crate::{Error, Result};
 
 pub use index::wrap_for_search;
 
-/// The `index_version`s of the IVF_VAMANA_* indices this build reads.
-///
-/// They sit far above upstream's vector versions and outside
-/// `IndexType::max_vector_version()`: an upstream build hides these indices
-/// and keeps them through its commits, and this build still hides every
-/// upstream vector version it does not know.
-pub const VAMANA_INDEX_VERSIONS: RangeInclusive<i32> = 100..=100;
-
 /// The type of an IVF_VAMANA_* index whose partitions hold `quantization`
 /// codes. RaBitQ codes are never built under a graph.
 pub fn index_type(quantization: QuantizationType) -> IndexType {
@@ -83,12 +72,11 @@ pub fn index_type(quantization: QuantizationType) -> IndexType {
     }
 }
 
-/// Whether this build reads `index` as an IVF_VAMANA_* index: one of its
-/// versions, with Vamana's details or with empty vector details, as upstream
-/// reads its own versions whatever their details. Details stay empty only
-/// where inferring them from the index files failed.
-pub fn is_supported_segment(index: &IndexMetadata) -> bool {
-    VAMANA_INDEX_VERSIONS.contains(&index.index_version)
+/// Whether `index` is an IVF_VAMANA_* segment: one at the IVF_VAMANA_*
+/// version, with Vamana's details or with empty vector details. Details stay
+/// empty only where inferring them from the index files failed.
+pub fn is_vamana_segment(index: &IndexMetadata) -> bool {
+    index.index_version == IVF_VAMANA_INDEX_VERSION as i32
         && index.index_details.as_deref().is_some_and(|details| {
             details.type_url.ends_with("VectorIndexDetails")
                 && (details.value.is_empty()

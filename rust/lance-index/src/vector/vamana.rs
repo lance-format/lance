@@ -8,8 +8,6 @@
 //! algorithm of the DiskANN paper, kept up to date through compaction with
 //! FreshVamana's delete consolidation, and extended in place when new rows are
 //! merged into a partition.
-//!
-//! This module exists only in the Vamana fork of Lance.
 
 pub(crate) mod batch;
 pub mod build;

@@ -568,7 +568,7 @@ mod tests {
             query_parallelism: 4,
             dist_q_c: 1.25,
             approx_mode: super::super::ApproxMode::Accurate,
-            adaptive_stop: None, // fork(vamana)
+            adaptive_stop: None,
         }
     }
 

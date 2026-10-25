@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_index::pb as index_pb;
-use lance_index::vector::vamana::AdaptiveStop; // fork(vamana)
+use lance_index::vector::vamana::AdaptiveStop;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, Query};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
@@ -99,7 +99,7 @@ fn approx_mode_from_proto(value: i32) -> ApproxMode {
 
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
     query.validate_search_effort()?;
-    // fork(vamana): only the margin crosses the wire; its rank is the query's k.
+    // Only the margin crosses the wire; its rank is the query's k.
     if let Some(stop) = &query.adaptive_stop {
         stop.validate(query.k)?;
     }
@@ -128,7 +128,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         // No planner narrows the covering projection yet, so this is always absent:
         // "materialize every covering column declared". See `CoveringProjection`.
         covering_projection: None,
-        stop_margin: query.adaptive_stop.map(|stop| stop.margin), // fork(vamana)
+        stop_margin: query.adaptive_stop.map(|stop| stop.margin),
     })
 }
 
@@ -160,14 +160,12 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         query_parallelism: proto.query_parallelism.unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
         approx_mode: approx_mode_from_proto(proto.approx_mode),
-        // fork(vamana)
         adaptive_stop: proto.stop_margin.map(|margin| AdaptiveStop {
             margin,
             rank: proto.k as usize,
         }),
     };
     query.validate_search_effort()?;
-    // fork(vamana)
     if let Some(stop) = &query.adaptive_stop {
         stop.validate(query.k)?;
     }
@@ -378,7 +376,6 @@ mod tests {
             query_parallelism: -1,
             dist_q_c: 0.42,
             approx_mode: ApproxMode::Accurate,
-            // fork(vamana)
             adaptive_stop: Some(AdaptiveStop {
                 margin: 0.05,
                 rank: 10,
@@ -403,7 +400,7 @@ mod tests {
         assert_eq!(query.query_parallelism, back.query_parallelism);
         assert_eq!(query.dist_q_c, back.dist_q_c);
         assert_eq!(query.approx_mode, back.approx_mode);
-        assert_eq!(query.adaptive_stop, back.adaptive_stop); // fork(vamana)
+        assert_eq!(query.adaptive_stop, back.adaptive_stop);
         assert_eq!(query.key.len(), back.key.len());
         assert_eq!(query.key.data_type(), back.key.data_type());
     }
@@ -427,7 +424,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
-            adaptive_stop: None, // fork(vamana)
+            adaptive_stop: None,
         };
 
         let proto = query_to_proto(&query).unwrap();
@@ -436,7 +433,7 @@ mod tests {
         assert!(!back.use_index);
         assert_eq!(back.approx_mode, ApproxMode::Normal);
         assert_eq!(back.search_effort, 0.5);
-        assert_eq!(back.adaptive_stop, None); // fork(vamana)
+        assert_eq!(back.adaptive_stop, None);
 
         for effort in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
             let mut proto = query_to_proto(&query).unwrap();
@@ -523,7 +520,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
-            adaptive_stop: None, // fork(vamana)
+            adaptive_stop: None,
         };
 
         let exec = ANNIvfPartitionExec::try_new(
@@ -573,7 +570,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
-            adaptive_stop: None, // fork(vamana)
+            adaptive_stop: None,
         };
 
         // Use a TestMemoryExec as a mock input child (provides the KNN_PARTITION_SCHEMA)
@@ -639,7 +636,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
-            adaptive_stop: None, // fork(vamana)
+            adaptive_stop: None,
         };
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             TestMemoryExec::try_new_exec(
@@ -799,7 +796,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // fork(vamana)
     /// A stop margin crosses the wire alone, its rank being the query's k on
     /// both sides, and only as one a walk can stop by, either way.
     #[test]

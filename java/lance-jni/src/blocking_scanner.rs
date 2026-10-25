@@ -519,7 +519,6 @@ pub(crate) fn build_scanner_with_options<'a>(
             scanner.ef(ef);
         }
 
-        // fork(vamana)
         if let Some(stop_margin) = crate::vamana::stop_margin(env, &java_obj)? {
             scanner.stop_margin(stop_margin)?;
         }

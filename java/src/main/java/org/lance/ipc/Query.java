@@ -37,7 +37,7 @@ public class Query {
   private final boolean useIndex;
   private final int queryParallelism;
   private final ApproxMode approxMode;
-  private final Optional<Float> stopMargin; // fork(vamana)
+  private final Optional<Float> stopMargin;
 
   private Query(Builder builder) {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
@@ -70,7 +70,7 @@ public class Query {
     this.useIndex = builder.useIndex;
     this.queryParallelism = builder.queryParallelism;
     this.approxMode = builder.approxMode;
-    this.stopMargin = builder.stopMargin; // fork(vamana)
+    this.stopMargin = builder.stopMargin;
   }
 
   public String getColumn() {
@@ -168,7 +168,6 @@ public class Query {
     return approxMode.toRustString();
   }
 
-  // fork(vamana)
   public Optional<Float> getStopMargin() {
     return stopMargin;
   }
@@ -191,7 +190,7 @@ public class Query {
         .add("useIndex", useIndex)
         .add("queryParallelism", queryParallelism)
         .add("approxMode", approxMode)
-        .add("stopMargin", stopMargin.orElse(null)) // fork(vamana)
+        .add("stopMargin", stopMargin.orElse(null))
         .toString();
   }
 
@@ -212,7 +211,7 @@ public class Query {
     private boolean useIndex = true;
     private int queryParallelism = 0;
     private ApproxMode approxMode = ApproxMode.NORMAL;
-    private Optional<Float> stopMargin = Optional.empty(); // fork(vamana)
+    private Optional<Float> stopMargin = Optional.empty();
 
     /**
      * Sets the column to be searched.
@@ -470,7 +469,6 @@ public class Query {
       return this;
     }
 
-    // fork(vamana)
     /**
      * Stops each walk of an IVF_VAMANA_* index once none of its unexpanded candidates is among the
      * {@code k} nearest or nearer than {@code 1 + stopMargin} times the length to the {@code k}-th:

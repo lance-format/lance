@@ -1080,7 +1080,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .await?
         }
         (SubIndexType::Vamana, quantization_type) => {
-            // fork(vamana)
             super::vamana::optimize(
                 dataset,
                 unindexed,
@@ -2441,7 +2440,6 @@ pub(crate) async fn remap_index_file_v3(
             .await
         }
         (SubIndexType::Vamana, quantization_type) => {
-            // fork(vamana)
             super::vamana::remap(
                 dataset,
                 column,
@@ -2867,7 +2865,7 @@ async fn merge_segments_inner(
     if segments.len() == 1 {
         return Ok(segments.into_iter().next().unwrap());
     }
-    super::vamana::segments::check_mergeable(object_store, indices_dir, &segments).await?; // fork(vamana)
+    super::vamana::segments::check_mergeable(object_store, indices_dir, &segments).await?;
 
     let mut merged_segment = segments[0].clone();
     let mut fragment_bitmap = RoaringBitmap::new();
@@ -3104,7 +3102,7 @@ async fn write_root_vector_index_from_auxiliary(
             }
         };
     if idx_meta.index_type.starts_with("IVF_VAMANA") {
-        // fork(vamana): each partition's graph is drawn over its merged rows.
+        // Each partition's graph is drawn over its merged rows.
         return super::vamana::segments::write_merged_root(
             object_store,
             index_dir,
@@ -6468,7 +6466,7 @@ mod tests {
                     query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                     dist_q_c: 0.0,
                     approx_mode: Default::default(),
-                    adaptive_stop: None, // fork(vamana)
+                    adaptive_stop: None,
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;

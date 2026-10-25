@@ -14,8 +14,8 @@
 //! The inheritance is one hop, so no edge dangles afterwards, but the graph
 //! can still come apart: removing 90% of a 1000-vertex graph of four
 //! dimensions evenly cut 2 of the 100 survivors off in [`super::remap`]'s
-//! tests, and 98 on the `lance-vamana` crate's fixture. Callers link the
-//! survivors it cuts off back in with `insert::relink_stranded`.
+//! tests. Callers link the survivors it cuts off back in with
+//! `insert::relink_stranded`.
 
 use lance_core::{Error, Result};
 
@@ -210,8 +210,7 @@ mod tests {
 
     /// A real build over scattered points, where inherited lists overflow and
     /// are pruned back. Removing every other row keeps every survivor
-    /// reachable; the crate measured the one-hop repair losing survivors only
-    /// past 70% removed evenly.
+    /// reachable.
     #[test]
     fn a_built_graph_survives_losing_half_its_rows() {
         const VERTICES: u32 = 1000;

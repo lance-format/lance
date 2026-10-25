@@ -27,7 +27,7 @@ public class VectorIndexParams {
   private final Optional<HnswBuildParams> hnswParams;
   private final Optional<SQBuildParams> sqParams;
   private final Optional<RQBuildParams> rqParams;
-  private final Optional<VamanaBuildParams> vamanaParams; // fork(vamana)
+  private final Optional<VamanaBuildParams> vamanaParams;
 
   private VectorIndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
@@ -36,7 +36,7 @@ public class VectorIndexParams {
     this.hnswParams = builder.hnswParams;
     this.sqParams = builder.sqParams;
     this.rqParams = builder.rqParams;
-    this.vamanaParams = builder.vamanaParams; // fork(vamana)
+    this.vamanaParams = builder.vamanaParams;
     validate();
   }
 
@@ -47,7 +47,6 @@ public class VectorIndexParams {
         > 1) {
       throw new IllegalArgumentException("Only one of PQ, SQ, or RQ can be specified at a time.");
     }
-    // fork(vamana)
     if (hnswParams.isPresent() && vamanaParams.isPresent()) {
       throw new IllegalArgumentException("Only one of HNSW or Vamana can be specified at a time.");
     }
@@ -178,7 +177,6 @@ public class VectorIndexParams {
         .build();
   }
 
-  // fork(vamana)
   /**
    * Create a new IVF_VAMANA_FLAT index. The dataset is partitioned into IVF partitions, and each
    * partition builds a Vamana graph over its vectors as they are. Supports the l2 and cosine
@@ -241,7 +239,7 @@ public class VectorIndexParams {
     private Optional<HnswBuildParams> hnswParams = Optional.empty();
     private Optional<SQBuildParams> sqParams = Optional.empty();
     private Optional<RQBuildParams> rqParams = Optional.empty();
-    private Optional<VamanaBuildParams> vamanaParams = Optional.empty(); // fork(vamana)
+    private Optional<VamanaBuildParams> vamanaParams = Optional.empty();
 
     /**
      * Create a new builder to create a vector index.
@@ -298,7 +296,6 @@ public class VectorIndexParams {
       return this;
     }
 
-    // fork(vamana)
     /**
      * @param vamanaParams the Vamana build parameters for building the Vamana graph for each IVF
      *     partition. Combines with no quantizer, with SQ or with PQ, and excludes HNSW
@@ -342,7 +339,7 @@ public class VectorIndexParams {
     return rqParams;
   }
 
-  public Optional<VamanaBuildParams> getVamanaParams() { // fork(vamana)
+  public Optional<VamanaBuildParams> getVamanaParams() {
     return vamanaParams;
   }
 
@@ -355,7 +352,7 @@ public class VectorIndexParams {
         .add("hnswParams", hnswParams.orElse(null))
         .add("sqParams", sqParams.orElse(null))
         .add("rqParams", rqParams.orElse(null))
-        .add("vamanaParams", vamanaParams.orElse(null)) // fork(vamana)
+        .add("vamanaParams", vamanaParams.orElse(null))
         .toString();
   }
 }

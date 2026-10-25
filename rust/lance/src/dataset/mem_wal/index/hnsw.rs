@@ -730,9 +730,9 @@ impl MemIndexPlugin for HnswMemIndexPlugin {
     }
 
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
-        if crate::index::vector::vamana::is_supported_segment(ctx.index_meta) {
-            // fork(vamana): the memtable would keep an HNSW graph and flush it
-            // as IVF_HNSW_SQ under an IVF_VAMANA_* index.
+        if crate::index::vector::vamana::is_vamana_segment(ctx.index_meta) {
+            // The memtable would keep an HNSW graph and flush it as IVF_HNSW_SQ
+            // under an IVF_VAMANA_* index.
             return Err(Error::not_supported(format!(
                 "MemWAL cannot maintain index '{}': IVF_VAMANA indices have no memtable index",
                 ctx.name

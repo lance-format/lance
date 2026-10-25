@@ -54,13 +54,13 @@ pub async fn check_mergeable(
 ) -> Result<()> {
     let Some(vamana) = segments
         .iter()
-        .find(|segment| super::is_supported_segment(segment))
+        .find(|segment| super::is_vamana_segment(segment))
     else {
         return Ok(());
     };
     if let Some(other) = segments
         .iter()
-        .find(|segment| !super::is_supported_segment(segment))
+        .find(|segment| !super::is_vamana_segment(segment))
     {
         return Err(Error::invalid_input(format!(
             "Cannot merge IVF_VAMANA segment {} with segment {} of index version {}, which is \

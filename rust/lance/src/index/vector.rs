@@ -18,7 +18,7 @@ pub mod hamming;
 pub mod ivf;
 pub mod pq;
 pub mod utils;
-pub(crate) mod vamana; // fork(vamana)
+pub(crate) mod vamana;
 
 #[cfg(test)]
 mod fixture_test;
@@ -278,7 +278,7 @@ pub enum StageParams {
     PQ(PQBuildParams),
     SQ(SQBuildParams),
     RQ(RQBuildParams),
-    Vamana(lance_index::vector::vamana::VamanaBuildParams), // fork(vamana)
+    Vamana(lance_index::vector::vamana::VamanaBuildParams),
 }
 
 // The version of the index file.
@@ -535,7 +535,6 @@ impl VectorIndexParams {
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
-            // fork(vamana)
             (2, _, Some(StageParams::Vamana(_))) => IndexType::IvfVamanaFlat,
             (3, Some(StageParams::Vamana(_)), Some(StageParams::PQ(_))) => IndexType::IvfVamanaPq,
             (3, Some(StageParams::Vamana(_)), Some(StageParams::SQ(_))) => IndexType::IvfVamanaSq,
@@ -1179,7 +1178,6 @@ pub(crate) async fn build_distributed_vector_index(
         }
 
         IndexType::IvfVamanaFlat | IndexType::IvfVamanaSq | IndexType::IvfVamanaPq => {
-            // fork(vamana)
             let files = vamana::build_shard(
                 dataset,
                 column,
@@ -1609,7 +1607,6 @@ async fn build_vector_index_impl(
             Ok(summary)
         }
         IndexType::IvfVamanaFlat | IndexType::IvfVamanaSq | IndexType::IvfVamanaPq => {
-            // fork(vamana)
             vamana::build(
                 dataset,
                 column,
@@ -1913,7 +1910,6 @@ pub(crate) async fn build_vector_index_incremental(
             }
         }
         (SubIndexType::Vamana, quantization_type) => {
-            // fork(vamana)
             vamana::build_incremental(
                 dataset,
                 column,
@@ -2300,7 +2296,6 @@ pub async fn initialize_vector_index(
             }
         }
         (SubIndexType::Vamana, quantization_type) => vamana::params_for_index(
-            // fork(vamana)
             source_vector_index.as_ref(),
             metric_type,
             ivf_params,
@@ -2485,7 +2480,7 @@ fn vector_index_type(index: &dyn VectorIndex) -> IndexType {
         (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
         (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
         (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::Vector,
-        (SubIndexType::Vamana, quantization_type) => vamana::index_type(quantization_type), // fork(vamana)
+        (SubIndexType::Vamana, quantization_type) => vamana::index_type(quantization_type),
     }
 }
 
@@ -2572,7 +2567,6 @@ pub(crate) fn fresh_vector_segment_params(
             ));
         }
         (SubIndexType::Vamana, quantization_type) => vamana::params_for_index(
-            // fork(vamana)
             index,
             metric_type,
             ivf_params,

@@ -68,9 +68,9 @@ impl DirectoryNamespace {
             "IVF_HNSW_FLAT" => Ok(IndexType::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(IndexType::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(IndexType::IvfHnswPq),
-            "IVF_VAMANA_FLAT" => Ok(IndexType::IvfVamanaFlat), // fork(vamana)
-            "IVF_VAMANA_SQ" => Ok(IndexType::IvfVamanaSq),     // fork(vamana)
-            "IVF_VAMANA_PQ" => Ok(IndexType::IvfVamanaPq),     // fork(vamana)
+            "IVF_VAMANA_FLAT" => Ok(IndexType::IvfVamanaFlat),
+            "IVF_VAMANA_SQ" => Ok(IndexType::IvfVamanaSq),
+            "IVF_VAMANA_PQ" => Ok(IndexType::IvfVamanaPq),
             other => Err(NamespaceError::InvalidInput {
                 message: format!("Unsupported index_type '{}'", other),
             }
@@ -233,8 +233,8 @@ impl DirectoryNamespace {
                     PQBuildParams::default(),
                 ),
             },
-            // fork(vamana): like the HNSW arms, these read only the distance from
-            // the request, and every build parameter keeps its default.
+            // Like the HNSW arms, these read only the distance from the request,
+            // and every build parameter keeps its default.
             IndexType::IvfVamanaFlat => DirectoryIndexParams::Vector {
                 index_type,
                 params: VectorIndexParams::ivf_vamana(

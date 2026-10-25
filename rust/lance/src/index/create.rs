@@ -288,7 +288,7 @@ impl<'a> CreateIndexBuilder<'a> {
             .map(|resolved| resolved.canonical_path.as_str())
             .unwrap_or(quoted_column.as_str());
 
-        // fork(vamana): refuse unbuildable IVF_VAMANA_* parameters before a row is read.
+        // Refuse unbuildable IVF_VAMANA_* parameters before a row is read.
         if let Some(params) = self.params.as_any().downcast_ref::<VectorIndexParams>() {
             super::vector::vamana::check_params(self.dataset, column, params)?;
         }
@@ -299,7 +299,7 @@ impl<'a> CreateIndexBuilder<'a> {
             is_builtin_vector_index(self.index_type, self.params)
                 .then(|| effective_vector_fragments(self.dataset, self.fragments.as_deref()))
                 .flatten();
-        // fork(vamana): a Vamana shard over every fragment is still a shard.
+        // A Vamana shard over every fragment is still a shard.
         let vector_fragments_for_validation = super::vector::vamana::shard_fragments(
             self.params.as_any().downcast_ref::<VectorIndexParams>(),
             self.fragments.as_deref(),
@@ -548,7 +548,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
-                | IndexType::IvfVamanaFlat // fork(vamana)
+                | IndexType::IvfVamanaFlat
                 | IndexType::IvfVamanaPq
                 | IndexType::IvfVamanaSq,
                 LANCE_VECTOR_INDEX,
@@ -565,7 +565,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                // fork(vamana): a Vamana shard over every fragment is still a shard.
+                // A Vamana shard over every fragment is still a shard.
                 let effective_fragments = super::vector::vamana::shard_fragments(
                     Some(vec_params),
                     self.fragments.as_deref(),
@@ -1031,7 +1031,7 @@ fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> b
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
-                | IndexType::IvfVamanaFlat // fork(vamana)
+                | IndexType::IvfVamanaFlat
                 | IndexType::IvfVamanaPq
                 | IndexType::IvfVamanaSq
         )

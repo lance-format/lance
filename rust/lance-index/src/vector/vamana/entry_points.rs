@@ -69,8 +69,8 @@ pub(crate) fn train_entry_points<S: VectorStore>(store: &S, seed: u64) -> Result
     }
     let mut rng = SmallRng::seed_from_u64(seed);
     let sample_size = num_entries * SAMPLE_RATE;
-    // In the order it is drawn, as the crate the rule was measured with keeps
-    // it: the k-means starts from rows picked by their place in the sample.
+    // In the order it is drawn, as the rule was measured: the k-means starts
+    // from rows picked by their place in the sample.
     let sample = if num_vertices > sample_size {
         rand::seq::index::sample(&mut rng, num_vertices, sample_size)
             .into_iter()
@@ -349,13 +349,12 @@ mod tests {
         assert_ne!(first, train_entry_points(&store, 43).unwrap());
     }
 
-    /// The `lance-vamana` crate's recipe, written out: a sample of 256 rows
-    /// an entry point kept in the order it is drawn, starting centroids drawn
-    /// from its rows by their place in it, and the vertex nearest each
-    /// centroid. A flat partition trains what the crate trains, which is what
-    /// lets the two be compared.
+    /// The recipe the entry-point rule was measured with, written out: a
+    /// sample of 256 rows an entry point kept in the order it is drawn,
+    /// starting centroids drawn from its rows by their place in it, and the
+    /// vertex nearest each centroid. A flat partition trains exactly that.
     #[test]
-    fn a_flat_partition_trains_what_the_crate_trains() {
+    fn a_flat_partition_trains_the_measured_recipe() {
         const ROWS: usize = 5000;
         let vectors = vectors_of(scattered_values(ROWS * 4), 4);
         let mut rng = SmallRng::seed_from_u64(42);

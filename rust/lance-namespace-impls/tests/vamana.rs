@@ -3,10 +3,10 @@
 
 //! IVF_VAMANA_* indices through the directory namespace.
 //!
-//! This file exists only in the Vamana fork of Lance. It tests the hook in
-//! `src/dir.rs` that maps the IVF_VAMANA_* type names to their build
-//! parameters, through the public namespace API, and reads the table past the
-//! namespace only for what that API does not report.
+//! These tests check that `src/dir/index_params.rs` maps the IVF_VAMANA_*
+//! type names to their build parameters, through the public namespace API,
+//! and read the table past the namespace only for what that API does not
+//! report.
 
 use std::io::Cursor;
 use std::sync::Arc;

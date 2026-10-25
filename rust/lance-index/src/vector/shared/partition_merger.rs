@@ -39,7 +39,7 @@ pub enum SupportedIvfIndexType {
     IvfHnswFlat,
     IvfHnswPq,
     IvfHnswSq,
-    IvfVamanaFlat, // fork(vamana)
+    IvfVamanaFlat,
     IvfVamanaPq,
     IvfVamanaSq,
 }
@@ -55,7 +55,7 @@ impl SupportedIvfIndexType {
             Self::IvfHnswFlat => "IVF_HNSW_FLAT",
             Self::IvfHnswPq => "IVF_HNSW_PQ",
             Self::IvfHnswSq => "IVF_HNSW_SQ",
-            Self::IvfVamanaFlat => "IVF_VAMANA_FLAT", // fork(vamana)
+            Self::IvfVamanaFlat => "IVF_VAMANA_FLAT",
             Self::IvfVamanaPq => "IVF_VAMANA_PQ",
             Self::IvfVamanaSq => "IVF_VAMANA_SQ",
         }
@@ -73,7 +73,7 @@ impl SupportedIvfIndexType {
             "IVF_HNSW_FLAT" => Some(Self::IvfHnswFlat),
             "IVF_HNSW_PQ" => Some(Self::IvfHnswPq),
             "IVF_HNSW_SQ" => Some(Self::IvfHnswSq),
-            "IVF_VAMANA_FLAT" => Some(Self::IvfVamanaFlat), // fork(vamana)
+            "IVF_VAMANA_FLAT" => Some(Self::IvfVamanaFlat),
             "IVF_VAMANA_PQ" => Some(Self::IvfVamanaPq),
             "IVF_VAMANA_SQ" => Some(Self::IvfVamanaSq),
             _ => None,

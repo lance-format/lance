@@ -46,7 +46,7 @@ pub mod storage;
 pub mod transform;
 pub mod utils;
 pub mod v3;
-pub mod vamana; // fork(vamana)
+pub mod vamana;
 
 use super::pb;
 use crate::metrics::MetricsCollector;
@@ -226,7 +226,6 @@ pub struct Query {
     /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
 
-    // fork(vamana)
     /// How far past its `k`-th candidate an IVF_VAMANA_* walk goes on
     /// expanding; see [`vamana::AdaptiveStop`]. `None` walks each partition's
     /// list of `ef` candidates to its end. Other index types ignore it.

@@ -1213,7 +1213,7 @@ fn inner_create_index<'local>(
         | IndexType::IvfHnswSq
         | IndexType::IvfHnswPq
         | IndexType::IvfHnswFlat
-        | IndexType::IvfVamanaFlat // fork(vamana)
+        | IndexType::IvfVamanaFlat
         | IndexType::IvfVamanaSq
         | IndexType::IvfVamanaPq => {
             // For vector indices, use the existing parameter handling

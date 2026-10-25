@@ -4222,7 +4222,6 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
             "IVF_RQ",
-            # fork(vamana)
             "IVF_VAMANA_FLAT",
             "IVF_VAMANA_PQ",
             "IVF_VAMANA_SQ",
@@ -7442,7 +7441,7 @@ class ScannerBuilder:
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
-        stop_margin: Optional[float] = None,  # fork(vamana)
+        stop_margin: Optional[float] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7519,7 +7518,7 @@ class ScannerBuilder:
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
-            stop_margin=stop_margin,  # fork(vamana)
+            stop_margin=stop_margin,
         )
         return self
 
@@ -8828,7 +8827,7 @@ def _build_vector_search_query(
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     search_effort: Optional[float] = None,
-    stop_margin: Optional[float] = None,  # fork(vamana)
+    stop_margin: Optional[float] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8983,7 +8982,7 @@ def _build_vector_search_query(
         "approx_mode": approx_mode,
         "search_effort": search_effort,
         "distance_range": distance_range,
-        "stop_margin": stop_margin,  # fork(vamana)
+        "stop_margin": stop_margin,
     }
 
 

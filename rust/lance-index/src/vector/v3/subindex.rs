@@ -129,7 +129,6 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     where
         Self: Sized;
 
-    // fork(vamana)
     /// Whether [`Self::index_vectors_incremental`] may extend a base of
     /// `vertices` rows into a merged partition of `num_rows` rows whose first
     /// `matched` rows are the base's; `false` when it builds the partition
@@ -172,7 +171,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 pub enum SubIndexType {
     Flat,
     Hnsw,
-    Vamana, // fork(vamana)
+    Vamana,
 }
 
 impl std::fmt::Display for SubIndexType {
@@ -180,7 +179,7 @@ impl std::fmt::Display for SubIndexType {
         match self {
             Self::Flat => write!(f, "{}", flat::index::FlatIndex::name()),
             Self::Hnsw => write!(f, "{}", hnsw::builder::HNSW::name()),
-            Self::Vamana => write!(f, "{}", crate::vector::vamana::Vamana::name()), // fork(vamana)
+            Self::Vamana => write!(f, "{}", crate::vector::vamana::Vamana::name()),
         }
     }
 }
@@ -192,7 +191,7 @@ impl TryFrom<&str> for SubIndexType {
         match value {
             "FLAT" => Ok(Self::Flat),
             "HNSW" => Ok(Self::Hnsw),
-            "VAMANA" => Ok(Self::Vamana), // fork(vamana)
+            "VAMANA" => Ok(Self::Vamana),
             _ => Err(Error::index(format!("unknown sub index type {}", value))),
         }
     }

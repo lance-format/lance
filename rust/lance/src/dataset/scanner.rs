@@ -86,7 +86,7 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::vector::vamana::AdaptiveStop; // fork(vamana)
+use lance_index::vector::vamana::AdaptiveStop;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, ProbeParams, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -2509,7 +2509,7 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
-            adaptive_stop: None, // fork(vamana)
+            adaptive_stop: None,
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
@@ -2647,7 +2647,6 @@ impl Scanner {
         self
     }
 
-    // fork(vamana)
     /// Stop each IVF_VAMANA_* walk once none of its unexpanded candidates is
     /// among the `k` nearest or nearer than `1 + margin` times the length to
     /// the `k`-th: adaptive beam search, where a query whose neighbors stand
@@ -3527,8 +3526,8 @@ impl Scanner {
         }
         if let Some(QueryFilter::Vector(query)) = &self.filter.query_filter {
             query.validate_search_effort()?;
-            // fork(vamana): a filter's query is the caller's own, while a
-            // margin reaches `self.nearest` only through `stop_margin`.
+            // A filter's query is the caller's own, while a margin reaches
+            // `self.nearest` only through `stop_margin`.
             if let Some(stop) = &query.adaptive_stop {
                 stop.validate(query.k)?;
             }
@@ -7378,7 +7377,7 @@ impl Scanner {
                         crate::index::vector::details::derive_vector_index_type(details);
                     index_type.starts_with("IVF_")
                         && !index_type.contains("HNSW")
-                        && !index_type.contains("VAMANA") // fork(vamana)
+                        && !index_type.contains("VAMANA")
                 })
                 .unwrap_or(false)
         });

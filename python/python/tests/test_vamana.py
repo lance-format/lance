@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-# fork(vamana): IVF_VAMANA_* indices through the Python API. The graph itself
-# is tested in Rust; these tests check that Python reaches it: the index types
-# and their keyword arguments, the errors Lance raises for what it refuses,
-# search through the scanner, optimize, and segments built apart.
+# IVF_VAMANA_* indices through the Python API. The graph itself is tested in
+# Rust; these tests check that Python reaches it: the index types and their
+# keyword arguments, the errors Lance raises for what it refuses, search
+# through the scanner, optimize, and segments built apart.
 
 import re
 

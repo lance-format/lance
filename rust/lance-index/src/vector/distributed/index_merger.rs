@@ -555,7 +555,7 @@ struct ShardInfo {
     partition_offsets: Vec<usize>,
     total_rows: usize,
     row_filter: Option<Arc<OldIndexDataFilter>>,
-    // fork(vamana): a Vamana scalar-code shard's own metadata, and how its codes are re-encoded.
+    // A Vamana scalar-code shard's own metadata, and how its codes are re-encoded.
     scalar_metadata: Option<ScalarQuantizationMetadata>,
     recode: Option<crate::vector::vamana::shards::ScalarRecode>,
 }
@@ -803,7 +803,6 @@ async fn read_shard_window_partitions(
     Ok(per_partition_batches)
 }
 
-// fork(vamana): crate-visible for the re-encoding of Vamana's scalar codes.
 pub(crate) fn filter_batch_to_owned_rows(
     batch: &RecordBatch,
     row_filter: &OldIndexDataFilter,
@@ -829,9 +828,9 @@ pub(crate) fn filter_batch_to_owned_rows(
 /// segments share the same quantizer/codebook and distance type; it reuses the
 /// first encountered metadata.
 ///
-/// fork(vamana): IVF_VAMANA_* storage merges too. Its product codes stay
-/// row-major, and the codes of IVF_VAMANA_SQ shards, which each train their
-/// own bounds, are re-encoded to bounds the shards share.
+/// IVF_VAMANA_* storage merges too. Its product codes stay row-major, and
+/// the codes of IVF_VAMANA_SQ shards, which each train their own bounds, are
+/// re-encoded to bounds the shards share.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],
@@ -981,7 +980,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
                     "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                     "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
-                    "IVF_VAMANA_FLAT" => SupportedIvfIndexType::IvfVamanaFlat, // fork(vamana)
+                    "IVF_VAMANA_FLAT" => SupportedIvfIndexType::IvfVamanaFlat,
                     "IVF_VAMANA_PQ" => SupportedIvfIndexType::IvfVamanaPq,
                     "IVF_VAMANA_SQ" => SupportedIvfIndexType::IvfVamanaSq,
                     other => {
@@ -1055,7 +1054,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
         // Preserve the historical fallback while keeping the writer boundary exact.
         let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
-        let mut scalar_metadata = None; // fork(vamana)
+        let mut scalar_metadata = None;
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -1352,7 +1351,6 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 }
             }
             SupportedIvfIndexType::IvfHnswFlat | SupportedIvfIndexType::IvfVamanaFlat => {
-                // fork(vamana)
                 // Treat HNSW_FLAT storage the same as FLAT and preserve the actual flat item dtype.
                 let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
                 let Some(flat_field) = schema_arrow
@@ -1386,7 +1384,6 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 }
             }
             SupportedIvfIndexType::IvfHnswPq | SupportedIvfIndexType::IvfVamanaPq => {
-                // fork(vamana)
                 // Treat HNSW_PQ storage the same as PQ: reuse PQ metadata and schema creation
                 let pm_json = if let Some(pm_json) =
                     reader.metadata().file_schema.metadata.get(PQ_METADATA_KEY)
@@ -1477,7 +1474,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
-                    // fork(vamana): Vamana keeps product codes row-major.
+                    // Vamana keeps product codes row-major.
                     pm_for_unified.transposed &= idx_type != SupportedIvfIndexType::IvfVamanaPq;
                     let w =
                         init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
@@ -1485,7 +1482,6 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 }
             }
             SupportedIvfIndexType::IvfHnswSq | SupportedIvfIndexType::IvfVamanaSq => {
-                // fork(vamana)
                 // Treat HNSW_SQ storage the same as SQ: reuse SQ metadata and schema creation
                 let sq_json = if let Some(sq_json) =
                     reader.metadata().file_schema.metadata.get(SQ_METADATA_KEY)
@@ -1536,7 +1532,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                         init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
                     v2w_opt = Some(w);
                 }
-                scalar_metadata = Some(sq_meta_parsed); // fork(vamana)
+                scalar_metadata = Some(sq_meta_parsed);
             }
         }
 
@@ -1560,7 +1556,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
             partition_offsets,
             total_rows: running_offset,
             row_filter: row_filters.map(|filters| Arc::new(filters[idx].clone())),
-            scalar_metadata, // fork(vamana)
+            scalar_metadata,
             recode: None,
         });
         progress
@@ -1579,7 +1575,8 @@ async fn merge_partial_vector_auxiliary_files_inner(
     let nlist = nlist_opt.ok_or_else(|| Error::index("Missing IVF partition count".to_string()))?;
     let idx_type_final = detected_index_type
         .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
-    // fork(vamana): each shard trained its own scalar bounds; all are re-encoded to bounds they share.
+    // IVF_VAMANA_SQ shards each train their own scalar bounds; all are re-encoded to bounds
+    // they share.
     if idx_type_final == SupportedIvfIndexType::IvfVamanaSq {
         let mut shards = Vec::with_capacity(shard_infos.len());
         for shard in &shard_infos {
@@ -1627,7 +1624,6 @@ async fn merge_partial_vector_auxiliary_files_inner(
         SupportedIvfIndexType::IvfPq
         | SupportedIvfIndexType::IvfHnswPq
         | SupportedIvfIndexType::IvfVamanaPq => {
-            // fork(vamana)
             // For PQ-backed indices, transpose PQ codes while merging partitions
             // so that the unified file stores column-major PQ codes; IVF_VAMANA_PQ
             // keeps them row-major.
@@ -1650,7 +1646,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 let partition_batch = concat_batches(&schema, batches.iter())?;
                 if let Some(w) = v2w_opt.as_mut() {
                     if idx_type_final == SupportedIvfIndexType::IvfVamanaPq {
-                        w.write_batch(&partition_batch).await?; // fork(vamana): row-major
+                        w.write_batch(&partition_batch).await?;
                     } else {
                         write_partition_rows_pq_transposed(w, partition_batch).await?;
                     }
@@ -1729,7 +1725,6 @@ async fn merge_partial_vector_auxiliary_files_inner(
                         Error::index("Failed to initialize unified writer".to_string())
                     })?;
                     let written = if let Some(recode) = shard.recode.as_ref() {
-                        // fork(vamana)
                         crate::vector::vamana::shards::write_recoded_partition_rows(
                             shard.reader.as_ref(),
                             writer,

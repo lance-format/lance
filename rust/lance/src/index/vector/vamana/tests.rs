@@ -47,7 +47,10 @@ use lance_index::vector::{
     DEFAULT_QUERY_PARALLELISM, DIST_COL, PQ_CODE_COLUMN, PartitionSearchControl, Query,
     SQ_CODE_COLUMN, VectorIndex,
 };
-use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, IndexType};
+use lance_index::{
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, IVF_RQ_INDEX_VERSION, IVF_VAMANA_INDEX_VERSION,
+    IndexType,
+};
 use lance_io::scheduler::IoStats;
 use lance_io::utils::tracking_store::IoRequestRecord;
 use lance_linalg::distance::DistanceType;
@@ -58,7 +61,6 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 use uuid::Uuid;
 
-use super::VAMANA_INDEX_VERSIONS;
 use super::merge::merge_base;
 use super::vectors::read_vectors;
 use crate::Error;
@@ -407,40 +409,36 @@ fn json(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap()
 }
 
+/// Java passes these codes to `IndexType::try_from`, so they are pinned here.
 #[test]
-fn the_vamana_types_name_and_number_themselves_apart_from_upstream() {
+fn the_vamana_types_name_and_number_themselves() {
     for (index_type, name, code, quantization) in [
         (
             IndexType::IvfVamanaFlat,
             "IVF_VAMANA_FLAT",
-            190,
+            108,
             QuantizationType::Flat,
         ),
         (
             IndexType::IvfVamanaSq,
             "IVF_VAMANA_SQ",
-            191,
+            109,
             QuantizationType::Scalar,
         ),
         (
             IndexType::IvfVamanaPq,
             "IVF_VAMANA_PQ",
-            192,
+            110,
             QuantizationType::Product,
         ),
     ] {
         assert_eq!(index_type.to_string(), name);
-        assert_eq!(IndexType::try_from(name).unwrap(), index_type);
         assert_eq!(IndexType::try_from(code).unwrap(), index_type);
         assert!(index_type.is_vector());
-        assert!(VAMANA_INDEX_VERSIONS.contains(&index_type.version()));
         assert_eq!(index_type.target_partition_size(), 1 << 20);
         assert_eq!(super::index_type(quantization), index_type);
         assert_eq!(index_type_string(SubIndexType::Vamana, quantization), name);
     }
-    // Upstream's vector versions stay below the fork's, so neither bounds
-    // the other.
-    assert!(VAMANA_INDEX_VERSIONS.start() > &(IndexType::max_vector_version() as i32));
     assert!(matches!(
         SubIndexType::try_from("VAMANA").unwrap(),
         SubIndexType::Vamana
@@ -475,25 +473,38 @@ fn vamana_details() -> VectorIndexDetails {
     }
 }
 
-/// A Vamana segment at a Vamana version is read, and so is one with empty
-/// details, as upstream reads its own versions whatever their details; any
-/// other vector index above upstream's versions is still hidden.
+/// A build reads IVF_VAMANA_* segments, also with the empty details a failed
+/// inference leaves, and hides the next vector version. A segment is an
+/// IVF_VAMANA_* one by its version and details together: neither the version
+/// with another index's details nor empty details at another version is.
 #[test]
-fn a_build_reads_its_own_vamana_versions_and_no_other_high_version() {
-    let hidden = Some(IndexType::max_vector_version());
+fn a_build_reads_vamana_segments_and_tells_them_apart() {
+    let version = IVF_VAMANA_INDEX_VERSION as i32;
     let hnsw = VectorIndexDetails {
         hnsw_index_config: Some(HnswParameters::default()),
         ..Default::default()
     };
-    for (index, expected) in [
-        (segment(100, vamana_details()), None),
-        (segment(100, VectorIndexDetails::default()), None),
-        (segment(100, hnsw), hidden),
-        (segment(101, vamana_details()), hidden),
-        (segment(101, VectorIndexDetails::default()), hidden),
+    for (index, is_vamana) in [
+        (segment(version, vamana_details()), true),
+        (segment(version, VectorIndexDetails::default()), true),
+        (segment(version, hnsw), false),
+        (
+            segment(IVF_RQ_INDEX_VERSION as i32, VectorIndexDetails::default()),
+            false,
+        ),
     ] {
-        assert_eq!(unsupported_index_version(&index), expected, "{index:?}");
+        assert_eq!(unsupported_index_version(&index), None, "{index:?}");
+        assert_eq!(super::is_vamana_segment(&index), is_vamana, "{index:?}");
     }
+    let next = segment(version + 1, vamana_details());
+    assert_eq!(
+        unsupported_index_version(&next),
+        Some(IndexType::max_vector_version())
+    );
+    assert!(!super::is_vamana_segment(&segment(
+        version + 1,
+        VectorIndexDetails::default()
+    )));
 }
 
 #[rstest]
@@ -516,7 +527,7 @@ async fn an_index_is_built_described_and_searched(
         )
         .await
         .unwrap();
-    assert_eq!(index.index_version, 100);
+    assert_eq!(index.index_version, IVF_VAMANA_INDEX_VERSION as i32);
 
     let descriptions = dataset.describe_indices(None).await.unwrap();
     assert_eq!(descriptions.len(), 1);
@@ -1436,7 +1447,7 @@ async fn a_definition_trains_when_optimized() {
         .await
         .unwrap();
     let indices = dataset.load_indices().await.unwrap();
-    assert_eq!(indices[0].index_version, 100);
+    assert_eq!(indices[0].index_version, IVF_VAMANA_INDEX_VERSION as i32);
     assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
 
     dataset
@@ -1445,7 +1456,7 @@ async fn a_definition_trains_when_optimized() {
         .unwrap();
     let indices = dataset.load_indices().await.unwrap();
     assert_eq!(indices.len(), 1);
-    assert_eq!(indices[0].index_version, 100);
+    assert_eq!(indices[0].index_version, IVF_VAMANA_INDEX_VERSION as i32);
     assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 2);
     let statistics = json(&dataset.index_statistics(INDEX).await.unwrap());
     assert_eq!(statistics["index_type"], "IVF_VAMANA_SQ");
@@ -2130,7 +2141,7 @@ async fn a_merge_reads_no_graph_it_would_build_anew() {
     assert!(!handed_on && reads > 0, "{handed_on}, {reads} reads");
 }
 
-/// Upstream merges stay as they were: an IVF_HNSW_* merge builds every
+/// Other merges stay as they were: an IVF_HNSW_* merge builds every
 /// partition anew from the old segment's rows and reads none of its graphs.
 #[tokio::test]
 async fn a_merge_of_hnsw_graphs_reads_none_of_them() {
@@ -2448,7 +2459,7 @@ async fn shard(dataset: &mut Dataset, fragment: u32, params: &VectorIndexParams)
         .execute_uncommitted()
         .await
         .unwrap();
-    assert_eq!(shard.index_version, 100);
+    assert_eq!(shard.index_version, IVF_VAMANA_INDEX_VERSION as i32);
     assert_eq!(
         shard.fragment_bitmap,
         Some(RoaringBitmap::from_iter([fragment]))
@@ -2485,7 +2496,7 @@ async fn shards_built_apart_merge_into_graphs_drawn_over_their_rows(
     let params = shard_params(codes, distance_type);
     let shards = shards(&mut dataset, &params).await;
     let merged = dataset.merge_existing_index_segments(shards).await.unwrap();
-    assert_eq!(merged.index_version, 100);
+    assert_eq!(merged.index_version, IVF_VAMANA_INDEX_VERSION as i32);
     assert_eq!(
         merged.fragment_bitmap,
         Some(RoaringBitmap::from_iter([0, 1]))
@@ -3235,7 +3246,7 @@ async fn merges_that_cannot_make_one_segment_are_refused_before_writing(
                 .execute_uncommitted()
                 .await
                 .unwrap();
-            assert!(!VAMANA_INDEX_VERSIONS.contains(&other.index_version));
+            assert!(!super::is_vamana_segment(&other));
             let shards = match unmergeable {
                 Unmergeable::OtherIndexFirst => vec![other, vamana],
                 _ => vec![vamana, other],
@@ -3741,7 +3752,7 @@ async fn compaction_remaps_the_index_and_keeps_its_details() {
     .unwrap();
     assert_eq!(raw.len(), 1);
     assert_ne!(raw[0].uuid, before.uuid);
-    assert_eq!(raw[0].index_version, 100);
+    assert_eq!(raw[0].index_version, IVF_VAMANA_INDEX_VERSION as i32);
     assert_eq!(raw[0].index_details, before.index_details);
     assert_eq!(
         dataset.describe_indices(None).await.unwrap()[0].index_type(),
