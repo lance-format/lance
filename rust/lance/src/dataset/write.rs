@@ -3053,6 +3053,43 @@ mod tests {
         assert_eq!(row_counts, vec![5000, 5000, 2000]);
     }
 
+    /// A zero row limit used to panic on V2 and, on V1, commit an empty
+    /// dataset. V2 ignores `max_rows_per_group`, so a zero there still writes.
+    #[rstest]
+    #[case::v2_rows_per_file(LanceFileVersion::Stable, 0, 1024, Some("max_rows_per_file"))]
+    #[case::v1_rows_per_file(LanceFileVersion::Legacy, 0, 1024, Some("max_rows_per_file"))]
+    #[case::v1_rows_per_group(LanceFileVersion::Legacy, 1024, 0, Some("max_rows_per_group"))]
+    #[case::v2_ignores_rows_per_group(LanceFileVersion::Stable, 1024, 0, None)]
+    #[tokio::test]
+    async fn test_write_rejects_zero_row_limits(
+        #[case] version: LanceFileVersion,
+        #[case] max_rows_per_file: usize,
+        #[case] max_rows_per_group: usize,
+        #[case] rejected: Option<&str>,
+    ) {
+        let data = gen_batch()
+            .col("a", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(2));
+        let params = WriteParams {
+            data_storage_version: Some(version),
+            max_rows_per_file,
+            max_rows_per_group,
+            ..Default::default()
+        };
+        let result = Dataset::write(data, "memory://zero-row-limits", Some(params)).await;
+        match rejected {
+            Some(param) => {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(&err, Error::InvalidInput { source, .. }
+                    if source.to_string().contains(&format!("{param} must be greater than zero"))),
+                    "{err:?}"
+                );
+            }
+            None => assert_eq!(result.unwrap().count_rows(None).await.unwrap(), 20),
+        }
+    }
+
     #[tokio::test]
     async fn test_max_rows_per_group() {
         let reader_to_frags = |data_reader: Box<dyn RecordBatchReader + Send>,

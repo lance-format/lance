@@ -53,6 +53,7 @@ use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
+use rand::{Rng, seq::index::sample as sample_indices};
 use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
@@ -181,6 +182,23 @@ pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
 const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+
+// Full samples already have their final ordering and need no randomness.
+fn sample_row_offsets(rng: &mut impl Rng, num_rows: usize, n: usize) -> Vec<u64> {
+    let sample_size = n.min(num_rows);
+    if sample_size == 0 {
+        return Vec::new();
+    }
+    if sample_size == num_rows {
+        return (0..num_rows as u64).collect();
+    }
+    let mut offsets: Vec<u64> = sample_indices(rng, num_rows, sample_size)
+        .into_iter()
+        .map(|offset| offset as u64)
+        .collect();
+    offsets.sort_unstable();
+    offsets
+}
 
 fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
     value
@@ -1528,11 +1546,12 @@ impl Dataset {
     /// # Arguments
     ///
     /// * `older_than` - Versions older than this will be deleted.
-    /// * `delete_unverified` - If false (the default) then files will only be deleted if they
-    ///                        are listed in at least one manifest.  Otherwise these files will
-    ///                        be kept since they cannot be distinguished from an in-progress
-    ///                        transaction.  Set to true to delete these files if you are sure
-    ///                        there are no other in-progress dataset operations.
+    /// * `delete_unverified` - If false (the default), files that are not referenced by any
+    ///                        manifest will only be deleted if they are more than 7 days old.
+    ///                        Otherwise these files will be kept since they cannot be
+    ///                        distinguished from an in-progress transaction. Set to true to
+    ///                        delete these files if you are sure there are no other
+    ///                        in-progress dataset operations.
     ///
     /// # Returns
     ///
@@ -2028,27 +2047,35 @@ impl Dataset {
         take::take_scan(self, row_ranges, projection, batch_readahead)
     }
 
-    /// Randomly sample `n` rows from the dataset.
+    /// Randomly sample up to `n` live rows uniformly without replacement.
+    ///
+    /// Returns all available live rows if `n` exceeds their count.
     ///
     /// If `fragment_ids` is provided, sampling is limited to rows from those
     /// fragments in the current dataset version.
     ///
-    /// The returned rows are in row-id order (not random order), which allows
-    /// the underlying take operation to use an efficient sorted code path.
+    /// The returned rows are in ascending logical row-offset order within the
+    /// dataset or selected fragments, allowing efficient sorted reads.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let batch = dataset.sample(10, dataset.schema(), None).await?;
+    /// assert!(batch.num_rows() <= 10);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn sample(
         &self,
         n: usize,
         projection: &Schema,
         fragment_ids: Option<&[u32]>,
     ) -> Result<RecordBatch> {
-        use rand::seq::IteratorRandom;
-
         match fragment_ids {
             None => {
                 let num_rows = self.count_rows(None).await?;
-                let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
-                ids.sort_unstable();
-                self.take(&ids, projection.clone()).await
+                let offsets = sample_row_offsets(&mut rand::rng(), num_rows, n);
+                self.take(&offsets, projection.clone()).await
             }
             Some(fragment_ids) => {
                 if fragment_ids.is_empty() {
@@ -2062,11 +2089,22 @@ impl Dataset {
                 let num_rows = stream::iter(selected_fragments.iter().cloned())
                     .map(|fragment| async move { fragment.count_rows(None).await })
                     .buffer_unordered(16)
-                    .try_fold(0_u64, |acc, rows| async move { Ok(acc + rows as u64) })
+                    .try_fold(0_u64, |acc, rows| async move {
+                        acc.checked_add(rows as u64).ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "Dataset::sample selected live row count overflow: {acc} + {rows}"
+                            ))
+                        })
+                    })
                     .await?;
 
-                let mut offsets = (0..num_rows).choose_multiple(&mut rand::rng(), n);
-                offsets.sort_unstable();
+                let num_rows = usize::try_from(num_rows).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Dataset::sample selected live row count {num_rows} exceeds usize::MAX ({})",
+                        usize::MAX
+                    ))
+                })?;
+                let offsets = sample_row_offsets(&mut rand::rng(), num_rows, n);
 
                 let row_addrs = row_offsets_to_row_addresses(&selected_fragments, &offsets).await?;
                 let dataset = Arc::new(self.clone());
@@ -4434,8 +4472,8 @@ pub(crate) async fn write_manifest_file(
     }
     // Every manifest write funnels through here, including restore and clone,
     // which rebuild a manifest from a stored one rather than from an Arrow
-    // schema, so this is where the invariant holds for a schema that never
-    // passed through that conversion.
+    // schema. Validate names and primary keys at this boundary so all write
+    // paths enforce them.
     //
     // Only for transactions that can change the schema. Released versions could
     // install a key on a nullable column through the metadata path, and
@@ -4451,6 +4489,10 @@ pub(crate) async fn write_manifest_file(
     // once it spilled -- and a MemWAL table spills routinely, since its
     // transactions carry mem-table state.
     if may_change_schema {
+        manifest
+            .schema
+            .validate_writable()
+            .map_err(CommitError::OtherError)?;
         manifest
             .schema
             .verify_primary_key()

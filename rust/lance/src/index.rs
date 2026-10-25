@@ -3208,9 +3208,16 @@ impl DatasetIndexExt for Dataset {
             .collect();
         validate_segment_params_compatible(&retained_indices, &new_indices)?;
 
+        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
+        if segment_has_inverted_details(&new_indices[0]) {
+            // Apply the merge/query semantic contract only to segments that will
+            // coexist, so a full rebuild can change the analyzer settings.
+            let segments = coexisting_indices.clone().cloned().collect::<Vec<_>>();
+            scalar::inverted::load_segment_details(self, column, &segments).await?;
+        }
+
         // The query planner ranks coexisting vector segments under one contract.
         // Validate after replacement selection so a full rebuild may change it.
-        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
         let vector_segment_count = coexisting_indices
             .clone()
             .filter(|segment| segment_has_vector_details(segment))
@@ -5230,6 +5237,7 @@ mod tests {
     use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
     use lance_index::scalar::inverted::{
         INVERTED_INDEX_VERSION_V1, INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3,
+        InvertedListFormatVersion,
     };
     use lance_index::scalar::registry::ScalarIndexCacheKey;
     use lance_index::scalar::{
@@ -5293,6 +5301,7 @@ mod tests {
             files: Some(vec![lance_table::format::IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
+                file_metadata_size_bytes: None,
             }]),
         }
     }
@@ -12466,6 +12475,208 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::analyzer(InvertedIndexParams::default())]
+    #[case::split_identifiers(InvertedIndexParams::code().split_identifiers(false))]
+    #[case::positions(InvertedIndexParams::code().split_identifiers(true).with_position(true))]
+    #[case::block_size(InvertedIndexParams::code().split_identifiers(true).block_size(256).unwrap())]
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_validates_inverted_params(
+        #[case] incompatible_params: InvertedIndexParams,
+        #[values(false, true)] has_existing_index: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1, 2]),
+            (
+                "code",
+                Utf8,
+                [
+                    Some("def getUserName(): shared"),
+                    Some("fn fetchUserProfile() { shared }"),
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        let params = InvertedIndexParams::code().split_identifiers(true);
+        let original = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &params)
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        if has_existing_index {
+            dataset
+                .commit_existing_index_segments("cidx", "code", vec![original.clone()])
+                .await
+                .unwrap();
+        }
+        let version = dataset.manifest.version;
+        let original_indices = dataset.load_indices().await.unwrap();
+        let incompatible = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &incompatible_params)
+            .fragments(vec![1, 2])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let segments = if has_existing_index {
+            vec![incompatible]
+        } else {
+            vec![original.clone(), incompatible]
+        };
+        let error = dataset
+            .commit_existing_index_segments("cidx", "code", segments)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("FTS index cidx has inconsistent inverted index details across segments"),
+            "{error}"
+        );
+        assert_eq!(dataset.manifest.version, version);
+        assert_eq!(dataset.load_indices().await.unwrap(), original_indices);
+        if has_existing_index {
+            let result = dataset
+                .scan()
+                .full_text_search(FullTextSearchQuery::new("user".to_owned()))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(result.num_rows(), 2);
+        }
+
+        let compatible = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &params)
+            .fragments(vec![1, 2])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let segments = if has_existing_index {
+            vec![compatible]
+        } else {
+            vec![original, compatible]
+        };
+        dataset
+            .commit_existing_index_segments("cidx", "code", segments)
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+        let result = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("user".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1]);
+
+        // Removed segments do not constrain a full rebuild's analyzer settings.
+        let replacement = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &incompatible_params)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let replacement_uuid = replacement.uuid;
+        dataset
+            .commit_existing_index_segments("cidx", "code", vec![replacement])
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, replacement_uuid);
+        let result = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("shared".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+    }
+
+    #[rstest]
+    #[case::posting_format_version(
+        InvertedIndexParams::default().format_version(InvertedListFormatVersion::V3),
+        None
+    )]
+    #[case::omitted_defaults(InvertedIndexParams::default(), Some(InvertedIndexDetails::default()))]
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_accepts_equivalent_inverted_details(
+        #[case] incoming_params: InvertedIndexParams,
+        #[case] incoming_details: Option<InvertedIndexDetails>,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1]),
+            ("text", Utf8, ["hello world", "hello again"])
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let original = dataset
+            .create_index_builder(
+                &["text"],
+                IndexType::Inverted,
+                &InvertedIndexParams::default(),
+            )
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![original])
+            .await
+            .unwrap();
+        let mut incoming = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &incoming_params)
+            .name("staged_text_idx".to_owned())
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        if let Some(details) = incoming_details {
+            incoming.index_details = Some(Arc::new(prost_types::Any::from_msg(&details).unwrap()));
+        }
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![incoming])
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+        let result = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+    }
+
     #[tokio::test]
     async fn test_commit_existing_index_segments_rejects_partial_replacement_of_wider_segment() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -14913,22 +15124,36 @@ mod tests {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
+        // A text column alongside `two_column_reader`'s numeric ones: every
+        // remaining row-id-domain scalar index type (NGram here) requires text,
+        // unlike BTree and Bitmap, which moved to row-address domain and no
+        // longer exercise this test.
+        fn three_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
+            lance_datagen::gen_batch()
+                .col("id", array::step::<Int32Type>())
+                .col("payload", array::step::<Int32Type>())
+                .col("text", array::rand_utf8(ByteCount::from(8), false))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+        }
+
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             max_rows_per_file: 5,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
+        let mut dataset =
+            Dataset::write(three_column_reader(), test_uri, Some(write_params.clone()))
+                .await
+                .unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
 
         // Row-id-domain: its coverage is recalculated (not dropped) across a
         // rewrite under stable row ids, which is exactly the property this test
-        // checks. BTree moved to row-address domain and no longer exercises it.
-        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        // checks. BTree and Bitmap moved to row-address domain and no longer
+        // exercise it.
+        let ngram_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
         dataset
-            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .create_index_builder(&["text"], IndexType::NGram, &ngram_params)
             .name("id_idx".to_string())
             .train(false)
             .await
@@ -14938,7 +15163,7 @@ mod tests {
         // A fragment the index does not cover, so a bin holding it together with
         // the covered ones would split the index's coverage.
         let mut dataset = Dataset::write(
-            two_column_reader(),
+            three_column_reader(),
             test_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,

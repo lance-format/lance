@@ -717,8 +717,11 @@ impl CompressedBufferEncoder {
         for off in offsets.windows(2) {
             let start = off[0].as_usize();
             let end = off[1].as_usize();
-            self.compressor
-                .decompress(&data[start..end], decompressed)?;
+            // Full-zip omits null payloads; LZ4 rejects empty input.
+            if start < end {
+                self.compressor
+                    .decompress(&data[start..end], decompressed)?;
+            }
             new_offsets.push(T::from_usize(decompressed.len()).unwrap());
         }
 
@@ -1304,6 +1307,33 @@ mod tests {
             assert!(output.is_empty());
         }
 
+        #[test]
+        fn test_lz4_per_value_decompress_skips_null_slots() {
+            let encoder = CompressedBufferEncoder::try_new(CompressionConfig {
+                scheme: CompressionScheme::Lz4,
+                level: None,
+            })
+            .unwrap();
+            let mut compressed = Vec::new();
+            let offsets = encoder
+                .per_value_compress::<u32>(b"abc", &[0, 3, 3], &mut compressed)
+                .unwrap();
+            let offsets = offsets.borrow_to_typed_slice::<u32>();
+            // Full-zip writes no payload for a null, so append an empty slot after the
+            // compressed "abc" and empty-string values.
+            let offsets = [offsets.as_ref(), &[compressed.len() as u32]].concat();
+
+            let mut decompressed = Vec::new();
+            let new_offsets = encoder
+                .per_value_decompress::<u32>(&compressed, &offsets, &mut decompressed)
+                .unwrap();
+            assert_eq!(decompressed, b"abc");
+            assert_eq!(
+                new_offsets.borrow_to_typed_slice::<u32>().as_ref(),
+                &[0, 3, 3, 3]
+            );
+        }
+
         #[rstest::rstest]
         #[test_log::test(tokio::test)]
         async fn test_lz4_compress_round_trip(
@@ -1335,10 +1365,15 @@ mod tests {
                 STRUCTURAL_ENCODING_FULLZIP.to_string(),
             );
             let field = field.with_metadata(field_meta);
+            let expected_encoding = if encoding == TestEncoding::StructuralSparse {
+                "lz4"
+            } else {
+                "zstd"
+            };
             let test_cases = TestCases::basic()
                 // Need to use large pages as small pages might be too small to compress
                 .with_page_sizes(vec![1024 * 1024])
-                .with_expected_encoding("zstd")
+                .with_expected_encoding(expected_encoding)
                 .with_encoding(encoding)
                 .with_slicing_modes([use_slicing]);
 

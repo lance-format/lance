@@ -10,9 +10,6 @@ description = "Arrow Extension for Lance"
 keywords.workspace = true
 categories.workspace = true
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }

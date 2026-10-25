@@ -75,20 +75,26 @@ feature-depth = 1
 #db-urls = ["https://github.com/rustsec/advisory-db"]
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
+#
+# Each reason must start with `expires YYYY-MM-DD:` or `no fix:`, and
+# ci/check_advisory_ignores.py fails CI once an expires day (UTC) has passed.
+# Use expires about a week out for a fix that cannot land yet, such as one
+# younger than the 48 hours ci/check_dependency_age.py requires. Use no fix
+# when there is nothing to upgrade to.
 ignore = [
-    #"RUSTSEC-0000-0000",
-    #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
-    #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
-    #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
-    { id = "RUSTSEC-2024-0436", reason = "`paste` is used by datafusion" },
-    { id = "RUSTSEC-2023-0071", reason = "`rsa` is used by opendal via reqsign" },
-    { id = "RUSTSEC-2025-0119", reason = "`number_prefix` used by hf-hub in examples" },
-    { id = "RUSTSEC-2026-0194", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
-    { id = "RUSTSEC-2026-0195", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
-    { id = "RUSTSEC-2024-0449", reason = "`serde_yaml` pulled transitively via datafusion-substrait; serde features not utilized by us" },
-    { id = "RUSTSEC-2026-0381", reason = "fixed `webpki-roots` 1.0.10 is under 48 hours old, cannot upgrade due to our release age policy; 0.26.11 comes from hf-hub 0.4 in examples and only re-exports 1.x" },
-    { id = "RUSTSEC-2026-0382", reason = "fixed `rustls-webpki` 0.103.16 is under 48 hours old, cannot upgrade due to our release age policy" },
+    #{ id = "RUSTSEC-0000-0000", reason = "expires 2026-01-31: fixed `some-crate` 1.2.4 is under 48 hours old" },
+    #{ id = "RUSTSEC-0000-0000", reason = "no fix: `some-crate` is unmaintained with no patched release; `other-crate` depends on it" },
+    #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "expires 2026-01-31: 0.1.2 replaces the yanked release and is under 48 hours old" },
+    { id = "RUSTSEC-2024-0436", reason = "no fix: `paste` is unmaintained with no patched release; lance-bitpacking and foyer-memory (latest 0.22.6) depend on it" },
+    { id = "RUSTSEC-2023-0071", reason = "no fix: no `rsa` release fixes the Marvin timing side channel; opendal's reqsign crates depend on it" },
+    { id = "RUSTSEC-2026-0194", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
+    { id = "RUSTSEC-2026-0195", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
+    { id = "RUSTSEC-2024-0449", reason = "no fix: `unsafe-libyaml` is unmaintained; serde_yaml pulls it in for substrait 0.63, which datafusion-substrait (latest 55.2) still requires, and serde_yaml_ng for lindera 3" },
+    { id = "RUSTSEC-2026-0385", reason = "expires 2026-10-30: fixed in `ctutils` 0.4.4, but both 0.4.4 and 0.4.5 were published 2026-10-23 and are under the 48h dependency age; run `cargo update -p ctutils` (root, python, java/lance-jni) once eligible and remove this ignore" },
 ]
+# Fail when an ignored advisory no longer matches any crate, so an ignore is
+# removed along with the upgrade that fixed it.
+unused-ignored-advisory = "deny"
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
 # Setting this to true can be helpful if you have special authentication requirements that cargo-deny does not support.

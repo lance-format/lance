@@ -3938,6 +3938,7 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{FixedSizeListArray, record_batch};
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
         physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
@@ -5560,9 +5561,49 @@ mod tests {
             "part_456_page_data.lance".to_string(),
         ];
 
-        // The cleanup function should handle both valid and invalid file patterns gracefully
-        // This test mainly verifies that the function doesn't panic and handles edge cases
+        // Materialize every file so that deletion is observable.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        for name in lookup_files.iter().chain(page_files.iter()) {
+            let mut writer = test_store
+                .new_index_file(name, schema.clone())
+                .await
+                .unwrap();
+            writer
+                .write_record_batch(record_batch!(("v", Int32, [1])).unwrap())
+                .await
+                .unwrap();
+            writer.finish().await.unwrap();
+        }
+
+        let partition_files = [
+            "part_123_page_lookup.lance",
+            "part_456_page_lookup.lance",
+            "part_123_page_data.lance",
+            "part_456_page_data.lance",
+        ];
+        for name in partition_files {
+            assert!(
+                test_store.open_index_file(name).await.is_ok(),
+                "{name} should exist before cleanup"
+            );
+        }
+
         super::cleanup_partition_files(test_store.as_ref(), &lookup_files, &page_files).await;
+
+        // Files matching part_*_page_{lookup,data}.lance are deleted ...
+        for name in partition_files {
+            assert!(
+                test_store.open_index_file(name).await.is_err(),
+                "{name} should have been deleted"
+            );
+        }
+        // ... while files outside the partition naming pattern are left alone.
+        for name in ["invalid_lookup_file.lance", "invalid_page_file.lance"] {
+            assert!(
+                test_store.open_index_file(name).await.is_ok(),
+                "{name} should not have been deleted"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7336,6 +7377,12 @@ mod tests {
         assert_eq!(restored.lookup_batch, state.lookup_batch);
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
+        // This flag decides whether search results are translated from row
+        // addresses to row ids.
+        assert_eq!(
+            restored.results_are_row_addresses,
+            state.results_are_row_addresses
+        );
     }
 
     #[test]

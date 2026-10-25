@@ -7,18 +7,176 @@ use crate::{
     Result,
     buffer::LanceBuffer,
     compression::{
-        BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+        BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
+        VariablePerValueDecompressor, require_block_payload,
     },
-    data::DataBlock,
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
+        logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
         logical::primitive::miniblock::{
             MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
         },
-        physical::block::{CompressionConfig, GeneralBufferCompressor},
+        physical::{
+            block::{CompressionConfig, GeneralBufferCompressor},
+            value::ValueEncoder,
+        },
     },
     format::{EncodingUtils, metadata::CompressiveEncoding},
 };
+use arrow_buffer::ArrowNativeType;
 use lance_core::Error;
+
+/// Compress fixed-width rows independently, retaining their logical type description.
+#[derive(Debug)]
+pub(crate) struct FixedWidthGeneralPerValueCompressor {
+    compression: CompressionConfig,
+}
+
+impl FixedWidthGeneralPerValueCompressor {
+    pub(crate) fn new(compression: CompressionConfig) -> Self {
+        Self { compression }
+    }
+
+    /// Frame already encoded fixed-width rows without running their child codec again.
+    pub(crate) fn compress_encoded(
+        data: FixedWidthDataBlock,
+        encoding: CompressiveEncoding,
+        compression: CompressionConfig,
+    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        let width = usize::try_from(data.bits_per_value / 8)
+            .map_err(|_| Error::invalid_input("Per-row byte width exceeds usize"))?;
+        let rows = usize::try_from(data.num_values)
+            .map_err(|_| Error::invalid_input("Per-row value count exceeds usize"))?;
+        if !data.bits_per_value.is_multiple_of(8)
+            || rows.checked_mul(width) != Some(data.data.len())
+        {
+            return Err(Error::invalid_input(format!(
+                "Invalid fixed-width rows: {} values, {} bits per value, {} bytes",
+                data.num_values,
+                data.bits_per_value,
+                data.data.len()
+            )));
+        }
+        let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+        let mut compressed = Vec::with_capacity(data.data.len());
+        let num_offsets = rows
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_input("Per-row offset count exceeds usize"))?;
+        let mut offsets = Vec::with_capacity(num_offsets);
+        offsets.push(0_u64);
+        for row in 0..rows {
+            compressor.compress(&data.data[row * width..(row + 1) * width], &mut compressed)?;
+            offsets.push(compressed.len() as u64);
+        }
+        Ok((
+            PerValueDataBlock::Variable(VariableWidthBlock {
+                data: LanceBuffer::from(compressed),
+                offsets: LanceBuffer::reinterpret_vec(offsets),
+                bits_per_offset: 64,
+                num_values: data.num_values,
+                block_info: BlockInfo::new(),
+            }),
+            EncodingUtils::wrapped(compression, encoding)?,
+        ))
+    }
+}
+
+impl PerValueCompressor for FixedWidthGeneralPerValueCompressor {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        let (data, encoding) = PerValueCompressor::compress(&ValueEncoder::default(), data)?;
+        let PerValueDataBlock::Fixed(data) = data else {
+            return Err(Error::invalid_input(
+                "Per-row general compression requires fixed-width rows",
+            ));
+        };
+        Self::compress_encoded(data, encoding, self.compression)
+    }
+}
+
+/// Decode individually compressed rows into the fixed-width child's logical type.
+#[derive(Debug)]
+pub(crate) struct FixedWidthGeneralPerValueDecompressor {
+    child: Box<dyn FixedPerValueDecompressor>,
+    compression: CompressionConfig,
+}
+
+impl FixedWidthGeneralPerValueDecompressor {
+    pub(crate) fn new(
+        child: Box<dyn FixedPerValueDecompressor>,
+        compression: CompressionConfig,
+    ) -> Self {
+        Self { child, compression }
+    }
+
+    fn decompress_rows<T: ArrowNativeType>(&self, data: VariableWidthBlock) -> Result<DataBlock> {
+        let bits_per_value = self.child.bits_per_value();
+        let width = usize::try_from(bits_per_value / 8)
+            .map_err(|_| Error::invalid_input("Decoded row width exceeds usize"))?;
+        let rows = usize::try_from(data.num_values)
+            .map_err(|_| Error::invalid_input("Decoded row count exceeds usize"))?;
+        let expected_bytes = rows
+            .checked_mul(width)
+            .ok_or_else(|| Error::invalid_input("Decoded rows exceed usize"))?;
+        let offsets = data.offsets.borrow_to_typed_slice::<T>();
+        if !bits_per_value.is_multiple_of(8) || rows.checked_add(1) != Some(offsets.len()) {
+            return Err(Error::invalid_input(format!(
+                "Invalid compressed rows: {rows} values, {bits_per_value} bits per value, {} offsets",
+                offsets.len()
+            )));
+        }
+        let compressor = GeneralBufferCompressor::get_compressor(self.compression)?;
+        let mut decoded = Vec::new();
+        decoded.try_reserve_exact(expected_bytes).map_err(|err| {
+            Error::invalid_input(format!(
+                "Cannot allocate {expected_bytes} bytes for decoded rows: {err}"
+            ))
+        })?;
+        for offsets in offsets.windows(2) {
+            let start = offsets[0]
+                .to_usize()
+                .ok_or_else(|| Error::invalid_input("Row offset exceeds usize"))?;
+            let end = offsets[1]
+                .to_usize()
+                .ok_or_else(|| Error::invalid_input("Row offset exceeds usize"))?;
+            let frame = data.data.get(start..end).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Compressed row offsets {start}..{end} exceed payload size {}",
+                    data.data.len()
+                ))
+            })?;
+            // Dense FullZip supplies an empty slot for a visible null tensor.
+            // Real compressed tensors always have a frame header, even at width zero.
+            // Its bytes are hidden by the structural validity after reconstruction.
+            if frame.is_empty() {
+                decoded.resize(decoded.len() + width, 0);
+            } else {
+                // Validate each frame against the typed row width before decoding it.
+                compressor.decompress_exact(frame, &mut decoded, width)?;
+            }
+        }
+        self.child.decompress(
+            FixedWidthDataBlock {
+                data: LanceBuffer::from(decoded),
+                bits_per_value,
+                num_values: data.num_values,
+                block_info: BlockInfo::new(),
+            },
+            data.num_values,
+        )
+    }
+}
+
+impl VariablePerValueDecompressor for FixedWidthGeneralPerValueDecompressor {
+    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
+        match data.bits_per_offset {
+            32 => self.decompress_rows::<u32>(data),
+            64 => self.decompress_rows::<u64>(data),
+            bits => Err(Error::invalid_input(format!(
+                "Unsupported compressed row offset width: {bits}"
+            ))),
+        }
+    }
+}
 
 /// General-purpose compressor that wraps one payload-bearing block codec.
 #[derive(Debug)]
@@ -238,10 +396,56 @@ mod tests {
     use crate::encodings::physical::value::ValueEncoder;
     use crate::format::metadata;
     use crate::format::metadata::compressive_encoding::Compression;
-    use arrow_array::{Float64Array, Int32Array};
+    use arrow_array::{FixedSizeListArray, Float64Array, Int32Array};
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
 
     fn miniblock_context() -> MiniBlockCompressionContext {
         MiniBlockCompressionContext::new(0, true, true)
+    }
+
+    #[rstest::rstest]
+    #[case::declared_length("declared length")]
+    #[case::offset_bounds("offset bounds")]
+    #[case::offset_count("offset count")]
+    fn test_tensor_per_value_rejects_corruption(#[case] corruption: &str) {
+        let array = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            64,
+            Arc::new(Int32Array::from(vec![7; 128])),
+            None,
+        );
+        let compressor = FixedWidthGeneralPerValueCompressor::new(CompressionConfig::new(
+            CompressionScheme::Zstd,
+            Some(3),
+        ));
+        let (encoded, description) = compressor.compress(DataBlock::from_array(array)).unwrap();
+        let PerValueDataBlock::Variable(mut encoded) = encoded else {
+            panic!("expected variable frames")
+        };
+        let expected_error = match corruption {
+            "declared length" => {
+                let mut bytes = encoded.data.to_vec();
+                bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+                encoded.data = LanceBuffer::from(bytes);
+                "expected 256"
+            }
+            "offset bounds" => {
+                encoded.offsets = LanceBuffer::reinterpret_vec(vec![0_u64, u64::MAX, u64::MAX]);
+                "exceed payload size"
+            }
+            "offset count" => {
+                encoded.num_values = 3;
+                "Invalid compressed rows"
+            }
+            _ => unreachable!(),
+        };
+        let decoder = DefaultDecompressionStrategy::default()
+            .create_variable_per_value_decompressor(&description)
+            .unwrap();
+        let error = decoder.decompress(encoded).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_error), "{error}");
     }
 
     #[derive(Debug)]

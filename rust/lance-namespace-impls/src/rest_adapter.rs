@@ -1671,6 +1671,9 @@ fn extract_identity(headers: &HeaderMap) -> Option<Box<Identity>> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "rest")]
+    mod conformance;
+
     #[test]
     fn test_parse_id_default_delimiter() {
         let id = parse_id("ns1$ns2$table", None);
@@ -1765,8 +1768,8 @@ mod tests {
                     builder = builder.table_version_tracking_enabled(true);
                 }
                 let backend = Arc::new(RecordingNamespace {
-                    inner: builder.build().await.unwrap(),
-                    received: Default::default(),
+                    inner: Some(builder.build().await.unwrap()),
+                    ..Default::default()
                 });
 
                 // Start REST server with port 0 (OS assigns available port)
@@ -1796,21 +1799,44 @@ mod tests {
             format!("http://127.0.0.1:{}", server_handle.port())
         }
 
-        /// Forwards every operation to a DirectoryNamespace, and keeps the
-        /// last request each operation received. An operation listed with an
-        /// answer gets that answer instead.
-        #[derive(Debug)]
-        struct RecordingNamespace {
-            inner: crate::DirectoryNamespace,
-            received: std::sync::Mutex<HashMap<&'static str, serde_json::Value>>,
+        /// One request an operation received: the operation, the request as
+        /// JSON, and its Arrow data.
+        type Received = (&'static str, serde_json::Value, Option<Bytes>);
+
+        /// Keeps every request each operation receives, and forwards it to
+        /// `inner`. An operation listed with an answer gets that answer
+        /// instead. Without `inner`, every other operation answers its default
+        /// response, with a context entry that the adapter must send as an
+        /// x-served-by header.
+        #[derive(Debug, Default)]
+        pub(super) struct RecordingNamespace {
+            inner: Option<crate::DirectoryNamespace>,
+            received: std::sync::Mutex<Vec<Received>>,
         }
 
         impl RecordingNamespace {
             /// The last request `operation` received, as JSON.
             fn received(&self, operation: &str) -> serde_json::Value {
                 let received = self.received.lock().unwrap();
-                received.get(operation).cloned().unwrap_or_default()
+                let mut requests = received.iter().rev();
+                let last =
+                    requests.find_map(|(op, request, _)| (*op == operation).then_some(request));
+                last.cloned().unwrap_or_default()
             }
+
+            /// Takes every request received so far.
+            pub(super) fn take(&self) -> Vec<Received> {
+                std::mem::take(&mut self.received.lock().unwrap())
+            }
+        }
+
+        /// Adds the x-served-by context entry to a model response.
+        fn with_context<T: serde::Serialize + serde::de::DeserializeOwned>(response: T) -> T {
+            let mut response = serde_json::to_value(response).unwrap();
+            if response.is_object() {
+                response["context"] = serde_json::json!({"header.x-served-by": "recorder"});
+            }
+            serde_json::from_value(response).unwrap()
         }
 
         macro_rules! forward {
@@ -1824,18 +1850,24 @@ mod tests {
                             $(, $data: Bytes)?
                         ) -> Result<$response> {
                             let json = serde_json::to_value(&request).unwrap();
-                            self.received.lock().unwrap().insert(stringify!($method), json);
-                            forward!(@answer self.inner.$method(request $(, $data)?) $(, $answer)?)
+                            let data: Option<Bytes> = None $(.or(Some($data.clone())))?;
+                            self.received.lock().unwrap().push((stringify!($method), json, data));
+                            forward!(@answer self, $method(request $(, $data)?) $(, $answer)?)
                         }
                     )*
 
                     fn namespace_id(&self) -> String {
-                        self.inner.namespace_id()
+                        self.inner.as_ref().map_or("recorder".to_string(), |inner| inner.namespace_id())
                     }
                 }
             };
-            (@answer $forward:expr) => { $forward.await };
-            (@answer $forward:expr, $answer:expr) => { Ok($answer) };
+            (@answer $self:ident, $method:ident($($arg:expr),*)) => {
+                match &$self.inner {
+                    Some(inner) => inner.$method($($arg),*).await,
+                    None => Ok(with_context(Default::default())),
+                }
+            };
+            (@answer $self:ident, $method:ident($($arg:expr),*), $answer:expr) => { Ok($answer) };
         }
 
         forward! {
@@ -1858,7 +1890,9 @@ mod tests {
                 -> MergeInsertIntoTableResponse;
             update_table(UpdateTableRequest) -> UpdateTableResponse;
             delete_from_table(DeleteFromTableRequest) -> DeleteFromTableResponse;
-            query_table(QueryTableRequest) -> Bytes;
+            // Bytes has no serde form to add a context to, so we always answer
+            // this rather than forward.
+            query_table(QueryTableRequest) -> Bytes = Bytes::from_static(b"arrow ipc file");
             create_table_index(CreateTableIndexRequest) -> CreateTableIndexResponse;
             list_table_indices(ListTableIndicesRequest) -> ListTableIndicesResponse;
             describe_table_index_stats(DescribeTableIndexStatsRequest)
@@ -1880,8 +1914,9 @@ mod tests {
             batch_commit_tables(BatchCommitTablesRequest) -> BatchCommitTablesResponse;
             update_table_schema_metadata(UpdateTableSchemaMetadataRequest)
                 -> UpdateTableSchemaMetadataResponse;
+            // DirectoryNamespace does not implement this.
             update_field_metadata(UpdateFieldMetadataRequest) -> UpdateFieldMetadataResponse
-                = UpdateFieldMetadataResponse::new(7);
+                = with_context(UpdateFieldMetadataResponse::new(7));
             get_table_stats(GetTableStatsRequest) -> GetTableStatsResponse;
             explain_table_query_plan(ExplainTableQueryPlanRequest) -> String;
             analyze_table_query_plan(AnalyzeTableQueryPlanRequest) -> String;
