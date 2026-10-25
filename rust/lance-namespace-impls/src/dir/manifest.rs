@@ -6656,10 +6656,21 @@ mod tests {
             let mut req = DeclareTableRequest::new();
             req.id = Some(vec![name.to_string()]);
             let resp = dir_namespace.declare_table(req).await.unwrap();
-            let uri = resp.location.unwrap();
             let mut drop = DropTableRequest::new();
             drop.id = Some(vec![name.to_string()]);
             dir_namespace.drop_table(drop).await.unwrap();
+            // List temp dir: only manifest + expected parents, no stray encoded marker
+            let entries: Vec<_> = std::fs::read_dir(temp_path)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect();
+            eprintln!("after drop, temp dir entries: {:?}", entries);
+            assert_eq!(
+                entries.len(),
+                1,
+                "only __manifest should remain, got {:?}",
+                entries
+            );
         }
     }
 }
