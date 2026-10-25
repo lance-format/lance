@@ -3582,7 +3582,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_path = self.base_path.clone().join(dir_name.as_str());
+        let table_path = Self::join_location(&self.base_path, &dir_name)?;
         let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
@@ -6591,5 +6591,78 @@ mod tests {
         drop_request.id = Some(vec!["nested".to_string(), "held".to_string()]);
         dir_namespace.drop_table(drop_request).await.unwrap();
         assert!(!nested.exists());
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_real_writer_nested_location_drop_cleans_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Write a real lance dataset at outside/held using Dataset::write
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+                1i64, 2, 3,
+            ]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let nested_uri = format!("{}/outside/held", temp_path);
+        lance::dataset::Dataset::write(Box::new(reader), &nested_uri, None)
+            .await
+            .unwrap();
+
+        let mut ns = CreateNamespaceRequest::new();
+        ns.id = Some(vec!["n".to_string()]);
+        dir_namespace.create_namespace(ns).await.unwrap();
+        // Register + drop
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(
+            !std::path::Path::new(&nested_uri).exists(),
+            "nested data must be removed"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_declare_unicode_name_drop_marker_clean(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        for name in ["plain", "räksmörgås", "growth%"] {
+            let mut req = DeclareTableRequest::new();
+            req.id = Some(vec![name.to_string()]);
+            let resp = dir_namespace.declare_table(req).await.unwrap();
+            let uri = resp.location.unwrap();
+            let fs_path = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
+            eprintln!("declared {} at {}", name, uri);
+            let mut drop = DropTableRequest::new();
+            drop.id = Some(vec![name.to_string()]);
+            dir_namespace.drop_table(drop).await.unwrap();
+            eprintln!("after drop, {} marker exists: {}", name, fs_path.exists());
+        }
     }
 }
