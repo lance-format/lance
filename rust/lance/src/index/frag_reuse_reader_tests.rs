@@ -3446,7 +3446,8 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
             &["text"],
             IndexType::Inverted,
             Some("text_idx".into()),
-            &lance_index::scalar::InvertedIndexParams::default(),
+            // The fixture below rewrites the initial partition's file names.
+            &lance_index::scalar::InvertedIndexParams::default().num_workers(1),
             true,
         )
         .await

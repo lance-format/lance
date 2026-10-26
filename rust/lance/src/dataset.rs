@@ -3815,6 +3815,8 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     // the ones in between). On non-lexically-ordered stores this uses the version
     // hint to avoid an O(n) listing.
     let io_parallelism = dataset.object_store.as_ref().io_parallelism();
+    // Both stages must poll their input even when the store permits only one I/O.
+    let stage_parallelism = (io_parallelism / 2).max(1);
     let locations = dataset.commit_handler.list_manifest_locations_since(
         &dataset.base,
         dataset.object_store.as_ref(),
@@ -3845,7 +3847,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 Ok((manifest, location))
             }
         })
-        .try_buffer_unordered(io_parallelism / 2);
+        .try_buffer_unordered(stage_parallelism);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
             let manifest_copy = manifest.clone();
@@ -3883,7 +3885,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 };
             Ok((manifest.version, transaction))
         })
-        .try_buffer_unordered(io_parallelism / 2);
+        .try_buffer_unordered(stage_parallelism);
 
     let dataset = async move {
         if let Ok((latest_manifest, location)) = latest_rx.await {

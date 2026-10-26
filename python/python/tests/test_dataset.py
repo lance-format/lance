@@ -9,6 +9,10 @@ import pickle
 import platform
 import random
 import re
+import subprocess
+import sys
+import textwrap
+import threading
 import time
 import uuid
 from datetime import date, datetime, timedelta
@@ -5182,6 +5186,145 @@ def test_custom_commit_lock(tmp_path: Path):
     dataset = lance.dataset(tmp_path / "test1", commit_lock=commit_lock)
     with pytest.raises(Exception, match="CommitConflictError"):
         dataset.delete("a < 10")
+
+
+@pytest.mark.parametrize("manager_type", ["class", "generator"])
+@pytest.mark.parametrize("exit_behavior", ["propagate", "suppress", "raise"])
+def test_custom_commit_lock_failed_write(tmp_path, manager_type, exit_behavior):
+    data = pa.table({"a": [1, 2]})
+    lance.write_dataset(data, tmp_path, max_rows_per_file=1)
+    manifest_path = tmp_path / "_versions" / f"{2**64 - 1 - 2:020}.manifest"
+    lock = threading.Lock()
+    exit_args = []
+    leases = []
+
+    class Lease:
+        def __enter__(self):
+            assert lock.acquire(blocking=False)
+            # HEAD does not treat this directory as a manifest, but publishing
+            # the manifest file fails. No timing or permission changes are needed.
+            manifest_path.mkdir()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            exit_args.append((exc_type, exc_value, traceback))
+            manifest_path.rmdir()
+            lock.release()
+            if exit_behavior == "raise":
+                raise ValueError("lease cleanup failed")
+            return exit_behavior == "suppress"
+
+    @contextlib.contextmanager
+    def generator_lease():
+        with Lease():
+            yield
+
+    def commit_lock(version):
+        assert version == 2
+        lease = Lease() if manager_type == "class" else generator_lease()
+        # Retain generators so garbage collection cannot hide a missing __exit__.
+        leases.append(lease)
+        return lease
+
+    try:
+        message = (
+            "lease cleanup failed"
+            if exit_behavior == "raise"
+            else re.escape(manifest_path.name)
+        )
+        with pytest.raises(OSError, match=message):
+            lance.write_dataset(
+                pa.table({"a": [3]}), tmp_path, mode="append", commit_lock=commit_lock
+            )
+
+        assert len(exit_args) == 1
+        exc_type, exc_value, traceback = exit_args[0]
+        assert exc_type is OSError
+        assert isinstance(exc_value, OSError)
+        assert str(exc_value) == "commit failed"
+        if manager_type == "class":
+            assert traceback is None
+        else:
+            # Throwing into the generator adds its yield frame to the traceback.
+            assert traceback is not None
+        assert not lock.locked()
+        assert not manifest_path.exists()
+        dataset = lance.dataset(tmp_path)
+        assert dataset.version == 1
+        assert dataset.to_table() == data
+    finally:
+        if manager_type == "generator":
+            for lease in leases:
+                with contextlib.suppress(ValueError):
+                    lease.gen.close()
+
+
+@pytest.mark.parametrize("suppress", [False, True])
+def test_custom_commit_lock_retries_after_conflict(tmp_path, suppress):
+    lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path, max_rows_per_file=1)
+    lock = threading.Lock()
+    attempted_versions = []
+    outcomes = []
+    leases = []
+
+    @contextlib.contextmanager
+    def lease(version):
+        assert lock.acquire(blocking=False)
+        attempted_versions.append(version)
+        try:
+            if version == 2:
+                # A separate process avoids re-entering Lance's runtime or
+                # blocking its only worker while waiting for the competing write.
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        textwrap.dedent("""
+                            import sys
+                            import lance
+                            import pyarrow as pa
+
+                            dataset = lance.write_dataset(
+                                pa.table({"a": [3]}), sys.argv[1], mode="append"
+                            )
+                            assert dataset.version == 2
+                        """),
+                        str(tmp_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+            try:
+                yield
+            except OSError as exc:
+                outcomes.append((version, type(exc), str(exc)))
+                if not suppress:
+                    raise
+            else:
+                outcomes.append((version, None, None))
+        finally:
+            lock.release()
+
+    def commit_lock(version):
+        context = lease(version)
+        leases.append(context)
+        return context
+
+    try:
+        dataset = lance.dataset(tmp_path, commit_lock=commit_lock)
+        dataset.merge_insert("a").when_not_matched_insert_all().execute(
+            pa.table({"a": [4]})
+        )
+
+        assert attempted_versions == [2, 3]
+        assert outcomes == [(2, OSError, "commit failed"), (3, None, None)]
+        assert not lock.locked()
+        assert dataset.version == 3
+        actual = lance.dataset(tmp_path).to_table().sort_by("a")
+        assert actual == pa.table({"a": [1, 2, 3, 4]})
+    finally:
+        for context in leases:
+            context.gen.close()
 
 
 def test_dataset_restore(tmp_path: Path):

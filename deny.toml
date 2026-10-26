@@ -91,6 +91,7 @@ ignore = [
     { id = "RUSTSEC-2026-0195", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
     { id = "RUSTSEC-2024-0449", reason = "no fix: `unsafe-libyaml` is unmaintained; serde_yaml pulls it in for substrait 0.63, which datafusion-substrait (latest 55.2) still requires, and serde_yaml_ng for lindera 3" },
     { id = "RUSTSEC-2026-0385", reason = "expires 2026-10-30: fixed in `ctutils` 0.4.4, but both 0.4.4 and 0.4.5 were published 2026-10-23 and are under the 48h dependency age; run `cargo update -p ctutils` (root, python, java/lance-jni) once eligible and remove this ignore" },
+    { id = "RUSTSEC-2026-0403", reason = "expires 2026-11-03: fixed in `zstd-safe` 8.2.0, which requires `zstd` 0.14; `arrow-ipc` 58 only accepts `zstd` 0.13, and both Lance and Arrow use bulk decompression rather than the affected `DCtx::decompress_stream`, so ignore until an Arrow 60 and DataFusion upgrade" },
 ]
 # Fail when an ignored advisory no longer matches any crate, so an ignore is
 # removed along with the upgrade that fixed it.
