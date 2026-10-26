@@ -17,7 +17,7 @@ async fn test_modern_posting_validation_is_cached_per_token() {
     ));
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.add("term".to_owned());
+    builder.tokens.get_or_add("term");
     let mut valid_builder = PostingListBuilder::new(false);
     valid_builder.add(0, PositionRecorder::Count(1));
     builder.posting_lists.push(valid_builder);
@@ -80,7 +80,7 @@ async fn test_posting_list_synthetic_grouping_reads_group_boundaries() {
     let num_tokens = runtime_posting_group_tokens() as u32 + 4;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for t in 0..num_tokens {
-        builder.tokens.add(format!("t{t}"));
+        builder.tokens.get_or_add(&format!("t{t}"));
         let mut pl = PostingListBuilder::new(false);
         pl.add(t, PositionRecorder::Count(1));
         builder.posting_lists.push(pl);
@@ -132,7 +132,7 @@ async fn test_prewarm_group_keys_match_read_path() {
     let num_tokens = runtime_posting_group_tokens() as u32 + 4;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for t in 0..num_tokens {
-        builder.tokens.add(format!("t{t}"));
+        builder.tokens.get_or_add(&format!("t{t}"));
         let mut pl = PostingListBuilder::new(false);
         pl.add(t, PositionRecorder::Count(1));
         builder.posting_lists.push(pl);
@@ -229,14 +229,14 @@ async fn test_large_posting_reads_inside_synthetic_group() {
 
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     let big_docs = (BLOCK_SIZE * 3 + 5) as u32;
-    builder.tokens.add("big".to_owned());
+    builder.tokens.get_or_add("big");
     let mut big = PostingListBuilder::new(false);
     for d in 0..big_docs {
         big.add(d, PositionRecorder::Count(1));
     }
     builder.posting_lists.push(big);
     for t in 1..5u32 {
-        builder.tokens.add(format!("t{t}"));
+        builder.tokens.get_or_add(&format!("t{t}"));
         let mut pl = PostingListBuilder::new(false);
         pl.add(0, PositionRecorder::Count(1));
         builder.posting_lists.push(pl);
@@ -285,7 +285,7 @@ async fn test_prewarm_synthetic_grouping_populates_group_entries() {
     let num_tokens = 3u32;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for t in 0..num_tokens {
-        builder.tokens.add(format!("t{t}"));
+        builder.tokens.get_or_add(&format!("t{t}"));
         let mut pl = PostingListBuilder::new(false);
         pl.add(t, PositionRecorder::Count(1));
         builder.posting_lists.push(pl);
@@ -357,10 +357,10 @@ async fn test_grouped_bm25_search_correct_and_cache_stable() {
     let num_rare = runtime_posting_group_tokens() as u32 + 2;
     let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
     for t in 0..num_rare {
-        builder.tokens.add(format!("t{t}"));
+        builder.tokens.get_or_add(&format!("t{t}"));
         builder.posting_lists.push(PostingListBuilder::new(false));
     }
-    let common_id = builder.tokens.add("common".to_owned());
+    let common_id = builder.tokens.get_or_add("common");
     builder.posting_lists.push(PostingListBuilder::new(false));
     for d in 0..num_rare {
         builder.posting_lists[d as usize].add(d, PositionRecorder::Count(1));

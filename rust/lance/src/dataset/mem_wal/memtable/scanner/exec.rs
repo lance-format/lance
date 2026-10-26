@@ -5,7 +5,7 @@
 //!
 //! This module contains execution nodes for:
 //! - `MemTableScanExec` - Full table scan with MVCC visibility
-//! - `BTreeIndexExec` - BTree index queries
+//! - `ScalarMemIndexExec` - Filters answered from the memtable's indexes
 //! - `VectorIndexExec` - HNSW vector search
 //! - `MemTableBruteForceVectorExec` - KNN over the active memtable without an HNSW
 //! - `FtsIndexExec` - Full-text search
@@ -20,21 +20,29 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use lance_arrow::RecordBatchExt;
 
 mod brute_force_vector;
-mod btree;
 mod dedup_scan;
 mod fts;
+mod scalar_index;
 mod scan;
 mod vector;
 
+use crate::dataset::blob::prepared_blob_batch_to_descriptors;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::BatchStore;
 
 pub use brute_force_vector::MemTableBruteForceVectorExec;
-pub use btree::BTreeIndexExec;
 pub use dedup_scan::MemTableDedupScanExec;
 pub use fts::{FtsIndexExec, SCORE_COLUMN};
+pub use scalar_index::ScalarMemIndexExec;
+#[cfg(test)]
+pub use scalar_index::{FALLBACK_READS_METRIC, NEWEST_CHECKS_METRIC};
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;
+
+pub(super) fn scan_record_batch(batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
+    prepared_blob_batch_to_descriptors(batch)
+        .map_err(|error| DataFusionError::External(Box::new(error)))
+}
 
 /// Take `indices` out of `source_columns` and trim each to the shape
 /// `output_schema` promises for that column name.

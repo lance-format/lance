@@ -90,7 +90,7 @@ fn bench_zonemap(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
     let details = prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(ZoneMapIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
+        .block_on(ZoneMapIndexPlugin.load_index(store, &details, 0, None, &LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("zonemap_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {

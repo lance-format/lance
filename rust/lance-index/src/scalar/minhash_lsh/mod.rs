@@ -60,6 +60,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+use crate::scalar::RowAddrTranslator;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{UInt16Type, UInt32Type, UInt64Type};
 use arrow_array::{
@@ -74,7 +75,6 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
 use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
@@ -872,6 +872,7 @@ impl ScalarIndexPlugin for MinHashLshIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {

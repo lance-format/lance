@@ -31,7 +31,7 @@ use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
-use lance_core::{Error, ROW_ID, Result, box_error};
+use lance_core::{Error, ROW_ADDR, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -60,6 +60,7 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
+use lance_table::transaction::validate_non_reusable_field_id_transition;
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
@@ -101,6 +102,17 @@ static BASE_OBJECTS_VALUE_FIELD: LazyLock<Field> = LazyLock::new(|| {
 // commit retry budget so multi-process namespace writes can make progress.
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
 const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
+// Dataset config keys of Lance's automatic old-version cleanup policy. Lance
+// releases before 7.0 wrote this policy into every new dataset by default, so
+// directory manifests created by those releases still carry it.
+const AUTO_CLEANUP_CONFIG_PREFIX: &str = "lance.auto_cleanup.";
+
+fn has_auto_cleanup_config(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .keys()
+        .any(|key| key.starts_with(AUTO_CLEANUP_CONFIG_PREFIX))
+}
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,23 +609,20 @@ pub struct NamespaceInfo {
 /// A wrapper around a Dataset that provides concurrent access.
 ///
 /// This can be cloned cheaply. It supports concurrent reads or exclusive writes.
-/// The manifest dataset uses contiguous attached versions and this module never
-/// runs old-version cleanup on it, allowing reads to check only the immediate
-/// successor manifest before deciding whether a reload is needed.
+///
+/// Manifest rewrites never run old-version cleanup or add an auto-cleanup
+/// policy. Policy-free manifests therefore keep contiguous attached versions,
+/// so reloads only need to probe the immediate successor manifest. A manifest
+/// created by an older Lance release can still carry an auto-cleanup policy,
+/// and older writers act on it by removing old versions, which leaves gaps
+/// after the held version. While that version carries the policy, reloads
+/// resolve the latest version instead.
 #[derive(Debug, Clone)]
 pub struct DatasetConsistencyWrapper(Arc<RwLock<Dataset>>);
 
 impl DatasetConsistencyWrapper {
     /// Create a new wrapper with the given dataset.
     pub fn new(dataset: Dataset) -> Self {
-        debug_assert!(
-            !dataset
-                .manifest()
-                .config
-                .keys()
-                .any(|key| key.starts_with("lance.auto_cleanup.")),
-            "the directory manifest dataset must not enable old-version cleanup"
-        );
         Self(Arc::new(RwLock::new(dataset)))
     }
 
@@ -642,11 +651,13 @@ impl DatasetConsistencyWrapper {
 
     /// Get a mutable reference to the dataset.
     /// Always reloads to ensure strong consistency.
+    ///
+    /// Acquires the write lock before reloading so that tokio's write-fairness
+    /// prevents reader starvation of the writer.
     pub async fn get_mut(&self) -> Result<DatasetWriteGuard<'_>> {
-        self.reload().await?;
-        let guard = DatasetWriteGuard {
-            guard: self.0.write().await,
-        };
+        let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await?;
+        let guard = DatasetWriteGuard { guard: write_guard };
         ensure_readable(guard.metadata())?;
         ensure_writable(guard.metadata())?;
         Ok(guard)
@@ -663,7 +674,10 @@ impl DatasetConsistencyWrapper {
         }
     }
 
-    /// Reload the dataset to the latest version.
+    /// Reload the dataset to the latest version (for the read path).
+    ///
+    /// Takes a read lock first to check if a reload is needed, then upgrades
+    /// to a write lock only if necessary.
     async fn reload(&self) -> Result<()> {
         // First check if we need to reload (with read lock)
         let read_guard = self.0.read().await;
@@ -674,41 +688,40 @@ impl DatasetConsistencyWrapper {
             dataset_uri,
             current_version
         );
-        // The directory manifest table uses contiguous attached versions and
-        // does not run old-version cleanup, so the immediate successor probe is
-        // enough to detect changes without resolving or loading the latest
-        // manifest on every namespace read.
-        let has_successor_version = read_guard.has_successor_version().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to check dataset staleness: {:?}", e),
-            })
-        })?;
+        let has_newer_version = Self::has_newer_version(&read_guard).await?;
         log::debug!(
-            "Reload checked successor_version_exists={} for uri={}, current_version={}",
-            has_successor_version,
+            "Reload checked has_newer_version={} for uri={}, current_version={}",
+            has_newer_version,
             dataset_uri,
             current_version
         );
         drop(read_guard);
 
         // If already up-to-date, return early
-        if !has_successor_version {
+        if !has_newer_version {
             log::debug!("Already up-to-date for uri={}", dataset_uri);
             return Ok(());
         }
 
         // Need to reload, acquire write lock
         let mut write_guard = self.0.write().await;
+        Self::reload_under_write_lock(&mut write_guard).await
+    }
 
-        // Double-check after acquiring write lock (someone else might have reloaded)
-        let has_successor_version = write_guard.has_successor_version().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to check dataset staleness: {:?}", e),
-            })
-        })?;
+    /// Reload the dataset while already holding the write lock.
+    async fn reload_under_write_lock(
+        dataset: &mut tokio::sync::RwLockWriteGuard<'_, Dataset>,
+    ) -> Result<()> {
+        let dataset_uri = dataset.uri().to_string();
+        let current_version = dataset.version().version;
+        log::debug!(
+            "Reload (under write lock) for uri={}, current_version={}",
+            dataset_uri,
+            current_version
+        );
 
-        if has_successor_version {
-            write_guard.checkout_latest().await.map_err(|e| {
+        if Self::has_newer_version(dataset).await? {
+            dataset.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),
                 })
@@ -716,6 +729,25 @@ impl DatasetConsistencyWrapper {
         }
 
         Ok(())
+    }
+
+    /// Return whether a version newer than the held one has been committed.
+    ///
+    /// Probing the immediate successor avoids resolving the latest manifest on
+    /// every namespace read, but misses newer versions once cleanup has removed
+    /// the successor. A held version with an auto-cleanup policy can have such
+    /// gaps after it, so it resolves the latest version instead.
+    async fn has_newer_version(dataset: &Dataset) -> Result<bool> {
+        let has_newer_version = if has_auto_cleanup_config(dataset.manifest()) {
+            dataset.is_stale().await
+        } else {
+            dataset.has_successor_version().await
+        };
+        has_newer_version.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to check dataset staleness: {:?}", e),
+            })
+        })
     }
 }
 
@@ -1058,10 +1090,17 @@ impl ManifestNamespace {
         Self::string_list_array(values, "object_id")
     }
 
-    fn value_row_id_schema(value_field: Field) -> SchemaRef {
+    /// Schema for a manifest index training stream: BTree, Bitmap, and
+    /// LabelList all read their id column as `ROW_ADDR`, never `ROW_ID` (see
+    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`, `BITMAP_ROW_ADDR_DOMAIN_VERSION`, and
+    /// `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
+    /// rows with is already an address, not a row id -- see the single
+    /// fragment id 0 invariant in `rewrite_manifest` -- so only the column
+    /// name matters, not the values.
+    fn value_row_addr_schema(value_field: Field) -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![
             value_field,
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]))
     }
 
@@ -1097,7 +1136,7 @@ impl ManifestNamespace {
 
     fn object_id_index_stream(object_ids: BTreeMap<Arc<str>, u64>) -> SendableRecordBatchStream {
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (object_ids.into_iter(), false, schema),
@@ -1135,8 +1174,12 @@ impl ManifestNamespace {
     fn object_type_index_stream(
         object_types: BTreeMap<&'static str, RoaringBitmap>,
     ) -> SendableRecordBatchStream {
+        // Like `object_id_index_stream`, but for Bitmap: Bitmap training also
+        // reads its id column as `ROW_ADDR`, never `ROW_ID` (see
+        // `BITMAP_ROW_ADDR_DOMAIN_VERSION`). Only the column name needs to
+        // change, not the values -- see `value_row_addr_schema`.
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let entries = object_types
             .into_iter()
@@ -1193,7 +1236,11 @@ impl ManifestNamespace {
         base_objects_values: Vec<Option<Vec<String>>>,
         base_objects_row_ids: Vec<u64>,
     ) -> SendableRecordBatchStream {
-        let schema = Self::value_row_id_schema(BASE_OBJECTS_VALUE_FIELD.clone());
+        // Like `object_type_index_stream`, but for LabelList: LabelList
+        // training also reads its id column as `ROW_ADDR`, never `ROW_ID`
+        // (see `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). Only the column name
+        // needs to change, not the values -- see `value_row_addr_schema`.
+        let schema = Self::value_row_addr_schema(BASE_OBJECTS_VALUE_FIELD.clone());
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (
@@ -1322,7 +1369,13 @@ impl ManifestNamespace {
             })
             .collect::<Vec<_>>();
         fragments.sort_by_key(|fragment| fragment.id);
-        Manifest::new_from_previous(previous, schema, Arc::new(fragments))
+        let mut manifest = Manifest::new_from_previous(previous, schema, Arc::new(fragments));
+        // Drop a legacy auto-cleanup policy so later commits, including those of
+        // older writers that inherit this config, stop removing old versions.
+        manifest
+            .config
+            .retain(|key, _| !key.starts_with(AUTO_CLEANUP_CONFIG_PREFIX));
+        manifest
     }
 
     async fn build_manifest_indices(
@@ -1858,6 +1911,8 @@ impl ManifestNamespace {
             .map_err(CommitError::from)?;
         let base_path = self.base_path.clone().join(MANIFEST_TABLE_NAME);
         let naming_scheme = dataset.manifest_location().naming_scheme;
+        let inline_transaction =
+            lance_table::format::Transaction::try_from(&transaction).map_err(CommitError::from)?;
         commit_handler
             .commit(
                 manifest,
@@ -1866,7 +1921,7 @@ impl ManifestNamespace {
                 &object_store,
                 write_manifest_file_to_path,
                 naming_scheme,
-                Some((&transaction).into()),
+                Some(inline_transaction),
             )
             .await
             .map(|_location| ())
@@ -2026,6 +2081,16 @@ impl ManifestNamespace {
                 schema.clone(),
                 fragments,
             );
+            if let Err(err) = validate_non_reusable_field_id_transition(
+                dataset.manifest(),
+                &manifest,
+                &transaction.operation,
+            ) {
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                    .await;
+                return Err(err);
+            }
+            manifest.update_max_field_id();
             let target_version = manifest.version;
 
             let index_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
@@ -2251,13 +2316,55 @@ impl ManifestNamespace {
             .is_some())
     }
 
+    /// Resolve a relative table location to the storage path that
+    /// [`Self::construct_full_uri`] addresses.
+    ///
+    /// `construct_full_uri` splits on `/` and drops empty segments, and the URL
+    /// segment extension also drops `.` and `..` segments. Reproduce the empty and
+    /// `.` handling so probes and deletes target the same physical directory as the
+    /// writer instead of a percent-encoded single segment (`Path::join`) or an
+    /// `EmptySegment` error for accepted inputs like `a//b`. `..` stays rejected to
+    /// match `register_table`'s traversal contract rather than silently rewriting
+    /// such input. `Path::parse` preserves raw segment bytes, so escaped slashes and
+    /// non-ASCII names stay literal.
+    fn join_location(
+        base: &object_store::path::Path,
+        location: &str,
+    ) -> Result<object_store::path::Path> {
+        let mut canonical = String::new();
+        for segment in location.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == ".." {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Table location must stay within the namespace root, got '{}'",
+                        location
+                    ),
+                }
+                .into());
+            }
+            if !canonical.is_empty() {
+                canonical.push('/');
+            }
+            canonical.push_str(segment);
+        }
+        if canonical.is_empty() {
+            return Ok(base.clone());
+        }
+        Ok(object_store::path::Path::parse(format!(
+            "{base}/{canonical}"
+        ))?)
+    }
+
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
-        Self::path_has_actual_manifests(&self.object_store, &self.base_path.clone().join(location))
-            .await
+        let path = Self::join_location(&self.base_path, location)?;
+        Self::path_has_actual_manifests(&self.object_store, &path).await
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
-        match err {
+        match err.find_root() {
             LanceError::NotFound { .. } => true,
             LanceError::IO { source, .. } => source
                 .downcast_ref::<ObjectStoreError>()
@@ -2392,7 +2499,11 @@ impl ManifestNamespace {
         for i in 1..=namespace_path.len() {
             let partial_path = &namespace_path[..i];
             let object_id = partial_path.join(DELIMITER);
-            if !self.manifest_contains_object(&object_id).await? {
+            if self
+                .query_manifest_for_namespace(&object_id)
+                .await?
+                .is_none()
+            {
                 return Err(NamespaceError::NamespaceNotFound {
                     message: format!("parent namespace '{}'", object_id),
                 }
@@ -2936,7 +3047,7 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         let object_id = Self::str_object_id(table_id);
-        let exists = self.manifest_contains_object(&object_id).await?;
+        let exists = self.query_manifest_for_table(&object_id).await?.is_some();
         if exists {
             Ok(())
         } else {
@@ -2973,6 +3084,14 @@ impl LanceNamespace for ManifestNamespace {
         self.ensure_manifest_writable().await?;
 
         let existing_table = self.query_manifest_for_table(&object_id).await?;
+        // Tables and namespaces share object ids. We refuse an id that a
+        // namespace holds before we write any data.
+        if existing_table.is_none() && self.manifest_contains_object(&object_id).await? {
+            return Err(NamespaceError::TableAlreadyExists {
+                message: table_name,
+            }
+            .into());
+        }
         let existing_has_manifests = if let Some(existing_table) = &existing_table {
             Some(
                 self.location_has_actual_manifests(&existing_table.location)
@@ -3181,12 +3300,23 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
+                // Resolve and validate the target before mutating the manifest so a
+                // root-equivalent location cannot delete the namespace root after the
+                // row is already gone.
+                let table_path = Self::join_location(&self.base_path, info.location.as_str())?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                if table_path == self.base_path {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "Refusing to drop table '{}': location '{}' resolves to the namespace root",
+                            object_id, info.location
+                        ),
+                    }
+                    .into());
+                }
+
                 // Delete from manifest first
                 self.delete_from_manifest(&object_id).boxed().await?;
-
-                // Delete physical data directory using the dir_name from manifest
-                let table_path = self.base_path.clone().join(info.location.as_str());
-                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
                 self.object_store
@@ -3377,8 +3507,14 @@ impl LanceNamespace for ManifestNamespace {
 
         let object_id = namespace_id.join(DELIMITER);
 
-        // Check if namespace exists
-        if !self.manifest_contains_object(&object_id).boxed().await? {
+        // Check if namespace exists. A table's id is not a namespace, and
+        // dropping it here would delete the table's entry.
+        if self
+            .query_manifest_for_namespace(&object_id)
+            .boxed()
+            .await?
+            .is_none()
+        {
             return Err(NamespaceError::NamespaceNotFound {
                 message: object_id.to_string(),
             }
@@ -3432,7 +3568,11 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         let object_id = namespace_id.join(DELIMITER);
-        if self.manifest_contains_object(&object_id).await? {
+        if self
+            .query_manifest_for_namespace(&object_id)
+            .await?
+            .is_some()
+        {
             Ok(())
         } else {
             Err(NamespaceError::NamespaceNotFound {
@@ -3459,9 +3599,9 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
-        // Check if table already exists in manifest
-        let existing = self.query_manifest_for_table(&object_id).await?;
-        if existing.is_some() {
+        // Tables and namespaces share object ids. We refuse an id that either
+        // one holds before we write the marker.
+        if self.manifest_contains_object(&object_id).await? {
             return Err(NamespaceError::TableAlreadyExists {
                 message: table_name.to_string(),
             }
@@ -3478,7 +3618,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_path = self.base_path.clone().join(dir_name.as_str());
+        let table_path = Self::join_location(&self.base_path, &dir_name)?;
         let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
@@ -3845,29 +3985,34 @@ impl LanceNamespace for ManifestNamespace {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation, DeleteObjectMutation,
-        LANCE_DATA_DIR, LANCE_INDICES_DIR, MANIFEST_TABLE_NAME, ManifestBatchBuilder,
-        ManifestEntry, ManifestIndexAccumulator, ManifestNamespace, ManifestOutputRow,
-        ManifestRowValue, ManifestStreamMutation, OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME,
-        ObjectType,
+        BASE_OBJECTS_INDEX_NAME, ConflictResolution, CopyOnWriteMutation,
+        DatasetConsistencyWrapper, DeleteObjectMutation, LANCE_DATA_DIR, LANCE_INDICES_DIR,
+        MANIFEST_TABLE_NAME, ManifestBatchBuilder, ManifestEntry, ManifestIndexAccumulator,
+        ManifestNamespace, ManifestOutputRow, ManifestRowValue, ManifestStreamMutation,
+        OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME, ObjectType, has_auto_cleanup_config,
     };
-    use crate::DirectoryNamespaceBuilder;
+    use crate::{DirectoryNamespace, DirectoryNamespaceBuilder};
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use futures::StreamExt;
+    use lance::dataset::builder::DatasetBuilder;
+    use lance::dataset::cleanup::CleanupPolicyBuilder;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
-        DropTableRequest, ListTablesRequest, TableExistsRequest,
+        DropTableRequest, ListTablesRequest, RegisterTableRequest, TableExistsRequest,
     };
     use lance_table::feature_flags::FLAG_UNKNOWN;
     use lance_table::format::Fragment;
     use rstest::rstest;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     async fn create_manifest_namespace(
         root: &str,
@@ -4242,6 +4387,142 @@ mod tests {
             .collect()
     }
 
+    async fn create_manifest_only_table(ns: &DirectoryNamespace, name: &str) {
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec![name.to_string()]);
+        ns.create_table(create_request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+    }
+
+    fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempStdDir> {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data")
+            .join(table_path);
+        let temp_dir = TempStdDir::default();
+        let mut directories = vec![(source, temp_dir.to_path_buf())];
+        while let Some((source, destination)) = directories.pop() {
+            std::fs::create_dir_all(&destination)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                let target = destination.join(entry.file_name());
+                if entry.file_type()?.is_dir() {
+                    directories.push((entry.path(), target));
+                } else {
+                    std::fs::copy(entry.path(), target)?;
+                }
+            }
+        }
+        Ok(temp_dir)
+    }
+
+    #[derive(Debug)]
+    enum ManifestAccess {
+        Get,
+        GetRefreshed,
+        GetMut,
+    }
+
+    /// Readers and writers holding a manifest created by a released old writer
+    /// must observe newer commits after cleanup removes the immediate successor.
+    #[rstest]
+    #[case::get(ManifestAccess::Get)]
+    #[case::get_refreshed(ManifestAccess::GetRefreshed)]
+    #[case::get_mut(ManifestAccess::GetMut)]
+    #[tokio::test]
+    async fn test_legacy_auto_cleanup_manifest_reload_skips_removed_versions(
+        #[case] access: ManifestAccess,
+    ) {
+        let temp_dir = copy_test_data_to_tmp("v6.0.1/dir_manifest/namespace").unwrap();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_uri = format!("{}/{}", temp_path, MANIFEST_TABLE_NAME);
+        // Directory listing would surface tables the manifest misses, so the
+        // namespaces read only the manifest.
+        let build_namespace = || {
+            DirectoryNamespaceBuilder::new(temp_path)
+                .manifest_enabled(true)
+                .dir_listing_enabled(false)
+                .build()
+        };
+
+        let manifest_ds = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        assert!(has_auto_cleanup_config(manifest_ds.manifest()));
+        assert_eq!(
+            manifest_ds.manifest().config["lance.auto_cleanup.interval"],
+            "20"
+        );
+        assert_eq!(
+            manifest_ds.manifest().config["lance.auto_cleanup.older_than"],
+            "14days"
+        );
+        let legacy_version = manifest_ds.version().version;
+        let wrapper = DatasetConsistencyWrapper::new(manifest_ds);
+        let reader = build_namespace().await.unwrap();
+        let writer = build_namespace().await.unwrap();
+        create_manifest_only_table(&writer, "t2").await;
+        create_manifest_only_table(&writer, "t3").await;
+
+        let latest = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        let latest_version = latest.version().version;
+        assert_eq!(latest_version, legacy_version + 2);
+        assert!(!has_auto_cleanup_config(latest.manifest()));
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&latest, 1)
+            .await
+            .unwrap()
+            .delete_unverified(true)
+            .build();
+        latest.cleanup_with_policy(policy).await.unwrap();
+        let error = latest
+            .checkout_version(legacy_version + 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::DatasetNotFound { .. }),
+            "unexpected missing-version error: {error:?}"
+        );
+        assert!(error.to_string().contains("not found"));
+
+        let reloaded_version = match access {
+            ManifestAccess::Get => wrapper.get().await.unwrap().version().version,
+            ManifestAccess::GetRefreshed => {
+                wrapper.get_refreshed().await.unwrap().version().version
+            }
+            ManifestAccess::GetMut => wrapper.get_mut().await.unwrap().version().version,
+        };
+        assert_eq!(reloaded_version, latest_version);
+        assert!(!has_auto_cleanup_config(
+            wrapper.get().await.unwrap().manifest()
+        ));
+
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        let mut tables = reader
+            .list_tables(list_request.clone())
+            .await
+            .unwrap()
+            .tables;
+        tables.sort();
+        assert_eq!(tables, vec!["t1", "t2", "t3"]);
+
+        // Once refreshed to a policy-free version, the successor fast path must
+        // still observe subsequent writes.
+        create_manifest_only_table(&writer, "t4").await;
+        assert_eq!(
+            wrapper.get().await.unwrap().version().version,
+            latest_version + 1
+        );
+        let mut tables = reader.list_tables(list_request).await.unwrap().tables;
+        tables.sort();
+        assert_eq!(tables, vec!["t1", "t2", "t3", "t4"]);
+    }
+
     #[tokio::test]
     async fn test_manifest_rewrite_preserves_utf8_metadata_and_base_objects() {
         let temp_dir = TempStdDir::default();
@@ -4464,6 +4745,57 @@ mod tests {
             original_version
         );
         assert_eq!(manifest_data_paths(&manifest_ns).await, data_paths_before);
+    }
+
+    /// A reader that arrives after a waiting `get_mut()` must be served after
+    /// it. tokio's `RwLock` guarantees that only once the writer is queued on
+    /// the write lock: if `get_mut()` first queued as a reader to reload, the
+    /// later reader would be admitted alongside it, and a reader that holds
+    /// its permit until the writer is done would then block the write lock
+    /// forever.
+    #[tokio::test]
+    async fn test_get_mut_is_served_before_later_readers() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        let wrapper = manifest_ns.manifest_dataset.clone();
+
+        // Hold the lock exclusively so both tasks below park on their first
+        // lock request, in spawn order. The current-thread test runtime polls
+        // each spawned task before this task resumes from `yield_now`.
+        let blocker = wrapper.0.write().await;
+        let writer = {
+            let wrapper = wrapper.clone();
+            tokio::spawn(async move {
+                wrapper.get_mut().await.unwrap();
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // The late reader takes a single read permit and keeps it until told
+        // to let go. A raw lock rather than `get()` so that it never releases
+        // and re-acquires the permit around a reload probe, which would leave
+        // a window for the writer's request to slip in ahead of it.
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let late_reader = {
+            let wrapper = wrapper.clone();
+            tokio::spawn(async move {
+                let guard = wrapper.0.read().await;
+                release_rx.await.unwrap();
+                drop(guard);
+            })
+        };
+        tokio::task::yield_now().await;
+
+        drop(blocker);
+        timeout(Duration::from_secs(10), writer)
+            .await
+            .expect("get_mut() waited on a reader that arrived after it")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(10), late_reader)
+            .await
+            .expect("the late reader did not finish after the writer released the lock")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4811,6 +5143,19 @@ mod tests {
         request.id = Some(vec!["test_table".to_string()]);
         let result = dir_namespace.table_exists(request).await;
         assert!(result.is_ok());
+
+        // A namespace's id is not a table. A root id would be answered from
+        // the directory listing, so check a child id.
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["ns".to_string()]);
+        dir_namespace.create_namespace(create_ns_req).await.unwrap();
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["ns".to_string(), "child".to_string()]);
+        dir_namespace.create_namespace(create_ns_req).await.unwrap();
+        let mut request = TableExistsRequest::new();
+        request.id = Some(vec!["ns".to_string(), "child".to_string()]);
+        let err = dir_namespace.table_exists(request).await.unwrap_err();
+        assert!(err.to_string().contains("Table not found"), "{err}");
     }
 
     #[rstest]
@@ -5245,6 +5590,21 @@ mod tests {
         create_req.id = Some(vec!["nonexistent_parent".to_string(), "child".to_string()]);
         let result = dir_namespace.create_namespace(create_req).await;
         assert!(result.is_err(), "Should fail when parent doesn't exist");
+
+        // A table is not a parent namespace.
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["t".to_string()]);
+        dir_namespace
+            .create_table(create_table_req, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["t".to_string(), "child".to_string()]);
+        let err = dir_namespace
+            .create_namespace(create_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Namespace not found"), "{err}");
     }
 
     #[rstest]
@@ -5294,7 +5654,9 @@ mod tests {
     #[case::without_optimization(false)]
     #[tokio::test]
     async fn test_drop_namespace_with_children_fails(#[case] inline_optimization: bool) {
-        use lance_namespace::models::{CreateNamespaceRequest, DropNamespaceRequest};
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DropNamespaceRequest, NamespaceExistsRequest,
+        };
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -5319,6 +5681,32 @@ mod tests {
         drop_req.id = Some(vec!["parent".to_string()]);
         let result = dir_namespace.drop_namespace(drop_req).await;
         assert!(result.is_err(), "Should fail when namespace has children");
+
+        // A table's id is not a namespace. Dropping it as one must leave the
+        // table in place.
+        let table_id = vec!["parent".to_string(), "t".to_string()];
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(table_id.clone());
+        dir_namespace
+            .create_table(create_table_req, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+        let mut drop_req = DropNamespaceRequest::new();
+        drop_req.id = Some(table_id.clone());
+        let err = dir_namespace.drop_namespace(drop_req).await.unwrap_err();
+        assert!(err.to_string().contains("Namespace not found"), "{err}");
+        let exists_req = NamespaceExistsRequest {
+            id: Some(table_id.clone()),
+            ..Default::default()
+        };
+        let err = dir_namespace
+            .namespace_exists(exists_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Namespace not found"), "{err}");
+        let mut request = TableExistsRequest::new();
+        request.id = Some(table_id);
+        dir_namespace.table_exists(request).await.unwrap();
     }
 
     #[rstest]
@@ -5369,6 +5757,24 @@ mod tests {
         let tables = result.unwrap();
         assert_eq!(tables.tables.len(), 1);
         assert_eq!(tables.tables[0], "table1");
+
+        // We refuse a name that a namespace holds, before we write any data.
+        let taken = vec!["ns1".to_string(), "taken".to_string()];
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(taken.clone());
+        dir_namespace.create_namespace(create_ns_req).await.unwrap();
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(taken);
+        let err = dir_namespace
+            .create_table(create_table_req, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Table already exists"), "{err}");
+        assert!(
+            !dir_entry_names(temp_path)
+                .iter()
+                .any(|name| name.ends_with("_ns1$taken"))
+        );
     }
 
     #[rstest]
@@ -6193,5 +6599,241 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.alter_table_drop_columns(request).await;
         assert!(result.is_err(), "Should fail when table does not exist");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_drop_nested_table_removes_physical_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let nested = std::path::Path::new(temp_path).join("outside/held");
+        std::fs::create_dir_all(nested.join("_versions")).unwrap();
+        std::fs::write(nested.join("_versions/1.manifest"), b"{}").unwrap();
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["nested".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        req.location = "outside/held".to_string();
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop_request = DropTableRequest::new();
+        drop_request.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop_request).await.unwrap();
+        assert!(!nested.exists());
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_real_writer_nested_location_drop_cleans_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Write a real lance dataset at outside/held using Dataset::write
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+                1i64, 2, 3,
+            ]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let nested_uri = format!("{}/outside/held", temp_path);
+        lance::dataset::Dataset::write(Box::new(reader), &nested_uri, None)
+            .await
+            .unwrap();
+
+        let mut ns = CreateNamespaceRequest::new();
+        ns.id = Some(vec!["n".to_string()]);
+        dir_namespace.create_namespace(ns).await.unwrap();
+        // Register + drop
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(
+            !std::path::Path::new(&nested_uri).exists(),
+            "nested data must be removed"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_declare_unicode_name_drop_marker_clean(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        for name in ["plain", "räksmörgås", "growth%"] {
+            let mut req = DeclareTableRequest::new();
+            req.id = Some(vec![name.to_string()]);
+            dir_namespace.declare_table(req).await.unwrap();
+            let mut drop = DropTableRequest::new();
+            drop.id = Some(vec![name.to_string()]);
+            dir_namespace.drop_table(drop).await.unwrap();
+            // List temp dir: only manifest + expected parents, no stray encoded marker
+            let entries: Vec<_> = std::fs::read_dir(temp_path)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "only __manifest should remain, got {:?}",
+                entries
+            );
+        }
+    }
+
+    async fn write_single_column_dataset(uri: &str) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        lance::dataset::Dataset::write(Box::new(reader), uri, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_registered_location_matches_construct_full_uri_canonicalization() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // construct_full_uri maps `a//b` and `c/d//` to `a/b` and `c/d`, so write
+        // the datasets there. `a%2Fb` stays a literal escaped-slash segment.
+        for dir in ["a/b", "c/d", "a%2Fb"] {
+            write_single_column_dataset(&format!("{temp_path}/{dir}")).await;
+        }
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["canon".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        for (name, location) in [
+            ("empty-segments", "a//b"),
+            ("trailing-slashes", "c/d//"),
+            ("escaped-slash", "a%2Fb"),
+        ] {
+            let mut req = RegisterTableRequest::new(location.to_string());
+            req.id = Some(vec!["canon".to_string(), name.to_string()]);
+            dir_namespace.register_table(req).await.unwrap();
+        }
+
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["canon".to_string()]);
+        list.include_declared = Some(false);
+        let listed = dir_namespace.list_tables(list).await.unwrap();
+        assert_eq!(
+            listed.tables,
+            vec!["empty-segments", "escaped-slash", "trailing-slashes"]
+        );
+
+        let mut describe = DescribeTableRequest::new();
+        describe.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        describe.check_declared = Some(true);
+        let described = dir_namespace.describe_table(describe).await.unwrap();
+        assert_eq!(described.is_only_declared, Some(false));
+
+        // Dropping the canonicalized location removes `a/b` and leaves the literal
+        // `a%2Fb` directory untouched.
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a/b")).exists());
+        assert!(std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "trailing-slashes".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/c/d")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "escaped-slash".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+    }
+
+    #[rstest]
+    #[case::empty_location("")]
+    #[case::dot_location(".")]
+    #[tokio::test]
+    async fn test_drop_rejects_root_equivalent_location(#[case] location: &str) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["root".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        let mut req = RegisterTableRequest::new(location.to_string());
+        req.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+
+        // Physical data that a root-directory delete would destroy.
+        std::fs::write(std::path::Path::new(temp_path).join("keep.txt"), b"keep").unwrap();
+
+        // Probing must not turn the whole listing into an error for these rows.
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["root".to_string()]);
+        list.include_declared = Some(false);
+        assert!(
+            dir_namespace
+                .list_tables(list)
+                .await
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        let error = dir_namespace.drop_table(drop).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("namespace root"), "{message}");
+
+        // The manifest row and physical data must both survive the rejected drop.
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        assert!(dir_namespace.table_exists(exists).await.is_ok());
+        assert!(std::path::Path::new(temp_path).join("keep.txt").exists());
+        assert!(std::path::Path::new(temp_path).join("__manifest").exists());
     }
 }

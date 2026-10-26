@@ -24,6 +24,7 @@ use lance_core::{ROW_ADDR, ROW_ID};
 use crate::Dataset;
 use crate::dataset::transaction::UpdateMode::RewriteColumns;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::write::WriteParams;
 use crate::dataset::write::merge_insert::assign_action::Action;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertJob, MergeInsertParams, MergeStats,
@@ -36,10 +37,11 @@ use super::MergeInsertMetrics;
 /// whole rows.
 ///
 /// This is the v2 counterpart of the legacy in-place write path: the columns
-/// present in the source are written as new data files attached to the
-/// fragments that already hold the matched rows, and the old versions of those
-/// columns are tombstoned. Columns absent from the source are never read or
-/// written, which is what makes a narrow update of a wide table cheap.
+/// present in the source, excluding join keys, are written as new data files
+/// attached to the fragments that already hold the matched rows, and the old
+/// versions of those columns are tombstoned. Columns absent from the source
+/// are never read or written, which is what makes a narrow update of a wide
+/// table cheap.
 ///
 /// Compared to [`super::FullSchemaMergeInsertExec`] this node:
 /// - consumes only the source data columns plus `_rowaddr` / `_rowid` /
@@ -61,6 +63,10 @@ pub struct InPlaceMergeInsertExec {
     /// mode. Counted there rather than here, so it has to be folded into the
     /// stats this node reports.
     source_skipped_duplicates: Arc<AtomicU64>,
+    /// The caller's write parameters, for the new fragments `update_fragments`
+    /// would write. Eligibility forbids inserts here, so none are expected.
+    write_params: Arc<WriteParams>,
+    update_if_deferred: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
@@ -73,6 +79,7 @@ impl InPlaceMergeInsertExec {
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
+        write_params: Arc<WriteParams>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -87,11 +94,19 @@ impl InPlaceMergeInsertExec {
             dataset,
             params,
             source_skipped_duplicates,
+            write_params,
+            update_if_deferred: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             merge_stats: Arc::new(Mutex::new(None)),
             transaction: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Marks the `UpdateIf` condition as evaluated by `MergeConditionExec`.
+    pub fn with_update_if_deferred(mut self) -> Self {
+        self.update_if_deferred = true;
+        self
     }
 
     /// Takes the merge statistics if the execution has completed.
@@ -341,16 +356,8 @@ impl DisplayAs for InPlaceMergeInsertExec {
         match t {
             datafusion::physical_plan::DisplayFormatType::Default
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
-                let when_matched = match &self.params.when_matched {
-                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll".to_string(),
-                    crate::dataset::WhenMatched::UpdateIf(condition) => {
-                        format!("UpdateIf({})", condition)
-                    }
-                    crate::dataset::WhenMatched::UpdateIfExpr(expr) => {
-                        format!("UpdateIf({})", expr.human_display())
-                    }
-                    other => format!("{:?}", other),
-                };
+                let when_matched =
+                    super::when_matched_label(&self.params.when_matched, self.update_if_deferred);
                 write!(
                     f,
                     "InPlaceMergeInsert: on=[{}], when_matched={}, mode=RewriteColumns",
@@ -392,6 +399,8 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
+            write_params: self.write_params.clone(),
+            update_if_deferred: self.update_if_deferred,
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
             merge_stats: self.merge_stats.clone(),
@@ -436,6 +445,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         let transaction_holder = self.transaction.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
+        let write_params = self.write_params.clone();
 
         let result_stream = stream::once(async move {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
@@ -454,6 +464,8 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 current_version,
                 target_bases_info,
                 params.write_version(&dataset),
+                &params.on,
+                write_params,
             )
             .await?;
 

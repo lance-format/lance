@@ -1303,6 +1303,7 @@ fn kth_smallest_sum_bound(sums: &[u16], k: usize, block_mins: &mut Vec<u32>) -> 
     Some(*kth as u16)
 }
 
+#[allow(deprecated)] // Pairwise table construction has an infallible interface.
 pub(crate) fn build_pairwise_distance_table<T: L2 + Cosine + Dot>(
     codebook: &[T],
     num_bits: u32,
@@ -1780,7 +1781,7 @@ mod tests {
                 v,
             ),
         );
-        let expected = storage.distance_type.func()(&qu, &qv);
+        let expected = storage.distance_type.try_func().unwrap()(&qu, &qv);
         let dist_calc = storage.dist_calculator_from_id(u);
         assert!((dist_calc.distance(v) - expected).abs() < 1e-4);
         assert!((storage.dist_between(u, v) - expected).abs() < 1e-4);

@@ -10,6 +10,7 @@ use crate::dataset::CommitBuilder;
 use crate::dataset::ROW_ID;
 use crate::dataset::WriteDestination;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
@@ -32,9 +33,11 @@ use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::{Array, LargeBinaryArray, MapArray, StructArray};
 use arrow_array::{
-    ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray, UInt64Array,
+    ArrayRef, Float32Array, Int32Array, LargeListArray, ListArray, RecordBatchIterator,
+    StringArray, UInt64Array,
     types::{Int32Type, UInt64Type},
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
@@ -440,6 +443,83 @@ async fn test_insert_subschema() {
     assert_eq!(data, expected);
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_commit_append_missing_column(
+    #[values(false, true)] is_nullable: bool,
+    #[values(
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+        LanceFileVersion::V2_3
+    )]
+    data_storage_version: LanceFileVersion,
+) {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, is_nullable),
+    ]));
+    let batch =
+        arrow_array::record_batch!(("id", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec()).unwrap();
+    let params = WriteParams {
+        max_rows_per_file: 1,
+        data_storage_version: Some(data_storage_version),
+        ..Default::default()
+    };
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], schema),
+        &uri,
+        Some(params.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+
+    // Distributed writers can stage files with a narrower schema independently
+    // of the dataset. The commit must validate them against the current schema.
+    let narrow = batch.project(&[0]).unwrap();
+    let narrow_schema = narrow.schema();
+    let fragments = FileFragment::create_fragments(
+        &uri,
+        RecordBatchIterator::new(vec![Ok(narrow)], narrow_schema),
+        Some(params),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fragments.len(), 2);
+    let result = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::Append { fragments },
+        Some(1),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await;
+    if is_nullable {
+        let appended = result.unwrap();
+        assert_eq!(appended.fragments().len(), 4);
+        let actual = appended.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            actual["value"].as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![Some(10), Some(20), None, None])
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("value"), "{error}");
+        let unchanged = Dataset::open(&uri).await.unwrap();
+        assert_eq!(unchanged.version().version, 1);
+        assert_eq!(unchanged.fragments().len(), 2);
+        let actual = unchanged.scan().try_into_batch().await.unwrap();
+        assert_eq!(actual, batch);
+        assert_eq!(actual["value"].null_count(), 0);
+    }
+}
+
 #[tokio::test]
 async fn test_insert_nested_subschemas() {
     // Test subschemas at struct level
@@ -591,6 +671,109 @@ async fn test_insert_nested_subschemas() {
     )
     .unwrap();
     assert_eq!(result, expected);
+}
+
+/// An append that leaves out a child of a struct nested in a list is filled
+/// with nulls on read, whichever list type carries the struct. Narrowing the
+/// projection to the children a file has used to stop at `List`, so for
+/// `LargeList` the read asked the older file for a column it never wrote.
+#[rstest]
+#[case::list(false)]
+#[case::large_list(true)]
+#[tokio::test]
+async fn test_insert_subschema_nested_in_a_list(
+    #[case] is_large: bool,
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+    version: LanceFileVersion,
+) {
+    let field_a = Arc::new(ArrowField::new("a", DataType::Int32, true));
+    let field_b = Arc::new(ArrowField::new("b", DataType::Int32, true));
+    let list_of = |fields: Vec<Arc<ArrowField>>| {
+        let item = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(fields.into()),
+            true,
+        ));
+        if is_large {
+            DataType::LargeList(item)
+        } else {
+            DataType::List(item)
+        }
+    };
+    let batch_of = |fields: Vec<Arc<ArrowField>>, values: Vec<ArrayRef>| {
+        let structs = StructArray::new(fields.clone().into(), values, None);
+        // One struct per list, so each row holds a single element.
+        let lengths = std::iter::repeat_n(1, structs.len());
+        let item = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(fields.clone().into()),
+            true,
+        ));
+        let list: ArrayRef = if is_large {
+            Arc::new(LargeListArray::new(
+                item,
+                OffsetBuffer::<i64>::from_lengths(lengths),
+                Arc::new(structs),
+                None,
+            ))
+        } else {
+            Arc::new(ListArray::new(
+                item,
+                OffsetBuffer::<i32>::from_lengths(lengths),
+                Arc::new(structs),
+                None,
+            ))
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "l",
+            list_of(fields),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![list]).unwrap()
+    };
+
+    let full = batch_of(
+        vec![field_a.clone(), field_b.clone()],
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![2])),
+        ],
+    );
+    let test_uri = TempStrDir::default();
+    let write_params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(full.clone())], full.schema());
+    Dataset::write(reader, &test_uri, Some(write_params.clone()))
+        .await
+        .unwrap();
+
+    let just_a = batch_of(
+        vec![field_a.clone()],
+        vec![Arc::new(Int32Array::from(vec![3]))],
+    );
+    let reader = RecordBatchIterator::new(vec![Ok(just_a.clone())], just_a.schema());
+    let dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..write_params
+        }),
+    )
+    .await
+    .unwrap();
+
+    let data = dataset.scan().try_into_batch().await.unwrap();
+    let expected = batch_of(
+        vec![field_a, field_b],
+        vec![
+            Arc::new(Int32Array::from(vec![1, 3])),
+            Arc::new(Int32Array::from(vec![Some(2), None])),
+        ],
+    );
+    assert_eq!(data, expected);
 }
 
 #[tokio::test]
@@ -883,6 +1066,7 @@ async fn test_datafile_partial_replacement() {
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -944,6 +1128,7 @@ async fn test_datafile_partial_replacement() {
         file_major_version: major,
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -1044,6 +1229,7 @@ async fn test_datafile_replacement_error() {
         file_major_version: 2,
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
 
@@ -3266,6 +3452,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
         file_major_version,
         file_minor_version,
         file_size_bytes: CachedFileSize::unknown(),
+        file_metadata_size_bytes: None,
         base_id: None,
     };
     let read_version = dataset.version().version;
@@ -5521,4 +5708,200 @@ async fn test_concurrent_tightening_stress() {
         at.scan().try_into_batch().await.unwrap();
     }
     assert!(totals[1] > 0, "nothing succeeded: {totals:?}");
+}
+
+/// A Merge commit may introduce staged fragments (write_fragments output:
+/// placeholder id 0, no row id metadata) alongside the existing fragments.
+/// They must receive fresh fragment ids and, on stable row id datasets, row
+/// ids -- the same treatment Append gives them. Regression test for
+/// https://github.com/lance-format/lance/issues/7702.
+#[rstest]
+#[case::no_stable_row_ids(false)]
+#[case::stable_row_ids(true)]
+#[tokio::test]
+async fn test_merge_commits_staged_new_fragments(#[case] use_stable_row_id: bool) {
+    let batch = arrow_array::record_batch!(("i", Int32, [1, 2, 3, 4])).unwrap();
+    let schema = batch.schema();
+    let test_uri = TempStrDir::default();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: use_stable_row_id,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let read_version = dataset.version().version;
+    let existing: Vec<Fragment> = dataset.fragments().as_ref().clone();
+
+    // Stage new fragments without committing, like Python's write_fragments.
+    let batch2 = arrow_array::record_batch!(("i", Int32, [5, 6])).unwrap();
+    let transaction = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch2])
+        .await
+        .unwrap();
+    let Operation::Append { fragments: staged } = transaction.operation else {
+        panic!("expected an Append transaction from execute_uncommitted");
+    };
+    assert!(
+        staged.iter().all(|f| f.id == 0 && f.row_id_meta.is_none()),
+        "staged fragments arrive with placeholder id 0 and no row ids"
+    );
+
+    let mut merge_list = existing.clone();
+    merge_list.extend(staged);
+    let merge_schema = dataset.schema().clone();
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::Merge {
+            fragments: merge_list,
+            schema: merge_schema,
+            preserves_nullability: true,
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    dataset.validate().await.unwrap();
+
+    // The staged fragment received a fresh, non-duplicate id.
+    let ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+
+    // Existing fragments keep their row id metadata byte-identical.
+    for prev in &existing {
+        let frag = dataset
+            .fragments()
+            .iter()
+            .find(|f| f.id == prev.id)
+            .unwrap();
+        assert_eq!(frag.row_id_meta, prev.row_id_meta);
+    }
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    let mut values: Vec<i32> = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+    values.sort_unstable();
+    assert_eq!(values, vec![1, 2, 3, 4, 5, 6]);
+
+    if use_stable_row_id {
+        let new_frag = dataset.fragments().iter().find(|f| f.id == 2).unwrap();
+        assert!(
+            new_frag.row_id_meta.is_some(),
+            "staged fragment must be assigned row ids at commit time"
+        );
+        assert_eq!(dataset.manifest.next_row_id, 6);
+
+        // Row ids are unique and the staged rows got the next allocation block.
+        let batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let row_ids: HashSet<u64> = batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(row_ids, (0..6).collect::<HashSet<u64>>());
+    } else {
+        assert!(dataset.fragments().iter().all(|f| f.row_id_meta.is_none()));
+    }
+}
+
+/// A concurrent Append between the Merge's read version and its commit must
+/// fail the Merge with a retryable conflict instead of committing overlapping
+/// fragment or row ids.
+#[tokio::test]
+async fn test_merge_staged_new_fragments_concurrent_append_conflicts() {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+    )
+    .unwrap();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let read_version = dataset.version().version;
+    let existing: Vec<Fragment> = dataset.fragments().as_ref().clone();
+
+    // The merging writer holds a handle at the read version.
+    let merge_handle = dataset.clone();
+
+    let batch2 =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![5, 6]))]).unwrap();
+    let transaction = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch2])
+        .await
+        .unwrap();
+    let Operation::Append { fragments: staged } = transaction.operation else {
+        panic!("expected an Append transaction from execute_uncommitted");
+    };
+
+    // Concurrent Append lands between the Merge's read version and its commit.
+    let batch3 =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![7, 8]))]).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch3)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut merge_list = existing;
+    merge_list.extend(staged);
+    let merge_schema = merge_handle.schema().clone();
+    let err = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(merge_handle)),
+        Operation::Merge {
+            fragments: merge_list,
+            schema: merge_schema,
+            preserves_nullability: true,
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::RetryableCommitConflict { .. }),
+        "unexpected error: {}",
+        err
+    );
+    assert!(
+        err.to_string()
+            .contains("preempted by concurrent transaction"),
+        "unexpected message: {}",
+        err
+    );
 }

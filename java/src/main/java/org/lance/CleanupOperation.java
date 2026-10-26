@@ -30,11 +30,45 @@ import java.util.Optional;
 public class CleanupOperation {
   private final Dataset dataset;
   private final CleanupPolicy policy;
+  private Optional<Long> deleteConcurrency = Optional.empty();
+  private Optional<Long> deleteRateLimit = Optional.empty();
   private Optional<Long> maxCandidateFiles = Optional.empty();
 
   CleanupOperation(Dataset dataset, CleanupPolicy policy) {
     this.dataset = Preconditions.checkNotNull(dataset, "dataset cannot be null");
     this.policy = Preconditions.checkNotNull(policy, "policy cannot be null");
+  }
+
+  /**
+   * Set the maximum in-flight file deletes shared with all cascaded branches.
+   *
+   * <p>Defaults to the object store's I/O parallelism. Must be positive (at most 2^61 - 1 on 64-bit
+   * platforms), validated on execute.
+   *
+   * <p>Example: {@code dataset.cleanup(policy).withDeleteConcurrency(32).execute()}.
+   *
+   * @param deleteConcurrency maximum concurrent file deletes
+   * @return this operation for chaining
+   */
+  public CleanupOperation withDeleteConcurrency(long deleteConcurrency) {
+    this.deleteConcurrency = Optional.of(deleteConcurrency);
+    return this;
+  }
+
+  /**
+   * Set delete requests per second, shared with all cascaded branches.
+   *
+   * <p>Overrides the policy's rate. Must be positive, validated on execute. Without either setting,
+   * deletes are not rate limited.
+   *
+   * <p>Example: {@code dataset.cleanup(policy).withDeleteRateLimit(100).execute()}.
+   *
+   * @param deleteRateLimit maximum delete requests per second
+   * @return this operation for chaining
+   */
+  public CleanupOperation withDeleteRateLimit(long deleteRateLimit) {
+    this.deleteRateLimit = Optional.of(deleteRateLimit);
+    return this;
   }
 
   /**
@@ -69,6 +103,6 @@ public class CleanupOperation {
    * @return removal stats
    */
   public RemovalStats execute() {
-    return dataset.executeCleanup(policy);
+    return dataset.executeCleanup(policy, deleteConcurrency, deleteRateLimit);
   }
 }

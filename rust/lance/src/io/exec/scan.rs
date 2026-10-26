@@ -44,7 +44,9 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
-use super::utils::{IoMetrics, buffered_fragment_opens};
+use super::utils::{
+    IoMetrics, buffered_fragment_opens, estimated_bytes_per_row, estimated_total_byte_size,
+};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -633,6 +635,8 @@ pub struct LanceScanExec {
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
     output_schema: Arc<ArrowSchema>,
+    /// Cached from the output schema and dataset blob metadata at construction.
+    bytes_per_row: Option<f64>,
     properties: Arc<PlanProperties>,
     config: LanceScanConfig,
     metrics: ExecutionPlanMetricsSet,
@@ -708,6 +712,7 @@ impl LanceScanExec {
                 .unwrap();
         }
         let output_schema = Arc::new(output_schema);
+        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -721,6 +726,7 @@ impl LanceScanExec {
             range,
             projection,
             output_schema,
+            bytes_per_row,
             properties,
             config,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -809,6 +815,26 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        if self.config.with_make_deletions_null {
+            // Ranges use visible-row offsets. Trust `physical_rows` only with a writer version.
+            if self.range.is_some() || self.dataset.manifest().writer_version.is_none() {
+                return Ok(Arc::new(Statistics {
+                    num_rows: Precision::Absent,
+                    ..Statistics::new_unknown(self.schema().as_ref())
+                }));
+            }
+            let num_rows = self
+                .fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows)
+                .sum::<Option<usize>>()
+                .map_or(Precision::Absent, Precision::Exact);
+            return Ok(Arc::new(Statistics {
+                num_rows,
+                total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
+                ..Statistics::new_unknown(self.schema().as_ref())
+            }));
+        }
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
@@ -846,6 +872,7 @@ impl ExecutionPlan for LanceScanExec {
 
         Ok(Arc::new(Statistics {
             num_rows,
+            total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
     }
@@ -903,6 +930,12 @@ mod tests {
     async fn ranged_scan_dataset(version: LanceFileVersion) -> Arc<Dataset> {
         let dataset = gen_batch()
             .col("x", array::step::<Int32Type>())
+            .col(
+                "v",
+                array::rand_vec::<arrow_array::types::Float32Type>(lance_datagen::Dimension::from(
+                    4,
+                )),
+            )
             .into_ram_dataset_with_params(
                 FragmentCount::from(FRAGMENTS),
                 FragmentRowCount::from(ROWS_PER_FRAGMENT),
@@ -953,6 +986,11 @@ mod tests {
 
         let stats = scan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
+        // Nullable int32 plus a four-float vector, including estimated validity.
+        assert_eq!(
+            stats.total_byte_size,
+            Precision::Inexact((expected_rows as f64 * 20.75).ceil() as usize)
+        );
 
         // The estimate is only worth anything if it matches what the scan emits.
         assert_eq!(scanned_rows(&scan).await, expected_rows);
@@ -979,7 +1017,206 @@ mod tests {
 
         let stats = scan.partition_statistics(None).unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(TOTAL_ROWS));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(8300));
         assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
+    }
+
+    #[rstest]
+    #[case::known(None, false, Precision::Exact(TOTAL_ROWS))]
+    #[case::missing_rows(None, true, Precision::Absent)]
+    #[case::ranged(Some(0..10), false, Precision::Absent)]
+    #[tokio::test]
+    async fn deletion_null_statistics(
+        #[case] range: Option<Range<u64>>,
+        #[case] has_missing_row_counts: bool,
+        #[case] expected: Precision<usize>,
+    ) {
+        let mut dataset = ranged_scan_dataset(LanceFileVersion::Stable)
+            .await
+            .as_ref()
+            .clone();
+        dataset.delete("x = 0").await.unwrap();
+        let mut fragments = dataset.fragments().clone();
+        if has_missing_row_counts {
+            Arc::make_mut(&mut fragments)[0].physical_rows = None;
+        }
+        let dataset = Arc::new(dataset);
+        let scan = LanceScanExec::new(
+            dataset.clone(),
+            fragments,
+            range.clone(),
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig {
+                with_row_id: true,
+                with_make_deletions_null: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(scan.partition_statistics(None).unwrap().num_rows, expected);
+        if range.is_none() {
+            assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
+        }
+    }
+
+    #[derive(Debug)]
+    enum PhysicalRowMetadata {
+        Present,
+        Untrusted,
+        Missing,
+    }
+
+    #[rstest]
+    #[case::legacy(
+        LanceFileVersion::Legacy,
+        "LanceScan:",
+        PhysicalRowMetadata::Present,
+        true,
+        Precision::Exact(8)
+    )]
+    #[case::stable(
+        LanceFileVersion::Stable,
+        "LanceRead:",
+        PhysicalRowMetadata::Present,
+        true,
+        Precision::Exact(8)
+    )]
+    #[case::legacy_untrusted(
+        LanceFileVersion::Legacy,
+        "LanceScan:",
+        PhysicalRowMetadata::Untrusted,
+        false,
+        Precision::Absent
+    )]
+    #[case::stable_untrusted(
+        LanceFileVersion::Stable,
+        "LanceRead:",
+        PhysicalRowMetadata::Untrusted,
+        false,
+        Precision::Absent
+    )]
+    #[case::legacy_missing_physical_rows(
+        LanceFileVersion::Legacy,
+        "LanceScan:",
+        PhysicalRowMetadata::Missing,
+        false,
+        Precision::Absent
+    )]
+    #[case::stable_missing_physical_rows(
+        LanceFileVersion::Stable,
+        "LanceRead:",
+        PhysicalRowMetadata::Missing,
+        false,
+        Precision::Absent
+    )]
+    #[tokio::test]
+    async fn include_deleted_rows_statistics(
+        #[case] version: LanceFileVersion,
+        #[case] scan_node: &str,
+        #[case] metadata: PhysicalRowMetadata,
+        #[case] deleted: bool,
+        #[case] expected: Precision<usize>,
+    ) {
+        let mut dataset = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        if deleted {
+            dataset.delete("x = 0").await.unwrap();
+        }
+        let mut fragments = dataset.fragments().as_ref().clone();
+        match metadata {
+            PhysicalRowMetadata::Present => {}
+            PhysicalRowMetadata::Untrusted => {
+                Arc::make_mut(&mut dataset.manifest).writer_version = None;
+                fragments[0].physical_rows = Some(999);
+            }
+            PhysicalRowMetadata::Missing => {
+                fragments[0].physical_rows = None;
+            }
+        }
+        let mut scanner = dataset.scan();
+        scanner
+            .with_fragments(fragments)
+            .with_row_id()
+            .include_deleted_rows();
+        let plan = scanner.create_plan().await.unwrap();
+        let description = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(description.contains(scan_node), "{description}");
+        assert_eq!(plan.partition_statistics(None).unwrap().num_rows, expected);
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 8);
+        assert_eq!(batch["_rowid"].null_count(), usize::from(deleted));
+    }
+
+    /// Keeping deleted rows means emitting them, so the statistics have to count
+    /// the fragment's physical rows. `num_rows` reports the live ones, which
+    /// understates both the count and the byte size scaled from it -- and an
+    /// `Exact` count that is wrong is what `AggregateStatistics` folds `COUNT(*)`
+    /// to.
+    #[rstest]
+    #[case::deletions_dropped(false, 60)]
+    #[case::deletions_kept_as_null(true, 100)]
+    #[tokio::test]
+    async fn test_partition_statistics_count_the_rows_a_scan_emits(
+        #[case] with_make_deletions_null: bool,
+        #[case] expected_rows: usize,
+    ) {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
+        dataset.delete("x < 40").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let exec = LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(dataset.schema().clone()),
+            LanceScanConfig {
+                with_row_id: true,
+                with_make_deletions_null,
+                ..Default::default()
+            },
+        );
+
+        let stats = exec.partition_statistics(None).unwrap();
+        let emitted = scanned_rows(&exec).await;
+
+        assert_eq!(
+            emitted, expected_rows,
+            "fixture no longer emits what it claims"
+        );
+        assert_eq!(stats.num_rows, Precision::Exact(emitted));
+        // 4 bytes of int32 and a validity bit, plus 8 of nullable row id and a bit
+        // of its own: 12.25 bytes per row.
+        assert_eq!(
+            stats.total_byte_size,
+            Precision::Inexact((expected_rows as f64 * 12.25).ceil() as usize)
+        );
     }
 
     /// Verify that executing with target_partitions=1 produces the same row count as the

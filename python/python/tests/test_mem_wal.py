@@ -145,6 +145,28 @@ def test_point_lookup_with_memtables(tmp_path):
     assert len(result_miss) == 0, "Non-existent key must return empty result"
 
 
+def test_lsm_scanner_to_reader_json_column(tmp_path):
+    """to_reader returns a JSON column as Arrow JSON, the same as
+    Dataset.to_table, not as Lance's stored JSONB bytes."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("doc", pa.json_(pa.utf8())),
+        ]
+    )
+    docs = pa.array(['{"a": 1}', '{"b": 2}'], pa.json_(pa.utf8()))
+    data = pa.table({"id": pa.array([1, 2], pa.int64()), "doc": docs}, schema=schema)
+    base_ds = lance.write_dataset(data, str(tmp_path / "base"), schema=schema)
+    base_ds.initialize_mem_wal()
+    snap = ShardSnapshot(str(uuid.uuid4())).with_current_generation(1)
+
+    expected = base_ds.to_table().sort_by("id")
+    assert expected.schema.field("doc").type == pa.json_(pa.utf8())
+
+    reader = LsmScanner.from_snapshots(base_ds, [snap]).to_reader()
+    assert reader.read_all().sort_by("id") == expected
+
+
 def test_lsm_scanner_with_memtables(tmp_path):
     """
     Full-scan via LsmScanner.from_snapshots deduplicates rows across LSM
@@ -177,10 +199,41 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[2] == "gen1_2", "SSTable gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
 
+    reader = LsmScanner.from_snapshots(base_ds, [snap]).to_reader()
+    assert isinstance(reader, pa.RecordBatchReader)
+    assert reader.schema == table.schema
+    assert reader.read_all().sort_by("id") == table.sort_by("id")
+
     offset_table = (
         LsmScanner.from_snapshots(base_ds, [snap]).limit(None, offset=1).to_table()
     )
     assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
+
+
+def test_lsm_scanner_json_column(tmp_path):
+    """Every LsmScanner read method returns a JSON column as Arrow JSON, the
+    same as Dataset.to_table, not as Lance's stored JSONB bytes."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("doc", pa.json_(pa.utf8())),
+        ]
+    )
+    docs = pa.array(['{"a": 1}', '{"b": 2}'], pa.json_(pa.utf8()))
+    data = pa.table({"id": pa.array([1, 2], pa.int64()), "doc": docs}, schema=schema)
+    base_ds = lance.write_dataset(data, str(tmp_path / "base"), schema=schema)
+    base_ds.initialize_mem_wal()
+    snap = ShardSnapshot(str(uuid.uuid4())).with_current_generation(1)
+
+    expected = base_ds.to_table().sort_by("id")
+    assert expected.schema.field("doc").type == pa.json_(pa.utf8())
+
+    def scanner():
+        return LsmScanner.from_snapshots(base_ds, [snap])
+
+    assert scanner().to_table().sort_by("id") == expected
+    assert pa.Table.from_batches(scanner().to_batches()).sort_by("id") == expected
+    assert scanner().count_rows() == 2
 
 
 def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
@@ -207,6 +260,31 @@ def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
             if time.time() >= deadline:
                 assert False, "writer.lsm_scanner() did not include SSTable writer rows"
             time.sleep(0.05)
+
+
+def test_shard_writer_lsm_scanner_reads_frozen_memtables(tmp_path):
+    """A row is readable from the moment ``put`` returns.
+
+    ``max_memtable_batches=1`` seals the MemTable on every put, so each row
+    spends time in a frozen MemTable: no longer the active one, not yet an
+    SSTable. The scanner must read that state too.
+    """
+    ds_path = str(tmp_path / "base")
+    shard_id = str(uuid.uuid4())
+    ds = lance.write_dataset(_lookup_table([0], "base"), ds_path, schema=_LOOKUP_SCHEMA)
+    ds.initialize_mem_wal()
+
+    with ds.mem_wal_writer(
+        shard_id,
+        durable_write=True,
+        max_wal_buffer_size=1,
+        max_wal_flush_interval_ms=10,
+        max_memtable_batches=1,
+    ) as writer:
+        for row_id in range(1, 9):
+            writer.put(_lookup_table([row_id], "writer"))
+            table = writer.lsm_scanner().to_table()
+            assert sorted(table["id"].to_pylist()) == list(range(row_id + 1))
 
 
 def test_shard_writer_delete_binding_masks_base_row(tmp_path):
@@ -450,6 +528,7 @@ def test_initialize_mem_wal_manual(tmp_path):
     assert details["num_shards"] == 0
     assert details["sharding_specs"] == []
     assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is True
     assert details["writer_config_defaults"] == {}
 
 
@@ -517,7 +596,29 @@ def test_initialize_mem_wal_maintained_indexes(tmp_path):
     ds.create_scalar_index("id", "BTREE", name="id_btree")
     ds.initialize_mem_wal(maintained_indexes=["id_btree"])
 
-    assert ds.mem_wal_index_details()["maintained_indexes"] == ["id_btree"]
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == ["id_btree"]
+    assert details["maintain_all_indexes"] is False
+
+
+def test_initialize_mem_wal_maintains_none_and_all_differently(tmp_path):
+    # Both leave maintained_indexes empty, so the flag is the only thing
+    # separating "every index the table has" from "no index at all".
+    ds = _mem_wal_dataset(tmp_path)
+    ds.create_scalar_index("id", "BTREE", name="id_btree")
+    ds.initialize_mem_wal(maintained_indexes=[])
+
+    details = ds.mem_wal_index_details()
+    assert details["maintained_indexes"] == []
+    assert details["maintain_all_indexes"] is False
+
+    all_ds = _mem_wal_dataset(tmp_path, "all")
+    all_ds.create_scalar_index("id", "BTREE", name="id_btree")
+    all_ds.initialize_mem_wal()
+
+    all_details = all_ds.mem_wal_index_details()
+    assert all_details["maintained_indexes"] == []
+    assert all_details["maintain_all_indexes"] is True
 
 
 def test_initialize_mem_wal_writer_config_defaults(tmp_path):
