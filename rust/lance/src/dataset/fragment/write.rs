@@ -119,6 +119,9 @@ impl<'a> FragmentCreateBuilder<'a> {
             .write_params
             .map(|params| params.storage_version_or_default())
             .unwrap_or_else(stable_file_version);
+        if let Some(params) = self.write_params {
+            crate::dataset::versions::validate_row_limits(version, params)?;
+        }
         crate::dataset::versions::write_fragment(
             version,
             self,
@@ -781,6 +784,40 @@ mod tests {
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
+    }
+
+    /// A zero row limit used to panic on V2. On V1 a zero group size wrote
+    /// nothing, and a zero file limit was ignored by `write`.
+    #[rstest]
+    #[case::v2_rows_per_file(LanceFileVersion::Stable, 0, 1024, "max_rows_per_file")]
+    #[case::v1_rows_per_file(LanceFileVersion::Legacy, 0, 1024, "max_rows_per_file")]
+    #[case::v1_rows_per_group(LanceFileVersion::Legacy, 1024, 0, "max_rows_per_group")]
+    #[tokio::test]
+    async fn test_fragment_write_rejects_zero_row_limits(
+        #[case] file_version: LanceFileVersion,
+        #[case] max_rows_per_file: usize,
+        #[case] max_rows_per_group: usize,
+        #[case] param: &str,
+    ) {
+        let tmp_dir = TempStrDir::default();
+        let params = WriteParams {
+            data_storage_version: Some(file_version),
+            max_rows_per_file,
+            max_rows_per_group,
+            ..Default::default()
+        };
+        let builder = FragmentCreateBuilder::new(&tmp_dir).write_params(&params);
+        let errors = [
+            builder.write(test_data(), None).await.unwrap_err(),
+            builder.write_fragments(test_data()).await.unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                matches!(&err, Error::InvalidInput { source, .. }
+                if source.to_string().contains(&format!("{param} must be greater than zero"))),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

@@ -750,16 +750,19 @@ async fn prepare_vector_segment_build(
         (Some(num_partitions), None) => num_partitions,
         (None, Some(centroids)) => centroids.len(),
         (None, None) => {
+            let target_partition_size = ivf_params0
+                .target_partition_size
+                .unwrap_or_else(|| index_type.target_partition_size());
+            if target_partition_size == 0 {
+                return Err(Error::invalid_input(
+                    "target_partition_size must be greater than zero",
+                ));
+            }
             let num_rows = match fragment_ids {
                 Some(fragment_ids) => dataset.count_rows_in_fragments(fragment_ids).await?,
                 None => dataset.count_rows(None).await?,
             };
-            recommended_num_partitions(
-                num_rows,
-                ivf_params0
-                    .target_partition_size
-                    .unwrap_or(index_type.target_partition_size()),
-            )
+            recommended_num_partitions(num_rows, target_partition_size)
         }
     };
     let mut ivf_params = ivf_params0.clone();

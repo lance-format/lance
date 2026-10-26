@@ -14622,12 +14622,10 @@ mod tests {
     /// The multi-segment FM-Index builder reserves names on its own, so it needs
     /// the same complete view as the single-segment path.
     ///
-    /// The hidden index is a BTree and the new one an FM index, which is what
-    /// makes this test specific to the multi-segment builder: its name loop
-    /// (`index/create.rs`) only steps past a taken name when the *fields* differ,
-    /// where the single-segment loop also steps past a different index kind. So
-    /// the single-segment path would quietly settle on `text_idx_2` and succeed;
-    /// only the multi-segment path keeps `text_idx` and hits the collision.
+    /// The hidden index is an FM index too: the default-name loop steps past a
+    /// different index kind on the same column, so only an index of the same
+    /// kind keeps `text_idx` and reaches the collision check. A builder that
+    /// could not see the hidden index would commit a second `text_idx` instead.
     #[tokio::test]
     async fn test_multi_segment_fmindex_respects_an_unsupported_index_name() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -14647,9 +14645,9 @@ mod tests {
         .await
         .unwrap();
 
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         dataset
-            .create_index_builder(&["text"], IndexType::BTree, &btree_params)
+            .create_index_builder(&["text"], IndexType::Fm, &fm_params)
             .name("text_idx".to_string())
             .train(false)
             .await

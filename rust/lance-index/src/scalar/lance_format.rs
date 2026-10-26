@@ -254,6 +254,13 @@ impl IndexReader for V1IndexReader {
         )))
     }
 
+    fn guarantees_byte_splitting(&self) -> bool {
+        // A batch is exactly one row group, and the V1 format bounds the
+        // offsets inside a row group, so a batch never merges rows into one
+        // oversized offset array.
+        true
+    }
+
     async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.0.num_batches() as u32
     }
@@ -499,6 +506,13 @@ impl IndexReader for CurrentIndexReader {
         let num_rows = CurrentFileReader::num_rows(&self.0) as usize;
         self.read_range_stream(0..num_rows, None, batch_size, batch_readahead)
             .await
+    }
+
+    fn guarantees_byte_splitting(&self) -> bool {
+        // The V2.0 decoder splits a batch before its i32 offsets overflow
+        // (#9225). The V2.1+ structural decoder drains by row count alone, so
+        // a multi-row batch of huge rows can overflow inside one batch.
+        self.0.metadata().version() == ConcreteFileVersion::V2_0
     }
 
     // V2 format has removed the row group concept,

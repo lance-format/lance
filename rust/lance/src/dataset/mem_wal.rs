@@ -282,6 +282,9 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 /// with `false`; a column the target does not declare is dropped; a missing
 /// primary key is an error.
 ///
+/// A blob v2 field the batches hold writer-prepared stays prepared, at any depth;
+/// one held as descriptors is an error.
+///
 /// `batches` must be in `source_schema` order. The result is in `target_schema`
 /// order, without field ids.
 pub fn reconcile_batches(
@@ -307,8 +310,11 @@ pub fn reconcile_batches(
             .collect::<Vec<_>>(),
         source_schema.metadata().clone(),
     );
-    let plan =
-        reconcile::Plan::resolve(&source, target_schema, pk_columns)?.emitting_plain_schema();
+    let target = Arc::new(ArrowSchema::new_with_metadata(
+        reconcile::with_prepared_blobs_held(source.fields(), target_schema.fields())?,
+        target_schema.metadata().clone(),
+    ));
+    let plan = reconcile::Plan::resolve(&source, &target, pk_columns)?.emitting_plain_schema();
     if plan.is_identity() {
         return Ok(batches);
     }
@@ -337,6 +343,7 @@ pub use write::WriteResult;
 mod tests {
     use super::*;
     use arrow_schema::Fields;
+    use lance_core::datatypes::BlobV2Layout;
 
     fn logical() -> ArrowSchema {
         ArrowSchema::new(vec![
@@ -461,6 +468,270 @@ mod tests {
             .downcast_ref::<arrow_array::Int64Array>()
             .expect("int64");
         assert_eq!(a.value(0), 20, "id 2's value follows its id to `a`");
+    }
+
+    /// A prepared column named `name` of one `Managed` reference, five bytes at
+    /// `offset`, under the ids of the table field `of` when given.
+    fn managed_blob(
+        name: &str,
+        of: Option<&ArrowField>,
+        offset: u64,
+    ) -> (ArrowField, arrow_array::ArrayRef) {
+        let mut builder = crate::blob::BlobDescriptorArrayBuilder::new(name);
+        if let Some(of) = of {
+            builder = builder.with_field_ids_of(of).expect("the table's ids");
+        }
+        builder
+            .push(crate::blob::BlobDescriptor::Managed {
+                base_id: None,
+                uri: "_blobs/a".to_string(),
+                offset,
+                size: 5,
+            })
+            .expect("a managed reference");
+        builder.finish().expect("prepared column").into_parts()
+    }
+
+    /// `blob` is still prepared, holding the reference [`managed_blob`] built.
+    fn assert_managed(blob: &arrow_array::StructArray, offset: u64) {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{UInt8Type, UInt64Type};
+        use lance_core::datatypes::BlobKind;
+
+        assert_eq!(
+            BlobV2Layout::classify(blob.fields()),
+            Some(BlobV2Layout::Prepared)
+        );
+        let value = |name: &str| blob.column_by_name(name).expect(name);
+        assert_eq!(
+            value("kind").as_primitive::<UInt8Type>().value(0),
+            BlobKind::Managed as u8
+        );
+        assert_eq!(
+            value("position").as_primitive::<UInt64Type>().value(0),
+            offset
+        );
+        assert_eq!(value("blob_size").as_primitive::<UInt64Type>().value(0), 5);
+    }
+
+    /// The table's schema with field ids, as a generation is resolved against.
+    fn table_schema(fields: Vec<ArrowField>) -> Arc<ArrowSchema> {
+        let table = Schema::try_from(&ArrowSchema::new(fields)).expect("table schema");
+        Arc::new(arrow_schema_with_field_ids(&table))
+    }
+
+    /// One row `id = 1` with `columns`, reconciled from `id` and `fields` to
+    /// `target`. A batch carries ids on every field or on none.
+    fn reconcile_one(
+        id: ArrowField,
+        fields: Vec<ArrowField>,
+        columns: Vec<arrow_array::ArrayRef>,
+        target: &Arc<ArrowSchema>,
+    ) -> Result<RecordBatch> {
+        let mut source = vec![id];
+        source.extend(fields);
+        let mut arrays: Vec<arrow_array::ArrayRef> =
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1]))];
+        arrays.extend(columns);
+        let source = ArrowSchema::new(source);
+        let batch = RecordBatch::try_new(Arc::new(source.clone()), arrays)
+            .expect("a batch under the source schema");
+        reconcile_batches(&source, target, &["id".to_string()], vec![batch])
+            .map(|mut out| out.remove(0))
+    }
+
+    /// A blob held writer-prepared, as the MemTable stores it, keeps its
+    /// reference though the table declares it logical: at the top level, inside
+    /// a struct, as a list element and as a map value. A blob held logical
+    /// beside it still resolves as declared.
+    #[test]
+    fn a_prepared_blob_stays_prepared_wherever_it_sits() {
+        use crate::blob::{BlobArrayBuilder, blob_field};
+        use arrow_array::cast::AsArray;
+        use arrow_buffer::OffsetBuffer;
+
+        let entries = |key: ArrowField, value: ArrowField| {
+            ArrowField::new("entries", DataType::Struct(vec![key, value].into()), false)
+        };
+        let target = table_schema(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            blob_field("blob", true),
+            blob_field("logical", true),
+            ArrowField::new(
+                "meta",
+                DataType::Struct(vec![blob_field("payload", true)].into()),
+                true,
+            ),
+            ArrowField::new(
+                "items",
+                DataType::List(Arc::new(blob_field("item", true))),
+                true,
+            ),
+            ArrowField::new(
+                "attrs",
+                DataType::Map(
+                    Arc::new(entries(
+                        ArrowField::new("key", DataType::Utf8, false),
+                        blob_field("value", true),
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]);
+        let children = |index: usize| match target.field(index).data_type() {
+            DataType::Struct(children) => children.clone(),
+            DataType::List(item) => vec![item.clone()].into(),
+            DataType::Map(entries, _) => match entries.data_type() {
+                DataType::Struct(children) => children.clone(),
+                _ => unreachable!("map entries are a struct"),
+            },
+            _ => unreachable!("a nested column"),
+        };
+
+        let (blob_field, blob) = managed_blob("blob", Some(target.field(1)), 3);
+        let mut logical = BlobArrayBuilder::new(1);
+        logical.push_bytes(b"bytes").expect("logical bytes");
+        let logical = logical.finish().expect("logical column");
+        let (payload_field, payload) = managed_blob("payload", Some(&children(3)[0]), 7);
+        let meta_fields: Fields = vec![payload_field].into();
+        let (item_field, item) = managed_blob("item", Some(&children(4)[0]), 7);
+        let item_field = Arc::new(item_field);
+        let (value_field, value) = managed_blob("value", Some(&children(5)[1]), 7);
+        let entries_field = entries(children(5)[0].as_ref().clone(), value_field);
+        let DataType::Struct(entry_fields) = entries_field.data_type().clone() else {
+            unreachable!("map entries are a struct");
+        };
+        let with_type = |index: usize, data_type: DataType| {
+            target.field(index).clone().with_data_type(data_type)
+        };
+        let out = reconcile_one(
+            target.field(0).clone(),
+            vec![
+                blob_field,
+                with_type(2, logical.data_type().clone()),
+                with_type(3, DataType::Struct(meta_fields.clone())),
+                with_type(4, DataType::List(Arc::clone(&item_field))),
+                with_type(5, DataType::Map(Arc::new(entries_field.clone()), false)),
+            ],
+            vec![
+                blob,
+                logical,
+                Arc::new(arrow_array::StructArray::new(
+                    meta_fields,
+                    vec![payload],
+                    None,
+                )),
+                Arc::new(arrow_array::ListArray::new(
+                    item_field,
+                    OffsetBuffer::from_lengths([1]),
+                    item,
+                    None,
+                )),
+                Arc::new(arrow_array::MapArray::new(
+                    Arc::new(entries_field),
+                    OffsetBuffer::from_lengths([1]),
+                    arrow_array::StructArray::new(
+                        entry_fields,
+                        vec![Arc::new(arrow_array::StringArray::from(vec!["k"])), value],
+                        None,
+                    ),
+                    None,
+                    false,
+                )),
+            ],
+            &target,
+        )
+        .expect("reconcile");
+
+        assert_managed(out["blob"].as_struct(), 3);
+        let logical = out["logical"].as_struct();
+        assert_eq!(
+            BlobV2Layout::classify(logical.fields()),
+            Some(BlobV2Layout::Logical)
+        );
+        assert_eq!(logical["data"].as_binary::<i64>().value(0), b"bytes");
+        assert_managed(out["meta"].as_struct()["payload"].as_struct(), 7);
+        assert_managed(out["items"].as_list::<i32>().values().as_struct(), 7);
+        assert_managed(out["attrs"].as_map().entries().column(1).as_struct(), 7);
+    }
+
+    /// Batches without field ids resolve by name, and a prepared blob in them
+    /// keeps its reference just the same.
+    #[test]
+    fn a_prepared_blob_without_field_ids_stays_prepared() {
+        use arrow_array::cast::AsArray;
+
+        let target = table_schema(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            crate::blob::blob_field("blob", true),
+        ]);
+        let (blob_field, blob) = managed_blob("blob", None, 3);
+        let id = ArrowField::new("id", DataType::Int64, false);
+        let out = reconcile_one(id, vec![blob_field], vec![blob], &target).expect("reconcile");
+        assert_managed(out["blob"].as_struct(), 3);
+    }
+
+    /// A blob held as descriptors is refused, not resolved to an empty one.
+    #[test]
+    fn a_blob_held_as_descriptors_is_refused() {
+        let target = table_schema(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            crate::blob::blob_field("blob", true),
+        ]);
+        let (blob_field, blob) = managed_blob("blob", None, 3);
+        let prepared =
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![blob_field])), vec![blob])
+                .expect("a prepared batch");
+        let described = crate::dataset::blob::prepared_blob_batch_to_descriptors(&prepared)
+            .expect("descriptors");
+        let id = ArrowField::new("id", DataType::Int64, false);
+        let err = reconcile_one(
+            id,
+            vec![described.schema().field(0).clone()],
+            vec![described.column(0).clone()],
+            &target,
+        )
+        .expect_err("descriptors are refused");
+        assert!(err.to_string().contains("held as descriptors"), "{err}");
+    }
+
+    /// A plain struct shaped like a blob is not one: its children still resolve
+    /// by id, so a child dropped and re-added under a new id comes back null.
+    #[test]
+    fn a_struct_shaped_like_a_blob_still_resolves_its_children() {
+        let asset = |uri_id| {
+            DataType::Struct(Fields::from(vec![
+                stamped("data", DataType::LargeBinary, 2),
+                stamped("uri", DataType::Utf8, uri_id),
+            ]))
+        };
+        use arrow_array::cast::AsArray;
+
+        let target = Arc::new(ArrowSchema::new(vec![
+            stamped("id", DataType::Int64, 0),
+            stamped("asset", asset(4), 1),
+        ]));
+        let held = stamped("asset", asset(3), 1);
+        let DataType::Struct(children) = held.data_type().clone() else {
+            unreachable!("asset is a struct");
+        };
+        let values = arrow_array::StructArray::new(
+            children,
+            vec![
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![None::<&[u8]>])),
+                Arc::new(arrow_array::StringArray::from(vec!["retired"])),
+            ],
+            None,
+        );
+        let out = reconcile_one(
+            stamped("id", DataType::Int64, 0),
+            vec![held],
+            vec![Arc::new(values)],
+            &target,
+        )
+        .expect("reconcile");
+        assert!(out["asset"].as_struct()["uri"].is_null(0));
     }
 
     #[test]

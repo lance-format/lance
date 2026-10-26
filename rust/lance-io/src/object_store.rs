@@ -1001,6 +1001,50 @@ impl ObjectStore {
         }
     }
 
+    /// Open a file after verifying its complete length against a checkpoint.
+    ///
+    /// Files within the existing small-file threshold are checked and buffered
+    /// by the same GET. Larger files retain the metadata check and range reader.
+    /// This does not pin a version of a mutable large file across later reads.
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn example(store: &ObjectStore, path: &Path) -> lance_core::Result<()> {
+    /// let reader = store.open_with_expected_size(path, 1024).await?;
+    /// let bytes = reader.get_range(0..16).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_with_expected_size(
+        &self,
+        path: &Path,
+        expected_size: u64,
+    ) -> Result<Box<dyn Reader>> {
+        if expected_size <= self.block_size as u64 {
+            let reader = SmallReader::open_with_expected_size(
+                self.inner.clone(),
+                path.clone(),
+                self.download_retry_count,
+                expected_size as usize,
+            )
+            .await?;
+            return Ok(Box::new(reader));
+        }
+        let actual_size = self.size(path).await?;
+        if actual_size != expected_size {
+            return Err(Error::invalid_input(format!(
+                "object at '{path}' has {actual_size} bytes, checkpoint expects {expected_size}"
+            )));
+        }
+        let size = usize::try_from(actual_size).map_err(|_| {
+            Error::invalid_input(format!(
+                "object at '{path}' is too large for this platform: {actual_size} bytes"
+            ))
+        })?;
+        self.open_with_size(path, size).await
+    }
+
     /// Create an [ObjectWriter] from local [std::path::Path]
     pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
         let object_store = Self::local();

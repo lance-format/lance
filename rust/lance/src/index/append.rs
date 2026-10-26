@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
@@ -402,6 +403,7 @@ pub async fn build_per_segment_filters(
 async fn overlay_rescan(
     dataset: &Dataset,
     selected_old_indices: &[&IndexMetadata],
+    tagged_coverage: Option<&HashMap<Uuid, RoaringBitmap>>,
     effective_old_frags: &RoaringBitmap,
     unindexed: &[Fragment],
     address_domain: bool,
@@ -410,8 +412,20 @@ async fn overlay_rescan(
     let overlaid = overlaid_fragments(&dataset.manifest.fragments);
     let mut stale_offsets: HashMap<u32, RoaringBitmap> = HashMap::new();
     for segment in selected_old_indices {
+        let mut segment = Cow::Borrowed(*segment);
+        if let Some(coverage) = tagged_coverage {
+            // Tagged bitmaps name retired sources. Match overlays against each
+            // segment's live coverage, retaining its own fields and version gate.
+            let bitmap = coverage.get(&segment.uuid).ok_or_else(|| {
+                Error::internal(format!(
+                    "tagged coverage missing for segment {}",
+                    segment.uuid
+                ))
+            })?;
+            segment.to_mut().fragment_bitmap = Some(bitmap.clone());
+        }
         collect_overlay_stale_rows_for_segment(
-            segment,
+            segment.as_ref(),
             &overlaid,
             &mut stale_offsets,
             dataset.schema(),
@@ -843,6 +857,7 @@ async fn merge_scalar_indices<'a>(
         overlay_rescan(
             dataset.as_ref(),
             &selected_old_indices,
+            tagged_coverage.as_ref(),
             &effective_old_frags,
             unindexed,
             // The domain each `build_per_segment_filters` call below asks for.

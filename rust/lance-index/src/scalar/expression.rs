@@ -977,11 +977,13 @@ impl ScalarQueryParser for TextQueryParser {
 
         let query = match func.name() {
             "contains" if args.len() == 2 => {
-                // A pattern shorter than the index's token width produces no
-                // tokens, so the index can only answer "recheck everything".
-                // Leave it to a full scan instead.  The count is in characters
-                // because tokenizers split on characters, not bytes.
-                if pattern.chars().count() < self.min_contains_chars {
+                // Every non-null string contains the empty pattern, so no index
+                // can narrow it down.  A pattern shorter than the index's token
+                // width produces no tokens, so the index can only answer
+                // "recheck everything".  Leave both to a full scan instead.  The
+                // count is in characters because tokenizers split on characters,
+                // not bytes.
+                if pattern.is_empty() || pattern.chars().count() < self.min_contains_chars {
                     return None;
                 }
                 TextQuery::StringContains(pattern)

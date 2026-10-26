@@ -72,7 +72,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{Span, debug, info, instrument, warn};
 
@@ -340,6 +340,8 @@ struct DeleteExecution {
 
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
+    // Shared by every manifest and cascaded branch in this run, including previews.
+    managed_scan_permits: Arc<Semaphore>,
     delete_execution: Option<Arc<DeleteExecution>>,
     dataset: &'a Dataset,
     policy: CleanupPolicy,
@@ -443,6 +445,9 @@ impl CleanupInspection {
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
+/// Overlap fragment I/O even for a single manifest without queuing all its scans.
+/// The operation's shared permits bound active scans across manifests and branches.
+const MANAGED_FRAGMENT_SCAN_CONCURRENCY: usize = 8;
 
 /// Builder-style cleanup operation.
 ///
@@ -560,6 +565,7 @@ impl<'a> CleanupTask<'a> {
             track_removed_manifests,
             include_referenced_branches,
             None,
+            None,
         )
     }
 
@@ -570,6 +576,7 @@ impl<'a> CleanupTask<'a> {
         track_removed_manifests: bool,
         include_referenced_branches: bool,
         mut delete_execution: Option<Arc<DeleteExecution>>,
+        managed_scan_permits: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
         if action.deletes_files() && delete_execution.is_none() {
             let concurrency = operation
@@ -586,7 +593,13 @@ impl<'a> CleanupTask<'a> {
                 ),
             }));
         }
+        let managed_scan_permits = managed_scan_permits.unwrap_or_else(|| {
+            Arc::new(Semaphore::new(
+                operation.dataset.object_store.io_parallelism(),
+            ))
+        });
         Ok(Self {
+            managed_scan_permits,
             delete_execution,
             dataset: operation.dataset,
             policy: operation.policy.clone(),
@@ -725,63 +738,78 @@ impl<'a> CleanupTask<'a> {
             .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
             .collect::<Vec<_>>();
         bases.sort_unstable();
-        let mut found = false;
-        // Manifests are already read concurrently. Scan their fragments in order
-        // to avoid multiplying concurrent descriptor buffers and path sets.
-        for fragment in dataset.get_fragments() {
-            let key = ManagedScanKey {
-                store_prefix: dataset.object_store.store_prefix.clone(),
-                data_dir: dataset.data_dir(),
-                bases: bases.clone(),
-                fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
-                    .encode_to_vec(),
-                fields: fields.clone(),
-                field_ids: field_ids.clone(),
-                retained,
-            };
-            let cell = inspection
-                .lock()
-                .unwrap()
-                .managed_scans
-                .entry(key)
-                .or_default()
-                .clone();
-            let scanned = cell
-                .get_or_try_init(|| async {
-                    let paths =
-                        super::blob::managed_paths(dataset, self.dataset, fragment.scan()).await?;
-                    let found = !paths.is_empty();
-                    let mut inspection = inspection.lock().unwrap();
-                    for path in paths {
-                        let relative = remove_prefix(&path, &self.dataset.base);
-                        if retained {
-                            inspection
-                                .verified_files
-                                .managed_blob_paths
-                                .remove(&relative);
-                            inspection
-                                .referenced_files
-                                .managed_blob_paths
-                                .insert(relative);
-                        } else {
-                            inspection
-                                .verified_files
-                                .managed_blob_paths
-                                .insert(relative);
-                        }
+        stream::iter(dataset.get_fragments())
+            .map(|fragment| {
+                let key = ManagedScanKey {
+                    store_prefix: dataset.object_store.store_prefix.clone(),
+                    data_dir: dataset.data_dir(),
+                    bases: bases.clone(),
+                    fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
+                        .encode_to_vec(),
+                    fields: fields.clone(),
+                    field_ids: field_ids.clone(),
+                    retained,
+                };
+                let cell = inspection
+                    .lock()
+                    .unwrap()
+                    .managed_scans
+                    .entry(key)
+                    .or_default()
+                    .clone();
+                async move {
+                    let scanned = cell
+                        .get_or_try_init(|| async {
+                            // Duplicate waiters must not consume the scan budget.
+                            let _permit =
+                                self.managed_scan_permits.acquire().await.map_err(|e| {
+                                    Error::internal(format!(
+                                        "cleanup managed scan semaphore closed: {e}"
+                                    ))
+                                })?;
+                            let paths =
+                                super::blob::managed_paths(dataset, self.dataset, fragment.scan())
+                                    .await?;
+                            let found = !paths.is_empty();
+                            let mut inspection = inspection.lock().unwrap();
+                            for path in paths {
+                                let relative = remove_prefix(&path, &self.dataset.base);
+                                if retained {
+                                    inspection
+                                        .verified_files
+                                        .managed_blob_paths
+                                        .remove(&relative);
+                                    inspection
+                                        .referenced_files
+                                        .managed_blob_paths
+                                        .insert(relative);
+                                } else if !inspection
+                                    .referenced_files
+                                    .managed_blob_paths
+                                    .contains(&relative)
+                                {
+                                    // Retained references win regardless of scan completion order.
+                                    inspection
+                                        .verified_files
+                                        .managed_blob_paths
+                                        .insert(relative);
+                                }
+                            }
+                            Ok::<_, Error>(found)
+                        })
+                        .await;
+                    match scanned {
+                        Ok(has_paths) => Ok(*has_paths),
+                        // An expired descriptor can disappear during concurrent cleanup.
+                        // Leave failed cells uninitialized so subsequent scans can retry.
+                        Err(error) if !retained && error.is_not_found() => Ok(false),
+                        Err(error) => Err(error),
                     }
-                    Ok::<_, Error>(found)
-                })
-                .await;
-            match scanned {
-                Ok(has_paths) => found |= *has_paths,
-                // An expired descriptor can disappear during concurrent cleanup.
-                // Do not mark failed scans complete: retained reads must still fail.
-                Err(error) if !retained && error.is_not_found() => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(found)
+                }
+            })
+            .buffer_unordered(MANAGED_FRAGMENT_SCAN_CONCURRENCY)
+            .try_fold(false, |found, scanned| future::ready(Ok(found || scanned)))
+            .await
     }
 
     async fn process_manifest_file(
@@ -1798,6 +1826,7 @@ impl<'a> CleanupTask<'a> {
                                 action,
                                 ignored_manifests,
                                 self.delete_execution.clone(),
+                                Some(self.managed_scan_permits.clone()),
                             )
                             .await?;
                             final_result
@@ -2385,8 +2414,14 @@ pub async fn cleanup_cascade_branch(
     let Some(operation) = build_cleanup_operation(dataset, manifest, false).await? else {
         return Ok(None);
     };
-    let result =
-        cleanup_cascade_branch_run(operation, CleanupAction::Execute, HashSet::new(), None).await?;
+    let result = cleanup_cascade_branch_run(
+        operation,
+        CleanupAction::Execute,
+        HashSet::new(),
+        None,
+        None,
+    )
+    .await?;
     Ok(Some(result.stats))
 }
 
@@ -2395,6 +2430,7 @@ async fn cleanup_cascade_branch_run(
     action: CleanupAction,
     ignored_manifests: HashSet<Path>,
     delete_execution: Option<Arc<DeleteExecution>>,
+    managed_scan_permits: Option<Arc<Semaphore>>,
 ) -> Result<CleanupRunResult> {
     operation.policy.clean_referenced_branches = false;
     operation.policy.error_if_tagged_old_versions = false;
@@ -2408,6 +2444,7 @@ async fn cleanup_cascade_branch_run(
         true,
         false,
         delete_execution,
+        managed_scan_permits,
     )?
     .run()
     .await
@@ -3223,13 +3260,17 @@ mod tests {
     #[case::tag(Some("tag"))]
     #[case::branch(Some("branch"))]
     #[tokio::test]
-    async fn managed_cleanup_preserves_protected_rows(#[case] protection: Option<&str>) {
+    async fn managed_cleanup_preserves_protected_rows(
+        #[case] protection: Option<&str>,
+        #[values(1, 2)] max_rows_per_file: usize,
+    ) {
         let fixture = MockDatasetFixture::try_new().unwrap();
         let batch = managed_blob_batch();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
             &fixture.dataset_path,
             Some(WriteParams {
+                max_rows_per_file,
                 store_params: Some(fixture.os_params()),
                 data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
                 ..Default::default()
@@ -3391,6 +3432,216 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn managed_cleanup_scan_budget_and_cancellation() {
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut old = dataset.clone();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    max_rows_per_file: 1,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        // Pause real descriptor reads so polling exposes exactly which scans own
+        // permits, without timing assumptions or a production-only test hook.
+        dataset.object_store = Arc::new(ObjectStore::new(
+            Arc::new(ThrottledStore::new(
+                dataset.object_store.inner.clone(),
+                ThrottleConfig {
+                    wait_get_per_call: Duration::from_secs(3600),
+                    ..Default::default()
+                },
+            )),
+            url::Url::parse("memory://").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            2,
+            0,
+            None,
+        ));
+        old.object_store = dataset.object_store.clone();
+        let operation = dataset.cleanup(CleanupPolicy::default());
+        let task = CleanupTask::new(&operation, CleanupAction::Execute).unwrap();
+        let independent = CleanupTask::new(&operation, CleanupAction::Execute).unwrap();
+        assert_eq!(task.managed_scan_permits.available_permits(), 2);
+        assert!(!Arc::ptr_eq(
+            &task.managed_scan_permits,
+            &independent.managed_scan_permits
+        ));
+        let inspection = Mutex::new(CleanupInspection::default());
+        let mut first = Box::pin(task.inspect_managed_blobs(&old, true, &inspection));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert_eq!(task.managed_scan_permits.available_permits(), 1);
+        let mut duplicate = Box::pin(task.inspect_managed_blobs(&old, true, &inspection));
+        assert!(futures::poll!(&mut duplicate).is_pending());
+        assert_eq!(task.managed_scan_permits.available_permits(), 1);
+        let separate_inspection = Mutex::new(CleanupInspection::default());
+        let mut separate =
+            Box::pin(independent.inspect_managed_blobs(&old, true, &separate_inspection));
+        assert!(futures::poll!(&mut separate).is_pending());
+        assert_eq!(independent.managed_scan_permits.available_permits(), 1);
+        assert_eq!(task.managed_scan_permits.available_permits(), 1);
+        drop(separate);
+        assert_eq!(independent.managed_scan_permits.available_permits(), 2);
+
+        // Cancelling the initializer releases its permit and lets a duplicate retry.
+        drop(first);
+        assert_eq!(task.managed_scan_permits.available_permits(), 2);
+        assert!(futures::poll!(&mut duplicate).is_pending());
+        assert_eq!(task.managed_scan_permits.available_permits(), 1);
+        let mut latest = Box::pin(task.inspect_managed_blobs(&dataset, true, &inspection));
+        assert!(futures::poll!(&mut latest).is_pending());
+        assert_eq!(task.managed_scan_permits.available_permits(), 0);
+        assert_eq!(inspection.lock().unwrap().managed_scans.len(), 3);
+        drop(latest);
+        assert_eq!(task.managed_scan_permits.available_permits(), 1);
+        drop(duplicate);
+        assert_eq!(task.managed_scan_permits.available_permits(), 2);
+        assert!(
+            inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .values()
+                .all(|cell| cell.get().is_none())
+        );
+
+        // One manifest can use the full budget; its third fragment waits.
+        let mut latest = Box::pin(task.inspect_managed_blobs(&dataset, true, &inspection));
+        assert!(futures::poll!(&mut latest).is_pending());
+        assert_eq!(task.managed_scan_permits.available_permits(), 0);
+        assert!(latest.await.unwrap());
+        assert_eq!(task.managed_scan_permits.available_permits(), 2);
+        assert_eq!(
+            inspection
+                .lock()
+                .unwrap()
+                .referenced_files
+                .managed_blob_paths
+                .len(),
+            4
+        );
+    }
+
+    #[rstest]
+    #[case::execute(CleanupAction::Execute)]
+    #[case::explain(CleanupAction::Explain { max_candidate_files: 100 })]
+    #[tokio::test]
+    async fn managed_cleanup_cascade_shares_scan_budget(#[case] action: CleanupAction) {
+        let batch = managed_blob_batch();
+        // Use the existing filesystem fixture so branch base-path resolution
+        // can reopen the parent's objects through a separate object store.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                store_params: Some(fixture.os_params()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for name in ["first", "second"] {
+            let mut child = fixture
+                .create_branch_and_load(&mut parent, name, (None, None))
+                .await
+                .unwrap();
+            child
+                .update_config([
+                    ("lance.auto_cleanup.interval", "1"),
+                    ("lance.auto_cleanup.retain_versions", "1"),
+                ])
+                .await
+                .unwrap();
+            child
+                .append(
+                    RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                    Some(WriteParams {
+                        max_rows_per_file: 1,
+                        skip_auto_cleanup: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            // Different source versions put the children in concurrent lineages.
+            parent
+                .append(
+                    RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                    Some(WriteParams {
+                        max_rows_per_file: 1,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = reads.clone();
+        fixture.mock_store.policy.lock().unwrap().set_before_policy(
+            "count_descriptors",
+            Arc::new(move |op, path| {
+                if op.starts_with("get") && path.extension() == Some("lance") {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let operation = parent.cleanup(CleanupPolicy {
+            before_version: Some(parent.version_id()),
+            clean_referenced_branches: true,
+            ..Default::default()
+        });
+        let task = CleanupTask::new(&operation, action).unwrap();
+        let branches = task.find_referenced_branches().await.unwrap();
+        assert_eq!(branches.len(), 2);
+        assert_ne!(branches[0].1, branches[1].1);
+        // A closed parent budget must stop the actual cascade before any child
+        // can read descriptors. This avoids timing or scheduler assumptions.
+        task.managed_scan_permits.close();
+        let error = task.run().await.unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert_contains!(error.to_string(), "cleanup managed scan semaphore closed");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        let task = CleanupTask::new(&operation, action).unwrap();
+        let permits = task.managed_scan_permits.clone();
+        task.run().await.unwrap();
+        assert!(reads.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            permits.available_permits(),
+            parent.object_store.io_parallelism()
+        );
+        assert_eq!(parent.count_rows(None).await.unwrap(), 6);
+        for name in ["first", "second"] {
+            let child = parent.checkout_version((name, None)).await.unwrap();
+            let values = Arc::new(child)
+                .take_blobs_by_indices(&[0], "blob")
+                .await
+                .unwrap();
+            assert_eq!(
+                values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+                b"first"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn managed_cleanup_deduplicates_reads_and_retries_failures() {
         let fixture = MockDatasetFixture::try_new().unwrap();
@@ -3418,11 +3669,12 @@ mod tests {
                 Ok(())
             }),
         );
-        let task = CleanupTask::new(
+        let mut task = CleanupTask::new(
             &dataset.cleanup(CleanupPolicy::default()),
             CleanupAction::Execute,
         )
         .unwrap();
+        task.managed_scan_permits = Arc::new(Semaphore::new(1));
         // Warm the session's file metadata cache, then measure one descriptor scan.
         for _ in 0..2 {
             reads.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -3432,30 +3684,43 @@ mod tests {
         }
         let single_scan_reads = reads.load(std::sync::atomic::Ordering::SeqCst);
         assert!(single_scan_reads > 0);
-        let inspection = Mutex::new(CleanupInspection::default());
-        for retained in [false, true] {
-            let before = reads.load(std::sync::atomic::Ordering::SeqCst);
-            let scans = (0..8).map(|_| task.inspect_managed_blobs(&dataset, retained, &inspection));
-            for result in futures::future::join_all(scans).await {
-                assert!(result.unwrap());
+        for order in [[false, true], [true, false]] {
+            let inspection = Mutex::new(CleanupInspection::default());
+            for retained in order {
+                let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+                let scans =
+                    (0..8).map(|_| task.inspect_managed_blobs(&dataset, retained, &inspection));
+                for result in futures::future::join_all(scans).await {
+                    assert!(result.unwrap());
+                }
+                let after = reads.load(std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(after - before, single_scan_reads);
+                task.inspect_managed_blobs(&dataset, retained, &inspection)
+                    .await
+                    .unwrap();
+                assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), after);
             }
-            let after = reads.load(std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(after - before, single_scan_reads);
-            task.inspect_managed_blobs(&dataset, retained, &inspection)
-                .await
-                .unwrap();
-            assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), after);
+            assert_eq!(inspection.lock().unwrap().managed_scans.len(), 2);
+            assert_eq!(
+                inspection
+                    .lock()
+                    .unwrap()
+                    .referenced_files
+                    .managed_blob_paths
+                    .len(),
+                2
+            );
+
+            assert!(
+                inspection
+                    .lock()
+                    .unwrap()
+                    .verified_files
+                    .managed_blob_paths
+                    .is_empty()
+            );
+            assert_eq!(task.managed_scan_permits.available_permits(), 1);
         }
-        assert_eq!(inspection.lock().unwrap().managed_scans.len(), 2);
-        assert_eq!(
-            inspection
-                .lock()
-                .unwrap()
-                .referenced_files
-                .managed_blob_paths
-                .len(),
-            2
-        );
 
         let file = dataset
             .data_dir()
@@ -3482,8 +3747,14 @@ mod tests {
         assert_eq!(fixture.count_files().await.unwrap(), before);
         assert_eq!(fixture.count_blob_files().await.unwrap(), 2);
 
-        // A missing expired descriptor must not publish successful completion.
         let inspection = Mutex::new(CleanupInspection::default());
+        let error = task
+            .inspect_managed_blobs(&dataset, true, &inspection)
+            .await
+            .unwrap_err();
+        assert!(error.is_not_found());
+        assert_eq!(task.managed_scan_permits.available_permits(), 1);
+        // A missing expired descriptor must not publish successful completion.
         assert!(
             !task
                 .inspect_managed_blobs(&dataset, false, &inspection)
@@ -3498,6 +3769,7 @@ mod tests {
                 .values()
                 .all(|cell| cell.get().is_none())
         );
+        assert_eq!(task.managed_scan_permits.available_permits(), 1);
         dataset
             .object_store
             .inner
@@ -3630,6 +3902,7 @@ mod tests {
             false,
             true,
             execution.delete_execution,
+            Some(execution.managed_scan_permits),
         )
         .unwrap()
         .run()
