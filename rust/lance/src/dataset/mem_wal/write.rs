@@ -7212,6 +7212,7 @@ mod tests {
             writer.stats.clone(),
             None,
             Duration::ZERO,
+            writer_state.stop_flush_retries.clone(),
         );
         (writer, handler, message, temp)
     }
