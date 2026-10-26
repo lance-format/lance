@@ -656,7 +656,7 @@ async fn the_searched_index_answers_at_exact_distances_cold_or_warm(
 /// query that projects no column, so that nothing is taken after the index,
 /// still reads at least the vectors of its shortlist.
 #[tokio::test]
-async fn vectors_scored_again_at_their_offsets_are_read_as_the_querys_own() {
+async fn vectors_scored_again_at_their_offsets_are_read_as_part_of_the_query() {
     let dir = TempStrDir::default();
     let dataset = indexed_of(dir.as_str(), Codes::Sq, DistanceType::L2, WIDE).await;
     let query = &queries_of(WIDE)[0];

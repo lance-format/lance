@@ -104,7 +104,7 @@ impl PartitionGraph {
     /// Replace the out-edges of `vertex`.
     ///
     /// Refuses an edge that leaves the graph, points at its own vertex or
-    /// repeats, so that no caller can write a list a walk would mis-read.
+    /// repeats, so that no caller can write a list a walk would misread.
     pub fn set_neighbors(&mut self, vertex: u32, neighbors: &[u32]) -> Result<()> {
         let num_vertices = self.row_ids.len();
         if vertex as usize >= num_vertices {

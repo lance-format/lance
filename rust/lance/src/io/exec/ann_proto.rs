@@ -799,7 +799,7 @@ mod tests {
     /// A stop margin crosses the wire alone, its rank being the query's k on
     /// both sides, and only as one a walk can stop by, either way.
     #[test]
-    fn a_stop_margin_crosses_the_wire_as_a_margin_off_the_querys_k() {
+    fn a_stop_margin_crosses_the_wire_as_a_margin_off_the_query_k() {
         let refused = |error: Error, reason: &str| {
             assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
             assert!(error.to_string().contains(reason), "{error}");
