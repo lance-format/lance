@@ -2941,8 +2941,9 @@ impl RequestBatch {
         pending
             .iter()
             .flat_map(|read| &read.ranges)
-            .map(|range| range.end - range.start)
-            .sum()
+            .fold(0u64, |total, range| {
+                total.saturating_add(range.end.saturating_sub(range.start))
+            })
     }
 
     /// Bytes requested by the reads collected so far.
@@ -3018,14 +3019,22 @@ impl EncodingsIo for RequestBatch {
         ranges: Vec<Range<u64>>,
         priority: u64,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        if let Some(invalid) = ranges.iter().find(|range| range.start > range.end) {
+            return futures::future::ready(Err(Error::invalid_input(format!(
+                "Invalid read range {}..{}: start is after end",
+                invalid.start, invalid.end
+            ))))
+            .boxed();
+        }
         let mut pending = self.pending.lock().unwrap();
         // Keep every batch within the budget: a page that shards its reads
         // must not have all its shards collapse into one unbounded read.
-        let bytes = ranges
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum::<u64>();
-        if !pending.is_empty() && Self::queued_bytes(&pending) + bytes > IO_REQUEST_BATCH_BYTES {
+        let bytes = ranges.iter().fold(0u64, |total, range| {
+            total.saturating_add(range.end.saturating_sub(range.start))
+        });
+        if !pending.is_empty()
+            && Self::queued_bytes(&pending).saturating_add(bytes) > IO_REQUEST_BATCH_BYTES
+        {
             Self::submit_batch(&self.inner, std::mem::take(&mut *pending));
         }
         let (tx, mut rx) = oneshot::channel();
@@ -4214,5 +4223,30 @@ mod tests {
                 "third batch should be near 50 rows, got {third_batch_rows}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn submit_request_rejects_inverted_range() {
+        use crate::testing::SimulatedScheduler;
+
+        let batch = super::RequestBatch::new(std::sync::Arc::new(SimulatedScheduler::new(
+            bytes::Bytes::new(),
+        )));
+        // Build the range at runtime: clippy rejects an inverted literal, but the
+        // point of the test is that malformed metadata can produce one.
+        let start = 10u64;
+        let end = 5u64;
+        let error = batch
+            .submit_request(vec![start..end], 0)
+            .await
+            .expect_err("an inverted read range must fail");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("start is after end"),
+            "unexpected error: {error}"
+        );
     }
 }

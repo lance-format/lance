@@ -378,7 +378,7 @@ impl StructuralPrimitiveFieldScheduler {
                     .layers
                     .iter()
                     .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
                     || page_info.buffer_offsets_and_sizes.len() == 3;
@@ -427,7 +427,7 @@ impl StructuralPrimitiveFieldScheduler {
                     .layers
                     .iter()
                     .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
                     Box::new(BlobDescriptionPageScheduler::new(
