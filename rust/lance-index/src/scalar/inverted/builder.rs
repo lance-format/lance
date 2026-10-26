@@ -76,6 +76,9 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
+// Bound the payload copied into each v3 write batch. A single posting can
+// exceed this target; it remains indivisible in the current format.
+const POSTING_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -495,6 +498,8 @@ impl InvertedIndexBuilder {
                     progress
                         .stage_progress("tokenize_docs", tokenized_count)
                         .await?;
+                    // A ready async-channel receiver does not consume Tokio's cooperative budget.
+                    tokio::task::yield_now().await;
                 }
                 worker.finish().await
             });
@@ -1309,7 +1314,10 @@ impl InnerBuilder {
                             &mut batch_builder,
                             format_version,
                         )?;
-                        if batch_builder.len() >= batch_rows {
+                        if batch_builder.len() >= batch_rows
+                            || (format_version == InvertedListFormatVersion::V3
+                                && batch_builder.payload_bytes() >= POSTING_BATCH_BYTES)
+                        {
                             batch = Some(batch_builder.finish()?);
                             break;
                         }
@@ -4652,8 +4660,15 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::single_worker(1)]
+    #[case::multiple_workers(3)]
     #[tokio::test]
-    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats(
+        #[case] workers: usize,
+        #[values(false, true)] with_position: bool,
+        #[values(128, 256)] block_size: usize,
+    ) -> Result<()> {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -4669,14 +4684,18 @@ mod tests {
             None,
             Some("hello"),
         ]);
-        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let batches = (0..batch.num_rows())
+            .map(|row| Ok(batch.slice(row, 1)))
+            .collect::<Vec<_>>();
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(batches));
         let params =
             InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
-                .with_position(false)
+                .with_position(with_position)
                 .remove_stop_words(true)
                 .stem(false)
                 .max_token_length(Some(6))
-                .num_workers(1);
+                .block_size(block_size)?
+                .num_workers(workers);
 
         let mut builder = InvertedIndexBuilder::new(params);
         builder
