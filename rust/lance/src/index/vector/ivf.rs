@@ -8487,17 +8487,23 @@ mod tests {
     }
 
     #[rstest]
-    #[case::float16_streaming_fixed(DataType::Float16, false, Some(1), 1)]
-    #[case::float16_streaming_nullable(DataType::Float16, true, Some(1), 1)]
-    #[case::float16_streaming_without_refinement(DataType::Float16, false, Some(1), 0)]
-    #[case::float32_streaming(DataType::Float32, false, Some(1), 1)]
-    #[case::float16_in_memory(DataType::Float16, false, None, 0)]
+    #[case::float16_streaming_fixed(DataType::Float16, false, Some(1), 1, "rq")]
+    #[case::float16_streaming_nullable(DataType::Float16, true, Some(1), 1, "rq")]
+    #[case::float16_streaming_without_refinement(DataType::Float16, false, Some(1), 0, "rq")]
+    #[case::float32_streaming(DataType::Float32, false, Some(1), 1, "rq")]
+    #[case::float16_in_memory(DataType::Float16, false, None, 0, "rq")]
+    // Flat and SQ fail partition assignment, PQ fails residuals, without
+    // Float16 centroids from streaming coreset training.
+    #[case::float16_streaming_flat(DataType::Float16, false, Some(1), 1, "flat")]
+    #[case::float16_streaming_pq(DataType::Float16, false, Some(1), 1, "pq")]
+    #[case::float16_streaming_sq(DataType::Float16, false, Some(1), 1, "sq")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_ivf_rq_build_and_search_float_types(
+    async fn test_ivf_build_and_search_float_types(
         #[case] value_type: DataType,
         #[case] is_nullable: bool,
         #[case] streaming_sample_rate: Option<usize>,
         #[case] refine_passes: usize,
+        #[case] index: &str,
     ) {
         const NUM_ROWS: usize = 600;
         const NUM_PARTITIONS: usize = 257;
@@ -8542,11 +8548,25 @@ mod tests {
         ivf_params.streaming_sample_rate = streaming_sample_rate;
         ivf_params.streaming_refine_passes = refine_passes;
         ivf_params.max_iters = 1;
-        let params = VectorIndexParams::with_ivf_rq_params(
-            MetricType::Cosine,
-            ivf_params,
-            RQBuildParams::new(1),
-        );
+        let params = match index {
+            "rq" => VectorIndexParams::with_ivf_rq_params(
+                MetricType::Cosine,
+                ivf_params,
+                RQBuildParams::new(1),
+            ),
+            "flat" => VectorIndexParams::with_ivf_flat_params(MetricType::Cosine, ivf_params),
+            "pq" => VectorIndexParams::with_ivf_pq_params(
+                MetricType::Cosine,
+                ivf_params,
+                PQBuildParams::new(4, 8),
+            ),
+            "sq" => VectorIndexParams::with_ivf_sq_params(
+                MetricType::Cosine,
+                ivf_params,
+                SQBuildParams::default(),
+            ),
+            _ => unreachable!(),
+        };
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
