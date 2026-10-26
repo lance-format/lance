@@ -55,7 +55,8 @@ package lance.transaction;
  *    logical rows with the same values before and after (e.g. compaction
  *    moving rows, re-encoding a column file). CDC readers emit rows only
  *    from `data_change = true` actions; an operation may mix both. Absent
- *    is treated as true.
+ *    is treated as true. On `TombstoneFieldData` the flag also decides what
+ *    the tombstone does to overlays and index coverage; see that message.
  *
  * Actions apply in order, with one exception: `ReserveFragmentIds` and
  * `ReserveRowIds` are summed and taken after the operation's own mints,
@@ -307,12 +308,27 @@ message AddBase {
  * data is dropped or superseded (data files have no id of their own; a live
  * field is backed by exactly one file). A column re-encode is
  * TombstoneFieldData(X) followed by AddDataFile(new file, field X).
+ *
+ * `data_change` has the meaning `DataReplacement.data_change` has:
+ *
+ * - true: the fields get new values, or none. Their entries in the fragment's
+ *   overlays are tombstoned, since the new base values supersede them, and
+ *   every index on one of the fields loses its coverage of the fragment.
+ * - false: the operation re-binds every tombstoned field in this fragment with
+ *   an AddDataFile that also has `data_change = false`, holding the same base
+ *   values (overlays not applied) for every physical row, only laid out in
+ *   different files. Overlays keep shadowing the base, index coverage is
+ *   kept, and no row's last-updated-at version moves.
+ *
+ * Apply rejects a false tombstone whose fields are not all re-bound that way,
+ * and an AddDataFile whose `data_change` differs from that of the tombstone
+ * it re-binds.
  */
 message TombstoneFieldData {
   Ref fragment = 1;
   // The fields whose current backing is tombstoned.
   repeated FieldRef field_ids = 2;
-  // Data-change marker; see AddFragment.data_change.
+  // Whether the fields' values change; see above.
   optional bool data_change = 3;
 }
 
