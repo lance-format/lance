@@ -6,9 +6,9 @@ reference arrays through exchange, spill, and retries. It does not change stored
 Blob v2 descriptors or any persisted Lance format.
 
 Protocol version 1 supplies transport, descriptor capture, validation, context
-remapping, and planned Rust reference reads. Java/Python bindings and coordinated
-snapshot retention are separate capabilities. Serializing a reference does not
-authenticate a worker or retain source files.
+remapping, and planned reference reads through Rust, Java/JNI, and Python.
+Explicit snapshot retention is available as a separate SDK operation. Serializing
+a reference does not authenticate a worker or retain source files.
 
 ## Source contexts
 
@@ -386,4 +386,203 @@ An open `Dataset`, a `SnapshotRef`, or a reference value is not a GC root.
 The application must retain the exact source snapshots and coordinate cleanup.
 External objects remain subject to their own ownership and immutability contract.
 Cross-query persistence or export needs an explicit retention agreement extending
-beyond the original query. Protocol version 1 does not acquire such retention.
+beyond the original query. Encoding a reference or retention token never acquires
+or extends protection by itself.
+
+## Query lifetime and cleanup
+
+`BlobSnapshotRetention::acquire(dataset, context, retention_id)` protects the exact
+source context with a durable tag before references are issued. Use a globally
+unique ID for each query lifetime. Retrying acquisition with that ID and context
+is idempotent. Do not reuse an ID after release or share it between independent
+queries: their release ownership would also be shared.
+Acquisition/release require write/delete access to `_refs`. Workers only need
+their read bindings. Configure maintenance to retain tagged versions rather than
+erroring on them; Python uses `error_if_tagged_old_versions=False` to clean around
+query roots.
+
+Acquisition and cleanup use the same table-root maintenance fence across branches
+and processes. Under the fence, acquisition checks the original manifest and
+commit identity and creates the protected tag. Cleanup marks expiring manifests
+before deleting any payload. If cleanup wins the race, acquisition fails; it cannot
+return a usable retention token for a manifest whose files may already be deleted.
+Retirement markers also cover partial cleanup failures that leave an old manifest
+on storage after some of its payloads have been deleted.
+Cleanup shares its delete concurrency and rate limits with coordination-object
+removal. Temporary fences and retirement markers are operational metadata and do
+not contribute to dataset removal statistics or dry-run candidates.
+
+Each maintenance attempt publishes its own object under
+`_refs/retention-v1/maintenance/<owner-UUID>`. Zero means that the owner is choosing
+a ticket. Published tickets establish an order, with owner IDs breaking ties.
+An acquisition checks for earlier owners and unfinished choosers before entering.
+Contenders return a conflict; retry the complete operation with backoff. Release
+deletes only that attempt's object, so a delayed DELETE retry cannot remove a later
+owner's fence. There is no time-based lock stealing.
+
+Hold the retention until all workers, outstanding reads, retries, and lazy result
+consumers have stopped. `release(dataset)` removes its protected tag and is
+idempotent. It accepts an authenticated handle to a later snapshot of the same
+table, so release does not require reopening an expired version. Drop does not
+release retention. There is no automatic expiration or renewal in this version.
+
+```rust
+use lance::{Dataset, Result};
+use lance::blob::reference::{BlobSourceContext, BlobSnapshotRetention};
+
+async fn query_lifetime(dataset: &Dataset, query_id: &str) -> Result<()> {
+    let source = BlobSourceContext::from_dataset(
+        dataset, "catalog/table-incarnation", "query/storage-binding",
+    ).await?;
+    let retention = BlobSnapshotRetention::acquire(dataset, source, query_id).await?;
+    // Capture/export refs, then wait for every consumer and retry to stop.
+    retention.release(dataset).await
+}
+```
+
+### Supported maintenance and storage
+
+Every cleanup process must use the coordination protocol advertised by the
+`snapshot_retention_v1` SDK operation. This includes automatic cleanup and branch
+cleanup. Stop and restart older maintenance processes during rollout, including
+already-open handles. A capability check on a new coordinator cannot fence an old
+handle that is still allowed to delete files. Older uncoordinated cleanup clients,
+forced table/branch deletion, manual tag changes, and deletion outside Lance are
+outside this retention guarantee.
+Coordinated cleanup also needs write/delete access to `_refs/retention-v1` for its
+maintenance fence and retirement markers.
+
+Storage must provide atomic conditional creation and consistent object reads and
+directory listings. Retention fails on backends without these operations. Tencent
+COS is explicitly unsupported; ordinary cleanup remains available there.
+Retention assumes the snapshot's payloads are available when acquired. It does not
+verify every payload or repair deletion/corruption from before coordinated cleanup.
+`SnapshotMaintenanceLock` in `lance::dataset::retention` is a coordination hook for
+maintenance services that need to serialize their own operations with Lance.
+Do not call Lance cleanup or retention acquisition while holding that hook: those
+operations acquire the same fence themselves.
+
+Protection covers source Inline files, Packed/Dedicated sidecars, and Managed
+objects owned by this dataset. Snapshots with foreign dataset roots, including
+shallow clones, are rejected by acquisition: their source owners need a separate
+retention agreement. A tag on a clone cannot prevent cleanup by another table.
+Registered bases outside this table must not be reclaimed by another owner during
+the query. External objects still depend on the external immutability and lifetime
+contract; a Lance tag does not protect their contents.
+
+### Recovery after interruption
+
+Keep the query ID, serialized token, and `tag_name` in the query coordinator's
+durable state. After a coordinator crash, stop its workers and retries, then decode
+the token and release it. An interrupted acquisition can leave an orphan
+`lance-query-<digest>` tag. Inspect the tag metadata and query ownership before
+removing it; never remove a tag merely because it is old.
+
+Cancellation or a crash during maintenance can leave an owner object in place.
+Remove only the abandoned owner's object, after proving that its operation and
+all submitted storage requests have stopped. Do not infer this from elapsed time.
+Never clear a retirement marker for a manifest still on storage to make acquisition
+succeed: some of its payloads may be gone. Finish deleting the expired manifest
+under maintenance coordination before removing its marker. A marker whose manifest is already absent may be removed
+after maintenance has stopped.
+
+## Python and Java/JNI bindings
+
+Python exposes `BlobSourceContext`, `BlobRefCapture`, `BlobRefBatch`,
+`BlobRefReader`, `BlobRefReadStream`, and `BlobSnapshotRetention` from `lance.blob`
+and `lance`. Java exposes the corresponding operations through
+`org.lance.BlobReferences`, with `SourceContext`, `Capture`, `Batch`, `Reader`,
+`ReadStream`, and `Retention` types.
+
+Query the protocol version, source capabilities, and supported SDK operations
+before scheduling workers. Python provides
+`BlobSourceContext.protocol_version()`, `supported_capabilities()`, and
+`supported_operations()`; Java provides `getProtocolVersion()`,
+`getSupportedCapabilities()`, and `getSupportedOperations()` on `BlobReferences`.
+Require `capture_top_level`, `read_whole`, `read_range`, `streaming`, and
+`cancellation`, plus `snapshot_retention_v1` on retention and maintenance clients.
+Reject executors missing required operations. Unknown wire versions/capabilities
+also fail during decode, before any payload request.
+
+Both bindings use the Rust capture validator and payload planner. Source contexts,
+reference batches, and retention tokens have opaque protobuf encodings. A reference
+batch also exposes its Arrow extension field and array for engine operators; keep
+its source table and remap context slots when combining independently captured
+arrays. Workers reopen the exact branch/version with their own storage binding.
+Native driver pointers and credentials are not part of the transport.
+
+```python
+import uuid
+from lance.blob import (
+    BlobRefCapture, BlobRefReader, BlobSnapshotRetention, BlobSourceContext,
+)
+
+def read_values(dataset, worker_dataset, consume):
+    source = BlobSourceContext.from_dataset(dataset, "catalog/table", "workers")
+    retention = BlobSnapshotRetention.acquire(dataset, source, str(uuid.uuid4()))
+    try:
+        field_id = dataset.lance_schema.field("blob").id()
+        with BlobRefCapture(dataset, source, field_id) as capture:
+            with BlobRefReader(
+                [(source, worker_dataset)],
+                io_buffer_size_bytes=8 << 20,
+                materialization_readahead_bytes=32 << 20,
+            ) as reader:
+                scanner = dataset.scanner(
+                    columns=["blob"], with_row_address=True,
+                    blob_handling="all_descriptions",
+                )
+                for scanned in scanner.to_batches():
+                    refs = capture.capture(
+                        source, scanned.schema.field("blob"),
+                        scanned["_rowaddr"], scanned["blob"],
+                    )
+                    # Correlate completed requests with the engine's output rows.
+                    indices = list(range(len(refs)))
+                    with reader.read(refs, indices, indices) as stream:
+                        for result in stream:
+                            consume(result)
+                            del result  # Release before waiting for another batch.
+    finally:
+        # Wait for any other participating workers/retries before this call.
+        retention.release(dataset)
+```
+
+A read stream yields one completed request per Arrow batch, with
+`request_index: uint64` and nullable `data: large_binary`. Completion order is
+unspecified; use the request index to place results. Null and valid empty bytes
+remain distinct. Python consumes the stream as an iterator/context manager.
+Java calls `ReadStream.next(allocator)` until it returns null and must close every
+returned `VectorSchemaRoot`, preferably with try-with-resources.
+For range demands, Python passes a `ranges` list with `(offset, length)` tuples
+or `None` for whole values. Java uses `Request.range(...)` or `Request.whole(...)`.
+Invalid ranges fail; neither binding clamps them to the blob length.
+
+The Arrow payload buffers retain their native `Bytes` owners and materialization
+reservations without copying. Close/drop consumed batches before waiting for work
+that needs the same budget. A retained slice or array keeps its reservation even
+after the stream is cancelled or closed. Additional copies made by an engine are
+outside this native budget and need separate accounting.
+
+Both factories require finite, nonzero `io_buffer_size_bytes` and
+`materialization_readahead_bytes` limits (camel case in Java). One oversized demand
+may run alone when idle; use chunked ranges if an engine requires a per-value cap.
+Streams from one reader share these limits. Closing the reader factory prevents
+new submissions; existing streams and returned arrays keep their owners and must
+be closed/released separately. Cancellation can interrupt a blocked `next` or a
+budget wait. Pending requests terminate with an error instead of becoming nulls.
+
+Java represents unsigned indices, versions, offsets, lengths, and limits as `long`
+bit patterns; use `Long.parseUnsignedLong`/`Long.toUnsignedString` as needed.
+Python accepts integers in `0..=2**64-1`. Neither binding truncates high bits.
+
+| Capability | Rust | Java/JNI | Python |
+| --- | --- | --- | --- |
+| Context/ref transport and Arrow remapping | Yes | Yes | Yes |
+| Top-level scanned Blob V2 capture | Yes | Yes | Yes |
+| Planned whole/range reads and cancellation | Yes | Yes | Yes |
+| Streaming results retaining native budgets | Yes | Yes | Yes |
+| Explicit-release owned-snapshot retention | Yes | Yes | Yes |
+| Automatic expiration/renewal | No | No | No |
+| Foreign dataset owner retention | Separate agreement | Separate agreement | Separate agreement |
+| Nested reference capture | No | No | No |

@@ -15,6 +15,24 @@ from .lance import (
     BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
 )
 from .lance import (
+    BlobRefBatch as BlobRefBatch,
+)
+from .lance import (
+    BlobRefCapture as BlobRefCapture,
+)
+from .lance import (
+    BlobRefReader as BlobRefReader,
+)
+from .lance import (
+    BlobRefReadStream as BlobRefReadStream,
+)
+from .lance import (
+    BlobSnapshotRetention as BlobSnapshotRetention,
+)
+from .lance import (
+    BlobSourceContext as BlobSourceContext,
+)
+from .lance import (
     DedicatedBlobWriter as DedicatedBlobWriter,
 )
 from .lance import (

@@ -14,6 +14,7 @@ import textwrap
 import threading
 import uuid
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 
 import lance
@@ -21,7 +22,14 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
-from lance.blob import BlobType
+from lance.blob import (
+    BlobRefBatch,
+    BlobRefCapture,
+    BlobRefReader,
+    BlobSnapshotRetention,
+    BlobSourceContext,
+    BlobType,
+)
 from lance.file import LanceFileSession
 from lance.fragment import write_fragments
 
@@ -3463,3 +3471,190 @@ def _read_in_8k_chunks(blob: BlobFile) -> bytes:
             break
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+@pytest.fixture
+def portable_blob_references(tmp_path):
+    values = [b"abc", b"abcde", b"abcdefghij", None, b"", b"uv"]
+    table = pa.Table.from_arrays(
+        [lance.blob_array(values)],
+        schema=pa.schema(
+            [
+                lance.blob_field(
+                    "blob", inline_size_threshold=4, dedicated_size_threshold=8
+                )
+            ]
+        ),
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "portable.lance",
+        max_rows_per_file=3,
+        enable_stable_row_ids=True,
+        data_storage_version="2.2",
+    )
+    source = BlobSourceContext.from_dataset(dataset, "catalog/portable", "workers")
+    retention = BlobSnapshotRetention.acquire(dataset, source, str(uuid.uuid4()))
+    try:
+        batch = (
+            dataset.to_table(
+                columns=["blob"],
+                with_row_address=True,
+                blob_handling="all_descriptions",
+            )
+            .combine_chunks()
+            .to_batches()[0]
+        )
+        with BlobRefCapture(
+            dataset, source, field_id=dataset.lance_schema.field("blob").id()
+        ) as capture:
+            references = capture.capture(
+                source,
+                batch.schema.field("blob"),
+                batch["_rowaddr"],
+                batch["blob"],
+            )
+        capture.close()
+        yield dataset, source, retention, references
+    finally:
+        retention.release(dataset)
+
+
+def test_portable_blob_reference_requests(portable_blob_references):
+    dataset, source, _, references = portable_blob_references
+    assert BlobSourceContext.protocol_version() == 1
+    assert BlobSourceContext.supported_capabilities() == [1, 2]
+    assert "snapshot_retention_v1" in BlobSourceContext.supported_operations()
+    assert source.table_identity == "catalog/portable"
+    assert source.access_context_key == "workers"
+    assert source.branch is None
+    assert BlobSourceContext.decode(source.encode()).encode() == source.encode()
+    references = BlobRefBatch.decode(references.encode())
+    selected = references.array.take(pa.array([2, 0, 1, 3, 4, 2]))
+    selected = BlobRefBatch.from_arrow(references.contexts, references.field, selected)
+    selected = selected.remap_contexts([BlobSourceContext.decode(source.encode())])
+    assert len(selected) == 6
+    worker = lance.dataset(dataset.uri, version=source.version)
+    with BlobRefReader(
+        [(source, worker)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        with reader.read(
+            selected,
+            list(range(6)),
+            [(1 << 64) - 1, 0, 1, 2, 3, 4],
+            [None, None, (1, 3), None, None, (2, 4)],
+        ) as stream:
+            results = {}
+            for batch in stream:
+                results[batch["request_index"][0].as_py()] = batch["data"][0].as_py()
+                del batch
+        assert results == {
+            (1 << 64) - 1: b"abcdefghij",
+            0: b"abc",
+            1: b"bcd",
+            2: None,
+            3: b"",
+            4: b"cdef",
+        }
+        assert reader.reserved_bytes == 0
+        assert reader.io_reserved_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "indices, request_indices, ranges, message",
+    [
+        ([0], [], None, "counts differ"),
+        ([99], [0], None, "index"),
+        ([0, 0], [1, 1], None, "Duplicate"),
+        ([0], [0], [(2, 2)], "range"),
+        ([0], [0], [((1 << 64) - 1, 1)], "overflow"),
+    ],
+)
+def test_portable_blob_reference_validation(
+    portable_blob_references, indices, request_indices, ranges, message
+):
+    dataset, source, _, references = portable_blob_references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        with pytest.raises(ValueError, match=message):
+            reader.read(references, indices, request_indices, ranges)
+        assert reader.reserved_bytes == 0
+    wire = bytearray(source.encode())
+    wire[1] = 99
+    with pytest.raises(ValueError, match="protocol version"):
+        BlobSourceContext.decode(bytes(wire))
+
+
+def test_portable_blob_reference_cancel_and_buffer_ownership(portable_blob_references):
+    dataset, source, _, references = portable_blob_references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1,
+        materialization_readahead_bytes=1,
+    ) as reader:
+        stream = reader.read(references, [0, 1], [0, 1])
+        first = next(stream)
+        array = first["data"]
+        del first
+        assert array[0].as_py() == b"abc"
+        assert reader.reserved_bytes >= 3
+        stream.cancel()
+        with pytest.raises(OSError, match="cancel"):
+            next(stream)
+        stream.close()
+        stream.close()
+        assert array[0].as_py() == b"abc"
+        assert reader.reserved_bytes >= 3
+        del array
+        assert reader.reserved_bytes == 0
+        assert next(stream, None) is None
+
+
+def test_portable_blob_references_in_separate_process(
+    portable_blob_references, tmp_path
+):
+    dataset, source, retention, references = portable_blob_references
+    reference_path = tmp_path / "refs.bin"
+    reference_path.write_bytes(references.encode())
+    token_path = tmp_path / "retention.bin"
+    token_path.write_bytes(retention.encode())
+    dataset.delete("true")
+    dataset.cleanup_old_versions(
+        older_than=timedelta(0), error_if_tagged_old_versions=False
+    )
+    script = textwrap.dedent("""
+        import sys
+        from pathlib import Path
+        import lance
+        refs = lance.BlobRefBatch.decode(Path(sys.argv[1]).read_bytes())
+        source = refs.contexts[0]
+        retention = lance.BlobSnapshotRetention.decode(Path(sys.argv[2]).read_bytes())
+        assert retention.context.encode() == source.encode()
+        worker = lance.dataset(source.table_uri, version=source.version)
+        with lance.BlobRefReader([(source, worker)], io_buffer_size_bytes=1024,
+                                 materialization_readahead_bytes=1024) as reader:
+            with reader.read(refs, [2, 0, 3, 4], [(1 << 64) - 1, 1, 2, 3],
+                             [(2, 4), None, None, None]) as stream:
+                values = {}
+                for batch in stream:
+                    values[batch['request_index'][0].as_py()] = batch['data'][0].as_py()
+                    del batch
+            assert values == {(1 << 64) - 1: b'cdef', 1: b'abc', 2: None, 3: b''}
+            assert reader.reserved_bytes == 0
+    """)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(reference_path), str(token_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    retention.release(dataset)
+    retention.release(dataset)
+    stats = dataset.cleanup_old_versions(older_than=timedelta(0))
+    assert stats.data_files_removed >= 2
