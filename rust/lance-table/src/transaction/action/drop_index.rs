@@ -4,7 +4,7 @@
 //! Drop a logical index.
 
 use super::Footprint;
-use super::apply::ApplyState;
+use super::apply::{ApplyState, reject_frag_reuse_history};
 use super::proto::non_empty;
 use crate::format::pb_actions;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
@@ -30,6 +30,7 @@ pub struct DropIndex {
 
 impl DropIndex {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        reject_frag_reuse_history("DropIndex", &self.name)?;
         state.drop_index(&self.name)
     }
 
