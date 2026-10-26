@@ -180,6 +180,9 @@ async fn maintenance_tickets(store: &ObjectStore, directory: &Path) -> Result<Ve
 /// token does not release it; a coordinator can recover orphaned tags after a crash.
 /// Acquisition is idempotent for the same context and globally unique `retention_id`.
 /// Reusing that ID for independent queries would give them shared release ownership.
+/// Persist that ID and the encoded context before acquiring, then persist the token
+/// before exporting refs. Record release intent before releasing, so recovery can
+/// retry release instead of accidentally acquiring protection again.
 ///
 /// This implementation protects primary-storage files and objects owned by this
 /// dataset. Snapshots with foreign dataset bases require retention of their owners
@@ -428,6 +431,7 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use rstest::rstest;
 
     use crate::dataset::{WriteMode, WriteParams, cleanup::CleanupPolicyBuilder};
 
@@ -491,6 +495,22 @@ mod tests {
         .await
         .unwrap();
         (dataset, policy)
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn overwrite_maintenance_dataset(dataset: &Dataset) -> Dataset {
+        let batch = record_batch!(("value", Int32, [3, 4])).unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            Arc::new(dataset.clone()),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -593,18 +613,7 @@ mod tests {
                 }
             }),
         );
-        let batch = record_batch!(("value", Int32, [3, 4])).unwrap();
-        let latest = Dataset::write(
-            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
-            Arc::new(dataset.clone()),
-            Some(WriteParams {
-                mode: WriteMode::Overwrite,
-                data_storage_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let latest = overwrite_maintenance_dataset(&dataset).await;
         let cleanup = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now() + chrono::Duration::hours(1))
             .build();
@@ -631,6 +640,84 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[rstest]
+    #[case::acquisition_intent(false)]
+    #[case::saved_token(true)]
+    #[tokio::test]
+    async fn recovery_preserves_roots_until_explicit_release(#[case] has_saved_token: bool) {
+        let (dataset, _) = maintenance_dataset().await;
+        let context = BlobSourceContext::from_dataset(&dataset, "catalog/recovery", "worker")
+            .await
+            .unwrap();
+        // The coordinator records acquisition intent before the storage operation.
+        let saved_context = context.encode();
+        let query_id = "query-recovery";
+        let retention = BlobSnapshotRetention::acquire(&dataset, context.clone(), query_id)
+            .await
+            .unwrap();
+        let tag_name = retention.tag_name().to_string();
+        let saved_token = has_saved_token.then(|| retention.encode());
+        drop(retention);
+        let latest = overwrite_maintenance_dataset(&dataset).await;
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() + chrono::Duration::hours(1))
+            .error_if_tagged_old_versions(false)
+            .build();
+
+        let fence = SnapshotMaintenanceLock::acquire(&latest).await.unwrap();
+        let abandoned_owner = fence.path.clone();
+        drop(fence);
+        let error = BlobSnapshotRetention::acquire(&dataset, context, query_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        assert!(error.to_string().contains(abandoned_owner.as_ref()));
+        let error = latest.cleanup(policy.clone()).execute().await.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        assert!(error.to_string().contains(abandoned_owner.as_ref()));
+
+        // This owner has stopped and has no outstanding storage calls. Recovery
+        // removes its fence explicitly; the durable query tag must survive it.
+        dataset.object_store.delete(&abandoned_owner).await.unwrap();
+        assert!(dataset.tags().list().await.unwrap().contains_key(&tag_name));
+        let protected = latest.cleanup(policy.clone()).execute().await.unwrap();
+        assert_eq!(protected.old_versions, 0);
+        assert_eq!(protected.data_files_removed, 0);
+        let recovered = match saved_token {
+            Some(token) => BlobSnapshotRetention::decode(&token).unwrap(),
+            None => BlobSnapshotRetention::acquire(
+                &dataset,
+                BlobSourceContext::decode(&saved_context).unwrap(),
+                query_id,
+            )
+            .await
+            .unwrap(),
+        };
+        assert_eq!(recovered.tag_name(), tag_name);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
+
+        // A durable release record retains the token until acknowledgement. A
+        // lost response is recovered by repeating release, without reacquiring.
+        let release_token = recovered.encode();
+        recovered.release(&latest).await.unwrap();
+        drop(recovered);
+        let pending_release = BlobSnapshotRetention::decode(&release_token).unwrap();
+        pending_release.release(&latest).await.unwrap();
+        assert!(latest.tags().list().await.unwrap().is_empty());
+        let removed = latest.cleanup(policy).execute().await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+        assert_eq!(removed.data_files_removed, 2);
+        assert!(
+            !dataset
+                .object_store
+                .exists(&dataset.manifest_location().path)
+                .await
+                .unwrap()
+        );
+        pending_release.release(&latest).await.unwrap();
+        assert!(latest.tags().list().await.unwrap().is_empty());
     }
 
     #[tokio::test]

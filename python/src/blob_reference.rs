@@ -433,6 +433,10 @@ impl PyBlobRefReadStream {
 /// roots are unsupported; external object lifetime remains the caller's contract.
 /// Dropping the token does not release it. See the portable blob references guide
 /// for deployment requirements and orphan recovery.
+///
+/// Persist the query ID and encoded context before acquisition, save the token
+/// before exporting refs, and record release intent before release. Recover a lost
+/// release response by retrying release with that saved token.
 #[pyclass(name = "BlobSnapshotRetention", module = "lance.blob", frozen)]
 pub struct PyBlobSnapshotRetention {
     inner: BlobSnapshotRetention,

@@ -360,6 +360,10 @@ public final class BlobReferences {
    * expiry/renewal is used. Foreign dataset bases require separate owner protection and are
    * rejected; external objects follow their own immutability contract. Dropping the token never
    * releases it. Recover orphaned tags only after all query consumers have stopped.
+   *
+   * <p>The coordinator must persist the query ID and encoded source context before acquisition,
+   * persist the token before exporting references, and record release intent before release.
+   * Recover a lost release response by retrying release with the saved token.
    */
   public static final class Retention {
     private final byte[] encoded;

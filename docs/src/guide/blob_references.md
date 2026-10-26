@@ -449,6 +449,10 @@ already-open handles. A capability check on a new coordinator cannot fence an ol
 handle that is still allowed to delete files. Older uncoordinated cleanup clients,
 forced table/branch deletion, manual tag changes, and deletion outside Lance are
 outside this retention guarantee.
+Before enabling retention, inventory scheduled cleanup jobs and services, verify
+their client capabilities, and assign an owner for recovery of abandoned fences
+and query tags. A deployment that cannot exclude older cleanup clients cannot
+advertise this retention guarantee.
 Coordinated cleanup also needs write/delete access to `_refs/retention-v1` for its
 maintenance fence and retirement markers.
 
@@ -472,19 +476,52 @@ contract; a Lance tag does not protect their contents.
 
 ### Recovery after interruption
 
-Keep the query ID, serialized token, and `tag_name` in the query coordinator's
-durable state. After a coordinator crash, stop its workers and retries, then decode
-the token and release it. An interrupted acquisition can leave an orphan
-`lance-query-<digest>` tag. Inspect the tag metadata and query ownership before
-removing it; never remove a tag merely because it is old.
+The query coordinator must keep a durable recovery record. Persist each phase
+before starting the operation in the next column:
 
-Cancellation or a crash during maintenance can leave an owner object in place.
-Remove only the abandoned owner's object, after proving that its operation and
-all submitted storage requests have stopped. Do not infer this from elapsed time.
-Never clear a retirement marker for a manifest still on storage to make acquisition
-succeed: some of its payloads may be gone. Finish deleting the expired manifest
-under maintenance coordination before removing its marker. A marker whose manifest is already absent may be removed
-after maintenance has stopped.
+| Durable phase | Recorded state | Next operation |
+| --- | --- | --- |
+| Acquiring | Globally unique query ID and encoded exact source context | Call `acquire` with that context and ID. |
+| Active | Serialized retention token, `tag_name`, and participating workers/retries | Export references and run the query. |
+| Releasing | Token and confirmation that all consumers have stopped | Call `release`. |
+| Released | Acknowledged release and completed query ID | Finish the recovery record; never reuse that ID. |
+
+Recording acquisition intent first covers a crash after tag creation but before
+the token is saved. Persist the active token before issuing any references. If
+saving recovery state fails, keep the query from starting. A lost release response
+must be handled by retrying `release`, not by acquiring the same query again.
+
+Recover an interrupted query in this order:
+
+1. Stop new assignments and retries. Wait for every worker, lazy consumer,
+   outstanding read, and submitted storage request to finish or stop.
+2. If an abandoned maintenance owner blocks progress, stop its operation and drain
+   its storage requests before deleting its object under
+   `_refs/retention-v1/maintenance/`. If ownership cannot be established, quiesce
+   all query coordinators and maintenance clients for the table and drain their
+   storage requests first. An owner object's age or ticket does not prove that it
+   is abandoned. Never delete the whole `_refs` directory.
+3. If a token was saved, decode it and call `release` using an authenticated handle
+   to the same table; a later snapshot is sufficient. If only acquisition intent
+   was saved, reopen the exact recorded snapshot, replay `acquire` with the same
+   context and ID, then release the returned token. This recovers the existing tag
+   idempotently. A failed replay remains a recovery error; never substitute the
+   latest snapshot or silently discard the record.
+4. Mark the query released after release is acknowledged. Retrying release is safe
+   even after cleanup has removed the source version. Resume maintenance using
+   participating clients once abandoned owners have been accounted for.
+
+An orphan `lance-query-<digest>` tag continues to protect its files after the
+coordinator has stopped. Do not delete it merely because it is old. Match it to
+durable query state and verify that every consumer has stopped before release.
+Monitor repeated maintenance conflicts and query tags without an active recovery
+record; neither fences nor tags expire automatically.
+
+Retirement markers are separate from maintenance owner objects. Never clear a
+marker for a manifest still on storage to make acquisition succeed: some of its
+payloads may be gone. Finish deleting the expired manifest under maintenance
+coordination before removing its marker. A marker whose manifest is already
+absent may be removed after maintenance has stopped.
 
 ## Python and Java/JNI bindings
 
@@ -510,6 +547,10 @@ batch also exposes its Arrow extension field and array for engine operators; kee
 its source table and remap context slots when combining independently captured
 arrays. Workers reopen the exact branch/version with their own storage binding.
 Native driver pointers and credentials are not part of the transport.
+
+This example shows local API use. A distributed coordinator must also persist the
+lifecycle state described in [Recovery after interruption](#recovery-after-interruption)
+before issuing references to workers.
 
 ```python
 import uuid
