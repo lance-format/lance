@@ -23,6 +23,7 @@ use log::{debug, trace};
 
 use crate::EncodingsIo;
 use crate::compression::DecompressionStrategy;
+use crate::data::concat_decoded_arrays;
 use crate::decoder::{
     ColumnInfo, DecodePageTask, DecodedArray, FilterExpression, IO_REQUEST_BATCH_BYTES,
     LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch, ScheduledScanLine,
@@ -919,7 +920,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             arrays.push(array);
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
-        let array = arrow_select::concat::concat(&array_refs)?;
+        let array = concat_decoded_arrays(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
         let array = Self::restore_validity(array, &mut repdef)?;

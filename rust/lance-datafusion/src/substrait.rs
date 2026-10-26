@@ -34,11 +34,70 @@ use std::sync::Arc;
 fn is_substrait_compatible(data_type: &DataType) -> bool {
     match data_type {
         DataType::FixedSizeList(_, _) => false,
-        DataType::List(inner) => is_substrait_compatible(inner.data_type()),
+        DataType::List(inner) | DataType::LargeList(inner) => {
+            is_substrait_compatible(inner.data_type())
+        }
+        DataType::Map(entries, _) => is_substrait_compatible(entries.data_type()),
         DataType::Struct(fields) => fields
             .iter()
             .all(|f| is_substrait_compatible(f.data_type())),
         _ => true,
+    }
+}
+
+/// Validates that every input field referenced by an expression can be
+/// represented by DataFusion's Substrait producer.
+///
+/// This is a preflight check for callers that prune unsupported fields before
+/// calling [`encode_substrait`]. It distinguishes an unsupported transport from
+/// an expression that references a field missing from the input schema. The
+/// producer may still reject unsupported expression operators during encoding.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use arrow_schema::{DataType, Field, Schema};
+/// use datafusion::prelude::col;
+/// use lance_core::Error;
+/// use lance_datafusion::substrait::validate_substrait_expr;
+///
+/// let schema = Schema::new(vec![Field::new(
+///     "vector",
+///     DataType::FixedSizeList(
+///         Arc::new(Field::new("item", DataType::Float32, true)),
+///         4,
+///     ),
+///     true,
+/// )]);
+/// let error = validate_substrait_expr(&col("vector").is_null(), &schema).unwrap_err();
+/// assert!(matches!(error, Error::NotSupported { .. }));
+/// ```
+pub fn validate_substrait_expr(expr: &Expr, schema: &ArrowSchema) -> Result<()> {
+    let mut columns = expr.column_refs().into_iter().collect::<Vec<_>>();
+    columns.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    let mut unsupported_columns = Vec::new();
+    for column in columns {
+        let field = schema.field_with_name(&column.name).map_err(|_| {
+            Error::schema(format!(
+                "Substrait expression references column '{}' which is missing from the input schema",
+                column.name
+            ))
+        })?;
+        if !is_substrait_compatible(field.data_type()) {
+            unsupported_columns.push(format!("'{}' ({})", column.name, field.data_type()));
+        }
+    }
+
+    if unsupported_columns.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::not_supported(format!(
+            "Substrait expression transport cannot encode predicates referencing unsupported columns: {}",
+            unsupported_columns.join(", ")
+        )))
     }
 }
 
@@ -733,11 +792,11 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
         logical_expr::{BinaryExpr, Case, Operator},
-        prelude::{Expr, SessionContext},
+        prelude::{Expr, SessionContext, col, lit},
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
@@ -761,7 +820,7 @@ mod tests {
     use prost::Message;
     use rstest::rstest;
 
-    use crate::substrait::{encode_substrait, parse_substrait};
+    use crate::substrait::{encode_substrait, parse_substrait, validate_substrait_expr};
 
     fn session_state() -> SessionState {
         let ctx = SessionContext::new();
@@ -1330,9 +1389,88 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]);
 
-        // Encoding with the full schema would fail, but pruning removes the FSL column
+        let supported_expr = col("id").is_not_null().and(col("name").is_not_null());
+        validate_substrait_expr(&supported_expr, &schema).unwrap();
+
+        // Encoding with the full schema would fail, but pruning removes the FSL column.
+        // The compound filter verifies references on both sides retain their mappings.
         let pruned = prune_schema_for_substrait(&schema);
         assert_eq!(pruned.fields().len(), 2); // id and name only
+        assert_substrait_roundtrip(pruned, supported_expr).await;
+    }
+
+    #[rstest]
+    #[case::is_null(col("vector").is_null())]
+    #[case::is_not_null(col("vector").is_not_null())]
+    #[case::compound(
+        col("before")
+            .gt(lit(0_i64))
+            .and(col("vector").is_null())
+            .and(col("after").lt(lit(10_i64)))
+    )]
+    fn test_validate_substrait_expr_rejects_fixed_size_list(#[case] expr: Expr) {
+        let schema = Schema::new(vec![
+            Field::new("before", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+            Field::new("after", DataType::Int64, true),
+        ]);
+
+        let error = validate_substrait_expr(&expr, &schema)
+            .expect_err("FixedSizeList predicates are not supported by Substrait transport");
+        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+        assert!(
+            error.to_string().contains("'vector' (FixedSizeList"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_schema_for_substrait_nested_list_types() {
+        // The producer recurses into LargeList and Map children, so an FSL
+        // nested under them must still be pruned.
+        use crate::substrait::prune_schema_for_substrait;
+
+        let fsl = |width: i32| {
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), width)
+        };
+        let map_of = |value: DataType| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", value, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("map_ok", map_of(DataType::Int32), true),
+            Field::new(
+                "ll_ok",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "ll_fsl",
+                DataType::LargeList(Arc::new(Field::new("item", fsl(16), true))),
+                true,
+            ),
+            Field::new("map_fsl", map_of(fsl(8)), true),
+        ]);
+
+        let pruned = prune_schema_for_substrait(&schema);
+        let names: Vec<&str> = pruned.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "map_ok", "ll_ok"]);
+        // The encoder writes the whole schema, so a filter on another column
+        // only encodes once those columns are gone.
         assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
     }
 

@@ -154,7 +154,7 @@ pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Result<Field
     ))
 }
 
-fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
+pub(crate) fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
     if field.is_blob_v2() {
         return match blob_v2_layout(field) {
             Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => with_field_ids_of(
@@ -475,20 +475,6 @@ fn validate_blob_id(blob_id: u32) -> Result<()> {
     Ok(())
 }
 
-fn validate_range(offset: u64, size: u64, object_size: u64, label: &str) -> Result<()> {
-    let end = offset.checked_add(size).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "{label} range overflows u64: offset={offset}, size={size}"
-        ))
-    })?;
-    if end > object_size {
-        return Err(Error::invalid_input(format!(
-            "{label} range [{offset}, {end}) exceeds blob object size {object_size}"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result<()> {
     if blob_v2_layout(field) != Some(BlobV2Layout::Prepared) {
         return Err(blob_v2_shape_error(field, &[BlobV2Layout::Prepared]));
@@ -626,7 +612,7 @@ pub(crate) fn validate_prepared_blob_array(field: &Field, array: &ArrayRef) -> R
     validate_prepared_blob_value_array(field, array)
 }
 
-fn sidecar_path_for_data_file(data_file_path: &Path, blob_id: u32) -> Result<Path> {
+pub(crate) fn sidecar_path_for_data_file(data_file_path: &Path, blob_id: u32) -> Result<Path> {
     validate_blob_id(blob_id)?;
     let file_name = data_file_path.filename().ok_or_else(|| {
         Error::invalid_input("Data file path must include a file name".to_string())
@@ -968,30 +954,146 @@ fn validate_blob_descriptor(value: &BlobDescriptor) -> Result<()> {
     }
 }
 
-fn packed_descriptor(blob_id: u32, offset: u64, size: u64) -> Result<(BlobDescriptor, u64)> {
+fn blob_range(offset: u64, size: u64) -> Result<(BlobRange, u64)> {
     let next_offset = offset.checked_add(size).ok_or_else(|| {
         Error::invalid_input(format!(
-            "Packed blob writer offset overflowed: offset={offset}, size={size}"
+            "Blob object writer offset overflowed: offset={offset}, size={size}"
         ))
     })?;
-    Ok((
-        BlobDescriptor::Packed {
-            blob_id,
-            offset,
-            size,
-        },
-        next_offset,
-    ))
+    Ok((BlobRange { offset, size }, next_offset))
+}
+
+/// Writes payload ranges into one object without choosing their addressing scheme.
+///
+/// Each write takes ownership of the active upload so a partial failure or
+/// cancellation drops it and prevents reusing incomplete payloads.
+pub(crate) struct BlobObjectWriter {
+    path: Path,
+    writer: Option<Box<dyn Writer>>,
+    offset: u64,
+}
+
+impl BlobObjectWriter {
+    pub(crate) async fn try_new(object_store: ObjectStore, path: Path) -> Result<Self> {
+        let writer = object_store.create(&path).await?;
+        Ok(Self {
+            path,
+            writer: Some(writer),
+            offset: 0,
+        })
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.offset
+    }
+
+    async fn write_blobs<'a>(
+        &mut self,
+        blobs: impl IntoIterator<Item = Option<&'a [u8]>>,
+    ) -> Result<Vec<Option<BlobRange>>> {
+        let mut writer = self.take_writer()?;
+        let mut ranges = Vec::new();
+        let mut next_offset = self.offset;
+        for blob in blobs {
+            let Some(blob) = blob else {
+                ranges.push(None);
+                continue;
+            };
+            let (range, following_offset) = blob_range(next_offset, blob.len() as u64)?;
+            if !blob.is_empty() {
+                writer.write_all(blob).await?;
+            }
+            ranges.push(Some(range));
+            next_offset = following_offset;
+        }
+        self.writer = Some(writer);
+        self.offset = next_offset;
+        Ok(ranges)
+    }
+
+    pub(crate) async fn write_blob(&mut self, bytes: &[u8]) -> Result<BlobRange> {
+        let (range, next_offset) = blob_range(self.offset, bytes.len() as u64)?;
+        let mut writer = self.take_writer()?;
+        writer.write_all(bytes).await?;
+        self.writer = Some(writer);
+        self.offset = next_offset;
+        Ok(range)
+    }
+
+    pub(crate) async fn write_blob_from_reader(
+        &mut self,
+        reader: &dyn Reader,
+        range: Range<usize>,
+    ) -> Result<BlobRange> {
+        let (value, next_offset) = blob_range(self.offset, range.len() as u64)?;
+        let mut writer = self.take_writer()?;
+        writer.copy_range_from_reader(reader, range).await?;
+        self.writer = Some(writer);
+        self.offset = next_offset;
+        Ok(value)
+    }
+
+    fn take_writer(&mut self) -> Result<Box<dyn Writer>> {
+        self.writer.take().ok_or_else(|| {
+            Error::io(format!(
+                "Blob object writer for '{}' has no active upload",
+                self.path
+            ))
+        })
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<u64> {
+        let mut writer = self.take_writer()?;
+        let result = Writer::shutdown(writer.as_mut()).await?;
+        let object_size = result.size as u64;
+        if object_size != self.offset {
+            return Err(Error::io(format!(
+                "Blob object '{}' has size {object_size}, expected {}",
+                self.path, self.offset
+            )));
+        }
+        Ok(object_size)
+    }
+}
+
+/// An independent object address, shared by explicit uploads and dataset writes.
+pub(crate) struct ManagedBlobLocation {
+    base_id: Option<u32>,
+    relative_path: Path,
+}
+
+impl ManagedBlobLocation {
+    pub(crate) fn new(base_id: Option<u32>) -> Self {
+        Self {
+            base_id,
+            relative_path: Path::from("_blobs").join(format!("{}.blob", uuid::Uuid::new_v4())),
+        }
+    }
+
+    pub(crate) fn path(&self, base_path: &Path) -> Path {
+        base_path
+            .parts()
+            .chain(self.relative_path.parts())
+            .collect()
+    }
+
+    pub(crate) fn descriptor(&self, range: BlobRange) -> BlobDescriptor {
+        BlobDescriptor::Managed {
+            base_id: self.base_id,
+            uri: self.relative_path.to_string(),
+            offset: range.offset,
+            size: range.size,
+        }
+    }
 }
 
 /// Writes a Lance-owned packed sidecar blob for one data file and returns descriptors.
+///
+/// Use [`ManagedBlobWriter`] to share payload references across data files.
 pub struct PackedBlobWriter {
-    object_store: ObjectStore,
-    path: Path,
+    upload: BlobObjectWriter,
     blob_id: u32,
-    writer: Option<Box<dyn Writer>>,
-    offset: u64,
-    values: Vec<BlobDescriptor>,
+    ranges: Vec<Option<BlobRange>>,
 }
 
 impl PackedBlobWriter {
@@ -1002,22 +1104,10 @@ impl PackedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
-        Self::try_new_at(object_store, path, blob_id).await
-    }
-
-    pub(crate) async fn try_new_at(
-        object_store: ObjectStore,
-        path: Path,
-        blob_id: u32,
-    ) -> Result<Self> {
-        let writer = object_store.create(&path).await?;
         Ok(Self {
-            object_store,
-            path,
+            upload: BlobObjectWriter::try_new(object_store, path).await?,
             blob_id,
-            writer: Some(writer),
-            offset: 0,
-            values: Vec::new(),
+            ranges: Vec::new(),
         })
     }
 
@@ -1028,13 +1118,13 @@ impl PackedBlobWriter {
 
     /// Return the derived sidecar path for this packed blob.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.upload.path
     }
 
     /// Append one logical blob payload to the packed sidecar.
     pub async fn write_blob(&mut self, bytes: impl AsRef<[u8]>) -> Result<()> {
-        let bytes = bytes.as_ref();
-        self.write_blob_bytes(bytes).await?;
+        let range = self.upload.write_blob(bytes.as_ref()).await?;
+        self.ranges.push(Some(range));
         Ok(())
     }
 
@@ -1064,83 +1154,156 @@ impl PackedBlobWriter {
         &mut self,
         blobs: impl IntoIterator<Item = Option<&'a [u8]>>,
     ) -> Result<()> {
-        let mut writer = self.take_writer()?;
-        let mut descriptors = Vec::new();
-        let mut next_offset = self.offset;
-        for blob in blobs {
-            let Some(blob) = blob else {
-                descriptors.push(BlobDescriptor::Null);
-                continue;
-            };
-            let (descriptor, following_offset) =
-                packed_descriptor(self.blob_id, next_offset, blob.len() as u64)?;
-            if !blob.is_empty() {
-                writer.write_all(blob).await?;
-            }
-            descriptors.push(descriptor);
-            next_offset = following_offset;
-        }
-        self.writer = Some(writer);
-        self.offset = next_offset;
-        self.values.extend(descriptors);
+        self.ranges.extend(self.upload.write_blobs(blobs).await?);
         Ok(())
     }
 
-    pub(crate) async fn write_blob_bytes(&mut self, bytes: &[u8]) -> Result<BlobDescriptor> {
-        let size = bytes.len() as u64;
-        let offset = self.offset;
-        let mut writer = self.take_writer()?;
-        writer.write_all(bytes).await?;
-        self.writer = Some(writer);
-        self.record_written_blob(offset, size)
+    /// Finish the packed sidecar and return descriptors in write order.
+    pub async fn finish(self) -> Result<Vec<BlobDescriptor>> {
+        self.upload.finish().await?;
+        Ok(self
+            .ranges
+            .into_iter()
+            .map(|range| {
+                range.map_or(BlobDescriptor::Null, |range| BlobDescriptor::Packed {
+                    blob_id: self.blob_id,
+                    offset: range.offset,
+                    size: range.size,
+                })
+            })
+            .collect())
     }
+}
 
-    pub(crate) async fn write_blob_from_reader(
-        &mut self,
-        reader: &dyn Reader,
-        range: Range<usize>,
-    ) -> Result<BlobDescriptor> {
-        let size = range.len() as u64;
-        let offset = self.offset;
-        let mut writer = self.take_writer()?;
-        writer.copy_range_from_reader(reader, range).await?;
-        self.writer = Some(writer);
-        self.record_written_blob(offset, size)
-    }
+/// Writes immutable payloads into an independently addressed Lance-owned object.
+///
+/// Its Managed descriptors can be reused across rows, fragments and ordinary
+/// compaction. This writer does not publish a dataset version or register bases.
+/// Use [`BlobDescriptorArrayBuilder`] and the normal dataset write APIs to commit
+/// references to the completed object.
+pub struct ManagedBlobWriter {
+    upload: BlobObjectWriter,
+    location: ManagedBlobLocation,
+    ranges: Vec<Option<BlobRange>>,
+}
 
-    fn record_written_blob(&mut self, offset: u64, size: u64) -> Result<BlobDescriptor> {
-        let (value, next_offset) = packed_descriptor(self.blob_id, offset, size)?;
-        self.offset = next_offset;
-        self.values.push(value.clone());
-        Ok(value)
-    }
-
-    fn take_writer(&mut self) -> Result<Box<dyn Writer>> {
-        self.writer.take().ok_or_else(|| {
-            Error::io(format!(
-                "Packed blob writer for '{}' has no active upload",
-                self.path
-            ))
+impl ManagedBlobWriter {
+    /// Create an independently addressed object under `base_path/_blobs`.
+    ///
+    /// `base_path` must be the table's primary root when `base_id` is `None`, or
+    /// the root of the already registered base identified by `Some(id)`. The
+    /// caller supplies an object store for that root. This does not register bases.
+    /// Without an explicit base id, write the referencing data files in primary
+    /// storage. Supply a registered payload base id when targeting other bases.
+    ///
+    /// [`Self::finish`] returns [`BlobDescriptor::Managed`] values. Reuse each
+    /// descriptor in a [`BlobDescriptorArrayBuilder`] for as many rows as needed,
+    /// including across file splits. Commit with schema metadata
+    /// `lance.blob.managed=true`. Finish the upload before committing references;
+    /// retain a referencing snapshot if concurrent cleanup can retire them.
+    /// Uncommitted objects follow the normal unverified-object cleanup policy.
+    ///
+    /// ```
+    /// # use std::{collections::HashMap, sync::Arc};
+    /// # use arrow_array::{RecordBatch, RecordBatchIterator};
+    /// # use arrow_schema::Schema;
+    /// # use lance::{BlobDescriptorArrayBuilder, Dataset, ManagedBlobWriter, Result};
+    /// # use lance::dataset::{WriteParams, optimize::compact_files};
+    /// # use lance::io::ObjectStore;
+    /// # use lance_file::version::LanceFileVersion;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let location = dir.path().to_string_lossy();
+    /// # let uri = location.as_ref();
+    /// let (store, root) = ObjectStore::from_uri(uri).await?;
+    /// let mut writer = ManagedBlobWriter::try_new((*store).clone(), root, None).await?;
+    /// writer.write_blob(b"shared payload").await?;
+    /// let references = writer.finish().await?;
+    /// let mut builder = BlobDescriptorArrayBuilder::new("blob");
+    /// builder.extend(vec![references[0].clone(); 4])?;
+    /// let (field, array) = builder.finish()?.into_parts();
+    /// let schema = Arc::new(Schema::new_with_metadata(
+    ///     vec![field], HashMap::from([("lance.blob.managed".into(), "true".into())]),
+    /// ));
+    /// let batch = RecordBatch::try_new(schema.clone(), vec![array])?;
+    /// let mut dataset = Dataset::write(
+    ///     RecordBatchIterator::new(vec![Ok(batch)], schema), uri,
+    ///     Some(WriteParams {
+    ///         max_rows_per_file: 2,
+    ///         data_storage_version: Some(LanceFileVersion::V2_2),
+    ///         ..Default::default()
+    ///     }),
+    /// ).await?;
+    /// assert_eq!(dataset.get_fragments().len(), 2);
+    /// compact_files(&mut dataset, Default::default(), None).await?;
+    /// let rows = Arc::new(dataset).read_blobs("blob")?
+    ///     .with_row_indices(vec![0, 1, 2, 3]).execute().await?;
+    /// assert!(rows.iter().all(|row| row.data.as_deref() == Some(b"shared payload")));
+    /// # Ok(()) }
+    /// ```
+    pub async fn try_new(
+        object_store: ObjectStore,
+        base_path: Path,
+        base_id: Option<u32>,
+    ) -> Result<Self> {
+        let location = ManagedBlobLocation::new(base_id);
+        let path = location.path(&base_path);
+        Ok(Self {
+            upload: BlobObjectWriter::try_new(object_store, path).await?,
+            location,
+            ranges: Vec::new(),
         })
     }
 
-    /// Finish the packed sidecar and return descriptors in write order.
-    pub async fn finish(mut self) -> Result<Vec<BlobDescriptor>> {
-        let mut writer = self.take_writer()?;
-        Writer::shutdown(writer.as_mut()).await?;
-        let object_size = self.object_store.size(&self.path).await?;
-        validate_range(0, self.offset, object_size, "Packed blob")?;
-        Ok(self.values)
+    /// Return the object path in the writer's object store.
+    pub fn path(&self) -> &Path {
+        &self.upload.path
+    }
+
+    /// Append one payload. Each call records one descriptor returned by [`Self::finish`].
+    pub async fn write_blob(&mut self, data: impl AsRef<[u8]>) -> Result<()> {
+        let range = self.upload.write_blob(data.as_ref()).await?;
+        self.ranges.push(Some(range));
+        Ok(())
+    }
+
+    /// Append payloads in order, preserving null and empty values.
+    ///
+    /// `None` records a null descriptor without writing bytes. Empty bytes record
+    /// a zero-length Managed range. A failed or cancelled write drops the active
+    /// upload, making this writer unusable. Reuse completed descriptors rather
+    /// than passing the same payload repeatedly to this method.
+    pub async fn write_blobs<'a>(
+        &mut self,
+        payloads: impl IntoIterator<Item = Option<&'a [u8]>>,
+    ) -> Result<()> {
+        self.ranges.extend(self.upload.write_blobs(payloads).await?);
+        Ok(())
+    }
+
+    /// Complete the upload and return Managed or null descriptors in write order.
+    ///
+    /// Finish before committing references. Without a committed reference, this
+    /// object is subject to the existing unverified-object cleanup policy.
+    pub async fn finish(self) -> Result<Vec<BlobDescriptor>> {
+        self.upload.finish().await?;
+        Ok(self
+            .ranges
+            .into_iter()
+            .map(|range| {
+                range.map_or(BlobDescriptor::Null, |range| {
+                    self.location.descriptor(range)
+                })
+            })
+            .collect())
     }
 }
 
 /// Writes a Lance-owned dedicated sidecar blob for one data file and returns its descriptor.
 pub struct DedicatedBlobWriter {
-    object_store: ObjectStore,
-    path: Path,
+    upload: BlobObjectWriter,
     blob_id: u32,
-    writer: Box<dyn Writer>,
-    size: u64,
 }
 
 impl DedicatedBlobWriter {
@@ -1151,21 +1314,9 @@ impl DedicatedBlobWriter {
         blob_id: u32,
     ) -> Result<Self> {
         let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
-        Self::try_new_at(object_store, path, blob_id).await
-    }
-
-    pub(crate) async fn try_new_at(
-        object_store: ObjectStore,
-        path: Path,
-        blob_id: u32,
-    ) -> Result<Self> {
-        let writer = object_store.create(&path).await?;
         Ok(Self {
-            object_store,
-            path,
+            upload: BlobObjectWriter::try_new(object_store, path).await?,
             blob_id,
-            writer,
-            size: 0,
         })
     }
 
@@ -1176,15 +1327,17 @@ impl DedicatedBlobWriter {
 
     /// Return the derived sidecar path for this dedicated blob.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.upload.path
     }
 
     /// Append bytes to the dedicated sidecar.
+    ///
+    /// A failed or cancelled write drops the active upload, making this writer
+    /// unusable. All successful appends form the single payload returned by
+    /// [`Self::finish`].
     pub async fn write(&mut self, bytes: impl AsRef<[u8]>) -> Result<()> {
-        let bytes = bytes.as_ref();
-        let size = bytes.len() as u64;
-        self.writer.write_all(bytes).await?;
-        self.record_written_bytes(size)
+        self.upload.write_blob(bytes.as_ref()).await?;
+        Ok(())
     }
 
     pub(crate) async fn write_from_reader(
@@ -1192,34 +1345,16 @@ impl DedicatedBlobWriter {
         reader: &dyn Reader,
         range: Range<usize>,
     ) -> Result<()> {
-        let size = range.len() as u64;
-        self.writer.copy_range_from_reader(reader, range).await?;
-        self.record_written_bytes(size)
-    }
-
-    fn record_written_bytes(&mut self, size: u64) -> Result<()> {
-        self.size = self.size.checked_add(size).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Dedicated blob writer size overflowed: current={}, append={size}",
-                self.size
-            ))
-        })?;
+        self.upload.write_blob_from_reader(reader, range).await?;
         Ok(())
     }
 
     /// Finish the dedicated sidecar and return its descriptor.
-    pub async fn finish(mut self) -> Result<BlobDescriptor> {
-        Writer::shutdown(self.writer.as_mut()).await?;
-        let object_size = self.object_store.size(&self.path).await?;
-        if object_size != self.size {
-            return Err(Error::io(format!(
-                "Dedicated blob sidecar '{}' has size {}, expected {}",
-                self.path, object_size, self.size
-            )));
-        }
+    pub async fn finish(self) -> Result<BlobDescriptor> {
+        let size = self.upload.finish().await?;
         Ok(BlobDescriptor::Dedicated {
             blob_id: self.blob_id,
-            size: self.size,
+            size,
         })
     }
 }
@@ -1393,7 +1528,10 @@ mod tests {
         }
 
         async fn shutdown(&mut self) -> Result<WriteResult> {
-            Ok(WriteResult::default())
+            Ok(WriteResult {
+                size: self.bytes_written.load(Ordering::SeqCst),
+                ..Default::default()
+            })
         }
     }
 
@@ -1904,7 +2042,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(dedicated.path(), &dedicated_path);
-        dedicated.write(b"abcdef").await.unwrap();
+        dedicated.write(b"abc").await.unwrap();
+        dedicated.write(b"def").await.unwrap();
         assert_eq!(
             dedicated.finish().await.unwrap(),
             BlobDescriptor::Dedicated {
@@ -1973,18 +2112,15 @@ mod tests {
     #[tokio::test]
     async fn test_packed_blob_writer_bulk_drops_after_partial_write_error() {
         let (partial_writer, bytes_written, dropped) = partial_writer(WriteTerminal::Error);
-        let previous_descriptor = BlobDescriptor::Packed {
-            blob_id: 7,
-            offset: 0,
-            size: 3,
-        };
+        let previous_range = BlobRange { offset: 0, size: 3 };
         let mut writer = PackedBlobWriter {
-            object_store: ObjectStore::local(),
-            path: Path::from("packed.blob"),
+            upload: BlobObjectWriter {
+                path: Path::from("packed.blob"),
+                writer: Some(partial_writer),
+                offset: 3,
+            },
             blob_id: 7,
-            writer: Some(partial_writer),
-            offset: 3,
-            values: vec![previous_descriptor.clone()],
+            ranges: vec![Some(previous_range)],
         };
 
         let error = writer
@@ -1996,9 +2132,9 @@ mod tests {
         assert!(error.to_string().contains("injected write failure"));
         assert_eq!(bytes_written.load(Ordering::SeqCst), 2);
         assert!(dropped.load(Ordering::SeqCst));
-        assert!(writer.writer.is_none());
-        assert_eq!(writer.offset, 3);
-        assert_eq!(writer.values, vec![previous_descriptor]);
+        assert!(writer.upload.writer.is_none());
+        assert_eq!(writer.upload.offset, 3);
+        assert_eq!(writer.ranges, vec![Some(previous_range)]);
         let retry_error = writer.write_blob(b"retry").await.unwrap_err();
         assert!(matches!(retry_error, Error::IO { .. }));
         assert!(retry_error.to_string().contains("no active upload"));
@@ -2007,26 +2143,84 @@ mod tests {
     #[test]
     fn test_packed_blob_writer_bulk_drops_if_cancelled() {
         let (partial_writer, bytes_written, dropped) = partial_writer(WriteTerminal::Pending);
-        let previous_descriptor = BlobDescriptor::Packed {
-            blob_id: 7,
-            offset: 0,
-            size: 3,
-        };
+        let previous_range = BlobRange { offset: 0, size: 3 };
         let mut writer = PackedBlobWriter {
-            object_store: ObjectStore::local(),
-            path: Path::from("packed.blob"),
+            upload: BlobObjectWriter {
+                path: Path::from("packed.blob"),
+                writer: Some(partial_writer),
+                offset: 3,
+            },
             blob_id: 7,
-            writer: Some(partial_writer),
-            offset: 3,
-            values: vec![previous_descriptor.clone()],
+            ranges: vec![Some(previous_range)],
         };
 
         cancel_pending(writer.write_packed_blobs([Some(b"abcdef".as_slice())]));
 
         assert_eq!(bytes_written.load(Ordering::SeqCst), 2);
         assert!(dropped.load(Ordering::SeqCst));
-        assert!(writer.writer.is_none());
-        assert_eq!(writer.offset, 3);
-        assert_eq!(writer.values, vec![previous_descriptor]);
+        assert!(writer.upload.writer.is_none());
+        assert_eq!(writer.upload.offset, 3);
+        assert_eq!(writer.ranges, vec![Some(previous_range)]);
+    }
+
+    #[rstest]
+    #[case::short(2)]
+    #[case::exact(3)]
+    #[case::long(4)]
+    #[tokio::test]
+    async fn test_blob_object_writer_validates_completion_size(#[case] completed_size: usize) {
+        let (writer, bytes_written, dropped) = partial_writer(WriteTerminal::Error);
+        bytes_written.store(completed_size, Ordering::SeqCst);
+        let upload = BlobObjectWriter {
+            path: Path::from("completion.blob"),
+            writer: Some(writer),
+            offset: 3,
+        };
+
+        let result = upload.finish().await;
+        assert!(dropped.load(Ordering::SeqCst));
+        if completed_size == 3 {
+            assert_eq!(result.unwrap(), 3);
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains(&format!(
+                "Blob object 'completion.blob' has size {completed_size}, expected 3"
+            )));
+        }
+    }
+
+    #[rstest]
+    #[case::error(WriteTerminal::Error)]
+    #[case::cancelled(WriteTerminal::Pending)]
+    #[tokio::test]
+    async fn test_dedicated_blob_writer_drops_partial_upload(#[case] terminal: WriteTerminal) {
+        let (partial_writer, bytes_written, dropped) = partial_writer(terminal);
+        let mut writer = DedicatedBlobWriter {
+            upload: BlobObjectWriter {
+                path: Path::from("dedicated.blob"),
+                writer: Some(partial_writer),
+                offset: 0,
+            },
+            blob_id: 7,
+        };
+
+        match terminal {
+            WriteTerminal::Error => {
+                let error = writer.write(b"abcdef").await.unwrap_err();
+                assert!(matches!(error, Error::IO { .. }));
+                assert!(error.to_string().contains("injected write failure"));
+            }
+            WriteTerminal::Pending => cancel_pending(writer.write(b"abcdef")),
+        }
+
+        assert_eq!(bytes_written.load(Ordering::SeqCst), 2);
+        assert!(dropped.load(Ordering::SeqCst));
+        let error = writer.write(b"retry").await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("no active upload"));
+        let error = writer.finish().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("no active upload"));
     }
 }

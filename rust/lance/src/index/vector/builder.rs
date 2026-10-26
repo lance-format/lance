@@ -1781,7 +1781,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                     storage_ivf.add_partition(0);
                     index_ivf.add_partition(0);
-                    partition_index_metadata.push(String::new());
+                    // Sub-indexes that need per-partition metadata on disk
+                    // (HNSW) serialize it here; it must carry the segment's
+                    // build parameters, not type defaults.
+                    partition_index_metadata.push(
+                        S::empty_partition_metadata(self.sub_index_params.as_ref())
+                            .unwrap_or_default(),
+                    );
 
                     continue;
                 };
@@ -1845,7 +1851,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let index_batch = index.to_batch()?;
                 if index_batch.num_rows() == 0 {
                     index_ivf.add_partition(0);
-                    partition_index_metadata.push(String::new());
+                    partition_index_metadata.push(
+                        S::empty_partition_metadata(self.sub_index_params.as_ref())
+                            .unwrap_or_default(),
+                    );
                 } else {
                     index_writer.write_batch(&index_batch).await?;
                     index_ivf.add_partition(index_batch.num_rows() as u32);
@@ -1976,10 +1985,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: storage_summary.size_bytes,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_summary.size_bytes,
+                file_metadata_size_bytes: None,
             },
         ])
     }

@@ -1049,13 +1049,9 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
-    // One logical index needs one declaration. The per-segment rules below only
-    // pin the *keyed* field and its count, so segments that disagree on the
-    // carried columns -- `fields = [k, a]` beside `fields = [k]`, say -- each pass
-    // individually. Committing that pair produces an index whose own description
-    // path refuses it: `IndexDescriptionImpl::try_new` requires `fields` to be
-    // identical across segments, so `describe_indices` would error on metadata
-    // this function just wrote. Same rule, and same reason, as
+    // Per-segment validation does not establish one ordered declaration for
+    // the logical index: both carried columns and plugin dependencies can
+    // differ. Keep the same invariant as `IndexDescriptionImpl::try_new` and
     // `merge_existing_index_segments`.
     let expected_fields = segments[0].fields().to_vec();
     let expected_covering_fields = segments[0].covering_fields().to_vec();
@@ -1068,7 +1064,17 @@ pub(crate) async fn build_index_metadata_from_segments(
                 dataset.manifest.version
             )));
         }
-        if segment.keyed_field() != Some(field_id) {
+        // Multi-field statistics are built and maintained by the plugin. Empty
+        // coverage keeps them out of the single-column query and remap paths.
+        let is_multi_field_plugin = segment.fields().len() > 1
+            && segment.covering_fields().is_empty()
+            && segment.fragment_bitmap().is_empty()
+            && scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(segment.index_details())
+                .is_ok_and(|plugin| !plugin.supports_optimization());
+        if segment.keyed_field() != Some(field_id)
+            && !(is_multi_field_plugin && segment.fields().first() == Some(&field_id))
+        {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
                  expected keyed field [{}]",
@@ -1077,6 +1083,27 @@ pub(crate) async fn build_index_metadata_from_segments(
                 segment.covering_fields(),
                 field_id
             )));
+        }
+        if is_multi_field_plugin {
+            let mut seen_fields = HashSet::with_capacity(segment.fields().len());
+            for id in segment.fields() {
+                if dataset.schema().field_by_id(*id).is_none() {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: segment {} references field id {} absent from dataset version {}",
+                        segment.uuid(),
+                        id,
+                        dataset.manifest.version
+                    )));
+                }
+                if !seen_fields.insert(*id) {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: segment {} repeats field id {} in {:?}",
+                        segment.uuid(),
+                        id,
+                        segment.fields()
+                    )));
+                }
+            }
         }
         // Cardinality alone does not prove `covering_fields` is really the
         // trailing slice of `fields`; delegate that to the same rule a
@@ -1930,7 +1957,13 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
-        _ => "N/A".to_string(),
+        _ => scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+            .get_plugin_by_details(&prost_types::Any {
+                type_url: index_uri.to_string(),
+                value: Vec::new(),
+            })
+            .map(|plugin| plugin.name().to_string())
+            .unwrap_or_else(|_| "N/A".to_string()),
     }
 }
 
@@ -3047,18 +3080,6 @@ impl DatasetIndexExt for Dataset {
             .map(|details| details.type_url.clone());
         let mut incoming_fragments = RoaringBitmap::new();
         for segment in &new_indices {
-            // Mirrors `build_index_metadata_from_segments`'s guard, which
-            // already validated these exact segments. Kept in the same shape
-            // so this second look does not silently re-reject what that guard
-            // just accepted.
-            if segment.keyed_field() != Some(field.id) {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: segment {} was built for fields {:?} (carried {:?}), \
-                     expected keyed field [{}]",
-                    segment.uuid, segment.fields, segment.covering_fields, field.id
-                )));
-            }
-            segment.validate_covering_fields()?;
             if let Some(fragment_bitmap) = &segment.fragment_bitmap {
                 incoming_fragments |= fragment_bitmap.clone();
             }
@@ -3066,9 +3087,9 @@ impl DatasetIndexExt for Dataset {
 
         let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
         if existing_named_indices.iter().any(|idx| {
-            // Same name-collision rule as `CreateIndexBuilder`'s default-name
-            // loop in create.rs.
-            idx.keyed_field() != Some(field.id)
+            // Field order is part of a plugin scope's identity. Covered
+            // single-column indices still compare only their keyed prefix.
+            idx.keyed_fields() != new_indices[0].keyed_fields()
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -3187,9 +3208,16 @@ impl DatasetIndexExt for Dataset {
             .collect();
         validate_segment_params_compatible(&retained_indices, &new_indices)?;
 
+        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
+        if segment_has_inverted_details(&new_indices[0]) {
+            // Apply the merge/query semantic contract only to segments that will
+            // coexist, so a full rebuild can change the analyzer settings.
+            let segments = coexisting_indices.clone().cloned().collect::<Vec<_>>();
+            scalar::inverted::load_segment_details(self, column, &segments).await?;
+        }
+
         // The query planner ranks coexisting vector segments under one contract.
         // Validate after replacement selection so a full rebuild may change it.
-        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
         let vector_segment_count = coexisting_indices
             .clone()
             .filter(|segment| segment_has_vector_details(segment))
@@ -3383,9 +3411,9 @@ impl DatasetIndexExt for Dataset {
 /// with all of its segments, in name order.
 ///
 /// An index this build cannot rewrite is skipped with a warning: an index type
-/// it does not recognize, a segment newer than it reads, a covered index, or a
-/// scalar index with nothing to do. A covered index the caller named in
-/// `index_names` is refused instead.
+/// it does not recognize, a segment newer than it reads, a covered index, an
+/// externally maintained index, or a scalar index with nothing to do. A covered
+/// or externally maintained index named in `index_names` is refused instead.
 pub(crate) fn optimizable_indices<'a>(
     dataset: &Dataset,
     indices: &'a [IndexMetadata],
@@ -3419,6 +3447,22 @@ pub(crate) fn optimizable_indices<'a>(
                 index.name,
                 type_url
             );
+            continue;
+        }
+
+        if let Some(index) = deltas.iter().find(|index| {
+            index.index_details.as_ref().is_some_and(|details| {
+                scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                    .get_plugin_by_details(details)
+                    .is_ok_and(|plugin| !plugin.supports_optimization())
+            })
+        }) {
+            if options.index_names.is_some() {
+                return Err(Error::not_supported(format!(
+                    "Index '{}' is maintained externally and does not support optimize_indices",
+                    index.name
+                )));
+            }
             continue;
         }
 
@@ -3668,13 +3712,19 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
-        // An index that covers no fragments has no file to load statistics
-        // from: it carries its definition and nothing else until there is
-        // enough data to train it.
-        if meta
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(roaring::RoaringBitmap::is_empty)
+        // Externally maintained indices can keep coverage in their own payload
+        // and deliberately declare an empty bitmap. Other empty indices carry
+        // only a definition until there is enough data to train them.
+        let is_externally_maintained = meta.index_details.as_ref().is_some_and(|details| {
+            scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(details)
+                .is_ok_and(|plugin| !plugin.supports_optimization())
+        });
+        if !is_externally_maintained
+            && meta
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
         {
             indices_stats.push(serde_json::json!({}));
             continue;
@@ -5187,6 +5237,7 @@ mod tests {
     use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
     use lance_index::scalar::inverted::{
         INVERTED_INDEX_VERSION_V1, INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3,
+        InvertedListFormatVersion,
     };
     use lance_index::scalar::registry::ScalarIndexCacheKey;
     use lance_index::scalar::{
@@ -5250,6 +5301,7 @@ mod tests {
             files: Some(vec![lance_table::format::IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
+                file_metadata_size_bytes: None,
             }]),
         }
     }
@@ -11906,10 +11958,8 @@ mod tests {
 
     /// A segment may carry extra columns; `build_index_metadata_from_segments`
     /// must still commit it, keyed on the field the index is being built for.
-    /// Calls the guarded function directly (not through
-    /// `commit_existing_index_segments`) so this test's outcome depends only
-    /// on this guard, not on the independent duplicate a few lines into
-    /// `commit_existing_index_segments`.
+    /// Calls the metadata builder directly to isolate field validation from
+    /// commit conflict resolution and manifest writing.
     #[tokio::test]
     async fn test_build_index_metadata_from_segments_accepts_carried_fields() {
         use lance_datagen::{BatchCount, RowCount, array};
@@ -12283,12 +12333,6 @@ mod tests {
             )
             .await
             .unwrap_err();
-        // This end-to-end path is guarded twice (`build_index_metadata_from_segments`
-        // and a duplicate check in `commit_existing_index_segments` itself), so
-        // this assertion alone does not prove which one fired -- see
-        // `test_build_index_metadata_from_segments_rejects_wrong_field_provenance`
-        // for that. It still proves the public `commit_existing_index_segments`
-        // entry point rejects this input end-to-end.
         assert!(error.to_string().contains("expected keyed field"));
     }
 
@@ -12429,6 +12473,208 @@ mod tests {
             err.to_string()
                 .contains("mixes incompatible index detail types")
         );
+    }
+
+    #[rstest]
+    #[case::analyzer(InvertedIndexParams::default())]
+    #[case::split_identifiers(InvertedIndexParams::code().split_identifiers(false))]
+    #[case::positions(InvertedIndexParams::code().split_identifiers(true).with_position(true))]
+    #[case::block_size(InvertedIndexParams::code().split_identifiers(true).block_size(256).unwrap())]
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_validates_inverted_params(
+        #[case] incompatible_params: InvertedIndexParams,
+        #[values(false, true)] has_existing_index: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1, 2]),
+            (
+                "code",
+                Utf8,
+                [
+                    Some("def getUserName(): shared"),
+                    Some("fn fetchUserProfile() { shared }"),
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        let params = InvertedIndexParams::code().split_identifiers(true);
+        let original = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &params)
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        if has_existing_index {
+            dataset
+                .commit_existing_index_segments("cidx", "code", vec![original.clone()])
+                .await
+                .unwrap();
+        }
+        let version = dataset.manifest.version;
+        let original_indices = dataset.load_indices().await.unwrap();
+        let incompatible = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &incompatible_params)
+            .fragments(vec![1, 2])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let segments = if has_existing_index {
+            vec![incompatible]
+        } else {
+            vec![original.clone(), incompatible]
+        };
+        let error = dataset
+            .commit_existing_index_segments("cidx", "code", segments)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("FTS index cidx has inconsistent inverted index details across segments"),
+            "{error}"
+        );
+        assert_eq!(dataset.manifest.version, version);
+        assert_eq!(dataset.load_indices().await.unwrap(), original_indices);
+        if has_existing_index {
+            let result = dataset
+                .scan()
+                .full_text_search(FullTextSearchQuery::new("user".to_owned()))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(result.num_rows(), 2);
+        }
+
+        let compatible = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &params)
+            .fragments(vec![1, 2])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let segments = if has_existing_index {
+            vec![compatible]
+        } else {
+            vec![original, compatible]
+        };
+        dataset
+            .commit_existing_index_segments("cidx", "code", segments)
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+        let result = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("user".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1]);
+
+        // Removed segments do not constrain a full rebuild's analyzer settings.
+        let replacement = dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &incompatible_params)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let replacement_uuid = replacement.uuid;
+        dataset
+            .commit_existing_index_segments("cidx", "code", vec![replacement])
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, replacement_uuid);
+        let result = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("shared".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
+    }
+
+    #[rstest]
+    #[case::posting_format_version(
+        InvertedIndexParams::default().format_version(InvertedListFormatVersion::V3),
+        None
+    )]
+    #[case::omitted_defaults(InvertedIndexParams::default(), Some(InvertedIndexDetails::default()))]
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_accepts_equivalent_inverted_details(
+        #[case] incoming_params: InvertedIndexParams,
+        #[case] incoming_details: Option<InvertedIndexDetails>,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1]),
+            ("text", Utf8, ["hello world", "hello again"])
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let original = dataset
+            .create_index_builder(
+                &["text"],
+                IndexType::Inverted,
+                &InvertedIndexParams::default(),
+            )
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![original])
+            .await
+            .unwrap();
+        let mut incoming = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &incoming_params)
+            .name("staged_text_idx".to_owned())
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        if let Some(details) = incoming_details {
+            incoming.index_details = Some(Arc::new(prost_types::Any::from_msg(&details).unwrap()));
+        }
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![incoming])
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+        let result = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 2);
     }
 
     #[tokio::test]
@@ -14376,12 +14622,10 @@ mod tests {
     /// The multi-segment FM-Index builder reserves names on its own, so it needs
     /// the same complete view as the single-segment path.
     ///
-    /// The hidden index is a BTree and the new one an FM index, which is what
-    /// makes this test specific to the multi-segment builder: its name loop
-    /// (`index/create.rs`) only steps past a taken name when the *fields* differ,
-    /// where the single-segment loop also steps past a different index kind. So
-    /// the single-segment path would quietly settle on `text_idx_2` and succeed;
-    /// only the multi-segment path keeps `text_idx` and hits the collision.
+    /// The hidden index is an FM index too: the default-name loop steps past a
+    /// different index kind on the same column, so only an index of the same
+    /// kind keeps `text_idx` and reaches the collision check. A builder that
+    /// could not see the hidden index would commit a second `text_idx` instead.
     #[tokio::test]
     async fn test_multi_segment_fmindex_respects_an_unsupported_index_name() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -14401,9 +14645,9 @@ mod tests {
         .await
         .unwrap();
 
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         dataset
-            .create_index_builder(&["text"], IndexType::BTree, &btree_params)
+            .create_index_builder(&["text"], IndexType::Fm, &fm_params)
             .name("text_idx".to_string())
             .train(false)
             .await
@@ -14878,22 +15122,36 @@ mod tests {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
+        // A text column alongside `two_column_reader`'s numeric ones: every
+        // remaining row-id-domain scalar index type (NGram here) requires text,
+        // unlike BTree and Bitmap, which moved to row-address domain and no
+        // longer exercise this test.
+        fn three_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
+            lance_datagen::gen_batch()
+                .col("id", array::step::<Int32Type>())
+                .col("payload", array::step::<Int32Type>())
+                .col("text", array::rand_utf8(ByteCount::from(8), false))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+        }
+
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             max_rows_per_file: 5,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
+        let mut dataset =
+            Dataset::write(three_column_reader(), test_uri, Some(write_params.clone()))
+                .await
+                .unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
 
         // Row-id-domain: its coverage is recalculated (not dropped) across a
         // rewrite under stable row ids, which is exactly the property this test
-        // checks. BTree moved to row-address domain and no longer exercises it.
-        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        // checks. BTree and Bitmap moved to row-address domain and no longer
+        // exercise it.
+        let ngram_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
         dataset
-            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .create_index_builder(&["text"], IndexType::NGram, &ngram_params)
             .name("id_idx".to_string())
             .train(false)
             .await
@@ -14903,7 +15161,7 @@ mod tests {
         // A fragment the index does not cover, so a bin holding it together with
         // the covered ones would split the index's coverage.
         let mut dataset = Dataset::write(
-            two_column_reader(),
+            three_column_reader(),
             test_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,

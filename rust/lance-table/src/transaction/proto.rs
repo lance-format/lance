@@ -22,6 +22,7 @@ use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -372,8 +373,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 }
             }
+            // `data_change` is not acted on yet: every replacement is still
+            // applied as a data change.
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement { replacements, .. },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
@@ -460,6 +463,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                         .map(|f| IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: NonZero::new(f.file_metadata_size_bytes),
                         })
                         .collect(),
                 )
@@ -679,6 +683,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                         .iter()
                         .map(pb::transaction::DataReplacementGroup::from)
                         .collect(),
+                    data_change: None,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -746,6 +751,9 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
                         .map(|f| pb::IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: f
+                                .file_metadata_size_bytes
+                                .map_or(0, NonZero::get),
                         })
                         .collect()
                 })
@@ -890,5 +898,30 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_rewritten_index_roundtrips() {
+        let rewritten_index = RewrittenIndex {
+            old_id: Uuid::new_v4(),
+            new_id: Uuid::new_v4(),
+            new_index_details: prost_types::Any::default(),
+            new_index_version: 1,
+            new_index_files: Some(vec![
+                IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 4_096,
+                    file_metadata_size_bytes: NonZero::new(256),
+                },
+                IndexFile {
+                    path: "auxiliary.idx".to_string(),
+                    size_bytes: 1_024,
+                    file_metadata_size_bytes: None,
+                },
+            ]),
+        };
+
+        let message = pb::transaction::rewrite::RewrittenIndex::from(&rewritten_index);
+        assert_eq!(RewrittenIndex::try_from(&message).unwrap(), rewritten_index);
     }
 }

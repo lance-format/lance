@@ -1001,6 +1001,50 @@ impl ObjectStore {
         }
     }
 
+    /// Open a file after verifying its complete length against a checkpoint.
+    ///
+    /// Files within the existing small-file threshold are checked and buffered
+    /// by the same GET. Larger files retain the metadata check and range reader.
+    /// This does not pin a version of a mutable large file across later reads.
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn example(store: &ObjectStore, path: &Path) -> lance_core::Result<()> {
+    /// let reader = store.open_with_expected_size(path, 1024).await?;
+    /// let bytes = reader.get_range(0..16).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_with_expected_size(
+        &self,
+        path: &Path,
+        expected_size: u64,
+    ) -> Result<Box<dyn Reader>> {
+        if expected_size <= self.block_size as u64 {
+            let reader = SmallReader::open_with_expected_size(
+                self.inner.clone(),
+                path.clone(),
+                self.download_retry_count,
+                expected_size as usize,
+            )
+            .await?;
+            return Ok(Box::new(reader));
+        }
+        let actual_size = self.size(path).await?;
+        if actual_size != expected_size {
+            return Err(Error::invalid_input(format!(
+                "object at '{path}' has {actual_size} bytes, checkpoint expects {expected_size}"
+            )));
+        }
+        let size = usize::try_from(actual_size).map_err(|_| {
+            Error::invalid_input(format!(
+                "object at '{path}' is too large for this platform: {actual_size} bytes"
+            ))
+        })?;
+        self.open_with_size(path, size).await
+    }
+
     /// Create an [ObjectWriter] from local [std::path::Path]
     pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
         let object_store = Self::local();
@@ -1708,15 +1752,32 @@ impl ObjectStore {
             metrics.record(&result, 0);
             return result;
         }
-        let sub_entries = self
-            .inner
-            .list(Some(&path))
-            .map(|m| m.map(|meta| meta.location))
-            .boxed();
+        // The deletion stream owns its input; share only the deferred zero-size paths.
+        let deferred = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let deferred_entries = deferred.clone();
+        let files = self.inner.list(Some(&path)).try_filter_map(move |entry| {
+            let deferred_entries = deferred_entries.clone();
+            async move {
+                // OpenDAL directories have size zero. Empty files can be deferred too,
+                // since every child path is longer than its parent directory.
+                if entry.size == 0 {
+                    deferred_entries.lock().await.push(entry.location);
+                    Ok(None)
+                } else {
+                    Ok(Some(entry.location))
+                }
+            }
+        });
+        // Feed one continuous stream so each backend retains its batching and concurrency.
         self.inner
-            .delete_stream(sub_entries)
-            .try_collect::<Vec<_>>()
+            .delete_stream(files.boxed())
+            .try_for_each(|_| future::ready(Ok(())))
             .await?;
+        let mut deferred = std::mem::take(&mut *deferred.lock().await);
+        deferred.sort_unstable_by_key(|location| std::cmp::Reverse(location.as_ref().len()));
+        for location in deferred {
+            self.inner.delete(&location).await?;
+        }
         if self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
@@ -2538,6 +2599,126 @@ mod tests {
 
         let sub_dirs = store.read_dir(base.clone().join("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
+    }
+
+    #[derive(Debug, Default)]
+    struct BatchedDeleteStore {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        deleted: Arc<AtomicUsize>,
+        deferred: Arc<tokio::sync::Mutex<Vec<Path>>>,
+    }
+
+    impl Display for BatchedDeleteStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BatchedDeleteStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for BatchedDeleteStore {
+        async fn put_opts(&self, _: &Path, _: PutPayload, _: PutOptions) -> OSResult<PutResult> {
+            unreachable!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _: &Path,
+            _: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            unreachable!()
+        }
+
+        async fn get_opts(&self, _: &Path, _: GetOptions) -> OSResult<GetResult> {
+            unreachable!()
+        }
+
+        fn list(&self, _: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let deferred = ["dataset", "dataset/data", "dataset/data/empty"]
+                .into_iter()
+                .map(|path| (Path::from(path), 0));
+            let files = (0..20_000)
+                .map(|index| (Path::from(format!("dataset/data/{index:05}.lance")), 128));
+            futures::stream::iter(deferred.chain(files).map(|(location, size)| {
+                Ok(ObjectMeta {
+                    location,
+                    size,
+                    last_modified: Utc::now(),
+                    e_tag: None,
+                    version: None,
+                })
+            }))
+            .boxed()
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            let active = self.active.clone();
+            let peak = self.peak.clone();
+            let deleted = self.deleted.clone();
+            let deferred = self.deferred.clone();
+            // Match S3's batching and concurrency, without depending on cloud timing.
+            locations
+                .try_chunks(1000)
+                .map(move |chunk| {
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    let deleted = deleted.clone();
+                    let deferred = deferred.clone();
+                    async move {
+                        let chunk = chunk.map_err(|error| error.1)?;
+                        if chunk
+                            .first()
+                            .is_some_and(|path| path.extension() == Some("lance"))
+                        {
+                            assert!(chunk.iter().all(|path| path.extension() == Some("lance")));
+                            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(count, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            deleted.fetch_add(chunk.len(), Ordering::SeqCst);
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        } else {
+                            assert_eq!(active.load(Ordering::SeqCst), 0);
+                            assert_eq!(deleted.load(Ordering::SeqCst), 20_000);
+                            deferred.lock().await.extend(chunk.iter().cloned());
+                        }
+                        Ok::<_, object_store::Error>(futures::stream::iter(
+                            chunk.into_iter().map(Ok),
+                        ))
+                    }
+                })
+                .buffered(20)
+                .try_flatten()
+                .boxed()
+        }
+
+        async fn list_with_delimiter(&self, _: Option<&Path>) -> OSResult<ListResult> {
+            unreachable!()
+        }
+
+        async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> OSResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_all_preserves_batch_concurrency() {
+        let backend = Arc::new(BatchedDeleteStore::default());
+        let mut store = ObjectStore::memory();
+        store.inner = backend.clone();
+        store.remove_dir_all("dataset").await.unwrap();
+        assert_eq!(backend.deleted.load(Ordering::SeqCst), 20_000);
+        assert_eq!(backend.peak.load(Ordering::SeqCst), 20);
+        assert_eq!(
+            *backend.deferred.lock().await,
+            [
+                Path::from("dataset/data/empty"),
+                Path::from("dataset/data"),
+                Path::from("dataset")
+            ]
+        );
     }
 
     #[tokio::test]

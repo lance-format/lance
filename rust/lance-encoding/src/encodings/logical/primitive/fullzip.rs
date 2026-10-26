@@ -15,6 +15,7 @@ use crate::{
     format::metadata::CompressiveEncoding,
 };
 
+use arrow_buffer::BooleanBuffer;
 use lance_core::Result;
 
 /// Per-value compression must either:
@@ -51,4 +52,19 @@ pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)>;
+
+    /// Whether selection needs the structural validity of materialized tensor slots.
+    fn needs_row_validity(&self) -> bool {
+        false
+    }
+
+    /// Compress with an optional valid-row bitmap for sampling. Validity remains
+    /// owned by the structural encoder and is not part of the value payload.
+    fn compress_with_validity(
+        &self,
+        data: DataBlock,
+        _validity: Option<&BooleanBuffer>,
+    ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
+        self.compress(data)
+    }
 }

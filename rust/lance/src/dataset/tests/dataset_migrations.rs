@@ -1653,13 +1653,21 @@ async fn test_count_rows_falls_back_to_files() {
     dataset.manifest = Arc::new(manifest);
     assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
 
-    // A fragment without data files is an error, even when the manifest has
-    // its counts.
+    // A fragment without data files is valid when the manifest carries a
+    // trustworthy row count (as when the only physical column is dropped);
+    // the cached count then supplies the length.
     let mut no_files = dataset.clone();
     let mut manifest = no_files.manifest.as_ref().clone();
     let mut fragments = manifest.fragments.as_ref().clone();
     fragments[2].files.clear();
     manifest.fragments = Arc::new(fragments);
+    no_files.manifest = Arc::new(manifest);
+    assert_eq!(no_files.count_rows(None).await.unwrap(), 24);
+
+    // Without a writer version the cached count of a file-less fragment is not
+    // trusted (#1531), so count_rows reports an error.
+    let mut manifest = no_files.manifest.as_ref().clone();
+    manifest.writer_version = None;
     no_files.manifest = Arc::new(manifest);
     let err = no_files.count_rows(None).await.unwrap_err();
     assert!(matches!(err, Error::NotFound { .. }), "{err}");

@@ -69,3 +69,6 @@ pub const STRUCTURAL_ENCODING_SPARSE: &str = "sparse";
 pub const BSS_META_KEY: &str = "lance-encoding:bss";
 /// Default BSS mode
 pub const DEFAULT_BSS_MODE: &str = "auto";
+
+/// Metadata key for ALP (Adaptive Lossless floating-Point) encoding configuration
+pub const ALP_META_KEY: &str = "lance-encoding:alp";
