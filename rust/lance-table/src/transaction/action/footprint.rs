@@ -1001,8 +1001,9 @@ mod tests {
         false,
     )]
     // A child added under a struct needs the struct to still be there. The
-    // reverse order is not a footprint conflict, but the drop then finds a
-    // live child it did not name, and apply rejects it.
+    // reverse order is a precondition of the drop: it names the children it
+    // read, so a child added since would be left without its parent, and
+    // apply would reject the drop outright rather than let it retry.
     #[case::a_child_landing_after_its_parent_was_dropped(
         vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
         vec![drop_field(1)],
@@ -1011,6 +1012,24 @@ mod tests {
     #[case::a_parent_dropped_after_a_child_was_added(
         vec![drop_field(1)],
         vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        true,
+    )]
+    #[case::a_struct_dropped_children_first_after_a_child_was_added(
+        vec![drop_field(2), drop_field(1)],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        true,
+    )]
+    #[case::a_struct_dropped_after_a_child_was_added_elsewhere(
+        vec![drop_field(4), drop_field(3)],
+        vec![add_field(0, "child", Some(FieldRef::Committed(1)))],
+        false,
+    )]
+    #[case::a_struct_dropped_after_a_child_was_added_under_a_local_parent(
+        vec![drop_field(2), drop_field(1)],
+        vec![
+            add_field(0, "parent", None),
+            add_field(1, "child", Some(FieldRef::Local(0))),
+        ],
         false,
     )]
     // A stale append may write the parent packed, without the new child.
