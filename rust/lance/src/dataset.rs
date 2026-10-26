@@ -1940,6 +1940,19 @@ impl Dataset {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
     }
 
+    /// Turn the blob v2 columns of `batch` into values another dataset can be
+    /// written from: the payload bytes of every blob this dataset stores, and an
+    /// External blob's absolute URI and byte range.
+    ///
+    /// `batch` must be scanned from this dataset with blob v2 columns as
+    /// descriptors (the default) and with [`ROW_ADDR`](lance_core::ROW_ADDR),
+    /// which is dropped from the result. Blobs inside structs and lists are
+    /// converted too. Every payload in the batch is read into memory, so bound
+    /// the scan's batch size.
+    pub async fn blobs_as_logical(self: &Arc<Self>, batch: RecordBatch) -> Result<RecordBatch> {
+        optimize::transform_blob_v2_batch(self, self.schema(), batch, false).await
+    }
+
     /// Take [BlobFile] by row indices (offsets in the dataset).
     ///
     /// The result has the same null and empty blob representation as
