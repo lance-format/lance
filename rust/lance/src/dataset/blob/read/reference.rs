@@ -239,6 +239,17 @@ struct BoundLocator {
     path: Path,
 }
 
+impl BoundLocator {
+    fn key(&self) -> ObjectKey {
+        ObjectKey {
+            slot: self.slot,
+            base_id: self.object.base_id,
+            origin: self.object.origin,
+            uri: self.object.object_uri.clone(),
+        }
+    }
+}
+
 struct PreparedRequest {
     request_index: u64,
     locator: Option<BoundLocator>,
@@ -384,18 +395,12 @@ impl BlobRefReader {
     }
 
     async fn object(&self, locator: &BoundLocator) -> Result<Arc<OnceCell<CachedObject>>> {
-        let key = ObjectKey {
-            slot: locator.slot,
-            base_id: locator.object.base_id,
-            origin: locator.object.origin,
-            uri: locator.object.object_uri.clone(),
-        };
         let cell = self
             .inner
             .objects
             .lock()
             .map_err(|_| Error::internal("Blob reference object cache lock was poisoned"))?
-            .entry(key)
+            .entry(locator.key())
             .or_default()
             .clone();
         cell.get_or_try_init(|| async {
@@ -464,7 +469,8 @@ impl ReadState {
     }
 
     async fn initialize(&mut self) -> Result<()> {
-        let mut entries = Vec::new();
+        let mut pending = Vec::with_capacity(self.requests.len());
+        let mut objects = HashMap::new();
         for (index, request) in self.requests.iter().enumerate() {
             let Some(locator) = &request.locator else {
                 self.ready.push_back((index, None));
@@ -478,29 +484,68 @@ impl ReadState {
                 self.ready.push_back((index, Some(Bytes::new())));
                 continue;
             }
-            let cell = self
-                .reader
-                .object(locator)
-                .await
-                .map_err(|error| Error::io(format!("{}: {error}", self.label(index))))?;
+            pending.push((index, locator));
+            // Prefer an unknown-length demand so the single lookup for this
+            // object also initializes its cached size, regardless of input order.
+            objects
+                .entry(locator.key())
+                .and_modify(|object_index| {
+                    if locator.object.length.is_none() {
+                        *object_index = index;
+                    }
+                })
+                .or_insert(index);
+        }
+        // Deduplicate before limiting concurrency: repeated demands must not fill
+        // the window with waiters for the same OnceCell and serialize other objects.
+        let state = &*self;
+        let objects =
+            stream::iter(objects)
+                .map(|(key, index)| async move {
+                    let locator = state.requests[index].locator.as_ref().ok_or_else(|| {
+                        Error::internal("Metadata lookup requires a blob locator")
+                    })?;
+                    let cell =
+                        state.reader.object(locator).await.map_err(|error| {
+                            Error::io(format!("{}: {error}", state.label(index)))
+                        })?;
+                    if locator.object.length.is_none() {
+                        let cached = cell.get().ok_or_else(|| {
+                            Error::internal("Resolved blob reference object was not cached")
+                        })?;
+                        cached
+                            .size
+                            .get_or_try_init(|| async {
+                                cached.source.object_store.size(&cached.source.path).await
+                            })
+                            .await
+                            .map_err(|error| {
+                                Error::io(format!(
+                                    "{}: metadata lookup failed: {error}",
+                                    state.label(index)
+                                ))
+                            })?;
+                    }
+                    Ok::<_, Error>((key, cell))
+                })
+                .buffer_unordered(self.reader.inner.parallelism)
+                .try_collect::<HashMap<_, _>>()
+                .await?;
+        let mut entries = Vec::with_capacity(pending.len());
+        for (index, locator) in pending {
+            let request = &self.requests[index];
+            let cell = objects
+                .get(&locator.key())
+                .ok_or_else(|| Error::internal("Blob reference object was not resolved"))?;
             let cached = cell
                 .get()
                 .ok_or_else(|| Error::internal("Resolved blob reference object was not cached"))?;
             let size = match locator.object.length {
                 Some(size) => size,
                 None => {
-                    let object_size = *cached
-                        .size
-                        .get_or_try_init(|| async {
-                            cached.source.object_store.size(&cached.source.path).await
-                        })
-                        .await
-                        .map_err(|error| {
-                            Error::io(format!(
-                                "{}: metadata lookup failed: {error}",
-                                self.label(index)
-                            ))
-                        })?;
+                    let object_size = *cached.size.get().ok_or_else(|| {
+                        Error::internal("Blob reference object size was not resolved")
+                    })?;
                     object_size
                         .checked_sub(locator.object.offset)
                         .ok_or_else(|| {

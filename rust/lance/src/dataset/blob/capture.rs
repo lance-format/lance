@@ -196,10 +196,8 @@ impl BlobRefCapture {
         for (row, address) in row_addresses.iter().enumerate() {
             let reference = self
                 .resolver
-                .resolve(&columns, row, u64::from(*address))
-                .await?
-                .map(|resolved| resolved.into_reference(&self.dataset, &self.context))
-                .transpose()?;
+                .capture_reference(&columns, row, u64::from(*address), &self.context)
+                .await?;
             references.push(reference);
         }
         BlobRefBatch::try_new(vec![self.context.clone()], references)
