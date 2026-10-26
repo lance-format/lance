@@ -77,6 +77,10 @@ FRAGS_ROWS_PER_FRAGMENT = 1_000
 # Rows appended to `merge_insert_unindexed_tail` after the index is built.
 UNINDEXED_TAIL_ROWS = NARROW_NUM_ROWS // 10
 
+# `merge_insert_unindexed_half` indexes only its first half. The unindexed keys
+# are too many for the index join to hold in memory, so it falls back to a scan.
+UNINDEXED_HALF_INDEXED_ROWS = NARROW_NUM_ROWS // 2
+
 # `merge_insert_deleted` deletes every Nth row, which puts a deletion file on
 # every fragment.
 DELETED_ROW_STRIDE = 1000
@@ -415,9 +419,39 @@ def gen_merge_insert_unindexed_tail() -> lance.LanceDataset:
     return ds
 
 
+def gen_merge_insert_unindexed_half() -> lance.LanceDataset:
+    """Narrow layout where only the first half of the rows is indexed."""
+    name = "merge_insert_unindexed_half"
+    dataset_uri = get_dataset_uri(name)
+    if _already_generated(dataset_uri, NARROW_NUM_ROWS):
+        LOGGER.info("Dataset %s already exists, skipping", name)
+        return lance.dataset(dataset_uri)
+
+    _gen(
+        name,
+        _narrow_data(UNINDEXED_HALF_INDEXED_ROWS),
+        NARROW_SCHEMA,
+        UNINDEXED_HALF_INDEXED_ROWS,
+        NARROW_ROWS_PER_FRAGMENT,
+        NARROW_INDEXED_COLUMNS,
+    )
+    unindexed_rows = NARROW_NUM_ROWS - UNINDEXED_HALF_INDEXED_ROWS
+    LOGGER.info("Appending %d unindexed rows to %s", unindexed_rows, name)
+    ds = lance.write_dataset(
+        _narrow_data(unindexed_rows, offset=UNINDEXED_HALF_INDEXED_ROWS),
+        dataset_uri,
+        schema=NARROW_SCHEMA,
+        mode="append",
+        max_rows_per_file=NARROW_ROWS_PER_FRAGMENT,
+    )
+    _tag_base(ds)
+    return ds
+
+
 def gen_merge_insert() -> None:
     gen_merge_insert_narrow()
     gen_merge_insert_wide()
     gen_merge_insert_frags()
     gen_merge_insert_deleted()
     gen_merge_insert_unindexed_tail()
+    gen_merge_insert_unindexed_half()

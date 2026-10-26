@@ -7,8 +7,11 @@ merge_insert has two execution paths and the routing between them is
 structural, not a flag.  `use_index` is the one knob that selects between them,
 so every benchmark here is parametrized on it:
 
-  ``v1_indexed`` — ``use_index(True)`` with an indexed key.  Takes the legacy
-      indexed-scan path (``create_indexed_scan_joined_stream``).
+  ``v1_indexed`` — ``use_index(True)`` with an indexed key.  A full-schema
+      source takes the DataFusion path with the hash join replaced by index
+      lookups (``IndexJoinExec``); other shapes take the legacy indexed-scan
+      path (``create_indexed_scan_joined_stream``).  The id is kept until the
+      legacy path is removed.
   ``v2_hash`` — ``use_index(False)``.  Disables the index gate in
       ``can_use_create_plan``, so the DataFusion path
       (``LanceRead + HashJoin``) runs instead.
@@ -43,6 +46,7 @@ from ci_benchmarks.datagen.merge_insert import (
     FRAGS_SCHEMA,
     NARROW_NUM_ROWS,
     NARROW_SCHEMA,
+    UNINDEXED_HALF_INDEXED_ROWS,
     UNINDEXED_TAIL_ROWS,
     WIDE_NUM_ROWS,
     WIDE_ROWS_PER_FRAGMENT,
@@ -159,6 +163,11 @@ def deleted() -> Iterable[Target]:
 @pytest.fixture(scope="module")
 def unindexed_tail() -> Iterable[Target]:
     yield from _open_target("merge_insert_unindexed_tail")
+
+
+@pytest.fixture(scope="module")
+def unindexed_half() -> Iterable[Target]:
+    yield from _open_target("merge_insert_unindexed_half")
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +644,24 @@ def test_upsert_unindexed_tail(benchmark, unindexed_tail: Target, plan: str) -> 
 
 
 @pytest.mark.parametrize("plan", PLANS)
+def test_upsert_unindexed_half(benchmark, unindexed_half: Target, plan: str) -> None:
+    """Half the target is unindexed, too much to match in memory beside the index.
+
+    The source straddles both halves.
+    """
+    half = TARGET_SHAPE_ROWS // 2
+    row_indices = np.concatenate(
+        [existing_rows(half), existing_rows(half, offset=UNINDEXED_HALF_INDEXED_ROWS)]
+    )
+    run(
+        benchmark,
+        unindexed_half,
+        upsert("id_int", narrow_source(row_indices), use_index=uses_index(plan)),
+        expected_rows=NARROW_NUM_ROWS,
+    )
+
+
+@pytest.mark.parametrize("plan", PLANS)
 def test_upsert_with_deletion_files(benchmark, deleted: Target, plan: str) -> None:
     """Every fragment carries a deletion file, which the probe has to mask."""
     source = narrow_source(existing_rows(TARGET_SHAPE_ROWS))
@@ -707,19 +734,19 @@ def test_upsert_streaming_source(benchmark, narrow: Target, plan: str) -> None:
     )
 
 
-def test_upsert_source_equals_target(benchmark, narrow: Target) -> None:
-    """Source the same size as the target -- the probe must not be chosen here.
+@pytest.mark.parametrize("plan", PLANS)
+def test_upsert_source_equals_target(benchmark, narrow: Target, plan: str) -> None:
+    """Source the same size as the target.
 
-    v2 only: the v1 indexed path cannot run this shape at all. Its source-side
-    hash join asks for more than the whole memory pool and the operation fails
-    with "Resources exhausted". So there is no v1 baseline to compare against,
-    and this benchmark exists to keep the v2 path honest at this size.
+    Before the index join, the indexed path could not run this shape: its
+    source-side hash join asked for more than the whole memory pool and failed
+    with "Resources exhausted".
     """
     source = narrow_source(existing_rows(NARROW_NUM_ROWS))
     run(
         benchmark,
         narrow,
-        upsert("id_int", source, use_index=False),
+        upsert("id_int", source, use_index=uses_index(plan)),
         rounds=1,
         warmup=False,
         expected_rows=NARROW_NUM_ROWS,
