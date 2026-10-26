@@ -347,14 +347,15 @@ message IndexMetadata {
   string name = 3;
 
   /* The segment's watermark: the segment reflects the data of every covered
-   * fragment, including row addresses, as of this dataset version.
+   * fragment as of this dataset version.
    *
-   * Overlays with a greater `committed_version` are not reflected. Fragment
-   * reuse index versions with a `dataset_version` greater than or equal to
-   * this value have not been applied to the segment's data. The value must
-   * not exceed the first such change to a covered fragment; any value at or
-   * below the version the data was read from is valid. See the index format
-   * specification for the full rules.
+   * Merge-on-read updates (such as data overlays) committed after this
+   * version are not reflected. Stored row addresses are the ones the rows had
+   * at this version: fragment reuse index versions with a `dataset_version`
+   * greater than or equal to this value have not been applied, so addresses
+   * must still be remapped through them. The value must not exceed the
+   * version before the first such change to a covered fragment. See the index
+   * format specification for the full rules.
    */
   uint64 dataset_version = 4;
 
@@ -363,8 +364,8 @@ message IndexMetadata {
    * It may contain ids of deleted fragments. When the dataset has a fragment
    * reuse index, compacted fragments may appear by their old or new ids;
    * readers normalize the bitmap by mapping it through the fragment reuse
-   * index. It does not determine which address space the segment's data is
-   * in; `dataset_version` does.
+   * index. Because of this, the bitmap cannot tell whether the stored row
+   * addresses still need remapping; `dataset_version` does.
    *
    * The bitmap is stored as a 32-bit Roaring bitmap.
    */
