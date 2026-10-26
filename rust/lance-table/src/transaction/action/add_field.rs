@@ -90,6 +90,7 @@ impl AddField {
         }
         if let Some(parent) = self.parent {
             footprint.require_field_definition(parent);
+            footprint.add_child(parent);
             if parent.committed().is_some() {
                 footprint.write(Coordinate::NewRowSchema);
             }
