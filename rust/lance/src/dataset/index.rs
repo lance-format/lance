@@ -4,6 +4,7 @@
 pub mod frag_reuse;
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -70,7 +71,7 @@ impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
         index: &IndexMetadata,
-        mapping: &RowAddrRemap,
+        mapping: &RowAddrTranslator,
     ) -> Result<RemapResult> {
         remap_index(&self.dataset, &index.uuid, mapping).await
     }
@@ -84,9 +85,22 @@ impl IndexRemapper for DatasetIndexRemapper {
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
+        // The compaction remap is fully materialized: one shared synchronous
+        // translator serves every index.
+        let mapping = RowAddrTranslator::sync(mapping);
+        // On a stable-row-id table a row-id-domain index's ids survive the
+        // rewrite untouched; translating them through an address map would
+        // corrupt them. Of the address-domain indices, only a type that
+        // supports an eager remap is worth opening here: ZoneMap, BloomFilter
+        // and FM always report `RemapResult::Drop` below, so opening one
+        // only to immediately discard it would be wasted I/O; their fragment
+        // bitmaps are fixed up from manifest metadata alone instead (see
+        // `manifest_build.rs`'s stable-row-id `Operation::Rewrite` handler).
+        let uses_stable_row_ids = self.dataset.manifest.uses_stable_row_ids();
         let mut remapped = Vec::with_capacity(self.indices.len());
         for index in self.indices.iter() {
             let needs_remapped = !is_system_index(index)
+                && (!uses_stable_row_ids || index.supports_eager_remap())
                 && match &index.fragment_bitmap {
                     None => true,
                     Some(fragment_bitmap) => fragment_bitmap
@@ -450,8 +464,13 @@ mod tests {
         let mut legacy_covered = current[0].clone();
         legacy_covered.fields = vec![a_id, b_id];
         legacy_covered.covering_fields = vec![b_id];
-        // Force the legacy migration path this fix touches.
+        // Force the legacy migration path this fix touches. A real
+        // `index_details: None` entry predates every version bump too (it was
+        // written before `index_details` existed at all), so `index_version`
+        // must go back to 0 along with it -- otherwise `unsupported_index_version`
+        // reads it as a too-new version of an unrecognized type and hides it.
         legacy_covered.index_details = None;
+        legacy_covered.index_version = 0;
 
         let transaction = Transaction::new(
             dataset.manifest.version,
@@ -534,6 +553,11 @@ mod tests {
                 // to be longer than `fields` -- more carried fields than fields
                 // at all. No normal commit can produce this.
                 idx.index_details = None;
+                // A real `index_details: None` entry predates every version bump
+                // too, so `index_version` must go back to 0 along with it --
+                // otherwise `unsupported_index_version` hides it as a too-new
+                // version of an unrecognized type before this path is even reached.
+                idx.index_version = 0;
                 idx.covering_fields = idx
                     .fields
                     .iter()

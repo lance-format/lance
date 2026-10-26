@@ -51,6 +51,7 @@ use crate::utils::address::RowAddress;
 use crate::{Error, Result};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::size_of;
 
 /// A queryable row-address remapping with the exact semantics of
@@ -406,7 +407,7 @@ impl GroupRemap {
         }
         let total_new_rows = rewritten_rows_before;
 
-        let mut per_frag: HashMap<u32, RoaringBitmap> = rewritten_old_row_addrs
+        let mut per_frag: IntMap<u32, RoaringBitmap> = rewritten_old_row_addrs
             .bitmaps()
             .map(|(frag_id, bitmap)| (frag_id, bitmap.clone()))
             .collect();
@@ -490,17 +491,78 @@ impl DeepSizeOf for GroupRemap {
     }
 }
 
+/// Hasher for this module's integer-keyed maps.
+///
+/// `remap_row_id` probes `CompactRemapStep::frags` once per remap step per row
+/// address, so at hundreds of millions of rows the default SipHash is a large
+/// share of consolidation CPU. The keys are internal fragment ids, never
+/// attacker-supplied, so the hash-flooding resistance it buys is worth nothing here.
+///
+/// Only single-integer keys are hashed well: `write_u32`/`write_u64`/`write_usize`
+/// replace the state rather than mixing into it, so a composite key would collide on
+/// its last field alone. Correct either way — `Eq` still decides — but keep these maps
+/// keyed by one integer.
+#[derive(Clone, Copy)]
+struct IntHasher(u64);
+
+/// FNV-1a offset basis, so the byte fallback does not absorb leading zero bytes.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+impl Default for IntHasher {
+    #[inline]
+    fn default() -> Self {
+        Self(FNV_OFFSET_BASIS)
+    }
+}
+
+impl Hasher for IntHasher {
+    /// Folds the high half down: multiplication only carries upward, so without this
+    /// the low bits — which hashbrown uses to pick the bucket — would ignore the high
+    /// bits of the key, and fragment ids strided by a power of two would all land in
+    /// one bucket.
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Fallback for key types this module does not use.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+
+/// `HashMap` over single-integer keys, hashed with [`IntHasher`].
+type IntMap<K, V> = HashMap<K, V, BuildHasherDefault<IntHasher>>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactRemapStep {
     groups: Vec<GroupRemap>,
     /// Old fragment id -> its bitmap/rank layout and rewrite group. Size is
     /// O(#fragments), not rows.
-    frags: HashMap<u32, OldFragmentRemap>,
+    frags: IntMap<u32, OldFragmentRemap>,
 }
 
 impl CompactRemapStep {
     fn new(groups: impl IntoIterator<Item = GroupInput>) -> Result<Self> {
-        let mut frags = HashMap::new();
+        let mut frags = IntMap::default();
         let mut group_remaps = Vec::new();
         for input in groups {
             let gi = group_remaps.len();
@@ -521,7 +583,7 @@ impl CompactRemapStep {
     }
 
     fn new_with_layout(groups: impl IntoIterator<Item = GroupInputWithLayout>) -> Result<Self> {
-        let mut frags = HashMap::new();
+        let mut frags = IntMap::default();
         let mut group_remaps = Vec::new();
         for input in groups {
             let gi = group_remaps.len();
@@ -733,6 +795,7 @@ impl DeepSizeOf for CompactRowAddrRemap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::{prop_assert, prop_assert_eq};
 
     fn addr(frag: u32, offset: u32) -> u64 {
         u64::from(RowAddress::new_from_parts(frag, offset))
@@ -1074,5 +1137,189 @@ mod tests {
             batch,
             vec![None, None, Some(addr(20, 0)), Some(addr(1, 0)), None]
         );
+    }
+
+    fn int_hash_of<K: std::hash::Hash>(key: &K) -> u64 {
+        use std::hash::BuildHasher;
+        BuildHasherDefault::<IntHasher>::default().hash_one(key)
+    }
+
+    #[test]
+    fn test_int_hasher_is_stateless_and_spreads_low_bits() {
+        // A `BuildHasherDefault` carries no seed, so a key must hash the same at insert,
+        // at lookup and after a resize; if it did not, a key could become unreachable.
+        for value in [0u32, 1, 7, 12345, 1 << 31, u32::MAX] {
+            assert_eq!(int_hash_of(&value), int_hash_of(&value));
+        }
+        // `get` borrows the key, so the borrowed form has to agree with the owned one.
+        let key = 424242u32;
+        assert_eq!(int_hash_of(&key), int_hash_of(&&key));
+
+        // Multiplication only carries upward, so without the fold in `finish` the low
+        // bits would ignore the high bits of the key and every fragment id below would
+        // land in the same bucket.
+        let buckets = |ids: &[u32]| -> usize {
+            let table_mask = 2048 - 1;
+            ids.iter()
+                .map(|id| int_hash_of(id) & table_mask)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        let strided: Vec<u32> = (0..1024).map(|i| i << 20).collect();
+        let dense: Vec<u32> = (0..1024).collect();
+        assert!(
+            buckets(&strided) > 512,
+            "power-of-two-strided fragment ids clustered into {} of 2048 buckets",
+            buckets(&strided)
+        );
+        assert!(buckets(&dense) > 512, "dense fragment ids clustered");
+    }
+
+    #[test]
+    fn test_int_hasher_composite_keys_collide_on_last_field() {
+        // `write_u32`/`write_u64` replace the state instead of mixing into it, so a
+        // composite key keeps only its last integer field. Pinned because it is the
+        // documented reason these maps are single-integer-keyed: the map still answers
+        // correctly, it just degenerates to one bucket.
+        assert_eq!(int_hash_of(&(1u32, 5u32)), int_hash_of(&(999u32, 5u32)));
+        assert_eq!(int_hash_of(&("abc", 4u32)), int_hash_of(&("zzzzzz", 4u32)));
+
+        let mut map: IntMap<(u32, u32), u32> = IntMap::default();
+        for a in 0..48u32 {
+            for b in 0..48u32 {
+                map.insert((a, b), a * 1000 + b);
+            }
+        }
+        assert_eq!(map.len(), 48 * 48);
+        for a in 0..48u32 {
+            for b in 0..48u32 {
+                assert_eq!(map.get(&(a, b)), Some(&(a * 1000 + b)));
+            }
+        }
+        assert_eq!(map.get(&(48, 0)), None);
+    }
+
+    #[test]
+    fn test_outputs_do_not_depend_on_fragment_insertion_order() {
+        // The maps are hashed with a fixed seed, so their iteration order is stable but
+        // different from the default hasher's. Nothing observable may depend on it.
+        let remap_over = |old_frag_ids: Vec<u32>| {
+            let rewritten = RoaringTreemap::from_iter(old_frag_ids.iter().map(|f| addr(*f, 0)));
+            let num_rows = old_frag_ids.len() as u32;
+            RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: rewritten,
+                old_frag_ids,
+                new_frags: vec![(1000, num_rows)],
+            }])
+            .unwrap()
+        };
+        let forward = remap_over(vec![3, 1, 4, 1 << 20, 2 << 20, 9, 700_000]);
+        let reverse = remap_over(vec![700_000, 9, 2 << 20, 1 << 20, 4, 1, 3]);
+
+        // `old_frag_ids` order is load-bearing for the row-to-row mapping, so only the
+        // set-shaped outputs are comparable across the two.
+        assert_eq!(
+            forward.affected_fragments(),
+            reverse.affected_fragments(),
+            "affected fragments must not depend on insertion order"
+        );
+        assert_eq!(
+            forward.fully_deleted_fragments(),
+            reverse.fully_deleted_fragments()
+        );
+    }
+
+    proptest::proptest! {
+        /// The compact remap must answer exactly like a materialized old-to-new map. A
+        /// wrong answer here silently points an index at the wrong physical row, so this
+        /// compares the two forms address by address over randomized rewrites.
+        #[test]
+        fn test_compact_matches_direct_over_random_rewrites(
+            // Fragment id shapes: dense, strided by a power of two (the integer hasher's
+            // worst case), and sparse.
+            frag_seeds in proptest::collection::vec((0..3usize, 0..64u32), 1..7),
+            rows_per_frag in 1..24u32,
+            keep in proptest::collection::vec(proptest::bool::weighted(0.75), 6 * 24),
+            gaps in proptest::collection::vec(1..4u32, 1..5),
+        ) {
+            let mut old_frag_ids: Vec<u32> = Vec::new();
+            for (shape, seed) in &frag_seeds {
+                let frag_id = match shape {
+                    0 => *seed,
+                    1 => (*seed + 1) << 20,
+                    _ => seed.wrapping_mul(7919),
+                };
+                if !old_frag_ids.contains(&frag_id) {
+                    old_frag_ids.push(frag_id);
+                }
+            }
+
+            // Rewritten rows are read fragment by fragment in `old_frag_ids` order, and
+            // by ascending offset within each fragment.
+            let mut rewritten = RoaringTreemap::new();
+            let mut read_order: Vec<u64> = Vec::new();
+            let mut covered: Vec<u64> = Vec::new();
+            for (frag_index, frag_id) in old_frag_ids.iter().enumerate() {
+                for offset in 0..rows_per_frag {
+                    covered.push(addr(*frag_id, offset));
+                    if keep[frag_index * rows_per_frag as usize + offset as usize] {
+                        rewritten.insert(addr(*frag_id, offset));
+                        read_order.push(addr(*frag_id, offset));
+                    }
+                }
+            }
+            let total_rewritten = read_order.len() as u32;
+            proptest::prop_assume!(total_rewritten > 0);
+
+            // Spread the rewritten rows over ascending new fragment ids, every fragment
+            // non-empty so the row counts still add up.
+            let parts = gaps.len().min(total_rewritten as usize);
+            let base = total_rewritten / parts as u32;
+            let remainder = total_rewritten % parts as u32;
+            let mut new_frags: Vec<(u32, u32)> = Vec::with_capacity(parts);
+            let mut new_frag_id = 10_000u32;
+            for (part, gap) in gaps.iter().take(parts).enumerate() {
+                let rows = base + u32::from((part as u32) < remainder);
+                new_frags.push((new_frag_id, rows));
+                new_frag_id += gap;
+            }
+
+            // The same mapping, materialized one address at a time.
+            let mut direct: HashMap<u64, Option<u64>> = HashMap::new();
+            let mut read_order_iter = read_order.iter();
+            for (new_frag_id, rows) in &new_frags {
+                for offset in 0..*rows {
+                    let old = read_order_iter.next().unwrap();
+                    direct.insert(*old, Some(addr(*new_frag_id, offset)));
+                }
+            }
+            prop_assert!(read_order_iter.next().is_none());
+            for old in &covered {
+                direct.entry(*old).or_insert(None);
+            }
+
+            let compact = RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: rewritten,
+                old_frag_ids: old_frag_ids.clone(),
+                new_frags,
+            }])
+            .unwrap();
+            let direct = RowAddrRemap::direct(direct);
+
+            for old in &covered {
+                prop_assert_eq!(
+                    compact.get(*old),
+                    direct.get(*old),
+                    "address {:#x} in fragments {:?}",
+                    old,
+                    old_frag_ids
+                );
+            }
+            // Fragments no group covers are left alone.
+            for frag_id in [0xFFFF_FFF0u32, 0x7EEE_EEEE] {
+                prop_assert_eq!(compact.get(addr(frag_id, 0)), None);
+            }
+            prop_assert_eq!(compact.affected_fragments(), direct.affected_fragments());
+        }
     }
 }

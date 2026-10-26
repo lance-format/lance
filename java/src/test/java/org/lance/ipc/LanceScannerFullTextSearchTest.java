@@ -121,6 +121,48 @@ class LanceScannerFullTextSearchTest {
   }
 
   @Test
+  void testCombinedFields() throws Exception {
+    // "hello" appears in doc or title of every row, so all 3 match.
+    FullTextQuery combined = FullTextQuery.combinedFields("hello", Arrays.asList("doc", "title"));
+    runFtsQuery("memory://fts_java_combined", combined, 3);
+  }
+
+  @Test
+  void testCombinedFieldsAndMatchesAcrossColumns() throws Exception {
+    // Rows 0 and 1 have "hello" only in doc and "bye" only in title. With AND, only a query
+    // that treats both columns as one field can match them; multiMatch requires every term in a
+    // single column and finds nothing.
+    FullTextQuery combined =
+        FullTextQuery.combinedFields(
+            "hello bye",
+            Arrays.asList("doc", "title"),
+            Arrays.asList(2.0f, 1.0f),
+            FullTextQuery.Operator.AND);
+    runFtsQuery("memory://fts_java_combined_and", combined, 2L);
+
+    FullTextQuery multiMatch =
+        FullTextQuery.multiMatch(
+            "hello bye", Arrays.asList("doc", "title"), null, FullTextQuery.Operator.AND);
+    runFtsQuery("memory://fts_java_multimatch_and", multiMatch, 0L);
+  }
+
+  @Test
+  void testCombinedFieldsInvalidBoostPropagates() {
+    // Boost validation lives in the Rust core and must surface across the JNI boundary.
+    FullTextQuery combined =
+        FullTextQuery.combinedFields(
+            "hello",
+            Arrays.asList("doc", "title"),
+            Arrays.asList(0.5f, 1.0f),
+            FullTextQuery.Operator.OR);
+    IllegalArgumentException ex =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> runFtsQuery("memory://fts_java_combined_bad_boost", combined, 0L));
+    assertTrue(ex.getMessage().contains("combined_fields boost for column 'doc'"), ex.getMessage());
+  }
+
+  @Test
   void testBooleanQuery() throws Exception {
     FullTextQuery.MatchQuery shouldMatch =
         (FullTextQuery.MatchQuery) FullTextQuery.match("hello", "doc");

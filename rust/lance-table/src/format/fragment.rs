@@ -13,7 +13,10 @@ use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
-use super::row_ids::RowIdMeta;
+use super::row_ids::{
+    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    RowIdMeta,
+};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -25,7 +28,7 @@ use lance_core::error::Result;
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
@@ -53,21 +56,38 @@ pub struct DataFile {
     /// The size of the file in bytes, if known.
     pub file_size_bytes: CachedFileSize,
 
+    /// The metadata suffix size in bytes, if known.
+    ///
+    /// The suffix starts at global buffer 0, which holds the `FileDescriptor`,
+    /// and ends at EOF. Readers treat this as an advisory hint and use the file
+    /// footer as authoritative. `None` preserves the footer-directed open path
+    /// used for older manifests.
+    pub file_metadata_size_bytes: Option<NonZero<u64>>,
+
     /// The base path of the datafile, when the datafile is outside the dataset.
     pub base_id: Option<u32>,
+}
+
+impl DeepSizeOf for DataFile {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.path.deep_size_of_children(context)
+            + self.fields.deep_size_of_children(context)
+            + self.column_indices.deep_size_of_children(context)
+    }
 }
 
 // Custom Serialize: convert Arc<[i32]> to slice for transparent JSON output
 impl Serialize for DataFile {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("DataFile", 7)?;
+        let mut s = serializer.serialize_struct("DataFile", 8)?;
         s.serialize_field("path", &self.path)?;
         s.serialize_field("fields", self.fields.as_ref())?;
         s.serialize_field("column_indices", self.column_indices.as_ref())?;
         s.serialize_field("file_major_version", &self.file_major_version)?;
         s.serialize_field("file_minor_version", &self.file_minor_version)?;
         s.serialize_field("file_size_bytes", &self.file_size_bytes)?;
+        s.serialize_field("file_metadata_size_bytes", &self.file_metadata_size_bytes)?;
         s.serialize_field("base_id", &self.base_id)?;
         s.end()
     }
@@ -87,6 +107,7 @@ impl<'de> Deserialize<'de> for DataFile {
             #[serde(default)]
             file_minor_version: u32,
             file_size_bytes: CachedFileSize,
+            file_metadata_size_bytes: Option<NonZero<u64>>,
             base_id: Option<u32>,
         }
 
@@ -98,6 +119,7 @@ impl<'de> Deserialize<'de> for DataFile {
             file_major_version: helper.file_major_version,
             file_minor_version: helper.file_minor_version,
             file_size_bytes: helper.file_size_bytes,
+            file_metadata_size_bytes: helper.file_metadata_size_bytes,
             base_id: helper.base_id,
         })
     }
@@ -121,6 +143,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
+            file_metadata_size_bytes: None,
             base_id,
         }
     }
@@ -135,6 +158,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
+            file_metadata_size_bytes: None,
             base_id: None,
         }
     }
@@ -166,7 +190,73 @@ impl DataFile {
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {
-        full_schema.project_by_ids(&self.fields, false)
+        // Structural field IDs describe physical headers in V2.0 and may also
+        // appear with column_index=-1 in older V2.1+ manifests. They do not, by
+        // themselves, mean that every child in the current dataset schema is
+        // present in this file. In particular, a struct can retain its ID while
+        // schema evolution replaces its last old child with a new one.
+        fn project_field(
+            field: &lance_core::datatypes::Field,
+            mapped_columns: &HashMap<i32, i32>,
+            is_v2_0: bool,
+        ) -> Option<lance_core::datatypes::Field> {
+            if field.is_blob() || field.is_packed_struct() {
+                return mapped_columns
+                    .contains_key(&field.id)
+                    .then(|| field.clone());
+            }
+
+            let children = field
+                .children
+                .iter()
+                .filter_map(|child| project_field(child, mapped_columns, is_v2_0))
+                .collect::<Vec<_>>();
+            if !children.is_empty() {
+                return Some(lance_core::datatypes::Field {
+                    children,
+                    ..field.clone()
+                });
+            }
+
+            if field.children.is_empty() && mapped_columns.contains_key(&field.id) {
+                return Some(field.clone());
+            }
+
+            // V2.0 stores a physical header for structural fields. Keep that
+            // header to preserve the parent's row count and validity, but leave
+            // its children empty so missing descendants are null-filled by the
+            // fragment reader instead of being added to this file's projection.
+            if is_v2_0 && mapped_columns.contains_key(&field.id) {
+                return Some(lance_core::datatypes::Field {
+                    children: Vec::new(),
+                    ..field.clone()
+                });
+            }
+            None
+        }
+
+        if self.uses_v1_data_file_encoding() {
+            return full_schema.project_by_ids(&self.fields, false);
+        }
+        let mapped_columns = self
+            .fields
+            .iter()
+            .copied()
+            .zip(self.column_indices.iter().copied())
+            .filter(|(_, column_index)| *column_index >= 0)
+            .collect::<HashMap<_, _>>();
+        let is_v2_0 = matches!(
+            (self.file_major_version, self.file_minor_version),
+            (0, 3) | (2, 0)
+        );
+        Schema {
+            fields: full_schema
+                .fields
+                .iter()
+                .filter_map(|field| project_field(field, &mapped_columns, is_v2_0))
+                .collect(),
+            metadata: full_schema.metadata.clone(),
+        }
     }
 
     fn uses_v1_data_file_encoding(&self) -> bool {
@@ -220,6 +310,7 @@ impl From<&DataFile> for pb::DataFile {
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
             base_id: df.base_id,
+            file_metadata_size_bytes: df.file_metadata_size_bytes.map_or(0, NonZero::get),
         }
     }
 }
@@ -236,6 +327,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            file_metadata_size_bytes: NonZero::new(proto.file_metadata_size_bytes),
         })
     }
 }
@@ -349,6 +441,7 @@ impl DataFileFieldInterner {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            file_metadata_size_bytes: NonZero::new(proto.file_metadata_size_bytes),
         })
     }
 
@@ -600,6 +693,61 @@ impl Fragment {
         Ok(file)
     }
 
+    /// The reserved field ids of the row lineage sequences this fragment
+    /// marks as spilled: [`ROW_ID_FIELD_ID`] when its row ids are, and
+    /// likewise [`ROW_CREATED_AT_VERSION_FIELD_ID`] and
+    /// [`ROW_LAST_UPDATED_AT_VERSION_FIELD_ID`] for its versions.
+    ///
+    /// These ids are never in the dataset schema, so code that decides whether
+    /// a data file is still needed by its schema fields has to keep a file
+    /// carrying one of them as well: that file is the sequence's only copy.
+    pub fn spilled_row_lineage_field_ids(&self) -> Vec<i32> {
+        let mut field_ids = Vec::new();
+        if matches!(self.row_id_meta, Some(RowIdMeta::Column)) {
+            field_ids.push(ROW_ID_FIELD_ID);
+        }
+        if matches!(
+            self.created_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_CREATED_AT_VERSION_FIELD_ID);
+        }
+        if matches!(
+            self.last_updated_at_version_meta,
+            Some(RowDatasetVersionMeta::Column)
+        ) {
+            field_ids.push(ROW_LAST_UPDATED_AT_VERSION_FIELD_ID);
+        }
+        field_ids
+    }
+
+    /// Check that every sequence this fragment marks as spilled has exactly
+    /// one carrier among [`Self::files`], and that the carrier is a v2 file,
+    /// the only version that can hold the columns.
+    ///
+    /// This reads metadata only. Committing a fragment that fails it would
+    /// publish lineage no reader can load, and once cleanup removed the
+    /// unreferenced carrier that lineage would be lost for good.
+    pub(crate) fn validate_row_lineage_carriers(&self) -> Result<()> {
+        for field_id in self.spilled_row_lineage_field_ids() {
+            let Some(file) = self.row_lineage_file(field_id)? else {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: it marks row lineage field {} as spilled but \
+                     none of its data files carries it",
+                    self.id, field_id
+                )));
+            };
+            if file.file_version()? == ConcreteFileVersion::V1 {
+                return Err(Error::internal(format!(
+                    "cannot commit fragment {}: its spilled row lineage field {} is carried by \
+                     legacy v1 data file {}, which cannot hold row lineage columns",
+                    self.id, field_id, file.path
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_json(json: &str) -> Result<Self> {
         let fragment: Self = serde_json::from_str(json)?;
         Ok(fragment)
@@ -778,6 +926,8 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            clustering_id: None,
+            metadata: Default::default(),
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }
@@ -794,6 +944,7 @@ mod tests {
     use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
     use object_store::path::Path;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use serde_json::{Value, json};
 
     #[test]
@@ -924,6 +1075,7 @@ mod tests {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
         fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.files[0].file_metadata_size_bytes = NonZero::new(1_024);
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
@@ -1010,10 +1162,101 @@ mod tests {
     }
 
     #[test]
-    fn test_to_json() {
+    fn data_file_schema_does_not_substitute_evolved_struct_children() {
+        let mut schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "values",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "later",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+        ]))
+        .unwrap();
+        schema.set_field_id(None);
+        let parent_id = schema.fields[0].id;
+        let later_id = schema.fields[0].children[0].id;
+        let id_field_id = schema.fields[1].id;
+        schema.fields[0].children[0].id = later_id + 2;
+
+        let stale_file = DataFile::new(
+            "stale.lance",
+            vec![parent_id, later_id, id_field_id],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let stale_schema = stale_file.schema(&schema);
+        assert_eq!(
+            stale_schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["values", "id"]
+        );
+        assert!(stale_schema.fields[0].children.is_empty());
+
+        let stale_v2_1_file = DataFile::new(
+            "stale-v2-1.lance",
+            vec![parent_id, later_id, id_field_id],
+            vec![-1, 0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        assert_eq!(
+            stale_v2_1_file.schema(&schema).fields,
+            vec![schema.fields[1].clone()]
+        );
+
+        let current_file = DataFile::new(
+            "current.lance",
+            vec![parent_id, later_id + 2, id_field_id],
+            vec![0, 1, 2],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        assert_eq!(current_file.schema(&schema), schema);
+    }
+
+    #[rstest]
+    #[case::present(1_024, NonZero::new(1_024))]
+    #[case::absent(0, None)]
+    fn test_intern_fragment_file_metadata_size_bytes(
+        #[case] encoded: u64,
+        #[case] expected: Option<NonZero<u64>>,
+    ) {
+        let proto = pb::DataFragment {
+            files: vec![pb::DataFile {
+                path: "data.lance".to_string(),
+                fields: vec![0],
+                file_metadata_size_bytes: encoded,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let interned = DataFileFieldInterner::default()
+            .intern_fragment(proto.clone())
+            .unwrap();
+        assert_eq!(interned.files[0].file_metadata_size_bytes, expected);
+        assert_eq!(interned, Fragment::try_from(proto).unwrap());
+    }
+
+    #[rstest]
+    #[case::present(NonZero::new(1_024))]
+    #[case::absent(None)]
+    fn test_to_json(#[case] file_metadata_size_bytes: Option<NonZero<u64>>) {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
         fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.files[0].file_metadata_size_bytes = file_metadata_size_bytes;
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
@@ -1024,7 +1267,7 @@ mod tests {
 
         let json = serde_json::to_string(&fragment).unwrap();
 
-        let value: Value = serde_json::from_str(&json).unwrap();
+        let mut value: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             value,
             json!({
@@ -1032,7 +1275,8 @@ mod tests {
                 "files":[
                     {"path": "foobar.lance", "fields": [0], "column_indices": [], 
                      "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null, "base_id": null }
+                     "file_size_bytes": null, "file_metadata_size_bytes": file_metadata_size_bytes,
+                     "base_id": null }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                   "num_deleted_rows": 10, "base_id": null},
@@ -1041,6 +1285,14 @@ mod tests {
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+
+        // JSON written before the hint existed has no key for it.
+        value["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("file_metadata_size_bytes");
+        let frag3: Fragment = serde_json::from_value(value).unwrap();
+        assert_eq!(frag3.files[0].file_metadata_size_bytes, None);
     }
 
     #[test]
@@ -1053,6 +1305,7 @@ mod tests {
             file_major_version: MAJOR_VERSION as u32,
             file_minor_version: MINOR_VERSION as u32,
             file_size_bytes: Default::default(),
+            file_metadata_size_bytes: None,
             base_id: None,
         };
 

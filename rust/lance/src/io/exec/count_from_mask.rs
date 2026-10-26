@@ -507,24 +507,23 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::io::exec::scalar_index::ScalarIndexExec;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    #[allow(deprecated)]
-    use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
+    use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 
     /// Build an `AggregateFunctionExpr` matching `COUNT(*)`.
-    // TODO(datafusion-54): migrate off the deprecated
-    // create_aggregate_expr_and_maybe_filter to LoweredAggregateBuilder.
-    #[allow(deprecated)]
     fn count_star_expr(input_schema: &SchemaRef) -> Arc<AggregateFunctionExpr> {
         let expr = functions_aggregate::count::count(lit(1));
         let df_schema = DFSchema::try_from(input_schema.as_ref().clone()).unwrap();
-        let (agg_expr, _filter, _order_by) = create_aggregate_expr_and_maybe_filter(
+        LoweredAggregateBuilder::new(
             &expr,
             &df_schema,
             input_schema.as_ref(),
             &ExecutionProps::default(),
         )
-        .unwrap();
-        agg_expr
+        .with_name(expr.schema_name().to_string())
+        .with_human_display(expr.human_display().to_string())
+        .build()
+        .unwrap()
+        .aggregate
     }
 
     struct Fixture {

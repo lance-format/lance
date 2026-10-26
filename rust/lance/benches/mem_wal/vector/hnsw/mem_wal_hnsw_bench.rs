@@ -38,6 +38,12 @@ struct Args {
     /// When > 0, run the query workload in a loop for this many seconds
     /// (sustained read), instead of `query_repeats` passes.
     query_seconds: f64,
+    /// Graph capacity; 0 means `rows`. A MemTable's graph is sized by
+    /// `max_memtable_rows`, usually well above the rows it ends up holding.
+    capacity: usize,
+    /// Rows per `insert_batch` call; 0 inserts every row in one call. A
+    /// MemTable inserts one write's rows at a time.
+    batch_rows: usize,
 }
 
 impl Default for Args {
@@ -58,6 +64,8 @@ impl Default for Args {
             query_repeats: 1,
             insert_seconds: 0.0,
             query_seconds: 0.0,
+            capacity: 0,
+            batch_rows: 0,
         }
     }
 }
@@ -98,8 +106,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         values,
         None,
     )?);
+    let capacity = if args.capacity == 0 {
+        args.rows
+    } else {
+        args.capacity
+    };
     let store = Arc::new(ArrowFixedSizeListVectorStore::try_new(
-        args.rows,
+        capacity,
         1,
         args.dim,
         DistanceType::L2,
@@ -120,9 +133,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut insert_passes: u64 = 0;
     let mut insert_core = std::time::Duration::ZERO;
     let graph = loop {
-        let g = HnswGraph::try_new(args.rows, params.clone())?;
+        let g = HnswGraph::try_new(capacity, params.clone())?;
         let core = Instant::now();
-        g.insert_batch(ids.clone(), &snapshot)?;
+        let step = if args.batch_rows == 0 {
+            args.rows
+        } else {
+            args.batch_rows
+        } as u32;
+        let mut start = ids.start;
+        while start < ids.end {
+            let end = (start + step).min(ids.end);
+            g.insert_batch(start..end, &snapshot)?;
+            start = end;
+        }
         insert_core += core.elapsed();
         insert_passes += 1;
         if args.insert_seconds <= 0.0 || insert_start.elapsed().as_secs_f64() >= args.insert_seconds
@@ -187,6 +210,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .sum();
     let truth_s = truth_start.elapsed().as_secs_f64();
     let recall_at_k = recall_hits as f64 / (args.truth_queries * args.k) as f64;
+
+    let resident_bytes = graph.resident_bytes();
+    let drop_start = Instant::now();
+    drop(graph);
+    let drop_s = drop_start.elapsed().as_secs_f64();
+    println!(
+        "lifecycle impl=lance_hnsw rows={} capacity={} resident_bytes={} drop_s={:.6}",
+        args.rows, capacity, resident_bytes, drop_s
+    );
 
     println!(
         "result impl=lance_hnsw rows={} dim={} generate_s={:.6} arrow_s={:.6} insert_s={:.6} insert_passes={} insert_qps={:.3} insert_core_s={:.6} insert_core_qps={:.3} query_s={:.6} query_passes={} query_qps={:.3} truth_s={:.6} recall_at_{}={:.6} self_recall_at_{}={:.6}",
@@ -255,6 +287,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--query-repeats" => args.query_repeats = value.parse()?,
             "--insert-seconds" => args.insert_seconds = value.parse()?,
             "--query-seconds" => args.query_seconds = value.parse()?,
+            "--capacity" => args.capacity = value.parse()?,
+            "--batch-rows" => args.batch_rows = value.parse()?,
             _ => return Err(format!("unknown argument: {flag}").into()),
         }
     }

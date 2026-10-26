@@ -25,7 +25,9 @@ use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 use crate::IndexParams;
 pub use crate::metrics::MetricsCollector;
 pub use lance_index_core::remapping::{
-    BatchRowIdRemapper, LEGACY_TRAFFIC_ONLY, check_batch_remapping_entry,
+    BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, LEGACY_TRAFFIC_ONLY,
+    RemapUnavailable, RowAddrTranslator, RowAddrTranslatorRef, check_batch_remapping_entry,
+    materialize_remap,
 };
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
@@ -45,6 +47,8 @@ pub mod lance_format;
 pub mod minhash_lsh;
 pub mod ngram;
 pub mod registry;
+#[cfg(test)]
+mod remap_compat_tests;
 #[cfg(feature = "geo")]
 pub mod rtree;
 pub mod seed;
@@ -56,8 +60,8 @@ pub use inverted::tokenizer::InvertedIndexParams;
 /// Convert a `Vec<`[`lance_index_core::scalar::IndexFile`]`>` to a
 /// `Vec<`[`lance_table::format::IndexFile`]`>`.
 ///
-/// These two structs have identical fields; this helper bridges the crate
-/// boundary without relying on orphan-rule–violating `From` impls.
+/// These structs share their path and total size fields; this helper bridges the
+/// crate boundary without relying on orphan-rule–violating `From` impls.
 pub fn index_files_to_table(
     files: Vec<lance_index_core::scalar::IndexFile>,
 ) -> Vec<lance_table::format::IndexFile> {
@@ -66,6 +70,7 @@ pub fn index_files_to_table(
         .map(|f| lance_table::format::IndexFile {
             path: f.path,
             size_bytes: f.size_bytes,
+            file_metadata_size_bytes: None,
         })
         .collect()
 }
@@ -73,8 +78,8 @@ pub fn index_files_to_table(
 /// Convert a `Vec<`[`lance_table::format::IndexFile`]`>` to a
 /// `Vec<`[`lance_index_core::scalar::IndexFile`]`>`.
 ///
-/// These two structs have identical fields; this helper bridges the crate
-/// boundary without relying on orphan-rule–violating `From` impls.
+/// These structs share their path and total size fields; this helper bridges the
+/// crate boundary without relying on orphan-rule–violating `From` impls.
 pub fn table_files_to_index(
     files: Vec<lance_table::format::IndexFile>,
 ) -> Vec<lance_index_core::scalar::IndexFile> {

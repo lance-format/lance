@@ -15,6 +15,18 @@ use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
+fn ensure_label_list_details(segment: &IndexMetadata) -> Result<()> {
+    if let Some(details) = segment.index_details.as_ref()
+        && !details.type_url.ends_with("LabelListIndexDetails")
+    {
+        return Err(Error::invalid_input(format!(
+            "Segment '{}' is not a LabelList segment (details type_url = '{}')",
+            segment.uuid, details.type_url
+        )));
+    }
+    Ok(())
+}
+
 async fn validate_nullable_segment_for_merge(
     dataset: &Dataset,
     field_id: i32,
@@ -63,9 +75,34 @@ async fn validate_nullable_segment_for_merge(
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
+    }
+
+    for segment in &segments {
+        ensure_label_list_details(segment)?;
+    }
+
+    // A pre-migration segment stores row ids directly, which on a
+    // stable-row-id dataset are a different domain than the row addresses a
+    // modern segment stores; merging the two into one segment would silently
+    // combine incompatible values in the postings column. This path never
+    // rescans the dataset to repair that, so refuse rather than corrupt --
+    // the caller should fully rebuild the legacy segment first (e.g. via
+    // `create_index(..., replace: true)`).
+    if dataset.manifest.uses_stable_row_ids() {
+        for segment in &segments {
+            if !segment.results_are_row_addrs() {
+                return Err(Error::invalid_input(format!(
+                    "LabelList merge_segments: segment {} predates row-address-domain support \
+                     and cannot be merged on a dataset with stable row IDs; rebuild it first \
+                     (e.g. with create_index(..., replace: true))",
+                    segment.uuid,
+                )));
+            }
+        }
     }
 
     let field_id = *segments[0].fields.first().ok_or_else(|| {
@@ -102,6 +139,7 @@ pub(in crate::index) async fn merge_segments(
             dataset,
             &effective_old_frags,
             &deleted_old_frags,
+            true,
         )
         .await?
     };
@@ -109,8 +147,15 @@ pub(in crate::index) async fn merge_segments(
     let mut source_indices = Vec::with_capacity(segments.len());
     for segment in &segments {
         validate_nullable_segment_for_merge(dataset, field_id, segment).await?;
-        let scalar_index =
-            super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
+        let scalar_index = super::open_scalar_index_with_plan(
+            dataset,
+            &field_path,
+            segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
         let label_list_index = scalar_index
             .as_any()
             .downcast_ref::<LabelListIndex>()

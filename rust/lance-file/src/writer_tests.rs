@@ -61,6 +61,101 @@ mod tests {
             .map(Into::into)
     }
 
+    fn create_v2_3_writer_with_compression(
+        object_writer: Box<dyn Writer>,
+        schema: LanceSchema,
+        options: FileWriterOptions,
+        compression: CompressionParams,
+    ) -> lance_core::Result<FileWriter> {
+        versions::v2_3::create_writer_with_compression(object_writer, schema, options, compression)
+            .map(Into::into)
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_alp_rd_single_dictionary_default_compression() {
+        // A slow linear drift whose pages collapse to a one-entry ALP-RD
+        // dictionary writes an empty index stream (index_bits == 0). The files
+        // must still read back end-to-end through the default Compress-All path;
+        // this is the integration-level companion to the ALP-RD unit test.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            DataType::Float64,
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let n = 65536usize;
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = SmallRng::seed_from_u64(0x05ee_da1b_2026_1023);
+        let mut gauss = || {
+            let u1: f64 = rng.random_range(1e-12..1.0);
+            let u2: f64 = rng.random();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let vals: Vec<f64> = (0..n)
+            .map(|i| 1_000_000.0 + i as f64 * 0.1 + gauss() * 0.01)
+            .collect();
+        let expected_sum: f64 = vals.iter().sum();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema,
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        let arr = Arc::new(arrow_array::Float64Array::from(vals));
+        let batch = RecordBatch::try_new(arrow_schema, vec![arr]).unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stream = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        assert_eq!(total, n as u64);
+        let read_sum: f64 = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .sum();
+        assert_eq!(read_sum, expected_sum);
+    }
+
     fn reader_projection_from_column_names(
         version: ConcreteFileVersion,
         schema: &LanceSchema,
@@ -97,6 +192,30 @@ mod tests {
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
         // Tests asserting the contents of the written file are in reader.rs
+    }
+
+    #[rstest]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_negative_dictionary_values_with_runt_tail(#[case] version: ConcreteFileVersion) {
+        let values: Vec<i64> = (0..9216_u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 7) % 1600) as i64 - 800)
+            .collect();
+        let batch = arrow_array::record_batch!(("f0", Int64, values)).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let fs = FsFixture::default();
+
+        crate::testing::write_lance_file(reader, &fs, version, FileWriterOptions::default()).await;
+        let read = crate::testing::read_lance_file(
+            &fs,
+            Arc::new(DecoderPlugins::default()),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read, batch);
     }
 
     #[tokio::test]
@@ -787,6 +906,191 @@ mod tests {
             )
             .await,
             vec![Some(4), Some(5), Some(6)]
+        );
+    }
+
+    /// The 2.1+ preflight must pair each field with the array encoding will select for
+    /// it. Pairing `batch.columns()` positionally against the schema misreads a batch
+    /// whose column order differs: it rejects a legal null in the nullable field while
+    /// naming the non-nullable one, and lets a null through in the non-nullable field.
+    #[rstest]
+    #[case::null_in_nullable_field(true, true)]
+    #[case::null_in_non_nullable_field(false, false)]
+    #[tokio::test]
+    async fn test_structural_writer_verifies_name_selected_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+        #[case] null_in_nullable: bool,
+        #[case] should_succeed: bool,
+    ) {
+        // The schema declares "a" non-nullable; the batch puts "b" first, so a
+        // positional pairing would check "a" against "b"'s array. The batch's
+        // columns are both nullable (what `record_batch!` builds); the writer's
+        // schema is the contract being checked.
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let with_null: Vec<Option<i32>> = vec![Some(1), None, Some(3)];
+        let without_null: Vec<Option<i32>> = vec![Some(4), Some(5), Some(6)];
+        let (b, a) = if null_in_nullable {
+            (with_null, without_null)
+        } else {
+            (without_null, with_null)
+        };
+        let batch = arrow_array::record_batch!(("b", Int32, b), ("a", Int32, a)).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if should_succeed {
+            result.expect("a null in the nullable field must be accepted");
+            writer.finish().await.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, lance_core::Error::InvalidInput { .. }),
+                "expected InvalidInput, got: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("field `a` contained null values"),
+                "expected the error to name field `a`, got: {error}"
+            );
+        }
+    }
+
+    /// With two batch columns named `a`, encoding selects the first via
+    /// `column_by_name`, so the nullability preflight must check that same first
+    /// column. Non-nullable `a` sits at schema index 1, where a positional pairing
+    /// would line it up with the second `a` (which carries a null) and wrongly
+    /// reject; name selection validates the first `a` that is actually written.
+    /// Guards against a future positional fast path reintroducing the mismatch.
+    #[rstest]
+    #[tokio::test]
+    async fn test_structural_writer_checks_first_duplicate_column_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("z", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(writer_schema.as_ref()).unwrap();
+        // Two columns named "a": the first is what `column_by_name` (and the
+        // encoder) selects and is null-free; the second carries a null and must
+        // be ignored by the name-selected check.
+        let first_a: Vec<Option<i32>> = vec![Some(1), Some(2), Some(3)];
+        let second_a: Vec<Option<i32>> = vec![Some(4), None, Some(6)];
+        let z: Vec<Option<i32>> = vec![Some(7), Some(8), Some(9)];
+        let batch = arrow_array::record_batch!(
+            ("a", Int32, first_a),
+            ("a", Int32, second_a),
+            ("z", Int32, z)
+        )
+        .unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        writer
+            .write_batch(&batch)
+            .await
+            .expect("the first \"a\" is null-free, so the name-selected check accepts it");
+        writer.finish().await.unwrap();
+
+        // Read `a` back: the encoder must have written the first `a` (null-free),
+        // not the second. A positional fast path on the encoding side would write
+        // the second `a` and its null, passing the preflight but only failing here.
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_int32_column(
+                &reader,
+                &lance_schema,
+                version,
+                "a",
+                lance_io::ReadBatchParams::RangeFull,
+            )
+            .await,
+            vec![Some(1), Some(2), Some(3)]
+        );
+    }
+
+    /// A batch missing a column the schema names is rejected when arrays are
+    /// selected by name, not written short. The type preflight leaves a missing
+    /// column for this step (`check_batch` skips absent columns), so the error
+    /// has to come from the name selection itself.
+    #[rstest]
+    #[tokio::test]
+    async fn test_structural_writer_rejects_batch_missing_column(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        // The schema names "a" and "b", both nullable so only the absence of a
+        // column can fail the write; the batch carries only "a".
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let a: Vec<Option<i32>> = vec![Some(1), Some(2), Some(3)];
+        let batch = arrow_array::record_batch!(("a", Int32, a)).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let error = writer.write_batch(&batch).await.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("missing the column `b`"),
+            "expected the error to name the missing column `b`, got: {error}"
         );
     }
 
@@ -1492,6 +1796,8 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -1764,6 +2070,244 @@ mod tests {
             status_encoding.contains("RLE") || status_encoding.contains("Rle"),
             "status column should use RLE encoding due to metadata threshold, but got: {}",
             status_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_default_alp_auto_gate() {
+        // With no ALP metadata, the v2.3 writer defaults to AlpMode::Auto: finite
+        // decimal floats pass the entropy gate, high-entropy floats stay flat.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("prices", DataType::Float64, false),
+            ArrowField::new("random", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        // Reuse a fixed LCG so the test is deterministic across platforms. The
+        // [-1e12, 1e12) range matches the high-entropy fixture used by the
+        // `should_use_alp` unit test: near-uniform bytes in every position.
+        let mut state = 0x05ee_da1b_2026_1023_u64;
+        let random = arrow_array::Float64Array::from_iter_values((0..n).map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 * (2e12 / (1u64 << 53) as f64)) - 1e12
+        }));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(random)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        let prices_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        let random_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        assert!(
+            prices_encoding.contains("Alp"),
+            "prices column should use ALP via the Auto gate, got: {prices_encoding}"
+        );
+        assert!(
+            !random_encoding.contains("Alp"),
+            "random column should stay flat under the Auto gate, got: {random_encoding}"
+        );
+
+        // Both columns must round-trip bitwise; this also exercises the reader.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["prices", "random"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_alp_round_trip() {
+        use futures::TryStreamExt;
+        use lance_encoding::constants::ALP_META_KEY;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata.clone()),
+            ArrowField::new("sensor", DataType::Float64, false).with_metadata(metadata),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices =
+            Float32Array::from_iter_values((0..n).map(|i| ((i * 73) % 10000) as f32 / 100.0));
+        let sensors = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(sensors)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Both float columns should have been written with the ALP codec.
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        for (i, column) in ["price", "sensor"].iter().enumerate() {
+            let encoding = describe_encoding(&column_metadatas[i].pages[0]);
+            assert!(
+                encoding.contains("Alp"),
+                "column {column} should use ALP encoding, got: {encoding}"
+            );
+        }
+
+        // Full pipeline round-trip must be bitwise identical.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["price", "sensor"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        let got_sensors: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f32 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got_sensors,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -1142,6 +1142,13 @@ impl DocVisibility {
     }
 }
 
+/// A request's row-ID translation, excluded from reader-free cache snapshots.
+#[derive(Clone)]
+pub(super) enum DocumentRemapping {
+    Sync(Arc<dyn RowIdRemapper>),
+    Batch(Arc<dyn BatchRowIdRemapper>),
+}
+
 /// Modern query-side document state for one partition.
 pub(super) struct PartitionDocuments {
     store: Arc<dyn IndexStore>,
@@ -1360,6 +1367,26 @@ impl AddressKeyedDocuments {
         }
     }
 
+    /// Every live DocId the row at `address` owns in this partition.
+    ///
+    /// `None` for a legacy partition: its [`DocSet`] does not key documents by the
+    /// DocIds a compressed posting list holds, so callers keep walking postings
+    /// through [`Self::row_address`] there.
+    pub(crate) fn doc_ids_at(&self, address: u64) -> Option<impl Iterator<Item = u32> + '_> {
+        match &self.0 {
+            AddressKeyedSource::Legacy(_) => None,
+            AddressKeyedSource::Modern {
+                projection,
+                doc_ids_by_address,
+                ..
+            } => Some(
+                doc_ids_by_address
+                    .positions_in_address_range(projection, address, address)
+                    .map(|position| doc_ids_by_address.doc_id_at(position)),
+            ),
+        }
+    }
+
     /// Number of distinct row addresses the live documents cover.
     ///
     /// Equal to [`Self::len`] whenever each row owns a single live document.
@@ -1497,8 +1524,13 @@ impl PartitionDocuments {
     pub(crate) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapping: Option<DocumentRemapping>,
     ) -> Self {
+        let (remapper, batch_remapper) = match remapping {
+            Some(DocumentRemapping::Sync(remapper)) => (Some(remapper), None),
+            Some(DocumentRemapping::Batch(remapper)) => (None, Some(remapper)),
+            None => (None, None),
+        };
         Self {
             store,
             path: self.path.clone(),
@@ -1509,7 +1541,7 @@ impl PartitionDocuments {
             persisted_total_tokens: self.persisted_total_tokens,
             quantized_scoring: self.quantized_scoring,
             remapper,
-            batch_remapper: None,
+            batch_remapper,
             lengths: self.lengths.clone(),
             projection: self.projection.clone(),
             shared_addresses: self.shared_addresses.clone(),
@@ -2411,6 +2443,15 @@ mod tests {
             } else {
                 Ok(reader)
             }
+        }
+
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_buffer_size(bytes),
+                target: self.target.clone(),
+                counts: self.counts.clone(),
+                fault: self.fault.clone(),
+            })
         }
 
         fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {

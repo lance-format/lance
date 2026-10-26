@@ -19,8 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
+use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
@@ -48,7 +49,7 @@ pub fn wants_row_address(projection: Option<&[String]>) -> bool {
 }
 
 /// Auto-managed by the planner; must never reach `scanner.project()`.
-fn is_auto_managed(col: &str) -> bool {
+pub(super) fn is_auto_managed(col: &str) -> bool {
     col == DISTANCE_COLUMN || is_system_column(col)
 }
 
@@ -69,6 +70,21 @@ pub(super) fn resolve_data_fields(
     }
     let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
     let projected = lance_schema.project(data_names)?;
+    let arrow_schema = Schema::from(&projected);
+    Ok(arrow_schema.fields().iter().cloned().collect())
+}
+
+/// [`resolve_data_fields`], but skips names the schema does not have instead
+/// of failing.
+pub(super) fn resolve_data_fields_or_drop(
+    data_names: &[String],
+    base_schema: &SchemaRef,
+) -> Result<Vec<Arc<Field>>> {
+    if data_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lance_schema = LanceSchema::try_from(base_schema.as_ref())?;
+    let projected = lance_schema.project_or_drop(data_names)?;
     let arrow_schema = Schema::from(&projected);
     Ok(arrow_schema.fields().iter().cloned().collect())
 }
@@ -202,6 +218,40 @@ pub fn canonical_output_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
+/// Multiply `plan`'s `_distance` by `factor`, forwarding other columns; no-op
+/// at `1.0`.
+pub fn scale_distance(plan: Arc<dyn ExecutionPlan>, factor: f32) -> Result<Arc<dyn ExecutionPlan>> {
+    if factor == 1.0 {
+        return Ok(plan);
+    }
+    let input_schema = plan.schema();
+    let project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = input_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), idx));
+            let expr = if field.name() == DISTANCE_COLUMN {
+                Arc::new(BinaryExpr::new(
+                    column,
+                    Operator::Multiply,
+                    Arc::new(Literal::new(ScalarValue::Float32(Some(factor)))),
+                ))
+            } else {
+                column
+            };
+            (expr, field.name().clone())
+        })
+        .collect();
+    let projection_exec = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!(
+            "Failed to build scale_distance ProjectionExec: {}",
+            e
+        ))
+    })?;
+    Ok(Arc::new(projection_exec))
+}
+
 /// Wrap `plan` so the named columns become typed NULL literals; all
 /// other columns are forwarded unchanged. Schema is preserved (same
 /// fields, same dtypes). Useful for stripping the *value* of an
@@ -292,7 +342,7 @@ pub fn project_to_canonical(
             // its rows are all live. The column is non-nullable, so a null here
             // fails the scan outright.
             None if name == TOMBSTONE => Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
-            // A source sealed before this column existed. Typed nulls are what
+            // A source frozen before this column existed. Typed nulls are what
             // it holds for those rows.
             None => Arc::new(Literal::new(
                 ScalarValue::try_from(field.data_type()).map_err(|e| {
