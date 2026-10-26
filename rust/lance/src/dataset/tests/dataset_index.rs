@@ -6645,6 +6645,48 @@ async fn test_optimize_append_json_btree_preserves_float_type() {
     assert_eq!(indexed.num_rows(), baseline.num_rows());
 }
 
+/// A JSON-wrapped zonemap answers in row addresses, which differ from stable
+/// row ids past fragment 0, so the wrapper must report its target's domain.
+#[tokio::test]
+async fn test_json_zonemap_index_with_stable_row_ids() {
+    let batch = json_batch(vec![
+        r#"{"val": 1}"#,
+        r#"{"val": 2}"#,
+        r#"{"val": 3}"#,
+        r#"{"val": 4}"#,
+    ]);
+    let schema = batch.schema();
+    let write_params = WriteParams {
+        enable_stable_row_ids: true,
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(write_params),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "zonemap",
+        "path": "val",
+    }));
+    dataset
+        .create_index(&["json"], IndexType::Scalar, None, &params, false)
+        .await
+        .unwrap();
+
+    let predicate = "json_get_int(json, 'val') >= 2";
+    let mut scan = dataset.scan();
+    scan.filter(predicate).unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let indexed = scan.try_into_batch().await.unwrap();
+    assert_eq!(indexed.num_rows(), 3);
+}
+
 /// `json_extract` evaluates to serialized JSON text (`"click"`, `9`) while a JSON-path
 /// index stores decoded native values (`click`, `9`). The index must decline these
 /// predicates instead of answering them against a different representation.

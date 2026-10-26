@@ -3115,6 +3115,17 @@ mod tests {
         );
     }
 
+    /// Indices that do not override `lookup` refuse it rather than returning
+    /// no matches, so callers can fall back to another plan.
+    #[tokio::test]
+    async fn test_lookup_is_not_supported() {
+        let index =
+            train_and_load::<arrow_array::types::Int32Type>(vec![vec![Some(1), Some(2)]]).await;
+        let keys = Arc::new(arrow_array::Int32Array::from(vec![1]));
+        let err = index.lookup(keys, &NoOpMetricsCollector).err().unwrap();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
     #[tokio::test]
     async fn test_empty_zonemap_index() {
         let tmpdir = TempObjDir::default();
