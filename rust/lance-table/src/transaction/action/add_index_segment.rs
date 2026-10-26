@@ -1287,24 +1287,28 @@ mod tests {
     /// A rewrite prunes the segments that were there when it ran. One added
     /// after it, in the same operation, was built over the rewritten data and
     /// keeps its coverage; one added before it describes the replaced values.
+    /// A re-encode with `data_change` false replaces no values, so it prunes
+    /// neither.
     #[rstest]
-    #[case::segment_after_the_rewrite(true, Some([0].into_iter().collect()))]
-    #[case::segment_before_the_rewrite(false, Some(RoaringBitmap::new()))]
+    #[case::segment_after_the_rewrite(true, true, Some([0].into_iter().collect()))]
+    #[case::segment_before_the_rewrite(false, true, Some(RoaringBitmap::new()))]
+    #[case::segment_before_a_reencode(false, false, Some([0].into_iter().collect()))]
     fn test_a_rewrite_prunes_only_segments_added_before_it(
         #[case] segment_after_rewrite: bool,
+        #[case] data_change: bool,
         #[case] expected_bitmap: Option<RoaringBitmap>,
     ) {
         let rewrite = vec![
             Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
                 field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
+                data_change,
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(0),
                 file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
                 field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
+                data_change,
                 base: None,
             }),
         ];
@@ -1374,6 +1378,31 @@ mod tests {
             !rewrite.conflicts_with(&build),
             "the rewrite prunes the committed segment's coverage as it applies"
         );
+    }
+
+    /// A re-encode with `data_change` false moves the values the segment
+    /// describes without changing any, so the segment still describes them,
+    /// whichever lands first.
+    #[test]
+    fn test_a_build_does_not_conflict_with_a_reencode() {
+        let build = index_footprint(covering("by_a", Some(vec![0])));
+        let reencode = footprint(vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(0),
+                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+                base: None,
+            }),
+        ]);
+
+        assert!(!build.conflicts_with(&reencode));
+        assert!(!reencode.conflicts_with(&build));
     }
 
     /// A rewrite of a column the segment merely carries invalidates it just as

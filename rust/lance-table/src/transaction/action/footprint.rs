@@ -136,6 +136,11 @@ enum Mode {
     /// may require the same coordinate -- two readers of one column do not
     /// collide.
     Requires,
+    /// Replaces how the coordinate is stored without changing its values: a
+    /// re-encode with `data_change` false. It collides with any write, as a
+    /// write does, but not with a requirement -- an index segment built over
+    /// the values still describes them after they move.
+    Moves,
     /// Replaces the coordinate. Two of these on one coordinate never commute.
     Writes,
 }
@@ -165,22 +170,26 @@ impl Region {
 /// `committed` on the same coordinate, where the `committed` set landed after
 /// the `committing` set read.
 ///
-/// | committing \ committed | Writes   | Requires |
-/// |------------------------|----------|----------|
-/// | Writes                 | conflict | ok       |
-/// | Requires               | conflict | ok       |
+/// | committing \ committed | Writes   | Moves    | Requires |
+/// |------------------------|----------|----------|----------|
+/// | Writes                 | conflict | conflict | ok       |
+/// | Moves                  | conflict | conflict | ok       |
+/// | Requires               | conflict | ok       | ok       |
 ///
 /// The `Requires` column is all "ok": what the committed set required held when
 /// it committed, and it serialized first, so nothing arriving later can
 /// retroactively break it. The `Requires` row is the open question, because
-/// the committing set read before the other landed.
+/// the committing set read before the other landed. It collides with a write
+/// and not a move, since a move leaves every value where a reader finds it.
 ///
 /// The table is monotone along [`Mode`]'s order in every row and column, which
 /// is what lets one coordinate touched two ways by one set be summarized by
 /// its strongest mode.
 fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     match (committing, committed) {
-        (Mode::Writes | Mode::Requires, Mode::Writes) => true,
+        (_, Mode::Writes) => true,
+        (Mode::Writes | Mode::Moves, Mode::Moves) => true,
+        (Mode::Requires, Mode::Moves) => false,
         (_, Mode::Requires) => false,
     }
 }
@@ -490,7 +499,7 @@ impl Footprint {
         let fields: Vec<FieldRef> = fields.into_iter().collect();
         self.values_written
             .extend(fields.iter().copied().filter_map(committed_field));
-        self.move_field_data(fragment, fields);
+        self.claim_field_data(fragment, fields, Mode::Writes);
     }
 
     /// The data of each field within `fragment`, moved to new files without
@@ -498,11 +507,21 @@ impl Footprint {
     ///
     /// The same claims as [`Self::write_field_data`], except that no values
     /// count as written, so a concurrent change that makes one of the fields
-    /// required is not invalidated by it.
+    /// required is not invalidated by it, and the data is claimed as
+    /// [`Mode::Moves`], so a concurrent index build over it is not either.
     pub(super) fn move_field_data(
         &mut self,
         fragment: Ref,
         fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        self.claim_field_data(fragment, fields, Mode::Moves);
+    }
+
+    fn claim_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+        mode: Mode,
     ) {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
@@ -513,7 +532,7 @@ impl Footprint {
         };
         self.require_fragment(fragment);
         for field in fields {
-            self.write(Coordinate::FieldData { fragment, field });
+            self.claim(Coordinate::FieldData { fragment, field }, mode);
         }
     }
 
