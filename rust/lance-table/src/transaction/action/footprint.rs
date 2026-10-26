@@ -403,10 +403,26 @@ impl Footprint {
         fragment: Ref,
         fields: impl IntoIterator<Item = FieldRef>,
     ) {
+        let fields: Vec<FieldRef> = fields.into_iter().collect();
+        self.values_written
+            .extend(fields.iter().copied().filter_map(committed_field));
+        self.move_field_data(fragment, fields);
+    }
+
+    /// The data of each field within `fragment`, moved to new files without
+    /// changing any value: one half of a re-encode with `data_change` false.
+    ///
+    /// The same claims as [`Self::write_field_data`], except that no values
+    /// count as written, so a concurrent change that makes one of the fields
+    /// required is not invalidated by it.
+    pub(super) fn move_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+    ) {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
             self.require(Coordinate::FieldDefinition(field));
-            self.values_written.insert(field);
         }
         let Some(fragment) = fragment.committed() else {
             return;
@@ -593,6 +609,25 @@ mod tests {
             data_change: true,
             base: None,
         })
+    }
+
+    /// Tombstone `field` in `fragment` and bind a new file for it, both
+    /// carrying `data_change`.
+    fn reencode(fragment: u64, field: i32, data_change: bool) -> Vec<Action> {
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment),
+                field_ids: vec![FieldRef::Committed(field)],
+                data_change,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment),
+                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                field_ids: vec![FieldRef::Committed(field)],
+                data_change,
+                base: None,
+            }),
+        ]
     }
 
     fn add_field(local: u32, name: &str, parent: Option<FieldRef>) -> Action {
@@ -951,6 +986,18 @@ mod tests {
     #[case::a_tightening_landing_after_a_rewrite_of_the_field(
         vec![set_nullability(1, false)],
         vec![add_data_file(Ref::Committed(7), &[1])],
+        true,
+    )]
+    // A re-encode moves the field's values without changing any, so the
+    // tightening still holds against them.
+    #[case::a_tightening_landing_after_a_reencode_of_the_field(
+        vec![set_nullability(1, false)],
+        reencode(7, 1, false),
+        false,
+    )]
+    #[case::a_tightening_landing_after_a_data_changing_reencode_of_the_field(
+        vec![set_nullability(1, false)],
+        reencode(7, 1, true),
         true,
     )]
     #[case::a_tightening_landing_after_an_append_omitting_the_field(
