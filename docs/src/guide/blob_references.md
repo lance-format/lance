@@ -121,8 +121,9 @@ binding even when multiple bases have the same URI.
 
 Capture does not reread descriptors, read payloads, or HEAD objects. Fragment,
 object store, and base resolution metadata are cached within the session. External
-whole-object lengths remain unknown; a later reader must resolve and cache that
-metadata. External references require the source context's explicit immutability
+absolute URIs are captured without constructing storage clients. Whole-object
+lengths remain unknown; a later reader must resolve and cache that metadata.
+External references require the source context's explicit immutability
 assumption. The application must retain source snapshots through all deferred
 reads and retries, as described below.
 
@@ -169,7 +170,9 @@ logical blob, including an empty range at its end.
 Reader sessions cache object resolution and unknown external lengths across
 operations. Known lengths require no HEAD request. An unknown external length
 requires one successful metadata lookup per object and binding; a later demand
-uses the cached size. Payload fetching never takes rows or rereads descriptors.
+uses the cached size. Store resolution and metadata lookups run concurrently over
+distinct objects, bounded by the reader's I/O parallelism. Payload fetching never
+takes rows or rereads descriptors.
 Registered storage bases use their bound routing; standalone external URIs use
 the authenticated snapshot's registry and storage parameters.
 
@@ -192,8 +195,10 @@ Applications requiring a hard maximum must split large values into range demands
 
 Returned `Bytes`, their clones, and their slices retain the batch's materialization
 reservation until the last owner is dropped. An adapter copying results into Arrow
-arrays must retain those owners alongside the arrays, or acquire and retain a
-separate output reservation through `budget.admission().reserve(bytes).await`.
+arrays must retain those owners alongside the arrays. The batch reservation
+already includes one logical copy per request. Requesting an additional reservation
+from the same budget while holding the results can block indefinitely if the batch
+fills the budget.
 Arbitrary additional copies are outside the reader's accounting. Use
 `reserved_bytes()` and `io_reserved_bytes()` to observe outstanding reservations.
 Retaining all results while collecting a multi-batch stream can fill the budget

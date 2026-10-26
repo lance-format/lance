@@ -781,14 +781,16 @@ mod tests {
     use arrow_array::{
         DictionaryArray, RecordBatchIterator, StringArray, UInt8Array, UInt32Array, UInt64Array,
     };
+    use async_trait::async_trait;
     use futures::{FutureExt, TryStreamExt};
     use lance_core::datatypes::{BlobHandling, BlobKind};
     use lance_core::utils::address::RowAddress;
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::ObjectStore;
+    use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreProvider};
     use lance_table::format::BasePath;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
+    use tokio::sync::Semaphore;
 
     use crate::blob::{
         BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobFieldOptions, blob_field,
@@ -1383,6 +1385,66 @@ mod tests {
         (reader, source, budget, recorded)
     }
 
+    #[derive(Debug)]
+    struct FixedStoreProvider(ObjectStore);
+
+    #[async_trait]
+    impl ObjectStoreProvider for FixedStoreProvider {
+        async fn new_store(
+            &self,
+            _base_path: url::Url,
+            _params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn external_metadata_ref_reader(
+        parallelism: usize,
+    ) -> (
+        BlobRefReader,
+        BlobSourceContext,
+        Arc<BlobMaterializationContext>,
+        Arc<RecordingRangeObjectStore>,
+        Arc<Semaphore>,
+    ) {
+        let gate = Arc::new(Semaphore::new(0));
+        let recorded = Arc::new(RecordingRangeObjectStore {
+            head_gate: Some(gate.clone()),
+            ..RecordingRangeObjectStore::new(Bytes::from_static(b"abcdefghijklmnop"))
+        });
+        let store = ObjectStore::new(
+            recorded.clone(),
+            url::Url::parse("mock://objects").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            parallelism,
+            lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        );
+        let dataset = capture_dataset("memory://").await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap()
+            .with_external_immutability_assumption();
+        dataset
+            .session
+            .store_registry()
+            .insert("mock", Arc::new(FixedStoreProvider(store.clone())));
+        let mut dataset = dataset.as_ref().clone();
+        dataset.object_store = Arc::new(store);
+        let budget = BlobMaterializationContext::try_new(1024, 1024).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source.clone(), Arc::new(dataset)).unwrap()],
+            budget.clone(),
+        )
+        .unwrap();
+        (reader, source, budget, recorded, gate)
+    }
+
     #[cfg_attr(coverage, coverage(off))]
     fn ref_read_request(
         source: &BlobSourceContext,
@@ -1676,10 +1738,22 @@ mod tests {
         let source = source.with_external_immutability_assumption();
         let mut capture = BlobRefCapture::try_new(dataset.clone(), source.clone(), id).unwrap();
         let before = dataset.object_store.io_stats_snapshot();
+        let registry_before = dataset.session.store_registry().stats();
         let references = capture
             .capture(&source, &field, &addresses, &descriptors)
             .await
             .unwrap();
+        let repeated = capture
+            .capture(&source, &field, &addresses, &descriptors)
+            .await
+            .unwrap();
+        assert_eq!(references.contexts(), repeated.contexts());
+        assert_eq!(references.array(), repeated.array());
+        if !is_registered {
+            let registry_after = dataset.session.store_registry().stats();
+            assert_eq!(registry_after.hits, registry_before.hits);
+            assert_eq!(registry_after.misses, registry_before.misses);
+        }
         assert_eq!(
             dataset.object_store.io_stats_snapshot().requests.len(),
             before.requests.len()
@@ -2379,6 +2453,86 @@ mod tests {
         {
             assert_eq!(results[&(100 + index as u64)].as_deref(), expected);
         }
+    }
+
+    #[rstest]
+    #[case::complete(false)]
+    #[case::cancel(true)]
+    #[tokio::test]
+    async fn read_refs_resolves_distinct_external_metadata_concurrently(#[case] cancel: bool) {
+        let (reader, source, budget, recorded, gate) = external_metadata_ref_reader(2).await;
+        let requests = [0, 0, 0, 0, 1, 2, 3, 4]
+            .into_iter()
+            .enumerate()
+            .map(|(index, object)| {
+                let reference = source
+                    .reference(
+                        format!("mock://objects/{object}"),
+                        0,
+                        (index == 0).then_some(16),
+                        BlobKind::External,
+                        None,
+                    )
+                    .unwrap();
+                BlobRefRequest::new(
+                    index as u64,
+                    Some(reference),
+                    BlobRefDemand::Range(BlobReadRange::new(2, 3)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut stream = reader.read(requests.clone()).unwrap();
+        assert!(stream.try_next().now_or_never().is_none());
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 2);
+        assert!(recorded.requested_ranges().is_empty());
+        assert_eq!(budget.reserved_bytes().unwrap(), 0);
+        assert_eq!(budget.io_reserved_bytes().unwrap(), 0);
+        let expected_heads = if cancel {
+            stream.cancel();
+            let error = stream.try_next().await.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("cancelled"), "{error}");
+            assert!(stream.try_next().await.unwrap().is_none());
+            stream = reader.read(requests.clone()).unwrap();
+            7
+        } else {
+            gate.add_permits(1);
+            assert!(stream.try_next().now_or_never().is_none());
+            assert_eq!(recorded.head_requests.load(Ordering::Acquire), 3);
+            5
+        };
+        gate.add_permits(5);
+        let mut results =
+            tokio::time::timeout(Duration::from_secs(1), stream.try_collect::<Vec<_>>())
+                .await
+                .unwrap()
+                .unwrap();
+        results.sort_by_key(|result| result.request_index);
+        assert_eq!(results.len(), requests.len());
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result.request_index, index as u64);
+            assert_eq!(result.data.as_deref(), Some(b"cde".as_slice()));
+        }
+        assert_eq!(
+            recorded.head_requests.load(Ordering::Acquire),
+            expected_heads
+        );
+        drop(results);
+        assert_eq!(budget.reserved_bytes().unwrap(), 0);
+        assert_eq!(budget.io_reserved_bytes().unwrap(), 0);
+        let repeated = reader
+            .read(requests)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(repeated.len(), 8);
+        assert_eq!(
+            recorded.head_requests.load(Ordering::Acquire),
+            expected_heads
+        );
+        drop(repeated);
+        assert_eq!(budget.reserved_bytes().unwrap(), 0);
     }
 
     #[rstest]
