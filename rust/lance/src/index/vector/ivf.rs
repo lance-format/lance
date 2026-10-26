@@ -8222,6 +8222,7 @@ mod tests {
         #[case] streaming_sample_rate: Option<usize>,
         #[case] refine_passes: usize,
     ) {
+        const NUM_ROWS: usize = 600;
         const NUM_PARTITIONS: usize = 257;
         const DIMENSION: usize = 32;
         const EXPECTED_ROW: usize = 17;
@@ -8235,7 +8236,7 @@ mod tests {
                 "vector",
                 array::rand_vec::<Float32Type>((DIMENSION as u32).into()),
             )
-            .into_batch_rows(600.into())
+            .into_batch_rows((NUM_ROWS as u64).into())
             .unwrap();
         let vectors = batch["vector"].as_fixed_size_list();
         let values = arrow::compute::cast(vectors.values(), &value_type).unwrap();
@@ -8251,7 +8252,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap();
         let mut dataset = InsertBuilder::new(test_dir.as_str())
             .with_params(&WriteParams {
-                max_rows_per_file: 300,
+                max_rows_per_file: NUM_ROWS / 2,
                 ..Default::default()
             })
             .execute(vec![batch])
@@ -8289,13 +8290,14 @@ mod tests {
         assert_eq!(model.centroids_array().unwrap().value_type(), value_type);
 
         let mut scanner = dataset.scan();
-        // Keep the query checks independent of the trained partition quality.
+        // Probe and rerank the full fixture to isolate type correctness from
+        // partition training and random one-bit quantization quality.
         scanner
             .nearest("vector", query.as_ref(), K)
             .unwrap()
             .distance_metric(MetricType::Cosine)
             .minimum_nprobes(NUM_PARTITIONS)
-            .refine(10);
+            .refine(NUM_ROWS.div_ceil(K) as u32);
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(plan.contains("ANNIvfPartition"), "{plan}");
         let result = scanner.try_into_batch().await.unwrap();
