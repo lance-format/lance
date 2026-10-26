@@ -96,8 +96,14 @@ impl DropField {
     /// That is complete for a struct too, because apply only drops a field
     /// with no children left: the children were each dropped by their own
     /// `DropField` in the same operation, which writes their definitions.
+    ///
+    /// Except for a child a concurrent set added after this one read: the
+    /// drop does not name it, and apply would reject the drop for leaving it
+    /// behind. The drop therefore requires that no child was added under the
+    /// field since, so that order is a retryable conflict instead.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.write_field_definition(self.field);
+        footprint.require_children_unchanged(self.field);
     }
 }
 
