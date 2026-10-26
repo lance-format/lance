@@ -5209,7 +5209,6 @@ fn is_vector_field(data_type: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
