@@ -495,3 +495,86 @@ async fn fully_deleted_output_needs_no_commit() {
     assert_eq!(segments(&dataset).await, before);
     assert_query(&dataset, BASE + 64).await;
 }
+
+#[rstest]
+#[case(false, false)]
+#[case(true, false)]
+#[case(false, true)]
+#[case(true, true)]
+#[tokio::test]
+async fn restored_source_rows_require_replanning(
+    #[case] stable: bool,
+    #[case] delete_different_rows: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, stable).await;
+    let before_delete = dataset.manifest.version;
+    dataset
+        .delete(&format!("id >= {BASE} AND id < {}", BASE + SMALL / 2))
+        .await
+        .unwrap();
+    let options = OptimizeOptions::consolidate(512);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert!(!plan.tasks.is_empty());
+    let results = execute(&dataset, &plan).await;
+    let mut restored = dataset.checkout_version(before_delete).await.unwrap();
+    restored.restore().await.unwrap();
+    dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let expected = if delete_different_rows {
+        // The deletion count is unchanged, but the omitted rows are live again.
+        dataset
+            .delete(&format!(
+                "id >= {} AND id < {}",
+                BASE + SMALL / 2,
+                BASE + SMALL
+            ))
+            .await
+            .unwrap();
+        BASE + 2 * SMALL - SMALL / 2
+    } else {
+        BASE + 2 * SMALL
+    };
+    assert_query(&dataset, expected).await;
+    let version = dataset.manifest.version;
+    let before = segments(&dataset).await;
+    let error = commit_optimize_indices(&mut dataset, results, &options)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("has restored rows; replan"));
+    dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(dataset.manifest.version, version);
+    assert_eq!(segments(&dataset).await, before);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), expected);
+    assert_query(&dataset, expected).await;
+    dataset.optimize_indices(&options).await.unwrap();
+    assert_eq!(segments(&dataset).await.len(), 2);
+    assert_query(&dataset, expected).await;
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn additional_deletions_reuse_staged_output(#[case] stable: bool) {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, stable).await;
+    dataset.delete(&format!("id = {BASE}")).await.unwrap();
+    let options = OptimizeOptions::consolidate(512);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    let results = execute(&dataset, &plan).await;
+    let uuid = results[0].segment.uuid;
+    let staged_files = files(&dir, uuid);
+    dataset.delete(&format!("id = {}", BASE + 1)).await.unwrap();
+    commit_optimize_indices(&mut dataset, results, &options)
+        .await
+        .unwrap();
+    assert!(
+        segments(&dataset)
+            .await
+            .iter()
+            .any(|segment| segment.uuid == uuid)
+    );
+    assert_eq!(files(&dir, uuid), staged_files);
+    assert_query(&dataset, BASE + 2 * SMALL - 2).await;
+}

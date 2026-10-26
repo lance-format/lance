@@ -38,7 +38,8 @@
 //! the newest selected model, then merged into one output. All selected coverage
 //! must be present before committing. A caller may retry the same results on a
 //! refreshed dataset after a concurrent append or delete; a changed source owner
-//! requires replanning. Tagged fragment reuse is not supported in this mode.
+//! or restored source rows require replanning. Tagged fragment reuse is not
+//! supported in this mode.
 //!
 //! Planning is not always cheap: a split vector index that has to be rebuilt
 //! (`retrain`, every segment's fragments gone, or nothing but a definition so

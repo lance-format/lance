@@ -4,6 +4,7 @@
 //! Bounded vector consolidation using the existing optimize execution stages.
 
 use super::*;
+use crate::dataset::fragment::FileFragment;
 
 pub(super) fn validate_options(options: &OptimizeOptions) -> Result<()> {
     let Some(budget) = options.max_rows_to_consolidate else {
@@ -261,6 +262,28 @@ pub(super) async fn validate_commit(
                     return Err(Error::invalid_input(format!(
                         "consolidation source fragment {id} changed; replan before committing"
                     )));
+                }
+                // Re-encoding omits deleted rows. A restore may make them live
+                // again without changing the source UUID or its data files.
+                if before.deletion_file.is_some() && before.deletion_file != after.deletion_file {
+                    let deleted_before =
+                        FileFragment::new(Arc::new(planned.clone()), before.clone())
+                            .get_deletion_vector()
+                            .await?;
+                    let deleted_after = FileFragment::new(Arc::new(dataset.clone()), after.clone())
+                        .get_deletion_vector()
+                        .await?;
+                    if deleted_before.is_some_and(|before| {
+                        before.iter().any(|offset| {
+                            !deleted_after
+                                .as_ref()
+                                .is_some_and(|after| after.contains(offset))
+                        })
+                    }) {
+                        return Err(Error::invalid_input(format!(
+                            "consolidation source fragment {id} has restored rows; replan before committing"
+                        )));
+                    }
                 }
             }
             expected |= live;
