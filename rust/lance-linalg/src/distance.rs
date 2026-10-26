@@ -12,12 +12,11 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type, Int8Type, UInt8Type};
-use arrow_array::{
-    Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray, PrimitiveArray,
-};
-use arrow_schema::{ArrowError, DataType};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, ListArray};
+use arrow_schema::ArrowError;
 use lance_core::utils::cpu::SimdSupport;
+
+mod arrow;
 
 pub mod cosine;
 pub mod cosine_u8;
@@ -28,24 +27,6 @@ pub mod hamming;
 pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
-
-/// Widens an `Int8` query vector to `f32`, rejecting nulls.
-///
-/// The three `_arrow_batch` entry points that accept `Int8` take the query as a
-/// `&dyn Array`, so it has to be widened before it reaches a kernel. A null
-/// element has no distance to compute, so it is rejected rather than widened.
-fn int8_query_to_f32(query: &PrimitiveArray<Int8Type>) -> Result<Float32Array> {
-    if query.null_count() > 0 {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "Int8 query vector `from` must not contain nulls, found {} in {} values",
-            query.null_count(),
-            query.len()
-        )));
-    }
-    Ok(Float32Array::from(
-        query.values().iter().map(|&v| v as f32).collect::<Vec<_>>(),
-    ))
-}
 
 // `#[track_caller]` on these helpers is load-bearing: without it a length-contract
 // panic reports this file rather than the distance function the caller reached.
@@ -207,6 +188,7 @@ pub(crate) enum BatchKind {
 
 pub use cosine::*;
 pub use dot::*;
+#[allow(deprecated)]
 pub use hamming::{
     BinaryHashValues, Cluster, ClusteringResult, PairwiseResult, UnionFind, cluster_edges,
     cluster_pairwise_result, extract_binary_hashes_from_fixed_list, extract_hashes_from_fixed_list,
@@ -239,26 +221,102 @@ pub type BatchDistanceFunc = fn(&[f32], &[f32], usize) -> Arc<Float32Array>;
 pub type ArrowBatchDistanceFunc = fn(&dyn Array, &FixedSizeListArray) -> Result<Arc<Float32Array>>;
 
 impl DistanceType {
-    /// Compute the distance from one vector to a batch of vectors.
+    /// Compute distances from `query` to each row of `vectors`, propagating row nulls.
     ///
-    /// This propagates nulls to the output.
-    pub fn arrow_batch_func(&self) -> ArrowBatchDistanceFunc {
+    /// L2, cosine and dot accept Float16/Float32/Float64 queries and Int8 queries.
+    /// An Int8 query also accepts Float32, Int16, or Int32 stored vectors; both
+    /// sides are widened to Float32, preserving the legacy mixed-type behavior.
+    /// Other query and stored element types must match. Hamming accepts UInt8.
+    /// The query must be non-null and have the same positive dimension as the rows.
+    /// Unsupported types and invalid queries return an [`ArrowError::InvalidArgumentError`].
+    ///
+    /// ```
+    /// use arrow_array::{FixedSizeListArray, Float32Array, types::Float32Type};
+    /// use lance_linalg::distance::DistanceType;
+    /// let query = Float32Array::from(vec![1.0, 2.0]);
+    /// let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+    ///     [Some(vec![Some(3.0), Some(4.0)])], 2);
+    /// assert_eq!(DistanceType::L2.batch(&query, &vectors)?.value(0), 8.0);
+    /// # Ok::<(), arrow_schema::ArrowError>(())
+    /// ```
+    pub fn batch(&self, query: &dyn Array, vectors: &FixedSizeListArray) -> Result<Float32Array> {
+        let values = arrow::dispatch(arrow::Operation::Batch(*self), Some(query), vectors)?;
+        Ok(Float32Array::new(values.into(), vectors.nulls().cloned()))
+    }
+
+    /// Compute additive late-interaction distances for a flattened multivector query.
+    ///
+    /// Each query sub-vector contributes its minimum distance to any stored
+    /// sub-vector in the row. Null or empty stored rows produce `NaN`.
+    /// Float16/Float32/Float64 support L2, cosine and dot; UInt8 supports Hamming.
+    /// Int8 multivectors remain unsupported. Query and stored element types must
+    /// match, and the non-null query length must be a positive multiple of the
+    /// stored vector dimension. Invalid inputs return [`ArrowError::InvalidArgumentError`].
+    ///
+    /// ```
+    /// use arrow_array::ListArray;
+    /// use lance_linalg::distance::DistanceType;
+    /// # fn example(query: &dyn arrow_array::Array, vectors: &ListArray)
+    /// # -> Result<Vec<f32>, arrow_schema::ArrowError> {
+    /// DistanceType::Cosine.multivec(query, vectors)
+    /// # }
+    /// ```
+    pub fn multivec(&self, query: &dyn Array, vectors: &ListArray) -> Result<Vec<f32>> {
+        let values = vectors.values().as_fixed_size_list_opt().ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "{self} multivec: vectors must be a list of fixed size list, got {}",
+                vectors.data_type()
+            ))
+        })?;
+        arrow::dispatch(
+            arrow::Operation::Multivec(*self, vectors),
+            Some(query),
+            values,
+        )
+    }
+
+    /// Return a typed numeric kernel, or an error for Hamming.
+    ///
+    /// Use [`Self::batch`] for UInt8 Hamming distances.
+    ///
+    /// ```
+    /// use lance_linalg::distance::DistanceType;
+    /// let distance = DistanceType::L2.try_func::<f32>()?;
+    /// assert_eq!(distance(&[1.0], &[3.0]), 4.0);
+    /// assert!(DistanceType::Hamming.try_func::<f32>().is_err());
+    /// # Ok::<(), arrow_schema::ArrowError>(())
+    /// ```
+    pub fn try_func<T: L2 + Cosine + Dot>(&self) -> Result<DistanceFunc<T>> {
         match self {
-            Self::L2 => l2_distance_arrow_batch,
-            Self::Cosine => cosine_distance_arrow_batch,
-            Self::Dot => dot_distance_arrow_batch,
-            Self::Hamming => hamming_distance_arrow_batch,
+            Self::L2 => Ok(l2),
+            Self::Cosine => Ok(cosine_distance),
+            Self::Dot => Ok(dot_distance),
+            Self::Hamming => Err(ArrowError::InvalidArgumentError(
+                "hamming: typed numeric kernels do not support Hamming; use DistanceType::batch with UInt8 vectors".to_string(),
+            )),
         }
     }
 
-    /// Returns the distance function between two vectors.
-    pub fn func<T: L2 + Cosine + Dot>(&self) -> DistanceFunc<T> {
+    /// Compute distances through the legacy function-pointer API.
+    #[deprecated(note = "Use DistanceType::batch")]
+    pub fn arrow_batch_func(&self) -> ArrowBatchDistanceFunc {
         match self {
-            Self::L2 => l2,
-            Self::Cosine => cosine_distance,
-            Self::Dot => dot_distance,
-            Self::Hamming => todo!(),
+            Self::L2 => |query, vectors| Self::L2.batch(query, vectors).map(Arc::new),
+            Self::Cosine => |query, vectors| Self::Cosine.batch(query, vectors).map(Arc::new),
+            Self::Dot => |query, vectors| Self::Dot.batch(query, vectors).map(Arc::new),
+            Self::Hamming => |query, vectors| Self::Hamming.batch(query, vectors).map(Arc::new),
         }
+    }
+
+    /// Return a typed numeric kernel through the legacy infallible API.
+    ///
+    /// # Panics
+    /// Panics for Hamming. Use [`Self::try_func`] to receive an error instead.
+    #[deprecated(note = "Use DistanceType::try_func or DistanceType::batch")]
+    pub fn func<T: L2 + Cosine + Dot>(&self) -> DistanceFunc<T> {
+        // This deprecated signature cannot return an error without breaking callers.
+        self.try_func()
+            .expect("Hamming requires UInt8 Arrow vectors")
     }
 }
 
@@ -298,147 +356,17 @@ impl TryFrom<&str> for DistanceType {
 /// For each query sub-vector, this finds the minimum distance to any stored
 /// sub-vector in the row, then sums those minimum distances. Null or empty
 /// stored rows produce `NaN`.
+#[deprecated(note = "Use DistanceType::multivec")]
 pub fn multivec_distance(
     query: &dyn Array,
     vectors: &ListArray,
     distance_type: DistanceType,
 ) -> Result<Vec<f32>> {
-    let (element_type, dim) = match vectors.value_type() {
-        DataType::FixedSizeList(field, dim) => (field.data_type().clone(), dim as usize),
-        _ => {
-            return Err(ArrowError::InvalidArgumentError(
-                "vectors must be a list of fixed size list".to_string(),
-            ));
-        }
-    };
-
-    // Validate the query once, up front, rather than per vector. The type and
-    // metric checks below prevent an arrow downcast panic or the `unreachable!`
-    // dispatch arm — the dispatch picks its kernel type from the query's dtype
-    // and then downcasts the *stored* values to that same type. The dim, null
-    // and length checks prevent a `chunks_exact` panic and, worse, silently
-    // wrong results: a short query yields no sub-vectors and scores every row
-    // `0.0`, and a null slot is scored from whatever the values buffer holds.
-    let query_type = query.data_type();
-    // Which element types have a kernel here at all. `Int8` is a valid vector
-    // element type elsewhere in the stack (`l2_distance_arrow_batch` and its
-    // siblings have an `Int8` arm) but has no multivector kernel, so it is
-    // rejected for the type, not the metric.
-    let type_supported = matches!(
-        query_type,
-        DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
-    );
-    if !type_supported {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "multivec_distance: unsupported vector element type {query_type}"
-        )));
-    }
-    let metric_supported = match query_type {
-        DataType::UInt8 => distance_type == DistanceType::Hamming,
-        _ => matches!(
-            distance_type,
-            DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
-        ),
-    };
-    if !metric_supported {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "multivec_distance: distance type {distance_type} does not support query type {query_type}"
-        )));
-    }
-    if *query_type != element_type {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "multivec_distance: query type {query_type} does not match the stored vector type {element_type}"
-        )));
-    }
-    if dim == 0 {
-        return Err(ArrowError::InvalidArgumentError(
-            "multivec_distance: stored vectors have dimension 0".to_string(),
-        ));
-    }
-    if query.null_count() > 0 {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "multivec_distance: query must not contain nulls, got {} null(s)",
-            query.null_count()
-        )));
-    }
-    if query.is_empty() || !query.len().is_multiple_of(dim) {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "multivec_distance: query length {} must be a positive multiple of the vector dimension {dim}",
-            query.len()
-        )));
-    }
-
-    let mut dists = Vec::with_capacity(vectors.len());
-    for v in vectors.iter() {
-        match v {
-            None => dists.push(f32::NAN),
-            Some(v) => {
-                let multivector = v.as_fixed_size_list();
-                if multivector.len() == 0 {
-                    dists.push(f32::NAN);
-                    continue;
-                }
-
-                let distance = match distance_type {
-                    DistanceType::Hamming => multivec_distance_impl::<UInt8Type>(
-                        query,
-                        multivector,
-                        dim,
-                        hamming::hamming,
-                    ),
-                    _ => match query.data_type() {
-                        DataType::Float16 => multivec_distance_impl::<Float16Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type.func(),
-                        ),
-                        DataType::Float32 => multivec_distance_impl::<Float32Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type.func(),
-                        ),
-                        DataType::Float64 => multivec_distance_impl::<Float64Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type.func(),
-                        ),
-                        _ => unreachable!("missed to check query type"),
-                    },
-                };
-
-                dists.push(distance);
-            }
-        }
-    }
-    Ok(dists)
-}
-
-fn multivec_distance_impl<T: ArrowPrimitiveType>(
-    query: &dyn Array,
-    multivector: &FixedSizeListArray,
-    dim: usize,
-    distance_func: DistanceFunc<T::Native>,
-) -> f32 {
-    let query = query.as_primitive::<T>().values();
-    query
-        .chunks_exact(dim)
-        .map(|q| {
-            multivector
-                .values()
-                .as_primitive::<T>()
-                .values()
-                .chunks_exact(dim)
-                .map(|v| distance_func(q, v))
-                .min_by(|a, b| a.total_cmp(b))
-                .unwrap()
-        })
-        .sum()
+    distance_type.multivec(query, vectors)
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -446,12 +374,14 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use arrow_array::types::{Float16Type, Float32Type, Int8Type};
+    use arrow_array::ArrowPrimitiveType;
+    use arrow_array::types::{Float16Type, Float32Type, Int8Type, UInt8Type};
     use arrow_array::{
-        Float32Array, Float64Array, Int8Array, Int32Array, ListArray, PrimitiveArray, UInt8Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, ListArray, PrimitiveArray,
+        UInt8Array,
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-    use arrow_schema::Field;
+    use arrow_schema::{DataType, Field};
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
 
@@ -618,30 +548,33 @@ mod tests {
         let unsupported_query = Int32Array::from(vec![1, 2]);
 
         for distance_type in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
-            let error =
-                distance_type.arrow_batch_func()(&unsupported_query, &float32_targets).unwrap_err();
+            let error = distance_type
+                .batch(&unsupported_query, &float32_targets)
+                .unwrap_err();
             assert!(
                 matches!(error, ArrowError::InvalidArgumentError(_)),
                 "{distance_type} returned a different error variant: {error}"
             );
         }
 
-        let unsupported_from_error =
-            cosine_distance_arrow_batch(&unsupported_query, &float32_targets).unwrap_err();
+        let unsupported_from_error = DistanceType::Cosine
+            .batch(&unsupported_query, &float32_targets)
+            .unwrap_err();
         assert!(
             matches!(&unsupported_from_error, ArrowError::InvalidArgumentError(message)
-                if message == "`from` has unsupported data type Int32"),
+                if message == "cosine batch: query type Int32 does not match the stored vector type Float32"),
             "unexpected unsupported `from` error: {unsupported_from_error}"
         );
 
         let float32_query = Float32Array::from(vec![1.0, 2.0]);
         let float64_targets =
             FixedSizeListArray::try_new_from_values(Float64Array::from(vec![1.0, 2.0]), 2).unwrap();
-        let mismatched_to_error =
-            cosine_distance_arrow_batch(&float32_query, &float64_targets).unwrap_err();
+        let mismatched_to_error = DistanceType::Cosine
+            .batch(&float32_query, &float64_targets)
+            .unwrap_err();
         assert!(
             matches!(&mismatched_to_error, ArrowError::InvalidArgumentError(message)
-                if message == "`to` values have data type Float64, expected Float32 to match `from`"),
+                if message == "cosine batch: query type Float32 does not match the stored vector type Float64"),
             "unexpected mismatched `to` error: {mismatched_to_error}"
         );
     }
@@ -692,7 +625,7 @@ mod tests {
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             let err = multivec_distance(u8_query.as_ref(), &u8_vectors, dt).unwrap_err();
             assert!(
-                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not support query type")),
+                matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("unsupported vector element type")),
                 "UInt8 query with {dt} must be rejected for the metric, got: {err}"
             );
         }
@@ -700,7 +633,7 @@ mod tests {
         let err =
             multivec_distance(f32_query.as_ref(), &f32_vectors, DistanceType::Hamming).unwrap_err();
         assert!(
-            matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("does not support query type")),
+            matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("unsupported vector element type")),
             "Float32 query with hamming must be rejected for the metric, got: {err}"
         );
     }
@@ -718,10 +651,10 @@ mod tests {
         let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None]));
 
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
-            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            let err = dt.batch(query.as_ref(), &targets).unwrap_err();
             assert!(
                 matches!(&err, ArrowError::InvalidArgumentError(m)
-                    if m.contains("Int8 query vector `from`") && m.contains("found 1 in 2 values")),
+                    if m.contains("query must not contain nulls") && m.contains("found 1 in 2 values")),
                 "{dt} accepted a null Int8 query element, got: {err}"
             );
         }
@@ -731,9 +664,7 @@ mod tests {
         let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![1_i8, 2]));
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             assert_eq!(
-                dt.arrow_batch_func()(query.as_ref(), &targets)
-                    .unwrap()
-                    .len(),
+                dt.batch(query.as_ref(), &targets).unwrap().len(),
                 2,
                 "{dt} rejected a well-formed Int8 query"
             );
@@ -747,17 +678,17 @@ mod tests {
         // gives (3-1)^2 + (4-2)^2 = 8 and 0.
         let sliced = Int8Array::from(vec![None, Some(3_i8), Some(4), None]).slice(1, 2);
         let query: Arc<dyn Array> = Arc::new(sliced);
-        let got = DistanceType::L2.arrow_batch_func()(query.as_ref(), &targets).unwrap();
+        let got = DistanceType::L2.batch(query.as_ref(), &targets).unwrap();
         assert_eq!(
             got.values(),
             &[8.0_f32, 0.0],
             "L2 did not follow the query slice"
         );
         for dt in [DistanceType::Cosine, DistanceType::Dot] {
-            let got = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap();
-            let want =
-                dt.arrow_batch_func()(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
-                    .unwrap();
+            let got = dt.batch(query.as_ref(), &targets).unwrap();
+            let want = dt
+                .batch(Arc::new(Int8Array::from(vec![3_i8, 4])).as_ref(), &targets)
+                .unwrap();
             assert_eq!(got, want, "{dt} did not follow the query slice");
         }
     }
@@ -774,7 +705,7 @@ mod tests {
         let query: Arc<dyn Array> = Arc::new(Int8Array::from(vec![Some(1_i8), None, Some(2)]));
 
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
-            let err = dt.arrow_batch_func()(query.as_ref(), &targets).unwrap_err();
+            let err = dt.batch(query.as_ref(), &targets).unwrap_err();
             assert!(
                 matches!(&err, ArrowError::InvalidArgumentError(m) if m.contains("must not contain nulls")),
                 "{dt} did not report the null query, got: {err}"
@@ -796,9 +727,7 @@ mod tests {
         );
     }
 
-    /// The query's element type must match the stored vectors': the dispatch
-    /// picks `T` from the query and then downcasts the stored array to the same
-    /// `T` without checking it.
+    /// Query and stored vector element types must match before dispatch.
     #[test]
     fn test_multivec_distance_rejects_element_type_mismatch() {
         let f16_vectors =
@@ -954,5 +883,278 @@ mod tests {
         assert_eq!(dists.len(), 2);
         assert!(dists[0].is_nan());
         assert_eq!(dists[1], -4.0);
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    pub(super) fn arrow_values(dtype: &DataType, values: Vec<i32>) -> Arc<dyn Array> {
+        match dtype {
+            DataType::Float16 => Arc::new(PrimitiveArray::<Float16Type>::from(
+                values
+                    .into_iter()
+                    .map(|v| f16::from_f32(v as f32))
+                    .collect::<Vec<_>>(),
+            )),
+            DataType::Float32 => Arc::new(Float32Array::from(
+                values.into_iter().map(|v| v as f32).collect::<Vec<_>>(),
+            )),
+            DataType::Float64 => Arc::new(Float64Array::from(
+                values.into_iter().map(|v| v as f64).collect::<Vec<_>>(),
+            )),
+            DataType::Int8 => Arc::new(Int8Array::from(
+                values.into_iter().map(|v| v as i8).collect::<Vec<_>>(),
+            )),
+            DataType::Int16 => Arc::new(Int16Array::from(
+                values.into_iter().map(|v| v as i16).collect::<Vec<_>>(),
+            )),
+            DataType::UInt8 => Arc::new(UInt8Array::from(
+                values.into_iter().map(|v| v as u8).collect::<Vec<_>>(),
+            )),
+            DataType::Int32 => Arc::new(Int32Array::from(values)),
+            _ => panic!("unsupported test dtype {dtype}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::l2(DistanceType::L2, [0.0, 8.0])]
+    #[case::dot(DistanceType::Dot, [-4.0, -10.0])]
+    #[case::cosine(DistanceType::Cosine, [0.0, 1.0 - 11.0 / (5.0_f32.sqrt() * 5.0)])]
+    #[case::hamming(DistanceType::Hamming, [0.0, 3.0])]
+    fn test_arrow_support_table(
+        #[case] metric: DistanceType,
+        #[case] expected: [f32; 2],
+        #[values(
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Int8,
+            DataType::UInt8,
+            DataType::Int32
+        )]
+        dtype: DataType,
+    ) {
+        let query = arrow_values(&dtype, vec![1, 2]);
+        let vectors =
+            FixedSizeListArray::try_new_from_values(arrow_values(&dtype, vec![1, 2, 3, 4]), 2)
+                .unwrap();
+        let rows = ListArray::new(
+            Arc::new(Field::new("item", vectors.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([1, 1]),
+            Arc::new(vectors.clone()),
+            None,
+        );
+        let supports_batch = if metric == DistanceType::Hamming {
+            dtype == DataType::UInt8
+        } else {
+            matches!(
+                dtype,
+                DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Int8
+            )
+        };
+        let supports_multivec = supports_batch && dtype != DataType::Int8;
+        let batch = metric.batch(query.as_ref(), &vectors);
+        let legacy: ArrowBatchDistanceFunc = match metric {
+            DistanceType::L2 => l2_distance_arrow_batch,
+            DistanceType::Cosine => cosine_distance_arrow_batch,
+            DistanceType::Dot => dot_distance_arrow_batch,
+            DistanceType::Hamming => hamming_distance_arrow_batch,
+        };
+        for legacy in [legacy, metric.arrow_batch_func()] {
+            match (&batch, legacy(query.as_ref(), &vectors)) {
+                (Ok(batch), Ok(legacy)) => assert_eq!(batch, legacy.as_ref()),
+                (Err(batch), Err(legacy)) => assert_eq!(batch.to_string(), legacy.to_string()),
+                (batch, legacy) => panic!("legacy dispatch differs: {batch:?}, {legacy:?}"),
+            }
+        }
+        let multivec = metric.multivec(query.as_ref(), &rows);
+        for (result, supported) in [
+            (batch.map(|a| a.values().to_vec()), supports_batch),
+            (multivec, supports_multivec),
+        ] {
+            if supported {
+                let got = result.unwrap();
+                assert_eq!(got.len(), expected.len());
+                for (got, want) in got.iter().zip(expected) {
+                    approx::assert_abs_diff_eq!(*got, want, epsilon = 1e-6);
+                }
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(&error, ArrowError::InvalidArgumentError(message)
+                    if message.contains("unsupported vector element type") && message.contains(&dtype.to_string())),
+                    "{metric} {dtype}: {error}"
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::l2(DistanceType::L2, [0.0, 8.0])]
+    #[case::dot(DistanceType::Dot, [-4.0, -10.0])]
+    #[case::cosine(DistanceType::Cosine, [0.0, 1.0 - 11.0 / (5.0_f32.sqrt() * 5.0)])]
+    fn test_int8_query_with_legacy_stored_types(
+        #[case] metric: DistanceType,
+        #[case] expected: [f32; 2],
+        #[values(DataType::Float32, DataType::Int16, DataType::Int32)] dtype: DataType,
+    ) {
+        let query = arrow_values(&DataType::Int8, vec![1, 2]);
+        let vectors =
+            FixedSizeListArray::try_new_from_values(arrow_values(&dtype, vec![1, 2, 3, 4]), 2)
+                .unwrap();
+
+        let got = metric.batch(query.as_ref(), &vectors).unwrap();
+        for (got, want) in got.values().iter().zip(expected) {
+            approx::assert_abs_diff_eq!(*got, want, epsilon = 1e-6);
+        }
+
+        let legacy: ArrowBatchDistanceFunc = match metric {
+            DistanceType::L2 => l2_distance_arrow_batch,
+            DistanceType::Cosine => cosine_distance_arrow_batch,
+            DistanceType::Dot => dot_distance_arrow_batch,
+            DistanceType::Hamming => hamming_distance_arrow_batch,
+        };
+        assert_eq!(&got, legacy(query.as_ref(), &vectors).unwrap().as_ref());
+    }
+
+    #[test]
+    fn test_int8_query_does_not_broaden_past_legacy_stored_types() {
+        let query = arrow_values(&DataType::Int8, vec![1, 2]);
+        for dtype in [DataType::Float16, DataType::Float64, DataType::UInt8] {
+            let vectors =
+                FixedSizeListArray::try_new_from_values(arrow_values(&dtype, vec![1, 2, 3, 4]), 2)
+                    .unwrap();
+            assert!(
+                DistanceType::L2.batch(query.as_ref(), &vectors).is_err(),
+                "Int8 query unexpectedly accepted stored {dtype}"
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::l2(DistanceType::L2, DataType::Float32)]
+    #[case::dot(DistanceType::Dot, DataType::Float32)]
+    #[case::cosine(DistanceType::Cosine, DataType::Float32)]
+    #[case::hamming(DistanceType::Hamming, DataType::UInt8)]
+    fn test_arrow_batch_dimension_errors(
+        #[case] metric: DistanceType,
+        #[case] dtype: DataType,
+        #[values(0, 1, 3)] query_len: usize,
+    ) {
+        let vectors =
+            FixedSizeListArray::try_new_from_values(arrow_values(&dtype, vec![1, 2, 3, 4]), 2)
+                .unwrap();
+        let query = arrow_values(&dtype, vec![1; query_len]);
+        let error = metric.batch(query.as_ref(), &vectors).unwrap_err();
+        assert!(
+            matches!(&error, ArrowError::InvalidArgumentError(message)
+            if message.contains(&format!("query length {query_len}")) && message.contains("dimension 2")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_hamming_validation_and_legacy_wrapper() {
+        let targets =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let query = UInt8Array::from(vec![1, 2]);
+        let error = hamming_distance_arrow_batch(&query, &targets).unwrap_err();
+        assert!(
+            matches!(&error, ArrowError::InvalidArgumentError(message)
+            if message.contains("hamming batch") && message.contains("Float32")),
+            "{error}"
+        );
+
+        let targets =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![1, 2]), 2).unwrap();
+        let query = UInt8Array::from(vec![Some(1), None]);
+        let error = DistanceType::Hamming.batch(&query, &targets).unwrap_err();
+        assert!(
+            matches!(&error, ArrowError::InvalidArgumentError(message)
+            if message.contains("query must not contain nulls")),
+            "{error}"
+        );
+        let query = UInt8Array::from(vec![1, 2]);
+        assert_eq!(
+            hamming_distance_arrow_batch(&query, &targets)
+                .unwrap()
+                .as_ref(),
+            &DistanceType::Hamming.batch(&query, &targets).unwrap()
+        );
+        let error = DistanceType::Hamming.try_func::<f32>().unwrap_err();
+        assert!(
+            matches!(&error, ArrowError::InvalidArgumentError(message)
+            if message.contains("Hamming") && message.contains("UInt8")),
+            "{error}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::l2(DistanceType::L2, DataType::Float32, 0.0)]
+    #[case::dot(DistanceType::Dot, DataType::Float32, -24.0)]
+    #[case::cosine(DistanceType::Cosine, DataType::Float32, 0.0)]
+    #[case::hamming(DistanceType::Hamming, DataType::UInt8, 0.0)]
+    fn test_arrow_batch_slices_and_null_rows(
+        #[case] metric: DistanceType,
+        #[case] dtype: DataType,
+        #[case] expected: f32,
+    ) {
+        let values = arrow_values(&dtype, vec![99, 99, 3, 4, 0, 0, 99, 99]);
+        let vectors = FixedSizeListArray::new(
+            Arc::new(Field::new("item", dtype.clone(), true)),
+            2,
+            values,
+            Some(arrow_buffer::NullBuffer::from(vec![
+                true, true, false, true,
+            ])),
+        )
+        .slice(1, 2);
+        let query = arrow_values(&dtype, vec![99, 3, 4, 99]).slice(1, 2);
+        let got = metric.batch(query.as_ref(), &vectors).unwrap();
+        assert_eq!(got.len(), 2);
+        approx::assert_abs_diff_eq!(got.value(0), expected, epsilon = 1e-6);
+        assert!(got.is_null(1));
+
+        let empty = vectors.slice(0, 0);
+        assert_eq!(metric.batch(query.as_ref(), &empty).unwrap().len(), 0);
+        let zero_dim = FixedSizeListArray::try_new_with_length(
+            Arc::new(Field::new("item", dtype.clone(), true)),
+            0,
+            arrow_values(&dtype, vec![]),
+            None,
+            1,
+        )
+        .unwrap();
+        let error = metric.batch(query.as_ref(), &zero_dim).unwrap_err();
+        assert!(
+            matches!(&error, ArrowError::InvalidArgumentError(message)
+            if message.contains("dimension 0")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_multivec_sliced_null_and_empty_rows() {
+        let rows = multivecs_of::<Float32Type>(
+            vec![
+                vec![99.0, 99.0],
+                vec![1.0, 2.0, 3.0, 4.0],
+                vec![],
+                vec![5.0, 6.0],
+            ],
+            2,
+        );
+        let rows = ListArray::new(
+            Arc::new(Field::new("item", rows.value_type(), true)),
+            rows.offsets().clone(),
+            rows.values().clone(),
+            Some(arrow_buffer::NullBuffer::from(vec![
+                true, true, true, false,
+            ])),
+        )
+        .slice(1, 3);
+        let query = Float32Array::from(vec![99.0, 3.0, 4.0, 99.0]).slice(1, 2);
+        let got = DistanceType::L2.multivec(&query, &rows).unwrap();
+        assert_eq!(got[0], 0.0);
+        assert!(got[1].is_nan());
+        assert!(got[2].is_nan());
     }
 }

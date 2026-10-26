@@ -83,7 +83,7 @@ use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
-use lance_linalg::distance::{DistanceType, multivec_distance};
+use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
@@ -1627,7 +1627,8 @@ fn multivec_ground_truth(
     } else {
         query.as_fixed_size_list().values().clone()
     };
-    multivec_distance(&query, vectors, distance_type)
+    distance_type
+        .multivec(&query, vectors)
         .unwrap()
         .into_iter()
         .enumerate()

@@ -2966,7 +2966,13 @@ impl RequestBatch {
         if pending.is_empty() {
             return;
         }
-        if pending.len() == 1 {
+        // The I/O layer rejects unsorted ranges, so a lone unsorted read takes
+        // the sort and scatter below like any batch.
+        if pending.len() == 1
+            && pending[0]
+                .ranges
+                .is_sorted_by_key(|range| (range.start, range.end))
+        {
             let read = pending.into_iter().next().unwrap();
             let _ = read.tx.send(SubmittedRead::Alone(
                 inner.submit_request(read.ranges, read.priority),

@@ -38,7 +38,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 bytemuck.workspace = true
 byteorder.workspace = true
 lz4 = { version = "1", optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [dev-dependencies]
 lance-datagen.workspace = true
