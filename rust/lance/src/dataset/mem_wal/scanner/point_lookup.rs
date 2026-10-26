@@ -48,6 +48,11 @@ use crate::dataset::mem_wal::reconcile::relabel_to;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
+/// Keys resolved per on-disk pass. Each unresolved key becomes a literal in
+/// every source's `IN` filter, so planning memory grows with the key count;
+/// past this many keys, the sources are scanned once per chunk instead.
+const ON_DISK_LOOKUP_CHUNK_KEYS: usize = 4096;
+
 /// Plans point lookup queries over LSM data.
 ///
 /// Point lookups are optimized for primary key-based queries where we expect
@@ -666,7 +671,8 @@ impl LsmPointLookupPlanner {
     /// first, in the carry schema. Each source is scanned once, for the keys no
     /// newer source held (and its bloom filter admits), and reading stops once
     /// every key is resolved. A source lists its rows newest first, so a key's
-    /// first row is its newest version there.
+    /// first row is its newest version there. Keys are resolved
+    /// [`ON_DISK_LOOKUP_CHUNK_KEYS`] at a time.
     async fn lookup_many_on_disk(
         &self,
         keys: Vec<ScalarValue>,
@@ -675,7 +681,6 @@ impl LsmPointLookupPlanner {
         use datafusion::prelude::{col, lit};
 
         let pk = &self.pk_columns[0];
-        let mut pending: HashSet<ScalarValue> = keys.into_iter().collect();
         let mut sources: Vec<LsmDataSource> = self
             .collector
             .collect()?
@@ -690,38 +695,43 @@ impl LsmPointLookupPlanner {
         sources.sort_by_key(|s| std::cmp::Reverse(s.generation()));
 
         let mut out = Vec::new();
-        for source in sources {
-            let bloom = self.bloom_filters.get(&source.generation().as_u64());
-            let candidates: Vec<Expr> = pending
-                .iter()
-                .filter(|k| {
-                    bloom.is_none_or(|bf| {
-                        bf.check_hash(compute_pk_hash_from_scalars(std::slice::from_ref(*k)))
+        for chunk in keys.chunks(ON_DISK_LOOKUP_CHUNK_KEYS) {
+            let mut pending: HashSet<ScalarValue> = chunk.iter().cloned().collect();
+            for source in &sources {
+                let bloom = self.bloom_filters.get(&source.generation().as_u64());
+                let candidates: Vec<Expr> = pending
+                    .iter()
+                    .filter(|k| {
+                        bloom.is_none_or(|bf| {
+                            bf.check_hash(compute_pk_hash_from_scalars(std::slice::from_ref(*k)))
+                        })
                     })
-                })
-                .map(|k| lit(k.clone()))
-                .collect();
-            if candidates.is_empty() {
-                continue;
-            }
-            let filter = col(pk.as_str()).in_list(candidates, false);
-            // Type-erased for the same `Send`-proof depth as `plan_lookup_coalesced`.
-            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                Box::pin(self.build_source_scan(&source, projection, &filter));
-            let mut stream = arm.await?.execute(0, self.task_ctx.clone())?;
-            while let Some(batch) = stream.try_next().await? {
-                let pk_values = batch.column_by_name(pk).ok_or_else(|| {
-                    lance_core::Error::internal("point-lookup: scan output lacks the primary key")
-                })?;
-                let first = (0..batch.num_rows())
-                    .map(|i| Ok(pending.remove(&ScalarValue::try_from_array(pk_values, i)?)))
-                    .collect::<Result<Vec<_>>>()?;
-                let first = filter_record_batch(&batch, &BooleanArray::from(first))?;
-                if first.num_rows() > 0 {
-                    out.push(first);
+                    .map(|k| lit(k.clone()))
+                    .collect();
+                if candidates.is_empty() {
+                    continue;
                 }
-                if pending.is_empty() {
-                    break;
+                let filter = col(pk.as_str()).in_list(candidates, false);
+                // Type-erased for the same `Send`-proof depth as `plan_lookup_coalesced`.
+                let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
+                    Box::pin(self.build_source_scan(source, projection, &filter));
+                let mut stream = arm.await?.execute(0, self.task_ctx.clone())?;
+                while let Some(batch) = stream.try_next().await? {
+                    let pk_values = batch.column_by_name(pk).ok_or_else(|| {
+                        lance_core::Error::internal(
+                            "point-lookup: scan output lacks the primary key",
+                        )
+                    })?;
+                    let first = (0..batch.num_rows())
+                        .map(|i| Ok(pending.remove(&ScalarValue::try_from_array(pk_values, i)?)))
+                        .collect::<Result<Vec<_>>>()?;
+                    let first = filter_record_batch(&batch, &BooleanArray::from(first))?;
+                    if first.num_rows() > 0 {
+                        out.push(first);
+                    }
+                    if pending.is_empty() {
+                        break;
+                    }
                 }
             }
         }
@@ -3196,15 +3206,20 @@ mod tests {
 
         // The memtables are probed, not scanned. An absent key keeps every
         // on-disk source in play, so each is scanned once whether the call
-        // carries ten keys or a thousand.
-        for n in [10, 1_000] {
+        // carries ten keys or a thousand, and once per chunk past a chunk.
+        let two_chunks = 2 * ON_DISK_LOOKUP_CHUNK_KEYS as i32;
+        for (n, scans) in [(10, 3), (1_000, 3), (two_chunks, 6)] {
             planner.source_scans.store(0, Ordering::Relaxed);
             let batch = planner
                 .lookup_many_keep_tombstone(&int32_keys(1..=n), None)
                 .await
                 .unwrap();
             assert_eq!(batch.num_rows(), 9);
-            assert_eq!(planner.source_scans.load(Ordering::Relaxed), 3, "{n} keys");
+            assert_eq!(
+                planner.source_scans.load(Ordering::Relaxed),
+                scans,
+                "{n} keys"
+            );
         }
 
         // Keys the memtables resolve, including one with several versions,
