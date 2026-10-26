@@ -2316,20 +2316,45 @@ impl ManifestNamespace {
             .is_some())
     }
 
-    /// Join a relative table location (which may contain `/` separators) onto a base
-    /// path, preserving each path segment.  `object_store::Path::join` appends its
-    /// argument as a single segment and percent-encodes `/`, which collapses nested
-    /// or non-ASCII locations and makes storage probes / deletes miss the real data.
+    /// Resolve a relative table location to the storage path that
+    /// [`Self::construct_full_uri`] addresses.
+    ///
+    /// `construct_full_uri` splits on `/` and drops empty segments, and the URL
+    /// segment extension also drops `.` and `..` segments. Reproduce the empty and
+    /// `.` handling so probes and deletes target the same physical directory as the
+    /// writer instead of a percent-encoded single segment (`Path::join`) or an
+    /// `EmptySegment` error for accepted inputs like `a//b`. `..` stays rejected to
+    /// match `register_table`'s traversal contract rather than silently rewriting
+    /// such input. `Path::parse` preserves raw segment bytes, so escaped slashes and
+    /// non-ASCII names stay literal.
     fn join_location(
         base: &object_store::path::Path,
         location: &str,
     ) -> Result<object_store::path::Path> {
-        // Build the target path by parsing the full relative location, so that each
-        // `/`-separated segment is treated as its own path part.  Path::parse does
-        // not percent-decode; it validates and preserves the raw segment bytes,
-        // matching how construct_full_uri addresses the data.
+        let mut canonical = String::new();
+        for segment in location.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == ".." {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Table location must stay within the namespace root, got '{}'",
+                        location
+                    ),
+                }
+                .into());
+            }
+            if !canonical.is_empty() {
+                canonical.push('/');
+            }
+            canonical.push_str(segment);
+        }
+        if canonical.is_empty() {
+            return Ok(base.clone());
+        }
         Ok(object_store::path::Path::parse(format!(
-            "{base}/{location}"
+            "{base}/{canonical}"
         ))?)
     }
 
@@ -3275,12 +3300,23 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
-                // Delete from manifest first
-                self.delete_from_manifest(&object_id).boxed().await?;
-
-                // Delete physical data directory using the dir_name from manifest
+                // Resolve and validate the target before mutating the manifest so a
+                // root-equivalent location cannot delete the namespace root after the
+                // row is already gone.
                 let table_path = Self::join_location(&self.base_path, info.location.as_str())?;
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                if table_path == self.base_path {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "Refusing to drop table '{}': location '{}' resolves to the namespace root",
+                            object_id, info.location
+                        ),
+                    }
+                    .into());
+                }
+
+                // Delete from manifest first
+                self.delete_from_manifest(&object_id).boxed().await?;
 
                 // Remove the table directory
                 self.object_store
@@ -6671,5 +6707,133 @@ mod tests {
                 entries
             );
         }
+    }
+
+    async fn write_single_column_dataset(uri: &str) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        lance::dataset::Dataset::write(Box::new(reader), uri, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_registered_location_matches_construct_full_uri_canonicalization() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // construct_full_uri maps `a//b` and `c/d//` to `a/b` and `c/d`, so write
+        // the datasets there. `a%2Fb` stays a literal escaped-slash segment.
+        for dir in ["a/b", "c/d", "a%2Fb"] {
+            write_single_column_dataset(&format!("{temp_path}/{dir}")).await;
+        }
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["canon".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        for (name, location) in [
+            ("empty-segments", "a//b"),
+            ("trailing-slashes", "c/d//"),
+            ("escaped-slash", "a%2Fb"),
+        ] {
+            let mut req = RegisterTableRequest::new(location.to_string());
+            req.id = Some(vec!["canon".to_string(), name.to_string()]);
+            dir_namespace.register_table(req).await.unwrap();
+        }
+
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["canon".to_string()]);
+        list.include_declared = Some(false);
+        let listed = dir_namespace.list_tables(list).await.unwrap();
+        assert_eq!(
+            listed.tables,
+            vec!["empty-segments", "escaped-slash", "trailing-slashes"]
+        );
+
+        let mut describe = DescribeTableRequest::new();
+        describe.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        describe.check_declared = Some(true);
+        let described = dir_namespace.describe_table(describe).await.unwrap();
+        assert_eq!(described.is_only_declared, Some(false));
+
+        // Dropping the canonicalized location removes `a/b` and leaves the literal
+        // `a%2Fb` directory untouched.
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a/b")).exists());
+        assert!(std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "trailing-slashes".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/c/d")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "escaped-slash".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+    }
+
+    #[rstest]
+    #[case::empty_location("")]
+    #[case::dot_location(".")]
+    #[tokio::test]
+    async fn test_drop_rejects_root_equivalent_location(#[case] location: &str) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["root".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        let mut req = RegisterTableRequest::new(location.to_string());
+        req.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+
+        // Physical data that a root-directory delete would destroy.
+        std::fs::write(std::path::Path::new(temp_path).join("keep.txt"), b"keep").unwrap();
+
+        // Probing must not turn the whole listing into an error for these rows.
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["root".to_string()]);
+        list.include_declared = Some(false);
+        assert!(
+            dir_namespace
+                .list_tables(list)
+                .await
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        let error = dir_namespace.drop_table(drop).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("namespace root"), "{message}");
+
+        // The manifest row and physical data must both survive the rejected drop.
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        assert!(dir_namespace.table_exists(exists).await.is_ok());
+        assert!(std::path::Path::new(temp_path).join("keep.txt").exists());
+        assert!(std::path::Path::new(temp_path).join("__manifest").exists());
     }
 }
