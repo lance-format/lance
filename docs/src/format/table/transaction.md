@@ -698,6 +698,20 @@ the same values before and after, as when compaction moves rows or a column
 file is re-encoded. Change-data-capture readers emit rows only from
 `data_change = true` actions, and one operation may mix both.
 
+On a `TombstoneFieldData`, the flag means what `DataReplacement.data_change`
+means. A tombstone that changes data tombstones the fields' entries in the
+fragment's overlays, since new base values supersede them, and withdraws every
+index on those fields from the fragment. A tombstone with `data_change` false
+is one half of a re-encode: the same operation re-binds every tombstoned field
+in that fragment with an `AddDataFile` that also has `data_change` false and
+holds the same base values (overlays not applied) for every physical row. No
+value a reader sees changes, so overlays keep shadowing the base, index
+coverage is kept, and no row's last-updated-at version moves. Nor does it count
+as writing values against a concurrent index build over those fields or a
+concurrent change that makes one of them required. Apply rejects a `false`
+tombstone whose fields are not all re-bound that way, and an `AddDataFile`
+whose `data_change` differs from that of the tombstone it re-binds.
+
 ### Isolation
 
 Two `CompositeOperation`s conflict when they write overlapping parts of the
