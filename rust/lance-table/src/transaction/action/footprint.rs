@@ -128,11 +128,18 @@ impl Coordinate {
 /// coordinate is a new variant here and a new row and column there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Mode {
+    /// Needs the coordinate's values not to be replaced in place, but not the
+    /// fragment holding them to survive: what an index segment needs of the
+    /// data it describes. The format gives a reader no way to notice that the
+    /// values were replaced underneath a segment, but it does show that their
+    /// fragment was removed, and a segment naming a removed fragment either
+    /// reaches its rows through the fragment reuse history or loses that
+    /// coverage. So unlike [`Mode::Requires`], a removal of the fragment
+    /// does not collide with it; see [`Footprint::claims_conflict_with`].
+    RequiresUnlessRemoved,
     /// Reads the coordinate and needs it to still hold what it read. Data
     /// written for a committed field requires the field's definition, since
-    /// the values are encoded in the type it names; an index segment requires
-    /// the data it describes, since the format gives a reader no way to notice
-    /// that those values were replaced underneath it. Unlike a write, two sets
+    /// the values are encoded in the type it names. Unlike a write, two sets
     /// may require the same coordinate -- two readers of one column do not
     /// collide.
     Requires,
@@ -143,6 +150,15 @@ enum Mode {
     Moves,
     /// Replaces the coordinate. Two of these on one coordinate never commute.
     Writes,
+}
+
+impl Mode {
+    /// Whether writing `region` wholesale leaves a claim of this mode on a
+    /// coordinate inside it intact: a removed fragment is visible in the
+    /// metadata, which is all [`Mode::RequiresUnlessRemoved`] needs.
+    fn is_released_by(self, region: &Region) -> bool {
+        self == Self::RequiresUnlessRemoved && matches!(region, Region::Fragment(_))
+    }
 }
 
 /// A part of the manifest an action set touches wholesale, without being able
@@ -170,17 +186,23 @@ impl Region {
 /// `committed` on the same coordinate, where the `committed` set landed after
 /// the `committing` set read.
 ///
-/// | committing \ committed | Writes   | Moves    | Requires |
-/// |------------------------|----------|----------|----------|
-/// | Writes                 | conflict | conflict | ok       |
-/// | Moves                  | conflict | conflict | ok       |
-/// | Requires               | conflict | ok       | ok       |
+/// | committing \ committed | Writes   | Moves    | Requires | RequiresUnlessRemoved |
+/// |------------------------|----------|----------|----------|-----------------------|
+/// | Writes                 | conflict | conflict | ok       | ok                    |
+/// | Moves                  | conflict | conflict | ok       | ok                    |
+/// | Requires               | conflict | ok       | ok       | ok                    |
+/// | RequiresUnlessRemoved  | conflict | ok       | ok       | ok                    |
 ///
-/// The `Requires` column is all "ok": what the committed set required held when
-/// it committed, and it serialized first, so nothing arriving later can
-/// retroactively break it. The `Requires` row is the open question, because
-/// the committing set read before the other landed. It collides with a write
+/// The requirement columns are all "ok": what the committed set required held
+/// when it committed, and it serialized first, so nothing arriving later can
+/// retroactively break it. The requirement rows are the open question, because
+/// the committing set read before the other landed. They collide with a write
 /// and not a move, since a move leaves every value where a reader finds it.
+///
+/// The two requirement rows differ only where the write is a removal of the
+/// whole fragment, which reaches the coordinate through a [`Region`] rather
+/// than claiming it; that difference lives in
+/// [`Footprint::claims_conflict_with`].
 ///
 /// The table is monotone along [`Mode`]'s order in every row and column, which
 /// is what lets one coordinate touched two ways by one set be summarized by
@@ -189,8 +211,8 @@ fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     match (committing, committed) {
         (_, Mode::Writes) => true,
         (Mode::Writes | Mode::Moves, Mode::Moves) => true,
-        (Mode::Requires, Mode::Moves) => false,
-        (_, Mode::Requires) => false,
+        (Mode::Requires | Mode::RequiresUnlessRemoved, Mode::Moves) => false,
+        (_, Mode::Requires | Mode::RequiresUnlessRemoved) => false,
     }
 }
 
@@ -405,6 +427,7 @@ impl Footprint {
                 .regions
                 .iter()
                 .filter(|(region, _)| region.contains(coordinate))
+                .filter(|(region, _)| !ours.is_released_by(region))
                 .map(|(_, theirs)| *theirs);
             same_coordinate
                 .into_iter()
@@ -583,18 +606,22 @@ impl Footprint {
         }
     }
 
-    /// Record that this set reads `fields` in `fragment` and needs them to
-    /// still hold what it read.
+    /// Record that this set describes `fields` in `fragment` and needs their
+    /// values not to have been replaced in place, though the fragment may
+    /// since have been removed. See [`Mode::RequiresUnlessRemoved`].
     ///
     /// A fragment this operation mints records nothing: no concurrent writer
     /// can have replaced data that did not exist when they planned.
-    pub(super) fn require_field_data(
+    pub(super) fn require_field_data_unless_removed(
         &mut self,
         fragment: u64,
         fields: impl IntoIterator<Item = FieldRef>,
     ) {
         for field in fields.into_iter().filter_map(committed_field) {
-            self.require(Coordinate::FieldData { fragment, field });
+            self.claim(
+                Coordinate::FieldData { fragment, field },
+                Mode::RequiresUnlessRemoved,
+            );
         }
     }
 
@@ -743,6 +770,40 @@ mod tests {
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
+
+    /// One coordinate touched two ways by one set is summarized by its
+    /// strongest mode, which is only sound while every row and column of the
+    /// table is monotone in that order.
+    #[test]
+    fn test_pair_conflicts_is_monotone_in_mode_order() {
+        let modes = [
+            Mode::RequiresUnlessRemoved,
+            Mode::Requires,
+            Mode::Moves,
+            Mode::Writes,
+        ];
+        assert!(modes.windows(2).all(|pair| pair[0] < pair[1]));
+        for weaker in 0..modes.len() {
+            for stronger in weaker..modes.len() {
+                for other in modes {
+                    assert!(
+                        pair_conflicts(modes[stronger], other)
+                            >= pair_conflicts(modes[weaker], other),
+                        "row {:?} vs {:?} against {other:?}",
+                        modes[stronger],
+                        modes[weaker]
+                    );
+                    assert!(
+                        pair_conflicts(other, modes[stronger])
+                            >= pair_conflicts(other, modes[weaker]),
+                        "column {:?} vs {:?} against {other:?}",
+                        modes[stronger],
+                        modes[weaker]
+                    );
+                }
+            }
+        }
+    }
 
     fn add_fragment(id: Ref) -> Action {
         Action::AddFragment(AddFragment {

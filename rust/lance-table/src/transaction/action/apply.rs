@@ -32,6 +32,7 @@ use crate::format::{
 };
 use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::validate::schema_fragments_valid;
@@ -1117,6 +1118,22 @@ fn prune_rebound_fields_from_indices(
     Ok(())
 }
 
+/// Refuse an index action naming the fragment reuse history. The history is
+/// not an index on the action path -- its own actions append to and trim it,
+/// merged onto the current history at every attempt -- so an index action
+/// naming it could only splice in a snapshot or drop records a concurrent
+/// writer appended.
+pub(super) fn reject_frag_reuse_history(action: &str, name: &str) -> Result<()> {
+    if name == FRAG_REUSE_INDEX_NAME {
+        return Err(Error::invalid_input(format!(
+            "{action} names '{FRAG_REUSE_INDEX_NAME}', the fragment reuse history, which is not \
+             an index an index action may change; use AppendFragReuseTransition or \
+             TrimFragReuse"
+        )));
+    }
+    Ok(())
+}
+
 fn beyond_read_mark_err(space: &str, id: impl std::fmt::Display, mark: String) -> Error {
     Error::invalid_input(format!(
         "an action names {space} {id} by a Committed ref, but the read version's high-water mark \
@@ -1246,7 +1263,6 @@ mod tests {
     };
     use crate::format::DataFile;
     use crate::rowids::write_row_ids;
-    use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use crate::system_index::mem_wal::{
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
         new_mem_wal_index_meta,
