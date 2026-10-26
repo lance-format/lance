@@ -1503,24 +1503,44 @@ mod tests {
         assert!(indices.is_empty(), "{indices:?}");
     }
 
-    /// A segment requires the data of the fragments it covers, and that data
-    /// is gone if the fragment is: a compaction landing first would leave the
-    /// segment describing rows the dataset no longer has, in a fragment the
-    /// replacement does not cover. Landing second, the compaction is the one
-    /// answerable for the index, and the footprint has nothing to say.
-    #[test]
-    fn test_a_build_loses_to_a_committed_removal_of_a_covered_fragment() {
+    /// Removal isn't staleness: a removed fragment is visible in the
+    /// metadata, so a segment naming one either reaches its rows through the
+    /// fragment reuse history or loses that coverage. Neither a compaction
+    /// nor a deletion of the whole fragment conflicts with the build, in
+    /// either order.
+    #[rstest]
+    #[case::compaction(false)]
+    #[case::whole_fragment_deletion(true)]
+    fn test_a_build_does_not_conflict_with_removing_a_covered_fragment(#[case] data_change: bool) {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let removal = |fragment: u64| {
-            footprint(vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(fragment),
-                data_change: false,
-            })])
-        };
+        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment {
+            fragment: Ref::Committed(0),
+            data_change,
+        })]);
 
-        assert!(build.conflicts_with(&removal(0)));
-        assert!(!removal(0).conflicts_with(&build));
-        assert!(!build.conflicts_with(&removal(1)));
+        assert!(!build.conflicts_with(&removal));
+        assert!(!removal.conflicts_with(&build));
+    }
+
+    /// The exemption is for removal only: replacing the covered values in
+    /// place still conflicts, even in the set that also removes another
+    /// fragment.
+    #[test]
+    fn test_a_build_still_conflicts_with_an_in_place_write_beside_a_removal() {
+        let build = index_footprint(covering("by_a", Some(vec![0])));
+        let write = footprint(vec![
+            Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(1),
+                data_change: true,
+            }),
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+            }),
+        ]);
+
+        assert!(build.conflicts_with(&write));
     }
 
     fn index_footprint(action: AddIndexSegment) -> Footprint {
