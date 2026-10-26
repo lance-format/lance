@@ -186,27 +186,21 @@ impl DatasetPreFilter {
         )
         .map(|fragment| async move {
             let id = fragment.id() as u32;
-            if fragment.metadata().deletion_file.is_none() {
-                return Ok((id, None));
-            }
-            // Bound the complement by the physical row count, not the entire
-            // u32 address space. Full - Partial otherwise expands a huge bitmap.
+            // Bound every fragment by its physical row count. Even undeleted
+            // fragments can later intersect with a block filter or overlay;
+            // Full - Partial would expand the entire u32 offset domain.
             let num_rows = fragment.physical_rows().await?;
             let mut live_rows = RoaringBitmap::new();
             live_rows.insert_range(0..num_rows as u32);
             if let Some(deletions) = fragment.get_deletion_vector().await? {
                 live_rows -= &RoaringBitmap::from(deletions.as_ref());
             }
-            Ok::<_, crate::Error>((id, Some(live_rows)))
+            Ok::<_, crate::Error>((id, live_rows))
         })
         .buffer_unordered(dataset.object_store.io_parallelism());
         let mut allowed = RowAddrTreeMap::new();
         while let Some((id, rows)) = fragment_rows.try_next().await? {
-            if let Some(rows) = rows {
-                allowed.insert_bitmap(id, rows);
-            } else {
-                allowed.insert_fragment(id);
-            }
+            allowed.insert_bitmap(id, rows);
         }
         Ok(Arc::new(RowAddrMask::from_allowed(allowed)))
     }
@@ -674,6 +668,46 @@ mod test {
             })
             .collect();
         assert_eq!(selected, expected);
+    }
+
+    #[rstest]
+    #[case::filter(false)]
+    #[case::overlay(true)]
+    #[tokio::test]
+    async fn test_restricted_mask_composes_with_block_filter(#[case] overlay: bool) {
+        let datasets = test_datasets(false).await;
+        // Only fragment 2 has a deletion; exclusions in fragments 0 and 1
+        // must not expand their allow entries to the full u32 offset domain.
+        let blocked = RowAddrTreeMap::from_iter([0_u64, 1_u64 << 32]);
+        let block_mask = RowAddrMask::from_block(blocked);
+        let filter = if overlay {
+            None
+        } else {
+            let block_mask = block_mask.clone();
+            Some(async move { Ok(Arc::new(block_mask)) }.boxed())
+        };
+        let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(
+            datasets.deletions_no_missing_frags,
+            RoaringBitmap::from_iter(0..3),
+            filter,
+        );
+        if overlay {
+            prefilter = prefilter.with_overlay_block(block_mask);
+        }
+        prefilter.wait_for_ready().await.unwrap();
+        let mask = prefilter.mask();
+        let allowed = mask.allow_list().unwrap();
+        let bytes = allowed.serialized_size();
+        assert!(bytes < 1024, "nine-row prefilter expanded to {bytes} bytes");
+        let expected = RowAddrTreeMap::from_iter([
+            1,
+            2,
+            (1_u64 << 32) + 1,
+            (1_u64 << 32) + 2,
+            2_u64 << 32,
+            (2_u64 << 32) + 1,
+        ]);
+        assert_eq!(allowed, &expected);
     }
 
     #[tokio::test]
