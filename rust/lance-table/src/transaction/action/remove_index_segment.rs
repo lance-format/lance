@@ -3,7 +3,7 @@
 
 //! Remove an index segment.
 
-use super::apply::ApplyState;
+use super::apply::{ApplyState, reject_frag_reuse_history};
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::{Coordinate, Footprint};
 use crate::format::pb_actions;
@@ -30,6 +30,7 @@ pub struct RemoveIndexSegment {
 
 impl RemoveIndexSegment {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        reject_frag_reuse_history("RemoveIndexSegment", &self.name)?;
         state.remove_index_segment(self.uuid, &self.name)
     }
 

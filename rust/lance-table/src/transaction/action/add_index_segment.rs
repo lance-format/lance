@@ -3,13 +3,12 @@
 
 //! Add an index segment.
 
-use super::apply::ApplyState;
+use super::apply::{ApplyState, reject_frag_reuse_history};
 use super::footprint::IndexIdentity;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::query_contract::QueryContract;
 use super::{FieldRef, Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
-use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
@@ -30,6 +29,10 @@ use uuid::Uuid;
 /// counter, so unlike a fragment or a field it needs no [`Ref`]: two writers
 /// cannot pick the same one, and replaying the action onto another version
 /// leaves it untouched.
+///
+/// The fragment reuse history (`__lance_frag_reuse`) is not an index here,
+/// and `apply` rejects a segment carrying its name, as it does for the other
+/// index actions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddIndexSegment {
     /// Identifies the segment, and names the directory its files live in.
@@ -38,7 +41,7 @@ pub struct AddIndexSegment {
     pub name: String,
     /// The fields the segment is keyed on -- the columns it can be searched
     /// by. Empty only for a system index keyed on no column at all, such as
-    /// `mem_wal` or `frag_reuse`.
+    /// `mem_wal`.
     ///
     /// Keys only, unlike [`IndexMetadata::fields`] under the legacy contract,
     /// where it means keyed columns followed by carried ones. `apply` derives
@@ -60,10 +63,9 @@ pub struct AddIndexSegment {
     /// The fragments this segment covers. An empty list says the segment
     /// covers nothing.
     ///
-    /// `None` says no coverage is recorded, which only the system indices
-    /// (`__lance_mem_wal`, `__lance_frag_reuse`) may say: they are not served
-    /// per fragment. A user index segment must state its coverage, and `apply`
-    /// rejects one that does not.
+    /// `None` says no coverage is recorded, which only the MemWAL system index
+    /// (`__lance_mem_wal`) may say: it is not served per fragment. A user index
+    /// segment must state its coverage, and `apply` rejects one that does not.
     pub covered_fragments: Option<Vec<Ref>>,
     /// The segment's files and their sizes, empty when the writer did not
     /// record them.
@@ -92,17 +94,16 @@ pub struct AddIndexSegment {
 
 impl AddIndexSegment {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        reject_frag_reuse_history("AddIndexSegment", &self.name)?;
         let fields = self
             .fields
             .iter()
             .map(|field| state.resolve_schema_field(*field, "AddIndexSegment"))
             .collect::<Result<Vec<_>>>()?;
-        let is_system_index = self.name == MEM_WAL_INDEX_NAME || self.name == FRAG_REUSE_INDEX_NAME;
-        if self.covered_fragments.is_none() && !is_system_index {
+        if self.covered_fragments.is_none() && self.name != MEM_WAL_INDEX_NAME {
             return Err(Error::invalid_input(format!(
                 "AddIndexSegment for index '{}' leaves covered_fragments unset; only the system \
-                 indices '{MEM_WAL_INDEX_NAME}' and '{FRAG_REUSE_INDEX_NAME}' may omit their \
-                 coverage",
+                 index '{MEM_WAL_INDEX_NAME}' may omit its coverage",
                 self.name
             )));
         }
@@ -257,8 +258,11 @@ impl AddIndexSegment {
     /// reader no way to catch it -- an in-place column rewrite "cannot be
     /// detected just by examining metadata", so a reader trusts
     /// `fragment_bitmap` as it finds it. Requiring the data keeps that trust
-    /// earned. Deletions and overlays are excluded on purpose: both leave a
-    /// trace a reader can act on, so both may still run alongside a build.
+    /// earned. Deletions, overlays and the removal of a whole fragment are
+    /// excluded on purpose: each leaves a trace a reader can act on, so each
+    /// may still run alongside a build. A segment naming a removed fragment
+    /// reaches its rows through the fragment reuse history or loses that
+    /// coverage.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.claim_index_segment(
             self.name.clone(),
@@ -295,7 +299,7 @@ impl AddIndexSegment {
             return;
         };
         for fragment in covered.iter().filter_map(|fragment| fragment.committed()) {
-            footprint.require_field_data(fragment, dependencies.iter().copied());
+            footprint.require_field_data_unless_removed(fragment, dependencies.iter().copied());
         }
     }
 }
