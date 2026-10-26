@@ -207,7 +207,14 @@ dataset version references them.
 Older readers and writers did not expect both stable row IDs and a Fragment Reuse Index but are
 not prevented from opening tables that have both. These older systems could silently corrupt such
 tables. A table version that has both sets `FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS` in the reader and
-writer [feature flags](../../table/versioning.md#current-feature-flags) to guard against this.
+writer [feature flags](../../table/versioning.md#current-feature-flags) to guard against this,
+whatever the FRI index version. A tagged history on such a table sets it alongside
+`FLAG_FRAGMENT_REUSE_INDEX`.
+
+FRI translates row addresses, so it applies only to indices that store row addresses. Tagged
+histories (`index_version >= 1`) are allowed on tables with stable row IDs, but an index that
+stores stable row IDs must not coexist with a tagged entry: writers must refuse to record a
+transition while such an index exists, and to add such an index while a tagged entry exists.
 
 ## Impacts
 
@@ -230,9 +237,6 @@ Longer mapping chains add translation work; trimming unused history reduces it.
 The first commit publishing FRI index version 1 sets
 `FLAG_FRAGMENT_REUSE_INDEX` (1024) in both manifest flag fields. Subsequent
 manifests retain both bits. FRI index version 0 does not require this flag.
-
-Tables using stable row IDs do not support tagged histories; writers must not
-publish `index_version >= 1` on them.
 
 The reader flag prevents older clients from partially interpreting the new
 history. The writer flag prevents them from dropping mappings when rewriting

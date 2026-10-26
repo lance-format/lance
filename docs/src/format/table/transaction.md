@@ -712,6 +712,84 @@ concurrent change that makes one of them required. Apply rejects a `false`
 tombstone whose fields are not all re-bound that way, and an `AddDataFile`
 whose `data_change` differs from that of the tombstone it re-binds.
 
+### Fragment Reuse History
+
+The [fragment reuse history](../index/system/frag_reuse.md) is not an index in
+a `CompositeOperation`. Apply rejects `AddIndexSegment`, `RemoveIndexSegment`,
+`AdjustIndexCoverage`, and `DropIndex` when they name `__lance_frag_reuse`.
+The history changes only through two actions, and neither refers to the
+history's index entry, its UUID, or its `index_version`.
+
+`AppendFragReuseTransition` records that a compaction in the same operation
+moved rows from its `sources` to its `destinations`, with one ordered
+compaction or stable partition mapping. It is a delta: on every commit attempt,
+apply appends the transition to the history as it stands on the version being
+committed on top of, never to a copy the writer read. Transitions with disjoint
+sources therefore commute. The transition carries no fragment digests. Apply
+derives each source digest from the fragment as it stands (its physical rows
+and deleted rows) and each destination digest from its `AddFragment` (its
+physical rows and no deleted rows).
+
+Apply validates the transition without reading any file, and rejects it unless:
+
+- every source is removed in the same operation by a `RemoveFragment` with
+  `data_change` false;
+- every destination is added in the same operation by an `AddFragment`, under a
+  local or a reserved committed id, and has no deletion file;
+- each source's surviving-row count in the mapping equals its physical rows
+  minus its deleted rows, and the sources' surviving rows total the
+  destinations' physical rows;
+- no source is consumed by any other transition, in the history or in the same
+  operation;
+- no index on the table stores stable row ids rather than row addresses;
+- a stable partition has between 1 and 65,536 destinations.
+
+Apply then creates the history if the table has none, converts a version 0
+history to version 1 (keeping its `legacy_versions`), sets
+`FLAG_FRAGMENT_REUSE_INDEX`, and, on a table with stable row ids, also sets
+`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`. A history over the inline size limit is
+written to an external details file.
+
+Recording a transition is never required. A compaction that moves covered rows
+without one is legal: the indices lose coverage of those rows, which are then
+scanned, and since fragment ids are never reused nothing is served wrongly.
+Recording a transition on every compaction is a writer default, not a rule
+apply enforces. The writer is responsible only for the mapping payload being
+correct.
+
+`TrimFragReuse` is declarative. On every commit attempt, apply drops every
+transition that no index on the version being committed on top of still needs.
+It names no transition, so it never conflicts; an implementation may keep a
+transition it cannot prove unneeded.
+
+Neither action adds a conflict claim of its own. A transition's sources are
+removed by `RemoveFragment`s in the same operation, which already make two
+compactions of the same fragment, or a compaction and a concurrent deletion
+from one of its sources, conflict.
+
+### Index Builds and Removed Fragments
+
+An `AddIndexSegment` requires the data it covers, and so does an
+`AdjustIndexCoverage` for the fragments it adds: a concurrent commit that
+replaces those fields' values in place (an `AddDataFile` or a
+`TombstoneFieldData` with `data_change` true, or an `AlterField` of one of the
+fields) conflicts with it, because a reader cannot tell from the metadata that
+the indexed values changed. Removing a whole fragment does not conflict with
+that requirement. Like a deletion or an overlay, a removal is visible in the
+metadata: a segment naming a removed fragment either reaches its rows through
+the fragment reuse history or loses that coverage. So neither a removal nor a
+compaction conflicts with building an index, whether or not the compaction
+records a transition, and this does not depend on what else the removing
+operation contains. A data file written into a committed fragment still
+conflicts with that fragment's removal, which destroys the written cells, and
+an `AdjustIndexCoverage` still requires each committed fragment it adds to
+exist.
+
+After such a race, an index can hold two segments whose coverage overlaps once
+the history is applied: one built late over a compacted source, and one built
+over the destination. Resolving the overlap is the index maintenance's
+concern, and it only ever loses coverage; it is never a conflict.
+
 ### Isolation
 
 Two `CompositeOperation`s conflict when they write overlapping parts of the

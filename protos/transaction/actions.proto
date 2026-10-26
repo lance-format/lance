@@ -169,6 +169,9 @@ message Action {
     RemoveIndexSegment remove_index_segment = 15;
     AdjustIndexCoverage adjust_index_coverage = 16;
     DropIndex drop_index = 22;
+    // -- Fragment reuse history (not an index on this wire; see below) --
+    AppendFragReuseTransition append_frag_reuse_transition = 23;
+    TrimFragReuse trim_frag_reuse = 24;
     // -- Wholesale-within-operation --
     ResetTable reset_table = 17;
     ReserveFragmentIds reserve_fragment_ids = 18;
@@ -468,6 +471,11 @@ message AlterField {
  *
  * A brand-new index is expressed as its first segment; the set of segments
  * sharing `name` constitutes one logical index.
+ *
+ * The fragment reuse history is not an index here: apply rejects this and the
+ * other index actions (RemoveIndexSegment, AdjustIndexCoverage, DropIndex)
+ * when they name `__lance_frag_reuse`. It changes only through
+ * AppendFragReuseTransition and TrimFragReuse.
  */
 message AddIndexSegment {
   lance.table.UUID uuid = 1;
@@ -475,7 +483,7 @@ message AddIndexSegment {
   /*
    * The field ids this segment is keyed on -- the columns it can be searched
    * by (Committed, or Local for same-op minted fields). Empty only for a
-   * system index keyed on no column at all, such as mem_wal or frag_reuse.
+   * system index keyed on no column at all, such as mem_wal.
    *
    * Keys only. `IndexMetadata.fields` in a manifest written under the legacy
    * contract instead means keyed columns followed by carried ones; this
@@ -502,8 +510,8 @@ message AddIndexSegment {
    * Fragments covered by this segment (resolved to a fragment_bitmap at apply,
    * and remapped under fragment relocation).
    *
-   * Absent means the coverage is unknown, which is what the system indices
-   * (MemWAL, fragment reuse) carry and what pre-bitmap segments read back as.
+   * Absent means the coverage is unknown, which is what the MemWAL system
+   * index carries and what pre-bitmap segments read back as.
    * That is a different statement from a present-but-empty list, which says the
    * segment covers no fragment at all -- the query path serves a segment of
    * unknown coverage and skips one that covers nothing.
@@ -613,6 +621,62 @@ message AdjustIndexCoverage {
 message DropIndex {
   string name = 1;
 }
+
+/*
+ * Record that this operation's compaction moved rows from `sources` to
+ * `destinations`, so that index segments built over the sources keep serving
+ * those rows through the fragment reuse history instead of losing coverage.
+ *
+ * The history is not an index on this wire: no action names it as one, and
+ * the index actions reject the reserved name `__lance_frag_reuse`. Apply merges
+ * the transition onto the history as it stands on the version being committed
+ * on top of, at every attempt, never onto a snapshot the writer carried.
+ *
+ * Digests are not carried. Apply derives each source's digest from the
+ * fragment as it stands (physical rows, deleted rows) and each destination's
+ * from its AddFragment (physical rows, no deleted rows).
+ *
+ * Apply rejects the action unless:
+ * - every source is removed in this operation by a RemoveFragment with
+ *   `data_change = false`;
+ * - every destination is added in this operation by an AddFragment (Local, or
+ *   a reserved Committed id) and given no deletion file;
+ * - each source's surviving-row count in the mapping equals its physical rows
+ *   minus its deleted rows, and the surviving rows of all sources total the
+ *   destinations' physical rows;
+ * - no source is consumed by another transition, in the history or in this
+ *   operation;
+ * - no index on the table records stable row ids rather than row addresses;
+ * - a stable partition has between 1 and 65,536 destinations.
+ *
+ * Recording a transition is never required: a compaction that moves covered
+ * rows without one is legal and loses that coverage.
+ */
+message AppendFragReuseTransition {
+  /*
+   * Scan order. Each must be removed in this operation by
+   * RemoveFragment{data_change=false}.
+   */
+  repeated Ref sources = 1;
+  /*
+   * Output/label order. Each must be added in this operation by AddFragment
+   * (local, or a reserved committed id) and given no deletion file.
+   */
+  repeated Ref destinations = 2;
+  oneof mapping {
+    lance.table.FragmentReuseIndexDetails.OrderedCompaction ordered_compaction = 3;
+    lance.table.FragmentReuseIndexDetails.StablePartition stable_partition = 4;
+  }
+}
+
+/*
+ * Drop every transition of the fragment reuse history that no index on the
+ * table still needs, judged against the history and the index list of the
+ * version being committed on top of at every attempt. Declarative: it names no
+ * transition, so it never conflicts and drops whatever is safe to drop when it
+ * lands.
+ */
+message TrimFragReuse {}
 
 /*
  * Reset the table to an empty state, in preparation for a fresh schema and data
