@@ -19,6 +19,7 @@ import org.lance.Fragment;
 import org.lance.FragmentMetadata;
 import org.lance.ReadOptions;
 import org.lance.Ref;
+import org.lance.Session;
 import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.namespace.errors.ErrorCode;
@@ -216,6 +217,35 @@ public class DirectoryNamespaceTest {
     assertTrue(
         versionRejectingNamespace.getDescribeTableCallCount() > 0,
         "Expected describeTable to be called when opening through namespace");
+  }
+
+  @Test
+  void testRepeatedOpensShareReadOptionsSession() throws Exception {
+    List<String> tableId = Arrays.asList("shared_session");
+    namespaceClient.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+
+    try (Session session = Session.builder().build()) {
+      ReadOptions options = new ReadOptions.Builder().setSession(session).build();
+      long previousHits = 0;
+      for (int i = 0; i < 2; i++) {
+        try (Dataset dataset =
+            Dataset.open()
+                .allocator(allocator)
+                .namespaceClient(namespaceClient)
+                .tableId(tableId)
+                .readOptions(options)
+                .build()) {
+          assertTrue(dataset.session().isSameAs(session));
+          assertEquals(3, dataset.countRows());
+        }
+        assertFalse(session.isClosed());
+        long hits = session.metadataCacheStats().getHits();
+        if (i > 0) {
+          assertTrue(hits > previousHits, "Repeated opens should reuse the metadata cache");
+        }
+        previousHits = hits;
+      }
+    }
   }
 
   @Test

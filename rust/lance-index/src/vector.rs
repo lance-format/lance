@@ -28,6 +28,7 @@ use v3::subindex::SubIndexType;
 
 pub mod bq;
 pub mod distributed;
+pub(crate) mod exact_buffers;
 pub mod flat;
 pub mod graph;
 pub mod hnsw;
@@ -188,6 +189,8 @@ pub struct Query {
 
     /// The number of candidates to reserve while searching.
     /// this is an optional parameter for HNSW related index types.
+    /// Unset defaults to `1.5 * k * refine_factor`, floored at
+    /// [`crate::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub ef: Option<usize>,
 
     /// If presented, apply a refine step.

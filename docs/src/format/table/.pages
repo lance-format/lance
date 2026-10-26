@@ -1,6 +1,8 @@
 nav:
   - index.md
   - Schema: schema.md
+  - Blob v2: blob.md
+  - Table Config: table_config.md
   - Versioning: versioning.md
   - Transactions: transaction.md
   - Layout: layout.md

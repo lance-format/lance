@@ -5,13 +5,14 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::types::Int32Type;
+use arrow_array::builder::{ListBuilder, StringBuilder};
+use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
-    PrimitiveArray, StringArray, new_null_array,
+    PrimitiveArray, StringArray, UInt16Array, new_null_array,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -33,7 +34,10 @@ use crate::encodings::logical::primitive::{MiniBlockScheduler, StructuralPageSch
 use crate::format::metadata;
 use crate::format::metadata::compressive_encoding::Compression;
 use crate::repdef::build_control_word_iterator;
-use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
+use crate::testing::{
+    TestCases, TestEncoding, check_round_trip_encoding_of_data,
+    check_round_trip_encoding_of_data_with_expected,
+};
 
 use super::{DictionaryEncodingPolicy, MiniblockChunkSize, PrimitiveStructuralEncoder};
 
@@ -147,6 +151,32 @@ fn test_fullzip_fixed_rejects_non_byte_aligned_values() {
         err.to_string().contains("byte aligned"),
         "unexpected error: {err}"
     );
+}
+
+// https://github.com/lance-format/lance/issues/8558
+#[tokio::test]
+async fn test_take_multichunk_string_lists() {
+    let mut list_builder = ListBuilder::new(StringBuilder::new());
+    for row in 0..3 {
+        for item in 0..512 {
+            list_builder
+                .values()
+                .append_value(format!("r{row:03}i{item:06}xaaaa"));
+        }
+        list_builder.append(true);
+    }
+    let list_array: ArrayRef = Arc::new(list_builder.finish());
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        STRUCTURAL_ENCODING_META_KEY.to_string(),
+        STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+    );
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralU16)
+        .with_indices(vec![0, 2]);
+
+    check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await;
 }
 
 async fn test_minichunk_size_helper(
@@ -768,6 +798,113 @@ async fn test_sparse_vector_dictionary_hidden_payload(
         .with_batch_size(256)
         .with_range(0..rows as u64)
         .with_indices(vec![0, valid as u64 - 1, valid as u64, rows as u64 - 1]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::rgb("u8", false)]
+#[case::depth("u16", true)]
+#[case::dense_depth("u16_dense", false)]
+#[case::nested_nullable("nested", true)]
+#[case::null_children("null_children", false)]
+#[tokio::test]
+async fn test_tensor_per_value_compression(
+    #[case] kind: &str,
+    #[case] sparse: bool,
+    #[values("zstd", "lz4", "none")] compression: &str,
+) {
+    const ROWS: usize = 32;
+    const DIMENSION: usize = 1030;
+    let child: ArrayRef = match kind {
+        "u16_dense" => Arc::new(arrow_array::UInt16Array::from_iter_values(
+            (0..ROWS * DIMENSION).map(|i| (i / DIMENSION + i % 5) as u16),
+        )),
+        "u8" => Arc::new(arrow_array::UInt8Array::from_iter_values(
+            (0..ROWS * DIMENSION).map(|i| (i / DIMENSION + i % 5) as u8),
+        )),
+        "null_children" => Arc::new(arrow_array::UInt16Array::new_null(ROWS * DIMENSION)),
+        _ => Arc::new(arrow_array::UInt16Array::from_iter(
+            (0..ROWS * DIMENSION).map(|i| (i % 7 != 0).then_some((i / DIMENSION + i % 5) as u16)),
+        )),
+    };
+    let dimension = if kind == "nested" {
+        DIMENSION / 2
+    } else {
+        DIMENSION
+    };
+    let mut array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new(
+            "item",
+            child.data_type().clone(),
+            true,
+        )),
+        dimension as i32,
+        child,
+        None,
+    ));
+    if kind == "nested" {
+        array = Arc::new(FixedSizeListArray::new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                array.data_type().clone(),
+                true,
+            )),
+            2,
+            array,
+            None,
+        ));
+    }
+    if sparse {
+        array = arrow_array::make_array(
+            array
+                .to_data()
+                .into_builder()
+                .nulls(Some(NullBuffer::from(
+                    (0..ROWS).map(|i| i % 4 == 0).collect::<Vec<_>>(),
+                )))
+                .build()
+                .unwrap(),
+        );
+    }
+    let metadata = HashMap::from([
+        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
+        (COMPRESSION_LEVEL_META_KEY.to_string(), "3".to_string()),
+        // Exercise the configured codec independently of automatic selection.
+        ("lance-encoding:axis-delta".to_string(), "off".to_string()),
+    ]);
+    let field = arrow_schema::Field::new("tensor", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let PageEncoding::Planar(layout) = page.description else {
+        panic!("expected Planar page")
+    };
+    let Some(crate::format::pb23::value_plane::Codec::Zipped(values)) =
+        layout.values.and_then(|v| v.codec)
+    else {
+        panic!("expected independently addressed tensors");
+    };
+    assert_eq!(
+        matches!(
+            values.addressing,
+            Some(crate::format::pb23::zipped_values::Addressing::BitsPerOffset(_))
+        ),
+        compression != "none"
+    );
+    assert_eq!(
+        matches!(
+            values.compression.as_ref().unwrap().compression,
+            Some(Compression::General(_))
+        ),
+        compression != "none"
+    );
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024])
+        .with_ingest_batch_counts([4])
+        .with_slicing_modes([true])
+        .with_batch_size(7)
+        .with_range(3..29)
+        .with_indices(vec![0, 3, 4, 7, 8, 17, 28, 31]);
     check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
 }
 
@@ -1958,4 +2095,331 @@ async fn test_per_value_zstd_round_trip_large_values_with_nulls() {
         )
         .await;
     }
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_axis_delta_per_value_compression(
+    #[values("off", "on:1", "auto:1", "auto", "default")] mode: &str,
+    #[values("zstd", "lz4", "none")] compression: &str,
+    #[values(false, true)] nullable: bool,
+    #[values("fullzip", "sparse")] structure: &str,
+) {
+    const ROWS: usize = 16;
+    const DIM: usize = 3 * 17 * 23;
+    let child: ArrayRef = Arc::new(arrow_array::Int32Array::from(
+        (0..ROWS * DIM)
+            .map(|i| (i as i32 * 107) - 1_000_000)
+            .collect::<Vec<_>>(),
+    ));
+    let array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new(
+            "item",
+            child.data_type().clone(),
+            true,
+        )),
+        DIM as i32,
+        child,
+        nullable.then(|| NullBuffer::from((0..ROWS).map(|i| i % 3 != 0).collect::<Vec<_>>())),
+    ));
+    let mut metadata = HashMap::from([
+        (
+            "lance-encoding:structural-encoding".to_string(),
+            structure.to_string(),
+        ),
+        ("lance-encoding:axis-delta".to_string(), mode.to_string()),
+        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
+    ]);
+    if mode == "default" {
+        metadata.remove("lance-encoding:axis-delta");
+    }
+    metadata.insert(
+        "ARROW:extension:name".into(),
+        "arrow.fixed_shape_tensor".into(),
+    );
+    metadata.insert(
+        "ARROW:extension:metadata".into(),
+        r#"{"shape":[23,17,3]}"#.into(),
+    );
+    let field = arrow_schema::Field::new("pixels", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let PageEncoding::Planar(layout) = page.description else {
+        panic!("expected Planar")
+    };
+    let Some(crate::format::pb23::value_plane::Codec::Zipped(values)) =
+        layout.values.and_then(|v| v.codec)
+    else {
+        panic!("expected Zipped")
+    };
+    let mut codec = values.compression.as_ref().unwrap();
+    if let Some(Compression::General(general)) = &codec.compression {
+        codec = general.values.as_ref().unwrap();
+    }
+    assert_eq!(
+        matches!(codec.compression, Some(Compression::AxisDelta(_))),
+        mode != "off"
+            && !((mode.starts_with("auto") || mode == "default") && compression == "none")
+    );
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024])
+        .with_ingest_batch_counts([4])
+        .with_slicing_modes([true])
+        .with_batch_size(3)
+        .with_range(3..15)
+        .with_indices(vec![0, 1, 3, 8, 14, 15]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::scalar("scalar")]
+#[case::strings("strings")]
+#[case::float_vector("float")]
+#[case::noise("noise")]
+#[case::repeated_vector("repeated")]
+#[case::inner_nulls("inner_nulls")]
+#[case::small_tensor("small")]
+#[case::invalid_extension("invalid_extension")]
+#[tokio::test]
+async fn test_default_axis_delta_preserves_other_encodings(
+    #[case] kind: &str,
+    #[values("lz4", "zstd", "none", "unset")] compression: &str,
+    #[values(
+        TestEncoding::StructuralSparse,
+        TestEncoding::StructuralU32,
+        TestEncoding::StructuralU16
+    )]
+    version: TestEncoding,
+) {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    let mut rng = StdRng::seed_from_u64(601);
+    const ROWS: usize = 128;
+    let dimension = if kind == "small" { 2 } else { 1024 };
+    let array: ArrayRef = match kind {
+        "scalar" => Arc::new(arrow_array::Int32Array::from(
+            (0..ROWS as i32).collect::<Vec<_>>(),
+        )),
+        "strings" => Arc::new(StringArray::from(
+            (0..ROWS)
+                .map(|i| format!("value {i} {}", "abc".repeat(i % 7)))
+                .collect::<Vec<_>>(),
+        )),
+        _ => {
+            let values: ArrayRef = if kind == "float" {
+                Arc::new(Float32Array::from(
+                    (0..ROWS * dimension)
+                        .map(|_| rng.random::<f32>())
+                        .collect::<Vec<_>>(),
+                ))
+            } else {
+                Arc::new(arrow_array::UInt32Array::from(
+                    (0..ROWS * dimension)
+                        .map(|i| {
+                            if kind == "inner_nulls" && i % 7 == 0 {
+                                None
+                            } else {
+                                Some(if kind == "repeated" {
+                                    (i % dimension) as u32
+                                } else {
+                                    rng.random()
+                                })
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            };
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(arrow_schema::Field::new(
+                    "item",
+                    values.data_type().clone(),
+                    true,
+                )),
+                dimension as i32,
+                values,
+                None,
+            ))
+        }
+    };
+    let mut metadata = HashMap::new();
+    if compression != "unset" {
+        metadata.insert(COMPRESSION_META_KEY.into(), compression.into());
+    }
+    if kind == "invalid_extension" {
+        metadata.insert(
+            "ARROW:extension:name".into(),
+            "arrow.fixed_shape_tensor".into(),
+        );
+        metadata.insert("ARROW:extension:metadata".into(), "invalid-json".into());
+    }
+    let field = arrow_schema::Field::new("value", array.data_type().clone(), false)
+        .with_metadata(metadata.clone());
+    let automatic = encode_first_page(field, array.clone(), version).await;
+    if matches!(
+        kind,
+        "float" | "noise" | "inner_nulls" | "small" | "invalid_extension"
+    ) {
+        // Auto must preserve raw storage when compression has no sampled benefit
+        // or the tensor is unsupported. Stable writers already use raw storage.
+        metadata.remove(COMPRESSION_META_KEY);
+    }
+    metadata.insert("lance-encoding:axis-delta".into(), "off".into());
+    let field =
+        arrow_schema::Field::new("value", array.data_type().clone(), false).with_metadata(metadata);
+    let disabled = encode_first_page(field, array, version).await;
+    assert_eq!(
+        format!("{:?}", automatic.description),
+        format!("{:?}", disabled.description)
+    );
+    assert_eq!(automatic.data.len(), disabled.data.len());
+    for (automatic, disabled) in automatic.data.iter().zip(&disabled.data) {
+        assert_eq!(automatic.as_ref(), disabled.as_ref());
+    }
+}
+
+fn int8_dictionary_with_all_values() -> ArrayRef {
+    let values: Vec<u16> = (0..127u16).collect();
+    let keys: Vec<i8> = (0..127)
+        .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+        .collect();
+    Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap(),
+    )
+}
+
+#[rstest::rstest]
+// Both chunks land in one page, which the writer merges.
+#[case::one_page(4096, vec![TestEncoding::StructuralU32])]
+// Each chunk is its own page, so the reader merges the two decoded dictionaries
+// for a batch that spans both pages.
+#[case::page_per_chunk(
+    64,
+    vec![TestEncoding::Array, TestEncoding::StructuralU16, TestEncoding::StructuralU32]
+)]
+#[tokio::test]
+async fn test_dictionary_merge_keeps_declared_key_type_round_trip(
+    #[case] page_size: u64,
+    #[case] encodings: Vec<TestEncoding>,
+) {
+    // Two Dictionary(Int8, UInt16) chunks, each holding all 127 values an Int8
+    // key can address.  Arrow's lossy concat merge over-counts the union (hash
+    // collisions in its interner) and overflows Int8, although the exact union
+    // fits.  The column must round-trip with its declared key type.
+    let a = int8_dictionary_with_all_values();
+    let b = int8_dictionary_with_all_values();
+    // Build the expected array directly: `concat` hits the same Arrow
+    // interner overflow, so the test harness cannot derive it.
+    let values: Vec<u16> = (0..127u16).collect();
+    let permutation: Vec<i8> = (0..127)
+        .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+        .collect();
+    let mut keys = permutation.clone();
+    keys.extend_from_slice(&permutation);
+    let expected: ArrayRef = Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap(),
+    );
+    let test_cases = TestCases::default()
+        .with_encodings(encodings)
+        .with_page_sizes(vec![page_size])
+        .with_batch_size(1000);
+    check_round_trip_encoding_of_data_with_expected(
+        vec![a, b],
+        Some(expected),
+        &test_cases,
+        HashMap::new(),
+    )
+    .await;
+}
+
+fn disjoint_int8_dictionary(offset: u16) -> ArrayRef {
+    let values: Vec<u16> = (0..100u16).map(|value| value + offset).collect();
+    let keys: Vec<i8> = (0..100).map(|i| i as i8).collect();
+    Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn test_dictionary_merge_overflow_is_rejected_at_write() {
+    // Two chunks with disjoint dictionaries whose exact union (200 values)
+    // cannot be addressed by Int8 indices.  The writer must reject the
+    // mismatch instead of persisting indices wider than the declared key.
+    use crate::encoder::{
+        ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+    };
+    use crate::repdef::RepDefBuilder;
+    use crate::testing::{create_test_field_encoder, test_encoding_strategy};
+
+    let a = disjoint_int8_dictionary(0);
+    let b = disjoint_int8_dictionary(1000);
+    let field = ArrowField::new("d", a.data_type().clone(), false);
+    let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU32);
+    let mut column_index_seq = ColumnIndexSequence::default();
+    let encoding_options = EncodingOptions {
+        cache_bytes_per_column: 1024 * 1024,
+        max_page_bytes: 32 * 1024 * 1024,
+        keep_original_array: true,
+        buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+    };
+    let mut encoder = create_test_field_encoder(
+        encoding_strategy.as_ref(),
+        &lance_field,
+        &mut column_index_seq,
+        &encoding_options,
+    )
+    .unwrap();
+
+    let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+    let mut error = None;
+    for (index, array) in [a, b].into_iter().enumerate() {
+        let row_number = (index * 100) as u64;
+        match encoder.maybe_encode(
+            array,
+            &mut external_buffers,
+            RepDefBuilder::default(),
+            row_number,
+            100,
+        ) {
+            Ok(tasks) => {
+                for task in tasks {
+                    if let Err(err) = task.await {
+                        error = Some(err);
+                        break;
+                    }
+                }
+            }
+            Err(err) => error = Some(err),
+        }
+        if error.is_some() {
+            break;
+        }
+    }
+    if error.is_none() {
+        for task in encoder.flush(&mut external_buffers).unwrap() {
+            if let Err(err) = task.await {
+                error = Some(err);
+                break;
+            }
+        }
+    }
+
+    let error = error.expect("oversized dictionary merge must be rejected");
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(
+        error.to_string().contains("widen the dictionary key type"),
+        "unexpected error: {error}"
+    );
 }

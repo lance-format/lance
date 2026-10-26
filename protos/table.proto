@@ -349,6 +349,11 @@ message IndexMetadata {
 
   /* The columns the index is keyed on, in key order. These refer to file.Field.id.
    *
+   * On a stable-row-ID table, -3 may reference the logical _rowid column even
+   * though it is absent from the user schema. This identity is independent of
+   * whether a fragment stores its row IDs inline or in a hidden data column.
+   * An index on this field must store physical row addresses as its payload.
+   *
    * When the manifest has feature flag 1 << 13, this list contains only key
    * fields. `covering_fields` independently declares the values the index
    * carries.
@@ -462,6 +467,20 @@ message IndexFile {
   string path = 1;
   // Size of the file in bytes
   uint64 size_bytes = 2;
+  /* Size in bytes of the file's metadata suffix, or 0 if unknown.
+   *
+   * For a Lance file of format version 2.0 or later, this is the file size minus
+   * the position of global buffer 0, which holds the file's `FileDescriptor`.
+   * That position is stored in the first entry of the global buffer offset
+   * table, which the footer locates. It is always 0 for legacy (0.1) Lance files
+   * and for files in other formats. Writers record either this exact value or 0.
+   *
+   * This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+   * bytes of the file before decoding the footer. The footer stays
+   * authoritative: readers must ignore a value larger than the file and read
+   * any metadata the footer references outside the hinted range.
+   */
+  uint64 file_metadata_size_bytes = 3;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.

@@ -474,7 +474,8 @@ pub fn chunk_concat_stream(
 pub struct StrictBatchSizeStream<S> {
     inner: S,
     batch_size: usize,
-    residual: Option<RecordBatch>,
+    buffered: VecDeque<RecordBatch>,
+    buffered_rows: usize,
 }
 
 impl<S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin> StrictBatchSizeStream<S> {
@@ -482,7 +483,53 @@ impl<S: Stream<Item = DataFusionResult<RecordBatch>> + Unpin> StrictBatchSizeStr
         Self {
             inner,
             batch_size,
-            residual: None,
+            buffered: VecDeque::new(),
+            buffered_rows: 0,
+        }
+    }
+
+    fn take_buffered(&mut self, num_rows: usize) -> DataFusionResult<RecordBatch> {
+        let mut batches = Vec::with_capacity(self.buffered.len());
+        let mut rows_remaining = num_rows;
+
+        while rows_remaining > 0 {
+            let Some(batch) = self.buffered.pop_front() else {
+                return Err(DataFusionError::Internal(format!(
+                    "StrictBatchSizeStream has fewer than {num_rows} buffered rows"
+                )));
+            };
+            if batch.num_rows() <= rows_remaining {
+                rows_remaining -= batch.num_rows();
+                batches.push(batch);
+            } else {
+                batches.push(batch.slice(0, rows_remaining));
+                self.buffered
+                    .push_front(batch.slice(rows_remaining, batch.num_rows() - rows_remaining));
+                rows_remaining = 0;
+            }
+        }
+
+        self.buffered_rows = self.buffered_rows.checked_sub(num_rows).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "StrictBatchSizeStream cannot take {num_rows} rows from {} buffered rows",
+                self.buffered_rows
+            ))
+        })?;
+
+        if batches.len() == 1 {
+            batches.pop().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "StrictBatchSizeStream produced an empty output batch".to_string(),
+                )
+            })
+        } else {
+            let schema = batches.first().map(RecordBatch::schema).ok_or_else(|| {
+                DataFusionError::Internal(
+                    "StrictBatchSizeStream produced an empty output batch".to_string(),
+                )
+            })?;
+            arrow::compute::concat_batches(&schema, &batches)
+                .map_err(|error| DataFusionError::External(Box::new(error)))
         }
     }
 }
@@ -510,54 +557,34 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            // Process residual first if present
-            if let Some(residual) = self.residual.take() {
-                if residual.num_rows() >= self.batch_size {
-                    let split_at = self.batch_size;
-                    let chunk = residual.slice(0, split_at);
-                    let new_residual = residual.slice(split_at, residual.num_rows() - split_at);
-                    self.residual = Some(new_residual);
-                    return Poll::Ready(Some(Ok(chunk)));
-                } else {
-                    // Keep residual and proceed to get more data
-                    self.residual = Some(residual);
-                }
+            if self.buffered_rows >= self.batch_size {
+                let batch_size = self.batch_size;
+                return Poll::Ready(Some(self.take_buffered(batch_size)));
             }
 
-            // Poll the inner stream for next batch
             match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
                 Some(Ok(batch)) => {
-                    // Combine with residual if any
-                    let current_batch = if let Some(residual) = self.residual.take() {
-                        arrow::compute::concat_batches(&residual.schema(), &[residual, batch])
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?
-                    } else {
-                        batch
-                    };
-
-                    if current_batch.num_rows() >= self.batch_size {
-                        let split_at = self.batch_size;
-                        let chunk = current_batch.slice(0, split_at);
-                        let new_residual =
-                            current_batch.slice(split_at, current_batch.num_rows() - split_at);
-                        if new_residual.num_rows() > 0 {
-                            self.residual = Some(new_residual);
-                        }
-                        return Poll::Ready(Some(Ok(chunk)));
-                    } else {
-                        // Not enough rows, store as residual
-                        self.residual = Some(current_batch);
-                        continue;
+                    if batch.num_rows() > 0 {
+                        self.buffered_rows = self
+                            .buffered_rows
+                            .checked_add(batch.num_rows())
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(format!(
+                                    "StrictBatchSizeStream row count overflow while buffering {} rows",
+                                    batch.num_rows()
+                                ))
+                            })?;
+                        self.buffered.push_back(batch);
                     }
                 }
                 Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                 None => {
-                    return Poll::Ready(
-                        self.residual
-                            .take()
-                            .filter(|r| r.num_rows() > 0)
-                            .map(Ok::<_, DataFusionError>),
-                    );
+                    return if self.buffered_rows == 0 {
+                        Poll::Ready(None)
+                    } else {
+                        let buffered_rows = self.buffered_rows;
+                        Poll::Ready(Some(self.take_buffered(buffered_rows)))
+                    };
                 }
             }
         }
@@ -731,5 +758,28 @@ mod tests {
         for batch in batches {
             assert_eq!(batch.num_rows(), 10);
         }
+    }
+
+    #[tokio::test]
+    async fn test_strict_batch_size_stream_buffers_tiny_batches() {
+        let batches = (0..100).map(|value| {
+            arrow_array::record_batch!(("value", Int32, [value]))
+                .map_err(datafusion_common::DataFusionError::from)
+        });
+        let stream = super::StrictBatchSizeStream::new(futures::stream::iter(batches), 100);
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 100);
+        let expected = (0..100).collect::<Vec<i32>>();
+        assert_eq!(
+            batches[0]["value"]
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            expected.as_slice()
+        );
     }
 }

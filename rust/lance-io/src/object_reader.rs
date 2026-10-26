@@ -11,7 +11,7 @@ use crate::local::read_exact_at;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
@@ -138,16 +138,33 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
 // However, this failure is pretty common (e.g. timeout) and we want to retry in these
 // situations.  In addition, we provide additional logging information in these
 // failures cases.
-async fn do_get_with_outer_retry(
+async fn do_get_with_outer_retry<E: From<object_store::Error> + From<Error>>(
     download_retry_count: usize,
     get_request: Arc<GetRequest>,
+    expected_size: Option<usize>,
     desc: impl Fn() -> String,
-) -> OSResult<Bytes> {
+) -> std::result::Result<Bytes, E> {
     let mut retries = download_retry_count;
     loop {
         let get_request_clone = get_request.clone();
-        let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
-        match get_result.bytes().await {
+        let get_result = do_with_retry(move || get_request_clone.get_range())
+            .await
+            .map_err(E::from)?;
+        if let Some(size) = expected_size {
+            // Reject stale lengths before consuming or allocating for the body.
+            // A partial response cannot establish the complete object's length.
+            if get_result.meta.size != size as u64 || get_result.range != (0..size as u64) {
+                return Err(Error::invalid_input(format!(
+                    "object at '{}' has {} bytes and response range {:?}, expected complete file of {size} bytes",
+                    get_request.path(), get_result.meta.size, get_result.range
+                )).into());
+            }
+        }
+        let body = match expected_size {
+            Some(size) => read_sized_body(get_result, size).await,
+            None => get_result.bytes().await,
+        };
+        match body {
             Ok(bytes) => return Ok(bytes),
             Err(err) => {
                 if retries == 0 {
@@ -158,7 +175,7 @@ async fn do_get_with_outer_retry(
                         download_retry_count,
                         err
                     );
-                    return Err(err);
+                    return Err(err.into());
                 }
                 log::debug!(
                     "Retrying {} from {} (remaining retries: {}).  Error details: {:?}",
@@ -171,6 +188,32 @@ async fn do_get_with_outer_retry(
             }
         }
     }
+}
+
+// Keep the existing small-file buffer bounded even if a store returns a body
+// inconsistent with its metadata. Body failures retain the download retry loop.
+async fn read_sized_body(result: GetResult, size: usize) -> OSResult<Bytes> {
+    let path = result.meta.location.clone();
+    let mut stream = result.into_stream();
+    let mut bytes = BytesMut::with_capacity(size);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if chunk.len() > size - bytes.len() {
+            return Err(Error::io(format!(
+                "object body at '{path}' exceeds expected {size} bytes"
+            ))
+            .into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != size {
+        return Err(Error::io(format!(
+            "object body at '{path}' has {} bytes, expected {size}",
+            bytes.len()
+        ))
+        .into());
+    }
+    Ok(bytes.freeze())
 }
 
 impl Reader for CloudObjectReader {
@@ -220,9 +263,12 @@ impl Reader for CloudObjectReader {
         });
         let download_retry_count = self.download_retry_count;
         Box::pin(async move {
-            do_get_with_outer_retry(download_retry_count, get_request, move || {
-                format!("range {}..{}", range.start, range.end)
-            })
+            do_get_with_outer_retry::<object_store::Error>(
+                download_retry_count,
+                get_request,
+                None,
+                move || format!("range {}..{}", range.start, range.end),
+            )
             .await
         })
     }
@@ -235,9 +281,12 @@ impl Reader for CloudObjectReader {
             options: GetOptions::default(),
         });
         Box::pin(async move {
-            do_get_with_outer_retry(self.download_retry_count, get_request, || {
-                "read_all".to_string()
-            })
+            do_get_with_outer_retry::<object_store::Error>(
+                self.download_retry_count,
+                get_request,
+                None,
+                || "read_all".to_string(),
+            )
             .await
         })
     }
@@ -324,18 +373,47 @@ impl SmallReader {
         size: usize,
     ) -> Self {
         let path_ref = path.clone();
+        Self::from_download(path, size, async move {
+            let reader = CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)?;
+            reader.get_all().await.map_err(Error::from)
+        })
+    }
+
+    /// Admit a checkpoint length before exposing the reader to its caller.
+    /// Ordinary known-size readers do not require this stricter contract.
+    pub(crate) async fn open_with_expected_size(
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        download_retry_count: usize,
+        expected_size: usize,
+    ) -> Result<Self> {
+        let request = Arc::new(GetRequest {
+            object_store: store,
+            path: path.clone(),
+            options: GetOptions::default(),
+        });
+        let reader = Self::from_download(path, expected_size, async move {
+            do_get_with_outer_retry::<Error>(
+                download_retry_count,
+                request,
+                Some(expected_size),
+                || "read_all".to_string(),
+            )
+            .await
+        });
+        reader.inner.wait().await?;
+        Ok(reader)
+    }
+
+    fn from_download(
+        path: Path,
+        size: usize,
+        download: impl std::future::Future<Output = Result<Bytes>> + Send + 'static,
+    ) -> Self {
         let state = SmallReaderState::Loading(
-            Box::pin(async move {
-                let object_reader =
-                    CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
-                        .map_err(CloneableError::new)?;
-                object_reader
-                    .get_all()
-                    .await
-                    .map_err(|err| CloneableError::new(Error::from(err)))
-            })
-            .boxed()
-            .shared(),
+            async move { download.await.map_err(CloneableError::new) }
+                .boxed()
+                .shared(),
         );
         Self {
             inner: Arc::new(SmallReaderInner {
@@ -348,19 +426,19 @@ impl SmallReader {
 }
 
 impl SmallReaderInner {
-    async fn wait(&self) -> OSResult<Bytes> {
+    async fn wait(&self) -> Result<Bytes> {
         let future = {
             let state = self.state.lock().unwrap();
             match &*state {
                 SmallReaderState::Loading(future) => future.clone(),
                 SmallReaderState::Finished(result) => {
-                    return result.clone().map_err(|err| err.into_inner().into());
+                    return result.clone().map_err(|err| err.into_inner());
                 }
             }
         };
 
         let result = future.await;
-        let result_to_return = result.clone().map_err(|err| err.into_inner().into());
+        let result_to_return = result.clone().map_err(|err| err.into_inner());
         let mut state = self.state.lock().unwrap();
         if matches!(*state, SmallReaderState::Loading(_)) {
             *state = SmallReaderState::Finished(result);
@@ -391,7 +469,7 @@ impl Reader for SmallReader {
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let inner = self.inner.clone();
         Box::pin(async move {
-            let bytes = inner.wait().await?;
+            let bytes = inner.wait().await.map_err(object_store::Error::from)?;
             let start = range.start;
             let end = range.end;
             if start >= bytes.len() || end > bytes.len() {
@@ -411,7 +489,7 @@ impl Reader for SmallReader {
     }
 
     fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
-        Box::pin(async move { self.inner.wait().await })
+        Box::pin(async move { self.inner.wait().await.map_err(object_store::Error::from) })
     }
 }
 
@@ -498,7 +576,31 @@ mod tests {
     /// Answers every read with a body that fails partway: the request
     /// succeeded and the download did not. Reads are all these tests do.
     #[derive(Debug)]
-    struct PartialBodyStore;
+    struct PartialBodyStore {
+        metadata_size: u64,
+        returned_range: Option<Range<u64>>,
+        body: Vec<Bytes>,
+        failed_downloads: usize,
+        requests: AtomicUsize,
+        body_polls: Arc<AtomicUsize>,
+        head_requests: AtomicUsize,
+        body_gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl Default for PartialBodyStore {
+        fn default() -> Self {
+            Self {
+                metadata_size: 1024,
+                returned_range: None,
+                body: vec![Bytes::from(vec![7; 1024])],
+                failed_downloads: usize::MAX,
+                requests: AtomicUsize::new(0),
+                body_polls: Arc::new(AtomicUsize::new(0)),
+                head_requests: AtomicUsize::new(0),
+                body_gate: None,
+            }
+        }
+    }
 
     impl Display for PartialBodyStore {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -524,25 +626,47 @@ mod tests {
             unimplemented!("put_multipart_opts is not used by these tests")
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-            let range = options
-                .range
-                .expect("the reader asks for a range")
-                .as_range(1024)
-                .expect("the range fits the object");
+            let request = self.requests.fetch_add(1, Ordering::SeqCst);
+            if options.head {
+                self.head_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            let range = self.returned_range.clone().unwrap_or_else(|| {
+                options
+                    .range
+                    .map(|r| r.as_range(self.metadata_size).unwrap())
+                    .unwrap_or(0..self.metadata_size)
+            });
+            let chunks = if request < self.failed_downloads {
+                vec![Err(object_store::Error::Generic {
+                    store: "PartialBodyStore",
+                    source: "connection reset".into(),
+                })]
+            } else {
+                self.body.iter().cloned().map(Ok).collect()
+            };
+            let polls = self.body_polls.clone();
+            let gate = self.body_gate.clone();
             Ok(GetResult {
                 payload: GetResultPayload::Stream(
-                    futures::stream::once(async {
-                        Err(object_store::Error::Generic {
-                            store: "PartialBodyStore",
-                            source: "connection reset".into(),
+                    stream::iter(chunks)
+                        .then(move |chunk| {
+                            let gate = gate.clone();
+                            async move {
+                                if let Some(gate) = gate {
+                                    gate.notified().await;
+                                }
+                                chunk
+                            }
                         })
-                    })
-                    .boxed(),
+                        .inspect(move |_| {
+                            polls.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .boxed(),
                 ),
                 meta: ObjectMeta {
                     location: location.clone(),
                     last_modified: Default::default(),
-                    size: 1024,
+                    size: self.metadata_size,
                     e_tag: None,
                     version: None,
                 },
@@ -592,7 +716,7 @@ mod tests {
         #[case] expected_requests: u64,
     ) {
         let stats = Arc::new(Mutex::new(IoStats::default()));
-        let store = IoTrackingStore::new(Arc::new(PartialBodyStore), stats.clone());
+        let store = IoTrackingStore::new(Arc::new(PartialBodyStore::default()), stats.clone());
         let reader = reader(Arc::new(store), download_retry_count);
 
         reader.get_range(0..128).await.unwrap_err();
@@ -622,5 +746,181 @@ mod tests {
         reader.get_range(0..128).await.unwrap_err();
 
         assert_eq!(requests.load(Ordering::Relaxed), 4);
+    }
+    #[rstest]
+    #[case::same_size(1024, None)]
+    #[case::stale_hint(1023, None)]
+    #[case::partial_metadata_range(1024, Some(0..512))]
+    #[tokio::test]
+    async fn known_size_open_preserves_body_collection_and_shared_bytes(
+        #[case] known_size: usize,
+        #[case] returned_range: Option<Range<u64>>,
+    ) {
+        let body = Bytes::from(vec![7; 1024]);
+        let inner = Arc::new(PartialBodyStore {
+            body: vec![body.clone()],
+            returned_range,
+            failed_downloads: 0,
+            ..Default::default()
+        });
+        let mut store = crate::object_store::ObjectStore::memory();
+        store.inner = inner.clone();
+        let reader = store
+            .open_with_size(&Path::from("part"), known_size)
+            .await
+            .unwrap();
+        assert_eq!(inner.requests.load(Ordering::SeqCst), 0);
+        let (first, second) = tokio::join!(reader.get_all(), reader.get_range(8..16));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first, body);
+        assert_eq!(first.as_ptr(), body.as_ptr());
+        assert_eq!(second.as_ptr(), body.slice(8..16).as_ptr());
+        assert_eq!(inner.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.head_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.body_polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[case::short(1023, None)]
+    #[case::long(1025, None)]
+    #[case::partial_range(1024, Some(0..512))]
+    #[tokio::test]
+    async fn small_reader_rejects_metadata_before_body(
+        #[case] metadata_size: u64,
+        #[case] returned_range: Option<Range<u64>>,
+    ) {
+        let store = Arc::new(PartialBodyStore {
+            metadata_size,
+            returned_range,
+            failed_downloads: 0,
+            ..Default::default()
+        });
+        let error =
+            SmallReader::open_with_expected_size(store.clone(), Path::from("part"), 3, 1024)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error.find_root(), Error::InvalidInput { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("expected complete file"),
+            "{error}"
+        );
+        assert_eq!(store.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(store.body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[rstest]
+    #[case::truncated(1023, "has 1023 bytes")]
+    #[case::overlong(1025, "exceeds expected")]
+    #[tokio::test]
+    async fn small_reader_rejects_body_length_with_existing_retry_budget(
+        #[case] size: usize,
+        #[case] message: &str,
+    ) {
+        let store = Arc::new(PartialBodyStore {
+            body: vec![Bytes::from(vec![0; size])],
+            failed_downloads: 0,
+            ..Default::default()
+        });
+        let error =
+            SmallReader::open_with_expected_size(store.clone(), Path::from("part"), 1, 1024)
+                .await
+                .unwrap_err();
+        assert!(matches!(error.find_root(), Error::IO { .. }), "{error}");
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(store.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn small_reader_retries_body_then_shares_the_validated_bytes() {
+        let store = Arc::new(PartialBodyStore {
+            failed_downloads: 1,
+            ..Default::default()
+        });
+        let reader =
+            SmallReader::open_with_expected_size(store.clone(), Path::from("part"), 1, 1024)
+                .await
+                .unwrap();
+        let (first, second) = tokio::join!(reader.get_all(), reader.get_range(8..16));
+        assert_eq!(first.unwrap(), Bytes::from(vec![7; 1024]));
+        assert_eq!(second.unwrap(), Bytes::from(vec![7; 8]));
+        assert_eq!(store.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[rstest]
+    #[case::truncated(3)]
+    #[case::grown(5)]
+    #[tokio::test]
+    async fn small_reader_checks_replaced_object_on_first_read(#[case] size: usize) {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("part");
+        store
+            .put(&path, Bytes::from_static(b"old!").into())
+            .await
+            .unwrap();
+        let opening = SmallReader::open_with_expected_size(store.clone(), path.clone(), 3, 4);
+        store
+            .put(&path, Bytes::from(vec![0; size]).into())
+            .await
+            .unwrap();
+        let error = opening.await.unwrap_err();
+        assert!(
+            matches!(error.find_root(), Error::InvalidInput { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("expected complete file"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case::small(0, 0)]
+    #[case::large(1, 1)]
+    #[tokio::test]
+    async fn checked_open_keeps_the_existing_small_file_threshold(
+        #[case] extra: usize,
+        #[case] expected_heads: usize,
+    ) {
+        let mut store = crate::object_store::ObjectStore::memory();
+        let size = store.block_size() + extra;
+        let inner = Arc::new(PartialBodyStore {
+            metadata_size: size as u64,
+            body: vec![Bytes::from(vec![9; size])],
+            failed_downloads: 0,
+            ..Default::default()
+        });
+        store.inner = inner.clone();
+        let reader = store
+            .open_with_expected_size(&Path::from("part"), size as u64)
+            .await
+            .unwrap();
+        assert_eq!(reader.get_all().await.unwrap(), Bytes::from(vec![9; size]));
+        assert_eq!(inner.head_requests.load(Ordering::SeqCst), expected_heads);
+        assert_eq!(inner.requests.load(Ordering::SeqCst), 1 + expected_heads);
+    }
+
+    #[tokio::test]
+    async fn small_reader_cancellation_drops_the_pending_body() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let store = Arc::new(PartialBodyStore {
+            failed_downloads: 0,
+            body_gate: Some(gate.clone()),
+            ..Default::default()
+        });
+        let mut opening = Box::pin(SmallReader::open_with_expected_size(
+            store.clone(),
+            Path::from("part"),
+            3,
+            1024,
+        ));
+        assert!(opening.as_mut().now_or_never().is_none());
+        assert_eq!(store.requests.load(Ordering::SeqCst), 1);
+        drop(opening);
+        assert_eq!(Arc::strong_count(&gate), 2); // Test and store only; no pending stream.
+        assert_eq!(store.body_polls.load(Ordering::SeqCst), 0);
     }
 }

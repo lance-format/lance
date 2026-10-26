@@ -21,7 +21,7 @@ use crate::dataset::write::merge_insert::exec::{
     DeleteOnlyMergeInsertExec, FullSchemaMergeInsertExec, InPlaceMergeInsertExec,
     MergeConditionExec,
 };
-use crate::dataset::{WhenMatched, WhenNotMatchedBySource};
+use crate::dataset::{WhenMatched, WhenNotMatchedBySource, WriteParams};
 
 use super::{MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertParams};
 
@@ -218,7 +218,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         // Going to need:
-        // * all columns from the `source` relation (or just key columns for delete-only)
+        // * the dataset columns from the `source` relation (or just key columns for delete-only)
         // * `__action` column (unqualified)
         // * `target._rowaddr` column specifically
 
@@ -226,23 +226,25 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
         let mut necessary_columns = Vec::new();
 
         // Check if this is a delete-only operation (no writes needed)
-        // In delete-only mode, we only need the key columns from source for matching
-        let no_upsert = matches!(
-            self.params.when_matched,
-            crate::dataset::WhenMatched::Delete
-        ) && !self.params.insert_not_matched;
+        // In delete-only mode, we only need the key columns from source for matching.
+        // This must agree with the exec `MergeInsertPlanner` picks: every other exec
+        // reads the dataset columns the source carries from `source.*`.
+        let delete_only = MergeInsertPlanner::is_delete_only(&self.params);
 
         for (i, (qualifier, field)) in input_schema.iter().enumerate() {
             let should_include = match qualifier {
                 // For delete-only: only include source KEY columns (for matching) plus the
                 // sentinel column needed for action determination.
-                // For other ops: include all source columns - they contain the new data to write.
+                // For other ops: include the source's dataset columns - they contain the new data
+                // to write, and the exec looks up every dataset column by name even when it
+                // writes nothing. A source column the dataset lacks is never read.
                 Some(qualifier) if qualifier.table() == "source" => {
-                    if no_upsert {
+                    if delete_only {
                         self.params.on.iter().any(|k| k == field.name())
                             || field.name() == MERGE_SOURCE_SENTINEL
                     } else {
-                        true
+                        self.dataset.schema().field(field.name()).is_some()
+                            || field.name() == MERGE_SOURCE_SENTINEL
                     }
                 }
 
@@ -287,7 +289,11 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 }
 
 /// Physical planner for MergeInsertWriteNode.
-pub struct MergeInsertPlanner {}
+pub struct MergeInsertPlanner {
+    /// The job's write parameters for the data files the planned node writes.
+    /// They live on the planner because the logical node must stay comparable.
+    pub(crate) write_params: Arc<WriteParams>,
+}
 
 impl MergeInsertPlanner {
     /// Check if this is a delete-only operation that can use the optimized path.
@@ -347,6 +353,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
+                        self.write_params.clone(),
                     )?;
                     match update_if_deferred {
                         true => Arc::new(exec.with_update_if_deferred()),
@@ -359,6 +366,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
                         write_node.source_blob_columns.clone(),
+                        self.write_params.clone(),
                     )?;
                     match update_if_deferred {
                         true => Arc::new(exec.with_update_if_deferred()),

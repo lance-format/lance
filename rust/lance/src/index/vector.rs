@@ -29,7 +29,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use futures::stream;
-use lance_core::utils::tempfile::TempStdDir;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -46,7 +45,7 @@ use object_store::path::Path;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::v3::shuffler::{Shuffler, create_ivf_shuffler};
+use lance_index::vector::v3::shuffler::{Shuffler, create_owned_ivf_shuffler};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
     VectorIndex,
@@ -678,8 +677,8 @@ pub(crate) fn vector_quantizer_minimum_rows(stages: &[StageParams]) -> Option<us
 /// validating the vector column, deriving the effective index type, sizing IVF
 /// partitions, and constructing the shuffler.
 ///
-/// The shuffler carries only the path of its scratch directory, so the returned
-/// [`TempStdDir`] guard owns that directory: hold it until the build finishes.
+/// The returned shuffler owns the scratch directory it shuffles into, so callers
+/// do not have to keep a guard alive for the build.
 async fn prepare_vector_segment_build(
     dataset: &Dataset,
     column: &str,
@@ -688,13 +687,7 @@ async fn prepare_vector_segment_build(
     mode: &str,
     require_precomputed_ivf: bool,
     fragment_ids: Option<&[u32]>,
-) -> Result<(
-    DataType,
-    IndexType,
-    IvfBuildParams,
-    Box<dyn Shuffler>,
-    TempStdDir,
-)> {
+) -> Result<(DataType, IndexType, IvfBuildParams, Box<dyn Shuffler>)> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -757,32 +750,28 @@ async fn prepare_vector_segment_build(
         (Some(num_partitions), None) => num_partitions,
         (None, Some(centroids)) => centroids.len(),
         (None, None) => {
+            let target_partition_size = ivf_params0
+                .target_partition_size
+                .unwrap_or_else(|| index_type.target_partition_size());
+            if target_partition_size == 0 {
+                return Err(Error::invalid_input(
+                    "target_partition_size must be greater than zero",
+                ));
+            }
             let num_rows = match fragment_ids {
                 Some(fragment_ids) => dataset.count_rows_in_fragments(fragment_ids).await?,
                 None => dataset.count_rows(None).await?,
             };
-            recommended_num_partitions(
-                num_rows,
-                ivf_params0
-                    .target_partition_size
-                    .unwrap_or(index_type.target_partition_size()),
-            )
+            recommended_num_partitions(num_rows, target_partition_size)
         }
     };
     let mut ivf_params = ivf_params0.clone();
     ivf_params.num_partitions = Some(num_partitions);
 
     let format_version = dataset_format_version(dataset);
-    let temp_dir = TempStdDir::default();
-    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(
-        temp_dir_path,
-        num_partitions,
-        format_version,
-        Some(progress),
-    );
+    let shuffler = create_owned_ivf_shuffler(num_partitions, format_version, Some(progress))?;
 
-    Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
+    Ok((element_type, index_type, ivf_params, shuffler))
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -798,17 +787,16 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
-    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
-        prepare_vector_segment_build(
-            dataset,
-            column,
-            params,
-            progress.clone(),
-            "Build Distributed Vector Index",
-            true,
-            Some(fragment_ids),
-        )
-        .await?;
+    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
+        dataset,
+        column,
+        params,
+        progress.clone(),
+        "Build Distributed Vector Index",
+        true,
+        Some(fragment_ids),
+    )
+    .await?;
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -1238,17 +1226,16 @@ async fn build_vector_index_impl(
     fragment_ids: Option<&[u32]>,
     train_only: bool,
 ) -> Result<Vec<IndexFile>> {
-    let (element_type, index_type, ivf_params, shuffler, _shuffle_temp_dir) =
-        prepare_vector_segment_build(
-            dataset,
-            column,
-            params,
-            progress.clone(),
-            "Build Vector Index",
-            false,
-            fragment_ids,
-        )
-        .await?;
+    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
+        dataset,
+        column,
+        params,
+        progress.clone(),
+        "Build Vector Index",
+        false,
+        fragment_ids,
+    )
+    .await?;
     let stages = &params.stages;
 
     // RaBitQ encodes against L2 or dot residuals, and its transform rejects
@@ -1591,14 +1578,11 @@ pub(crate) async fn build_vector_index_incremental(
 
     let format_version = dataset_format_version(dataset);
 
-    let temp_dir = TempStdDir::default();
-    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(
-        temp_dir_path,
+    let shuffler = create_owned_ivf_shuffler(
         ivf_model.num_partitions(),
         format_version,
         Some(progress.clone()),
-    );
+    )?;
 
     let index_dir = dataset.indices_dir().join(uuid.to_string());
 
@@ -2438,7 +2422,7 @@ mod tests {
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
@@ -3027,7 +3011,7 @@ mod tests {
     ///
     /// The OS temp dir is process-global, so an in-process check cannot
     /// attribute a leftover directory to our own build. This test re-executes
-    /// itself in a child process with `TMPDIR` pointed at an isolated dir we
+    /// itself in a child process with its temp dir pointed at an isolated dir we
     /// own: the child builds, the parent asserts nothing survives. Same shape as
     /// `index::vector::ivf::io::tests::test_hnsw_pq_scratch_dir_is_not_leaked`,
     /// which covers the legacy partition-staging dir.
@@ -3045,6 +3029,25 @@ mod tests {
             let root = root
                 .into_string()
                 .expect("the isolated root must be valid UTF-8");
+
+            // The parent can only scan the directory it owns, so if its temp-dir env
+            // vars did not take effect the scan is vacuous and passes no matter what
+            // the build does. Fail here instead of reporting a clean run.
+            let temp_dir = std::env::temp_dir();
+            let canonical = |path: &std::path::Path| {
+                path.canonicalize()
+                    .unwrap_or_else(|e| panic!("cannot canonicalize {path:?}: {e}"))
+            };
+            assert_eq!(
+                canonical(&temp_dir),
+                canonical(std::path::Path::new(&root)),
+                "the temp dir was not redirected to the isolated root; temp_dir() is \
+                 {temp_dir:?}, root is {root:?}. On Windows 11 and Server 2022 and newer, \
+                 `std::env::temp_dir` goes through `GetTempPath2`, which ignores TMP and \
+                 TEMP for a process running as SYSTEM; older Windows falls back to \
+                 `GetTempPathW`, which honors them.",
+            );
+
             tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(async move {
@@ -3078,7 +3081,13 @@ mod tests {
         let this_test = std::thread::current().name().unwrap().to_string();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([&this_test, "--exact", "--nocapture"])
+            // `std::env::temp_dir()` reads `TMPDIR` on POSIX and `TMP`/`TEMP` on
+            // Windows. Set all three, and let the child confirm the redirect took
+            // effect: a child staging into the real temp dir would leave the scan
+            // below looking at an empty directory and passing for the wrong reason.
             .env("TMPDIR", isolated_root.as_ref())
+            .env("TMP", isolated_root.as_ref())
+            .env("TEMP", isolated_root.as_ref())
             .env(ROOT_VAR, isolated_root.as_ref())
             .output()
             .expect("failed to spawn child test process");
@@ -3096,8 +3105,8 @@ mod tests {
             "the child process did not run the build; filter was {this_test:?}"
         );
 
-        // Every scratch dir a build creates sits directly under TMPDIR and is
-        // owned by a guard, so none should survive the child process.
+        // Every scratch dir a build creates sits directly under the child's temp
+        // dir and is owned by a guard, so none should survive the child process.
         let leaked: Vec<std::path::PathBuf> = std::fs::read_dir(&isolated_root)
             .expect("read isolated temp root")
             .flatten()
@@ -3113,7 +3122,9 @@ mod tests {
 
         assert!(
             leaked.is_empty(),
-            "vector index build leaked scratch directories under the temp dir: {leaked:?}"
+            "vector index build leaked scratch directories under the temp dir: {leaked:?}. \
+             `.tmp` is tempfile's default prefix, so one of these may belong to another \
+             tempfile user rather than to the shuffler's guard."
         );
     }
 
