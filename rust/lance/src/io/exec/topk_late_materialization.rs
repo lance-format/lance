@@ -193,7 +193,7 @@ impl TopKLateMaterialization {
             .ok_or("the loop exits on a FilteredReadExec")?;
         let dataset = read.dataset().clone();
         if dropped_takes.iter().any(|take| {
-            take.uri() != dataset.uri() || take.version().version != dataset.version().version
+            take.uri() != dataset.uri() || take.manifest.version != dataset.manifest.version
         }) {
             return Err("a take in the chain reads a different dataset".into());
         }

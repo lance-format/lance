@@ -10,13 +10,16 @@ use arrow_array::RecordBatch;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
 
 use super::fts::FtsQueryExpr;
 use super::{
-    FlushContext, FlushOutcome, FtsMemQuery, MemIndex, MemIndexBuildContext, MemIndexPlugin,
-    MemIndexSpec, MemMatches, MemQuery, MemSearchResult, PositionSet, PrimaryKeyIndex, RankedMatch,
-    ResolveContext, ResolvedIndex, RowPosition, SearchContext, VectorMemQuery,
+    FlushContext, FlushOutcome, FtsMemQuery, MemIndex, MemIndexBuildContext, MemIndexParams,
+    MemIndexPlugin, MemIndexSpec, MemMatches, MemQuery, MemSearchResult, PositionSet,
+    PrimaryKeyIndex, RankedMatch, ResolveContext, ResolvedIndex, RowPosition, SearchContext,
+    VectorMemQuery,
 };
 
 /// How a wrapped index departs from the one it wraps.
@@ -24,11 +27,14 @@ use super::{
 pub enum Deviation {
     /// None: only the type differs.
     None,
+    /// Lists every match, whatever budget it is offered.
+    IgnoresMatchBudget,
     /// Answers probes, declines every real search.
     DeclinesRealSearches,
     /// Declines probes, answers every real search.
     DeclinesProbes,
-    /// Accepts every query while planning, then declines it.
+    /// Accepts every query while planning, then declines it; a filter, which
+    /// planning does not ask about, is simply declined.
     AcceptsThenDeclines,
     /// Accepts every query while planning, then fails it.
     AcceptsThenFails,
@@ -48,14 +54,26 @@ pub enum Deviation {
     RecordsAnotherName,
     /// Panics on every insert.
     PanicsOnInsert,
+    /// Rejects its flush parameters.
+    RejectsFlushParams,
 }
 
 /// `spec`, maintained by its plugin wrapped with `deviation`.
 pub fn wrapped(spec: MemIndexSpec, deviation: Deviation) -> MemIndexSpec {
+    wrapped_with_flush_params(spec, deviation, None)
+}
+
+/// As [`wrapped`], building on disk with `flush_params` when given.
+pub fn wrapped_with_flush_params(
+    spec: MemIndexSpec,
+    deviation: Deviation,
+    flush_params: Option<ScalarIndexParams>,
+) -> MemIndexSpec {
     MemIndexSpec {
         plugin: Arc::new(Wrapped {
             inner: spec.plugin.clone(),
             deviation,
+            flush_params,
         }),
         ..spec
     }
@@ -65,6 +83,7 @@ pub fn wrapped(spec: MemIndexSpec, deviation: Deviation) -> MemIndexSpec {
 struct Wrapped {
     inner: Arc<dyn MemIndexPlugin>,
     deviation: Deviation,
+    flush_params: Option<ScalarIndexParams>,
 }
 
 #[async_trait::async_trait]
@@ -80,6 +99,22 @@ impl MemIndexPlugin for Wrapped {
     }
     fn training_criteria(&self) -> TrainingCriteria {
         self.inner.training_criteria()
+    }
+    fn flush_params(&self, spec: &MemIndexSpec) -> Result<ScalarIndexParams> {
+        if self.deviation == Deviation::RejectsFlushParams {
+            return Err(Error::invalid_input("flush parameters rejected"));
+        }
+        match &self.flush_params {
+            Some(params) => Ok(params.clone()),
+            None => self.inner.flush_params(spec),
+        }
+    }
+    fn query_parser(
+        &self,
+        index_name: String,
+        params: &dyn MemIndexParams,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        self.inner.query_parser(index_name, params)
     }
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         self.inner.resolve(ctx).await
@@ -158,6 +193,9 @@ impl MemIndex for WrappedIndex {
                 })
             }
             _ if !self.can_answer(query) => Ok(None),
+            Deviation::IgnoresMatchBudget => self
+                .inner
+                .search(query, &SearchContext::new(ctx.max_visible)),
             _ => self.inner.search(query, ctx),
         }
     }

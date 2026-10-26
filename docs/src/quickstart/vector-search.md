@@ -49,14 +49,13 @@ Then, convert the raw vector data into Lance format for efficient storage and qu
 
 ```python
 from lance.vector import vec_to_table
-import struct
 
 uri = "vec_data.lance"
 
-with open("sift/sift_base.fvecs", mode="rb") as fobj:
-    buf = fobj.read()
-    data = np.array(struct.unpack("<128000000f", buf[4 : 4 + 4 * 1000000 * 128])).reshape((1000000, 128))
-    dd = dict(zip(range(1000000), data))
+# Each .fvecs record is an int32 dimension followed by that many float32 values
+raw = np.fromfile("sift/sift_base.fvecs", dtype="<f4").reshape(-1, 129)
+data = raw[:, 1:]
+dd = dict(zip(range(len(data)), data))
 
 table = vec_to_table(dd)
 lance.write_dataset(table, uri, max_rows_per_group=8192, max_rows_per_file=1024*1024)

@@ -1617,6 +1617,26 @@ def test_get_fragments(tmp_path: Path):
     assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})
 
 
+def test_fragment_ids(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(10)}), tmp_path, max_rows_per_file=2)
+    dataset = lance.dataset(tmp_path)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
+    ids = dataset.fragment_ids()
+    ids.add(100)
+    assert list(dataset.fragment_ids()) == [0, 1, 2, 3, 4]
+
+    dataset.delete("a < 4")
+    assert list(dataset.fragment_ids()) == [2, 3, 4]
+
+    dataset.create_scalar_index("a", "BTREE")
+    lance.write_dataset(pa.table({"a": range(2)}), tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    (index,) = dataset.describe_indices()
+    indexed = index.segments[0].fragment_ids
+    assert list(dataset.fragment_ids() - indexed) == [5]
+
+
 def test_pickle_fragment(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1646,6 +1666,9 @@ def test_cleanup_old_versions(tmp_path):
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
+
+    with pytest.raises(OSError, match="delete_concurrency"):
+        dataset.cleanup_old_versions(delete_concurrency=0)
 
     # These calls do nothing, but make sure we can call the method ok
 
@@ -1683,6 +1706,7 @@ def test_explain_cleanup_old_versions(tmp_path):
         older_than=(datetime.now() - moment),
         include_files=True,
         max_files=1000,
+        delete_rate_limit=0,
     )
 
     assert explanation.read_version == dataset.version
@@ -1993,7 +2017,9 @@ def test_cleanup_with_rate_limit(tmp_path):
     start = time.time_ns()
     # Cleanup with a rate limit should still remove old versions correctly
     stats = dataset.cleanup_old_versions(
-        older_than=(now - latest_version_timestamp), delete_rate_limit=1
+        older_than=(now - latest_version_timestamp),
+        delete_rate_limit=1,
+        delete_concurrency=2,
     )
     finished = time.time_ns()
 
@@ -5242,6 +5268,21 @@ def test_scan_with_row_ids(tmp_path: Path):
     assert tbl2["a"] == tbl["a"]
 
 
+def test_take_rows_ignore_deletions(tmp_path: Path):
+    data = pa.table({"a": range(8)})
+    ds = lance.write_dataset(data, tmp_path, enable_stable_row_ids=True)
+    ds.delete("a in (1, 7)")
+
+    assert ds._take_rows([0, 1, 7, 4])["a"].to_pylist() == [0, 4]
+    # Deleted rows come back with their stored values; no deletion file is read.
+    assert ds._take_rows([0, 1, 7, 4], ignore_deletions=True)["a"].to_pylist() == [
+        0,
+        1,
+        7,
+        4,
+    ]
+
+
 @pytest.mark.cuda
 def test_random_dataset_recall_accelerated(tmp_path: Path):
     dims = 32
@@ -6894,6 +6935,51 @@ def test_file_reader_options(tmp_path: Path):
     assert iops_scanner <= iops_without_cache
 
 
+def test_transaction_audit_fields(tmp_path):
+    import uuid
+
+    from lance.mem_wal import CompactedSsTable
+
+    dataset = lance.write_dataset(pa.table({"id": [1, 2]}), tmp_path / "base")
+    dataset = lance.write_dataset(
+        pa.table({"id": [3, 4]}), tmp_path / "base", mode="append"
+    )
+
+    empty = lance.LanceOperation.UpdateMemWalState()
+    tagged = lance.Transaction(
+        read_version=dataset.version, operation=empty, tag="audit-window"
+    )
+    dataset = lance.LanceDataset.commit(dataset, tagged)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.tag == "audit-window"
+    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
+    assert list(read_back.operation.compacted_sstables) == []
+
+    shard_id = str(uuid.uuid4())
+    recorded = lance.LanceOperation.UpdateMemWalState(
+        compacted_sstables=[CompactedSsTable(shard_id, 3)]
+    )
+    with pytest.raises(OSError, match="__lance_mem_wal"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.Transaction(read_version=dataset.version, operation=recorded),
+        )
+
+    update = lance.LanceOperation.Update(
+        compacted_sstables=[CompactedSsTable(shard_id, 1)]
+    )
+    with pytest.raises(OSError, match="__lance_mem_wal"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.Transaction(read_version=dataset.version, operation=update),
+        )
+
+    dataset.optimize.compact_files()
+    rewrite = dataset.read_transaction(dataset.version)
+    assert isinstance(rewrite.operation, lance.LanceOperation.Rewrite)
+    assert rewrite.operation.frag_reuse_index is None
+
+
 def test_read_transaction_properties(tmp_path):
     """Test retrieving properties from transactions at different versions."""
     # Create schema and data for the dataset
@@ -7709,3 +7795,101 @@ def test_all_files(tmp_path):
     assert result.schema.field("size_bytes").type == pa.int64()
     assert result.num_rows >= 2  # at least manifest + data file
     assert all(s > 0 for s in result.column("size_bytes").to_pylist())
+
+
+class TestLanceScannerTake:
+    def _make_dataset(self, tmp_path, max_rows_per_file=20):
+        table = pa.table({"id": pa.array(range(0, 20))})
+        return lance.write_dataset(
+            table, tmp_path / "ds", max_rows_per_file=max_rows_per_file
+        )
+
+    def test_take_filtered_relative_positions(self, tmp_path):
+        # issue #9142: take() positions are within the scanner's output, i.e.
+        # after the filter is applied — not absolute dataset row numbers.
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(filter="id % 2 = 0")  # matches id = 0, 2, 4, ...
+
+        # index i selects the i-th matching row: id = 2*i.
+        result = scanner.take(0).to_pylist()
+        assert result == [{"id": 0}]
+
+        result = scanner.take([0, 2, 4]).to_pylist()
+        assert [r["id"] for r in result] == [0, 4, 8]
+
+    def test_take_without_filter_matches_dataset_take(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+
+        expected = ds.take([0, 19]).to_pylist()
+        result = scanner.take([0, 19]).to_pylist()
+        assert result == expected
+
+    def test_take_out_of_bounds_raises(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()  # 20 rows
+
+        with pytest.raises(IndexError):
+            scanner.take(20)
+
+        with pytest.raises(IndexError):
+            scanner.take([0, 20])
+
+    def test_take_empty_indices_raises(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+
+        with pytest.raises(ValueError):
+            scanner.take([])
+
+    def test_take_negative_indices_raises(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+
+        with pytest.raises(ValueError):
+            scanner.take([-1])
+
+    def test_take_respects_scanner_projection(self, tmp_path):
+        table = pa.table(
+            {"id": pa.array(range(20)), "val": [f"v{i}" for i in range(20)]}
+        )
+        ds = lance.write_dataset(table, tmp_path / "ds")
+        scanner = ds.scanner(columns=["val"])
+        result = scanner.take(0).to_pylist()
+        assert result == [{"val": "v0"}]
+        assert "id" not in result[0]
+
+    def test_take_spans_multiple_batches(self, tmp_path):
+        table = pa.table({"id": pa.array(range(20))})
+        ds = lance.write_dataset(table, tmp_path / "ds", max_rows_per_file=4)
+        # 5 fragments of 4 rows each.
+        scanner = ds.scanner()
+        # Take across fragment boundaries.
+        result = scanner.take([2, 6, 10, 18]).to_pylist()
+        assert [r["id"] for r in result] == [2, 6, 10, 18]
+
+    def test_take_duplicates_and_unsorted(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner()
+        result = scanner.take([7, 1, 7, 1]).to_pylist()
+        assert [r["id"] for r in result] == [7, 1, 7, 1]
+
+    def test_take_positions_are_within_limited_output(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(limit=5)
+        result = scanner.take(4).to_pylist()
+        assert result == [{"id": 4}]
+
+    def test_take_out_of_bounds_with_scanner_limit(self, tmp_path):
+        # The out-of-bounds path must not call count_rows, which rejects
+        # scanners carrying a limit (aggregate + limit is invalid).
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(limit=5)
+        with pytest.raises(IndexError):
+            scanner.take(5)
+
+    def test_take_accepts_pyarrow_array(self, tmp_path):
+        # pyarrow Scanner.take() documents pa.Array as an accepted form.
+        ds = self._make_dataset(tmp_path)
+        scanner = ds.scanner(filter="id >= 4")
+        assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]

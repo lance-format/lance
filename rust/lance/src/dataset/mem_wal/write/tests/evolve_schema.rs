@@ -345,11 +345,11 @@ mod evolve {
     }
 
     #[tokio::test]
-    async fn test_evolve_schema_seals_under_the_old_schema_and_writes_under_the_new() {
+    async fn test_evolve_schema_freezes_under_the_old_schema_and_writes_under_the_new() {
         use crate::dataset::ColumnAlteration;
 
         let (mut dataset, writer, shard_id, schema) =
-            evolving_writer("evolve-seal", Some(&["text_fts"])).await;
+            evolving_writer("evolve-freeze", Some(&["text_fts"])).await;
         writer
             .put(vec![rows_under(&schema, &[(100, "before")])])
             .await
@@ -365,14 +365,14 @@ mod evolve {
             .await
             .expect_err("a batch shaped to a schema the writer has not been evolved to");
 
-        let sealed_generation = writer.active_memtable_ref().await.unwrap().generation;
+        let frozen_generation = writer.active_memtable_ref().await.unwrap().generation;
         writer
             .evolve_schema(writer_schema_of(&dataset), fts_config_of(&dataset).await)
             .await
             .unwrap();
         let memtables = writer.in_memory_memtable_refs().await.unwrap();
-        assert_eq!(memtables.active.generation, sealed_generation + 1);
-        assert_eq!(memtables.frozen.len(), 1, "the old memtable is sealed");
+        assert_eq!(memtables.active.generation, frozen_generation + 1);
+        assert_eq!(memtables.frozen.len(), 1, "the old memtable is frozen");
         assert!(
             memtables.frozen[0]
                 .schema
@@ -390,23 +390,23 @@ mod evolve {
             .await
             .expect_err("a batch shaped to the schema the writer has moved off");
 
-        // Same schema again: nothing is sealed.
+        // Same schema again: nothing is frozen.
         writer
             .evolve_schema(writer_schema_of(&dataset), fts_config_of(&dataset).await)
             .await
             .unwrap();
         let memtables = writer.in_memory_memtable_refs().await.unwrap();
-        assert_eq!(memtables.active.generation, sealed_generation + 1);
+        assert_eq!(memtables.active.generation, frozen_generation + 1);
         assert_eq!(memtables.frozen.len(), 1);
 
-        // The sealed memtable flushes under its old schema and index.
+        // The frozen memtable flushes under its old schema and index.
         writer.wait_for_flush_drain().await.unwrap();
         let manifest = writer.manifest().await.unwrap().unwrap();
         let sstable = manifest
             .sstables
             .iter()
-            .find(|s| s.generation == sealed_generation)
-            .expect("the sealed generation is in the manifest");
+            .find(|s| s.generation == frozen_generation)
+            .expect("the frozen generation is in the manifest");
         let generation = Dataset::open(&format!(
             "{}/_mem_wal/{shard_id}/{}",
             dataset.uri().trim_end_matches('/'),
@@ -421,6 +421,130 @@ mod evolve {
             indices.iter().any(|index| index.name == "text_fts"),
             "the generation carries the index its memtable was built with: {:?}",
             indices.iter().map(|index| &index.name).collect::<Vec<_>>()
+        );
+        writer.close().await.unwrap();
+    }
+
+    /// A generation flushed after a column drop keeps the table's field ids,
+    /// whether or not the table has migrated to non-reusable ids.
+    ///
+    /// The drop leaves a gap in the table's ids. Reads and the merge into base
+    /// resolve a generation's columns by id, so numbering the generation's
+    /// fields afresh would hand one column's values to another.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_a_generation_flushed_after_a_drop_keeps_the_table_field_ids(
+        #[values(false, true)] non_reusable_ids: bool,
+    ) {
+        let (mut dataset, writer, shard_id, _) =
+            evolving_writer("evolve-drop", Some(&["text_fts"])).await;
+        if non_reusable_ids {
+            dataset.migrate_to_non_reusable_field_ids().await.unwrap();
+        }
+        dataset.drop_columns(&["vector"]).await.unwrap();
+        writer.evolve_to(&dataset).await.unwrap();
+        let dropped: ArrowSchema = dataset.schema().into();
+        writer
+            .put(vec![rows_under(&dropped, &[(100, "after the drop")])])
+            .await
+            .unwrap();
+        let generation = writer.active_memtable_ref().await.unwrap().generation;
+        writer.force_freeze_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        let sstable = manifest
+            .sstables
+            .iter()
+            .find(|s| s.generation == generation)
+            .expect("the frozen generation is flushed");
+        let flushed = Dataset::open(&format!(
+            "{}/_mem_wal/{shard_id}/{}",
+            dataset.uri().trim_end_matches('/'),
+            sstable.path
+        ))
+        .await
+        .unwrap();
+        let ids = |schema: &crate::datatypes::Schema| -> Vec<(String, i32)> {
+            schema
+                .fields_pre_order()
+                .map(|field| (field.name.clone(), field.id))
+                .collect()
+        };
+        let table_ids = ids(dataset.schema());
+        assert!(
+            table_ids.iter().map(|(_, id)| *id).collect::<Vec<_>>()
+                != (0..table_ids.len() as i32).collect::<Vec<_>>(),
+            "the drop leaves a gap in the table's ids: {table_ids:?}"
+        );
+        let generation_ids: Vec<_> = ids(flushed.schema())
+            .into_iter()
+            .filter(|(name, _)| table_ids.iter().any(|(table, _)| table == name))
+            .collect();
+        assert_eq!(generation_ids, table_ids);
+        // The data files carry the same ids, so readers find each column.
+        let file_ids: Vec<i32> = flushed.get_fragments()[0].metadata().files[0]
+            .fields
+            .to_vec();
+        for (name, id) in &table_ids {
+            assert!(
+                file_ids.contains(id),
+                "{name} (id {id}) not in {file_ids:?}"
+            );
+        }
+        assert!(
+            !flushed.manifest.uses_non_reusable_field_ids(),
+            "the generation takes the table's ids without allocating its own"
+        );
+
+        // Read the row back from the flushed generation alone: by scan, by key,
+        // and through the generation's FTS index.
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use datafusion::prelude::{col, lit};
+        let mut snapshot =
+            ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
+        for sstable in &manifest.sstables {
+            snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
+        }
+        let scanner = || {
+            LsmScanner::without_base_table(
+                Arc::new(dropped.clone()),
+                dataset.uri(),
+                vec![snapshot.clone()],
+                vec!["id".to_string()],
+            )
+            .with_identity_schema(writer_schema_of(&dataset))
+        };
+        let rows = |batch: RecordBatch| -> Vec<(i64, String)> {
+            let ids = batch["id"].as_primitive::<Int64Type>();
+            let texts = batch["text"].as_string::<i32>();
+            (0..batch.num_rows())
+                .map(|i| (ids.value(i), texts.value(i).to_string()))
+                .collect()
+        };
+        let expected = vec![(100, "after the drop".to_string())];
+        assert_eq!(rows(scanner().try_into_batch().await.unwrap()), expected);
+        let by_key = scanner()
+            .filter_expr(col("id").eq(lit(100i64)))
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(rows(by_key), expected);
+        let by_text = scanner()
+            .full_text_search(
+                FullTextSearchQuery::new("drop".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            by_text["id"].as_primitive::<Int64Type>().values().to_vec(),
+            vec![100]
         );
         writer.close().await.unwrap();
     }
@@ -503,7 +627,7 @@ mod evolve {
         let memtables = writer.in_memory_memtable_refs().await.unwrap();
         assert_eq!(
             memtables.active.generation, generation,
-            "nothing was sealed"
+            "nothing was frozen"
         );
         assert!(memtables.frozen.is_empty());
         assert!(memtables.active.schema.column_with_name("body").is_some());
@@ -533,6 +657,143 @@ mod evolve {
             err.to_string().contains("cannot change the primary key"),
             "unexpected error: {err}"
         );
+        writer.close().await.unwrap();
+    }
+
+    /// A memtable written before a rename answers a filter on the new name from
+    /// its indexes on the old one, keeping each key's newest version.
+    #[tokio::test]
+    async fn test_memtable_filter_indexes_answer_across_a_rename() {
+        use crate::dataset::ColumnAlteration;
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use datafusion::prelude::{col, lit};
+        use lance_index::scalar::ScalarIndexParams;
+
+        use crate::dataset::mem_wal::memtable::scanner::newest_checks;
+
+        let schema = create_test_schema(4);
+        let uri = format!("shared-memory://evolve-filter-{}/", Uuid::new_v4().simple());
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(create_test_batch(&schema, 0, 10, 4))], schema.clone()),
+            &uri,
+            Some(WriteParams::default()),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::BTree,
+                Some("text_btree".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["text_btree"])
+            .execute()
+            .await
+            .unwrap();
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id)
+                    .with_max_wal_flush_interval(std::time::Duration::from_millis(10))
+                    .with_frozen_memtable_grace(std::time::Duration::from_secs(3600)),
+            )
+            .await
+            .unwrap();
+        // Filler rows, sorting below every filter, give each memtable a match
+        // budget above zero, so a selective filter is read from the indexes.
+        let filler = |first: i64| -> Vec<(i64, String)> {
+            (first..first + 64)
+                .map(|id| (id, format!("aaa{id}")))
+                .collect()
+        };
+        fn as_rows(rows: &[(i64, String)]) -> Vec<(i64, &str)> {
+            rows.iter().map(|(id, text)| (*id, text.as_str())).collect()
+        }
+        let (old_filler, new_filler) = (filler(1000), filler(2000));
+        // Key 102 is rewritten under the old name, key 103 under the new one.
+        writer
+            .put(vec![rows_under(
+                &schema,
+                &[(101, "alpha"), (102, "beta"), (103, "gamma")],
+            )])
+            .await
+            .unwrap();
+        writer
+            .put(vec![rows_under(&schema, &as_rows(&old_filler))])
+            .await
+            .unwrap();
+        writer
+            .put(vec![rows_under(&schema, &[(102, "beta again")])])
+            .await
+            .unwrap();
+        dataset
+            .alter_columns(&[ColumnAlteration::new("text".into()).rename("body".into())])
+            .await
+            .unwrap();
+        writer.evolve_to(&dataset).await.unwrap();
+        let evolved: ArrowSchema = dataset.schema().into();
+        writer
+            .put(vec![rows_under(&evolved, &[(103, "gamma again")])])
+            .await
+            .unwrap();
+        writer
+            .put(vec![rows_under(&evolved, &as_rows(&new_filler))])
+            .await
+            .unwrap();
+
+        let memtables = writer.in_memory_memtable_refs().await.unwrap();
+        assert_eq!(
+            memtables.frozen.len(),
+            1,
+            "the pre-rename memtable is in memory"
+        );
+        for (filter, expected) in [
+            (col("body").eq(lit("beta")), vec![]),
+            (col("body").eq(lit("beta again")), vec![102]),
+            (col("body").eq(lit("gamma")), vec![]),
+            (col("body").eq(lit("gamma again")), vec![103]),
+            (col("body").gt_eq(lit("alpha")), vec![101, 102, 103]),
+        ] {
+            for enabled in [false, true] {
+                let scanner = LsmScanner::without_base_table(
+                    Arc::new(evolved.clone()),
+                    dataset.uri(),
+                    vec![],
+                    vec!["id".to_string()],
+                )
+                .with_identity_schema(writer_schema_of(&dataset))
+                .with_in_memory_memtables(shard_id, memtables.clone())
+                .with_memtable_filter_indexes(enabled)
+                .filter_expr(filter.clone());
+                let plan = scanner.create_plan().await.unwrap();
+                let batches = datafusion::physical_plan::collect(
+                    plan.clone(),
+                    datafusion::prelude::SessionContext::new().task_ctx(),
+                )
+                .await
+                .unwrap();
+                let mut ids: Vec<i64> = batches
+                    .iter()
+                    .flat_map(|batch| batch["id"].as_primitive::<Int64Type>().values().to_vec())
+                    .collect();
+                ids.sort_unstable();
+                assert_eq!(ids, expected, "{filter} with filter indexes {enabled}");
+                assert_eq!(
+                    newest_checks(&plan) > 0,
+                    enabled,
+                    "{filter}: the indexes' matches are checked only when enabled"
+                );
+            }
+        }
         writer.close().await.unwrap();
     }
 

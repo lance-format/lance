@@ -145,6 +145,19 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// newer version than this, it cannot be read
     fn version(&self) -> u32;
 
+    /// Whether Lance may maintain this index through `optimize_indices`.
+    ///
+    /// Return `false` when an external service owns refreshing and merging the
+    /// index. Table-wide optimization skips such indices without loading them;
+    /// explicitly naming one in an optimization request returns an error.
+    /// Creation, deletion, and compaction's fragment-coverage rules are unaffected.
+    ///
+    /// For example, a statistics plugin maintained by a separate refresh job can
+    /// override this method with `fn supports_optimization(&self) -> bool { false }`.
+    fn supports_optimization(&self) -> bool {
+        true
+    }
+
     /// Returns a new query parser for the index
     ///
     /// Can return None if this index cannot participate in query optimization

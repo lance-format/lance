@@ -5,6 +5,7 @@
 
 use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow_schema::DataType;
+use datafusion::logical_expr::function::Hint;
 use datafusion::logical_expr::{ScalarUDF, Volatility, create_udf};
 use datafusion::prelude::SessionContext;
 use datafusion_functions::utils::make_scalar_function;
@@ -103,35 +104,35 @@ fn contains_tokens() -> ScalarUDF {
                     "First argument of contains_tokens can't be cast to string".to_string(),
                 ),
             )?;
-            let scalar_str = args[1].as_any().downcast_ref::<StringArray>().ok_or(
+            let queries = args[1].as_any().downcast_ref::<StringArray>().ok_or(
                 datafusion::error::DataFusionError::Execution(
                     "Second argument of contains_tokens can't be cast to string".to_string(),
                 ),
             )?;
 
-            let tokens: Option<Vec<&str>> = match scalar_str.len() {
-                0 => None,
-                _ => Some(collect_tokens(scalar_str.value(0))),
-            };
-
-            let result = column.iter().map(|text| {
-                text.map(|text| {
-                    let text_tokens = collect_tokens(text);
-                    if let Some(tokens) = &tokens {
-                        tokens.len()
-                            == tokens
-                                .iter()
-                                .filter(|token| text_tokens.contains(*token))
-                                .count()
-                    } else {
-                        true
-                    }
+            // A literal query arrives as one row (see the hint below) and is
+            // tokenized once; a column query is read row by row. A NULL text
+            // or query is NULL, not a match: an empty token list would
+            // otherwise match every row.
+            let literal_tokens = (queries.len() == 1 && queries.is_valid(0))
+                .then(|| collect_tokens(queries.value(0)));
+            let result = column.iter().enumerate().map(|(i, text)| {
+                let text = text?;
+                let row = if queries.len() == 1 { 0 } else { i };
+                if queries.is_null(row) {
+                    return None;
+                }
+                let text_tokens = collect_tokens(text);
+                let matches = |tokens: &[&str]| tokens.iter().all(|t| text_tokens.contains(t));
+                Some(match &literal_tokens {
+                    Some(tokens) => matches(tokens),
+                    None => matches(&collect_tokens(queries.value(row))),
                 })
             });
 
             Ok(Arc::new(BooleanArray::from_iter(result)) as ArrayRef)
         },
-        vec![],
+        vec![Hint::Pad, Hint::AcceptsSingular],
     ));
 
     create_udf(
@@ -159,6 +160,7 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use datafusion::logical_expr::ScalarFunctionArgs;
     use datafusion::physical_plan::ColumnarValue;
+    use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -206,5 +208,59 @@ mod tests {
         } else {
             panic!("Expected an Array but got {:?}", values);
         }
+    }
+
+    fn invoke_contains_tokens(query: ColumnarValue) -> BooleanArray {
+        let text_col = Arc::new(StringArray::from(vec![
+            Some("a cat catch a fish"),
+            Some("dog runs"),
+            Some("dog runs"),
+            None,
+        ]));
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(text_col), query],
+            arg_fields: vec![
+                Arc::new(Field::new("text_col".to_string(), DataType::Utf8, true)),
+                Arc::new(Field::new("query".to_string(), DataType::Utf8, true)),
+            ],
+            number_rows: 4,
+            return_field: Arc::new(Field::new("res".to_string(), DataType::Boolean, true)),
+            config_options: Arc::new(Default::default()),
+        };
+        let ColumnarValue::Array(array) = CONTAINS_TOKENS_UDF.invoke_with_args(args).unwrap()
+        else {
+            panic!("Expected an Array");
+        };
+        array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn test_contains_tokens_null_query_matches_nothing() {
+        // The tokens of a NULL query used to be read as "", an empty token
+        // list that every text contains.
+        let result = invoke_contains_tokens(ColumnarValue::Scalar(ScalarValue::Utf8(None)));
+        assert_eq!(result, BooleanArray::from(vec![None, None, None, None]));
+    }
+
+    #[test]
+    fn test_contains_tokens_reads_a_column_query_per_row() {
+        // Only the first row's query used to be read, for every row, so the
+        // second row was matched against "fish". A NULL query is NULL on its
+        // own row only.
+        let queries = Arc::new(StringArray::from(vec![
+            Some("fish"),
+            Some("dog"),
+            None,
+            Some("cat"),
+        ]));
+        let result = invoke_contains_tokens(ColumnarValue::Array(queries));
+        assert_eq!(
+            result,
+            BooleanArray::from(vec![Some(true), Some(true), None, None])
+        );
     }
 }

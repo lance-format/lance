@@ -15,13 +15,13 @@ use arrow_schema::DataType;
 use lance_core::datatypes::{BlobHandling, BlobKind, Field};
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_io::object_store::ObjectStore;
+use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::{Fragment, Manifest};
 use object_store::path::Path;
 use uuid::Uuid;
 
-use super::{
-    BlobV2DescriptorColumns, field_contains_blob, join_base_and_relative_path, managed_references,
-};
+use super::locate::{BlobV2DescriptorColumns, join_base_and_relative_path};
+use super::managed::{field_contains_blob, managed_references};
 use crate::dataset::Dataset;
 use crate::dataset::optimize::BlobV2BatchRewritePlan;
 
@@ -149,7 +149,10 @@ async fn rewrite_blob_columns(
             .iter()
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>();
-        let write_schema = source.schema().project(&columns)?;
+        let mut write_schema = source.schema().project(&columns)?;
+        write_schema
+            .metadata
+            .insert(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string());
         let mut projection = columns.clone();
         projection.push(ROW_ADDR);
         let destination_fragment = target
@@ -227,7 +230,7 @@ pub async fn copy_blob_columns(
     target.manifest = Arc::new(manifest.clone());
     let target = Arc::new(target);
     let mut copies = HashMap::new();
-    for (id, uri) in managed_references(&source, source.scan()).await? {
+    for (id, uri) in managed_references(&source, source.scan(), true).await? {
         let path = join_base_and_relative_path(&source.blob_base_path(id)?, &uri)?;
         // Local objects keep their relative address, so their data files can be
         // copied verbatim. Registered bases may contain colliding object names.

@@ -112,7 +112,7 @@ pub struct LsmPointLookupPlanner {
     /// Prefix of the in-memory memtables this planner reads. Applies to the fast
     /// BTree probe and the plan fallback alike, so both resolve a key the same.
     visibility: MemTableVisibility,
-    /// `base_schema` with each field's id, which is what resolves a sealed
+    /// `base_schema` with each field's id, which is what resolves a flushed
     /// generation's columns to the table's. Defaults to `base_schema`, which
     /// carries them when the caller built it from a Lance schema.
     identity_schema: SchemaRef,
@@ -726,8 +726,8 @@ impl LsmPointLookupPlanner {
                 )
                 .await?;
                 let mut scanner = dataset.scan();
-                // A sealed generation holds the names the table had when it was
-                // sealed, so the projection, the key filter and the output all
+                // A flushed generation holds the names the table had when it was
+                // frozen, so the projection, the key filter and the output all
                 // go through the same resolution the scanner uses.
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
                 let generation = GenerationRead::new(
@@ -1540,7 +1540,7 @@ mod tests {
         // first (oldest) match. The plan-path active arm now sorts `_rowid`
         // DESC and keeps the first row (largest `_rowid` = newest insert).
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::write::BatchStore;
         use futures::TryStreamExt;
 
         let schema = create_pk_schema();
@@ -1548,11 +1548,8 @@ mod tests {
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
-        let mut index_store = IndexStore::new();
-        // BTree on the PK: the point lookup resolves keys through the indexed PK
-        // path, which this exercises. (`indexed_count`/`visible_count` advance
-        // from the batch position regardless of whether any index is configured.)
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        // A B-tree on the key, so the active arm's filter goes through it.
+        let index_store = btree_on_id(&schema);
 
         // Two writes to pk=1, then an unrelated pk=2. The "new" row goes
         // *second* so its `_rowid` is larger.
@@ -1827,7 +1824,22 @@ mod tests {
         );
     }
 
-    /// Build an in-memory active memtable ref from batches, with a BTree on
+    /// An index store with a B-tree on `id`, which filters reach.
+    fn btree_on_id(schema: &ArrowSchema) -> IndexStore {
+        let lance = lance_core::datatypes::Schema::try_from(schema).unwrap();
+        let field_id = lance.field("id").unwrap().id;
+        IndexStore::from_specs(
+            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+                "id_idx", field_id, "id",
+            )],
+            &lance,
+            1_000,
+            64,
+        )
+        .unwrap()
+    }
+
+    /// Build an in-memory active memtable ref from batches, with a B-tree on
     /// `id` and the visibility watermark advanced so every row is visible.
     fn active_memtable_ref(
         schema: &Arc<ArrowSchema>,
@@ -1836,8 +1848,7 @@ mod tests {
     ) -> crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef {
         use crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef;
         let batch_store = Arc::new(BatchStore::with_capacity(64));
-        let mut index_store = IndexStore::new();
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let index_store = btree_on_id(schema);
         for b in batches {
             let (idx, row_offset, _) = batch_store.append(b.clone()).unwrap();
             index_store

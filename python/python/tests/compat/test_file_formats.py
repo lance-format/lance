@@ -71,6 +71,28 @@ class ManagedBlobCompatibility:
         # this must not be mistaken for permission to run old maintenance clients.
         assert lance.dataset(self.path, version=1).count_rows() == 4
 
+    def write_config(self):
+        dataset = lance.dataset(self.path)
+        dataset.update_config({"test": "released-writer"})
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("version", ["11.0.0", "13.0.0"])
+def test_default_blob_writes_and_compaction_remain_compatible(
+    venv_factory, tmp_path, version
+):
+    case = ManagedBlobCompatibility(tmp_path / "blobs.lance")
+    case.create()
+    released = venv_factory.get_venv(version)
+    released.execute_method(case, "check_unflagged")
+    dataset = lance.dataset(case.path)
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=100, data_storage_version="2.2"
+    )
+    released.execute_method(case, "check_unflagged")
+    released.execute_method(case, "write_config")
+    assert lance.dataset(case.path).count_rows() == 4
+
 
 @pytest.mark.compat
 @pytest.mark.parametrize("version", ["11.0.0", "13.0.0"])
@@ -81,6 +103,8 @@ def test_managed_blob_activation_and_restore_fence(venv_factory, tmp_path, versi
     dataset = lance.dataset(case.path)
     dataset.update_config({"test": "metadata-only"})
     released.execute_method(case, "check_unflagged")
+    dataset.update_schema_metadata({"lance.blob.managed": "true"})
+    released.execute_method(case, "check_fenced")
     dataset.optimize.compact_files(
         target_rows_per_fragment=100, data_storage_version="2.2"
     )

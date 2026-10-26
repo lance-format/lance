@@ -213,14 +213,23 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
             .get("page_size")
             .map(|bs| bs.parse().unwrap_or(DEFAULT_RTREE_PAGE_SIZE))
             .unwrap_or(DEFAULT_RTREE_PAGE_SIZE);
-        let num_pages = metadata
-            .get("num_pages")
-            .map(|bs| bs.parse().unwrap_or(0))
-            .unwrap_or(0);
         let num_items = metadata
             .get("num_items")
             .map(|bs| bs.parse().unwrap_or(0))
             .unwrap_or(0);
+        // The page walk starts at `num_pages - 1`, so the count has to agree with
+        // the layout derived from `num_items` and `page_size`. The format leaves
+        // the key optional, and older writers stored one page per sorter batch
+        // for a tree that fits in a single page. A legacy `page_size` 1 index
+        // has no derived layout and keeps its stored count.
+        let num_pages = if page_size >= 2 {
+            Self::calculate_page_offsets(num_items, page_size).len() as u64
+        } else {
+            metadata
+                .get("num_pages")
+                .map(|bs| bs.parse().unwrap_or(0))
+                .unwrap_or(0)
+        };
         let bbox = metadata
             .get("bbox")
             .map(|bs| serde_json::from_str(bs).unwrap_or_default())
@@ -1098,9 +1107,15 @@ impl RTreeIndexPlugin {
 
         if num_items > 0 {
             let mut current_level = Some((sorted_data, num_items));
-            while let Some((mut data, num_items)) = current_level.take() {
+            while let Some((data, num_items)) = current_level.take() {
                 if num_items <= page_size as usize {
-                    while let Some(batch) = data.try_next().await? {
+                    // A tree that fits in one page reaches here straight from
+                    // the sorter, in its batch size rather than page_size, so
+                    // concatenate it like the levels below: the root must be a
+                    // single page or `num_pages` disagrees with the layout
+                    // readers derive from `num_items`.
+                    let mut root = chunk_concat_stream(data, page_size as usize);
+                    while let Some(batch) = root.try_next().await? {
                         Self::train_rtree_page(batch, page_idx, writer.as_mut()).await?;
                         page_idx += 1;
                     }
@@ -1327,6 +1342,29 @@ mod tests {
         assert!(validate_stored_page_size(0, 0).is_err());
     }
 
+    /// Loading follows the layout derived from `num_items` and `page_size`, so an
+    /// absent key and the page per sorter batch older writers stored both load as
+    /// one page. A legacy `page_size` 1 index has no derived layout and keeps its
+    /// stored count, or the page walk would start below page 0.
+    #[rstest::rstest]
+    #[case::absent(10_000, 9000, None)]
+    #[case::one_page_per_sorter_batch(10_000, 9000, Some("2"))]
+    #[case::legacy_page_size_one(1, 1, Some("1"))]
+    fn test_metadata_num_pages(
+        #[case] page_size: u32,
+        #[case] num_items: usize,
+        #[case] stored: Option<&str>,
+    ) {
+        let mut metadata = HashMap::from([
+            ("page_size".to_owned(), page_size.to_string()),
+            ("num_items".to_owned(), num_items.to_string()),
+        ]);
+        if let Some(value) = stored {
+            metadata.insert("num_pages".to_owned(), value.to_owned());
+        }
+        assert_eq!(RTreeMetadata::from(&metadata).num_pages, 1);
+    }
+
     fn convert_bbox_rowid_batch_stream(
         geo_array: &dyn GeoArrowArray,
         row_id_array: ArrayRef,
@@ -1383,9 +1421,15 @@ mod tests {
             .unwrap();
 
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await.unwrap();
-        let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
+        let stored = &pages_reader.schema().metadata;
+        let metadata = RTreeMetadata::from(stored);
         assert_eq!(metadata.num_items, num_items);
-        assert_eq!(metadata.num_pages, expected_num_pages(num_items, page_size));
+        // Loading derives the page count, so check the key the writer stored:
+        // older readers still start their page walk from it.
+        assert_eq!(
+            stored["num_pages"],
+            expected_num_pages(num_items, page_size).to_string()
+        );
 
         (
             RTreeIndex::load(store.clone(), None, &LanceCache::no_cache())
@@ -1397,16 +1441,19 @@ mod tests {
     }
 
     // Spill-enabled index builds share the cached DataFusion memory pool within the
-    // test process, so keep them in one resource group.
+    // test process, so keep them in one resource group. A page_size above the
+    // sorter's 8192-row batches keeps all 10000 items in a single root page.
+    #[rstest::rstest]
+    #[case::multi_level(16)]
+    #[case::single_page(10_000)]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_search_bbox() {
+    async fn test_search_bbox(#[case] page_size: u32) {
         let bbox_type = RectType::new(Dimension::XY, Default::default());
 
         let mut rng = rand::rng();
         let mut rect_builder = RectBuilder::new(bbox_type.clone());
         let num_items = 10000;
-        let page_size = 16;
 
         for _ in 0..num_items {
             let x1 = rng.random_range(-1000.0..1000.0);

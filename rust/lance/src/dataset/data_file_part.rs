@@ -3,16 +3,18 @@
 
 use std::{collections::HashSet, num::NonZeroU64, ops::Range};
 
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result};
 use lance_file::concat::{DataFilePart as OpenedDataFilePart, EncodedFileInput};
-use lance_io::{
-    scheduler::{ScanScheduler, SchedulerConfig},
-    utils::CachedFileSize,
-};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use object_store::path::PathPart;
 use serde::{Deserialize, Serialize};
 
 use super::{DataFileTarget, Dataset};
+
+// Opening a Blob-bearing part also decodes its descriptors. Bound that work
+// independently of the store's potentially much larger request concurrency.
+const MAX_CONCURRENT_PART_OPENS: usize = 8;
 
 /// Serializable description of a completed staging part, containing its identity
 /// and expected metadata rather than file contents or open readers.
@@ -104,28 +106,29 @@ impl DataFilePart {
         let store = dataset.object_store(target.base_id).await?;
         let dir = target.parts_dir(&dataset.data_file_dir_for_base(target.base_id)?);
         let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
-        let mut opened = Vec::with_capacity(parts.len());
-        for part in parts {
-            let path = dir.clone().join(part.file_name.as_str());
-            let size = store.size(&path).await?;
-            if size != part.size_bytes() {
-                return Err(Error::invalid_input(format!(
-                    "part at '{path}' has {size} bytes, checkpoint expects {}",
-                    part.size_bytes()
-                )));
-            }
-            let file = scheduler
-                .open_file(&path, &CachedFileSize::new(size))
-                .await?;
-            opened.push(
+        let concurrency = store.io_parallelism().min(MAX_CONCURRENT_PART_OPENS);
+        let opens = parts.iter().map(|part| {
+            let store = &store;
+            let scheduler = &scheduler;
+            let dir = &dir;
+            async move {
+                let path = dir.clone().join(part.file_name.as_str());
+                let reader = store
+                    .open_with_expected_size(&path, part.size_bytes())
+                    .await?;
+                let file = scheduler.open_reader(reader.into());
                 OpenedDataFilePart::open(
                     EncodedFileInput::new(file).with_expected_num_rows(part.num_rows()),
                     part.blob_ids.clone(),
                     target.blob_target_id(),
                 )
-                .await?,
-            );
-        }
-        Ok(opened)
+                .await
+            }
+        });
+        // Completion order must not change the caller's physical row order.
+        stream::iter(opens)
+            .buffered(concurrency)
+            .try_collect()
+            .await
     }
 }

@@ -293,6 +293,17 @@ pub trait IndexReader: Send + Sync {
             .buffered(batch_readahead.max(1) as usize);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+    /// Whether the decoder behind this reader splits batches before their i32
+    /// offsets overflow.
+    ///
+    /// Callers streaming rows of unbounded size (e.g. large posting lists) may
+    /// request multi-row batches only when this returns `true`: a decoder that
+    /// splits by row count alone can overflow its i32 offsets within a single
+    /// batch. When it returns `false`, such callers should request one row per
+    /// batch instead, which still reads the file in one sequential pass.
+    fn guarantees_byte_splitting(&self) -> bool {
+        false
+    }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file
@@ -351,6 +362,23 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Return a store that submits its I/O at the given base priority.
     fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore>;
+
+    /// Return a store whose reads work against a budget of `bytes` rather than the store's
+    /// own, for a caller that needs to hold less data in flight than the store would.
+    ///
+    /// The budget is what bounds a read's memory: a whole-file read is scheduled eagerly, so
+    /// its outstanding bytes are capped by the budget, not by how far ahead of the consumer
+    /// it reads. The cap is soft — the scheduler goes over it rather than stall a read — and
+    /// it is per store, so a caller reading several at once holds one budget per store unless
+    /// it narrows each.
+    ///
+    /// The budget lives in the scheduler, so unlike [`IndexStore::with_io_priority`] this
+    /// cannot share the original's — expect an implementation to build one, and call this
+    /// per scope, not per request. Do not cache the result:
+    /// [`IndexStore::is_same_storage_binding`] compares storage, not budgets. A store that
+    /// prefetches nothing may return itself, but must say so explicitly, since a caller
+    /// that silently gets no bound cannot tell.
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore>;
 
     /// Copy a range of batches from an index file from this store to another
     ///
@@ -530,23 +558,25 @@ pub struct UpdateCriteria {
 
 /// Filter used when merging existing scalar-index rows during update.
 ///
-/// The caller must pick a filter mode that matches the row-id semantics of the
-/// dataset:
-/// - address-style row IDs: fragment filtering is valid
-/// - stable row IDs: use exact row-id membership instead
+/// When we are doing an update we have an opportunity (not a requirement) to
+/// prune fragments from the index.  This can happen because the fragment was
+/// deleted or because it was invalidated (the indexed column was modified).
+/// Pruning these rows can lead to a smaller, more efficient index.  However,
+/// we will always subtract these fragments from the result either way so this
+/// is only an optimization opportunity and not a correctness requirement.
+///
+/// Legacy indexes that store row IDs needed to use a less efficient RowAddrTreeMap
+/// for this approach.  As these indexes fade from support we can hopefully remove
+/// this branch.
 #[derive(Debug, Clone)]
 pub enum OldIndexDataFilter {
     /// Keeps track of which fragments are still valid and which are no longer valid.
-    ///
-    /// This is valid for address-style row IDs.
     Fragments {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
-    /// Keep old rows whose row IDs are in this exact allow-list.
-    ///
-    /// This is required for stable row IDs, where row IDs are opaque and
-    /// should not be interpreted as encoded row addresses.
+    /// Keep old rows whose identifier is in this exact allow-list, used for id-domain
+    /// indexes when stable row id is enabled.
     RowIds(RowAddrTreeMap),
 }
 
@@ -651,13 +681,6 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
 
     /// Returns true if this index reports matches as physical row addresses
     /// (`fragment_id << 32 | offset`) rather than row ids
-    ///
-    /// Address-domain indices (e.g. zone map, bloom filter) are built over the
-    /// `_rowaddr` column. On a dataset with stable row ids the address and
-    /// row-id domains diverge, so these results must be translated back to row
-    /// ids (via the per-fragment row-id sequences, known only at the dataset
-    /// layer) before they are combined with row-id results or handed to the
-    /// scan. The default (row-id domain) needs no translation.
     fn results_are_row_addresses(&self) -> bool {
         false
     }

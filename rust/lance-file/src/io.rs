@@ -48,6 +48,13 @@ impl EncodingsIo for LanceEncodingsIo {
         }))
     }
 
+    fn with_coalesce_gap(&self, gap: u64) -> Option<Arc<dyn EncodingsIo>> {
+        Some(Arc::new(Self {
+            scheduler: self.scheduler.with_block_size(gap),
+            read_chunk_size: self.read_chunk_size,
+        }))
+    }
+
     fn submit_request(
         &self,
         ranges: Vec<std::ops::Range<u64>>,

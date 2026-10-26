@@ -2330,7 +2330,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             false,
             // supports_regex: regex acceleration is only implemented for ngram.
             false,
-            // min_contains_chars: the FM-index can match a needle of any length.
+            // min_contains_chars: the FM-index can match any non-empty needle.
             0,
         )))
     }
@@ -2396,6 +2396,12 @@ mod tests {
         fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
             Arc::new(Self {
                 inner: self.inner.with_io_priority(io_priority),
+            })
+        }
+
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_buffer_size(bytes),
             })
         }
 

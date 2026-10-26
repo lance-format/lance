@@ -172,6 +172,39 @@ impl DatasetPreFilter {
         Ok(Arc::new(RowAddrMask::from_block(deleted_ids)))
     }
 
+    /// Keep the live address domain explicit: a staged index can physically
+    /// retain rows whose fragments were pruned from its committed coverage.
+    async fn do_create_restricted_deletion_mask(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+    ) -> Result<Arc<RowAddrMask>> {
+        let mut fragment_rows = stream::iter(
+            dataset
+                .get_fragments()
+                .into_iter()
+                .filter(|fragment| fragments.contains(fragment.id() as u32)),
+        )
+        .map(|fragment| async move {
+            let id = fragment.id() as u32;
+            // Bound every fragment by its physical row count. Even undeleted
+            // fragments can later intersect with a block filter or overlay;
+            // Full - Partial would expand the entire u32 offset domain.
+            let num_rows = fragment.physical_rows().await?;
+            let mut live_rows = RoaringBitmap::new();
+            live_rows.insert_range(0..num_rows as u32);
+            if let Some(deletions) = fragment.get_deletion_vector().await? {
+                live_rows -= &RoaringBitmap::from(deletions.as_ref());
+            }
+            Ok::<_, crate::Error>((id, live_rows))
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism());
+        let mut allowed = RowAddrTreeMap::new();
+        while let Some((id, rows)) = fragment_rows.try_next().await? {
+            allowed.insert_bitmap(id, rows);
+        }
+        Ok(Arc::new(RowAddrMask::from_allowed(allowed)))
+    }
+
     #[instrument(level = "debug", skip_all)]
     pub(super) async fn do_create_deletion_mask_row_id(
         dataset: Arc<Dataset>,
@@ -224,43 +257,45 @@ impl DatasetPreFilter {
 
         let dataset_clone = dataset.clone();
         let restrict_for_load = restrict_to.clone();
+        let load_mask = move || async move {
+            let row_ids_and_deletions =
+                load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref()).await?;
+
+            // The process of computing the final mask is CPU-bound, so we spawn it
+            // on a blocking thread.
+            let allow_list = spawn_cpu(move || {
+                Result::Ok(row_ids_and_deletions.into_iter().fold(
+                    RowAddrTreeMap::new(),
+                    |mut allow_list, (row_ids, deletion_vector)| {
+                        let seq = if let Some(deletion_vector) = deletion_vector {
+                            let mut row_ids = row_ids.as_ref().clone();
+                            row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
+                            Cow::<RowIdSequence>::Owned(row_ids)
+                        } else {
+                            Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
+                        };
+                        let treemap = RowAddrTreeMap::from(seq.as_ref());
+                        allow_list |= treemap;
+                        allow_list
+                    },
+                ))
+            })
+            .await?;
+
+            Ok(RowAddrMask::from_allowed(allow_list))
+        };
+        let Some(e_tag) = dataset.manifest_location().e_tag.as_deref() else {
+            return load_mask().await.map(Arc::new);
+        };
         let key = crate::session::caches::RowAddrMaskKey {
             version: dataset.manifest().version,
+            e_tag: Some(e_tag),
             restrict_hash,
         };
         dataset
             .metadata_cache
             .as_ref()
-            .get_or_insert_with_key(key, move || {
-                async move {
-                    let row_ids_and_deletions =
-                        load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref())
-                            .await?;
-
-                    // The process of computing the final mask is CPU-bound, so we spawn it
-                    // on a blocking thread.
-                    let allow_list = spawn_cpu(move || {
-                        Result::Ok(row_ids_and_deletions.into_iter().fold(
-                            RowAddrTreeMap::new(),
-                            |mut allow_list, (row_ids, deletion_vector)| {
-                                let seq = if let Some(deletion_vector) = deletion_vector {
-                                    let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
-                                    Cow::<RowIdSequence>::Owned(row_ids)
-                                } else {
-                                    Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
-                                };
-                                let treemap = RowAddrTreeMap::from(seq.as_ref());
-                                allow_list |= treemap;
-                                allow_list
-                            },
-                        ))
-                    })
-                    .await?;
-
-                    Ok(RowAddrMask::from_allowed(allow_list))
-                }
-            })
+            .get_or_insert_with_key(key, load_mask)
             .await
     }
 
@@ -325,24 +360,17 @@ impl DatasetPreFilter {
                 .iter()
                 .map(|frag| (frag.id as u32, frag)),
         );
-        // When restrict_to_fragments is set, check if the dataset has fragments
-        // outside the index bitmap. This can happen when a fragment's data was
-        // modified but the index was not rewritten (e.g. after DataReplacement
-        // or partial merge_insert).
-        //
-        // We materialize the set of non-index fragments here so the slow path
-        // below can fold them into the deletion mask as Full blocks instead of
-        // computing AllowList(Full) - BlockList(Partial), which forces
-        // RoaringBitmap::full() per fragment in RowAddrTreeMap::sub_assign and
-        // is the dominant cost on every merge_insert call.
-        let non_index_frags: Option<RoaringBitmap> = if restrict_to_fragments {
-            let dataset_frag_ids: RoaringBitmap = frag_map.keys().copied().collect();
-            let outside = &dataset_frag_ids - &fragments;
-            (!outside.is_empty()).then_some(outside)
-        } else {
-            None
-        };
-        let needs_allow_list = non_index_frags.is_some();
+        // A retired fragment can be absent from both the current manifest and
+        // the index bitmap after coverage pruning. The no-mask fast path is
+        // safe only if every allocated fragment is still present and covered.
+        // Compare cardinalities instead of enumerating historical/reserved IDs.
+        // Without a stored high water mark, retired trailing IDs are unknown.
+        let needs_restriction = restrict_to_fragments
+            && (dataset
+                .manifest
+                .max_fragment_id
+                .is_none_or(|max_id| u64::from(max_id) + 1 != frag_map.len() as u64)
+                || frag_map.keys().any(|id| !fragments.contains(*id)));
         for frag_id in fragments.iter() {
             let frag = frag_map.get(&frag_id);
             if let Some(frag) = frag {
@@ -353,7 +381,7 @@ impl DatasetPreFilter {
                 missing_frags.push(frag_id);
             }
         }
-        if missing_frags.is_empty() && frags_with_deletion_files.is_empty() && !needs_allow_list {
+        if missing_frags.is_empty() && frags_with_deletion_files.is_empty() && !needs_restriction {
             None
         } else if dataset.manifest.uses_stable_row_ids() {
             let restrict_to = if restrict_to_fragments {
@@ -362,44 +390,13 @@ impl DatasetPreFilter {
                 None
             };
             Some(Self::do_create_deletion_mask_row_id(dataset.clone(), restrict_to).boxed())
-        } else if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
-            // No deletions to load, but the dataset has fragments outside the
-            // index bitmap. Return a synchronous allow-list mask.
-            let mut allow_list = RowAddrTreeMap::new();
-            for frag_id in fragments.iter() {
-                allow_list.insert_fragment(frag_id);
-            }
-            Some(async move { Ok(Arc::new(RowAddrMask::from_allowed(allow_list))) }.boxed())
+        } else if restrict_to_fragments {
+            Some(Self::do_create_restricted_deletion_mask(dataset, fragments).boxed())
         } else {
-            // There are deletions/missing frags. Build the deletion mask and,
-            // if needed, fold the non-index fragments into it as Full blocks.
-            // Equivalent to BlockList(deletions) | BlockList(non_index) — but
-            // expressed via insert_fragment so we never materialize a
-            // RoaringBitmap::full() per fragment.
-            let fut =
-                Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files);
-            if let Some(non_index_frags) = non_index_frags {
-                Some(
-                    async move {
-                        let deletion_mask = fut.await?;
-                        let mut combined = match &*deletion_mask {
-                            RowAddrMask::BlockList(b) => b.clone(),
-                            RowAddrMask::AllowList(_) => {
-                                // do_create_deletion_mask only returns BlockList; this is
-                                // defensive and should be unreachable.
-                                return Ok(deletion_mask);
-                            }
-                        };
-                        for frag_id in non_index_frags.iter() {
-                            combined.insert_fragment(frag_id);
-                        }
-                        Ok(Arc::new(RowAddrMask::from_block(combined)))
-                    }
+            Some(
+                Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files)
                     .boxed(),
-                )
-            } else {
-                Some(fut.boxed())
-            }
+            )
         }
     }
 }
@@ -481,6 +478,7 @@ mod test {
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
+    use crate::session::Session;
 
     use super::*;
 
@@ -619,6 +617,99 @@ mod test {
         assert_eq!(prefilter.mask().block_list(), Some(&expected));
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_restricted_deletion_mask_pruned_fragments(
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] partial_deletion: bool,
+        #[values(false, true)] unset_high_water_mark: bool,
+    ) {
+        let datasets = test_datasets(stable_row_ids).await;
+        assert!(
+            DatasetPreFilter::create_restricted_deletion_mask(
+                datasets.no_deletions.clone(),
+                RoaringBitmap::from_iter(0..3),
+            )
+            .is_none()
+        );
+        let (dataset, coverage, expected) = if partial_deletion {
+            (
+                datasets.deletions_missing_frags,
+                vec![0, 2],
+                vec![0, 1, 2, 6, 7],
+            )
+        } else {
+            (datasets.only_missing_frags, vec![0], vec![0, 1, 2])
+        };
+        let mut dataset = (*dataset).clone();
+        if unset_high_water_mark {
+            Arc::make_mut(&mut dataset.manifest).max_fragment_id = None;
+        }
+        // A staged segment can still contain entries from retired fragments
+        // even after publication has pruned those fragments from its bitmap.
+        let mask = DatasetPreFilter::create_restricted_deletion_mask(
+            Arc::new(dataset),
+            RoaringBitmap::from_iter(coverage),
+        )
+        .expect("retired fragments still need filtering")
+        .await
+        .unwrap();
+        let selected: Vec<_> = (0..9)
+            .filter(|id| {
+                let row_id = if stable_row_ids {
+                    *id as u64
+                } else {
+                    u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                        id / 3,
+                        id % 3,
+                    ))
+                };
+                mask.selected(row_id)
+            })
+            .collect();
+        assert_eq!(selected, expected);
+    }
+
+    #[rstest]
+    #[case::filter(false)]
+    #[case::overlay(true)]
+    #[tokio::test]
+    async fn test_restricted_mask_composes_with_block_filter(#[case] overlay: bool) {
+        let datasets = test_datasets(false).await;
+        // Only fragment 2 has a deletion; exclusions in fragments 0 and 1
+        // must not expand their allow entries to the full u32 offset domain.
+        let blocked = RowAddrTreeMap::from_iter([0_u64, 1_u64 << 32]);
+        let block_mask = RowAddrMask::from_block(blocked);
+        let filter = if overlay {
+            None
+        } else {
+            let block_mask = block_mask.clone();
+            Some(async move { Ok(Arc::new(block_mask)) }.boxed())
+        };
+        let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(
+            datasets.deletions_no_missing_frags,
+            RoaringBitmap::from_iter(0..3),
+            filter,
+        );
+        if overlay {
+            prefilter = prefilter.with_overlay_block(block_mask);
+        }
+        prefilter.wait_for_ready().await.unwrap();
+        let mask = prefilter.mask();
+        let allowed = mask.allow_list().unwrap();
+        let bytes = allowed.serialized_size();
+        assert!(bytes < 1024, "nine-row prefilter expanded to {bytes} bytes");
+        let expected = RowAddrTreeMap::from_iter([
+            1,
+            2,
+            (1_u64 << 32) + 1,
+            (1_u64 << 32) + 2,
+            2_u64 << 32,
+            (2_u64 << 32) + 1,
+        ]);
+        assert_eq!(allowed, &expected);
+    }
+
     #[tokio::test]
     async fn test_deletion_mask_stable_row_id() {
         // Here, behavior is different.
@@ -658,6 +749,78 @@ mod test {
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(3)); // There were three rows left over;
+    }
+
+    #[tokio::test]
+    async fn test_deletion_mask_stable_row_ids_recreated_at_same_uri() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let session = Arc::new(Session::default());
+        let write = |num_rows| {
+            let test_data = BatchGenerator::new()
+                .col(Box::new(IncrementingInt32::new().named("x")))
+                .batch(num_rows);
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session.clone()),
+                ..Default::default()
+            };
+            async move {
+                Dataset::write(test_data, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let mut dataset = write(10).await;
+        dataset.delete("x = 9").await.unwrap();
+        assert_eq!(dataset.manifest().version, 2);
+        let mask = DatasetPreFilter::create_deletion_mask(
+            Arc::new(dataset.clone()),
+            RoaringBitmap::from_iter(0..1),
+        )
+        .expect("stable-row-id deletion mask")
+        .await
+        .unwrap();
+        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter(0..9)));
+
+        drop(dataset);
+        std::fs::remove_dir_all(tmp_path.as_str()).unwrap();
+
+        let mut dataset = write(20).await;
+        dataset.delete("x = 19").await.unwrap();
+        assert_eq!(dataset.manifest().version, 2);
+        let mask = DatasetPreFilter::create_deletion_mask(
+            Arc::new(dataset),
+            RoaringBitmap::from_iter(0..1),
+        )
+        .expect("stable-row-id deletion mask")
+        .await
+        .unwrap();
+        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter(0..19)));
+    }
+
+    #[tokio::test]
+    async fn test_deletion_mask_without_generation_token_is_not_cached() {
+        let datasets = test_datasets(true).await;
+        let mut dataset = (*datasets.deletions_no_missing_frags).clone();
+        dataset.manifest_location.e_tag = None;
+        let dataset = Arc::new(dataset);
+
+        let load_mask = || {
+            let dataset = dataset.clone();
+            async move {
+                DatasetPreFilter::create_deletion_mask(dataset, RoaringBitmap::from_iter(0..3))
+                    .expect("stable-row-id deletion mask")
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = load_mask().await;
+        let second = load_mask().await;
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.allow_list(), Some(&RowAddrTreeMap::from_iter(0..8)));
     }
 
     // Regression test for issue #6877.

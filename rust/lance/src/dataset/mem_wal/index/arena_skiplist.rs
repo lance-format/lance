@@ -51,8 +51,13 @@ const MAX_HEIGHT: usize = 16;
 /// Inverse promotion probability (p = 1/4): a node grows one level with prob
 /// 1/4. Matches RocksDB's default `kBranching`.
 const BRANCHING: u64 = 4;
-/// Bump-arena chunk size (1 MiB). Nodes are packed contiguously within a chunk.
-const CHUNK_SIZE: usize = 1 << 20;
+/// Largest bump-arena chunk (1 MiB). Nodes are packed contiguously within one.
+const MAX_CHUNK_SIZE: usize = 1 << 20;
+/// First chunk (4 KiB), doubling up to [`MAX_CHUNK_SIZE`], so an index holding
+/// few nodes is not charged a full chunk.
+const FIRST_CHUNK_SIZE: usize = 4 << 10;
+/// How many times the chunk size doubles before it reaches [`MAX_CHUNK_SIZE`].
+const CHUNK_DOUBLINGS: usize = (MAX_CHUNK_SIZE / FIRST_CHUNK_SIZE).trailing_zeros() as usize;
 
 /// Node header. The variable-length forward-pointer tower (`height` slots of
 /// `AtomicPtr<Node<K>>`) is laid out immediately after this header in the same
@@ -119,7 +124,8 @@ impl Arena {
     #[cold]
     unsafe fn grow(&mut self, layout: Layout, allocated: &AtomicUsize) {
         let align = layout.align().max(64);
-        let size = CHUNK_SIZE.max(layout.size().next_power_of_two());
+        let ramped = FIRST_CHUNK_SIZE << self.chunks.len().min(CHUNK_DOUBLINGS);
+        let size = ramped.max(layout.size().next_power_of_two());
         let chunk_layout = Layout::from_size_align(size, align).expect("valid chunk layout");
         let ptr = alloc::alloc(chunk_layout);
         if ptr.is_null() {
@@ -352,8 +358,8 @@ pub struct SkipListReader<K> {
 impl<K: Ord> SkipListReader<K> {
     /// Bytes of arena chunks backing this skiplist's nodes.
     ///
-    /// Counts chunks, not entries, so it steps by `CHUNK_SIZE` and overshoots
-    /// the live nodes by at most one partly-filled chunk. Excludes any bytes a
+    /// Counts chunks, not entries, so it overshoots the live nodes by at most
+    /// one partly-filled chunk. Excludes any bytes a
     /// key owns outside its node (e.g. a long `Box<[u8]>` key) — the arena
     /// never sees those, so whoever built the key charges them; see
     /// `BytesBackend::key_heap_bytes`.
@@ -487,6 +493,44 @@ mod tests {
         }
         assert_eq!(collect(&r), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(r.len(), 10);
+    }
+
+    /// Chunks double from the first size to the largest and stay there, so a
+    /// small index is charged little and a large one allocates rarely.
+    #[test]
+    fn chunks_ramp_up_to_the_largest_size() {
+        let (mut w, r) = new_skiplist::<i64>();
+        let mut charged = vec![0];
+        let mut key = 0;
+        while charged.len() <= CHUNK_DOUBLINGS + 3 {
+            w.insert(key);
+            key += 1;
+            if r.resident_bytes() != *charged.last().unwrap() {
+                charged.push(r.resident_bytes());
+            }
+        }
+        let chunks: Vec<usize> = charged.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut expected: Vec<usize> = (0..=CHUNK_DOUBLINGS)
+            .map(|doublings| FIRST_CHUNK_SIZE << doublings)
+            .collect();
+        expected.extend([MAX_CHUNK_SIZE; 2]);
+        assert_eq!(chunks, expected);
+        assert_eq!(collect(&r), (0..key).collect::<Vec<_>>());
+    }
+
+    /// A node larger than the current chunk gets a chunk of its own, and small
+    /// nodes keep allocating around it.
+    #[test]
+    fn oversized_nodes_mix_with_small_ones() {
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        struct Big(u32, [u8; 8192]);
+        let (mut w, r) = new_skiplist::<Big>();
+        for i in [5u32, 1, 9, 3] {
+            w.insert(Big(i, [i as u8; 8192]));
+        }
+        assert_eq!(r.iter().map(|b| b.0).collect::<Vec<_>>(), vec![1, 3, 5, 9]);
+        assert!(r.iter().all(|b| b.1.iter().all(|x| *x == b.0 as u8)));
+        assert!(r.resident_bytes() >= 4 * 8192);
     }
 
     #[test]

@@ -216,6 +216,9 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
         // Insert exchange nodes (RepartitionExec, CoalescePartitionsExec) where needed
         // to satisfy distribution requirements as exec nodes migrate to multi-partition output.
         Arc::new(datafusion::physical_optimizer::enforce_distribution::EnforceDistribution::new()),
+        // Strip the `OutputRequirementExec` a plan may state its ordering with;
+        // it cannot execute
+        Arc::new(datafusion::physical_optimizer::output_requirements::OutputRequirements::new_remove_mode()),
     ])
 }
 
