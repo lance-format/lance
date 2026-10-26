@@ -1246,6 +1246,7 @@ mod tests {
     };
     use crate::format::DataFile;
     use crate::rowids::write_row_ids;
+    use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use crate::system_index::mem_wal::{
         CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
         new_mem_wal_index_meta,
@@ -1255,9 +1256,10 @@ mod tests {
         one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
-        ConfigUpdate, DropField, FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds,
-        ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
@@ -2279,5 +2281,51 @@ mod tests {
         .unwrap();
 
         assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    /// The fragment reuse history is not an index on the action path: no
+    /// index action may name it, so it changes only through its own actions.
+    #[rstest]
+    #[case::add_segment(|uuid: Uuid| Action::AddIndexSegment(AddIndexSegment {
+        uuid: Uuid::from_u128(uuid.as_u128() + 1),
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        fields: Vec::new(),
+        covering_fields: Vec::new(),
+        index_details: None,
+        index_version: 1,
+        covered_fragments: None,
+        files: Vec::new(),
+        base: None,
+        created_at: None,
+        dataset_version: None,
+        data_change: false,
+    }))]
+    #[case::remove_segment(|uuid| Action::RemoveIndexSegment(RemoveIndexSegment {
+        uuid,
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        data_change: false,
+    }))]
+    #[case::adjust_coverage(|uuid| Action::AdjustIndexCoverage(AdjustIndexCoverage {
+        uuid,
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        add_fragments: Vec::new(),
+        remove_fragments: vec![0],
+        fields: Vec::new(),
+        covering_fields: Vec::new(),
+    }))]
+    #[case::drop_index(|_| Action::DropIndex(DropIndex {
+        name: FRAG_REUSE_INDEX_NAME.into(),
+    }))]
+    fn test_an_index_action_may_not_name_the_fragment_reuse_history(
+        #[case] action: fn(Uuid) -> Action,
+    ) {
+        let mut entry = sample_index_metadata(FRAG_REUSE_INDEX_NAME);
+        entry.fields.clear();
+        entry.index_version = 0;
+        let error = apply_with_indices(&backed_manifest(), vec![action(entry.uuid)], vec![entry])
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(FRAG_REUSE_INDEX_NAME), "{error}");
     }
 }
