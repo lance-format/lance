@@ -30,7 +30,7 @@ use lance_core::{
     Error, ROW_ADDR, Result,
     cache::{
         CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-        KeyBuilder, LanceCache, WeakLanceCache,
+        CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
     },
     error::LanceOptionExt,
     utils::tokio::get_num_compute_intensive_cpus,
@@ -993,6 +993,7 @@ impl Index for BitmapIndex {
                 })?;
                 let cache_key = BitmapKey::try_new(row_offset)?;
                 self.index_cache
+                    .with_load_origin(CacheLoadOrigin::Warm)
                     .insert_with_key(&cache_key, Arc::new(bitmap))
                     .await;
             }

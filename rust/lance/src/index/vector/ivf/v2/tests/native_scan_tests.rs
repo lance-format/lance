@@ -232,9 +232,31 @@ async fn test_rabit_scan_factory_rebinds_from_current_session(
             lazy_index(&index).uses_rabit_plane_cache(),
             cache_layout == RabitCacheLayout::Planes
         );
+        if opening == 1 {
+            let before = installed.session().cache_diagnostics();
+            index.prewarm().await.unwrap();
+            let after = installed.session().cache_diagnostics();
+            assert!(after.index.activity.warm.attempts > before.index.activity.warm.attempts);
+            assert!(
+                after.index.activity.warm.loads_succeeded
+                    > before.index.activity.warm.loads_succeeded
+            );
+            assert!(after.index.activity.warm.load_bytes > before.index.activity.warm.load_bytes);
+        }
+        let before_query = installed.session().cache_diagnostics();
         let result = search_global(&index, &query, Arc::new(NoFilter))
             .await
             .unwrap();
+        let after_query = installed.session().cache_diagnostics();
+        assert!(after_query.index.activity.hits > before_query.index.activity.hits);
+        assert_eq!(
+            after_query.index.activity.warm.attempts,
+            before_query.index.activity.warm.attempts
+        );
+        assert_eq!(
+            after_query.index.activity.warm.loads_succeeded,
+            before_query.index.activity.warm.loads_succeeded
+        );
         let actual = result_bits(&result);
         assert_eq!(original.opens.load(Ordering::Relaxed), opening);
         assert_eq!(original.searches.load(Ordering::Relaxed), opening);
