@@ -415,7 +415,7 @@ fn bench_hnsw_prefetch(c: &mut Criterion) {
                             prefetch_distance,
                         )
                         .unwrap();
-                    assert_eq!(result.0.len(), K);
+                    assert_eq!(result.len(), K);
                 })
             });
         }

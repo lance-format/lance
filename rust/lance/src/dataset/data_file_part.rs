@@ -6,10 +6,7 @@ use std::{collections::HashSet, num::NonZeroU64, ops::Range};
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result};
 use lance_file::concat::{DataFilePart as OpenedDataFilePart, EncodedFileInput};
-use lance_io::{
-    scheduler::{ScanScheduler, SchedulerConfig},
-    utils::CachedFileSize,
-};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use object_store::path::PathPart;
 use serde::{Deserialize, Serialize};
 
@@ -116,16 +113,10 @@ impl DataFilePart {
             let dir = &dir;
             async move {
                 let path = dir.clone().join(part.file_name.as_str());
-                let size = store.size(&path).await?;
-                if size != part.size_bytes() {
-                    return Err(Error::invalid_input(format!(
-                        "part at '{path}' has {size} bytes, checkpoint expects {}",
-                        part.size_bytes()
-                    )));
-                }
-                let file = scheduler
-                    .open_file(&path, &CachedFileSize::new(size))
+                let reader = store
+                    .open_with_expected_size(&path, part.size_bytes())
                     .await?;
+                let file = scheduler.open_reader(reader.into());
                 OpenedDataFilePart::open(
                     EncodedFileInput::new(file).with_expected_num_rows(part.num_rows()),
                     part.blob_ids.clone(),

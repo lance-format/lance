@@ -67,8 +67,8 @@ use crate::{
             range::RangeDecompressor,
             rle::{
                 BlockRleDecompressor, BlockRleRunCount, RleChildDecompressor, RleDecompressor,
-                RleEncoder, RunLengthWidth, rle_encoded_size, select_miniblock_run_length_width,
-                select_run_length_width,
+                RleEncoder, RunLengthWidth, rle_encoded_size, rle_encoded_size_from_entries,
+                select_miniblock_run_length_width, select_run_length_width,
             },
             value::{ValueDecompressor, ValueEncoder},
         },
@@ -238,6 +238,13 @@ fn rle_is_applicable(data: &FixedWidthDataBlock, params: &CompressionFieldParams
     Some((data.num_values as u128) * (type_size as u128))
 }
 
+/// Every run yields at least one RLE entry, and every entry stores one value and
+/// at least one length byte, so `RunCount` bounds the RLE payload from below.
+fn rle_payload_lower_bound(data: &FixedWidthDataBlock) -> u128 {
+    let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+    rle_encoded_size_from_entries(run_count, data.bits_per_value, RunLengthWidth::U8)
+}
+
 fn rle_beats_raw_and_bitpacking(
     data: &FixedWidthDataBlock,
     encoded_bytes: u128,
@@ -263,6 +270,10 @@ fn try_fixed_u8_rle_for_mini_block(
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let raw_bytes = rle_is_applicable(data, params)?;
+    // Skip the value scan when even the lower bound cannot win.
+    if !rle_beats_raw_and_bitpacking(data, rle_payload_lower_bound(data), raw_bytes) {
+        return None;
+    }
     let rle_bytes = estimate_rle_size_for_width_from_data(
         data,
         Some(*MAX_MINIBLOCK_VALUES),
@@ -326,8 +337,7 @@ fn rle_child_compression_config(params: &CompressionFieldParams) -> Option<Compr
 fn try_rle_for_block_with_width(
     data: &FixedWidthDataBlock,
     params: &CompressionFieldParams,
-    run_length_width: RunLengthWidth,
-    rle_payload_bytes: u128,
+    estimate: impl FnOnce() -> Result<(RunLengthWidth, u128)>,
 ) -> Result<Option<Box<dyn BlockCompressor>>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
@@ -349,19 +359,22 @@ fn try_rle_for_block_with_width(
     }
 
     let raw_bytes = (data.num_values as u128) * ((bits / 8) as u128);
-    let rle_bytes = rle_payload_bytes.saturating_add(RLE_BLOCK_HEADER_BYTES);
+    #[cfg(feature = "bitpacking")]
+    let bitpack_bytes = estimate_block_bitpacking_bytes(data);
+    #[cfg(not(feature = "bitpacking"))]
+    let bitpack_bytes = None::<u128>;
+    let beats = |payload_bytes: u128| {
+        let rle_bytes = payload_bytes.saturating_add(RLE_BLOCK_HEADER_BYTES);
+        rle_bytes < raw_bytes && !bitpack_bytes.is_some_and(|bytes| bytes < rle_bytes)
+    };
 
-    if rle_bytes >= raw_bytes {
+    // Skip the value scan when even the lower bound cannot win.
+    if !beats(rle_payload_lower_bound(data)) {
         return Ok(None);
     }
-
-    #[cfg(feature = "bitpacking")]
-    {
-        if let Some(bitpack_bytes) = estimate_block_bitpacking_bytes(data)
-            && bitpack_bytes < rle_bytes
-        {
-            return Ok(None);
-        }
+    let (run_length_width, rle_payload_bytes) = estimate()?;
+    if !beats(rle_payload_bytes) {
+        return Ok(None);
     }
 
     Ok(Some(Box::new(RleEncoder::with_run_length_width(
@@ -376,8 +389,10 @@ fn try_fixed_u8_rle_for_block(
     if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
         return Ok(None);
     }
-    let encoded_bytes = estimate_rle_size_for_width_from_data(data, None, RunLengthWidth::U8)?;
-    try_rle_for_block_with_width(data, params, RunLengthWidth::U8, encoded_bytes)
+    try_rle_for_block_with_width(data, params, || {
+        let bytes = estimate_rle_size_for_width_from_data(data, None, RunLengthWidth::U8)?;
+        Ok((RunLengthWidth::U8, bytes))
+    })
 }
 
 fn try_variable_rle_for_block(
@@ -387,8 +402,9 @@ fn try_variable_rle_for_block(
     if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
         return Ok(None);
     }
-    let (width, encoded_bytes) = estimate_rle_width_and_size_from_data(data, None)?;
-    try_rle_for_block_with_width(data, params, width, encoded_bytes)
+    try_rle_for_block_with_width(data, params, || {
+        estimate_rle_width_and_size_from_data(data, None)
+    })
 }
 
 fn estimate_rle_width_and_size_from_data(
@@ -1054,6 +1070,14 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     /// Decoders with multiple buffers must override the single-buffer default.
     fn num_buffers(&self) -> usize {
         1
+    }
+
+    /// Returns the output bit width when this is the single-buffer inline
+    /// bitpacking codec. The mini-block reader uses this optional capability
+    /// to unpack directly into a typed output buffer; other codecs keep the
+    /// generic path.
+    fn inline_bitpacking_width(&self) -> Option<u64> {
+        None
     }
 
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.

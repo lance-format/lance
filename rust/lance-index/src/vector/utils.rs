@@ -192,6 +192,7 @@ impl SimpleIndex {
 /// exactly as before, while at 768 dims the cap turns a within-noise effect
 /// into a 20-28% search speedup on the `search_hnsw_prefetch` bench
 /// (issue #8275).
+#[cfg(target_arch = "x86_64")]
 const PREFETCH_MAX_CACHE_LINES: usize = 8;
 
 #[inline]

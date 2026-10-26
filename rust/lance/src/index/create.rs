@@ -695,9 +695,10 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     async fn execute(mut self) -> Result<IndexMetadata> {
-        // Multi-segment FM-Index path: when num_segments > 1, build one segment
-        // per fragment group and commit them all atomically.
-        if let Some(num_segments) = self.fmindex_num_segments()
+        // Multi-segment FM-Index path: split whole-table builds into fragment groups.
+        // Explicit fragment selections stay on the single-segment path.
+        if self.fragments.is_none()
+            && let Some(num_segments) = self.fmindex_num_segments()
             && num_segments > 1
         {
             return self.execute_multi_segment_fmindex(num_segments).await;
@@ -745,10 +746,15 @@ impl<'a> CreateIndexBuilder<'a> {
     }
     /// Extract `num_segments` from FM-Index params if this is an FM-Index build.
     fn fmindex_num_segments(&self) -> Option<u32> {
-        if self.index_type != IndexType::Fm {
+        let scalar_params = self.params.as_any().downcast_ref::<ScalarIndexParams>()?;
+        // `IndexType::Scalar` builds whichever plugin `ScalarIndexParams::index_type`
+        // names, so a Scalar request for "fm" is an FM-Index build too.
+        let is_fmindex = self.index_type == IndexType::Fm
+            || (self.index_type == IndexType::Scalar
+                && scalar_params.index_type.eq_ignore_ascii_case("fm"));
+        if !is_fmindex {
             return None;
         }
-        let scalar_params = self.params.as_any().downcast_ref::<ScalarIndexParams>()?;
         let params_json = scalar_params.params.as_deref()?;
         let json: serde_json::Value = serde_json::from_str(params_json).ok()?;
         json.get("num_segments")?.as_u64().map(|n| n as u32)
@@ -792,7 +798,9 @@ impl<'a> CreateIndexBuilder<'a> {
             while indices.iter().any(|idx| {
                 // Same name-collision rule as `execute_uncommitted_impl`'s
                 // default-name loop above in this file.
-                idx.name == candidate && idx.keyed_field() != Some(field.id)
+                let different_field = idx.keyed_field() != Some(field.id);
+                idx.name == candidate
+                    && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
                 candidate = format!("{base_name}_{counter}");
                 counter += 1;
@@ -1410,6 +1418,102 @@ mod tests {
                 .contains("already exists, please specify a different name or use replace=True"),
             "{err2}"
         );
+    }
+
+    /// `IndexConfig("fm", {"num_segments": N})` reaches the builder as
+    /// `IndexType::Scalar` with the plugin name in the params, and must be
+    /// split into segments the same way as an `IndexType::Fm` request. Other
+    /// plugins have no `num_segments` and still build a single index.
+    #[rstest]
+    #[case::fm(IndexType::Fm, "fm", 2)]
+    #[case::scalar(IndexType::Scalar, "fm", 2)]
+    #[case::scalar_uppercase(IndexType::Scalar, "FM", 2)]
+    #[case::scalar_btree(IndexType::Scalar, "btree", 1)]
+    #[tokio::test]
+    async fn test_fmindex_num_segments_for_index_type(
+        #[case] index_type: IndexType,
+        #[case] plugin_name: &str,
+        #[case] expected_segments: usize,
+    ) {
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams {
+            index_type: plugin_name.to_string(),
+            params: Some(r#"{"num_segments": 2}"#.to_string()),
+        };
+        CreateIndexBuilder::new(&mut dataset, &["text"], index_type, &params)
+            .name("text_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+
+        let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(segments.len(), expected_segments);
+    }
+
+    /// The multi-segment FM-Index build picks its default name like the
+    /// single-segment path: it steps past a name held by another kind of index
+    /// on the same column, so `replace` cannot drop that index, and keeps one
+    /// held by an FM index, so a rebuild with `replace` takes its place.
+    #[rstest]
+    #[case::fm(IndexType::Fm)]
+    #[case::scalar(IndexType::Scalar)]
+    #[tokio::test]
+    async fn test_fmindex_multi_segment_default_name_matches_index_type(
+        #[case] index_type: IndexType,
+    ) {
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        let btree_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::BTree, &btree_params)
+            .train(false)
+            .execute()
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams {
+            index_type: "fm".to_string(),
+            params: Some(r#"{"num_segments": 2}"#.to_string()),
+        };
+        for _ in 0..2 {
+            CreateIndexBuilder::new(&mut dataset, &["text"], index_type, &params)
+                .replace(true)
+                .execute()
+                .await
+                .unwrap();
+        }
+
+        // The BTree keeps `text_idx`; the rebuild replaces the two FM segments
+        // under `text_idx_2` instead of adding `text_idx_3`.
+        let btree = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(btree.len(), 1);
+        let btree_details = btree[0].index_details.as_ref().unwrap();
+        assert!(btree_details.type_url.ends_with("BTreeIndexDetails"));
+        let fm_segments = dataset.load_indices_by_name("text_idx_2").await.unwrap();
+        assert_eq!(fm_segments.len(), 2);
+        let extra = dataset.load_indices_by_name("text_idx_3").await.unwrap();
+        assert!(extra.is_empty());
     }
 
     #[tokio::test]
@@ -4177,8 +4281,12 @@ mod tests {
     /// The other Bitmap merge tests go through `optimize_indices` and build one
     /// segment per fragment, so this is the only coverage of the distributed-build
     /// entry point, and of a segment whose coverage is wider than one fragment.
-    /// Stable row ids make the filter an exact row-id allow-list, so the deleted
-    /// rows reach it rather than being masked at scan time.
+    /// Bitmap is now address-domain (see `BITMAP_ROW_ADDR_DOMAIN_VERSION`), so
+    /// -- like BTree -- its old-data filter is the coarse `Fragments` kind: a
+    /// fragment with any live rows still contributes every one of its postings,
+    /// deleted or not (masked at scan time instead, via the deletion vector).
+    /// The delete below empties a whole fragment so the filter still has
+    /// something real to exclude.
     #[tokio::test]
     async fn test_bitmap_merge_existing_index_segments_multi_fragment() {
         async fn count_value(dataset: &Dataset, segment: &IndexMetadata, value: &str) -> usize {
@@ -4249,8 +4357,9 @@ mod tests {
             .await
             .unwrap();
 
-        // One B from each segment's coverage, so both filters have work to do.
-        dataset.delete("id = 1 OR id = 9").await.unwrap();
+        // Empties fragment 0 entirely (one of each category), so the coarse
+        // Fragments filter actually excludes something.
+        dataset.delete("id < 4").await.unwrap();
 
         let merged = dataset
             .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())
@@ -4258,17 +4367,38 @@ mod tests {
             .unwrap();
         assert_eq!(
             merged.fragment_bitmap.as_ref(),
-            Some(&(0..4u32).collect::<RoaringBitmap>()),
-            "the merged segment must cover every fragment the sources did"
+            Some(&(1..4u32).collect::<RoaringBitmap>()),
+            "the merged segment must cover every fragment the sources did, minus the one emptied"
         );
 
-        for (value, expected) in [("A", 4), ("B", 2), ("C", 4), ("D", 4)] {
+        for (value, expected) in [("A", 3), ("B", 3), ("C", 3), ("D", 3)] {
             assert_eq!(
                 count_value(&dataset, &merged, value).await,
                 expected,
                 "wrong row count for cat = {value} after merging multi-fragment segments"
             );
         }
+
+        // A partial delete -- one row out of a fragment (2) that otherwise
+        // stays live -- is the case the coarse `Fragments` filter does NOT
+        // exclude from the merged postings: row 9 (cat = 'B') stays in
+        // `merged`'s bitmap for 'B', so this only passes end to end if the
+        // scanner's own deletion vector, not the index, is what masks it.
+        dataset.delete("id = 9").await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.filter("cat = 'B'").unwrap();
+        scanner.project(&["id"]).unwrap();
+        scanner.use_scalar_index(true);
+        let ids = scanner.try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![5, 13],
+            "the scanner must mask row 9 via the deletion vector even though the coarse \
+             Fragments filter leaves its posting in the merged segment"
+        );
     }
 
     #[tokio::test]

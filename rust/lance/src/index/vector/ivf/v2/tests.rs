@@ -1203,6 +1203,61 @@ async fn load_vector_index_context(
     }
 }
 
+/// An empty HNSW partition must carry the segment's build parameters so that
+/// `statistics()` never reports the sub-index defaults for a partition without
+/// rows (regression: append-optimize segments with a leading empty partition
+/// surfaced `{max_level: 7, m: 20, ef_construction: 150}` instead of the
+/// reference segment's parameters).
+#[tokio::test]
+async fn test_empty_partition_metadata_preserves_hnsw_build_params() {
+    const INDEX_NAME: &str = "test_index";
+
+    let test_dir = TempStrDir::default();
+    let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS);
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+        .await
+        .unwrap();
+
+    // A centroid at 100000.0 puts every row closer to the zero centroid, so
+    // partition 0 is deterministically empty without retraining.
+    let mut centroid_values = vec![0.0_f32; DIM * 2];
+    for value in centroid_values.iter_mut().take(DIM) {
+        *value = 100000.0;
+    }
+    let centroids = Arc::new(
+        FixedSizeListArray::try_new_from_values(Float32Array::from(centroid_values), DIM as i32)
+            .unwrap(),
+    );
+    let mut ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+    ivf_params.max_iters = 2;
+    ivf_params.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+
+    let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+        DistanceType::L2,
+        ivf_params,
+        lightweight_hnsw_params(),
+        lightweight_pq_params(),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some(INDEX_NAME.to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+
+    let stats_json = dataset.index_statistics(INDEX_NAME).await.unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+    let hnsw_params = &stats["indices"][0]["sub_index"]["params"];
+    assert_eq!(hnsw_params["max_level"], 2, "stats: {stats_json}");
+    assert_eq!(hnsw_params["m"], 4, "stats: {stats_json}");
+    assert_eq!(hnsw_params["ef_construction"], 16, "stats: {stats_json}");
+}
+
 async fn shrink_smallest_partition(
     dataset: &mut Dataset,
     index_name: &str,

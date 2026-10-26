@@ -314,7 +314,8 @@ enum OverlayTiming {
     AfterCompaction,
     /// On a source; the compaction folds it into the output.
     BeforeCompaction,
-    /// On a source, then two compactions; the fragment that folded it is gone.
+    /// On a source of each first-round group, then two compactions; the
+    /// fragments that folded them are gone.
     BeforeTwoCompactions,
     /// On the first compaction's output, folded in by the second.
     BetweenCompactions,
@@ -350,8 +351,14 @@ async fn test_rtree_merge_drops_coverage_an_overlay_reaches(#[case] timing: Over
             rtree_compact(&mut dataset, 3).await;
         }
         OverlayTiming::BeforeTwoCompactions => {
-            let source = first(&dataset);
-            dataset = rtree_overlay_geometry(dataset, geometry, source).await;
+            // Folding a newer overlay drops the output from the committed
+            // index, and compaction never mixes indexed and unindexed
+            // fragments, so both first-round outputs must fold one for the
+            // second compaction to merge them.
+            let sources = fragment_ids(&dataset);
+            for source in [sources[0], sources[2]] {
+                dataset = rtree_overlay_geometry(dataset, geometry, source as u64).await;
+            }
             rtree_compact(&mut dataset, 2).await;
             rtree_compact(&mut dataset, 4).await;
             assert_eq!(dataset.get_fragments().len(), 1);

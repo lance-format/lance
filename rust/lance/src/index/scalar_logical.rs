@@ -2279,11 +2279,11 @@ mod tests {
 
     /// An update moves the row with `id = 0` to a new fragment (keeping its row id) and an
     /// append-only optimize gives that fragment its own segment, so the old segment still
-    /// maps `id = 0` to the moved row. That stale posting must not be reported. Bitmap hits
-    /// are row ids, so they need the row-id mask; BTree and zone map hits are row addresses,
-    /// so they must not be restricted by it.
+    /// maps `id = 0` to the moved row. That stale posting must not be reported. On a
+    /// stable-row-id dataset, Bitmap, BTree and zone map hits are all row addresses, so none
+    /// of them must be restricted by the row-id mask.
     #[rstest]
-    #[case::bitmap(IndexType::Bitmap, BuiltinIndexType::Bitmap, false)]
+    #[case::bitmap(IndexType::Bitmap, BuiltinIndexType::Bitmap, true)]
     #[case::btree(IndexType::BTree, BuiltinIndexType::BTree, true)]
     #[case::zone_map(IndexType::ZoneMap, BuiltinIndexType::ZoneMap, true)]
     #[tokio::test]

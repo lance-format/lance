@@ -1075,6 +1075,40 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
+        if log::log_enabled!(log::Level::Debug) {
+            // Bound both dimensions of the candidate bin previews.
+            const MAX_PREVIEW_BINS: usize = 100;
+            const MAX_PREVIEW_ITEMS: usize = 100;
+            log::debug!(
+                "Compaction candidate_bins: count={}, omitted_bins={}, index_fragmaps={:?}",
+                candidate_bins.len(),
+                candidate_bins.len().saturating_sub(MAX_PREVIEW_BINS),
+                index_fragmaps,
+            );
+            for (bin_index, bin) in candidate_bins.iter().take(MAX_PREVIEW_BINS).enumerate() {
+                let fragment_ids: Vec<_> = bin
+                    .fragments
+                    .iter()
+                    .take(MAX_PREVIEW_ITEMS)
+                    .map(|fragment| fragment.id)
+                    .collect();
+                log::debug!(
+                    "Compaction candidate_bins[{}]: pos_range={:?}, fragment_count={}, \
+                     fragment_ids_preview={:?}, candidacy_preview={:?}, row_counts_preview={:?}, \
+                     index_count={}, indices_preview={:?}, preview_item_limit={}",
+                    bin_index,
+                    bin.pos_range,
+                    bin.fragments.len(),
+                    fragment_ids,
+                    &bin.candidacy[..bin.candidacy.len().min(MAX_PREVIEW_ITEMS)],
+                    &bin.row_counts[..bin.row_counts.len().min(MAX_PREVIEW_ITEMS)],
+                    bin.indices.len(),
+                    &bin.indices[..bin.indices.len().min(MAX_PREVIEW_ITEMS)],
+                    MAX_PREVIEW_ITEMS,
+                );
+            }
+        }
+
         let all_tasks: Vec<(TaskData, usize)> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
@@ -3538,14 +3572,7 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
-    // Collect the rewritten fragments' file paths up front so every failure
-    // path below can clean them up (or deliberately keep them). Fragment ids
-    // may still be reassigned by reserve_fragment_ids; cleanup only needs the
-    // file paths, which never change.
-    let all_new_fragments: Vec<Fragment> = completed_tasks
-        .iter()
-        .flat_map(|t| t.new_fragments.iter().cloned())
-        .collect();
+    let new_fragment_count: usize = completed_tasks.iter().map(|t| t.new_fragments.len()).sum();
 
     // Single reserve_fragment_ids for all address-style tasks
     let mut reserved_version = None;
@@ -3555,14 +3582,9 @@ pub async fn commit_compaction(
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        match reserve_fragment_ids(dataset, frags.into_iter()).await {
-            Ok(version) => reserved_version = Some(version),
-            Err(e) => {
-                cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments)
-                    .await;
-                return Err(e);
-            }
-        }
+        // A replayed result shares file paths with its earlier commit, so a failed
+        // reservation cannot prove the files are unreferenced. Leave them for GC.
+        reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter()).await?);
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -3778,10 +3800,8 @@ pub async fn commit_compaction(
             .iter_mut()
             .flat_map(|group| group.new_fragments.iter_mut())
             .collect::<Vec<_>>();
-        if let Err(e) = reserve_fragment_ids(dataset, new_fragments.into_iter()).await {
-            cleanup_compaction_files_after_reservation_failure(dataset, &all_new_fragments).await;
-            return Err(e);
-        }
+        // As above, reservation failure does not make replayed files safe to delete.
+        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
         Vec::new()
     } else {
         Vec::new()
@@ -3936,7 +3956,7 @@ pub async fn commit_compaction(
         // that the rewritten files are unreferenced. Leave them for dataset GC.
         log::warn!(
             "Compaction commit failed; leaving {} rewritten fragment(s) in place for GC: {}",
-            all_new_fragments.len(),
+            new_fragment_count,
             e
         );
         return Err(e);
@@ -3979,22 +3999,6 @@ async fn normalize_source_fragments(
     Ok(normalized)
 }
 
-/// Remove rewritten files after fragment-id reservation fails. Reservation
-/// commits do not reference the rewritten files, so they are still owned by
-/// this uncommitted compaction attempt and are safe to delete.
-async fn cleanup_compaction_files_after_reservation_failure(
-    dataset: &Dataset,
-    all_new_fragments: &[Fragment],
-) {
-    cleanup_data_fragments(
-        &dataset.object_store,
-        &dataset.base,
-        None,
-        all_new_fragments,
-    )
-    .await;
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -4014,7 +4018,9 @@ mod tests {
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::session::caches::{ManifestKey, RowIdIndexKey, TransactionKey};
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{
+        AmbiguousCommitHandler, AmbiguousFailure, DatagenExt, FragmentCount, FragmentRowCount,
+    };
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
@@ -4899,32 +4905,44 @@ mod tests {
         assert!(dataset.object_store.exists(&path).await.unwrap());
     }
 
-    /// A failed ReserveFragments commit cannot reference the rewritten files,
-    /// so both stable-row-id reservation paths must still clean them up.
+    #[rstest]
+    #[case::address_style(false, true)]
+    #[case::stable_row_ids(true, false)]
     #[tokio::test]
-    async fn test_compaction_cleans_up_files_when_fragment_reservation_fails() {
-        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
-
+    async fn test_compaction_retains_files_when_fragment_reservation_fails(
+        #[case] enable_stable_row_ids: bool,
+        #[case] defer_index_remap: bool,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
-        let data = sample_data();
-        let num_rows = data.num_rows();
         let handler = Arc::new(AmbiguousCommitHandler::default());
-
-        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-        let write_params = WriteParams {
-            max_rows_per_file: 3_000,
-            enable_stable_row_ids: true,
-            commit_handler: Some(handler.clone()),
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    enable_stable_row_ids,
+                    commit_handler: Some(handler.clone()),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
         let files_before = list_data_files(test_uri);
-        let options = CompactionOptions::default();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        };
         let completed = execute_compaction_plan(&dataset, &options).await;
-        assert!(list_data_files(test_uri).len() > files_before.len());
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].row_addrs.is_some(), defer_index_remap);
+        let files_after_rewrite = list_data_files(test_uri);
+        assert!(files_after_rewrite.len() > files_before.len());
 
         handler.fail_next_reserve(AmbiguousFailure::FailOutright);
         let err = commit_compaction(
@@ -4935,21 +4953,100 @@ mod tests {
         )
         .await
         .expect_err("fragment reservation that did not land must fail");
+        assert!(matches!(&err, Error::IO { .. }), "{err:?}");
         assert!(
-            !err.is_commit_status_unknown(),
-            "a verified-absent reservation is a definite failure, got: {:?}",
-            err
+            err.to_string()
+                .contains("simulated outright commit failure")
         );
+        assert_eq!(list_data_files(test_uri), files_after_rewrite);
 
-        let files_after = list_data_files(test_uri);
-        let leftover: Vec<_> = files_after.difference(&files_before).collect();
-        assert!(
-            leftover.is_empty(),
-            "rewritten files must be cleaned up after reservation fails; leftover: {:?}",
-            leftover
-        );
         let ds = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+        // No writes remain in progress, so unverified output can be reclaimed.
+        ds.cleanup_old_versions(chrono::Duration::zero(), Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(list_data_files(test_uri), files_before);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::address_style(false, true)]
+    #[case::stable_row_ids(true, false)]
+    #[tokio::test]
+    async fn test_replayed_compaction_reservation_failure_keeps_published_files(
+        #[case] enable_stable_row_ids: bool,
+        #[case] defer_index_remap: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    enable_stable_row_ids,
+                    commit_handler: Some(handler.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        };
+        let completed = execute_compaction_plan(&dataset, &options).await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].row_addrs.is_some(), defer_index_remap);
+        let serialized = serde_json::to_vec(&completed).unwrap();
+        commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let published_version = dataset.version().version;
+        let published_files = list_data_files(test_uri);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.get_fragments().len(), 1);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+
+        handler.fail_next_reserve(AmbiguousFailure::FailOutright);
+        let err = commit_compaction(
+            &mut dataset,
+            serde_json::from_slice(&serialized).unwrap(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .expect_err("the injected reservation failure must fail the replay");
+        assert!(matches!(&err, Error::IO { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("simulated outright commit failure")
+        );
+        assert_eq!(list_data_files(test_uri), published_files);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.version().version, published_version);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
+
+        // GC must still treat the replayed output as referenced by the published version.
+        ds.cleanup_old_versions(chrono::Duration::zero(), Some(true), None)
+            .await
+            .unwrap();
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.version().version, published_version);
+        assert_eq!(ds.scan().try_into_batch().await.unwrap(), expected);
     }
 
     /// Compaction is a read->write roundtrip and the decoder materializes the
@@ -6776,9 +6873,18 @@ mod tests {
         }
     }
 
+    /// `cat` is a Utf8 column alongside the numeric `i` one so a test can build
+    /// a row-id-domain index (e.g. NGram) over it -- every remaining
+    /// row-id-domain scalar index type requires a text column, unlike BTree,
+    /// Bitmap, and LabelList, which moved to row-address domain and no longer
+    /// serve as that fixture.
     async fn stable_row_id_dataset(uri: &str, num_fragments: u32) -> Dataset {
         lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "cat",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_dataset_with_params(
                 uri,
                 FragmentCount::from(num_fragments),
@@ -7155,12 +7261,16 @@ mod tests {
             );
         }
         if matches!(mismatch, RecordingMismatch::IncompatibleIndexCreated) {
+            // NGram, not Bitmap: Bitmap now always creates an address-domain
+            // segment on a stable-row-id dataset (safe alongside the recorded
+            // moves by construction), so it can no longer illustrate this
+            // mismatch. NGram still stores row ids directly here.
             dataset
                 .create_index(
-                    &["i"],
-                    IndexType::Bitmap,
+                    &["cat"],
+                    IndexType::NGram,
                     Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                     false,
                 )
                 .await
@@ -9988,7 +10098,7 @@ mod tests {
     /// An FRI and a row-id-domain index cannot coexist on a stable-row-id
     /// dataset: the FRI is applied to every index on load, and a stable row id
     /// is numerically indistinguishable from an address into fragment 0, so it
-    /// would silently rewrite the bitmap index's valid row ids.
+    /// would silently rewrite the NGram index's valid row ids.
     ///
     /// Compaction refuses to create that pair, at the plan boundary and again at
     /// the commit boundary.
@@ -9997,10 +10107,10 @@ mod tests {
         let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
         dataset
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10054,10 +10164,10 @@ mod tests {
 
         let err = dataset
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10095,9 +10205,9 @@ mod tests {
     /// at a snapshot taken before the other committed.
     ///
     /// The compaction plans and rewrites while no row-id-domain index exists, so
-    /// its plan-time guard passes. A bitmap index is then created and commits: no
+    /// its plan-time guard passes. An NGram index is then created and commits: no
     /// FRI exists yet, so its guard passes too. The compaction finally commits
-    /// from the handle it planned on, which still cannot see the bitmap index,
+    /// from the handle it planned on, which still cannot see the NGram index,
     /// and the rewrite rebases on top of the `CreateIndex`.
     ///
     /// The result is the combination both guards exist to prevent: stable row
@@ -10128,10 +10238,10 @@ mod tests {
         let mut concurrent = Dataset::open(test_uri).await.unwrap();
         concurrent
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10216,16 +10326,16 @@ mod tests {
         // `create_index` sees no FRI at its own version, so its guard passes and
         // the transaction reaches the rebase.
         //
-        // Bitmap, not BTree: BTree now always creates an address-domain
+        // NGram, not BTree/Bitmap: both now always create an address-domain
         // segment on a stable-row-id dataset (safe alongside an FRI by
-        // construction), so it can no longer illustrate this race. Bitmap
-        // still stores row ids directly here.
+        // construction), so neither can illustrate this race any longer.
+        // NGram still stores row ids directly here.
         let err = concurrent
             .create_index(
-                &["id"],
-                IndexType::Bitmap,
+                &["cat"],
+                IndexType::NGram,
                 Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 false,
             )
             .await
@@ -10333,6 +10443,12 @@ mod tests {
     }
 
     /// 12 rows over 3 fragments with a zone map on `value`, stable row ids on.
+    ///
+    /// `cat` is a Utf8 column alongside the numeric `id`/`value` ones so a test
+    /// can build a row-id-domain index (e.g. NGram) over it -- every remaining
+    /// row-id-domain scalar index type requires a text column, unlike BTree and
+    /// Bitmap, which moved to row-address domain and no longer serve as that
+    /// fixture.
     async fn zonemap_stable_row_id_dataset(uri: &str) -> Dataset {
         let batch = arrow_array::record_batch!(
             ("id", Int32, (0..12).collect::<Vec<_>>()),
@@ -10353,6 +10469,11 @@ mod tests {
                     Some(100),
                     Some(110)
                 ]
+            ),
+            (
+                "cat",
+                Utf8,
+                (0..12).map(|i| format!("cat-{i}")).collect::<Vec<_>>()
             )
         )
         .unwrap();
@@ -10544,7 +10665,11 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
-        #[values(IndexType::Bitmap, IndexType::ZoneMap)] index_type: IndexType,
+        // NGram, not Bitmap: Bitmap now always creates an address-domain
+        // segment on a stable-row-id dataset (safe alongside an FRI by
+        // construction), so it can no longer illustrate this race. NGram
+        // still stores row ids directly here.
+        #[values(IndexType::NGram, IndexType::ZoneMap)] index_type: IndexType,
         #[values(false, true)] index_commits_first: bool,
         #[values(false, true)] is_disjoint: bool,
         #[values(
@@ -10558,9 +10683,23 @@ mod tests {
         let is_separate_session = first_commit_seen_as == FirstCommitSeenAs::SeparateSession;
         // How the rebase sees the compaction does not matter: an index rebasing
         // past it finds the moves recorded in the latest manifest's reuse index.
+        //
+        // This is a real, NGram-specific rebase difference, not an artifact of
+        // swapping out Bitmap: `check_create_index_txn`'s deferred-remap branch
+        // in conflict_resolver.rs carries an extra check solely for a new
+        // NGram index (`ngram_coverage`, mirroring `ngram_requires_rebuild` in
+        // append.rs) -- unlike every other index type, it cannot simply keep
+        // covering a fragment a concurrent deferred-remap rewrite just
+        // consumed, so overlapping coverage (`is_disjoint = false`) always
+        // retries there, regardless of commit order. That is exactly the raw
+        // retryable conflict the `index_commits_first = true` order already
+        // handles below; `false` with overlapping coverage now needs the same
+        // one extra manual retry to reach the domain rejection.
+        let ngram_overlap_retries = index_type == IndexType::NGram && !is_disjoint;
         let expected = match (index_type, index_commits_first) {
-            (IndexType::Bitmap, true) => RaceOutcome::ConflictThenRejected,
-            (IndexType::Bitmap, false) => RaceOutcome::Rejected,
+            (IndexType::NGram, true) => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) if ngram_overlap_retries => RaceOutcome::ConflictThenRejected,
+            (IndexType::NGram, false) => RaceOutcome::Rejected,
             _ => RaceOutcome::Committed,
         };
         let dir = TempStrDir::default();
@@ -10581,14 +10720,22 @@ mod tests {
             excluded_fragment_ids: if is_disjoint { vec![2] } else { vec![] },
             ..Default::default()
         };
-        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::Bitmap {
-            BuiltinIndexType::Bitmap
+        let params = ScalarIndexParams::for_builtin(if index_type == IndexType::NGram {
+            BuiltinIndexType::NGram
         } else {
             BuiltinIndexType::ZoneMap
         });
+        // NGram only applies to the text `cat` column; ZoneMap stays on the
+        // numeric `i` column the filters below query.
+        let index_column = if index_type == IndexType::NGram {
+            "cat"
+        } else {
+            "i"
+        };
         let create_index = async |dataset: &mut Dataset| {
+            let columns = [index_column];
             let builder = dataset
-                .create_index_builder(&["i"], index_type, &params)
+                .create_index_builder(&columns, index_type, &params)
                 .name("i_idx".into());
             if is_disjoint {
                 builder.fragments(vec![2]).await.map(|_| ())
@@ -10715,7 +10862,16 @@ mod tests {
                 ),
                 is_in_memory
             );
-            result
+            if matches!(expected, RaceOutcome::ConflictThenRejected) {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "{result:?}"
+                );
+                other.checkout_latest().await.unwrap();
+                create_index(&mut other).await
+            } else {
+                result
+            }
         };
 
         let latest = Dataset::open(dir.as_str()).await.unwrap();

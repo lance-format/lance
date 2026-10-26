@@ -14622,12 +14622,10 @@ mod tests {
     /// The multi-segment FM-Index builder reserves names on its own, so it needs
     /// the same complete view as the single-segment path.
     ///
-    /// The hidden index is a BTree and the new one an FM index, which is what
-    /// makes this test specific to the multi-segment builder: its name loop
-    /// (`index/create.rs`) only steps past a taken name when the *fields* differ,
-    /// where the single-segment loop also steps past a different index kind. So
-    /// the single-segment path would quietly settle on `text_idx_2` and succeed;
-    /// only the multi-segment path keeps `text_idx` and hits the collision.
+    /// The hidden index is an FM index too: the default-name loop steps past a
+    /// different index kind on the same column, so only an index of the same
+    /// kind keeps `text_idx` and reaches the collision check. A builder that
+    /// could not see the hidden index would commit a second `text_idx` instead.
     #[tokio::test]
     async fn test_multi_segment_fmindex_respects_an_unsupported_index_name() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -14647,9 +14645,9 @@ mod tests {
         .await
         .unwrap();
 
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         dataset
-            .create_index_builder(&["text"], IndexType::BTree, &btree_params)
+            .create_index_builder(&["text"], IndexType::Fm, &fm_params)
             .name("text_idx".to_string())
             .train(false)
             .await
@@ -15124,22 +15122,36 @@ mod tests {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
+        // A text column alongside `two_column_reader`'s numeric ones: every
+        // remaining row-id-domain scalar index type (NGram here) requires text,
+        // unlike BTree and Bitmap, which moved to row-address domain and no
+        // longer exercise this test.
+        fn three_column_reader() -> impl arrow_array::RecordBatchReader + Send + 'static {
+            lance_datagen::gen_batch()
+                .col("id", array::step::<Int32Type>())
+                .col("payload", array::step::<Int32Type>())
+                .col("text", array::rand_utf8(ByteCount::from(8), false))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+        }
+
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             max_rows_per_file: 5,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(two_column_reader(), test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
+        let mut dataset =
+            Dataset::write(three_column_reader(), test_uri, Some(write_params.clone()))
+                .await
+                .unwrap();
         assert_eq!(dataset.get_fragments().len(), 2);
 
         // Row-id-domain: its coverage is recalculated (not dropped) across a
         // rewrite under stable row ids, which is exactly the property this test
-        // checks. BTree moved to row-address domain and no longer exercises it.
-        let bitmap_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        // checks. BTree and Bitmap moved to row-address domain and no longer
+        // exercise it.
+        let ngram_params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
         dataset
-            .create_index_builder(&["id"], IndexType::Bitmap, &bitmap_params)
+            .create_index_builder(&["text"], IndexType::NGram, &ngram_params)
             .name("id_idx".to_string())
             .train(false)
             .await
@@ -15149,7 +15161,7 @@ mod tests {
         // A fragment the index does not cover, so a bin holding it together with
         // the covered ones would split the index's coverage.
         let mut dataset = Dataset::write(
-            two_column_reader(),
+            three_column_reader(),
             test_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
