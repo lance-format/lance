@@ -194,6 +194,63 @@ mod tests {
         // Tests asserting the contents of the written file are in reader.rs
     }
 
+    #[tokio::test]
+    async fn test_sliced_batches_preserve_page_accumulation() {
+        let expected =
+            arrow_array::record_batch!(("id", UInt64, (0..1024).collect::<Vec<u64>>())).unwrap();
+        let mut page_counts = Vec::with_capacity(2);
+        for sliced in [false, true] {
+            let batches = (0..1024).step_by(32).map(|offset| {
+                if sliced {
+                    Ok(expected.slice(offset, 32))
+                } else {
+                    arrow_array::record_batch!((
+                        "id",
+                        UInt64,
+                        (offset as u64..offset as u64 + 32).collect::<Vec<_>>()
+                    ))
+                }
+            });
+            let input = arrow_array::RecordBatchIterator::new(batches, expected.schema());
+            let fs = FsFixture::default();
+            crate::testing::write_lance_file(
+                input,
+                &fs,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions {
+                    data_cache_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            page_counts.push(reader.metadata().column_metadatas[0].pages.len());
+            let output = crate::testing::read_lance_file(
+                &fs,
+                Arc::<DecoderPlugins>::default(),
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await;
+            let actual = arrow_select::concat::concat_batches(&expected.schema(), &output).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(page_counts[0] < 32);
+        assert_eq!(page_counts[0], page_counts[1]);
+    }
+
     #[rstest]
     #[case::v2_1(ConcreteFileVersion::V2_1)]
     #[case::v2_2(ConcreteFileVersion::V2_2)]
