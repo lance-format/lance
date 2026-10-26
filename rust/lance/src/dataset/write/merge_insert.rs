@@ -165,28 +165,6 @@ mod assign_action;
 mod exec;
 mod logical_plan;
 
-/// Whether a partial source's field can be written to `target`: the same type,
-/// or blob input to a Blob v2 column, whose layout the writer checks, at any
-/// depth.
-fn partial_source_field_fits(
-    target: &lance_core::datatypes::Field,
-    source: &lance_core::datatypes::Field,
-) -> bool {
-    if target.data_type() == source.data_type() || (target.is_blob_v2() && source.is_blob()) {
-        return true;
-    }
-    !target.children.is_empty()
-        && target.logical_type == source.logical_type
-        && target.children.len() == source.children.len()
-        && source.children.iter().all(|child| {
-            target
-                .children
-                .iter()
-                .find(|field| field.name == child.name)
-                .is_some_and(|field| partial_source_field_fits(field, child))
-        })
-}
-
 /// Check a merge source against the target schema. As on append, a legacy
 /// blob input matches a Blob v2 target column, and a writer-prepared one is
 /// compared as the logical columns it writes; the writer converts both.
@@ -2966,28 +2944,27 @@ impl MergeInsertJob {
             &lance_core::datatypes::Schema::try_from(source_schema)?,
         )?;
         let full_schema = self.dataset.schema();
-        let is_full_schema = check_source_schema(
-            &lance_schema,
-            full_schema,
-            &SchemaCompareOptions {
-                compare_metadata: false,
-                // Allow nullable source fields for non-nullable targets.
-                compare_nullability: NullabilityComparison::Ignore,
-                // Allow columns to be in a different order; they will be matched by name.
-                ignore_field_order: true,
-                ..Default::default()
-            },
-        )
-        .is_ok();
+        let options = SchemaCompareOptions {
+            compare_metadata: false,
+            // Allow nullable source fields for non-nullable targets.
+            compare_nullability: NullabilityComparison::Ignore,
+            // Allow columns to be in a different order; they will be matched by name.
+            ignore_field_order: true,
+            ..Default::default()
+        };
+        let is_full_schema = check_source_schema(&lance_schema, full_schema, &options).is_ok();
 
-        // Partial-schema upsert: every source field must exist in the target
-        // and have a compatible data type. Missing target columns will be
-        // filled from the target side of the join in `create_plan`.
+        // Partial-schema upsert: every source column must be a whole table
+        // column. Missing target columns will be filled from the target side of
+        // the join in `create_plan`.
+        let source_columns: Vec<&str> = lance_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
         let is_subset_schema = !is_full_schema
-            && lance_schema.fields.iter().all(|sf| {
-                full_schema
-                    .field(&sf.name)
-                    .is_some_and(|tf| partial_source_field_fits(tf, sf))
+            && full_schema.project(&source_columns).is_ok_and(|columns| {
+                check_source_schema(&lance_schema, &columns, &options).is_ok()
             });
 
         // If the user is inserting unmatched rows with a partial source, any
