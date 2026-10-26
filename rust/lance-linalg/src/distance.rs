@@ -223,9 +223,11 @@ pub type ArrowBatchDistanceFunc = fn(&dyn Array, &FixedSizeListArray) -> Result<
 impl DistanceType {
     /// Compute distances from `query` to each row of `vectors`, propagating row nulls.
     ///
-    /// L2, cosine and dot accept Float16/Float32/Float64 and Int8 (widened to
-    /// Float32). Hamming accepts UInt8. Query and stored element types must match;
-    /// the query must be non-null and have the same positive dimension as the rows.
+    /// L2, cosine and dot accept Float16/Float32/Float64 queries and Int8 queries.
+    /// An Int8 query also accepts Float32, Int16, or Int32 stored vectors; both
+    /// sides are widened to Float32, preserving the legacy mixed-type behavior.
+    /// Other query and stored element types must match. Hamming accepts UInt8.
+    /// The query must be non-null and have the same positive dimension as the rows.
     /// Unsupported types and invalid queries return an [`ArrowError::InvalidArgumentError`].
     ///
     /// ```
@@ -375,7 +377,8 @@ mod tests {
     use arrow_array::ArrowPrimitiveType;
     use arrow_array::types::{Float16Type, Float32Type, Int8Type, UInt8Type};
     use arrow_array::{
-        Float32Array, Float64Array, Int8Array, Int32Array, ListArray, PrimitiveArray, UInt8Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, ListArray, PrimitiveArray,
+        UInt8Array,
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field};
@@ -900,6 +903,9 @@ mod tests {
             DataType::Int8 => Arc::new(Int8Array::from(
                 values.into_iter().map(|v| v as i8).collect::<Vec<_>>(),
             )),
+            DataType::Int16 => Arc::new(Int16Array::from(
+                values.into_iter().map(|v| v as i16).collect::<Vec<_>>(),
+            )),
             DataType::UInt8 => Arc::new(UInt8Array::from(
                 values.into_iter().map(|v| v as u8).collect::<Vec<_>>(),
             )),
@@ -978,6 +984,48 @@ mod tests {
                     "{metric} {dtype}: {error}"
                 );
             }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::l2(DistanceType::L2, [0.0, 8.0])]
+    #[case::dot(DistanceType::Dot, [-4.0, -10.0])]
+    #[case::cosine(DistanceType::Cosine, [0.0, 1.0 - 11.0 / (5.0_f32.sqrt() * 5.0)])]
+    fn test_int8_query_with_legacy_stored_types(
+        #[case] metric: DistanceType,
+        #[case] expected: [f32; 2],
+        #[values(DataType::Float32, DataType::Int16, DataType::Int32)] dtype: DataType,
+    ) {
+        let query = arrow_values(&DataType::Int8, vec![1, 2]);
+        let vectors =
+            FixedSizeListArray::try_new_from_values(arrow_values(&dtype, vec![1, 2, 3, 4]), 2)
+                .unwrap();
+
+        let got = metric.batch(query.as_ref(), &vectors).unwrap();
+        for (got, want) in got.values().iter().zip(expected) {
+            approx::assert_abs_diff_eq!(*got, want, epsilon = 1e-6);
+        }
+
+        let legacy: ArrowBatchDistanceFunc = match metric {
+            DistanceType::L2 => l2_distance_arrow_batch,
+            DistanceType::Cosine => cosine_distance_arrow_batch,
+            DistanceType::Dot => dot_distance_arrow_batch,
+            DistanceType::Hamming => hamming_distance_arrow_batch,
+        };
+        assert_eq!(&got, legacy(query.as_ref(), &vectors).unwrap().as_ref());
+    }
+
+    #[test]
+    fn test_int8_query_does_not_broaden_past_legacy_stored_types() {
+        let query = arrow_values(&DataType::Int8, vec![1, 2]);
+        for dtype in [DataType::Float16, DataType::Float64, DataType::UInt8] {
+            let vectors =
+                FixedSizeListArray::try_new_from_values(arrow_values(&dtype, vec![1, 2, 3, 4]), 2)
+                    .unwrap();
+            assert!(
+                DistanceType::L2.batch(query.as_ref(), &vectors).is_err(),
+                "Int8 query unexpectedly accepted stored {dtype}"
+            );
         }
     }
 

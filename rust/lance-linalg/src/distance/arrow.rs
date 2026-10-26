@@ -53,6 +53,16 @@ impl Operation<'_> {
         )
     }
 
+    fn supports_int8_query(self, dtype: &DataType) -> bool {
+        matches!(
+            (self, dtype),
+            (
+                Self::Batch(DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot),
+                DataType::Float32 | DataType::Int8 | DataType::Int16 | DataType::Int32,
+            )
+        )
+    }
+
     fn error(self, message: impl std::fmt::Display) -> ArrowError {
         let name = match self {
             Self::Batch(metric) => format!("{metric} batch"),
@@ -131,11 +141,13 @@ pub(super) fn dispatch(
     vectors: &FixedSizeListArray,
 ) -> Result<Vec<f32>> {
     let dtype = vectors.value_type();
-    if !operation.supports(&dtype) {
+    let int8_query = query.is_some_and(|query| query.data_type() == &DataType::Int8)
+        && operation.supports_int8_query(&dtype);
+    if !operation.supports(&dtype) && !int8_query {
         return Err(operation.error(format!("unsupported vector element type {dtype}")));
     }
     if let Some(query) = query {
-        if query.data_type() != &dtype {
+        if !int8_query && query.data_type() != &dtype {
             return Err(operation.error(format!(
                 "query type {} does not match the stored vector type {dtype}",
                 query.data_type()
@@ -173,20 +185,11 @@ pub(super) fn dispatch(
 
     match dtype {
         DataType::Float16 => numeric::<Float16Type>(operation, query, vectors, dim),
+        DataType::Float32 if int8_query => numeric_int8_query(operation, query, vectors, dim),
         DataType::Float32 => numeric::<Float32Type>(operation, query, vectors, dim),
         DataType::Float64 => numeric::<Float64Type>(operation, query, vectors, dim),
-        DataType::Int8 => {
-            let query = query.map(|q| q.as_primitive::<Int8Type>());
-            let query = query.map(|q| {
-                Float32Array::from(q.values().iter().map(|&v| v as f32).collect::<Vec<_>>())
-            });
-            let vectors = vectors.convert_to_floating_point()?;
-            numeric::<Float32Type>(
-                operation,
-                query.as_ref().map(|q| q as &dyn Array),
-                &vectors,
-                dim,
-            )
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+            numeric_int8_query(operation, query, vectors, dim)
         }
         DataType::UInt8 => operation.binary(
             query.map_or(&[], |q| q.as_primitive::<UInt8Type>().values().as_ref()),
@@ -195,6 +198,19 @@ pub(super) fn dispatch(
         ),
         _ => Err(operation.error(format!("unsupported vector element type {dtype}"))),
     }
+}
+
+fn numeric_int8_query(
+    operation: Operation<'_>,
+    query: Option<&dyn Array>,
+    vectors: &FixedSizeListArray,
+    dim: usize,
+) -> Result<Vec<f32>> {
+    let query = query.ok_or_else(|| operation.error("Int8 values require a query"))?;
+    let query = query.as_primitive::<Int8Type>();
+    let query = Float32Array::from(query.values().iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let vectors = vectors.convert_to_floating_point()?;
+    numeric::<Float32Type>(operation, Some(&query), &vectors, dim)
 }
 
 fn numeric<T>(
