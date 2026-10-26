@@ -3,10 +3,69 @@
 
 //! An accumulation queue accumulates arrays until we have enough data to flush.
 
-use arrow_array::ArrayRef;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, Utf8Type};
+use arrow_array::{Array, ArrayRef, GenericByteArray};
+use arrow_buffer::{ArrowNativeType, bit_util::round_upto_multiple_of_64};
 use arrow_schema::DataType;
 use lance_arrow::deepcopy::{deep_copy_array, deep_copy_array_sliced};
 use log::{debug, trace};
+
+// Value buffers are rounded to 64 bytes; compact validity buffers use exact byte lengths.
+// Inspect lengths without building ArrayData, so the copy decision requires no allocations.
+fn flat_copy_sizes(array: &dyn Array) -> Option<(usize, usize)> {
+    let (mut copied_bytes, mut compacted_bytes, mut has_unused_bytes) = match array.data_type() {
+        DataType::Null => (0, 0, false),
+        DataType::Boolean => {
+            let buffer_bytes = array.as_boolean().values().inner().len();
+            let value_bytes = array.len().div_ceil(8);
+            (
+                round_upto_multiple_of_64(buffer_bytes),
+                round_upto_multiple_of_64(value_bytes),
+                buffer_bytes > value_bytes,
+            )
+        }
+        DataType::Utf8 => byte_copy_sizes(array.as_bytes::<Utf8Type>()),
+        DataType::LargeUtf8 => byte_copy_sizes(array.as_bytes::<LargeUtf8Type>()),
+        DataType::Binary => byte_copy_sizes(array.as_bytes::<BinaryType>()),
+        DataType::LargeBinary => byte_copy_sizes(array.as_bytes::<LargeBinaryType>()),
+        DataType::FixedSizeBinary(_) => {
+            let bytes = round_upto_multiple_of_64(array.as_fixed_size_binary().values().len());
+            (bytes, bytes, false)
+        }
+        data_type => {
+            let width = data_type.primitive_width()?;
+            let bytes = round_upto_multiple_of_64(array.len() * width);
+            (bytes, bytes, false)
+        }
+    };
+    if let Some(nulls) = array.nulls() {
+        let validity_bytes = nulls.len().div_ceil(8);
+        copied_bytes += round_upto_multiple_of_64(nulls.buffer().len());
+        if nulls.null_count() > 0 {
+            compacted_bytes += validity_bytes;
+        }
+        has_unused_bytes |= nulls.buffer().len() > validity_bytes;
+    }
+    // Reserve compaction for buffers containing data outside the slice.
+    if !has_unused_bytes {
+        compacted_bytes = copied_bytes;
+    }
+    let array_bytes = std::mem::size_of_val(array);
+    Some((copied_bytes + array_bytes, compacted_bytes + array_bytes))
+}
+
+fn byte_copy_sizes<T: ByteArrayType>(array: &GenericByteArray<T>) -> (usize, usize, bool) {
+    let offsets = array.value_offsets();
+    let offset_bytes = round_upto_multiple_of_64(std::mem::size_of_val(offsets));
+    let value_bytes = (offsets[array.len()] - offsets[0]).as_usize();
+    let buffer_bytes = array.value_data().len();
+    (
+        offset_bytes + round_upto_multiple_of_64(buffer_bytes),
+        offset_bytes + round_upto_multiple_of_64(value_bytes),
+        buffer_bytes > value_bytes,
+    )
+}
 
 #[derive(Debug)]
 pub struct AccumulationQueue {
@@ -43,26 +102,25 @@ impl AccumulationQueue {
         row_number: u64,
         num_rows: u64,
     ) -> Option<(Vec<ArrayRef>, u64, u64)> {
+        let mut is_full = false;
         if !self.keep_original_array {
-            let data = array.to_data();
-            // Compacting nested and view arrays can retain shared child buffers.
-            // Preserve their existing deep-copy behavior.
-            let can_compact = data.child_data().is_empty()
-                && !matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView);
-            let bytes = if can_compact {
-                data.get_slice_memory_size()
-                    .unwrap_or_else(|_| array.get_array_memory_size())
-            } else {
-                array.get_array_memory_size()
-            };
-            // A slice can report its parent's capacity. Copy before accounting,
-            // unless its visible data already fills the remaining page budget.
-            if bytes as u64 <= self.cache_bytes - self.current_bytes {
-                array = if can_compact {
-                    deep_copy_array_sliced(array.as_ref())
-                } else {
-                    deep_copy_array(array.as_ref())
-                };
+            let remaining_bytes = self.cache_bytes - self.current_bytes;
+            match flat_copy_sizes(array.as_ref()) {
+                Some((copied_bytes, compacted_bytes)) => {
+                    if copied_bytes <= compacted_bytes && copied_bytes as u64 <= remaining_bytes {
+                        array = deep_copy_array(array.as_ref());
+                    } else if compacted_bytes as u64 <= remaining_bytes {
+                        array = deep_copy_array_sliced(array.as_ref());
+                    } else {
+                        // Copy alignment can exceed the budget even when the original fits.
+                        is_full = true;
+                    }
+                }
+                // Nested and view arrays retain their existing copy policy.
+                None if array.get_array_memory_size() as u64 <= remaining_bytes => {
+                    array = deep_copy_array(array.as_ref());
+                }
+                None => {}
             }
         }
         if self.row_number == u64::MAX {
@@ -71,7 +129,7 @@ impl AccumulationQueue {
         self.num_rows += num_rows;
         self.current_bytes += array.get_array_memory_size() as u64;
         self.buffered_arrays.push(array);
-        if self.current_bytes > self.cache_bytes {
+        if is_full || self.current_bytes > self.cache_bytes {
             debug!(
                 "Flushing column {} page of size {} bytes (unencoded)",
                 self.column_index, self.current_bytes
@@ -127,7 +185,7 @@ mod tests {
 
     use arrow_array::{Array, ArrayRef, BooleanArray, StringArray, UInt64Array};
     use arrow_schema::DataType;
-    use lance_arrow::deepcopy::deep_copy_array_sliced;
+    use lance_arrow::deepcopy::{deep_copy_array, deep_copy_array_sliced};
     use rstest::rstest;
 
     use super::AccumulationQueue;
@@ -135,6 +193,9 @@ mod tests {
     #[rstest]
     #[case::primitive(DataType::UInt64)]
     #[case::string(DataType::Utf8)]
+    #[case::large_string(DataType::LargeUtf8)]
+    #[case::binary(DataType::Binary)]
+    #[case::large_binary(DataType::LargeBinary)]
     #[case::boolean(DataType::Boolean)]
     fn test_accumulate_slices_by_retained_size(#[case] data_type: DataType) {
         let parent: ArrayRef = match data_type {
@@ -143,11 +204,14 @@ mod tests {
                     .map(|i| (i % 3 != 0).then_some(i))
                     .collect::<Vec<_>>(),
             )),
-            DataType::Utf8 => Arc::new(StringArray::from(
-                (0..4096)
-                    .map(|i| (i % 3 != 0).then(|| format!("{i:064}")))
-                    .collect::<Vec<_>>(),
-            )),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                let strings = StringArray::from(
+                    (0..4096)
+                        .map(|i| (i % 3 != 0).then(|| format!("{i:064}")))
+                        .collect::<Vec<_>>(),
+                );
+                arrow_cast::cast(&strings, &data_type).unwrap()
+            }
             DataType::Boolean => Arc::new(BooleanArray::from(
                 (0..4096)
                     .map(|i| (i % 3 != 0).then_some(i % 2 == 0))
@@ -176,15 +240,34 @@ mod tests {
         let (arrays, first_row, rows) = queue.flush().unwrap();
         assert_eq!((first_row, rows), (113, 32));
         assert_eq!(arrays[0].as_ref(), slice.as_ref());
+
+        let compact = deep_copy_array_sliced(slice.as_ref());
+        let copied_bytes = deep_copy_array(compact.as_ref()).get_array_memory_size() as u64;
+        let mut queue = AccumulationQueue::new(copied_bytes, 0, false);
+        assert!(queue.insert(compact.clone(), 0, 32).is_none());
+        assert_eq!(queue.current_bytes, copied_bytes);
+        let (arrays, _, _) = queue.flush().unwrap();
+        assert_eq!(arrays[0].as_ref(), compact.as_ref());
+        assert_ne!(
+            arrays[0].to_data().buffers()[0].as_ptr(),
+            compact.to_data().buffers()[0].as_ptr()
+        );
     }
 
     #[rstest]
-    #[case::keep_original(true, 32)]
-    #[case::large_batch(false, 4096)]
-    fn test_flush_without_copy(#[case] keep_original: bool, #[case] rows: usize) {
-        let parent: ArrayRef = Arc::new(UInt64Array::from(vec![1; 4096]));
+    #[case::keep_original(true, 4096, 32, 512)]
+    #[case::large_batch(false, 4096, 4096, 512)]
+    #[case::array_overhead(false, 4096, 32, 256)]
+    #[case::buffer_alignment(false, 1, 1, 128)]
+    fn test_flush_without_copy(
+        #[case] keep_original: bool,
+        #[case] parent_rows: usize,
+        #[case] rows: usize,
+        #[case] budget: u64,
+    ) {
+        let parent: ArrayRef = Arc::new(UInt64Array::from(vec![1; parent_rows]));
         let array = parent.slice(0, rows);
-        let mut queue = AccumulationQueue::new(512, 0, keep_original);
+        let mut queue = AccumulationQueue::new(budget, 0, keep_original);
         let (arrays, first_row, num_rows) = queue.insert(array.clone(), 0, rows as u64).unwrap();
         assert_eq!((first_row, num_rows), (0, rows as u64));
         assert!(Arc::ptr_eq(&arrays[0], &array));
