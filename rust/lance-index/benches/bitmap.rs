@@ -52,7 +52,12 @@ static STRING_LOW_CARD_INDEX_CACHED: OnceLock<Arc<dyn ScalarIndex>> = OnceLock::
 
 /// Get or create the tokio runtime
 fn get_runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().build().unwrap())
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    })
 }
 
 /// Get the cache - either a singleton cache or no_cache based on use_cache parameter
