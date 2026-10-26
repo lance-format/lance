@@ -199,6 +199,10 @@ enum Precondition {
     NoValuesWritten(i32),
     /// No fragment was added.
     NoRowsAdded,
+    /// The field has the children it had when the set read it: none was
+    /// added under it. A drop names the children it read, deepest first; one
+    /// added since would be left without a parent.
+    ChildrenUnchanged(i32),
 }
 
 /// Everything an action set writes, and everything it requires to still hold
@@ -245,6 +249,10 @@ pub struct Footprint {
     values_written: HashSet<i32>,
     /// Whether this set adds a fragment.
     rows_added: bool,
+    /// Committed fields this set adds a child under. A fact for
+    /// [`Precondition::ChildrenUnchanged`], not a claim: two sets adding children
+    /// under one parent do not collide through it.
+    children_added: HashSet<i32>,
     /// Row ids this set's new fragments arrive carrying, out of a reservation
     /// or kept by a compaction. A row id names one row, so two sets supplying
     /// the same id collide. The exact set rather than a range, so two
@@ -333,6 +341,7 @@ impl Footprint {
                     committed.rows_added || committed.values_written.contains(field)
                 }
                 Precondition::NoRowsAdded => committed.rows_added,
+                Precondition::ChildrenUnchanged(field) => committed.children_added.contains(field),
             })
     }
 
@@ -436,6 +445,22 @@ impl Footprint {
         if let Some(field) = committed_field(field) {
             self.preconditions
                 .push(Precondition::NoValuesWritten(field));
+        }
+    }
+
+    /// Record that this set adds a child under `parent`.
+    pub(super) fn add_child(&mut self, parent: FieldRef) {
+        if let Some(parent) = committed_field(parent) {
+            self.children_added.insert(parent);
+        }
+    }
+
+    /// Record that this set only holds if no child was added under `field`
+    /// since it read it.
+    pub(super) fn require_children_unchanged(&mut self, field: FieldRef) {
+        if let Some(field) = committed_field(field) {
+            self.preconditions
+                .push(Precondition::ChildrenUnchanged(field));
         }
     }
 
