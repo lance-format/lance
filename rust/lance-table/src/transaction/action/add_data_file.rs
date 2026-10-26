@@ -131,7 +131,11 @@ impl AddDataFile {
                 )));
             }
         }
+        let bound_fields = file.fields.clone();
         fragment.files.push(file);
+        for field_id in bound_fields.iter() {
+            state.note_rebind(fragment_id, *field_id, self.data_change)?;
+        }
         Ok(())
     }
 
@@ -142,7 +146,11 @@ impl AddDataFile {
     /// The data of every committed field the file backs, in the fragment it is
     /// attached to. A file backing only minted fields writes nothing.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write_field_data(self.fragment, self.field_ids.iter().copied());
+        if self.data_change {
+            footprint.write_field_data(self.fragment, self.field_ids.iter().copied());
+        } else {
+            footprint.move_field_data(self.fragment, self.field_ids.iter().copied());
+        }
     }
 }
 
@@ -572,7 +580,7 @@ mod tests {
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(0),
                     field_ids: vec![FieldRef::Committed(0)],
-                    data_change: false,
+                    data_change: true,
                 }),
                 add_file_for_field_zero(),
             ],

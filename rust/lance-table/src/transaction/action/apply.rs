@@ -196,9 +196,22 @@ pub(super) struct ApplyState<'a> {
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
 
+    /// Every field a [`TombstoneFieldData`](super::TombstoneFieldData) freed,
+    /// by fragment and field, so a re-encode can be checked to re-bind what it
+    /// tombstoned.
+    tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
+
     /// Whether the table was reset, which discards every index outright rather
     /// than pruning fragments out of them.
     reset: bool,
+}
+
+/// A field a [`TombstoneFieldData`](super::TombstoneFieldData) freed.
+#[derive(Debug, Clone, Copy)]
+struct TombstonedField {
+    data_change: bool,
+    /// Whether an [`AddDataFile`](super::AddDataFile) has bound it again.
+    rebound: bool,
 }
 
 impl<'a> ApplyState<'a> {
@@ -223,6 +236,7 @@ impl<'a> ApplyState<'a> {
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
             rebound_fields: HashMap::new(),
+            tombstoned_fields: HashMap::new(),
             reset: false,
         }
     }
@@ -240,6 +254,7 @@ impl<'a> ApplyState<'a> {
         let new_version = current_manifest.version + 1;
 
         self.check_spilled_lineage_is_bound()?;
+        self.check_reencodes_are_rebound()?;
 
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
@@ -423,6 +438,8 @@ impl<'a> ApplyState<'a> {
         }
         self.new_fragments.remove(&fragment_id);
         self.rebound_fields.remove(&fragment_id);
+        self.tombstoned_fields
+            .retain(|(fragment, _), _| *fragment != fragment_id);
         true
     }
 
@@ -435,6 +452,7 @@ impl<'a> ApplyState<'a> {
         self.fragments.clear();
         self.new_fragments.clear();
         self.rebound_fields.clear();
+        self.tombstoned_fields.clear();
         self.reset = true;
     }
 
@@ -670,6 +688,71 @@ impl<'a> ApplyState<'a> {
             .entry(fragment_id)
             .or_default()
             .extend(fields);
+    }
+
+    /// Record that a [`TombstoneFieldData`](super::TombstoneFieldData) freed
+    /// `field_id` in `fragment_id`.
+    pub(super) fn note_tombstone(&mut self, fragment_id: u64, field_id: i32, data_change: bool) {
+        self.tombstoned_fields.insert(
+            (fragment_id, field_id),
+            TombstonedField {
+                data_change,
+                rebound: false,
+            },
+        );
+    }
+
+    /// Record that an [`AddDataFile`](super::AddDataFile) bound `field_id` in
+    /// `fragment_id`. Re-binding a field this operation tombstoned has to agree
+    /// with the tombstone on whether the values change: a re-encode that is
+    /// half data change would keep index coverage of values that moved, or
+    /// withdraw it from values that did not.
+    pub(super) fn note_rebind(
+        &mut self,
+        fragment_id: u64,
+        field_id: i32,
+        data_change: bool,
+    ) -> Result<()> {
+        let Some(tombstoned) = self.tombstoned_fields.get_mut(&(fragment_id, field_id)) else {
+            return Ok(());
+        };
+        if tombstoned.data_change != data_change {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment_id} re-binds field {field_id} with \
+                 data_change {data_change}, but the TombstoneFieldData that freed it has \
+                 data_change {}; a re-encode's tombstone and re-add must agree",
+                tombstoned.data_change
+            )));
+        }
+        tombstoned.rebound = true;
+        Ok(())
+    }
+
+    /// A tombstone with `data_change` false promises the values come back
+    /// unchanged, which is what lets it keep the fields' overlays and index
+    /// coverage. Without the re-add the field would read as null, a change
+    /// those would still claim to describe.
+    fn check_reencodes_are_rebound(&self) -> Result<()> {
+        let mut unbound = self
+            .tombstoned_fields
+            .iter()
+            .filter(|(_, tombstoned)| !tombstoned.data_change && !tombstoned.rebound)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        if unbound.is_empty() {
+            return Ok(());
+        }
+        unbound.sort_unstable();
+        let unbound = unbound
+            .iter()
+            .map(|(fragment, field)| format!("field {field} in fragment {fragment}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(Error::invalid_input(format!(
+            "TombstoneFieldData with data_change false leaves {unbound} without a data file; \
+             a re-encode must re-bind every field it tombstones with an AddDataFile that is \
+             also data_change false, or tombstone it with data_change true"
+        )))
     }
 
     /// Every row lineage sequence a fragment added here spills has to be bound
