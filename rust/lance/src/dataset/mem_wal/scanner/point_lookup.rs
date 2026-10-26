@@ -966,7 +966,12 @@ impl LsmPointLookupPlanner {
         // that lack the column get a synthesized `false`.
         let plan = project_to_carry(scan, &target, &self.pk_columns)?;
         // Lookups read partition 0 and take a key's first row as its newest.
-        debug_assert_eq!(plan.output_partitioning().partition_count(), 1);
+        let partitions = plan.output_partitioning().partition_count();
+        if partitions != 1 {
+            return Err(lance_core::Error::internal(format!(
+                "point-lookup: source scan has {partitions} partitions, expected 1"
+            )));
+        }
         Ok(plan)
     }
 
@@ -3127,43 +3132,31 @@ mod tests {
             .unwrap();
 
         let live = |name: &str| Some((Some(name.to_string()), false));
-        let deleted = Some((None, true));
-        assert_eq!(version_of(&batch, 1), live("base_1"));
-        assert_eq!(version_of(&batch, 2), live("g1_2"), "gen 1 shadows base");
-        assert_eq!(
-            version_of(&batch, 3),
-            live("g3_3"),
-            "re-insert shadows tombstone"
-        );
-        assert_eq!(version_of(&batch, 4), deleted, "tombstone shadows base");
-        assert_eq!(version_of(&batch, 5), deleted, "tombstone shadows gen 2");
-        assert_eq!(
-            version_of(&batch, 6),
-            live("g4b_6"),
-            "newest within a memtable"
-        );
-        assert_eq!(version_of(&batch, 7), live("g1_7"));
-        assert_eq!(
-            version_of(&batch, 8),
-            deleted,
-            "tombstone of a key held nowhere else"
-        );
-        assert_eq!(version_of(&batch, 9), None, "absent key omitted");
-        assert_eq!(
-            version_of(&batch, 10),
-            live("g2b_10"),
-            "newest within an SSTable"
-        );
+        let deleted = || Some((None, true));
+        let expected = [
+            (1, live("base_1")),
+            (2, live("g1_2")),  // gen 1 shadows base
+            (3, live("g3_3")),  // re-insert shadows tombstone
+            (4, deleted()),     // tombstone shadows base
+            (5, deleted()),     // tombstone shadows gen 2
+            (6, live("g4b_6")), // newest within a memtable
+            (7, live("g1_7")),
+            (8, deleted()),       // tombstone of a key held nowhere else
+            (9, None),            // absent key omitted
+            (10, live("g2b_10")), // newest within an SSTable
+        ];
         assert_eq!(batch.num_rows(), 9);
-
-        // Each key agrees with the per-key plan.
-        for id in 1..=10 {
+        for (id, want) in expected {
+            assert_eq!(version_of(&batch, id), want, "key {id}");
             let single = planner
                 .lookup_keep_tombstone(&[ScalarValue::Int32(Some(id))], None)
                 .await
                 .unwrap();
-            let expected = single.and_then(|b| version_of(&b, id));
-            assert_eq!(version_of(&batch, id), expected, "key {id}");
+            assert_eq!(
+                single.and_then(|b| version_of(&b, id)),
+                want,
+                "key {id} per key"
+            );
         }
     }
 
