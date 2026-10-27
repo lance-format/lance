@@ -10,8 +10,11 @@ from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
+from snippet_runner import run_sql
 
 QUICKSTART = Path(__file__).resolve().parent.parent / "quickstart"
+OUTPUTS = QUICKSTART / "outputs"
+RUNNER = Path(__file__).resolve().parent / "snippet_runner.py"
 
 
 def spark_env():
@@ -26,6 +29,29 @@ def ivy_conf():
     """Point Spark's dependency resolution at the directory CI caches."""
     ivy_dir = os.environ.get("SPARK_IVY_DIR")
     return ["--conf", f"spark.jars.ivy={ivy_dir}"] if ivy_dir else []
+
+
+def check_outputs(snippet: Path, recorded_dir: Path, update: bool):
+    """Compare a snippet's recorded outputs with the copies the docs embed."""
+    pattern = f"{snippet.name}.*.txt"
+    recorded = {path.name: path.read_text() for path in recorded_dir.glob(pattern)}
+    if update:
+        for path in OUTPUTS.glob(pattern):
+            path.unlink()
+        OUTPUTS.mkdir(exist_ok=True)
+        for name, text in recorded.items():
+            (OUTPUTS / name).write_text(text)
+        return
+    expected = {path.name: path.read_text() for path in OUTPUTS.glob(pattern)}
+    hint = "rerun with `pytest --update-outputs` if the change is intended"
+    assert sorted(recorded) == sorted(expected), f"sections with output changed; {hint}"
+    for name in expected:
+        assert recorded[name] == expected[name], f"{name} changed; {hint}"
+
+
+@pytest.fixture
+def update_outputs(request):
+    return request.config.getoption("--update-outputs")
 
 
 @pytest.mark.parametrize("install_script", ["lancedb-install.sh", "spark-install.sh"])
@@ -43,41 +69,38 @@ def test_install_command_matches_locked_versions(install_script):
         )
 
 
-def test_lancedb_quickstart():
-    subprocess.run([sys.executable, QUICKSTART / "lancedb_quickstart.py"], check=True)
+def test_lancedb_quickstart(tmp_path, update_outputs):
+    snippet = QUICKSTART / "lancedb_quickstart.py"
+    subprocess.run([sys.executable, RUNNER, snippet, tmp_path], check=True)
+    check_outputs(snippet, tmp_path, update_outputs)
 
 
 # Spark creates a Derby metastore in its working directory, so the Spark tests
 # run from tmp_path to keep it out of the checkout.
-def test_spark_quickstart_pyspark(tmp_path):
+def test_spark_quickstart_pyspark(tmp_path, update_outputs):
+    snippet = QUICKSTART / "spark_quickstart.py"
     env = spark_env()
     env["PYSPARK_SUBMIT_ARGS"] = shlex.join([*ivy_conf(), "pyspark-shell"])
     subprocess.run(
-        [sys.executable, QUICKSTART / "spark_quickstart.py"],
+        [sys.executable, RUNNER, snippet, tmp_path / "outputs"],
         check=True,
         env=env,
         cwd=tmp_path,
     )
+    check_outputs(snippet, tmp_path / "outputs", update_outputs)
 
 
-def test_spark_quickstart_sql(tmp_path):
+def test_spark_quickstart_sql(tmp_path, update_outputs):
+    snippet = QUICKSTART / "spark_quickstart.sql"
     shutil.rmtree("/tmp/lance-spark-quickstart", ignore_errors=True)
     command = shlex.split(
         (QUICKSTART / "spark-sql.sh").read_text().replace("\\\n", " ")
     )
-    command += [*ivy_conf(), "-f", str(QUICKSTART / "spark_quickstart.sql")]
-    result = subprocess.run(
-        command,
-        check=True,
+    run_sql(
+        [*command, *ivy_conf()],
+        snippet,
+        tmp_path / "outputs",
         env=spark_env(),
         cwd=tmp_path,
-        capture_output=True,
-        text=True,
     )
-    rows = result.stdout.splitlines()
-    assert rows[-4:] == [
-        "1\tred running shoes\t79.0",
-        "2\tblue trail running shoes\t120.0",
-        "3\tleather hiking boots\t150.0",
-        "6\ttrail socks\t15.0",
-    ]
+    check_outputs(snippet, tmp_path / "outputs", update_outputs)

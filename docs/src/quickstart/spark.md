@@ -33,7 +33,7 @@ Start Spark with the Lance connector and a Lance catalog named `lance`. The `dir
     --8<-- "snippets/quickstart/spark_quickstart.py:session"
     ```
 
-The `--packages` option downloads the connector from Maven Central the first time you run it. Use the bundle that matches your Spark version: `lance-spark-bundle-4.2_2.13` is for Spark 4.2 with Scala 2.13.
+The `--packages` option downloads the connector from Maven Central the first time you run it. In `spark-sql`, the last option prints column headers with query results. Use the bundle that matches your Spark version: `lance-spark-bundle-4.2_2.13` is for Spark 4.2 with Scala 2.13.
 
 ## Create a Table
 
@@ -61,10 +61,18 @@ Lance tables work with standard Spark SQL. The connector pushes filters and colu
     --8<-- "snippets/quickstart/spark_quickstart.sql:query"
     ```
 
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.sql.query.txt"
+    ```
+
 === "PySpark"
 
     ```python
     --8<-- "snippets/quickstart/spark_quickstart.py:query"
+    ```
+
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.py.query.txt"
     ```
 
 ## Search by Vector Similarity
@@ -77,10 +85,18 @@ The `VECTOR_SEARCH` table function returns the rows nearest to a query vector, a
     --8<-- "snippets/quickstart/spark_quickstart.sql:vector-search"
     ```
 
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.sql.vector-search.txt"
+    ```
+
 === "PySpark"
 
     ```python
     --8<-- "snippets/quickstart/spark_quickstart.py:vector-search"
+    ```
+
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.py.vector-search.txt"
     ```
 
 `VECTOR_SEARCH` also takes filters and index tuning options. See [Vector Search](../integrations/spark/operations/dql/vector-search.md).
@@ -95,10 +111,18 @@ Create a full-text search index on a text column, then search it with `lance_mat
     --8<-- "snippets/quickstart/spark_quickstart.sql:fts"
     ```
 
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.sql.fts.txt"
+    ```
+
 === "PySpark"
 
     ```python
     --8<-- "snippets/quickstart/spark_quickstart.py:fts"
+    ```
+
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.py.fts.txt"
     ```
 
 ## Add, Update, and Delete Rows
@@ -109,10 +133,18 @@ Create a full-text search index on a text column, then search it with `lance_mat
     --8<-- "snippets/quickstart/spark_quickstart.sql:modify"
     ```
 
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.sql.modify.txt"
+    ```
+
 === "PySpark"
 
     ```python
     --8<-- "snippets/quickstart/spark_quickstart.py:modify"
+    ```
+
+    ```output
+    --8<-- "snippets/quickstart/outputs/spark_quickstart.py.modify.txt"
     ```
 
 ## Open the Table from LanceDB
@@ -121,6 +153,10 @@ Spark wrote an ordinary Lance table, so other engines can use it directly. For e
 
 ```python
 --8<-- "snippets/quickstart/spark_quickstart.py:lancedb"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/spark_quickstart.py.lancedb.txt"
 ```
 
 ## Next Steps
