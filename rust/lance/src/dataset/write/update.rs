@@ -16,7 +16,8 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
-use arrow_array::{ArrayRef, RecordBatch, StructArray, new_null_array};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, new_null_array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -25,8 +26,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
 use futures::StreamExt;
-use lance_arrow::RecordBatchExt;
 use lance_arrow::json::{JsonArray, is_json_field};
+use lance_arrow::{FieldExt, RecordBatchExt};
 use lance_core::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_TYPE, BlobHandling};
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -161,10 +162,10 @@ impl UpdateBuilder {
                 ))
             })?;
 
-        if crate::dataset::optimize::field_contains_blob_v2(field) && !field.is_blob_v2() {
+        if !blobs_reachable_through_structs(&Field::from(field)) {
             return Err(Error::not_supported_source(
                 format!(
-                    "Direct updates to column '{}' containing nested blob v2 values are not supported",
+                    "Direct updates to column '{}' containing blob v2 values in a list or map are not supported",
                     column.as_ref()
                 )
                 .into(),
@@ -190,13 +191,13 @@ impl UpdateBuilder {
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
 
-        // Cast expression to the column's data type if necessary. A blob v2
-        // column is assigned bytes, which `apply_updates` wraps in the logical layout.
-        let dest_type = if field.is_blob_v2() {
-            DataType::LargeBinary
-        } else {
-            field.data_type()
-        };
+        // Cast expression to the column's data type if necessary. Blob v2 fields
+        // are assigned bytes, which `apply_updates` wraps in the logical layout.
+        let dest_type = map_blob_fields(&Field::from(field), &|blob| {
+            Field::new(blob.name(), DataType::LargeBinary, blob.is_nullable())
+        })
+        .data_type()
+        .clone();
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let src_type = expr
             .get_type(&df_schema)
@@ -291,7 +292,7 @@ impl UpdateBuilder {
                 self.dataset
                     .schema()
                     .field(column)
-                    .is_some_and(|field| field.is_blob_v2())
+                    .is_some_and(crate::dataset::optimize::field_contains_blob_v2)
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -451,15 +452,10 @@ impl UpdateJob {
             let mut rewrite_fields = scan_schema.fields().to_vec();
             for column in self.blob_columns.iter() {
                 let column_idx = scan_schema.index_of(column)?;
-                let field = &scan_schema.fields()[column_idx];
-                rewrite_fields[column_idx] = Arc::new(
-                    Field::new(
-                        field.name(),
-                        BLOB_V2_LOGICAL_TYPE.clone(),
-                        field.is_nullable(),
-                    )
-                    .with_metadata(field.metadata().clone()),
-                );
+                rewrite_fields[column_idx] = Arc::new(map_blob_fields(
+                    &scan_schema.fields()[column_idx],
+                    &logical_blob_field,
+                ));
             }
             let rewrite_schema = Arc::new(ArrowSchema::new_with_metadata(
                 rewrite_fields,
@@ -487,7 +483,7 @@ impl UpdateJob {
                         .zip(batch.columns())
                         .map(|(field, column)| {
                             if blob_columns.contains(field.name()) {
-                                new_null_logical_blobs(batch.num_rows())
+                                blob_placeholders(column, field)
                             } else {
                                 Ok(column.clone())
                             }
@@ -767,7 +763,7 @@ impl UpdateJob {
                 })?;
                 Arc::new(json_array.into_inner())
             } else if blob_columns.contains(column) {
-                logical_blobs_from_bytes(&new_values)?
+                logical_blobs_in(&new_values, schema.field_with_name(column)?)?
             } else {
                 new_values
             };
@@ -843,6 +839,110 @@ impl RetryExecutor for UpdateJob {
     }
 }
 
+/// Whether every blob v2 field under `field` is reached through structs only.
+fn blobs_reachable_through_structs(field: &Field) -> bool {
+    fn contains_blob(field: &Field) -> bool {
+        field.is_blob_v2()
+            || data_type_children(field.data_type())
+                .iter()
+                .any(|f| contains_blob(f))
+    }
+    match field.data_type() {
+        _ if field.is_blob_v2() => true,
+        DataType::Struct(children) => children
+            .iter()
+            .all(|child| blobs_reachable_through_structs(child)),
+        data_type => !data_type_children(data_type)
+            .iter()
+            .any(|f| contains_blob(f)),
+    }
+}
+
+fn data_type_children(data_type: &DataType) -> Vec<Arc<Field>> {
+    match data_type {
+        DataType::Struct(children) => children.iter().cloned().collect(),
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => vec![child.clone()],
+        _ => vec![],
+    }
+}
+
+/// `field` with each blob v2 field reached through structs replaced by `blob(field)`.
+fn map_blob_fields(field: &Field, blob: &dyn Fn(&Field) -> Field) -> Field {
+    if field.is_blob_v2() {
+        return blob(field);
+    }
+    match field.data_type() {
+        DataType::Struct(children) => field.clone().with_data_type(DataType::Struct(
+            children
+                .iter()
+                .map(|child| Arc::new(map_blob_fields(child, blob)))
+                .collect(),
+        )),
+        _ => field.clone(),
+    }
+}
+
+fn logical_blob_field(blob: &Field) -> Field {
+    Field::new(
+        blob.name(),
+        BLOB_V2_LOGICAL_TYPE.clone(),
+        blob.is_nullable(),
+    )
+    .with_metadata(blob.metadata().clone())
+}
+
+/// `values` of `field` with its blob v2 fields replaced by placeholders; other
+/// fields keep their values.
+fn blob_placeholders(values: &ArrayRef, field: &Field) -> DFResult<ArrayRef> {
+    if field.is_blob_v2() {
+        return new_null_logical_blobs(values.len());
+    }
+    let DataType::Struct(children) = field.data_type() else {
+        return Ok(values.clone());
+    };
+    let values = values.as_struct();
+    let columns = children
+        .iter()
+        .zip(values.columns())
+        .map(|(child, column)| blob_placeholders(column, child))
+        .collect::<DFResult<Vec<_>>>()?;
+    let fields = children
+        .iter()
+        .map(|child| Arc::new(map_blob_fields(child, &logical_blob_field)));
+    Ok(Arc::new(StructArray::try_new(
+        fields.collect(),
+        columns,
+        values.nulls().cloned(),
+    )?))
+}
+
+/// Assigned `values` of `field` with each blob v2 field's bytes in the logical layout.
+fn logical_blobs_in(values: &ArrayRef, field: &Field) -> DFResult<ArrayRef> {
+    if field.is_blob_v2() {
+        return logical_blobs_from_bytes(values);
+    }
+    let DataType::Struct(children) = field.data_type() else {
+        return Ok(values.clone());
+    };
+    let values = values.as_struct();
+    let columns = children
+        .iter()
+        .zip(values.columns())
+        .map(|(child, column)| logical_blobs_in(column, child))
+        .collect::<DFResult<Vec<_>>>()?;
+    let fields = children
+        .iter()
+        .map(|child| Arc::new(map_blob_fields(child, &logical_blob_field)));
+    Ok(Arc::new(StructArray::try_new(
+        fields.collect(),
+        columns,
+        values.nulls().cloned(),
+    )?))
+}
+
 /// All-null children under a valid parent; stands in for blob values about to be overwritten.
 fn new_null_logical_blobs(num_rows: usize) -> DFResult<ArrayRef> {
     let children = BLOB_V2_LOGICAL_FIELDS
@@ -903,7 +1003,8 @@ mod tests {
     use arrow_array::record_batch;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{
-        Int64Array, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+        Int32Array, Int64Array, RecordBatchIterator, StringArray, StructArray, UInt32Array,
+        UInt64Array,
     };
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
@@ -2806,6 +2907,96 @@ mod tests {
     }
 
     #[rstest]
+    #[case::bytes("named_struct('label', 7, 'blob', X'0102')", Some((7, Some(&[1u8, 2][..]))))]
+    #[case::empty("named_struct('label', 8, 'blob', X'')", Some((8, Some(&[][..]))))]
+    #[case::null_blob("named_struct('label', 9, 'blob', NULL)", Some((9, None)))]
+    #[case::null_struct("NULL", None)]
+    #[tokio::test]
+    async fn test_update_assigns_struct_with_blob_v2(
+        #[case] value: &str,
+        #[case] expected: Option<(i32, Option<&[u8]>)>,
+    ) {
+        use crate::{BlobArrayBuilder, blob_field};
+
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"zero").unwrap();
+        blobs.push_bytes(b"one").unwrap();
+        let fields = vec![
+            Field::new("label", DataType::Int32, true),
+            blob_field("blob", true),
+        ];
+        let info = StructArray::try_new(
+            fields.clone().into(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                blobs.finish().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("info", DataType::Struct(fields.into()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![0, 1])), Arc::new(info)],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where("id = 1")
+            .unwrap()
+            .set("info", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 1);
+
+        let mut scanner = result.new_dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int64Type>();
+        let info = batch["info"].as_struct();
+        let labels = info
+            .column_by_name("label")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let blobs = info.column_by_name("blob").unwrap().as_binary::<i64>();
+        let read = |row| {
+            info.is_valid(row).then(|| {
+                (
+                    labels.value(row),
+                    blobs.is_valid(row).then(|| blobs.value(row)),
+                )
+            })
+        };
+        for row in 0..batch.num_rows() {
+            let want = match ids.value(row) {
+                0 => Some((0, Some(b"zero".as_slice()))),
+                _ => expected,
+            };
+            assert_eq!(read(row), want, "id {}", ids.value(row));
+        }
+    }
+
+    #[rstest]
     #[case::non_empty(0)]
     #[case::empty(1)]
     #[case::null(2)]
@@ -2856,11 +3047,13 @@ mod tests {
 
         let error = UpdateBuilder::new(dataset.clone())
             .set("info", "info")
+            .unwrap()
+            .build()
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(
             error.to_string().contains(
-                "Direct updates to column 'info' containing nested blob v2 values are not supported"
+                "The update to column 'info' reads blob v2 column 'info', which this update also assigns"
             ),
             "unexpected error: {error}"
         );
