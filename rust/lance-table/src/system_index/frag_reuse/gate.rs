@@ -934,5 +934,8 @@ mod tests {
             error.to_string().contains("stable row id migration"),
             "{error}"
         );
+        // Tagged histories are allowed on stable row id tables; only carrying
+        // one across the migration is missing.
+        assert!(error.to_string().contains("not implemented"), "{error}");
     }
 }
