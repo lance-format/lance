@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, RwLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -80,6 +80,10 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     }
 }
 
+/// Smallest cache size at which [`ObjectStoreRegistry::get_store()`] sweeps out
+/// dead entries.
+const MIN_PRUNE_THRESHOLD: usize = 64;
+
 /// Statistics for the object store registry cache.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectStoreRegistryStats {
@@ -109,9 +113,12 @@ pub struct ObjectStoreRegistryStats {
 /// Use [`Self::empty()`] to create an empty registry, with no providers registered.
 ///
 /// The registry also caches object stores that are currently in use. It holds
-/// weak references to the object stores, so they are not held onto. If an object
-/// store is no longer in use, it will be removed from the cache on the next
-/// call to either [`Self::active_stores()`] or [`Self::get_store()`].
+/// weak references to the object stores, so they are not held onto. Entries
+/// whose object store is no longer in use are removed by
+/// [`Self::active_stores()`], when [`Self::get_store()`] looks up the same key
+/// again, and in bulk once the cache outgrows its live entries (see
+/// [`Self::get_store()`]), so a long-lived registry that sees many distinct
+/// keys (e.g. one per namespace table) stays bounded.
 #[derive(Debug)]
 pub struct ObjectStoreRegistry {
     providers: RwLock<HashMap<String, Arc<dyn ObjectStoreProvider>>>,
@@ -119,6 +126,8 @@ pub struct ObjectStoreRegistry {
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
     active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    // Cache size at which `get_store` sweeps out dead entries before inserting.
+    prune_threshold: AtomicUsize,
     // Cache statistics
     hits: AtomicU64,
     misses: AtomicU64,
@@ -133,6 +142,7 @@ impl ObjectStoreRegistry {
         Self {
             providers: RwLock::new(HashMap::new()),
             active_stores: RwLock::new(HashMap::new()),
+            prune_threshold: AtomicUsize::new(MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -268,6 +278,12 @@ impl ObjectStoreRegistry {
     /// If the object store is already in use, it will return a strong reference
     /// to the object store. If the object store is not in use, it will create a
     /// new object store and return a strong reference to it.
+    ///
+    /// A dead entry is only found again if the same key is looked up, which
+    /// never happens when every key is distinct (each namespace table gets its
+    /// own storage options provider, hence its own key). So before inserting,
+    /// once the cache reaches twice its live size, all dead entries are swept
+    /// out; this keeps the cache bounded at amortized O(1) cost per insert.
     pub async fn get_store(
         &self,
         base_path: Url,
@@ -330,6 +346,13 @@ impl ObjectStoreRegistry {
         {
             // Insert the store into the cache
             let mut cache_lock = self.active_stores.write().ok().expect_ok()?;
+            if cache_lock.len() >= self.prune_threshold.load(Ordering::Relaxed) {
+                cache_lock.retain(|_, weak| weak.strong_count() > 0);
+                self.prune_threshold.store(
+                    (cache_lock.len() * 2).max(MIN_PRUNE_THRESHOLD),
+                    Ordering::Relaxed,
+                );
+            }
             cache_lock.insert(cache_key, Arc::downgrade(&store));
         }
 
@@ -406,6 +429,7 @@ impl Default for ObjectStoreRegistry {
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
+            prune_threshold: AtomicUsize::new(MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -690,6 +714,47 @@ mod tests {
 
         // Same params returns same instance
         assert!(Arc::ptr_eq(&stores[0], &stores[1]));
+    }
+
+    #[tokio::test]
+    async fn test_get_store_prunes_dead_entries_with_distinct_keys() {
+        use crate::object_store::StorageOptionsAccessor;
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+        let params_for = |i: usize| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("table".into(), i.to_string())]),
+            ))),
+            ..Default::default()
+        };
+        let cache_len = || registry.active_stores.read().unwrap().len();
+
+        // Every 10th store stays alive; the rest are dropped right away, like
+        // datasets opened once per sample, each on a different table.
+        let n = 10 * MIN_PRUNE_THRESHOLD;
+        let mut alive = vec![];
+        for i in 0..n {
+            let store = registry
+                .get_store(url.clone(), &params_for(i))
+                .await
+                .unwrap();
+            if i % 10 == 0 {
+                alive.push((i, store));
+            }
+        }
+        // Without pruning this would be `n`.
+        assert!(cache_len() <= 2 * alive.len() + MIN_PRUNE_THRESHOLD);
+        assert_eq!(registry.stats().active_stores, alive.len());
+
+        // Live entries survive pruning and are still reused.
+        for (i, store) in &alive {
+            let again = registry
+                .get_store(url.clone(), &params_for(*i))
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(store, &again));
+        }
+        assert_eq!(registry.stats().hits, alive.len() as u64);
     }
 
     #[tokio::test]
