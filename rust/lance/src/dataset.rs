@@ -1945,7 +1945,7 @@ impl Dataset {
     /// External blob's absolute URI and byte range.
     ///
     /// `batch` must be scanned from this dataset with blob v2 columns as
-    /// descriptors (the default) and with [`ROW_ADDR`](lance_core::ROW_ADDR),
+    /// descriptors (the default) and with [`ROW_ADDR`],
     /// which is dropped from the result. Blobs inside structs and lists are
     /// converted too. Every payload in the batch is read into memory, so bound
     /// the scan's batch size.
