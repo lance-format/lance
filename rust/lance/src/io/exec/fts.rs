@@ -6402,8 +6402,10 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::physical_plan::ChildrenPropertiesMode;
     use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion_physical_expr::PhysicalExpr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -7115,8 +7117,8 @@ mod tests {
         assert_eq!(filtered.children().len(), 2);
         assert!(
             filtered
-                .required_input_distribution()
-                .iter()
+                .input_distribution_requirements()
+                .per_child_distributions()
                 .all(|distribution| {
                     matches!(
                         distribution,
@@ -7146,15 +7148,20 @@ mod tests {
         );
         let rebuilt = filtered
             .clone()
-            .with_new_children(vec![
-                expanded_corpus,
-                empty.execution_plan().unwrap().clone(),
-            ])
+            .replace_children(
+                vec![expanded_corpus, empty.execution_plan().unwrap().clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .unwrap();
         assert!(execute_results(rebuilt.as_ref()).await.unwrap().is_empty());
         assert_eq!(rebuilt.metrics().unwrap().output_rows(), Some(0));
         assert_eq!(shared.wait().await.unwrap().num_docs(), 6);
-        let error = filtered.with_new_children(vec![]).unwrap_err();
+        let error = filtered
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("expected 2 children"));
     }
@@ -7171,7 +7178,12 @@ mod tests {
         };
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("got 0 and 0"));
-        let error = owner.with_new_children(vec![]).unwrap_err();
+        let error = owner
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("requires one input"));
     }
@@ -7223,6 +7235,12 @@ mod tests {
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.input]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
         fn with_new_children(
             self: Arc<Self>,
@@ -7351,10 +7369,17 @@ mod tests {
         let union = UnionExec::try_new(vec![indexed, flat]).unwrap();
         let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
         let owner = Arc::new(SharedFtsScorerExec::new(input.clone(), shared));
-        let owner = owner.with_new_children(vec![input]).unwrap();
-        assert_eq!(owner.required_input_distribution().len(), 1);
+        let owner = owner
+            .replace_children(
+                vec![input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        let distributions = owner.input_distribution_requirements();
+        let distributions = distributions.per_child_distributions().collect::<Vec<_>>();
+        assert_eq!(distributions.len(), 1);
         assert!(matches!(
-            owner.required_input_distribution()[0],
+            distributions[0],
             datafusion_physical_expr::Distribution::SinglePartition
         ));
         assert_eq!(owner.schema(), FTS_SCHEMA.clone());
