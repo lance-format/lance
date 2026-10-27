@@ -6305,6 +6305,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::index::DatasetIndexExt;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
         UInt64Array, record_batch,
@@ -6340,8 +6342,8 @@ mod tests {
     };
     use lance_index::scalar::inverted::{
         CombinedCorpusStats, CombinedFieldColumn, DocumentGranularity, FTS_SCHEMA, InvertedIndex,
-        Language, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer, build_global_bm25_scorer,
-        prepare_bm25_query,
+        InvertedListFormatVersion, Language, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer,
+        build_global_bm25_scorer, prepare_bm25_query,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -6350,12 +6352,16 @@ mod tests {
         result::{IndexExprResult, IndexExprResultWireFormat},
     };
     use lance_table::format::IndexMetadata;
+    use lance_table::io::manifest::read_manifest_indexes;
+    use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use rstest::rstest;
     use uuid::Uuid;
 
     use crate::{
         Dataset,
         dataset::WriteParams,
+        dataset::index::{DatasetIndexRemapperOptions, frag_reuse::cleanup_frag_reuse_index},
+        dataset::optimize::{CompactionOptions, CompactionTask, TaskData, commit_compaction},
         dataset::transaction::{Operation, TransactionBuilder},
         dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched},
         index::DatasetIndexInternalExt,
@@ -7974,6 +7980,293 @@ mod tests {
             expected_lookups,
             "FlatCombinedFieldsExec must report the scorer build's cache lookups",
         );
+    }
+
+    // Check the indexed leaf separately: the full scanner's fallback can hide stale
+    // postings even when the addresses passed from the leaf to Take are invalid.
+    async fn assert_partial_fts_results(
+        dataset: &Dataset,
+        index_uuid: Uuid,
+        expected_indexed: &[i32],
+        expected_all: &[i32],
+    ) {
+        let leaf = MatchQueryExec::new_with_segment_uuids(
+            Arc::new(dataset.clone()),
+            MatchQuery::new("searchable".into())
+                .with_column(Some("text".into()))
+                .with_document_granularity(DocumentGranularity::Row),
+            FtsSearchParams::default().with_limit(Some(1000)),
+            PreFilterSource::None,
+            vec![index_uuid],
+        )
+        .unwrap();
+        let mut addresses = execute_row_ids(&leaf).await.unwrap();
+        assert_eq!(
+            addresses.len(),
+            expected_indexed.len(),
+            "FTS must exclude postings outside its healed coverage"
+        );
+        assert!(
+            addresses.iter().all(|&address| dataset
+                .fragment_bitmap
+                .contains(RowAddress::from(address).fragment_id())),
+            "FTS must not return retired row addresses"
+        );
+
+        // Score order need not match physical row order. Verify Take preserves the
+        // requested order and one output row per address, including with deletions.
+        addresses.swap(0, 2);
+        let mut expected_taken = expected_indexed.to_vec();
+        expected_taken.swap(0, 2);
+        let taken = Arc::new(dataset.clone())
+            .take_builder(&addresses, Arc::new(dataset.schema().clone()))
+            .unwrap()
+            .with_row_address(false)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(taken.num_rows(), addresses.len());
+        assert_eq!(
+            taken["id"].as_primitive::<Int32Type>().values().as_ref(),
+            expected_taken
+        );
+
+        // The compacted destination must be scanned by the fallback. Exact IDs
+        // detect both missing rows and duplicates across indexed and flat results.
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new("searchable".into()))
+            .unwrap();
+        scan.limit(Some(1000), None).unwrap();
+        let results = scan.try_into_batch().await.unwrap();
+        let mut actual = results["id"].as_primitive::<Int32Type>().values().to_vec();
+        actual.sort_unstable();
+        assert_eq!(actual, expected_all);
+    }
+
+    #[rstest]
+    #[case::no_deletion(false)]
+    #[case::surviving_deletion(true)]
+    #[tokio::test]
+    async fn test_fts_v1_partial_coverage_after_fri_cleanup(#[case] has_surviving_deletion: bool) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["searchable document"]),
+            )
+            .into_dataset_with_params(
+                "memory://",
+                FragmentCount::from(259),
+                FragmentRowCount::from(2),
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    enable_stable_row_ids: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 259);
+        if has_surviving_deletion {
+            // Keep a deletion vector on a surviving indexed fragment, to cover the block-list path.
+            dataset.delete("id = 202").await.unwrap();
+        }
+        let params = InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V1)
+            .with_position(false);
+        // An existing index overlaps the rewrite, causing deferred compaction to
+        // record reuse history while its replacement builds on a pinned snapshot.
+        let old_index = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("text_idx".into())
+            .fragments((0..3).chain(101..259).collect())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![old_index])
+            .await
+            .unwrap();
+        let mut build_snapshot = dataset.clone();
+        let mut parts = Vec::with_capacity(2);
+        for fragments in [(0..130).collect(), (130..259).collect()] {
+            parts.push(
+                build_snapshot
+                    .create_index_builder(&["text"], IndexType::Inverted, &params)
+                    .name("text_idx".into())
+                    .replace(true)
+                    .fragments(fragments)
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(parts.iter().all(|s| s.index_version == 1));
+
+        let appended = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(518, 1))
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["searchable document"]),
+            )
+            .into_reader_rows(RowCount::from(40), BatchCount::from(1));
+        dataset
+            .append(
+                appended,
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 279);
+
+        // Rewrite 101 indexed fragments together with 20 appended fragments.
+        // The staged build covers only 101/121 inputs, so it cannot cover the destination.
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let task = CompactionTask {
+            task: TaskData {
+                fragments: dataset
+                    .fragments()
+                    .iter()
+                    .filter(|f| f.id < 101 || f.id >= 259)
+                    .cloned()
+                    .collect(),
+            },
+            read_version: dataset.version().version,
+            options: options.clone(),
+        };
+        assert_eq!(task.task.fragments.len(), 121);
+        let rewritten = task.execute(&dataset).await.unwrap();
+        assert_eq!(rewritten.new_fragments.len(), 1);
+        commit_compaction(
+            &mut dataset,
+            vec![rewritten],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let stored = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let fri_meta = stored
+            .iter()
+            .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        assert_eq!(fri_meta.index_version, 0);
+        let fri = crate::index::frag_reuse::load_frag_reuse_index_details(&dataset, fri_meta)
+            .await
+            .unwrap();
+        let group = &fri.versions.last().unwrap().groups[0];
+        assert_eq!(group.old_frags.len(), 121);
+        assert_eq!(group.new_frags.len(), 1);
+        let new_fragment = group.new_frags[0].id;
+
+        // Publish the staged build after compaction, from its original snapshot.
+        let merged = build_snapshot
+            .merge_existing_index_segments(parts)
+            .await
+            .unwrap();
+        assert_eq!(merged.index_version, 1);
+        let build_coverage = merged.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(build_coverage.len(), 259);
+        assert_eq!(
+            group
+                .old_frags
+                .iter()
+                .filter(|f| build_coverage.contains(f.id as u32))
+                .count(),
+            101
+        );
+        build_snapshot
+            .commit_existing_index_segments("text_idx", "text", vec![merged])
+            .await
+            .unwrap();
+        dataset = build_snapshot;
+        let raw = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let raw_fts = raw.iter().find(|i| i.name == "text_idx").unwrap();
+        let raw_overlap = group
+            .old_frags
+            .iter()
+            .filter(|f| {
+                raw_fts
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(f.id as u32)
+            })
+            .count();
+        assert_eq!(raw_overlap, 101);
+        let segments = crate::index::scalar::inverted::load_segments(
+            &dataset,
+            "text",
+            DocumentGranularity::Row,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(segments.len(), 1);
+        let coverage = segments[0].fragment_bitmap.as_ref().unwrap();
+        assert_eq!(coverage.len(), 158);
+        assert!(!coverage.contains(new_fragment as u32));
+        assert!(coverage.iter().all(|id| (101..259).contains(&id)));
+        let index_uuid = segments[0].uuid;
+        let expected_indexed = (202..518)
+            .filter(|id| !has_surviving_deletion || *id != 202)
+            .collect::<Vec<_>>();
+        let expected_all = (0..558)
+            .filter(|id| !has_surviving_deletion || *id != 202)
+            .collect::<Vec<_>>();
+
+        // A normal metadata commit persists the healed bitmap without rewriting
+        // postings. Warm the index while the original FRI mapping still exists.
+        dataset.delete("false").await.unwrap();
+        let stored = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let stored_fts = stored.iter().find(|i| i.name == "text_idx").unwrap();
+        assert_eq!(stored_fts.uuid, index_uuid);
+        assert_eq!(stored_fts.fragment_bitmap.as_ref(), Some(coverage));
+        let before_cleanup = dataset.clone();
+        let original_fri = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert_eq!(original_fri.details.versions.len(), 1);
+        assert_partial_fts_results(&dataset, index_uuid, &expected_indexed, &expected_all).await;
+
+        // Once coverage no longer intersects the retired fragments or destination,
+        // cleanup can discard this mapping. The unchanged postings must still be
+        // restricted to live covered fragments, even when a deletion vector exists.
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let trimmed_fri = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert!(trimmed_fri.details.versions.is_empty());
+        assert_ne!(trimmed_fri.uuid, original_fri.uuid);
+        assert_partial_fts_results(&dataset, index_uuid, &expected_indexed, &expected_all).await;
+        assert_partial_fts_results(
+            &before_cleanup,
+            index_uuid,
+            &expected_indexed,
+            &expected_all,
+        )
+        .await;
     }
 
     #[tokio::test]
