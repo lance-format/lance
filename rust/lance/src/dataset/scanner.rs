@@ -23299,8 +23299,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             &mut fixture.dataset,
             CompactionOptions {
                 target_rows_per_fragment: 32,
-                excluded_fragment_ids: vec![0, 3],
-                // Different index coverage prevents merging F1/F2; force both rewrites.
+                excluded_fragment_ids: vec![0],
+                // Different index coverage prevents merging F1/F2; force rewrites after
+                // the excluded prefix so the compaction cannot become a no-op.
                 materialize_deletions_threshold: 0.0,
                 defer_index_remap,
                 ..Default::default()

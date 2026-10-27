@@ -916,9 +916,11 @@ async fn test_vector_overlay_fragment_search(
         let metrics = compact_files(
             &mut dataset,
             CompactionOptions {
-                target_rows_per_fragment: 32,
+                // Keep the short appended tail out of the candidate bin. Exclusions
+                // now only permit planning in the suffix after the last excluded ID.
+                target_rows_per_fragment: 1,
                 max_overlays_per_fragment: Some(0),
-                excluded_fragment_ids: vec![0, 2],
+                excluded_fragment_ids: vec![0],
                 ..Default::default()
             },
             None,
