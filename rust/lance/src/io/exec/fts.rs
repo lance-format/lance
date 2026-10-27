@@ -8122,7 +8122,9 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 279);
 
-        // Rewrite 101 indexed fragments together with 20 appended fragments.
+        let before_compaction = dataset.scan().try_into_batch().await.unwrap();
+        // A task must rewrite a contiguous range to preserve row order. Rewrite
+        // the last 101 indexed fragments together with 20 appended fragments.
         // The staged build covers only 101/121 inputs, so it cannot cover the destination.
         let options = CompactionOptions {
             target_rows_per_fragment: 1000,
@@ -8134,7 +8136,7 @@ mod tests {
                 fragments: dataset
                     .fragments()
                     .iter()
-                    .filter(|f| f.id < 101 || f.id >= 259)
+                    .filter(|f| f.id >= 158)
                     .cloned()
                     .collect(),
             },
@@ -8152,6 +8154,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            before_compaction
+        );
         let stored = read_manifest_indexes(
             &dataset.object_store,
             &dataset.manifest_location,
@@ -8225,9 +8231,9 @@ mod tests {
         let coverage = segments[0].fragment_bitmap.as_ref().unwrap();
         assert_eq!(coverage.len(), 158);
         assert!(!coverage.contains(new_fragment as u32));
-        assert!(coverage.iter().all(|id| (101..259).contains(&id)));
+        assert!(coverage.iter().all(|id| (0..158).contains(&id)));
         let index_uuid = segments[0].uuid;
-        let expected_indexed = (202..518)
+        let expected_indexed = (0..316)
             .filter(|id| !has_surviving_deletion || *id != 202)
             .collect::<Vec<_>>();
         let expected_all = (0..558)
