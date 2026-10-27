@@ -103,6 +103,7 @@ Each WAL entry is an Apache Arrow IPC stream file.
 The Arrow schema metadata includes:
 
 - `writer_epoch`: decimal string containing the writer epoch that created the entry.
+- `generation`: decimal string containing the memtable generation the entry's batches belong to. A flush drains one memtable, so an entry never spans two generations. A reader rebuilds generation boundaries from this value. Absent in WAL-only mode, which holds no memtable.
 - `fence_sentinel`: optional marker for a data-less fence sentinel entry.
 
 A normal WAL entry contains one or more record batches.
@@ -129,6 +130,7 @@ For example, position 5 is encoded as:
 
 An SSTable is the immutable result of flushing a MemTable.
 It is stored as a Lance dataset under its shard directory.
+Its table columns carry the base table's field ids as of the MemTable's schema, not ids numbered afresh, since readers and the compactor match them to the base table's columns by field id.
 
 !!! note
     Unlike a classic LSM sorted string table, a MemWAL SSTable is not sorted by key; random access is instead served by its BTree primary-key sidecar. It is called an SSTable because it is an immutable, persisted, indexed run.

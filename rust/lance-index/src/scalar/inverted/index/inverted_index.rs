@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::scalar::RowAddrTranslatorRef;
+use crate::scalar::inverted::documents::DocumentRemapping;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 
@@ -34,6 +35,9 @@ pub struct InvertedIndex {
     // Fragments which are contained in the index, but no longer in the dataset.
     // These should be pruned at search time since we don't prune them at update time.
     pub(super) deleted_fragments: RoaringBitmap,
+    /// Rows this segment may report, intersected into every mask it searches with.
+    /// See [`Self::with_allowed_rows`].
+    pub(super) allowed_rows: Option<Arc<RowAddrMask>>,
 }
 
 impl Debug for InvertedIndex {
@@ -146,11 +150,32 @@ impl InvertedIndex {
         &self.deleted_fragments
     }
 
+    /// Only report rows that `allowed` selects.
+    ///
+    /// A segment's postings describe rows as they were when it covered their fragments.
+    /// Under stable row ids a rewritten row keeps its row id while it moves to a fragment
+    /// another segment may cover, so the old segment still lists it under its old tokens
+    /// and a prefilter built over the union of all segments lets it through. The opener
+    /// passes the live rows currently stored in the fragments this segment covers.
+    pub fn with_allowed_rows(mut self, allowed: Arc<RowAddrMask>) -> Self {
+        self.allowed_rows = Some(allowed);
+        self
+    }
+
+    /// The mask this segment searches with: `mask` restricted to its allowed rows.
+    pub(crate) fn restrict_mask(&self, mask: Arc<RowAddrMask>) -> Arc<RowAddrMask> {
+        match &self.allowed_rows {
+            None => mask,
+            Some(allowed) if mask.is_select_all() => allowed.clone(),
+            Some(allowed) => Arc::new(mask.as_ref().clone() & allowed.as_ref().clone()),
+        }
+    }
+
     pub async fn merge_segments(
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<OldIndexDataFilter>],
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
@@ -190,7 +215,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version());
         let files = builder
-            .update_from_segments(new_data, dest_store, segments, old_data_filter)
+            .update_from_segments(new_data, dest_store, segments, old_data_filters)
             .await?;
 
         let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
@@ -204,13 +229,41 @@ impl InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Preserve shared decoded state without retaining request-owned readers.
+    pub(in super::super) fn cache_snapshot(&self) -> Result<Option<Self>> {
+        if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
+            return Ok(None);
+        }
+        let mut snapshot = self.clone();
+        snapshot.partitions = self
+            .partitions
+            .iter()
+            .map(|part| {
+                let Some(docs) = part.docs.modern() else {
+                    return Err(Error::internal("modern FTS partition has legacy documents"));
+                };
+                Ok(Arc::new(InvertedPartition {
+                    inverted_list: Arc::new(
+                        part.inverted_list
+                            .with_store(part.store.clone(), posting_file_path(part.id))?,
+                    ),
+                    docs: PartitionDocumentStore::Modern(Arc::new(
+                        docs.with_store(part.store.clone(), None),
+                    )),
+                    ..part.as_ref().clone()
+                }))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(snapshot))
+    }
+
     /// Rebind a modern index within its immutable index/fragment-reuse cache
     /// namespace. Only reader-free state crosses the request boundary; all
     /// future posting and document I/O uses the supplied store and remapper.
     pub(in super::super) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapping: Option<DocumentRemapping>,
     ) -> Result<Option<Self>> {
         if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
             return Ok(None);
@@ -230,7 +283,7 @@ impl InvertedIndex {
                         .with_store(store.clone(), posting_file_path(part.id))?,
                 ),
                 docs: PartitionDocumentStore::Modern(Arc::new(
-                    docs.with_store(store, frag_reuse_index.clone()),
+                    docs.with_store(store, remapping.clone()),
                 )),
                 token_set_format: part.token_set_format,
             }));
@@ -246,6 +299,7 @@ impl InvertedIndex {
             prewarm_state: self.prewarm_state.clone(),
             document_projections_resident: self.document_projections_resident.clone(),
             deleted_fragments: self.deleted_fragments.clone(),
+            allowed_rows: self.allowed_rows.clone(),
         }))
     }
 
@@ -313,6 +367,7 @@ impl InvertedIndex {
             prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
+            allowed_rows: None,
         }))
     }
 
@@ -382,6 +437,7 @@ impl InvertedIndex {
             prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
+            allowed_rows: None,
         }))
     }
 
@@ -406,14 +462,68 @@ impl InvertedIndex {
     /// Read only the index's [`InvertedIndexParams`],
     /// Contains more complete info than manifest's lossy `InvertedIndexDetails`.
     pub async fn load_params(store: &dyn IndexStore) -> Result<InvertedIndexParams> {
+        Ok(Self::load_params_with_metadata(store).await?.0)
+    }
+
+    /// Recover training parameters without opening the index's partitions.
+    ///
+    /// Reads the tokenizer parameters and physical posting format from the
+    /// index files. `document_granularity` must come from the segment's manifest
+    /// details, since it is not stored in the tokenizer parameters. Build-time
+    /// resource settings such as worker counts and memory limits are not retained.
+    ///
+    /// ```
+    /// use lance_index::scalar::{IndexStore, inverted::{DocumentGranularity, InvertedIndex}};
+    /// # async fn example(store: &dyn IndexStore) -> lance_core::Result<()> {
+    /// let params = InvertedIndex::load_training_params(store, DocumentGranularity::Row).await?;
+    /// assert_eq!(params.index_type, "inverted");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn load_training_params(
+        store: &dyn IndexStore,
+        document_granularity: DocumentGranularity,
+    ) -> Result<ScalarIndexParams> {
+        let (params, metadata_reader) = Self::load_params_with_metadata(store).await?;
+        let format_version = match metadata_reader {
+            Some(reader) => parse_format_version_from_metadata(&reader.schema().metadata)?,
+            None => InvertedListFormatVersion::V1,
+        };
+        Self::params_for_training(
+            params.document_granularity(document_granularity),
+            format_version,
+        )
+    }
+
+    fn params_for_training(
+        mut params: InvertedIndexParams,
+        format_version: InvertedListFormatVersion,
+    ) -> Result<ScalarIndexParams> {
+        if params.base_tokenizer.is_empty() {
+            // Empty tokenizer metadata only appears in legacy simple-tokenizer indices.
+            params.base_tokenizer = "simple".to_string();
+        }
+        params = params.format_version(format_version);
+        Ok(ScalarIndexParams {
+            index_type: BuiltinIndexType::Inverted.as_str().to_string(),
+            params: Some(params.to_training_json()?.to_string()),
+        })
+    }
+
+    async fn load_params_with_metadata(
+        store: &dyn IndexStore,
+    ) -> Result<(InvertedIndexParams, Option<Arc<dyn IndexReader>>)> {
         match store.open_index_file(METADATA_FILE).await {
             Ok(reader) => {
-                let params = reader
-                    .schema()
+                let schema = reader.schema();
+                let params = schema
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                Ok(serde_json::from_str::<InvertedIndexParams>(params)?)
+                Ok((
+                    serde_json::from_str::<InvertedIndexParams>(params)?,
+                    Some(reader),
+                ))
             }
             Err(metadata_error) => {
                 // Legacy format: params live in the tokens file (see
@@ -423,13 +533,14 @@ impl InvertedIndex {
                 let Ok(reader) = store.open_index_file(TOKENS_FILE).await else {
                     return Err(metadata_error);
                 };
-                Ok(reader
+                let params = reader
                     .schema()
                     .metadata
                     .get("tokenizer")
                     .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
                     .transpose()?
-                    .unwrap_or_default())
+                    .unwrap_or_default();
+                Ok((params, None))
             }
         }
     }
@@ -537,6 +648,7 @@ impl InvertedIndex {
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
+                    allowed_rows: None,
                 }))
             }
             Err(_) => {
@@ -649,6 +761,7 @@ impl InvertedIndex {
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
+                    allowed_rows: None,
                 }))
             }
             Err(_) => {
@@ -709,7 +822,16 @@ impl Index for InvertedIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
+        // The posting lists store row ids (trained with `with_row_id`), which
+        // no longer identify a fragment once stable row ids are enabled; the
+        // fragment bitmap recorded in the index metadata is authoritative.
+        // Return not_supported like MinHash LSH rather than derive a wrong set
+        // (`migrate_indices` handles the error without failing the commit).
+        Err(Error::not_supported(
+            "inverted indices do not recalculate fragment coverage from their files; \
+             the fragment bitmap of the index metadata is authoritative"
+                .to_string(),
+        ))
     }
 }
 
@@ -1017,18 +1139,6 @@ impl ScalarIndex for InvertedIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let mut params = self.params.clone();
-        if params.base_tokenizer.is_empty() {
-            // Empty tokenizer metadata only appears in legacy simple-tokenizer indexes.
-            params.base_tokenizer = "simple".to_string();
-        }
-        params = params.format_version(self.format_version());
-
-        let params_json = params.to_training_json()?.to_string();
-
-        Ok(ScalarIndexParams {
-            index_type: BuiltinIndexType::Inverted.as_str().to_string(),
-            params: Some(params_json),
-        })
+        Self::params_for_training(self.params.clone(), self.format_version())
     }
 }

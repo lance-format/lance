@@ -85,6 +85,21 @@ message DataFragment {
    * `deletion_file.num_deleted_rows` from this value.
    */
   uint64 physical_rows = 4;
+
+  /* Optional reference to a clustering definition in the same manifest.
+   * References the clustering definition used to organize this fragment when it was created.
+   * When present, the ID must be non-zero. Requires FLAG_OBJECT_METADATA (1 << 17)
+   * in writer_feature_flags; no clustering reader flag is required.
+   */
+  optional uint32 clustering_id = 15;
+
+  /* Arbitrary metadata associated with this fragment, like Manifest.table_metadata.
+   * Entries must remain valid after operations on the same fragment, including
+   * column replacement, overlays, and deletions. Those operations preserve all
+   * entries, including unknown keys. New fragments do not inherit entries automatically.
+   * Requires writer flag 1 << 17 while this map is nonempty.
+   */
+  map<string, string> metadata = 16;
 }
 
 message DataFile {
@@ -180,6 +195,21 @@ message DataFile {
    * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
    */
   optional uint32 base_id = 7;
+
+  /* Size in bytes of the file's metadata suffix, or 0 if unknown.
+   *
+   * For a Lance file of format version 2.0 or later, this is the file size minus
+   * the position of global buffer 0, which holds the file's `FileDescriptor`.
+   * That position is stored in the first entry of the global buffer offset
+   * table, which the footer locates. It is always 0 for legacy (0.1) files.
+   * Writers record either this exact value or 0.
+   *
+   * This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+   * bytes of the file before decoding the footer. The footer stays
+   * authoritative: readers must ignore a value larger than the file and read
+   * any metadata the footer references outside the hinted range.
+   */
+  uint64 file_metadata_size_bytes = 8;
 } // DataFile
 
 /* An overlay file supplies new values for a subset of (row offset, field) cells
@@ -301,6 +331,10 @@ message DeletionFile {
  * Valid only in a fragment whose data files are Lance v2 files. A legacy v1
  * data file has no `column_indices` to locate the column by, so a writer on a
  * dataset that stores v1 files leaves every sequence inline.
+ *
+ * This is a stable table-format feature. A manifest containing any column
+ * marker must set the spilled row lineage feature flag (bit 11) in both the
+ * reader and writer feature words.
  */
 message RowLineageColumn {}
 

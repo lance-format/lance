@@ -3,7 +3,7 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, new_empty_array};
+use arrow_array::{Array, ArrayRef, new_empty_array, new_null_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -23,7 +23,7 @@ use crate::{
     encodings::logical::primitive::{
         CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     },
-    format::ProtobufUtils21,
+    format::EncodingUtils,
     repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level},
 };
 
@@ -43,7 +43,7 @@ pub(crate) fn encode_constant_page(
         ))
     };
 
-    let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, inline_value);
+    let description = EncodingUtils::constant_layout(&repdef.def_meaning, inline_value);
 
     let has_repdef = repdef.repetition_levels.is_some() || repdef.definition_levels.is_some();
 
@@ -446,7 +446,11 @@ impl DecodeConstantTask {
         })
     }
 
-    fn materialize_values(&self, num_values: u64) -> Result<ArrayRef> {
+    /// Repeats the scalar once per visible item.  Items that are null (definition
+    /// level > 0) are materialized as nulls instead of copies of the scalar so that
+    /// a large scalar with many null slots does not amplify into an oversized array
+    /// (e.g. overflowing i32 offsets for utf8/binary).
+    fn materialize_values(&self, def: Option<&[u16]>, num_values: u64) -> Result<ArrayRef> {
         if num_values == 0 {
             return Ok(new_empty_array(self.scalar.data_type()));
         }
@@ -458,6 +462,22 @@ impl DecodeConstantTask {
                 num_values as usize,
                 None,
             )) as ArrayRef);
+        }
+
+        if let Some(def) = def
+            && self.scalar.null_count() == 0
+            && def.iter().any(|d| *d != 0 && *d <= self.max_visible_def)
+        {
+            let null_slot = new_null_array(self.scalar.data_type(), 1);
+            let source = arrow_select::concat::concat(&[self.scalar.as_ref(), null_slot.as_ref()])?;
+            let indices = arrow_array::UInt64Array::from(
+                def.iter()
+                    .filter(|d| **d <= self.max_visible_def)
+                    .map(|d| if *d == 0 { 0u64 } else { 1u64 })
+                    .collect::<Vec<_>>(),
+            );
+            debug_assert_eq!(indices.len() as u64, num_values);
+            return Ok(arrow_select::take::take(source.as_ref(), &indices, None)?);
         }
 
         let indices = arrow_array::UInt64Array::from(vec![0u64; num_values as usize]);
@@ -480,7 +500,7 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
             self.visible_items_total
         };
 
-        let values = self.materialize_values(visible_items_total)?;
+        let values = self.materialize_values(def.as_deref(), visible_items_total)?;
         let data = crate::data::DataBlock::from_array(values);
         let unraveler =
             RepDefUnraveler::new(rep, def, self.def_meaning.clone(), visible_items_total);

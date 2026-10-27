@@ -42,7 +42,7 @@ pub(in crate::index) async fn merge_segments(
         .unwrap_or(dataset.manifest.version);
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let (fragment_bitmap, filters) =
-        build_per_segment_filters(dataset, &segment_refs, staged).await?;
+        build_per_segment_filters(dataset, &segment_refs, staged, false).await?;
 
     let scalar_indices = try_join_all(segments.iter().map(|segment| {
         let field_path = &field_path;

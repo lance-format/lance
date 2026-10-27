@@ -36,8 +36,10 @@ A-encoding:
 A-format:
   - changed-files:
       - any-glob-to-any-file:
+          - "protos/clustering.proto"
           - "protos/encodings_v2_0.proto"
           - "protos/encodings_v2_1.proto"
+          - "protos/encodings_v2_3.proto"
           - "protos/file.proto"
           - "protos/file2.proto"
           - "protos/index.proto"
@@ -55,8 +57,10 @@ A-format:
 format-change:
   - changed-files:
       - any-glob-to-any-file:
+          - "protos/clustering.proto"
           - "protos/encodings_v2_0.proto"
           - "protos/encodings_v2_1.proto"
+          - "protos/encodings_v2_3.proto"
           - "protos/file.proto"
           - "protos/file2.proto"
           - "protos/index.proto"

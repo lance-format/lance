@@ -611,6 +611,7 @@ fn effective_posting_read_policy(
     inverted_list: &PostingListReader,
     requested_policy: PostingReadPolicy,
     group_demand_counts: &HashMap<(u32, u32), usize>,
+    has_expansions: bool,
     token_id: u32,
 ) -> PostingReadPolicy {
     if requested_policy == PostingReadPolicy::ReadAhead {
@@ -624,7 +625,11 @@ fn effective_posting_read_policy(
         demand_count.is_some(),
         "posting group {group:?} must have a demand count for token {token_id}"
     );
-    if demand_count == Some(1) {
+    // Keep alternatives coalesced, even when a fuzzy expansion covers only a
+    // small part of a group. Ordinary sparse terms need no such read ahead.
+    if demand_count.is_some_and(|count| {
+        count == 1 || (!has_expansions && count < ((group.1 - group.0) as usize).div_ceil(2))
+    }) {
         PostingReadPolicy::CacheAwareExact
     } else {
         PostingReadPolicy::ReadAhead
@@ -856,11 +861,37 @@ impl InvertedPartition {
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
-        let token_file = store.open_index_file(&token_file_path(id)).await?;
+        Self::load_with_paths(
+            store,
+            id,
+            &token_file_path(id),
+            &posting_file_path(id),
+            &doc_file_path(id),
+            frag_reuse_index,
+            index_cache,
+            token_set_format,
+        )
+        .await
+    }
+
+    /// Load a partition whose three files sit at explicit paths, such as a
+    /// staged partition that has not been renumbered into the final layout.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn load_with_paths(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        token_path: &str,
+        posting_path: &str,
+        docs_path: &str,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
+    ) -> Result<Self> {
+        let token_file = store.open_index_file(token_path).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
-        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
+        let invert_list_file = store.open_index_file(posting_path).await?;
         let mut inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
-        let docs_path = doc_file_path(id);
+        let docs_path = docs_path.to_string();
         let docs_reader = store.open_index_file(&docs_path).await?;
         let docs = PartitionDocuments::try_new(
             store.clone(),
@@ -1398,6 +1429,8 @@ impl InvertedPartition {
         token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
         token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
 
+        let has_expansions = token_ids.windows(2).any(|pair| pair[0].2 == pair[1].2);
+
         let group_demand_counts = if requested_read_policy == PostingReadPolicy::CacheAwareExact {
             posting_group_demand_counts(self.inverted_list.as_ref(), &token_ids)
         } else {
@@ -1413,6 +1446,7 @@ impl InvertedPartition {
                     self.inverted_list.as_ref(),
                     requested_read_policy,
                     &group_demand_counts,
+                    has_expansions,
                     token_id,
                 );
                 async move {

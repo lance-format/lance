@@ -41,7 +41,8 @@ pub use compound::{
 };
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
+use documents::DocumentRemapping;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
@@ -433,8 +434,9 @@ use crate::scalar::{
     CreatedIndex, RowIdRemapper, ScalarIndex,
     expression::{FtsQueryParser, ScalarQueryParser},
     registry::{
-        BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-        TrainingRequest, single_flight_store_bound_open,
+        BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin,
+        StoreBoundScalarIndexCacheEntry, TrainingCriteria, TrainingOrdering, TrainingRequest,
+        single_flight_store_bound_open_with_snapshot,
     },
 };
 
@@ -667,16 +669,87 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let rebind_store = index_store.clone();
-        single_flight_store_bound_open(index_store, cache, load, move |index| async move {
-            let index = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
-            index
-                .with_store(rebind_store, frag_reuse_index)
-                .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-        })
+        single_flight_store_bound_open_with_snapshot(
+            index_store,
+            cache,
+            load,
+            move |index| async move {
+                let index = index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
+                index
+                    .with_store(rebind_store, frag_reuse_index.map(DocumentRemapping::Sync))
+                    .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+            },
+            |index| self.cache_snapshot(index),
+        )
         .await
+    }
+
+    async fn put_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        let snapshot = self.cache_snapshot(index.as_ref())?;
+        cache
+            .insert_unsized_with_key(
+                &ScalarIndexCacheKey,
+                Arc::new(StoreBoundScalarIndexCacheEntry::with_snapshot(
+                    index_store,
+                    index,
+                    snapshot,
+                )),
+            )
+            .await;
+        Ok(())
+    }
+
+    fn cache_snapshot(&self, index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .cache_snapshot()
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    fn rebind_with_remapping(
+        &self,
+        index: &dyn ScalarIndex,
+        index_store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .with_store(index_store, remapping.map(DocumentRemapping::Batch))
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(entry) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await else {
+            return Ok(None);
+        };
+        if let Some(index) = entry.index_for_store(&index_store) {
+            return Ok(Some(index));
+        }
+        let index = entry.index();
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .with_store(index_store, frag_reuse_index.map(DocumentRemapping::Sync))
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {

@@ -10,9 +10,6 @@ description = "Arrow Extension for Lance"
 keywords.workspace = true
 categories.workspace = true
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -25,7 +22,7 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 half = { workspace = true }
-jsonb ={ workspace = true }
+lance-jsonb = { workspace = true }
 num-traits = { workspace = true }
 rand.workspace = true
 
