@@ -114,6 +114,14 @@ impl AwsStoreProvider {
         )
         .await?;
 
+        // Published object_store requires an explicit mechanism for conditional
+        // S3 copies. Multipart completion uses If-None-Match without replacing
+        // an existing destination; preserve provider-specific overrides.
+        resolved_s3_options
+            .options
+            .entry(AmazonS3ConfigKey::CopyIfNotExists)
+            .or_insert_with(|| "multipart".to_string());
+
         // Set S3Express flag if detected
         if is_s3_express {
             resolved_s3_options
@@ -705,10 +713,152 @@ mod tests {
     use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use aws_credential_types::provider::error::CredentialsError;
     use mock_instant::thread_local::MockClock;
-    use object_store::path::Path;
+    use object_store::{ObjectStoreExt, path::Path};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::default(None, false)]
+    #[case::explicit_multipart(Some("multipart"), false)]
+    #[case::existing_destination(None, true)]
+    #[tokio::test]
+    async fn test_s3_conditional_copy(
+        #[case] copy_option: Option<&str>,
+        #[case] destination_exists: bool,
+    ) {
+        let server = MockServer::start().await;
+        let metadata = ResponseTemplate::new(200)
+            .insert_header("content-length", "3")
+            .insert_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .insert_header("etag", "\"source\"");
+        Mock::given(method("HEAD"))
+            .and(path("/bucket/staging.lance"))
+            .respond_with(metadata.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bucket/final.lance"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "upload-1"))
+            .and(query_param("partNumber", "1"))
+            .and(header("x-amz-copy-source", "bucket/staging.lance"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<CopyPartResult><ETag>\"part\"</ETag></CopyPartResult>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let completion = if destination_exists {
+            ResponseTemplate::new(412).set_body_string(
+                "<Error><Code>PreconditionFailed</Code><Message>exists</Message></Error>",
+            )
+        } else {
+            ResponseTemplate::new(200).set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"destination\"</ETag></CompleteMultipartUploadResult>",
+            )
+        };
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "upload-1"))
+            .and(header("if-none-match", "*"))
+            .respond_with(completion)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/bucket/final.lance"))
+            .respond_with(metadata)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(u64::from(destination_exists))
+            .mount(&server)
+            .await;
+
+        let mut options = HashMap::from([
+            ("aws_access_key_id".into(), "test".into()),
+            ("aws_secret_access_key".into(), "test".into()),
+            ("aws_region".into(), "us-east-1".into()),
+            ("aws_endpoint".into(), server.uri()),
+            ("aws_allow_http".into(), "true".into()),
+        ]);
+        if let Some(value) = copy_option {
+            options.insert("aws_copy_if_not_exists".into(), value.into());
+        }
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "s3://bucket",
+            &params,
+        )
+        .await
+        .unwrap();
+        let result = store
+            .copy_if_not_exists(&Path::from("staging.lance"), &Path::from("final.lance"))
+            .await
+            .unwrap();
+        assert_eq!(result.size, 3);
+    }
+
+    #[tokio::test]
+    async fn test_s3_conditional_copy_preserves_explicit_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/bucket/final.lance"))
+            .and(header("x-amz-copy-source", "bucket/staging.lance"))
+            .and(header("custom-condition", "absent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<CopyObjectResult><ETag>\"destination\"</ETag></CopyObjectResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let options = StorageOptions(HashMap::from([
+            ("aws_access_key_id".into(), "test".into()),
+            ("aws_secret_access_key".into(), "test".into()),
+            ("aws_region".into(), "us-east-1".into()),
+            ("aws_endpoint".into(), server.uri()),
+            ("aws_allow_http".into(), "true".into()),
+            (
+                "aws_copy_if_not_exists".into(),
+                "header:custom-condition:absent".into(),
+            ),
+        ]));
+        let store = AwsStoreProvider
+            .build_amazon_s3_store(
+                &mut Url::parse("s3://bucket").unwrap(),
+                &ObjectStoreParams::default(),
+                &options,
+                ResolvedS3StorageOptions::new(options.as_s3_options(), None),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .copy_if_not_exists(&Path::from("staging.lance"), &Path::from("final.lance"))
+            .await
+            .unwrap();
+    }
 
     #[rstest::rstest]
     #[case::canonical("aws_region", "region")]
