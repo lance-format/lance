@@ -440,15 +440,19 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
       correctly by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Once the current build has touched the index this way, an older build
-      must no longer use it -- its format version has moved past what that
-      build supports -- but it must still answer every query correctly via
-      a full scan, and must not error out when writing to the dataset
-      afterwards.
+    - Readers released before 15.0.0b2 must ignore the updated index and
+      answer correctly via a full scan. Readers from 15.0.0b2 onward must
+      use it. Both must still be able to write to the dataset afterwards.
     """
 
     def __init__(self, path: Path):
         self.path = path
+
+    def _supports_row_address_index(self) -> bool:
+        # 15.0.0b2 is the first release containing the row-address format.
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "15.0.0b2"
+        )
 
     def create(self):
         """Create a stable-row-id dataset with a BITMAP index."""
@@ -485,10 +489,8 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
             )
 
     def check_read(self):
-        """An old-format index must be used by the current build; a
-        too-new one must be safely ignored (but answers must stay correct)
-        by an older build."""
-        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
 
     def check_write(self):
         """Insert a row and update the index, then verify old and new rows
@@ -629,15 +631,19 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
       correctly by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Once the current build has touched the index this way, an older build
-      must no longer use it -- its format version has moved past what that
-      build supports -- but it must still answer every query correctly via
-      a full scan, and must not error out when writing to the dataset
-      afterwards.
+    - Readers released before 15.0.0b2 must ignore the updated index and
+      answer correctly via a full scan. Readers from 15.0.0b2 onward must
+      use it. Both must still be able to write to the dataset afterwards.
     """
 
     def __init__(self, path: Path):
         self.path = path
+
+    def _supports_row_address_index(self) -> bool:
+        # 15.0.0b2 is the first release containing the row-address format.
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "15.0.0b2"
+        )
 
     def create(self):
         """Create a stable-row-id dataset with a LABEL_LIST index."""
@@ -676,10 +682,8 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
             )
 
     def check_read(self):
-        """An old-format index must be used by the current build; a
-        too-new one must be safely ignored (but answers must stay correct)
-        by an older build."""
-        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
 
     def check_write(self):
         """Insert a row and update the index, then verify old and new rows

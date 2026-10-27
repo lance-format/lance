@@ -7706,6 +7706,62 @@ async fn json_btree_dataset(initial_values: Vec<&str>, path: &str) -> Dataset {
 }
 
 #[tokio::test]
+async fn test_compaction_preserves_recorded_json_type() {
+    let mut dataset = json_btree_dataset(vec![r#"{"val": 1}"#, r#"{"val": 2}"#], "val").await;
+    let appended = json_batch(vec![r#"{"val": 3}"#, r#"{"val": 4}"#]);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let mut indices = dataset.load_indices_by_name("json_idx").await.unwrap();
+    let old_segment = indices[0].clone();
+    let old_id = old_segment.uuid;
+    let mut details: lance_index::pb::JsonIndexDetails =
+        indices[0].index_details.as_ref().unwrap().to_msg().unwrap();
+    details.target_data_type = lance_index::pb::JsonTargetDataType::Int64 as i32;
+    let details = prost_types::Any::from_msg(&details).unwrap();
+    indices[0].index_details = Some(Arc::new(details.clone()));
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: indices,
+            removed_indices: vec![old_segment],
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    let indices = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(indices[0].index_details.as_deref(), Some(&details));
+    assert_ne!(indices[0].uuid, old_id);
+    for indexed in [false, true] {
+        let mut scan = dataset.scan();
+        scan.use_scalar_index(indexed)
+            .filter("json_get_int(json, 'val') >= 2")
+            .unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 3);
+    }
+}
+
+#[tokio::test]
 async fn test_json_btree_index_statistics() {
     let dataset = json_btree_dataset(
         vec![r#"{"val": 1000}"#, r#"{"val": 2000}"#, r#"{"val": 3000}"#],

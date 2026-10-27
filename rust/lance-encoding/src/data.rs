@@ -1708,6 +1708,16 @@ fn encode_bitmap_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
 fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
     let value_type = arrays[0].as_any_dictionary().values().data_type();
     let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
+    // Arrow's concat reuses a dictionary only when every array shares the same one.  Otherwise
+    // it appends the dictionaries one after another, unless together they hold at least as
+    // many entries as there are rows or more than the keys can address.  Arrays that each
+    // carry their own copy of the same values, as the write queue's copies of one input do,
+    // would repeat them once per array, yet only need their keys concatenated.
+    if !shares_one_dictionary(&array_refs)
+        && let Some(concatenated) = concat_keys_of_equal_dictionaries(&array_refs)
+    {
+        return concatenated;
+    }
     match arrow_select::concat::concat(&array_refs) {
         Ok(array) => array,
         Err(arrow_schema::ArrowError::DictionaryKeyOverflowError) => {
@@ -1757,6 +1767,44 @@ fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
         // Shouldn't be any other possible errors in concat
         err => err.unwrap(),
     }
+}
+
+/// Whether every dictionary array uses the very same values (the same buffers, not merely
+/// equal ones), which is when Arrow's concat keeps a single copy of them.
+fn shares_one_dictionary(arrays: &[&dyn Array]) -> bool {
+    let first = arrays[0].as_any_dictionary().values().to_data();
+    arrays[1..]
+        .iter()
+        .all(|array| array.as_any_dictionary().values().to_data().ptr_eq(&first))
+}
+
+/// Concatenates the keys of dictionary arrays whose dictionaries hold equal values, keeping
+/// one copy of the dictionary.  Returns `None` when the dictionaries differ, or when Arrow's
+/// concat merges them itself (they hold at least as many entries as there are rows, or more
+/// than the keys can address), which keeps only the distinct entries the keys use.
+fn concat_keys_of_equal_dictionaries(arrays: &[&dyn Array]) -> Option<ArrayRef> {
+    let DataType::Dictionary(key_type, _) = arrays[0].data_type() else {
+        return None;
+    };
+    let values = arrays[0].as_any_dictionary().values();
+    let entries = values.len().saturating_mul(arrays.len());
+    let rows = arrays.iter().map(|array| array.len()).sum::<usize>();
+    if entries >= rows || entries as u64 > max_index_val(key_type) {
+        return None;
+    }
+    let values_data = values.to_data();
+    if !arrays[1..]
+        .iter()
+        .all(|array| array.as_any_dictionary().values().to_data() == values_data)
+    {
+        return None;
+    }
+    let keys = arrays
+        .iter()
+        .map(|array| array.as_any_dictionary().keys())
+        .collect::<Vec<_>>();
+    let keys = arrow_select::concat::concat(&keys).ok()?;
+    make_dictionary_array(keys, values.clone())
 }
 
 /// Concatenates the arrays decoded from consecutive pages of one column.
@@ -1920,8 +1968,7 @@ fn max_index_val(index_type: &DataType) -> u64 {
 // A simple way to do this today is to just concatenate all the arrays.  This is because
 // arrow's dictionary concatenation function already has the logic to merge dictionaries.
 //
-// TODO: We could be more efficient here by checking if the dictionaries are the same
-//       Also, if they aren't, we can possibly do something cheaper than concatenating
+// TODO: If the dictionaries differ, we can possibly do something cheaper than concatenating
 //
 // In addition, we want to normalize the representation of nulls.  The cheapest thing to
 // do (space-wise) is to put the nulls in the dictionary.
@@ -2650,6 +2697,33 @@ mod tests {
             items.offsets,
             LanceBuffer::reinterpret_vec(vec![0, 1, 2, 3, 4],)
         );
+    }
+
+    #[test]
+    fn test_dictionary_copies_of_one_dictionary_keep_one_copy() {
+        // Two batches with equal but separately allocated dictionaries
+        let arr1 = DictionaryArray::<Int8Type>::from_iter([Some("a"), Some("b"), Some("a")]);
+        let arr2 = DictionaryArray::<Int8Type>::from_iter([Some("a"), Some("b")]);
+
+        let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5);
+
+        let data = data.as_dictionary().unwrap();
+        assert_eq!(
+            data.indices.data,
+            LanceBuffer::reinterpret_vec::<i8>(vec![0, 1, 0, 0, 1])
+        );
+        let items = data.dictionary.as_variable_width().unwrap();
+        assert_eq!(items.data, LanceBuffer::copy_slice(b"ab"));
+
+        // Where Arrow merges the dictionaries itself (128 entries for 128 rows) it also
+        // collapses repeated values, which keeping one copy would not
+        let make = || -> ArrayRef {
+            let values = StringArray::from(vec!["same"; 64]);
+            let keys = Int8Array::from((0..64).collect::<Vec<i8>>());
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap())
+        };
+        let data = DataBlock::from_arrays(&[make(), make()], 128);
+        assert_eq!(data.as_dictionary().unwrap().dictionary.num_values(), 1);
     }
 
     fn all_int8_dictionary() -> DictionaryArray<Int8Type> {
