@@ -779,7 +779,7 @@ mod tests {
         Mock::given(method("HEAD"))
             .and(path("/bucket/final.lance"))
             .respond_with(metadata)
-            .expect(1)
+            .expect(u64::from(destination_exists))
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
