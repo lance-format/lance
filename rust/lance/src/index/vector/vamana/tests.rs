@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
@@ -1167,6 +1168,130 @@ async fn a_margin_stops_the_walks_through_deleted_rows() {
             "{found:?}"
         );
     }
+}
+
+/// Queries in flight together answer exactly as the same queries one at a
+/// time: the same rows at the same distances, to the bit, from 24, 12 and 4
+/// tasks on a runtime of four threads. Each round opens the dataset afresh,
+/// so that its first queries race to load the index into an empty cache, and
+/// the most tasks go first, onto data files no query has opened yet. The ten
+/// queries run three times over, so that one query is often in flight twice.
+/// Over full vectors, scalar codes scored again from their byte offsets,
+/// product codes scored again through take, and walks a margin stops, with
+/// and without deleted rows, which reach every walk as a prefilter. Half the
+/// rows keep each case within a second.
+#[rstest]
+#[case::full_vectors(Codes::Flat, DIM, None)]
+#[case::scalar_codes_scored_again_from_their_offsets(Codes::Sq, WIDE, None)]
+#[case::product_codes_scored_again_through_take(Codes::Pq, PQ_DIM, None)]
+#[case::walks_a_margin_stops(Codes::Sq, WIDE, Some(0.05))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queries_in_flight_together_answer_as_one_at_a_time(
+    #[case] codes: Codes,
+    #[case] dimension: u32,
+    #[case] stop_margin: Option<f32>,
+    #[values(false, true)] deleted: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = two_fragments_of_rows(dir.as_str(), ROWS / 2, dimension, false).await;
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some(INDEX.into()),
+            &params(codes, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    if deleted {
+        dataset.delete("id % 7 = 0").await.unwrap();
+    }
+    let queries = Arc::new(
+        queries_of(dimension)
+            .iter()
+            .cycle()
+            .take(30)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let mut rounds = Vec::new();
+    for tasks in [24, 12, 4, 1] {
+        let dataset = DatasetBuilder::from_uri(dir.as_str()).load().await.unwrap();
+        let (answers, most_in_flight) =
+            answers_together(Arc::new(dataset), queries.clone(), tasks, stop_margin).await;
+        rounds.push((tasks, answers, most_in_flight));
+    }
+    let (_, one_at_a_time, _) = rounds.pop().unwrap();
+    assert!(
+        one_at_a_time.iter().all(|found| found.len() == 10),
+        "{one_at_a_time:?}"
+    );
+    for (tasks, answers, most_in_flight) in rounds {
+        assert!(
+            most_in_flight > 1,
+            "{tasks} tasks never had two queries in flight"
+        );
+        for (query, (found, expected)) in answers.iter().zip(&one_at_a_time).enumerate() {
+            assert_eq!(found, expected, "query {query} from {tasks} tasks");
+        }
+    }
+}
+
+/// The answers to `queries` from `tasks` tasks, started together, each taking
+/// the next query as it finishes its last, with the distances as their bits;
+/// and the most queries that were in flight at once.
+async fn answers_together(
+    dataset: Arc<Dataset>,
+    queries: Arc<Vec<Float32Array>>,
+    tasks: usize,
+    stop_margin: Option<f32>,
+) -> (Vec<Vec<(u64, u32)>>, usize) {
+    let next = Arc::new(AtomicUsize::new(0));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let most_in_flight = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(tokio::sync::Barrier::new(tasks));
+    let handles = (0..tasks)
+        .map(|_| {
+            let dataset = dataset.clone();
+            let queries = queries.clone();
+            let next = next.clone();
+            let in_flight = in_flight.clone();
+            let most_in_flight = most_in_flight.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                let mut answers = Vec::new();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(query) = queries.get(index) else {
+                        break answers;
+                    };
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    most_in_flight.fetch_max(now, Ordering::SeqCst);
+                    let (found, _) = search(&dataset, query, 10, None, |scan| {
+                        if let Some(margin) = stop_margin {
+                            scan.ef(400).stop_margin(margin).unwrap();
+                        }
+                    })
+                    .await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let found = found
+                        .into_iter()
+                        .map(|(row_id, distance)| (row_id, distance.to_bits()))
+                        .collect::<Vec<_>>();
+                    answers.push((index, found));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut answers = vec![Vec::new(); queries.len()];
+    for handle in handles {
+        for (index, found) in handle.await.unwrap() {
+            answers[index] = found;
+        }
+    }
+    (answers, most_in_flight.load(Ordering::SeqCst))
 }
 
 /// A margin no walk can stop by is refused as invalid input when it is set,
