@@ -774,7 +774,7 @@ fn inner_create_lookup_planner(
         None => get_pk_columns(&dataset)?,
     };
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
-    // A sealed generation stores the names it was written with, so the planner
+    // A flushed generation stores the names it was written with, so the planner
     // resolves its columns by id; `base_schema` carries none. Built before the
     // collector takes the dataset.
     let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));

@@ -435,14 +435,11 @@ async fn do_commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
     session: Arc<Session>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
-    if !keep_field_ids {
-        canonicalize_non_reusable_field_ids(None, &mut transaction.operation, None)?;
-    } else if let Operation::Overwrite { schema, .. } = &transaction.operation {
-        // Canonicalization would have checked the schema it renumbered.
-        schema.validate()?;
+    if let Operation::Overwrite { schema, .. } = &mut transaction.operation {
+        crate::dataset::write::assign_new_table_field_ids(schema, inherited_field_ids)?;
         schema.verify_primary_key()?;
     }
     let transaction = &transaction;
@@ -788,7 +785,7 @@ pub(crate) async fn commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
     session: Arc<Session>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
@@ -801,7 +798,7 @@ pub(crate) async fn commit_new_dataset(
         manifest_naming_scheme,
         metadata_cache,
         session,
-        keep_field_ids,
+        inherited_field_ids,
     )
     .await
 }
@@ -857,21 +854,37 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     crate::dataset::versions::check_manifest_storage_version(manifest)
 }
 
-/// Reject a manifest in which two fragments share an id. Per-fragment state is
-/// keyed by fragment id — deletion file paths, cached row id sequences, row
-/// addresses — so a duplicate makes it ambiguous which rows that state describes.
+/// Reject a manifest in which fragment identities are ambiguous or out of order.
+/// Per-fragment state is keyed by fragment id — deletion file paths, cached row
+/// id sequences, row addresses — so a duplicate makes it ambiguous which rows
+/// that state describes.
 ///
 /// Runs after the legacy fixups above, so a dataset that needs a rollback for some
-/// other reason is diagnosed with that first. Relies on `build_manifest` leaving
-/// the fragments sorted by id.
+/// other reason is diagnosed with that first.
 fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
-    if let Some(pair) = manifest.fragments.windows(2).find(|p| p[0].id == p[1].id) {
+    let mut fragment_ids = HashSet::with_capacity(manifest.fragments.len());
+    if let Some(fragment) = manifest
+        .fragments
+        .iter()
+        .find(|fragment| !fragment_ids.insert(fragment.id))
+    {
         return Err(Error::invalid_input(format!(
             "The commit would produce two fragments with id {}. Fragment ids must be \
              unique. Datasets written by Lance 0.16 and earlier may already contain \
              duplicate ids; those have to be rewritten, or rolled back to a version \
              without the duplicate.",
-            pair[0].id
+            fragment.id
+        )));
+    }
+    if let Some(fragments) = manifest
+        .fragments
+        .windows(2)
+        .find(|fragments| fragments[0].id > fragments[1].id)
+    {
+        return Err(Error::invalid_input(format!(
+            "The commit would place fragment {} before lower fragment id {}. Fragment ids must \
+             remain sorted in increasing order",
+            fragments[0].id, fragments[1].id
         )));
     }
     Ok(())
@@ -892,9 +905,20 @@ pub(crate) fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     }
 
     // First, see which, if any fields have duplicate ids, within any fragment.
+    // Data file field lists are interned `Arc<[i32]>`s shared across fragments, so
+    // fragments whose files carry the same lists were already checked.
     let mut fields_with_duplicate_ids = HashSet::new();
     let mut seen_fields = HashSet::new();
+    let mut checked_field_lists: HashSet<Vec<usize>> = HashSet::new();
     for fragment in manifest.fragments.iter() {
+        let field_lists: Vec<usize> = fragment
+            .files
+            .iter()
+            .map(|file| file.fields.as_ptr() as usize)
+            .collect();
+        if !checked_field_lists.insert(field_lists) {
+            continue;
+        }
         for file in fragment.files.iter() {
             for field_id in file.fields.iter() {
                 if *field_id >= 0 && !seen_fields.insert(*field_id) {
@@ -1372,13 +1396,20 @@ pub(crate) async fn do_commit_detached_transaction(
                 let prepared =
                     prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
                         .await?;
-                transaction.build_manifest_prepared(
+                let (mut manifest, indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
                     &build_config,
                     None,
-                )?
+                )?;
+                crate::dataset::write::seeds::apply_seed_feature_flags(
+                    &mut manifest,
+                    &indices,
+                    dataset,
+                )
+                .await?;
+                (manifest, indices)
             }
         };
 
@@ -1878,13 +1909,20 @@ pub(crate) async fn commit_transaction(
                 let prepared =
                     prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
                         .await?;
-                attempt_transaction.build_manifest_prepared(
+                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &build_config,
                     read_version_state,
-                )?
+                )?;
+                crate::dataset::write::seeds::apply_seed_feature_flags(
+                    &mut manifest,
+                    &indices,
+                    &dataset,
+                )
+                .await?;
+                (manifest, indices)
             }
         };
 
@@ -2122,6 +2160,24 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[test]
+    fn test_check_fragment_ids_requires_sorted_order() {
+        let manifest = Manifest::new(
+            Schema::try_from(&ArrowSchema::empty()).unwrap(),
+            Arc::new(vec![Fragment::new(5), Fragment::new(2)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let error = check_fragment_ids(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Fragment ids must remain sorted in increasing order")
+        );
+    }
 
     #[rstest::rstest]
     #[case::unset(None, DEFAULT_COMMIT_RETRY_TIMEOUT)]
@@ -3943,6 +3999,70 @@ mod tests {
         let err = check_storage_version(&mut manifest).unwrap_err();
 
         assert!(err.to_string().contains("Non-leaf field"), "{err}");
+    }
+
+    #[test]
+    fn test_fix_schema_checks_distinct_field_lists_after_shared_ones() {
+        // Fragments sharing interned field lists are scanned once; a later
+        // fragment with a distinct duplicate-id list must still be remapped.
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let mut field1 =
+            Field::try_from(ArrowField::new("b", arrow_schema::DataType::Int64, false)).unwrap();
+        field1.set_id(-1, &mut 1);
+        let schema = Schema {
+            fields: vec![field0.clone(), field1.clone()],
+            metadata: Default::default(),
+        };
+
+        let shared_a = DataFile::new_legacy_from_fields("a.lance", vec![0], None);
+        let shared_b = DataFile::new_legacy_from_fields("b.lance", vec![1], None);
+        let make_fragment = |id: u64, files: Vec<DataFile>| Fragment {
+            id,
+            files,
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let fragments = vec![
+            make_fragment(0, vec![shared_a.clone(), shared_b.clone()]),
+            make_fragment(1, vec![shared_a.clone(), shared_b]),
+            make_fragment(
+                2,
+                vec![
+                    shared_a,
+                    DataFile::new_legacy_from_fields("dup.lance", vec![0, 1], None),
+                ],
+            ),
+        ];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        fix_schema(&mut manifest).unwrap();
+
+        // Field 0 is duplicated only in fragment 2 -> remapped to max_field_id + 1 = 2.
+        field0.id = 2;
+        let expected_schema = Schema {
+            fields: vec![field0, field1],
+            metadata: Default::default(),
+        };
+        assert_eq!(manifest.schema, expected_schema);
+        // Shared lists in fragments 0/1 are remapped too; fragment 2's first
+        // file only held the old id and is dropped as no longer in use.
+        assert_eq!(manifest.fragments[0].files[0].fields.as_ref(), &[2]);
+        assert_eq!(manifest.fragments[0].files[1].fields.as_ref(), &[1]);
+        let frag2 = &manifest.fragments[2];
+        assert_eq!(frag2.files.len(), 1);
+        assert_eq!(frag2.files[0].path, "dup.lance");
+        assert_eq!(frag2.files[0].fields.as_ref(), &[2, 1]);
     }
 
     #[test]

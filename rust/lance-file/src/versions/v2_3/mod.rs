@@ -22,9 +22,8 @@ use lance_encoding::{
         ColumnIndexSequence, EncodedBatch, FieldEncoder, FieldEncodingContext,
         FieldEncodingStrategy,
         structural::{
-            PrimitiveFieldEncoding, PrimitivePageEncoding, try_create_binary_blob, try_create_list,
-            try_create_map, try_create_struct, try_create_structural_blob,
-            try_create_structural_fixed_size_list,
+            PrimitiveFieldEncoding, PrimitivePageEncoding, try_create_list, try_create_map,
+            try_create_struct, try_create_structural_blob, try_create_structural_fixed_size_list,
         },
     },
 };
@@ -79,10 +78,15 @@ impl FieldEncodingStrategy for FieldStrategy {
         column_index: &mut ColumnIndexSequence,
         context: &FieldEncodingContext<'_>,
     ) -> Result<Box<dyn FieldEncoder>> {
-        if let Some(encoder) =
-            try_create_binary_blob(&self.primitive, field, column_index, context)?
+        if field.is_blob()
+            && matches!(
+                field.data_type(),
+                arrow_schema::DataType::Binary | arrow_schema::DataType::LargeBinary
+            )
         {
-            return Ok(encoder);
+            return Err(Error::invalid_input(
+                "Lance 2.3 does not write Blob v1 pages; use a Blob v2 descriptor struct",
+            ));
         }
         if let Some(encoder) =
             try_create_structural_blob(&self.primitive, field, column_index, context)?
@@ -130,11 +134,7 @@ impl FieldEncodingStrategy for FieldStrategy {
 pub fn encoding_strategy(params: CompressionParams) -> Arc<dyn FieldEncodingStrategy> {
     let compression = Arc::new(compression::Strategy::new(params));
     Arc::new(FieldStrategy {
-        primitive: PrimitiveFieldEncoding::new([
-            PrimitivePageEncoding::sparse(compression.clone()),
-            PrimitivePageEncoding::constant(),
-            PrimitivePageEncoding::dense_u32(compression),
-        ]),
+        primitive: PrimitiveFieldEncoding::new([PrimitivePageEncoding::planar(compression)]),
     })
 }
 

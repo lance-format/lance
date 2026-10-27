@@ -29,8 +29,8 @@ use std::str::FromStr;
 use crate::compression::{BlockCompressor, BlockDecompressor, require_block_payload};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
-    ProtobufUtils21,
-    pb21::{self, CompressiveEncoding},
+    EncodingUtils,
+    metadata::{self, CompressiveEncoding},
 };
 use crate::{
     buffer::LanceBuffer,
@@ -79,7 +79,7 @@ pub enum CompressionScheme {
     Lz4,
 }
 
-impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
+impl TryFrom<CompressionScheme> for metadata::CompressionScheme {
     type Error = Error;
 
     fn try_from(scheme: CompressionScheme) -> Result<Self> {
@@ -94,13 +94,13 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
     }
 }
 
-impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
+impl TryFrom<metadata::CompressionScheme> for CompressionScheme {
     type Error = Error;
 
-    fn try_from(scheme: pb21::CompressionScheme) -> Result<Self> {
+    fn try_from(scheme: metadata::CompressionScheme) -> Result<Self> {
         match scheme {
-            pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
-            pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
+            metadata::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
+            metadata::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
             _ => Err(Error::invalid_input(format!(
                 "Unsupported compression scheme: {:?}",
                 scheme
@@ -672,7 +672,7 @@ impl CompressedBufferEncoder {
         })
     }
 
-    pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
+    pub fn from_scheme(scheme: metadata::CompressionScheme) -> Result<Self> {
         let scheme = CompressionScheme::try_from(scheme)?;
         let block_compression = CompressionConfig {
             scheme,
@@ -717,8 +717,11 @@ impl CompressedBufferEncoder {
         for off in offsets.windows(2) {
             let start = off[0].as_usize();
             let end = off[1].as_usize();
-            self.compressor
-                .decompress(&data[start..end], decompressed)?;
+            // Full-zip omits null payloads; LZ4 rejects empty input.
+            if start < end {
+                self.compressor
+                    .decompress(&data[start..end], decompressed)?;
+            }
             new_offsets.push(T::from_usize(decompressed.len()).unwrap());
         }
 
@@ -761,12 +764,9 @@ impl PerValueCompressor for CompressedBufferEncoder {
 
         // TODO: Support setting the level
         // TODO: Support underlying compression of data (e.g. defer to binary encoding for offset bitpacking)
-        let encoding = ProtobufUtils21::wrapped(
+        let encoding = EncodingUtils::wrapped(
             self.compressor.config(),
-            ProtobufUtils21::variable(
-                ProtobufUtils21::flat(data.bits_per_offset as u64, None),
-                None,
-            ),
+            EncodingUtils::variable(EncodingUtils::flat(data.bits_per_offset as u64, None), None),
         )?;
 
         Ok((compressed, encoding))
@@ -806,7 +806,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         let (encoded, inner_encoding) = match data {
             DataBlock::FixedWidth(fixed_width) => (
                 fixed_width.data,
-                ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+                EncodingUtils::flat(fixed_width.bits_per_value, None),
             ),
             DataBlock::VariableWidth(variable_width) => {
                 // Wrap VariableEncoder to handle the encoding
@@ -834,7 +834,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         self.compressor.compress(&encoded, &mut compressed)?;
         Ok((
             Some(LanceBuffer::from(compressed)),
-            ProtobufUtils21::wrapped(self.block_compression, inner_encoding)?,
+            EncodingUtils::wrapped(self.block_compression, inner_encoding)?,
         ))
     }
 }
@@ -1307,6 +1307,33 @@ mod tests {
             assert!(output.is_empty());
         }
 
+        #[test]
+        fn test_lz4_per_value_decompress_skips_null_slots() {
+            let encoder = CompressedBufferEncoder::try_new(CompressionConfig {
+                scheme: CompressionScheme::Lz4,
+                level: None,
+            })
+            .unwrap();
+            let mut compressed = Vec::new();
+            let offsets = encoder
+                .per_value_compress::<u32>(b"abc", &[0, 3, 3], &mut compressed)
+                .unwrap();
+            let offsets = offsets.borrow_to_typed_slice::<u32>();
+            // Full-zip writes no payload for a null, so append an empty slot after the
+            // compressed "abc" and empty-string values.
+            let offsets = [offsets.as_ref(), &[compressed.len() as u32]].concat();
+
+            let mut decompressed = Vec::new();
+            let new_offsets = encoder
+                .per_value_decompress::<u32>(&compressed, &offsets, &mut decompressed)
+                .unwrap();
+            assert_eq!(decompressed, b"abc");
+            assert_eq!(
+                new_offsets.borrow_to_typed_slice::<u32>().as_ref(),
+                &[0, 3, 3, 3]
+            );
+        }
+
         #[rstest::rstest]
         #[test_log::test(tokio::test)]
         async fn test_lz4_compress_round_trip(
@@ -1338,10 +1365,15 @@ mod tests {
                 STRUCTURAL_ENCODING_FULLZIP.to_string(),
             );
             let field = field.with_metadata(field_meta);
+            let expected_encoding = if encoding == TestEncoding::StructuralSparse {
+                "lz4"
+            } else {
+                "zstd"
+            };
             let test_cases = TestCases::basic()
                 // Need to use large pages as small pages might be too small to compress
                 .with_page_sizes(vec![1024 * 1024])
-                .with_expected_encoding("zstd")
+                .with_expected_encoding(expected_encoding)
                 .with_encoding(encoding)
                 .with_slicing_modes([use_slicing]);
 

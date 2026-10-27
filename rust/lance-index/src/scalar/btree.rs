@@ -15,9 +15,9 @@ use std::{
 };
 
 use super::{
-    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
-    compute_next_prefix,
+    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, LOOKUP_BATCH_SIZE,
+    MetricsCollector, OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams,
+    SearchOptions, SearchResult, compute_next_prefix, lookup_batch,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::scalar::registry::TrainingCriteria;
@@ -39,7 +39,8 @@ use crate::{
 };
 use arrow_arith::numeric::add;
 use arrow_array::{
-    Array, ArrayAccessor, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
+    Array, ArrayAccessor, ArrayRef, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
+    UInt64Array,
     cast::AsArray,
     new_empty_array,
     types::{
@@ -50,17 +51,19 @@ use arrow_array::{
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::{
-    ExecutionPlan, SendableRecordBatchStream,
-    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec,
-};
+use datafusion_common::hash_utils::{RandomState, with_hashes};
 use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
+use datafusion_physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream,
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec,
+};
+use futures::{Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
+use hashbrown::{HashTable, hash_table::Entry};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -74,7 +77,7 @@ use lance_core::{
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
 };
-use lance_datafusion::{
+use lance_datafusion_exec::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
@@ -1222,7 +1225,7 @@ impl BTreeLookup {
     }
 }
 
-/// Pages read and materialized together per chunk of [`BTreeIndex::search_missing_pages`].
+/// Pages read and materialized together per chunk of [`BTreeIndex::evaluate_missing_pages`].
 ///
 /// Loading pages one at a time costs a request per page, which dominates any
 /// query whose predicate spans many pages: a range covering most of a column
@@ -1641,6 +1644,116 @@ impl CacheKey for BTreeIndexStateKey {
     }
 }
 
+/// Lookup keys grouped by value, so a page value finds the positions of every
+/// key equal to it with one hash probe.
+///
+/// This is the hash set behind DataFusion's generic IN-list filter, except each
+/// entry carries its key positions: an IN-list only says whether a value
+/// matched, and recovering which keys it matched would take a second lookup.
+/// Keys are grouped, and page values matched, with comparators from the same
+/// `make_comparator` ordering, so grouping and matching cannot disagree.
+struct KeysByValue {
+    keys: ArrayRef,
+    random_state: RandomState,
+    /// `(hash, index into groups)` of each distinct key value.
+    table: HashTable<(u64, u32)>,
+    /// For each distinct key value, the positions in `keys` of every key equal
+    /// to it, ascending.
+    groups: Vec<Vec<u32>>,
+}
+
+/// The rows of one page that matched lookup keys, each with the index of its
+/// key group in [`KeysByValue::groups`]. One entry per row, however many
+/// keys share its value, so a page's matches stay as small as the page.
+struct PageKeyMatches {
+    rows: Vec<u64>,
+    groups: Vec<u32>,
+}
+
+impl KeysByValue {
+    /// Group the non-null entries of `keys` by value; null keys match nothing.
+    fn try_new(keys: ArrayRef) -> Result<Self> {
+        let random_state = RandomState::default();
+        let mut table: HashTable<(u64, u32)> = HashTable::new();
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let key_eq = make_comparator(&keys, &keys, SortOptions::default())?;
+        with_hashes([&keys], &random_state, |hashes| {
+            for idx in (0..keys.len()).filter(|idx| keys.is_valid(*idx)) {
+                let hash = hashes[idx];
+                match table.entry(
+                    hash,
+                    |&(_, group)| key_eq(groups[group as usize][0] as usize, idx).is_eq(),
+                    |&(hash, _)| hash,
+                ) {
+                    Entry::Occupied(entry) => groups[entry.get().1 as usize].push(idx as u32),
+                    Entry::Vacant(entry) => {
+                        entry.insert((hash, groups.len() as u32));
+                        groups.push(vec![idx as u32]);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            keys,
+            random_state,
+            table,
+            groups,
+        })
+    }
+
+    /// The page rows whose value equals some key.
+    fn match_page(&self, values: &ArrayRef, rows: &UInt64Array) -> Result<PageKeyMatches> {
+        let value_eq = make_comparator(values, &self.keys, SortOptions::default())?;
+        let mut matches = PageKeyMatches {
+            rows: Vec::new(),
+            groups: Vec::new(),
+        };
+        with_hashes([values], &self.random_state, |hashes| {
+            for idx in (0..values.len()).filter(|idx| values.is_valid(*idx)) {
+                if let Some(&(_, group)) = self.table.find(hashes[idx], |&(_, group)| {
+                    value_eq(idx, self.groups[group as usize][0] as usize).is_eq()
+                }) {
+                    matches.rows.push(rows.value(idx));
+                    matches.groups.push(group);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(matches)
+    }
+
+    /// Lookup batches of at most [`LOOKUP_BATCH_SIZE`] rows pairing each
+    /// matched row with every key position in its group, built as they are
+    /// consumed.
+    fn expand(
+        self: Arc<Self>,
+        matches: PageKeyMatches,
+        results_are_row_addresses: bool,
+    ) -> impl Iterator<Item = Result<RecordBatch>> {
+        let mut next_match = 0;
+        let mut next_position = 0;
+        std::iter::from_fn(move || {
+            let mut key_indices = Vec::new();
+            let mut rows = Vec::new();
+            while key_indices.len() < LOOKUP_BATCH_SIZE && next_match < matches.rows.len() {
+                let positions = &self.groups[matches.groups[next_match] as usize];
+                let taken =
+                    (positions.len() - next_position).min(LOOKUP_BATCH_SIZE - key_indices.len());
+                key_indices.extend_from_slice(&positions[next_position..next_position + taken]);
+                rows.extend(std::iter::repeat_n(matches.rows[next_match], taken));
+                next_position += taken;
+                if next_position == positions.len() {
+                    next_match += 1;
+                    next_position = 0;
+                }
+            }
+            (!key_indices.is_empty())
+                .then(|| lookup_batch(results_are_row_addresses, key_indices, rows))
+        })
+    }
+}
+
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
 /// for faster lookup
 #[derive(Clone, Debug)]
@@ -1821,7 +1934,7 @@ impl BTreeIndex {
     ///
     /// Probing the cache for the whole page set before loading any of it is
     /// what lets the misses be read together: within
-    /// [`Self::search_missing_pages`], sorting means each chunk's ranges are
+    /// [`Self::evaluate_missing_pages`], sorting means each chunk's ranges are
     /// ascending and disjoint, which is what lets the reader merge neighbours
     /// into shared requests. The answer is a snapshot and may be stale by the
     /// time a page is actually read (evicted by then, or already loaded by a
@@ -1848,7 +1961,7 @@ impl BTreeIndex {
         (cached, missing)
     }
 
-    /// Read, cache, and search every page in `missing`,
+    /// Read, cache, and evaluate every page in `missing`,
     /// [`PAGE_PREFETCH_CHUNK_SIZE`] pages at a time.
     ///
     /// `missing` must be sorted by page id (as returned by
@@ -1856,7 +1969,7 @@ impl BTreeIndex {
     /// and disjoint, which is what lets [`IndexReader::read_record_batches`]
     /// merge neighbours into shared requests.
     ///
-    /// A page is searched with the [`FlatIndex`] this call itself just built,
+    /// A page is evaluated with the [`FlatIndex`] this call itself just built,
     /// not with a follow-up cache lookup: without a warm, big-enough index
     /// cache (no cache configured, or a chunk larger than the cache's
     /// capacity) the page could already be evicted by the time a later step
@@ -1864,7 +1977,7 @@ impl BTreeIndex {
     /// wide search cost *more* I/O than reading pages one at a time. The page
     /// is still offered to the cache (so a concurrent or later query can
     /// reuse it), but this call never depends on that succeeding. Each
-    /// chunk's materialized pages are searched and dropped before the next
+    /// chunk's materialized pages are evaluated and dropped before the next
     /// chunk is read, which is what bounds peak memory to the chunk size
     /// rather than the whole query.
     ///
@@ -1872,15 +1985,13 @@ impl BTreeIndex {
     /// number of chunks a query actually took (as opposed to the number of
     /// pages it materialized, via `record_parts_loaded`) is visible to
     /// callers without needing `MetricsCollector::io_stats`.
-    async fn search_missing_pages(
+    async fn evaluate_missing_pages<T: Send>(
         &self,
         missing: &[Matches],
         index_reader: &LazyIndexReader,
-        query: &SargableQuery,
-        prebuilt: Option<&Arc<dyn PhysicalExpr>>,
-        track_nulls: bool,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<PageMatches>> {
+        evaluate: &(impl Fn(&FlatIndex, Matches) -> Result<T> + Sync),
+    ) -> Result<Vec<T>> {
         let mut results = Vec::with_capacity(missing.len());
         for chunk in missing.chunks(PAGE_PREFETCH_CHUNK_SIZE) {
             let reader = index_reader.get().await?;
@@ -1918,20 +2029,13 @@ impl BTreeIndex {
                         } else {
                             metrics.record_index_cache_miss();
                         }
-                        Self::evaluate_page_matches(
-                            &subindex,
-                            matches,
-                            query,
-                            prebuilt,
-                            track_nulls,
-                            metrics,
-                        )
+                        evaluate(&subindex, matches)
                     });
             // Bounded the same way the cached-page pipeline is, but only
             // within a chunk - chunks themselves run one at a time (the `for`
             // loop above), which is what keeps peak memory capped at one
             // chunk's pages instead of the whole missing set.
-            let chunk_results: Vec<PageMatches> = stream::iter(page_tasks)
+            let chunk_results: Vec<T> = stream::iter(page_tasks)
                 .buffered(get_num_compute_intensive_cpus())
                 .try_collect()
                 .await?;
@@ -2024,15 +2128,18 @@ impl BTreeIndex {
         }))
     }
 
+    fn page_schema(&self) -> Schema {
+        Schema::new(vec![
+            Field::new(BTREE_VALUES_COLUMN, self.data_type.clone(), true),
+            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+        ])
+    }
+
     /// Compile a sargable predicate into a physical expr against the per-page
     /// schema ([values, ids]). Built once in `search` and shared across pages so
     /// a large IN-list is not re-materialized for every page.
     fn compile_predicate(&self, query: &SargableQuery) -> Result<Arc<dyn PhysicalExpr>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(BTREE_VALUES_COLUMN, self.data_type.clone(), true),
-            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
-        ]));
-        let df_schema = DFSchema::try_from(schema)?;
+        let df_schema = DFSchema::try_from(self.page_schema())?;
         Ok(create_physical_expr(
             &query.to_expr(BTREE_VALUES_COLUMN.to_string()),
             &df_schema,
@@ -2040,26 +2147,90 @@ impl BTreeIndex {
         )?)
     }
 
-    async fn search_page(
+    /// Load every page in `pages` and run `evaluate` on each.
+    ///
+    /// The whole page set is decided before any of it is loaded, so the pages
+    /// that are not cached can be fetched together rather than one request
+    /// each - in fixed-size chunks (PAGE_PREFETCH_CHUNK_SIZE), so peak memory
+    /// and in-flight I/O stay bounded instead of growing with the query. A
+    /// missing page is evaluated as soon as its chunk is read, not via a
+    /// follow-up cache lookup, so a small or absent index cache still gets the
+    /// coalesced I/O (see `evaluate_missing_pages`).
+    async fn evaluate_pages<T: Send>(
         &self,
-        query: &SargableQuery,
-        matches: Matches,
-        index_reader: LazyIndexReader,
-        prebuilt: Option<&Arc<dyn PhysicalExpr>>,
-        track_nulls: bool,
+        pages: Vec<Matches>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<PageMatches> {
-        let subindex = self
-            .lookup_page(matches.page_id(), index_reader, metrics)
-            .await?;
-        Self::evaluate_page_matches(&subindex, matches, query, prebuilt, track_nulls, metrics)
+        evaluate: impl Fn(&FlatIndex, Matches) -> Result<T> + Send + Sync,
+    ) -> Result<Vec<T>> {
+        self.evaluate_pages_stream(pages, metrics, evaluate)
+            .try_collect()
+            .await
+    }
+
+    /// [`Self::evaluate_pages`], yielding each page's result as soon as it is
+    /// evaluated so callers need not hold every page's result at once.
+    fn evaluate_pages_stream<'a, T: Send + 'a>(
+        &'a self,
+        pages: Vec<Matches>,
+        metrics: &'a dyn MetricsCollector,
+        evaluate: impl Fn(&FlatIndex, Matches) -> Result<T> + Send + Sync + 'a,
+    ) -> BoxStream<'a, Result<T>> {
+        let evaluate = Arc::new(evaluate);
+        stream::once(async move {
+            let lazy_index_reader =
+                LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+            let (cached_pages, missing_pages) = self.partition_cached_pages(pages).await;
+            debug!(
+                "Evaluating {} btree pages ({} prefetched)",
+                cached_pages.len() + missing_pages.len(),
+                missing_pages.len()
+            );
+
+            let missing_chunks = missing_pages
+                .chunks(PAGE_PREFETCH_CHUNK_SIZE)
+                .map(<[Matches]>::to_vec)
+                .collect::<Vec<_>>();
+            let missing_results = stream::iter(missing_chunks)
+                .then({
+                    let index_reader = lazy_index_reader.clone();
+                    let evaluate = evaluate.clone();
+                    move |chunk| {
+                        let index_reader = index_reader.clone();
+                        let evaluate = evaluate.clone();
+                        async move {
+                            self.evaluate_missing_pages(
+                                &chunk,
+                                &index_reader,
+                                metrics,
+                                evaluate.as_ref(),
+                            )
+                            .await
+                        }
+                    }
+                })
+                .map_ok(|results| stream::iter(results.into_iter().map(Ok)))
+                .try_flatten();
+            let cached_results = stream::iter(cached_pages)
+                .map(move |matches| {
+                    let index_reader = lazy_index_reader.clone();
+                    let evaluate = evaluate.clone();
+                    async move {
+                        let subindex = self
+                            .lookup_page(matches.page_id(), index_reader, metrics)
+                            .await?;
+                        evaluate(&subindex, matches)
+                    }
+                })
+                // I/O and compute mixed here but important case is index in cache so
+                // use compute intensive thread count
+                .buffered(get_num_compute_intensive_cpus());
+            missing_results.chain(cached_results)
+        })
+        .flatten()
+        .boxed()
     }
 
     /// Evaluate `matches` against an already-loaded page.
-    ///
-    /// Shared by [`Self::search_page`] (page already resident, from cache or
-    /// a single-page read) and [`Self::search_missing_pages`] (page just
-    /// built from a prefetch chunk), so both paths score a page the same way.
     ///
     /// Each page hands back plain id arrays; the caller assembles the final
     /// `RowAddrTreeMap` once across all pages (see `search_with_options`).
@@ -2794,54 +2965,19 @@ impl ScalarIndex for BTreeIndex {
             _ => None,
         };
 
-        let lazy_index_reader =
-            LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
-        // Decide the whole page set before loading any of it, so the pages
-        // that are not cached can be fetched together rather than one
-        // request each - in fixed-size chunks (PAGE_PREFETCH_CHUNK_SIZE), so
-        // peak memory and in-flight I/O stay bounded instead of growing with
-        // the query. A missing page is searched as soon as its chunk is
-        // read, not via a follow-up cache lookup, so a small or absent index
-        // cache still gets the coalesced I/O (see `search_missing_pages`).
-        let (cached_pages, missing_pages) = self.partition_cached_pages(pages).await;
-        let missing_results = self
-            .search_missing_pages(
-                &missing_pages,
-                &lazy_index_reader,
-                query,
-                prebuilt.as_ref(),
-                options.track_nulls(),
-                metrics,
-            )
-            .await?;
-        let page_tasks = cached_pages
-            .into_iter()
-            .map(|page_index| {
-                self.search_page(
+        let track_nulls = options.track_nulls();
+        let results = self
+            .evaluate_pages(pages, metrics, |subindex, matches| {
+                Self::evaluate_page_matches(
+                    subindex,
+                    matches,
                     query,
-                    page_index,
-                    lazy_index_reader.clone(),
                     prebuilt.as_ref(),
-                    options.track_nulls(),
+                    track_nulls,
                     metrics,
                 )
-                .boxed()
             })
-            .collect::<Vec<_>>();
-        debug!(
-            "Searching {} btree pages ({} prefetched)",
-            page_tasks.len() + missing_results.len(),
-            missing_results.len()
-        );
-
-        // Collect both matching row IDs and null row IDs from all pages
-        let mut results: Vec<PageMatches> = stream::iter(page_tasks)
-            // I/O and compute mixed here but important case is index in cache so
-            // use compute intensive thread count
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect()
             .await?;
-        results.extend(missing_results);
 
         // Assemble the result once. A page holds rows sorted by value, so its
         // ids are scattered across fragments; a per-page `RowAddrTreeMap`
@@ -2863,6 +2999,64 @@ impl ScalarIndex for BTreeIndex {
         Ok(SearchResult::Exact(NullableRowAddrSet::new(
             selected, nulls,
         )))
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        if keys.data_type() != &self.data_type {
+            return Err(Error::invalid_input(format!(
+                "btree lookup keys have type {} but the index has type {}",
+                keys.data_type(),
+                self.data_type
+            )));
+        }
+        if u32::try_from(keys.len()).is_err() {
+            return Err(Error::invalid_input(format!(
+                "btree lookup takes at most {} keys per call, got {}",
+                u32::MAX,
+                keys.len()
+            )));
+        }
+        let non_null_keys = if keys.null_count() > 0 {
+            arrow_select::filter::filter(&keys, &arrow::compute::is_not_null(&keys)?)?
+        } else {
+            keys.clone()
+        };
+        let pages = self
+            .page_lookup
+            .candidate_pages_for_values(non_null_keys.as_ref())?;
+
+        // FlatIndex re-sorts each loaded page by row id (search builds row
+        // masks from that order), so its values can't be binary searched and
+        // each candidate page is scanned in full.
+        // TODO: benchmark whether value-ordered pages, searched by binary
+        // search, would be worth it here.
+        let keys_by_value = Arc::new(KeysByValue::try_new(keys)?);
+        let results_are_row_addresses = self.results_are_row_addresses;
+        // Pages are evaluated (and, when cold, read) a chunk at a time, so each
+        // page only records its matched rows; the expansion to one row per
+        // matching key happens as the output is consumed.
+        let page_matches =
+            self.evaluate_pages_stream(pages.into_iter().map(Matches::Some).collect(), metrics, {
+                let keys_by_value = keys_by_value.clone();
+                move |page, _| {
+                    metrics.record_comparisons(page.values().len());
+                    keys_by_value.match_page(page.values(), page.ids())
+                }
+            });
+        Ok(page_matches
+            .map_ok(move |matches| {
+                stream::iter(
+                    keys_by_value
+                        .clone()
+                        .expand(matches, results_are_row_addresses),
+                )
+            })
+            .try_flatten()
+            .boxed())
     }
 
     fn results_are_row_addresses(&self) -> bool {
@@ -3934,23 +4128,31 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::sync::atomic::Ordering;
-    use std::{collections::HashMap, ops::Bound, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        ops::Bound,
+        sync::Arc,
+    };
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
-    use arrow_array::{FixedSizeListArray, record_batch};
-    use datafusion::{
-        execution::{SendableRecordBatchStream, TaskContext},
-        physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
+    use arrow_array::{
+        Array, ArrayRef, FixedSizeListArray, Float64Array, Int64Array, UInt64Array,
+        new_empty_array, new_null_array, record_batch,
     };
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion_common::{DataFusionError, ScalarValue};
+    use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
+    use datafusion_physical_plan::{
+        ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter,
+    };
     use futures::TryStreamExt;
     use futures::stream;
     use lance_core::cache::LanceCache;
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
+    use lance_datafusion_exec::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -3963,12 +4165,13 @@ mod tests {
         metrics::NoOpMetricsCollector,
         pbold,
         scalar::{
-            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchOptions,
-            SearchResult,
+            IndexStore, LOOKUP_BATCH_SIZE, OldIndexDataFilter, SargableQuery, ScalarIndex,
+            SearchOptions, SearchResult,
             btree::{
                 BTREE_INDEX_VERSION, BTREE_PAGES_NAME, BTREE_ROW_ADDR_DOMAIN_VERSION, BTreeIndex,
             },
             lance_format::LanceIndexStore,
+            lookup_test_util::{CompactedToFragmentOne, lookup_pairs},
         },
     };
 
@@ -4245,6 +4448,269 @@ mod tests {
                 .await
                 .unwrap(),
             vec![true, false]
+        );
+    }
+
+    /// Every `(key position, row id)` pair where the key equals the row's value.
+    fn brute_force_lookup(
+        values: &dyn Array,
+        row_ids: &[u64],
+        keys: &dyn Array,
+    ) -> Vec<(u32, u64)> {
+        let mut pairs = Vec::new();
+        for key_idx in (0..keys.len()).filter(|idx| keys.is_valid(*idx)) {
+            let key = ScalarValue::try_from_array(keys, key_idx).unwrap();
+            for (row, row_id) in row_ids.iter().enumerate() {
+                if ScalarValue::try_from_array(values, row).unwrap() == key {
+                    pairs.push((key_idx as u32, *row_id));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs
+    }
+
+    /// Train a btree over `values` / `row_ids` with 64-row pages.
+    async fn train_lookup_store(
+        values: &ArrayRef,
+        row_ids: &[u64],
+    ) -> (TempObjDir, Arc<LanceIndexStore>) {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let sort_options = arrow_schema::SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        let order = arrow::compute::sort_to_indices(values, Some(sort_options), None).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", values.data_type().clone(), true),
+            Field::new("_rowaddr", DataType::UInt64, false),
+        ]));
+        let sorted = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                arrow::compute::take(values, &order, None).unwrap(),
+                arrow::compute::take(&UInt64Array::from(row_ids.to_vec()), &order, None).unwrap(),
+            ],
+        )
+        .unwrap();
+        let stream = break_stream(
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                stream::once(async move { Ok(sorted) }),
+            )),
+            64,
+        )
+        .map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+        (tmpdir, test_store)
+    }
+
+    async fn train_lookup_index(
+        values: &ArrayRef,
+        row_ids: &[u64],
+        cache: &LanceCache,
+        results_are_row_addresses: bool,
+    ) -> (TempObjDir, Arc<BTreeIndex>) {
+        let (tmpdir, store) = train_lookup_store(values, row_ids).await;
+        let index = BTreeIndex::load(store, None, cache, results_are_row_addresses)
+            .await
+            .unwrap();
+        (tmpdir, index)
+    }
+
+    #[rstest::rstest]
+    #[case::int64_cold(DataType::Int64, false, true)]
+    #[case::int64_cached(DataType::Int64, true, true)]
+    #[case::utf8_cold(DataType::Utf8, false, true)]
+    #[case::int64_row_ids(DataType::Int64, false, false)]
+    #[tokio::test]
+    async fn test_lookup_matches_brute_force(
+        #[case] data_type: DataType,
+        #[case] cached: bool,
+        #[case] results_are_row_addresses: bool,
+    ) {
+        // Each value repeats on three rows, so runs straddle the 64-row pages,
+        // and a few rows are null.
+        let num_rows = 1000_u64;
+        let values: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..num_rows).map(|i| (i % 50 != 7).then_some((i / 3) as i64)),
+        ));
+        let values = arrow::compute::cast(&values, &data_type).unwrap();
+        let row_ids: Vec<u64> = (0..num_rows).map(|i| i * 7).collect();
+
+        let cache = if cached {
+            LanceCache::with_capacity(100 * 1024 * 1024)
+        } else {
+            LanceCache::no_cache()
+        };
+        let (_tmpdir, index) =
+            train_lookup_index(&values, &row_ids, &cache, results_are_row_addresses).await;
+        if cached {
+            index.prewarm().await.unwrap();
+        }
+
+        // Present, repeated, null, absent (below, above, and a null-row value).
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(5),
+            Some(0),
+            None,
+            Some(5),
+            Some(333),
+            Some(-1),
+            Some(334),
+            Some(21),
+            Some(100),
+            Some(2),
+        ]));
+        let keys = arrow::compute::cast(&keys, &data_type).unwrap();
+
+        let expected = brute_force_lookup(values.as_ref(), &row_ids, keys.as_ref());
+        assert!(!expected.is_empty());
+        assert_eq!(lookup_pairs(index.as_ref(), keys).await, expected);
+
+        let no_keys = new_empty_array(&data_type);
+        assert!(lookup_pairs(index.as_ref(), no_keys).await.is_empty());
+        let null_keys = new_null_array(&data_type, 3);
+        assert!(lookup_pairs(index.as_ref(), null_keys).await.is_empty());
+    }
+
+    /// A page whose value matches a key repeated many times expands into
+    /// several bounded batches rather than one per page.
+    #[tokio::test]
+    async fn test_lookup_bounds_batches() {
+        let num_rows = 3 * 64;
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![7; num_rows]));
+        let row_ids: Vec<u64> = (0..num_rows as u64).collect();
+        let (_tmpdir, index) =
+            train_lookup_index(&values, &row_ids, &LanceCache::no_cache(), true).await;
+
+        // Every 64-row page pairs with all 200 keys: 12,800 matches a page.
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![7; 200]));
+        let batches: Vec<RecordBatch> = index
+            .lookup(keys.clone(), &NoOpMetricsCollector)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() <= LOOKUP_BATCH_SIZE),
+            "{:?}",
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>()
+        );
+        let expected = (0..200_u32)
+            .flat_map(|key| row_ids.iter().map(move |&row| (key, row)))
+            .collect::<Vec<_>>();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(lookup_pairs(index.as_ref(), keys).await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_applies_remapping() {
+        let values: ArrayRef = Arc::new(Int64Array::from_iter_values((0..200).map(|i| i / 2)));
+        let row_ids: Vec<u64> = (0..200).collect();
+        let (_tmpdir, store) = train_lookup_store(&values, &row_ids).await;
+        let remapper = CompactedToFragmentOne {
+            deleted: HashSet::from([4]),
+        };
+        let index = BTreeIndex::load(
+            store,
+            Some(Arc::new(remapper)),
+            &LanceCache::no_cache(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Value 2 was on rows 4 (deleted) and 5; value 70 on rows 140 and 141.
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![2, 70]));
+        let moved = CompactedToFragmentOne::moved;
+        assert_eq!(
+            lookup_pairs(index.as_ref(), keys).await,
+            vec![(0, moved(5)), (1, moved(140)), (1, moved(141))]
+        );
+    }
+
+    /// Lookup must agree with `search(Equals)` on float values whose equality
+    /// is subtle: signed zeros and NaN.
+    #[tokio::test]
+    async fn test_lookup_float_equality_matches_search() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(f64::NAN),
+            Some(1.0),
+            None,
+        ]));
+        let row_ids = [10, 11, 12, 13, 14];
+        let (_tmpdir, index) =
+            train_lookup_index(&values, &row_ids, &LanceCache::no_cache(), true).await;
+
+        let keys = Float64Array::from(vec![0.0, -0.0, f64::NAN, 1.0]);
+        let pairs = lookup_pairs(index.as_ref(), Arc::new(keys.clone())).await;
+        for (key_idx, key) in keys.values().iter().enumerate() {
+            let result = index
+                .search(
+                    &SargableQuery::Equals(ScalarValue::Float64(Some(*key))),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let searched: Vec<u64> = result
+                .row_addrs()
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect();
+            let looked_up: Vec<u64> = pairs
+                .iter()
+                .filter(|(idx, _)| *idx == key_idx as u32)
+                .map(|(_, row_id)| *row_id)
+                .collect();
+            assert_eq!(looked_up, searched, "key {key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lookup_rejects_mismatched_key_type() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(100), BatchCount::from(1));
+        train_btree_index(data, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+
+        let keys = Arc::new(Int64Array::from(vec![1]));
+        let err = index.lookup(keys, &NoOpMetricsCollector).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("btree lookup keys have type Int64 but the index has type Int32"),
+            "{err}"
         );
     }
 
@@ -5560,9 +6026,49 @@ mod tests {
             "part_456_page_data.lance".to_string(),
         ];
 
-        // The cleanup function should handle both valid and invalid file patterns gracefully
-        // This test mainly verifies that the function doesn't panic and handles edge cases
+        // Materialize every file so that deletion is observable.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        for name in lookup_files.iter().chain(page_files.iter()) {
+            let mut writer = test_store
+                .new_index_file(name, schema.clone())
+                .await
+                .unwrap();
+            writer
+                .write_record_batch(record_batch!(("v", Int32, [1])).unwrap())
+                .await
+                .unwrap();
+            writer.finish().await.unwrap();
+        }
+
+        let partition_files = [
+            "part_123_page_lookup.lance",
+            "part_456_page_lookup.lance",
+            "part_123_page_data.lance",
+            "part_456_page_data.lance",
+        ];
+        for name in partition_files {
+            assert!(
+                test_store.open_index_file(name).await.is_ok(),
+                "{name} should exist before cleanup"
+            );
+        }
+
         super::cleanup_partition_files(test_store.as_ref(), &lookup_files, &page_files).await;
+
+        // Files matching part_*_page_{lookup,data}.lance are deleted ...
+        for name in partition_files {
+            assert!(
+                test_store.open_index_file(name).await.is_err(),
+                "{name} should have been deleted"
+            );
+        }
+        // ... while files outside the partition naming pattern are left alone.
+        for name in ["invalid_lookup_file.lance", "invalid_page_file.lance"] {
+            assert!(
+                test_store.open_index_file(name).await.is_ok(),
+                "{name} should not have been deleted"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7336,6 +7842,12 @@ mod tests {
         assert_eq!(restored.lookup_batch, state.lookup_batch);
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
+        // This flag decides whether search results are translated from row
+        // addresses to row ids.
+        assert_eq!(
+            restored.results_are_row_addresses,
+            state.results_are_row_addresses
+        );
     }
 
     #[test]

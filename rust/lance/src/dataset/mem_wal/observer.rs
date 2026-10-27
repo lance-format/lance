@@ -26,7 +26,7 @@ pub trait WalObserver: Send + Sync + Debug {
     /// `durable_write` put waits on.
     fn on_wal_flush(&self, _duration: Duration, _bytes: usize) {}
 
-    /// A frozen memtable became an L0 SSTable. Orders of magnitude longer
+    /// A frozen memtable became an SSTable. Orders of magnitude longer
     /// than a WAL flush.
     fn on_memtable_flush(&self, _duration: Duration, _rows: usize) {}
 

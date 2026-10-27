@@ -15,7 +15,7 @@
 //! A writer that is already open keeps the set it opened with until something
 //! calls [`DatasetMemWalExt::refresh_mem_wal_index_configs`].
 //!
-//! A rename reaches every MemTable, sealed generation and replayed entry: each
+//! A rename reaches every MemTable, flushed generation and replayed entry: each
 //! is read by field id.
 //!
 //! # Upgrading
@@ -36,9 +36,9 @@
 //! generations with no value for it.
 //!
 //! A generation frozen before an index joined the maintained set is flushed
-//! without a vector or full-text index for it, and search over both is
-//! index-only, so its rows answer neither until compaction folds them into the
-//! base table.
+//! without a vector or full-text index for it. Vector search scans such a
+//! generation flat; full-text search over it is index-only, so its rows do not
+//! answer one until compaction folds them into the base table.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -69,7 +69,7 @@ use super::scanner::{DatasetCache, ShardSnapshot};
 use super::schema_with_tombstone;
 use super::util::derived_store_params;
 use super::write::ShardWriter;
-use super::{SealFence, ShardWriterConfig};
+use super::{FreezeFence, ShardWriterConfig};
 
 /// Spec id of the sole sharding spec installed by [`InitializeMemWalBuilder`].
 const SHARDING_SPEC_ID: u32 = 1;
@@ -653,7 +653,7 @@ pub trait DatasetMemWalExt {
     ) -> Result<ShardWriter>;
 
     /// Re-resolve the maintained set from this dataset and install it on
-    /// `writer`, sealing so the next MemTable carries it.
+    /// `writer`, freezing so the next MemTable carries it.
     ///
     /// This is how a change reaches a writer that is already open: a replaced
     /// `maintained_indexes`, or, for a table that maintains all of them, an
@@ -665,7 +665,7 @@ pub trait DatasetMemWalExt {
     async fn refresh_mem_wal_index_configs(
         &self,
         writer: &ShardWriter,
-    ) -> Result<Option<SealFence>>;
+    ) -> Result<Option<FreezeFence>>;
 }
 
 /// Prewarm every index of `dataset` into its session caches. A no-op when the
@@ -845,7 +845,7 @@ impl DatasetMemWalExt for Dataset {
     async fn refresh_mem_wal_index_configs(
         &self,
         writer: &ShardWriter,
-    ) -> Result<Option<SealFence>> {
+    ) -> Result<Option<FreezeFence>> {
         let details = require_mem_wal_details(self).await?;
         let index_specs = maintained_index_specs(self, &details, writer.config()).await?;
         writer.replace_index_configs(index_specs).await
@@ -878,7 +878,7 @@ impl ShardWriter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<SealFence>> {
+    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<FreezeFence>> {
         let details = require_mem_wal_details(dataset).await?;
         let index_specs = maintained_index_specs(dataset, &details, self.config()).await?;
         self.evolve_schema(
@@ -2034,7 +2034,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "a second pass over an unchanged table seals nothing"
+            "a second pass over an unchanged table freezes nothing"
         );
         writer.close().await.unwrap();
     }
@@ -2043,7 +2043,7 @@ mod tests {
     /// from is the same maintained index, so the writer keeps its memtable;
     /// one rebuilt with another distance type is not.
     #[tokio::test]
-    async fn refresh_seals_only_when_a_maintained_index_changes_its_settings() {
+    async fn refresh_freezes_only_when_a_maintained_index_changes_its_settings() {
         use crate::dataset::optimize::remapping::remap_column_index;
         use crate::dataset::optimize::{CompactionOptions, compact_files};
         use crate::index::vector::VectorIndexParams;
