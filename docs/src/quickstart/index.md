@@ -17,6 +17,8 @@ In this guide, you'll create a small product catalog with LanceDB, filter it, se
 
 ## Install LanceDB
 
+This guide displays results as pandas DataFrames, so install pandas as well:
+
 ```bash
 --8<-- "snippets/quickstart/lancedb-install.sh"
 ```

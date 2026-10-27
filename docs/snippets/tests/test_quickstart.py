@@ -9,12 +9,15 @@ from importlib.metadata import version
 from pathlib import Path
 
 import pytest
+import tomllib
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from snippet_runner import run_sql
 
 QUICKSTART = Path(__file__).resolve().parent.parent / "quickstart"
 OUTPUTS = QUICKSTART / "outputs"
 RUNNER = Path(__file__).resolve().parent / "snippet_runner.py"
+INSTALL_SCRIPTS = ["lancedb-install.sh", "spark-install.sh"]
 
 
 def spark_env():
@@ -60,19 +63,39 @@ def update_outputs(request):
     return request.config.getoption("--update-outputs")
 
 
-@pytest.mark.parametrize("install_script", ["lancedb-install.sh", "spark-install.sh"])
+def install_requirements(install_script: str) -> list[Requirement]:
+    args = shlex.split((QUICKSTART / install_script).read_text())
+    assert args[:2] == ["pip", "install"]
+    return [Requirement(spec) for spec in args[2:]]
+
+
+@pytest.mark.parametrize("install_script", INSTALL_SCRIPTS)
 def test_install_command_matches_locked_versions(install_script):
     # The pages show these commands to readers, so they must accept the
     # versions the snippets are actually tested against.
-    args = shlex.split((QUICKSTART / install_script).read_text())
-    assert args[:2] == ["pip", "install"]
-    for spec in args[2:]:
-        requirement = Requirement(spec)
+    for requirement in install_requirements(install_script):
         installed = version(requirement.name)
         assert requirement.specifier.contains(installed), (
-            f"{install_script} asks for {spec!r} but the snippets are tested "
-            f"with {requirement.name}=={installed}"
+            f"{install_script} asks for {str(requirement)!r} but the snippets are "
+            f"tested with {requirement.name}=={installed}"
         )
+
+
+def test_install_commands_cover_tested_dependencies():
+    # A package the snippets are tested with but no page tells readers to
+    # install (e.g. pandas for `to_pandas()`) breaks the quickstart on a fresh
+    # environment while passing here.
+    pyproject = tomllib.loads((QUICKSTART.parent / "pyproject.toml").read_text())
+    tested = {
+        canonicalize_name(Requirement(spec).name)
+        for spec in pyproject["project"]["dependencies"]
+    }
+    documented = {
+        canonicalize_name(requirement.name)
+        for script in INSTALL_SCRIPTS
+        for requirement in install_requirements(script)
+    }
+    assert tested == documented
 
 
 def test_lancedb_quickstart(tmp_path, update_outputs):

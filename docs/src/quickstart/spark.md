@@ -11,7 +11,7 @@ Each step shows both Spark SQL and PySpark. Pick whichever you prefer.
 
 ## Install Spark
 
-The connector needs Java 17 or later. Install PySpark, which includes the `spark-sql` shell, along with LanceDB for the last step:
+The connector needs Java 17 or later. Install PySpark, which includes the `spark-sql` shell, along with LanceDB and pandas for the last step:
 
 ```bash
 --8<-- "snippets/quickstart/spark-install.sh"

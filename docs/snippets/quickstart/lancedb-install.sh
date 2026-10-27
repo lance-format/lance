@@ -1,1 +1,1 @@
-pip install lancedb
+pip install lancedb pandas
