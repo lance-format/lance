@@ -47,15 +47,15 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: docs/snippets/uv.lock
-      # The Spark connector bundle and its dependencies are several hundred MB
-      # from Maven Central. The key follows the files that name the Maven
-      # coordinates; the prefix fallback means a version bump only downloads
-      # what changed.
+      # The Spark connector bundle and its dependencies are about 1 GB from
+      # Maven Central. The key follows spark-sql.sh, which names the connector
+      # coordinate, so snippet edits reuse the entry instead of saving another
+      # copy. There is no prefix fallback: restoring an older entry would carry
+      # its jars into every new one after a version bump.
       - name: Restore Spark packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SPARK_IVY_DIR }}
-          key: docs-snippets-ivy-${{ hashFiles('docs/snippets/quickstart/spark*') }}
-          restore-keys: docs-snippets-ivy-
+          key: docs-snippets-ivy-${{ hashFiles('docs/snippets/quickstart/spark-sql.sh') }}
       - name: Run snippets
         run: uv run --locked pytest tests -v
