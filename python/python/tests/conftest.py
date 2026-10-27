@@ -135,19 +135,7 @@ def pytest_configure_node(node):
     node.workerinput["lance_compat_versions"] = version_snapshot()
 
 
-# tryfirst because xdist reads xdist_group off each item to build its scheduling
-# groups before ordinary pytest_collection_modifyitems hooks run; a mark added
-# later is silently ignored rather than rejected.
-@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    # The lindera fixture unzips a dictionary into the checked-out models tree and
-    # removes it again on teardown, and the tokenizer configs name that path
-    # relative to the repo, so it cannot be relocated per worker. Pinning these
-    # tests to one xdist worker keeps a teardown in one worker from deleting the
-    # dictionary another is still reading. Without -n it changes nothing.
-    for item in items:
-        if "lindera_ipadic" in getattr(item, "fixturenames", ()):
-            item.add_marker(pytest.mark.xdist_group("lindera"))
     if not config.getoption("--run-integration"):
         disable_items_with_mark(items, "integration", "--run-integration not specified")
     if not config.getoption("--run-slow"):
