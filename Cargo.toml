@@ -4,6 +4,7 @@ members = [
     "rust/lance",
     "rust/lance-arrow",
     "rust/lance-core",
+    "rust/lance-datafusion-exec",
     "rust/lance-datagen",
     "rust/lance-encoding",
     "rust/lance-file",
@@ -63,6 +64,7 @@ lance = { version = "=15.0.0-beta.1", path = "./rust/lance", default-features = 
 lance-arrow = { version = "=15.0.0-beta.1", path = "./rust/lance-arrow" }
 lance-core = { version = "=15.0.0-beta.1", path = "./rust/lance-core" }
 lance-datafusion = { version = "=15.0.0-beta.1", path = "./rust/lance-datafusion" }
+lance-datafusion-exec = { version = "=15.0.0-beta.1", path = "./rust/lance-datafusion-exec" }
 lance-datagen = { version = "=15.0.0-beta.1", path = "./rust/lance-datagen" }
 lance-derive = { version = "=15.0.0-beta.1", path = "./rust/lance-derive" }
 lance-encoding = { version = "=15.0.0-beta.1", path = "./rust/lance-encoding" }
@@ -145,7 +147,9 @@ datafusion = { version = "54.0.0", default-features = false, features = [
 datafusion-common = "54.0.0"
 datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
 datafusion-sql = "54.0.0"
+datafusion-execution = "54.0.0"
 datafusion-expr = "54.0.0"
+datafusion-functions-nested = "54.0.0"
 datafusion-physical-expr = "54.0.0"
 datafusion-physical-plan = "54.0.0"
 datafusion-substrait = { version = "54.0.0", default-features = false }

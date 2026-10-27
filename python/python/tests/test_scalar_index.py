@@ -3730,14 +3730,13 @@ def test_nan_handling(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
 
-    # There is no way, in DF, to query for NAN / INF, that I'm aware of.
-    # So the best we can do here is make sure that the presence of NAN / INF
-    # doesn't interfere with normal operation of the btree.
+    # NaNs sort above finite values regardless of their sign bit, both with and
+    # without an index. Infinities retain their usual ordering.
     def check(has_index: bool):
         assert dataset.to_table(filter="x IS NULL").num_rows == 0
         assert dataset.to_table(filter="x IS NOT NULL").num_rows == 7
-        assert dataset.to_table(filter="x > 0").num_rows == 5
-        assert dataset.to_table(filter="x < 5").num_rows == 5
+        assert dataset.to_table(filter="x > 0").num_rows == 6
+        assert dataset.to_table(filter="x < 5").num_rows == 4
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
 
     check(False)
@@ -6006,6 +6005,45 @@ def test_minhashlsh_segment_merge_and_commit_from_python():
     assert stats["indices"][0]["num_bands"] == 16
     assert stats["indices"][0]["shingle_size"] == 3
     assert ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist()[2] == 2
+
+
+def test_fm_index():
+    texts = ["hello world", "say hello", None, "goodbye", "hello again", "nothing"]
+    tbl = pa.table({"id": list(range(len(texts))), "text": texts})
+    ds = lance.write_dataset(tbl, "memory://fm_index", max_rows_per_file=2)
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    assert len(fragment_ids) == 3
+    index_name = "text_idx"
+
+    def contains(ds, pattern):
+        predicate = f"contains(text, '{pattern}')"
+        plan = ds.scanner(filter=predicate).explain_plan()
+        assert f"@{index_name}" in plan
+        return sorted(ds.to_table(filter=predicate, columns=["id"])["id"].to_pylist())
+
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index("text", "FM", fragment_ids=fragment_ids[:1])
+
+    segments = [
+        ds.create_index_uncommitted(
+            "text", "FM", name=index_name, fragment_ids=[fragment_id]
+        )
+        for fragment_id in fragment_ids
+    ]
+    merged = ds.merge_existing_index_segments(segments[1:])
+    assert merged.fragment_ids == set(fragment_ids[1:])
+    ds = ds.commit_existing_index_segments(index_name, "text", [segments[0], merged])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "Fm"
+    assert len(descriptions[index_name].segments) == 2
+    assert contains(ds, "hello") == [0, 1, 4]
+
+    ds.create_scalar_index("text", "FM", name=index_name, num_segments=3)
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert len(descriptions[index_name].segments) == 3
+    assert contains(ds, "hello") == [0, 1, 4]
+    # Unlike NGRAM, a single-character pattern is still answered by the index.
+    assert contains(ds, "y") == [1, 3]
 
 
 def test_merge_index_metadata_btree_soft_break(tmp_path):

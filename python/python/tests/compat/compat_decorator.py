@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import pytest
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 
 def _fetch_stable_versions() -> List[Version]:
@@ -65,11 +65,46 @@ def recent_major_versions(n: int) -> List[str]:
     return major_versions
 
 
-def _fetch_last_beta_release():
-    """Returns the latest beta version available on fury.io.
+def _build_version() -> Optional[str]:
+    """The version of the build under test, when there is one to read.
 
-    Uses pip to query the fury.io index for pre-release versions of pylance.
+    A host interpreter that only drives provisioned venvs has no pylance of
+    its own (compat-pair.yml and nightly_run.yml install the suite's
+    dependencies and nothing else), so this is legitimately unavailable and
+    says why rather than looking like a failed index query.
     """
+    try:
+        import lance
+    except ImportError as e:
+        print(
+            f"Warning: no pylance to read the build's own version from: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+    return lance.__version__
+
+
+def _fetch_last_beta_release(current_version: Optional[str] = None):
+    """Returns the newest pre-release on the index older than the build under test.
+
+    Not simply the newest pre-release: the release automation bumps main's
+    version in the same commit that cuts a beta, so from the moment that beta
+    is published it carries the version every branch is also building. Pinning
+    it would hand a compat test a venv labelled with the build's own version
+    and call it the older build.
+
+    `current_version` is the build to measure against, defaulting to the
+    installed one. Without it there is no way to tell a release older than the
+    build from the build itself, so the slot stays empty.
+
+    Uses pip to query the fury.io indices, which are searched alongside PyPI,
+    for pre-release versions of pylance.
+    """
+    build_version = current_version or _build_version()
+    if build_version is None:
+        return None
+    build = Version(build_version)
     try:
         # Use pip index to get versions from fury.io
         result = subprocess.run(
@@ -98,14 +133,23 @@ def _fetch_last_beta_release():
             for line in result.stdout.splitlines():
                 if "Available versions:" in line:
                     versions_str = line.split("Available versions:")[1].strip()
-                    versions = [v.strip() for v in versions_str.split(",")]
-                    # Return the first beta/pre-release version
-                    for v in versions:
-                        if "beta" in v or "rc" in v or "a" in v or "b" in v:
-                            return v
-                    # If no pre-release found, return the first version
-                    if versions:
-                        return versions[0]
+                    older_prereleases = []
+                    for raw in versions_str.split(","):
+                        raw = raw.strip()
+                        try:
+                            parsed = Version(raw)
+                        except InvalidVersion:
+                            continue
+                        if parsed.is_prerelease and parsed < build:
+                            older_prereleases.append((parsed, raw))
+                    if older_prereleases:
+                        return max(older_prereleases)[1]
+                    print(
+                        "Warning: no pre-release older than the build under test "
+                        f"({build}) is available; compat tests will not cover one",
+                        file=sys.stderr,
+                    )
+                    return None
 
         print(
             "Warning: Could not fetch latest beta release from fury.io",

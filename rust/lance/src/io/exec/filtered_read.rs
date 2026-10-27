@@ -3994,7 +3994,7 @@ mod tests {
     use lance_index::{
         IndexType,
         optimize::OptimizeOptions,
-        scalar::{ScalarIndexParams, expression::PlannerIndexExt},
+        scalar::{ScalarIndexParams, expression::create_filter_plan},
     };
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
@@ -4173,9 +4173,12 @@ mod tests {
             if let Some(filter) = &options.full_filter {
                 let planner = Planner::new(Arc::new(self.dataset.schema().into()));
                 let index_info = self.dataset.scalar_index_info().await.unwrap();
-                let filter_plan = planner
-                    .create_filter_plan(filter.clone(), &index_info, true)
-                    .unwrap();
+                let filter_plan = create_filter_plan(
+                    planner.optimize_expr(filter.clone()).unwrap(),
+                    &index_info,
+                    true,
+                )
+                .unwrap();
                 if let Some(index_query) = filter_plan.index_query {
                     Some(Arc::new(ScalarIndexExec::new(
                         self.dataset.clone(),
@@ -4232,9 +4235,12 @@ mod tests {
             let planner = Planner::new(arrow_schema);
             let expr = planner.parse_filter(filter).unwrap();
             let index_info = self.dataset.scalar_index_info().await.unwrap();
-            planner
-                .create_filter_plan(expr, &index_info, use_scalar_index)
-                .unwrap()
+            create_filter_plan(
+                planner.optimize_expr(expr).unwrap(),
+                &index_info,
+                use_scalar_index,
+            )
+            .unwrap()
         }
     }
 
@@ -4766,7 +4772,8 @@ mod tests {
         let planner = Planner::new(arrow_schema);
         let expr = planner.parse_filter("value IS NOT NULL").unwrap();
         let index_info = dataset.scalar_index_info().await.unwrap();
-        let filter_plan = planner.create_filter_plan(expr, &index_info, true).unwrap();
+        let filter_plan =
+            create_filter_plan(planner.optimize_expr(expr).unwrap(), &index_info, true).unwrap();
         assert!(
             filter_plan.index_query.is_none(),
             "bloom filter IS NOT NULL should not use an index query"

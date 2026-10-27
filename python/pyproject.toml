@@ -121,6 +121,7 @@ include = [
     "python/tests/test_arrow.py",
     "python/tests/test_fragment_typing.py",
     "python/tests/test_optimize_typing.py",
+    "python/tests/test_optional_types_typing.py",
     "python/tests/test_udf.py",
 ]
 # Dependencies like pyarrow make this difficult to enforce strictly.

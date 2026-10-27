@@ -29,7 +29,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
@@ -2330,7 +2330,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             false,
             // supports_regex: regex acceleration is only implemented for ngram.
             false,
-            // min_contains_chars: the FM-index can match a needle of any length.
+            // min_contains_chars: the FM-index can match any non-empty needle.
             0,
         )))
     }
@@ -2358,7 +2358,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
 mod tests {
     use super::*;
     use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, UInt64Array};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::{ROW_ADDR, cache::LanceCache};
     use lance_io::object_store::ObjectStore;

@@ -87,13 +87,10 @@ fn lower(column: &Expr, op: Operator, operand: &Expr, schema: &Schema) -> Option
             return None;
         };
         if !value.is_finite() || value < min || value >= max {
-            // Arrow orders negative NaNs below all numbers and positive NaNs
-            // above them. Infinities and out-of-domain bounds follow suit.
-            let is_above = if value.is_nan() {
-                value.is_sign_positive()
-            } else {
-                value >= max
-            };
+            // Float filters treat every NaN as above finite values, regardless
+            // of its sign bit. Infinities and out-of-domain bounds retain their
+            // Arrow total-order position.
+            let is_above = value.is_nan() || value >= max;
             Comparison::Constant(match op {
                 Eq => false,
                 NotEq => true,
@@ -215,6 +212,10 @@ mod tests {
     #[case::lower("i = -9223372036854775808.0", i64::MIN, Some(true))]
     #[case::positive_nan("i < CAST('NaN' AS DOUBLE)", 0, Some(true))]
     #[case::nan_eq("i = CAST('NaN' AS DOUBLE)", 0, Some(false))]
+    #[case::negative_nan_lt("i < CAST('-NaN' AS DOUBLE)", 0, Some(true))]
+    #[case::negative_nan_lte("i <= CAST('-NaN' AS DOUBLE)", 0, Some(true))]
+    #[case::negative_nan_gt("i > CAST('-NaN' AS DOUBLE)", 0, Some(false))]
+    #[case::negative_nan_gte("i >= CAST('-NaN' AS DOUBLE)", 0, Some(false))]
     #[case::infinity("i > CAST('-inf' AS DOUBLE)", 0, Some(true))]
     fn predicates(#[case] sql: &str, #[case] value: i64, #[case] expected: Option<bool>) {
         let batch = record_batch!(("i", Int64, [Some(value), None])).unwrap();

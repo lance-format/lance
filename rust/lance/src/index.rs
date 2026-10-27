@@ -3275,10 +3275,10 @@ impl DatasetIndexExt for Dataset {
         let mut indices = indices
             .iter()
             .filter(|idx| {
-                // We shouldn't have any indices with empty fields, but just in case, log an error
-                // but don't fail the operation (we might not be using that index)
+                // System indices are fieldless by design. Report malformed user indices,
+                // but don't fail the operation (we might not be using that index).
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    if !is_system_index(idx) {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
@@ -7303,6 +7303,24 @@ mod tests {
             let num_rows = dataset.count_all_rows().await.unwrap();
             assert_eq!(indexed_rows, expected_indexed_rows);
             assert_eq!(unindexed_rows, num_rows - expected_indexed_rows);
+            for metadata in dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|metadata| metadata.name == "text_idx")
+            {
+                let index = dataset
+                    .open_scalar_index("text", &metadata.uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let live_index = Arc::downgrade(&index);
+                drop(index);
+                assert!(
+                    live_index.upgrade().is_none(),
+                    "optimization retained a live FTS index in the session cache"
+                );
+            }
         }
 
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -7443,6 +7461,7 @@ mod tests {
             compact_files(&mut dataset, CompactionOptions::default(), None)
                 .await
                 .unwrap();
+            assert_indexed_rows(&dataset, num_rows).await;
             for &word in uppercase_words.iter() {
                 let query_result = dataset
                     .scan()
@@ -14622,12 +14641,10 @@ mod tests {
     /// The multi-segment FM-Index builder reserves names on its own, so it needs
     /// the same complete view as the single-segment path.
     ///
-    /// The hidden index is a BTree and the new one an FM index, which is what
-    /// makes this test specific to the multi-segment builder: its name loop
-    /// (`index/create.rs`) only steps past a taken name when the *fields* differ,
-    /// where the single-segment loop also steps past a different index kind. So
-    /// the single-segment path would quietly settle on `text_idx_2` and succeed;
-    /// only the multi-segment path keeps `text_idx` and hits the collision.
+    /// The hidden index is an FM index too: the default-name loop steps past a
+    /// different index kind on the same column, so only an index of the same
+    /// kind keeps `text_idx` and reaches the collision check. A builder that
+    /// could not see the hidden index would commit a second `text_idx` instead.
     #[tokio::test]
     async fn test_multi_segment_fmindex_respects_an_unsupported_index_name() {
         let test_dir = tempfile::tempdir().unwrap();
@@ -14647,9 +14664,9 @@ mod tests {
         .await
         .unwrap();
 
-        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         dataset
-            .create_index_builder(&["text"], IndexType::BTree, &btree_params)
+            .create_index_builder(&["text"], IndexType::Fm, &fm_params)
             .name("text_idx".to_string())
             .train(false)
             .await

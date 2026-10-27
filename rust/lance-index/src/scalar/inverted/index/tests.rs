@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::scalar::inverted::document_tokenizer::DocType;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::cache::{LanceCache, QuickCacheBackend};
 use lance_core::utils::tempfile::TempObjDir;
@@ -102,7 +102,7 @@ fn empty_doc_stream() -> SendableRecordBatchStream {
     ]));
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
-        stream::iter(Vec::<datafusion::error::Result<RecordBatch>>::new()),
+        stream::iter(Vec::<datafusion_common::Result<RecordBatch>>::new()),
     ))
 }
 

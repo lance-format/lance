@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::scalar::RowAddrTranslatorRef;
+use crate::scalar::inverted::documents::DocumentRemapping;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 
@@ -228,13 +229,41 @@ impl InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Preserve shared decoded state without retaining request-owned readers.
+    pub(in super::super) fn cache_snapshot(&self) -> Result<Option<Self>> {
+        if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
+            return Ok(None);
+        }
+        let mut snapshot = self.clone();
+        snapshot.partitions = self
+            .partitions
+            .iter()
+            .map(|part| {
+                let Some(docs) = part.docs.modern() else {
+                    return Err(Error::internal("modern FTS partition has legacy documents"));
+                };
+                Ok(Arc::new(InvertedPartition {
+                    inverted_list: Arc::new(
+                        part.inverted_list
+                            .with_store(part.store.clone(), posting_file_path(part.id))?,
+                    ),
+                    docs: PartitionDocumentStore::Modern(Arc::new(
+                        docs.with_store(part.store.clone(), None),
+                    )),
+                    ..part.as_ref().clone()
+                }))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(snapshot))
+    }
+
     /// Rebind a modern index within its immutable index/fragment-reuse cache
     /// namespace. Only reader-free state crosses the request boundary; all
     /// future posting and document I/O uses the supplied store and remapper.
     pub(in super::super) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapping: Option<DocumentRemapping>,
     ) -> Result<Option<Self>> {
         if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
             return Ok(None);
@@ -254,7 +283,7 @@ impl InvertedIndex {
                         .with_store(store.clone(), posting_file_path(part.id))?,
                 ),
                 docs: PartitionDocumentStore::Modern(Arc::new(
-                    docs.with_store(store, frag_reuse_index.clone()),
+                    docs.with_store(store, remapping.clone()),
                 )),
                 token_set_format: part.token_set_format,
             }));
@@ -433,14 +462,68 @@ impl InvertedIndex {
     /// Read only the index's [`InvertedIndexParams`],
     /// Contains more complete info than manifest's lossy `InvertedIndexDetails`.
     pub async fn load_params(store: &dyn IndexStore) -> Result<InvertedIndexParams> {
+        Ok(Self::load_params_with_metadata(store).await?.0)
+    }
+
+    /// Recover training parameters without opening the index's partitions.
+    ///
+    /// Reads the tokenizer parameters and physical posting format from the
+    /// index files. `document_granularity` must come from the segment's manifest
+    /// details, since it is not stored in the tokenizer parameters. Build-time
+    /// resource settings such as worker counts and memory limits are not retained.
+    ///
+    /// ```
+    /// use lance_index::scalar::{IndexStore, inverted::{DocumentGranularity, InvertedIndex}};
+    /// # async fn example(store: &dyn IndexStore) -> lance_core::Result<()> {
+    /// let params = InvertedIndex::load_training_params(store, DocumentGranularity::Row).await?;
+    /// assert_eq!(params.index_type, "inverted");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn load_training_params(
+        store: &dyn IndexStore,
+        document_granularity: DocumentGranularity,
+    ) -> Result<ScalarIndexParams> {
+        let (params, metadata_reader) = Self::load_params_with_metadata(store).await?;
+        let format_version = match metadata_reader {
+            Some(reader) => parse_format_version_from_metadata(&reader.schema().metadata)?,
+            None => InvertedListFormatVersion::V1,
+        };
+        Self::params_for_training(
+            params.document_granularity(document_granularity),
+            format_version,
+        )
+    }
+
+    fn params_for_training(
+        mut params: InvertedIndexParams,
+        format_version: InvertedListFormatVersion,
+    ) -> Result<ScalarIndexParams> {
+        if params.base_tokenizer.is_empty() {
+            // Empty tokenizer metadata only appears in legacy simple-tokenizer indices.
+            params.base_tokenizer = "simple".to_string();
+        }
+        params = params.format_version(format_version);
+        Ok(ScalarIndexParams {
+            index_type: BuiltinIndexType::Inverted.as_str().to_string(),
+            params: Some(params.to_training_json()?.to_string()),
+        })
+    }
+
+    async fn load_params_with_metadata(
+        store: &dyn IndexStore,
+    ) -> Result<(InvertedIndexParams, Option<Arc<dyn IndexReader>>)> {
         match store.open_index_file(METADATA_FILE).await {
             Ok(reader) => {
-                let params = reader
-                    .schema()
+                let schema = reader.schema();
+                let params = schema
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                Ok(serde_json::from_str::<InvertedIndexParams>(params)?)
+                Ok((
+                    serde_json::from_str::<InvertedIndexParams>(params)?,
+                    Some(reader),
+                ))
             }
             Err(metadata_error) => {
                 // Legacy format: params live in the tokens file (see
@@ -450,13 +533,14 @@ impl InvertedIndex {
                 let Ok(reader) = store.open_index_file(TOKENS_FILE).await else {
                     return Err(metadata_error);
                 };
-                Ok(reader
+                let params = reader
                     .schema()
                     .metadata
                     .get("tokenizer")
                     .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
                     .transpose()?
-                    .unwrap_or_default())
+                    .unwrap_or_default();
+                Ok((params, None))
             }
         }
     }
@@ -1055,18 +1139,6 @@ impl ScalarIndex for InvertedIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let mut params = self.params.clone();
-        if params.base_tokenizer.is_empty() {
-            // Empty tokenizer metadata only appears in legacy simple-tokenizer indexes.
-            params.base_tokenizer = "simple".to_string();
-        }
-        params = params.format_version(self.format_version());
-
-        let params_json = params.to_training_json()?.to_string();
-
-        Ok(ScalarIndexParams {
-            index_type: BuiltinIndexType::Inverted.as_str().to_string(),
-            params: Some(params_json),
-        })
+        Self::params_for_training(self.params.clone(), self.format_version())
     }
 }

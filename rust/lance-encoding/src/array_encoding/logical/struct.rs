@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    data::concat_decoded_arrays,
     decoder::{
         DecodeArrayTask, DrainLimit, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
@@ -635,7 +636,7 @@ impl CompositeDecodeTask {
         //
         // This optimization is probably most important for super fast storage like NVME
         // where the page size can be smaller.
-        Ok(arrow_select::concat::concat(&array_refs)?)
+        concat_decoded_arrays(&array_refs)
     }
 }
 

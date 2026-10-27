@@ -124,11 +124,11 @@ impl FlatIndex {
         })
     }
 
-    fn ids(&self) -> &UInt64Array {
+    pub(crate) fn ids(&self) -> &UInt64Array {
         self.data.column(IDS_COL_IDX).as_primitive::<UInt64Type>()
     }
 
-    fn values(&self) -> &ArrayRef {
+    pub(crate) fn values(&self) -> &ArrayRef {
         self.data.column(VALUES_COL_IDX)
     }
 
