@@ -920,8 +920,9 @@ impl FileReader {
                 .submit_single(start..start + num_bytes_missing, 0)
                 .await?;
             let mut combined = BytesMut::with_capacity(data.len() + num_bytes_missing as usize);
-            combined.extend(missing_bytes);
-            combined.extend(data);
+            // `extend` with a `Bytes` iterator copies one byte at a time.
+            combined.extend_from_slice(&missing_bytes);
+            combined.extend_from_slice(data);
             Ok(combined.freeze())
         }
     }

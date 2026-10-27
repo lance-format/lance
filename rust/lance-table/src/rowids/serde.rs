@@ -57,9 +57,17 @@ fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64
         .find_map(|(index, (previous, next))| (previous >= next).then_some((index, previous, next)))
 }
 
+/// Consecutive `Range` segments this far apart are not folded into one
+/// [`U64Segment::Ranges`]: a compacted fragment holds pieces of far-apart
+/// source fragments, and a `Ranges` spanning the gap between them is one
+/// interval covering every other piece in between, which makes the row id
+/// index merge or probe them all (278 GB of merged map on one table).
+const FOLD_GAP: u64 = 1 << 16;
+
 /// Add a non-empty range to the run of consecutive, sorted, disjoint `Range`
 /// segments being folded into one [`U64Segment::Ranges`], merging an adjacent
-/// one and flushing the run first when `range` does not continue it.
+/// one and flushing the run first when `range` does not continue it or sits
+/// more than [`FOLD_GAP`] past it.
 ///
 /// A table whose deletions cluster is written as many small `Range` segments
 /// (see `RowIdSequence::use_range_segments`). Kept as separate segments they
@@ -68,7 +76,7 @@ fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64
 fn push_range(pending: &mut Vec<Range<u64>>, out: &mut Vec<U64Segment>, range: Range<u64>) {
     match pending.last_mut() {
         Some(last) if last.end == range.start => last.end = range.end,
-        Some(last) if last.end > range.start => {
+        Some(last) if last.end > range.start || range.start - last.end > FOLD_GAP => {
             flush_ranges(pending, out);
             pending.push(range);
         }
@@ -816,6 +824,30 @@ mod test {
         assert_corrupt_segment(
             pb::u64_segment::Segment::SortedArray(pb::EncodedU64Array { array: Some(array) }),
             "SortedArray values are not strictly increasing at indices 0 and 1",
+        );
+    }
+
+    #[test]
+    fn test_range_segments_are_not_folded_across_a_wide_gap() {
+        // 1000..1100 and 1300..1500 fold; 1_000_000..1_000_100 is a piece of
+        // its own and stays a separate segment.
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(1000..1100),
+            U64Segment::Range(1300..1500),
+            U64Segment::Range(1_000_000..1_000_100),
+        ]);
+        let decoded = read_row_ids(&write_row_ids(&sequence)).unwrap();
+        assert!(
+            matches!(
+                decoded.segments(),
+                [U64Segment::Ranges { .. }, U64Segment::Range(_)]
+            ),
+            "{:?}",
+            decoded.segments()
+        );
+        assert_eq!(
+            decoded.iter().collect::<Vec<_>>(),
+            sequence.iter().collect::<Vec<_>>()
         );
     }
 

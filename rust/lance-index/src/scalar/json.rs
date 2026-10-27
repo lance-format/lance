@@ -8,27 +8,25 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::{
-    execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
-};
 use datafusion_common::{DataFusionError, ScalarValue, config::ConfigOptions};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
-use futures::StreamExt;
+use datafusion_physical_plan::{
+    ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec,
+    stream::RecordBatchStreamAdapter,
+};
+use futures::{StreamExt, stream::BoxStream};
 use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
-use lance_datafusion::exec::{
-    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
-};
-use lance_datafusion::udf::json::JsonbType;
+use lance_datafusion_exec::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
+use lance_datafusion_exec::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -140,6 +138,18 @@ impl ScalarIndex for JsonIndex {
         self.target_index
             .search_with_options(query.target_query.as_ref(), options, metrics)
             .await
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        self.target_index.lookup(keys, metrics)
+    }
+
+    fn results_are_row_addresses(&self) -> bool {
+        self.target_index.results_are_row_addresses()
     }
 
     fn can_remap(&self) -> bool {
@@ -594,7 +604,7 @@ impl JsonIndexPlugin {
             Vec::with_capacity(input_schema.fields().len());
         exprs.push((
             Arc::new(ScalarFunctionExpr::try_new(
-                Arc::new(lance_datafusion::udf::json::json_extract_with_type_udf()),
+                Arc::new(lance_datafusion_exec::udf::json::json_extract_with_type_udf()),
                 vec![
                     Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
                     Arc::new(Literal::new(ScalarValue::Utf8(Some(path)))),
@@ -614,8 +624,9 @@ impl JsonIndexPlugin {
         }
 
         let project = ProjectionExec::try_new(exprs, input)?;
-        let ctx = get_session_context(&LanceExecutionOptions::default());
-        project.execute(0, ctx.task_ctx()).map_err(Into::into)
+        project
+            .execute(0, Arc::new(TaskContext::default()))
+            .map_err(Into::into)
     }
 
     fn infer_type_from_batch(batch: &RecordBatch, path: &str) -> Result<Option<DataType>> {
@@ -1214,10 +1225,16 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::bitmap::{BitmapIndex, BitmapIndexPlugin};
+    use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::lookup_test_util::lookup_pairs;
     use crate::scalar::{SargableQuery, TextQuery};
-    use arrow_array::{ArrayRef, RecordBatch};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, record_batch};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
+    use lance_io::object_store::ObjectStore;
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
@@ -1231,6 +1248,44 @@ mod tests {
     #[case::accessor_array_index("0", false)]
     fn test_path_matches_typed_accessor(#[case] path: &str, #[case] expected: bool) {
         assert_eq!(JsonQueryParser::path_matches_typed_accessor(path), expected);
+    }
+
+    /// Lookup keys are values of the indexed path, in the target index's
+    /// type, and are answered by the target index, in its row domain.
+    #[rstest]
+    #[case::row_addresses(true)]
+    #[case::row_ids(false)]
+    #[tokio::test]
+    async fn test_json_lookup_forwards_to_target(#[case] results_are_row_addresses: bool) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch =
+            record_batch!(("value", Int64, [1, 1, 2]), (ROW_ADDR, UInt64, [0, 2, 1])).unwrap();
+        let schema = batch.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok(batch) }),
+        ));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let target = BitmapIndex::load(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            results_are_row_addresses,
+        )
+        .await
+        .unwrap();
+        let index = JsonIndex::new(target, "x".to_string());
+        assert_eq!(index.results_are_row_addresses(), results_are_row_addresses);
+
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 3]));
+        assert_eq!(lookup_pairs(&index, keys).await, vec![(0, 0), (0, 2)]);
     }
 
     #[test]
@@ -1408,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn test_json_extract_with_type_info() {
         use arrow_array::{LargeBinaryArray, UInt64Array};
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
         use futures::stream;
 
         // Create test JSONB data

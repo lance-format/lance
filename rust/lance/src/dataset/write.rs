@@ -1779,7 +1779,7 @@ pub(crate) async fn write_fragments_internal_impl(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1799,7 +1799,7 @@ pub(crate) async fn write_fragments_internal_impl(
         target_bases_info,
         file_row_counts,
         preassigned_data_file_name,
-        keep_field_ids,
+        inherited_field_ids,
     )
     .await
 }
@@ -1813,20 +1813,26 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
+/// Give a new table its field IDs. `inherited` IDs are an existing table's,
+/// such as a MemWAL generation's, and may exceed the new-table limit.
+pub(crate) fn assign_new_table_field_ids(schema: &mut Schema, inherited: bool) -> Result<()> {
+    if inherited {
+        schema.try_keep_field_ids()
+    } else {
+        schema.try_assign_new_table_field_ids()
+    }
+}
+
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
     normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<Schema> {
     let schema = if dataset.is_none() {
         let mut schema = normalized_converted_schema;
-        if keep_field_ids {
-            schema.try_set_field_id(None)?;
-        } else {
-            schema.try_reassign_field_ids(None)?;
-        }
+        assign_new_table_field_ids(&mut schema, inherited_field_ids)?;
         schema
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
@@ -3053,6 +3059,43 @@ mod tests {
         assert_eq!(row_counts, vec![5000, 5000, 2000]);
     }
 
+    /// A zero row limit used to panic on V2 and, on V1, commit an empty
+    /// dataset. V2 ignores `max_rows_per_group`, so a zero there still writes.
+    #[rstest]
+    #[case::v2_rows_per_file(LanceFileVersion::Stable, 0, 1024, Some("max_rows_per_file"))]
+    #[case::v1_rows_per_file(LanceFileVersion::Legacy, 0, 1024, Some("max_rows_per_file"))]
+    #[case::v1_rows_per_group(LanceFileVersion::Legacy, 1024, 0, Some("max_rows_per_group"))]
+    #[case::v2_ignores_rows_per_group(LanceFileVersion::Stable, 1024, 0, None)]
+    #[tokio::test]
+    async fn test_write_rejects_zero_row_limits(
+        #[case] version: LanceFileVersion,
+        #[case] max_rows_per_file: usize,
+        #[case] max_rows_per_group: usize,
+        #[case] rejected: Option<&str>,
+    ) {
+        let data = gen_batch()
+            .col("a", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(2));
+        let params = WriteParams {
+            data_storage_version: Some(version),
+            max_rows_per_file,
+            max_rows_per_group,
+            ..Default::default()
+        };
+        let result = Dataset::write(data, "memory://zero-row-limits", Some(params)).await;
+        match rejected {
+            Some(param) => {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(&err, Error::InvalidInput { source, .. }
+                    if source.to_string().contains(&format!("{param} must be greater than zero"))),
+                    "{err:?}"
+                );
+            }
+            None => assert_eq!(result.unwrap().count_rows(None).await.unwrap(), 20),
+        }
+    }
+
     #[tokio::test]
     async fn test_max_rows_per_group() {
         let reader_to_frags = |data_reader: Box<dyn RecordBatchReader + Send>,
@@ -3285,16 +3328,15 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
-        // New datasets canonicalize incoming field IDs before writing while
-        // preserving the schema's field order.
+        // A new dataset keeps the supplied field IDs, in the schema's field order.
         assert_eq!(
             written_schema
                 .fields_pre_order()
                 .map(|field| field.id)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![3, 0, 1]
         );
-        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 2]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
 
         let path = base_path
             .clone()
@@ -3308,7 +3350,7 @@ mod tests {
             written_schema.clone(),
             0,
             0,
-            2,
+            3,
             None,
         )
         .await

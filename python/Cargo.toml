@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "15.0.0-beta.1"
+version = "15.0.0-beta.2"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -104,9 +104,6 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
-
-[patch.crates-io]
-object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }
 
 [lints.clippy]
 disallowed_macros = "deny"

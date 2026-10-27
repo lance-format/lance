@@ -36,7 +36,7 @@ use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
@@ -1977,10 +1977,9 @@ mod tests {
     use arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use datafusion::{
-        execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
-    };
     use datafusion_common::DataFusionError;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt, stream};
     use itertools::Itertools;
     use lance_core::{Error, ROW_ID, Result, cache::LanceCache, utils::tempfile::TempDir};

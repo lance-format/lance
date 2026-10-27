@@ -4,6 +4,7 @@ members = [
     "rust/lance",
     "rust/lance-arrow",
     "rust/lance-core",
+    "rust/lance-datafusion-exec",
     "rust/lance-datagen",
     "rust/lance-encoding",
     "rust/lance-file",
@@ -34,7 +35,7 @@ resolver = "3"
 
 
 [workspace.package]
-version = "15.0.0-beta.1"
+version = "15.0.0-beta.2"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -59,28 +60,29 @@ rust-version = "1.94.0"
 [workspace.dependencies]
 arc-swap = "1.7"
 libc = "0.2.176"
-lance = { version = "=15.0.0-beta.1", path = "./rust/lance", default-features = false }
-lance-arrow = { version = "=15.0.0-beta.1", path = "./rust/lance-arrow" }
-lance-core = { version = "=15.0.0-beta.1", path = "./rust/lance-core" }
-lance-datafusion = { version = "=15.0.0-beta.1", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=15.0.0-beta.1", path = "./rust/lance-datagen" }
-lance-derive = { version = "=15.0.0-beta.1", path = "./rust/lance-derive" }
-lance-encoding = { version = "=15.0.0-beta.1", path = "./rust/lance-encoding" }
-lance-file = { version = "=15.0.0-beta.1", path = "./rust/lance-file" }
-lance-geo = { version = "=15.0.0-beta.1", path = "./rust/lance-geo" }
-lance-index = { version = "=15.0.0-beta.1", path = "./rust/lance-index" }
-lance-index-core = { version = "=15.0.0-beta.1", path = "./rust/lance-index-core" }
-lance-io = { version = "=15.0.0-beta.1", path = "./rust/lance-io", default-features = false }
-lance-jsonb = { version = "=15.0.0-beta.1", path = "./rust/lance-jsonb" }
-lance-linalg = { version = "=15.0.0-beta.1", path = "./rust/lance-linalg" }
-lance-namespace = { version = "=15.0.0-beta.1", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=15.0.0-beta.1", path = "./rust/lance-namespace-impls" }
+lance = { version = "=15.0.0-beta.2", path = "./rust/lance", default-features = false }
+lance-arrow = { version = "=15.0.0-beta.2", path = "./rust/lance-arrow" }
+lance-core = { version = "=15.0.0-beta.2", path = "./rust/lance-core" }
+lance-datafusion = { version = "=15.0.0-beta.2", path = "./rust/lance-datafusion" }
+lance-datafusion-exec = { version = "=15.0.0-beta.2", path = "./rust/lance-datafusion-exec" }
+lance-datagen = { version = "=15.0.0-beta.2", path = "./rust/lance-datagen" }
+lance-derive = { version = "=15.0.0-beta.2", path = "./rust/lance-derive" }
+lance-encoding = { version = "=15.0.0-beta.2", path = "./rust/lance-encoding" }
+lance-file = { version = "=15.0.0-beta.2", path = "./rust/lance-file" }
+lance-geo = { version = "=15.0.0-beta.2", path = "./rust/lance-geo" }
+lance-index = { version = "=15.0.0-beta.2", path = "./rust/lance-index" }
+lance-index-core = { version = "=15.0.0-beta.2", path = "./rust/lance-index-core" }
+lance-io = { version = "=15.0.0-beta.2", path = "./rust/lance-io", default-features = false }
+lance-jsonb = { version = "=15.0.0-beta.2", path = "./rust/lance-jsonb" }
+lance-linalg = { version = "=15.0.0-beta.2", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=15.0.0-beta.2", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=15.0.0-beta.2", path = "./rust/lance-namespace-impls" }
 lance-namespace-reqwest-client = "0.13.0"
-lance-select = { version = "=15.0.0-beta.1", path = "./rust/lance-select" }
-lance-tokenizer = { version = "=15.0.0-beta.1", path = "./rust/lance-tokenizer" }
-lance-table = { version = "=15.0.0-beta.1", path = "./rust/lance-table" }
-lance-test-macros = { version = "=15.0.0-beta.1", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=15.0.0-beta.1", path = "./rust/lance-testing" }
+lance-select = { version = "=15.0.0-beta.2", path = "./rust/lance-select" }
+lance-tokenizer = { version = "=15.0.0-beta.2", path = "./rust/lance-tokenizer" }
+lance-table = { version = "=15.0.0-beta.2", path = "./rust/lance-table" }
+lance-test-macros = { version = "=15.0.0-beta.2", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=15.0.0-beta.2", path = "./rust/lance-testing" }
 all_asserts = "2.3.1"
 approx = "0.5.1"
 # Note that this one does not include pyarrow
@@ -109,7 +111,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "std",
     "bytemuck",
 ] }
-lance-bitpacking = { version = "=15.0.0-beta.1", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=15.0.0-beta.2", path = "./rust/compression/bitpacking" }
 bitpacking = "0.9"
 bitvec = "1"
 blake3 = "1.8.5"
@@ -145,7 +147,9 @@ datafusion = { version = "54.0.0", default-features = false, features = [
 datafusion-common = "54.0.0"
 datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
 datafusion-sql = "54.0.0"
+datafusion-execution = "54.0.0"
 datafusion-expr = "54.0.0"
+datafusion-functions-nested = "54.0.0"
 datafusion-physical-expr = "54.0.0"
 datafusion-physical-plan = "54.0.0"
 datafusion-substrait = { version = "54.0.0", default-features = false }
@@ -154,7 +158,7 @@ either = "1.0"
 env_logger = "0.11.7"
 nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=15.0.0-beta.1", path = "./rust/compression/fsst" }
+fsst = { version = "=15.0.0-beta.2", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.8"
 geoarrow-schema = "0.8"
@@ -286,6 +290,3 @@ multiple-crate-versions = "allow"
 single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
-
-[patch.crates-io]
-object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }

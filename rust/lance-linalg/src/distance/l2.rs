@@ -8,15 +8,9 @@ use std::iter::Sum;
 use std::ops::AddAssign;
 use std::sync::Arc;
 
-use crate::{Error, Result};
-use arrow_array::{
-    Array, FixedSizeListArray, Float32Array,
-    cast::AsArray,
-    types::{Float16Type, Float32Type, Float64Type, Int8Type},
-};
-use arrow_schema::DataType;
+use crate::Result;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(target_arch = "x86_64")]
@@ -26,7 +20,7 @@ use num_traits::{AsPrimitive, Num};
 use crate::distance::{
     BatchKernel, HALF_KERNELS_COMPILED, HalfBackend, HalfType, PairKernel,
     U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_output_layout, assert_equal_lengths, half_backend,
-    int8_query_to_f32, x86_half_features,
+    x86_half_features,
 };
 
 /// Calculate the L2 distance between two vectors.
@@ -1011,80 +1005,21 @@ pub fn l2_distance_batch_into<T: L2>(from: &[T], to: &[T], dimension: usize, out
     T::l2_batch_into(from, to, dimension, output);
 }
 
-fn do_l2_distance_arrow_batch<T: ArrowFloatType>(
-    from: &T::ArrayType,
-    to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>>
-where
-    T::Native: L2,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values =
-        to.values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::ComputeError(format!(
-                "Cannot downcast to the same type: {} != {}",
-                T::FLOAT_TYPE,
-                to.value_type()
-            )))?;
-    let mut distances = vec![0.0; to.len()];
-    l2_distance_batch_into(
-        from.as_slice(),
-        to_values.as_slice(),
-        dimension,
-        &mut distances,
-    );
-
-    Ok(Arc::new(Float32Array::new(
-        distances.into(),
-        to.nulls().cloned(),
-    )))
-}
-
-/// Compute L2 distance between a vector and a batch of vectors.
+/// Compute l2 distances, propagating the null buffer of `to`.
 ///
-/// Null buffer of `to` is propagated to the returned array.
-///
-/// Parameters
-///
-/// - `from`: the vector to compute distance from.
-/// - `to`: a list of vectors to compute distance to.
-///
-/// # Errors
-///
-/// Returns an error if `from` is an `Int8` array containing nulls, since a null
-/// query element has no distance to compute. The unsupported-type and downcast
-/// paths return errors of their own; this list is not exhaustive.
-///
-/// # Panics
-///
-/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
+/// See [`super::DistanceType::batch`] for supported types and input validation.
+#[deprecated(note = "Use DistanceType::L2.batch")]
 pub fn l2_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    match *from.data_type() {
-        DataType::Float16 => do_l2_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
-        DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
-        DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_l2_distance_arrow_batch::<Float32Type>(
-            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
-            &to.convert_to_floating_point()?,
-        ),
-        _ => Err(Error::InvalidArgumentError(format!(
-            "Unsupported data type: {}",
-            from.data_type()
-        ))),
-    }
+    super::DistanceType::L2.batch(from, to).map(Arc::new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{cast::AsArray, types::Float32Type};
 
     use approx::assert_relative_eq;
     use num_traits::ToPrimitive;

@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn test_register_replaces_geodatafusion_predicates() {
         let ctx = SessionContext::new();
-        crate::register_functions(&ctx);
+        crate::udf::register_functions(&ctx);
         for relation in Relation::ALL {
             let udf = lance_udf(relation);
             assert_eq!(ctx.udf(udf.name()).unwrap().as_ref(), &udf);

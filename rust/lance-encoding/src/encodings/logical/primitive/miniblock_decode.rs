@@ -1251,22 +1251,25 @@ impl ChunkInstructions {
                 // These blocks have no rows to take but may have a preamble we need
                 // We only look for preamble if to_skip == 0 (we're not skipping rows)
                 if rows_avail == 0 && to_skip == 0 {
-                    // Only process if this chunk has a preamble we need
-                    if has_preamble && need_preamble {
-                        chunk_instructions.push(Self {
-                            chunk_idx: block_index,
-                            preamble: PreambleAction::Take,
-                            rows_to_skip: 0,
-                            rows_to_take: 0,
-                            // We still need to look at has_trailer to distinguish between "all preamble
-                            // and row ends at end of chunk" and "all preamble and row bleeds into next
-                            // chunk".  Both cases will have 0 rows available.
-                            take_trailer: has_trailer,
-                        });
-                        // Only set need_preamble = false if the chunk has at least one row,
-                        // Or we are reaching the last block,
-                        // Otherwise, the chunk is entirely preamble and we need the next chunk's preamble too
-                        if starts_including_trailer > 0 || block_index == num_chunks - 1 {
+                    if need_preamble {
+                        if has_preamble {
+                            chunk_instructions.push(Self {
+                                chunk_idx: block_index,
+                                preamble: PreambleAction::Take,
+                                rows_to_skip: 0,
+                                rows_to_take: 0,
+                                // We still need to look at has_trailer to distinguish between "all preamble
+                                // and row ends at end of chunk" and "all preamble and row bleeds into next
+                                // chunk".  Both cases will have 0 rows available.
+                                take_trailer: has_trailer,
+                            });
+                            // Continue looking for a preamble only while the row actually
+                            // bleeds into the next chunk.  Once the row ends (no trailer),
+                            // the next chunk starts a new row and carries no preamble.
+                            need_preamble = has_trailer && block_index + 1 < num_chunks;
+                        } else {
+                            // The previous row ended at the previous chunk boundary, so
+                            // there is nothing left to continue.
                             need_preamble = false;
                         }
                     }
@@ -2508,6 +2511,48 @@ mod tests {
                     take_trailer: false,
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_schedule_stops_after_preamble_that_ends_the_row() {
+        // Chunk 0 starts one row that bleeds into chunk 1 (ends=0, partial=1).
+        // Chunk 1 is entirely a preamble and the row ends there (ends=1, partial=0).
+        // Chunk 2 starts the next row (no preamble).
+        //
+        // If the requested range covers only that first row, the scheduler must stop
+        // after chunk 1.  It used to keep `need_preamble` set for an all-preamble
+        // chunk that has no trailer, then emitted a zero-row `Absent` instruction for
+        // chunk 2.  `map_range` rejects an empty row range unless it is taking a
+        // preamble, so that instruction panicked during decoding.
+        let rep_data: Vec<u64> = vec![
+            0, 1, // chunk 0: no rows end, trailer -> the row bleeds into chunk 1
+            1, 0, // chunk 1: one row ends, no trailer -> all preamble, row ends here
+            1, 0, // chunk 2: the next row starts
+        ];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let chunk_index = MiniBlockChunkIndex::new_nested_for_test(&rep_bytes, 2);
+
+        let instructions = ChunkInstructions::schedule_instructions(&chunk_index, &[0..1]);
+
+        assert_eq!(
+            instructions,
+            vec![
+                ChunkInstructions {
+                    chunk_idx: 0,
+                    preamble: PreambleAction::Absent,
+                    rows_to_skip: 0,
+                    rows_to_take: 1,
+                    take_trailer: true,
+                },
+                ChunkInstructions {
+                    chunk_idx: 1,
+                    preamble: PreambleAction::Take,
+                    rows_to_skip: 0,
+                    rows_to_take: 0,
+                    take_trailer: false,
+                },
+            ]
         );
     }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
@@ -402,6 +403,7 @@ pub async fn build_per_segment_filters(
 async fn overlay_rescan(
     dataset: &Dataset,
     selected_old_indices: &[&IndexMetadata],
+    tagged_coverage: Option<&HashMap<Uuid, RoaringBitmap>>,
     effective_old_frags: &RoaringBitmap,
     unindexed: &[Fragment],
     address_domain: bool,
@@ -410,8 +412,20 @@ async fn overlay_rescan(
     let overlaid = overlaid_fragments(&dataset.manifest.fragments);
     let mut stale_offsets: HashMap<u32, RoaringBitmap> = HashMap::new();
     for segment in selected_old_indices {
+        let mut segment = Cow::Borrowed(*segment);
+        if let Some(coverage) = tagged_coverage {
+            // Tagged bitmaps name retired sources. Match overlays against each
+            // segment's live coverage, retaining its own fields and version gate.
+            let bitmap = coverage.get(&segment.uuid).ok_or_else(|| {
+                Error::internal(format!(
+                    "tagged coverage missing for segment {}",
+                    segment.uuid
+                ))
+            })?;
+            segment.to_mut().fragment_bitmap = Some(bitmap.clone());
+        }
         collect_overlay_stale_rows_for_segment(
-            segment,
+            segment.as_ref(),
             &overlaid,
             &mut stale_offsets,
             dataset.schema(),
@@ -843,6 +857,7 @@ async fn merge_scalar_indices<'a>(
         overlay_rescan(
             dataset.as_ref(),
             &selected_old_indices,
+            tagged_coverage.as_ref(),
             &effective_old_frags,
             unindexed,
             // The domain each `build_per_segment_filters` call below asks for.
@@ -2226,6 +2241,242 @@ mod tests {
         result["id"]
             .as_primitive::<arrow::datatypes::Int32Type>()
             .value(0)
+    }
+
+    #[rstest]
+    #[case::recorded_versions(false, false)]
+    #[case::hnsw_new_data(true, false)]
+    #[case::hnsw_steady_state(true, true)]
+    #[tokio::test]
+    async fn test_default_optimize_preserves_shared_model_policy(
+        #[case] is_hnsw: bool,
+        #[case] is_steady_state: bool,
+    ) {
+        const DIM: usize = 8;
+        const ROWS: usize = 16;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let (first, vectors) = clustered_vector_batch(schema.clone(), 0, ROWS, DIM, 0.0);
+        let (second, _) = clustered_vector_batch(schema.clone(), ROWS as i32, ROWS, DIM, 1.0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(first), Ok(second)], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: ROWS,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(
+                    vec![0.0; DIM]
+                        .into_iter()
+                        .chain(vec![100.0; DIM])
+                        .collect::<Vec<_>>(),
+                ),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let params = |m| {
+            let mut ivf = IvfBuildParams::try_with_centroids(2, centroids.clone()).unwrap();
+            if !is_steady_state {
+                // Keep the split threshold below the appended partition size,
+                // so default optimization exercises consolidation each cycle.
+                ivf.target_partition_size = Some(4);
+            }
+            if is_hnsw {
+                VectorIndexParams::ivf_hnsw(
+                    MetricType::L2,
+                    ivf,
+                    HnswBuildParams {
+                        m,
+                        max_level: 2,
+                        ef_construction: 16,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf)
+            }
+        };
+        let first =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params(4))
+                .name("vector_idx".into())
+                .fragments(vec![0])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![first])
+            .await
+            .unwrap();
+        if is_hnsw {
+            let second =
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params(8))
+                    .name("vector_idx".into())
+                    .replace(true)
+                    .fragments(vec![1])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            let mut segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            segments.push(second);
+            let old_segment = segments[0].clone();
+            let txn = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: segments,
+                    removed_indices: vec![old_segment],
+                },
+                None,
+            );
+            dataset
+                .apply_commit(txn, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+        } else {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            let mut segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            assert_eq!(segments.len(), 2);
+            let old_segments = segments.clone();
+            assert_ne!(segments[0].index_version, 0);
+            segments[0].index_version = 0;
+            let txn = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: segments,
+                    removed_indices: old_segments,
+                },
+                None,
+            );
+            dataset
+                .apply_commit(txn, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        if is_steady_state {
+            let logical = dataset
+                .open_logical_vector_index("vector", "vector_idx")
+                .await
+                .unwrap();
+            assert_eq!(
+                select_steady_state_rebalance(
+                    &logical.as_ivf().unwrap(),
+                    VectorSegmentCompatibility::SharedModel
+                )
+                .unwrap(),
+                Some(SteadyStateRebalance::MergeAll)
+            );
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset
+                    .load_indices_by_name("vector_idx")
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        for cycle in 0..if is_steady_state { 1 } else { 2 } {
+            if !is_steady_state {
+                let (batch, _) = clustered_vector_batch(
+                    schema.clone(),
+                    ((2 + cycle) * ROWS) as i32,
+                    ROWS,
+                    DIM,
+                    2.0 + cycle as f32,
+                );
+                dataset
+                    .append(RecordBatchIterator::new([Ok(batch)], schema.clone()), None)
+                    .await
+                    .unwrap();
+                dataset
+                    .optimize_indices(&OptimizeOptions::default())
+                    .await
+                    .unwrap();
+            }
+            let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            assert_eq!(
+                segments.len(),
+                1,
+                "default optimize must consolidate shared models"
+            );
+            assert_eq!(
+                segments[0].fragment_bitmap.as_ref().unwrap(),
+                dataset.fragment_bitmap.as_ref()
+            );
+            let index = dataset
+                .open_vector_index("vector", &segments[0].uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let mut stored_rows = roaring::RoaringTreemap::new();
+            for partition in 0..index.ivf_model().num_partitions() {
+                let mut batches = index
+                    .partition_reader(partition, false, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                while let Some(batch) = batches.try_next().await.unwrap() {
+                    for &row_id in batch[lance_core::ROW_ID]
+                        .as_primitive::<arrow::datatypes::UInt64Type>()
+                        .values()
+                    {
+                        assert!(stored_rows.insert(row_id), "duplicate row address {row_id}");
+                    }
+                }
+            }
+            let expected_rows = dataset
+                .get_fragments()
+                .iter()
+                .flat_map(|fragment| {
+                    (0..ROWS as u32).map(move |offset| {
+                        u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                            fragment.id() as u32,
+                            offset,
+                        ))
+                    })
+                })
+                .collect::<roaring::RoaringTreemap>();
+            assert_eq!(stored_rows, expected_rows);
+            assert_eq!(
+                stored_rows.len(),
+                (dataset.get_fragments().len() * ROWS) as u64
+            );
+            let mut correct = 0;
+            for offset in [0, 4, 8, 12] {
+                let query = vectors.value(offset);
+                correct += usize::from(
+                    nearest_id(&dataset, query.as_primitive::<Float32Type>(), 2).await
+                        == offset as i32,
+                );
+            }
+            assert!(correct as f32 / 4.0 >= 0.5, "recall={}/4", correct);
+        }
     }
 
     #[rstest]

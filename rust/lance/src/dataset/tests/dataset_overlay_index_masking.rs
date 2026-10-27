@@ -31,6 +31,7 @@ use lance_index::scalar::{AnyQuery, LabelListQuery, SargableQuery};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use lance_select::RowSetOps;
+use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{DataFile, IndexMetadata};
 use roaring::RoaringBitmap;
@@ -45,6 +46,7 @@ use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::scanner::RowAddrTreeMap;
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
+use crate::index::frag_reuse_reader::tests::persist_fixture;
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
@@ -1230,6 +1232,119 @@ async fn test_remapping_merge_rescans_overlay_stale_fragment(
     assert_ids_match_oracle(&dataset, "age >= 100", &[1, 10, 11, 12, 13, 14, 15, 16, 17]).await;
     let not_null = (0..18).filter(|id| *id != 2).collect::<Vec<i32>>();
     assert_ids_match_oracle(&dataset, "age IS NOT NULL", &not_null).await;
+    assert_answered_by_index(&dataset, "age = 999").await;
+    assert_answered_by_index(&dataset, "age IS NULL").await;
+    assert_optimize_is_noop(&mut dataset, &merge, &merged).await;
+}
+
+/// A tagged segment retains its source fragments as provenance after compaction. An
+/// overlay on the destination must be folded using derived coverage before stamping current.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+async fn test_remapping_merge_rescans_overlay_on_tagged_compaction_destination(
+    #[case] index_type: IndexType,
+) {
+    let mut dataset = create_base_dataset().await;
+    dataset
+        .create_index(
+            &["age"],
+            index_type,
+            Some("age_idx".into()),
+            &scalar_params(index_type),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // A drained tagged table retains this flag even without an FRI entry. Its
+    // next deferred compaction must write tagged history and preserve provenance.
+    let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+    {
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    }
+    persist_fixture(&mut dataset, indices.as_ref().clone()).await;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+    let destination_id = dataset.fragments()[0].id as u32;
+    assert!(destination_id > 1);
+    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    );
+    let source = stored.iter().find(|index| index.name == "age_idx").unwrap();
+    assert_eq!(source.fragment_bitmap, Some([0, 1].into_iter().collect()));
+    assert_eq!(
+        dataset.load_indices_by_name("age_idx").await.unwrap()[0].fragment_bitmap,
+        Some([destination_id].into_iter().collect())
+    );
+
+    // Overlay commits on tagged tables are currently gated. Persist a real overlay
+    // as a fixture to exercise maintenance without changing that admission rule.
+    let fragment = dataset.get_fragment(destination_id as usize).unwrap();
+    let mut writer = fragment
+        .write_overlay(&dataset.schema().project_by_ids(&[1], true))
+        .await
+        .unwrap();
+    let batch = arrow_array::record_batch!(
+        (
+            "_rowaddr",
+            UInt64,
+            vec![
+                u64::from(RowAddress::new_from_parts(destination_id, 1)),
+                u64::from(RowAddress::new_from_parts(destination_id, 2)),
+            ]
+        ),
+        ("age", Int32, vec![Some(999), None])
+    )
+    .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    let mut group = writer.finish().await.unwrap().unwrap();
+    group.overlays[0].committed_version = dataset.manifest.version + 1;
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    Arc::make_mut(&mut manifest.fragments)[0].overlays = group.overlays;
+    persist_fixture(&mut dataset, stored.as_ref().clone()).await;
+
+    assert_ids_match_oracle(&dataset, "age = 10", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 999", &[1]).await;
+    append_age_fragment(&mut dataset, 12..18).await;
+    let appended_id = dataset.fragments().last().unwrap().id as u32;
+    let merge = OptimizeOptions::merge(2);
+    let merged = optimize_into_one_segment(
+        &mut dataset,
+        "age_idx",
+        &merge,
+        &[destination_id, appended_id],
+    )
+    .await;
+
+    assert_eq!(age_hits(&dataset, 10).await, 0);
+    assert_eq!(age_hits(&dataset, 20).await, 0);
+    assert_eq!(age_hits(&dataset, 999).await, 1);
+    assert_eq!(
+        scalar_index_hits(&dataset, "age", "age_idx", &SargableQuery::IsNull()).await,
+        1
+    );
+    assert_ids_match_oracle(&dataset, "age = 10", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 20", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 999", &[1]).await;
+    assert_ids_match_oracle(&dataset, "age IS NULL", &[2]).await;
+    assert_ids_match_oracle(&dataset, "age = 60", &[6]).await;
+    assert_ids_match_oracle(&dataset, "age = 120", &[12]).await;
     assert_answered_by_index(&dataset, "age = 999").await;
     assert_answered_by_index(&dataset, "age IS NULL").await;
     assert_optimize_is_noop(&mut dataset, &merge, &merged).await;

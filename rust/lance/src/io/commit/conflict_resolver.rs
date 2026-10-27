@@ -70,7 +70,7 @@ pub struct TransactionRebase<'a> {
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// so a concurrent `Merge` can be told which columns it rewrote in place
     /// and which fields it removed or retyped.
-    read_fragments: Option<Vec<Fragment>>,
+    read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
@@ -261,7 +261,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
-                let read_fragments = is_create_index.then(|| dataset.fragments().as_ref().clone());
+                let read_fragments = is_create_index.then(|| dataset.fragments().clone());
                 let read_schema = is_create_index.then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
@@ -1551,6 +1551,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Rewrite {
             groups,
             frag_reuse_index,
+            rewritten_indices,
             ..
         } = &self.transaction.operation
         {
@@ -1633,7 +1634,11 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::Rewrite { groups, .. } => {
+                Operation::Rewrite {
+                    groups,
+                    rewritten_indices: other_rewritten_indices,
+                    ..
+                } => {
                     // Double consumption: the committed rewrite replaced
                     // fragments our tagged transitions read from or produce,
                     // so appending our transitions would record row movement
@@ -1679,6 +1684,40 @@ impl<'a> TransactionRebase<'a> {
                                 .into(),
                             ));
                         }
+                    }
+                    // A replaced source invalidates a physical segment merge even
+                    // when the concurrent rewrite also relabels our suffix fragments.
+                    // Diagnose this before the retryable fragment-overlap check.
+                    let mut replacement_source_counts = HashMap::new();
+                    for rewritten_index in rewritten_indices {
+                        *replacement_source_counts
+                            .entry(rewritten_index.new_id)
+                            .or_insert(0) += 1;
+                    }
+                    let merged_sources = rewritten_indices
+                        .iter()
+                        .filter(|rewritten_index| {
+                            replacement_source_counts[&rewritten_index.new_id] > 1
+                        })
+                        .map(|rewritten_index| rewritten_index.old_id)
+                        .collect::<HashSet<_>>();
+                    let replaced_source =
+                        other_rewritten_indices.iter().find_map(|rewritten_index| {
+                            (rewritten_index.old_id != rewritten_index.new_id
+                                && merged_sources.contains(&rewritten_index.old_id))
+                            .then_some(rewritten_index.old_id)
+                        });
+                    if let Some(source_id) = replaced_source {
+                        return Err(Error::incompatible_transaction_source(
+                            format!(
+                                "A concurrent rewrite at version {} replaced source index \
+                                 segment {}, which this rewrite planned to merge. The stale \
+                                 compaction plan can never succeed as committed; replan \
+                                 compaction from the latest dataset.",
+                                other_version, source_id
+                            )
+                            .into(),
+                        ));
                     }
                     if groups
                         .iter()

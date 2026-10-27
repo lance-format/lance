@@ -1902,6 +1902,21 @@ impl RepDefUnraveler {
         let current_def_cmp = self.current_def_cmp;
         self.current_def_cmp += 1;
 
+        // If every level present is visible at this layer (always the case without lists) then
+        // each level yields one validity bit and we can build them in bulk.  Slicing up to the
+        // max def level keeps the out-of-range panic of the per-level lookup below.
+        let max_def = def_levels.iter().copied().max().unwrap_or(0);
+        let current_rep_cmp = self.current_rep_cmp;
+        if self.levels_to_rep[..=max_def as usize]
+            .iter()
+            .all(|&rep| rep <= current_rep_cmp)
+        {
+            validity.append_buffer(&BooleanBuffer::collect_bool(def_levels.len(), |i| {
+                def_levels[i] <= current_def_cmp
+            }));
+            return Ok(());
+        }
+
         for is_valid in def_levels.iter().filter_map(|&level| {
             if self.levels_to_rep[level as usize] <= self.current_rep_cmp {
                 Some(level <= current_def_cmp)
@@ -4093,6 +4108,65 @@ mod tests {
             (
                 offsets_32(&[0, 2, 2, 2, 4]),
                 Some(validity(&[true, true, false, true]))
+            )
+        );
+    }
+
+    #[test]
+    fn test_unravel_validity_unaligned_pages() {
+        // Pages whose lengths are not multiples of 64 append at unaligned bit offsets
+        let def1: Vec<u16> = (0..70).map(|i| (i % 3 == 0) as u16).collect();
+        let def2: Vec<u16> = (0..130).map(|i| (i % 5 == 0) as u16).collect();
+        let expected = def1
+            .iter()
+            .chain(def2.iter())
+            .map(|&level| level == 0)
+            .collect::<Vec<_>>();
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![
+            RepDefUnraveler::new(
+                None,
+                Some(def1),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                70,
+            ),
+            RepDefUnraveler::new(
+                None,
+                Some(def2),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                130,
+            ),
+        ]);
+
+        assert_eq!(
+            unraveler.unravel_validity(200).unwrap(),
+            Some(validity(&expected))
+        );
+    }
+
+    #[test]
+    fn test_unravel_validity_list_page_without_null_lists() {
+        // No null or empty lists, so every level is visible at the item layer
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(vec![1, 0, 1, 1, 0]),
+            Some(vec![0, 1, 0, 1, 0]),
+            vec![
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::NullableList,
+            ]
+            .into(),
+            5,
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(5).unwrap(),
+            Some(validity(&[true, false, true, false, true]))
+        );
+        assert_eq!(
+            unraveler.unravel_offsets::<i32>().unwrap(),
+            (
+                offsets_32(&[0, 2, 3, 5]),
+                Some(validity(&[true, true, true]))
             )
         );
     }
