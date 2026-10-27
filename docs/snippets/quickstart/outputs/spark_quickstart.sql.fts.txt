@@ -1,5 +1,5 @@
 fragments_indexed	index_name
-5	name_idx
+2	name_idx
 
 id	name
 1	red running shoes

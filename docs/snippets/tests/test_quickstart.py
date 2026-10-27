@@ -25,10 +25,16 @@ def spark_env():
     return env
 
 
-def ivy_conf():
-    """Point Spark's dependency resolution at the directory CI caches."""
+def spark_submit_args():
+    # With the default local[*] master, writes split into one task per core and
+    # each task writes its own fragment, so outputs such as fragments_indexed
+    # would depend on the machine. A fixed thread count keeps them stable.
+    args = ["--master", "local[2]"]
+    # Point Spark's dependency resolution at the directory CI caches.
     ivy_dir = os.environ.get("SPARK_IVY_DIR")
-    return ["--conf", f"spark.jars.ivy={ivy_dir}"] if ivy_dir else []
+    if ivy_dir:
+        args += ["--conf", f"spark.jars.ivy={ivy_dir}"]
+    return args
 
 
 def check_outputs(snippet: Path, recorded_dir: Path, update: bool):
@@ -80,7 +86,7 @@ def test_lancedb_quickstart(tmp_path, update_outputs):
 def test_spark_quickstart_pyspark(tmp_path, update_outputs):
     snippet = QUICKSTART / "spark_quickstart.py"
     env = spark_env()
-    env["PYSPARK_SUBMIT_ARGS"] = shlex.join([*ivy_conf(), "pyspark-shell"])
+    env["PYSPARK_SUBMIT_ARGS"] = shlex.join([*spark_submit_args(), "pyspark-shell"])
     subprocess.run(
         [sys.executable, RUNNER, snippet, tmp_path / "outputs"],
         check=True,
@@ -97,7 +103,7 @@ def test_spark_quickstart_sql(tmp_path, update_outputs):
         (QUICKSTART / "spark-sql.sh").read_text().replace("\\\n", " ")
     )
     run_sql(
-        [*command, *ivy_conf()],
+        [*command, *spark_submit_args()],
         snippet,
         tmp_path / "outputs",
         env=spark_env(),
