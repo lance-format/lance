@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -73,8 +73,8 @@ use lance_index::IndexCriteria;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
+use lance_index::scalar::expression::create_filter_plan;
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator,
     PhraseQuery, fill_fts_query_column,
@@ -122,7 +122,7 @@ use crate::io::exec::fts::{
     BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
     FlatCombinedFieldsExec, FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage,
     FlatStatsScope, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
-    SharedFtsScorer,
+    SharedFtsScorer, SharedFtsScorerExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -168,6 +168,12 @@ pub(crate) fn validate_batch_size(batch_size: usize) -> Result<u32> {
         )));
     }
     Ok(validated)
+}
+
+/// A restricted corpus scan must count every document before selecting output rows.
+enum FlatMatchFilter<'a> {
+    BeforeScoring(&'a ExprFilterPlan),
+    AtEmission(PreFilterSource),
 }
 
 enum FtsOverlayPlan {
@@ -233,6 +239,23 @@ fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
     let mut seen = HashSet::new();
     visit(query, &mut columns, &mut seen);
     columns
+}
+
+/// The multiple of the exact distance a vector index ranks by. Lance indexes
+/// cosine on SQ and PQ as L2 over normalized vectors, twice `1 - cos`; FLAT
+/// and RQ rank it, and every other metric, on its own scale.
+fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
+    let quantized_as_l2 = segments.iter().any(|segment| {
+        segment.index_details.as_ref().is_some_and(|details| {
+            let index_type = crate::index::vector::details::derive_vector_index_type(details);
+            index_type.ends_with("PQ") || index_type.ends_with("SQ")
+        })
+    });
+    if metric == MetricType::Cosine && quantized_as_l2 {
+        2.0
+    } else {
+        1.0
+    }
 }
 
 fn collect_phrase_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
@@ -2410,8 +2433,8 @@ impl Scanner {
 
         let key = match &element_type {
             dt if dt == q.data_type() => q,
-            dt if dt.is_floating() => coerce_float_vector(
-                q.as_any().downcast_ref::<Float32Array>().unwrap(),
+            dt if dt.is_floating() && q.data_type() == &DataType::Float32 => coerce_float_vector(
+                q.as_primitive::<arrow_array::types::Float32Type>(),
                 FloatType::try_from(dt)?,
             )?,
             _ => {
@@ -2565,9 +2588,15 @@ impl Scanner {
         self
     }
 
+    /// Set the beam width used when searching an HNSW graph.
+    ///
+    /// Defaults to `1.5 * k * refine_factor`, floored at
+    /// [`lance_index::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub fn ef(&mut self, ef: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.ef = Some(ef);
+        } else {
+            log::warn!("ef is not set because nearest has not been called yet");
         }
         self
     }
@@ -2603,6 +2632,12 @@ impl Scanner {
     }
 
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
+    ///
+    /// When unset, the search ranks by the metric of the vector index it chooses for the
+    /// column, also where it falls back to flat KNN over fragments that index does not
+    /// cover. A search that chooses no index, such as one with [`Self::use_index`] false
+    /// or a full-text filter under [`Self::prefilter`], uses the column type's default:
+    /// Hamming for uint8 vectors and L2 otherwise.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = Some(metric_type)
@@ -3482,7 +3517,9 @@ impl Scanner {
 
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
-            let expr = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
+            let expr = planner.optimize_expr(
+                filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?,
+            )?;
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
@@ -3491,8 +3528,7 @@ impl Scanner {
                 }
                 None => self.dataset.scalar_index_info().await?,
             };
-            let filter_plan =
-                planner.create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
+            let filter_plan = create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
 
             // This tests if any of the fragments are missing the physical_rows property (old style)
             // If they are then we cannot use scalar indices
@@ -3512,8 +3548,7 @@ impl Scanner {
                 if has_missing_row_count {
                     // We need row counts to use scalar indices.  If we don't have them then
                     // fallback to a non-indexed filter
-                    let filter_plan =
-                        planner.create_filter_plan(expr.clone(), &index_info, false)?;
+                    let filter_plan = create_filter_plan(expr.clone(), &index_info, false)?;
                     FilterPlan::new(query_filter.clone(), filter_plan)
                 } else {
                     FilterPlan::new(query_filter.clone(), filter_plan)
@@ -4451,7 +4486,16 @@ impl Scanner {
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
 
-        let effective_projection = self.source_projection()?;
+        let mut effective_projection = self.source_projection()?;
+
+        // A single-stage read may omit row identifiers, so it must also load
+        // unprojected sort columns instead of relying on a later take.
+        if let Some(ordering) = &self.ordering {
+            effective_projection = effective_projection.union_columns(
+                ordering.iter().map(|col| &col.column_name),
+                OnMissing::Error,
+            )?;
+        }
 
         // Plan against the effective filter: with an external mask the SQL filter
         // becomes a refine, so its columns must be retained even when the original
@@ -5353,6 +5397,15 @@ impl Scanner {
                 self.fragments_covered_by_fts_query(query).await?,
             )
             .await?;
+        // Choose corpus-aware scoring only for the resolved root Match. Recursive leaves
+        // retain their existing scoring and approximation contracts.
+        if let FtsQuery::Match(match_query) = query
+            && let Some(plan) = self
+                .plan_restricted_match_query(match_query, &params, filter_plan, &prefilter_source)
+                .await?
+        {
+            return Ok(plan);
+        }
         // Data overlay masking blocks stale rows from indexed leaves and re-evaluates only those
         // rows from their current values on the flat-text path.
         let fts_exec = self
@@ -5893,7 +5946,7 @@ impl Scanner {
                             HashMap::new(),
                             &flat_query,
                             &flat_params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             None,
                         )
                         .await?;
@@ -5919,7 +5972,7 @@ impl Scanner {
                                 HashMap::new(),
                                 &flat_query,
                                 &flat_params,
-                                filter_plan,
+                                FlatMatchFilter::BeforeScoring(filter_plan),
                                 None,
                             )
                             .await?;
@@ -5970,7 +6023,7 @@ impl Scanner {
                             stale_rows,
                             &flat_query,
                             &flat_params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             shared_scorer,
                         )
                         .await?,
@@ -5993,7 +6046,7 @@ impl Scanner {
                         HashMap::new(),
                         &flat_query,
                         &flat_params,
-                        filter_plan,
+                        FlatMatchFilter::BeforeScoring(filter_plan),
                         None,
                     )
                     .await?;
@@ -6002,6 +6055,158 @@ impl Scanner {
         };
 
         Self::combine_fts_leaf_plans(phrase_plan, flat_phrase_plan, params)
+    }
+
+    /// Use global append-only corpus statistics independently of the selected candidates.
+    /// This entry is called only for a root scalar-text Match with a user prefilter or
+    /// explicit fragment selection. Other query shapes retain their existing planner.
+    async fn plan_restricted_match_query(
+        &self,
+        query: &MatchQuery,
+        params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let is_primary_fts = self.full_text_query.is_some()
+            && self.nearest.is_none()
+            && self.filter.query_filter.is_none();
+        let has_postfilter = !self.prefilter && self.filter.expr_filter.is_some();
+        let has_restriction =
+            self.fragments.is_some() || (self.prefilter && !filter_plan.is_empty());
+        if !is_primary_fts
+            || self.fast_search
+            || has_postfilter
+            || !has_restriction
+            || params.wand_factor != 1.0
+            || params.phrase_slop.is_some()
+            || query.fuzziness != Some(0)
+            || query.document_granularity != Some(DocumentGranularity::Row)
+            || self
+                .dataset
+                .fragments()
+                .iter()
+                .any(|f| f.deletion_file.is_some())
+        {
+            return Ok(None);
+        }
+        let Some(column) = query.column.as_ref() else {
+            return Ok(None);
+        };
+        let resolved = resolve_fts_field(self.dataset.schema(), column, DocumentGranularity::Row)?;
+        if resolved.has_lists()
+            || !self
+                .dataset
+                .schema()
+                .field_by_id(resolved.final_field_id)
+                .is_some_and(|field| {
+                    matches!(
+                        field.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                })
+        {
+            return Ok(None);
+        }
+        if params.limit == Some(0)
+            || self.dataset.fragments().is_empty()
+            || self.fragments.as_ref().is_some_and(Vec::is_empty)
+        {
+            return Ok(Some(Arc::new(EmptyExec::new(fts_schema(
+                DocumentGranularity::Row,
+            )))));
+        }
+
+        let index = self
+            .dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(column)
+                    .supports_fts()
+                    .with_fts_document_granularity(DocumentGranularity::Row),
+            )
+            .await?;
+        let (corpus_fragments, segments) = if let Some(index) = index {
+            // Keep the full residual corpus, including fragments outside candidate selection.
+            let corpus_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+            if corpus_fragments.is_empty() {
+                return Ok(None);
+            }
+            let FtsOverlayPlan::Unchanged(segments) = self
+                .fts_overlay_plan(column, DocumentGranularity::Row, self.dataset.fragments())
+                .await?
+            else {
+                return Ok(None);
+            };
+            let segments = match segments {
+                Some(segments) => segments,
+                None => load_segments(&self.dataset, column, DocumentGranularity::Row)
+                    .await?
+                    .ok_or_else(|| Error::internal("FTS index has no physical segments"))?,
+            };
+            let details = futures::future::try_join_all(
+                segments
+                    .iter()
+                    .map(|segment| load_physical_fts_details(&self.dataset, column, segment)),
+            )
+            .await?;
+            if details.iter().any(|details| {
+                !matches!(
+                    details.posting_format_version,
+                    Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
+                )
+            }) {
+                return Ok(None);
+            }
+            (corpus_fragments, Some(segments))
+        } else {
+            (self.dataset.fragments().to_vec(), None)
+        };
+        let candidate_filter = self
+            .prefilter_source(
+                filter_plan,
+                corpus_fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+            )
+            .await?;
+        let (indexed_plan, shared_scorer) = match segments {
+            Some(segments) => {
+                let shared_scorer = Arc::new(SharedFtsScorer::new());
+                let indexed_plan = MatchQueryExec::new_with_segments_and_document_granularity(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                    segments,
+                    DocumentGranularity::Row,
+                )
+                .with_shared_scorer(shared_scorer.clone())
+                .with_external_mask(self.external_row_mask.clone());
+                (
+                    Some(Arc::new(indexed_plan) as Arc<dyn ExecutionPlan>),
+                    Some(shared_scorer),
+                )
+            }
+            None => (None, None),
+        };
+        // Retain this producer even when the selected residual domain is empty. Its
+        // scorer must be published before indexed candidates can be pruned to top-k.
+        let flat_plan = self
+            .plan_flat_match_query(
+                corpus_fragments,
+                HashMap::new(),
+                query,
+                params,
+                FlatMatchFilter::AtEmission(candidate_filter),
+                shared_scorer.clone(),
+            )
+            .await?;
+        let plan = Self::combine_fts_leaf_plans(indexed_plan, Some(flat_plan), params)?;
+        Ok(Some(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new(plan, shared_scorer)),
+            None => plan,
+        }))
     }
 
     async fn plan_match_query(
@@ -6059,7 +6264,7 @@ impl Scanner {
                             HashMap::new(),
                             query,
                             params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             None,
                         )
                         .await?;
@@ -6085,7 +6290,7 @@ impl Scanner {
                                 HashMap::new(),
                                 query,
                                 params,
-                                filter_plan,
+                                FlatMatchFilter::BeforeScoring(filter_plan),
                                 None,
                             )
                             .await?;
@@ -6129,7 +6334,7 @@ impl Scanner {
                             stale_rows,
                             query,
                             params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             shared_scorer,
                         )
                         .await?,
@@ -6153,7 +6358,7 @@ impl Scanner {
                         HashMap::new(),
                         query,
                         params,
-                        filter_plan,
+                        FlatMatchFilter::BeforeScoring(filter_plan),
                         None,
                     )
                     .await?;
@@ -6205,9 +6410,14 @@ impl Scanner {
         stale_rows: HashMap<u32, RoaringBitmap>,
         query: &MatchQuery,
         params: &FtsSearchParams,
-        filter_plan: &ExprFilterPlan,
+        filter: FlatMatchFilter<'_>,
         shared_scorer: Option<Arc<SharedFtsScorer>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let unfiltered = ExprFilterPlan::default();
+        let (filter_plan, candidate_filter) = match filter {
+            FlatMatchFilter::BeforeScoring(filter_plan) => (filter_plan, None),
+            FlatMatchFilter::AtEmission(candidate_filter) => (&unfiltered, Some(candidate_filter)),
+        };
         let column = query
             .column
             .as_ref()
@@ -6247,6 +6457,9 @@ impl Scanner {
         );
         if let Some(shared_scorer) = shared_scorer {
             flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
+        }
+        if let Some(candidate_filter) = candidate_filter {
+            flat_match_plan = flat_match_plan.with_candidate_filter(candidate_filter);
         }
         let flat_match_plan: Arc<dyn ExecutionPlan> = Arc::new(flat_match_plan);
         // Unindexed fragments and stale rows never reach the index-side prefilter,
@@ -6643,6 +6856,11 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
+        // The metric of the index chosen for this query. When that index ends up unused
+        // because no searched fragment is in its coverage, or the fragment-reuse check drops
+        // it, the flat branch below still ranks by it if the query names no metric, so
+        // `_distance` keeps one scale whichever fragments are searched.
+        let mut chosen_index_metric = None;
         let mut index_and_segments = if use_index {
             if let Some(requested_segments) = self.index_segments.as_ref() {
                 let requested_segment_set =
@@ -6688,6 +6906,11 @@ impl Scanner {
                     ));
                 }
 
+                // From the details alone: opening a segment the scope may exclude would add
+                // I/O and a failure mode to what can end as a flat search.
+                chosen_index_metric = requested_index_segments
+                    .iter()
+                    .find_map(crate::index::vector::details::metric_type_from_index_metadata);
                 let selected_index_segments =
                     self.retain_relevant_index_segments(requested_index_segments);
                 if selected_index_segments.is_empty() {
@@ -6774,6 +6997,7 @@ impl Scanner {
 
                 match selected {
                     Some((index, index_metric)) => {
+                        chosen_index_metric = Some(index_metric);
                         let index_segments = self.retain_relevant_index_segments(
                             self.dataset.load_indices_by_name(&index.name).await?,
                         );
@@ -6862,8 +7086,28 @@ impl Scanner {
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    self.ann(&q, &index_segments, filter_plan, overlay_block.clone())
-                        .await?
+                    // Refine applies the distance range to exact distances, but
+                    // the search still has to, or a lower bound leaves it only
+                    // candidates refine then drops. It ranks on the index's own
+                    // scale, so it gets the range on that scale.
+                    let ann_query = match q.refine_factor {
+                        Some(_) => {
+                            let scale = index_distance_scale(index_metric, &index_segments);
+                            Query {
+                                lower_bound: q.lower_bound.map(|lower| lower * scale),
+                                upper_bound: q.upper_bound.map(|upper| upper * scale),
+                                ..q.clone()
+                            }
+                        }
+                        None => q.clone(),
+                    };
+                    self.ann(
+                        &ann_query,
+                        &index_segments,
+                        filter_plan,
+                        overlay_block.clone(),
+                    )
+                    .await?
                 }
                 DataType::List(_) => {
                     self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
@@ -6904,9 +7148,13 @@ impl Scanner {
                     self.is_batch_nearest,
                 ))));
             }
-            // Resolve metric type for flat search (use default if not specified)
+            // Resolve metric type for flat search: the query's, else the chosen index's,
+            // else the column type's default. An untrained index can record a metric its
+            // column cannot use, so such a metric is skipped.
             let metric = q
                 .metric_type
+                .or(chosen_index_metric
+                    .filter(|metric| validate_distance_type_for(*metric, &element_type).is_ok()))
                 .unwrap_or_else(|| default_distance_type_for(&element_type));
             q.metric_type = Some(metric);
             validate_distance_type_for(metric, &element_type)?;
@@ -8721,8 +8969,8 @@ pub mod test_dataset {
     use std::{collections::HashMap, vec};
 
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
-        types::Float32Type,
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+        StringArray, types::Float32Type,
     };
     use arrow_schema::{ArrowError, DataType};
     use lance_arrow::FixedSizeListArrayExt;
@@ -9061,9 +9309,9 @@ mod test {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
     use arrow_array::{
-        ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray,
-        ListArray, PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array,
-        UInt32Array,
+        ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array,
+        Int32Array, LargeStringArray, ListArray, PrimitiveArray, RecordBatchIterator, StringArray,
+        StructArray, UInt8Array, UInt32Array,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -12167,6 +12415,75 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn test_nearest_query_element_type_conversion() {
+        let float16 = FixedSizeListArray::try_new_from_values(
+            Float16Array::from(vec![f16::from_f32(1.0), f16::from_f32(2.0)]),
+            2,
+        )
+        .unwrap();
+        let float32 =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let float64 =
+            FixedSizeListArray::try_new_from_values(Float64Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("float16", float16.data_type().clone(), false),
+            ArrowField::new("float32", float32.data_type().clone(), false),
+            ArrowField::new("float64", float64.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(float16), Arc::new(float32), Arc::new(float64)],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let float16_query: ArrayRef = Arc::new(Float16Array::from(vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+        ]));
+        let float32_query: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0]));
+        let float64_query: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+        let integer_query: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let list_query: ArrayRef =
+            Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+                Some(vec![Some(1.0), Some(2.0)]),
+            ]));
+
+        for (column, query) in [
+            ("float32", &float64_query),
+            ("float32", &float16_query),
+            ("float32", &integer_query),
+        ] {
+            let Err(error) = dataset.scan().nearest(column, query.as_ref(), 1) else {
+                panic!("expected {column} to reject {}", query.data_type());
+            };
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("Float32") && message.contains(&query.data_type().to_string()),
+                "unexpected error: {message}"
+            );
+        }
+
+        for (column, query, expected_type) in [
+            ("float16", &float32_query, DataType::Float16),
+            ("float64", &float32_query, DataType::Float64),
+            ("float32", &float32_query, DataType::Float32),
+            ("float64", &float64_query, DataType::Float64),
+            ("float16", &float16_query, DataType::Float16),
+            ("float64", &list_query, DataType::Float64),
+        ] {
+            let mut scan = dataset.scan();
+            scan.nearest(column, query.as_ref(), 1).unwrap();
+            assert_eq!(
+                scan.nearest.as_ref().unwrap().key.data_type(),
+                &expected_type
+            );
+        }
+    }
+
     async fn dataset_with_query_index_column() -> (TempStrDir, Dataset) {
         let path = TempStrDir::default();
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -12279,6 +12596,101 @@ mod test {
             None,
         )
         .await;
+    }
+
+    /// A cosine SQ index ranks as twice `1 - cos`, so a refined search that also
+    /// applied the range inside the index would drop rows whose exact distance
+    /// is in range.
+    #[tokio::test]
+    async fn test_refined_knn_applies_distance_range_to_exact_distances() {
+        use lance_linalg::distance::cosine_distance;
+
+        const DIM: usize = 16;
+        const ROWS: usize = 2000;
+        let mut seed: u64 = 42;
+        let values: Vec<f32> = (0..ROWS * DIM)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new_from_values(
+                    Float32Array::from(values.clone()),
+                    DIM as i32,
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &tmp,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_hnsw_sq_params(
+                    DistanceType::Cosine,
+                    IvfBuildParams::new(1),
+                    HnswBuildParams::default(),
+                    SQBuildParams::default(),
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let query = values[..DIM].to_vec();
+        let mut exact: Vec<f32> = values
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .map(|row| cosine_distance(&query, row))
+            .collect();
+        exact.sort_by(f32::total_cmp);
+        // Rows from the 20th nearest out, capped so that `upper <= 2 * lower`:
+        // no row is in range on both the exact and the doubled scale.
+        let lower = exact[20];
+        let upper = exact[60].min(2.0 * lower);
+        assert!(upper > lower);
+
+        let batch = dataset
+            .scan()
+            .nearest("vec", &Float32Array::from(query), 5)
+            .unwrap()
+            .distance_metric(DistanceType::Cosine)
+            .refine(1)
+            .distance_range(Some(lower), Some(upper))
+            .try_into_batch()
+            .await
+            .unwrap();
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>().values();
+        assert!(!distances.is_empty(), "no rows within the exact range");
+        for distance in distances {
+            assert!(
+                (lower..upper).contains(distance),
+                "{distance} is outside [{lower}, {upper})"
+            );
+        }
     }
 
     #[tokio::test]
@@ -13719,9 +14131,29 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[rstest]
+    #[case::no_index(false)]
+    #[case::untrained_l2_index(true)]
     #[tokio::test]
-    async fn test_binary_vectors_default_to_hamming() {
-        let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
+    async fn test_binary_vectors_default_to_hamming(#[case] has_untrained_index: bool) {
+        let (_tmp_dir, mut dataset) = make_binary_vector_dataset().await.unwrap();
+        if has_untrained_index {
+            // An untrained index records its metric unchecked, and L2 cannot rank uint8.
+            dataset
+                .create_index_builder(
+                    &["bin"],
+                    IndexType::Vector,
+                    &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+                )
+                .train(false)
+                .await
+                .unwrap();
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(
+                crate::index::vector::details::metric_type_from_index_metadata(&indices[0]),
+                Some(DistanceType::L2)
+            );
+        }
         let query = UInt8Array::from(vec![0b0000_1111u8, 0, 0, 0]);
 
         let mut scan = dataset.scan();
@@ -13905,6 +14337,107 @@ mod test {
             "Expected the L2 index to answer an L2 query, got plan:\n{}",
             plan
         );
+    }
+
+    /// A query that names no metric ranks by the chosen index's metric even when its
+    /// fragment scope misses every segment of that index and the search runs flat KNN, so
+    /// `_distance` keeps one scale whichever fragments the scope selects.
+    #[rstest]
+    #[case::automatic_selection(false)]
+    #[case::explicit_segments(true)]
+    #[tokio::test]
+    async fn test_knn_no_metric_uses_index_metric_outside_index_coverage(
+        #[case] has_explicit_segments: bool,
+    ) {
+        // F0 (ids 0..3) is indexed and F1 (ids 3..6) is appended afterwards. On F1 cosine
+        // and L2 rank in reverse order: id 3 is nearest by angle and farthest by L2.
+        let vectors: [[f32; 4]; 6] = [
+            [3.0, 1.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0, 0.0],
+            [4.0, 3.0, 0.0, 0.0],
+            [10.0, 1.0, 0.0, 0.0],
+            [0.6, 0.6, 0.0, 0.0],
+            [2.0, 1.0, 0.0, 0.0],
+        ];
+        let rows_for = |ids: std::ops::Range<usize>| {
+            gen_batch()
+                .col("id", array::step_custom::<Int32Type>(ids.start as i32, 1))
+                .col(
+                    "vec",
+                    array::cycle_vec(
+                        array::cycle::<Float32Type>(vectors[ids].concat()),
+                        Dimension::from(4),
+                    ),
+                )
+        };
+        let mut dataset = rows_for(0..3)
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(1, DistanceType::Cosine),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                rows_for(3..6).into_reader_rows(RowCount::from(3), BatchCount::from(1)),
+                None,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref(),
+            Some(&RoaringBitmap::from_iter([0]))
+        );
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let norm = |vector: &[f32]| {
+            vector
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let cosine_distance = |vector: &[f32; 4]| {
+            let dot: f64 = vector
+                .iter()
+                .zip(query)
+                .map(|(value, query_value)| f64::from(*value) * f64::from(query_value))
+                .sum();
+            1.0 - dot / (norm(vector) * norm(&query))
+        };
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &Float32Array::from(query.to_vec()), 3)
+            .unwrap();
+        scan.with_fragments(vec![dataset.fragments()[1].clone()]);
+        if has_explicit_segments {
+            scan.with_index_segments(vec![indices[0].uuid]).unwrap();
+        }
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNSubIndex") && plan.contains("KNNVectorDistance: metric=cosine"),
+            "{plan}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>().values();
+        assert_eq!(ids, &[3, 5, 4], "{plan}");
+        let distances = batch[DIST_COL].as_primitive::<Float32Type>().values();
+        for (id, distance) in ids.iter().zip(distances.iter()) {
+            let expected = cosine_distance(&vectors[*id as usize]);
+            assert!(
+                (f64::from(*distance) - expected).abs() <= 1e-6,
+                "id={id}: distance={distance}, expected={expected}"
+            );
+        }
     }
 
     #[rstest]
@@ -14252,6 +14785,94 @@ mod test {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+    }
+
+    #[rstest]
+    #[case::equals("category = 'x'")]
+    #[case::not_equals("category != 'y'")]
+    #[tokio::test]
+    async fn test_scalar_indexed_filter_with_unprojected_sort(
+        #[case] filter: &str,
+        #[values(BuiltinIndexType::Bitmap, BuiltinIndexType::BTree)] index_type: BuiltinIndexType,
+        #[values(false, true)] has_full_index_coverage: bool,
+        #[values(false, true)] has_stable_row_ids: bool,
+    ) {
+        let data = arrow_array::record_batch!(
+            ("id", Utf8, ["a", "b", "c", "d", "e", "f"]),
+            (
+                "category",
+                Utf8,
+                [Some("x"), Some("x"), Some("y"), Some("x"), Some("x"), None]
+            ),
+            (
+                "t",
+                Int32,
+                [Some(3), Some(1), Some(2), Some(0), None, Some(4)]
+            )
+        )
+        .unwrap();
+        let indexed_rows = if has_full_index_coverage { 6 } else { 3 };
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, indexed_rows))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids: has_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::for_builtin(index_type),
+                false,
+            )
+            .await
+            .unwrap();
+        if !has_full_index_coverage {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(data.slice(3, 3))], data.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("t".to_string())]))
+            .unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(
+            batch["id"].as_string::<i32>(),
+            &StringArray::from(vec!["e", "d", "b", "a"])
+        );
+
+        let mut unindexed_scanner = scanner.clone();
+        unindexed_scanner.use_scalar_index(false);
+        assert_eq!(unindexed_scanner.try_into_batch().await.unwrap(), batch);
+
+        scanner.limit(Some(2), Some(1)).unwrap();
+        let limited = scanner.try_into_batch().await.unwrap();
+        assert_eq!(limited.num_columns(), 1);
+        assert_eq!(
+            limited["id"].as_string::<i32>(),
+            &StringArray::from(vec!["d", "b"])
+        );
     }
 
     #[rstest]
@@ -15932,6 +16553,44 @@ mod test {
 
         assert_eq!(unindexed_ids, BTreeSet::from([1, 3, 5, 7]));
         assert_eq!(indexed_ids, unindexed_ids);
+    }
+
+    #[tokio::test]
+    async fn test_fm_index_contains_empty_needle() {
+        // Every non-null string contains the empty string, so no text index can
+        // narrow `contains(text, '')` down; it must be left to a full scan.
+        let batch = arrow_array::record_batch!(
+            ("text", Utf8, [Some("alpha"), Some(""), None, Some("beta")]),
+            ("id", Int32, [0, 1, 2, 3])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+        dataset
+            .create_index(&["text"], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+
+        for (filter, uses_index, expected_ids) in [
+            ("contains(text, '')", false, vec![0, 1, 3]),
+            ("NOT contains(text, '')", false, vec![]),
+            // A one-character needle is still answered by the index.
+            ("contains(text, 'a')", true, vec![0, 3]),
+        ] {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            assert_eq!(ids, expected_ids, "wrong rows for {filter}");
+            assert_eq!(
+                plan.contains("ScalarIndexQuery"),
+                uses_index,
+                "unexpected plan for {filter}:\n{plan}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -19345,45 +20004,46 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows and prefilter");
-        // After routing flat FTS through `FilteredReadExec`, the BTree on `i`
-        // pushes into the unindexed-fragment scan too — no more `FilterExec` on
-        // top of an unfiltered `LanceScan`. Legacy uses the `MaterializeIndex`
-        // shape, v2 uses `LanceRead` with `full_filter` set.
+        // The shared scorer reads the full unindexed text corpus for BM25 statistics.
+        // Keep the BTree prefilter in separate candidate inputs so it restricts
+        // emitted matches without changing corpus statistics.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
+      MatchCorpus
+        SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+          CoalescePartitionsExec
+            UnionExec
+              MatchQuery: column=s, query=[hello]
+                CoalescePartitionsExec
+                  UnionExec
+                    MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                    ProjectionExec: expr=[_rowid@1 as _rowid]
+                      FilterExec: i@0 > 10
+                        LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
+              FlatMatchQuery: column=s, query=hello
+                LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None
+                CoalescePartitionsExec
+                  UnionExec
+                    MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                    ProjectionExec: expr=[_rowid@1 as _rowid]
+                      FilterExec: i@0 > 10
+                        LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
+        } else {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    MatchCorpus
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
-              CoalescePartitionsExec
-                UnionExec
-                  MaterializeIndex: query=[i > 10]@i_idx(BTree)
-                  ProjectionExec: expr=[_rowid@1 as _rowid]
-                    FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
+              LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             FlatMatchQuery: column=s, query=hello
-              CoalescePartitionsExec
-                UnionExec
-                  Take: columns="_rowid, (s)"
-                    CoalesceBatchesExec: target_batch_size=8192
-                      MaterializeIndex: query=[i > 10]@i_idx(BTree)
-                  ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-                    FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-      CoalescePartitionsExec
-        UnionExec
-          MatchQuery: column=s, query=[hello]
-            LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
-          FlatMatchQuery: column=s, query=hello
-            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
+              LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -20902,8 +21562,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         check("_rowaddr NOT IN (2, 4, 6, 8)", complement).await;
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_nested_field_ordering() {
+    async fn test_nested_field_ordering(#[values(false, true)] is_sort_column_projected: bool) {
         use arrow_array::StructArray;
 
         // Create test data with nested structs
@@ -20937,6 +21598,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         // Test ordering by nested field
         let mut scanner = dataset.scan();
+        if !is_sort_column_projected {
+            scanner.project(&["id"]).unwrap();
+        }
         scanner
             .order_by(Some(vec![ColumnOrdering {
                 column_name: "nested.value".to_string(),
@@ -20945,11 +21609,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             }]))
             .unwrap(); // ascending order
 
-        let stream = scanner.try_into_stream().await.unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.num_columns(),
+            if is_sort_column_projected { 2 } else { 1 }
+        );
 
         // Check that results are sorted by nested.value
-        let sorted_ids = batches[0].column(0).as_primitive::<Int32Type>().values();
+        let sorted_ids = batch["id"].as_primitive::<Int32Type>().values();
         assert_eq!(sorted_ids[0], 1); // id=1 has nested.value=10
         assert_eq!(sorted_ids[1], 2); // id=2 has nested.value=20
         assert_eq!(sorted_ids[2], 3); // id=3 has nested.value=30

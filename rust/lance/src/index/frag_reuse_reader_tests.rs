@@ -9,11 +9,13 @@ use super::*;
 use crate::dataset::WriteParams;
 use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse_remapping::vector_supports_batch_remapping;
+use crate::index::vector::dedup::{DuplicatePairsOptions, find_duplicate_pairs_with_options};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::index_caches::IndexMetadataKey;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use arrow_array::types::Int32Type;
 use arrow_array::{RecordBatch, RecordBatchIterator, cast::AsArray};
+use futures::TryStreamExt as _;
 #[cfg(feature = "geo")]
 use geo_types::line_string;
 #[cfg(feature = "geo")]
@@ -35,6 +37,105 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 #[rstest::rstest]
+#[case::in_memory(DuplicatePairsOptions::default())]
+#[case::spilled(DuplicatePairsOptions::default().with_memory_limit(0))]
+#[tokio::test]
+async fn tagged_remapping_translates_pairwise_staged_ids(#[case] options: DuplicatePairsOptions) {
+    // Rows 0/1 and 2/3 are duplicates.
+    let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
+        arrow_array::types::Float32Type,
+        _,
+        _,
+    >([1.0, 1.0, 2.0, 2.0].map(|v| Some(vec![Some(v); 4])), 4);
+    let batch = RecordBatch::try_from_iter([
+        (
+            "i",
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..4)) as arrow_array::ArrayRef,
+        ),
+        ("vector", Arc::new(vectors) as arrow_array::ArrayRef),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            None,
+            &crate::index::vector::VectorIndexParams::ivf_flat(
+                1,
+                lance_linalg::distance::DistanceType::L2,
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // A tagged rewrite moves every row, so the index opens with V1Translate
+    // and its files still hold the pre-rewrite row ids.
+    let read_version = dataset.manifest.version;
+    let old_fragments = dataset.fragments().as_ref().clone();
+    let (transition, new_fragments) = prepare(&dataset).await;
+    let frag_reuse_index = Some(
+        crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    let dataset = crate::dataset::CommitBuilder::new(Arc::new(dataset))
+        .execute(lance_table::transaction::Transaction::new(
+            read_version,
+            lance_table::transaction::Operation::Rewrite {
+                groups: vec![lance_table::transaction::RewriteGroup {
+                    old_fragments,
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let live: std::collections::HashSet<u64> =
+        dataset.scan().with_row_id().try_into_batch().await.unwrap()[crate::dataset::ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+    let pairs: Vec<RecordBatch> =
+        find_duplicate_pairs_with_options(Arc::new(dataset), "vector", 1e-3, options)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+    let paired: std::collections::HashSet<u64> = pairs
+        .iter()
+        .flat_map(|batch| {
+            ["row_id_a", "row_id_b"].map(|column| {
+                batch[column]
+                    .as_primitive::<arrow_array::types::UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
+        })
+        .flatten()
+        .collect();
+    assert_eq!(pairs.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    assert_eq!(paired, live);
+}
+
+#[rstest::rstest]
 #[case::default_search("default")]
 #[case::all_segments("all")]
 #[case::partial_selection("partial")]
@@ -53,9 +154,10 @@ async fn vector_fragment_search_requires_every_contributor(
         .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
         .await
         .unwrap();
+    // Not L2: the column default would hide a flat fallback that drops the index's metric.
     let params = crate::index::vector::VectorIndexParams::ivf_flat(
         1,
-        lance_linalg::distance::DistanceType::L2,
+        lance_linalg::distance::DistanceType::Cosine,
     );
     let fragments: Vec<_> = dataset
         .fragments()
@@ -199,6 +301,10 @@ async fn vector_fragment_search_requires_every_contributor(
     }
     let plan = scan.explain_plan(false).await.unwrap();
     assert_eq!(plan.contains("ANN"), selection != "partial", "{plan}");
+    if selection == "partial" {
+        // The query names no metric, so the flat fallback ranks by the index's.
+        assert!(plan.contains("KNNVectorDistance: metric=cosine"), "{plan}");
+    }
     let result = scan.try_into_batch().await.unwrap();
     assert_eq!(result.num_rows(), expected_rows);
     if expected_rows == 8 {
@@ -616,6 +722,93 @@ async fn text_indices_translate_through_the_shared_remapper(#[case] index_type: 
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(actual, std::collections::BTreeSet::from([0, 2, 6]));
+    }
+}
+
+#[rstest::rstest]
+#[case::lazy(false)]
+#[case::prewarmed(true)]
+#[tokio::test]
+async fn translated_fts_preserves_cached_state_after_request_end(#[case] prewarm: bool) {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col("text", lance_datagen::array::fill_utf8("hit".to_string()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &lance_index::scalar::InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let metadata = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    if prewarm {
+        dataset.prewarm_index("text_idx").await.unwrap();
+    } else {
+        dataset
+            .open_scalar_index("text", &metadata.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+    }
+    let before = crate::index::scalar::cached_scalar_index_container(&dataset, &metadata.uuid)
+        .await
+        .unwrap();
+    let before = before
+        .as_any()
+        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+        .unwrap();
+    for _ in 0..2 {
+        let metrics = lance_index::metrics::LocalMetricsCollector::default();
+        let index = dataset
+            .open_scalar_index("text", &metadata.uuid, &metrics)
+            .await
+            .unwrap();
+        let after = index
+            .as_any()
+            .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+            .unwrap();
+        assert_eq!(
+            (
+                metrics
+                    .index_loads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before.shares_prewarm_state(after),
+            ),
+            (0, true),
+            "translated FTS must preserve cached state after its request ends"
+        );
+        let live = Arc::downgrade(&index);
+        drop(index);
+        assert!(live.upgrade().is_none());
+        let mut scan = dataset.scan();
+        scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+            .unwrap();
+        let result = scan.try_into_batch().await.unwrap();
+        let mut values = result["i"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (0..8).collect::<Vec<_>>());
     }
 }
 
@@ -3340,7 +3533,8 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
             &["text"],
             IndexType::Inverted,
             Some("text_idx".into()),
-            &lance_index::scalar::InvertedIndexParams::default(),
+            // The fixture below rewrites the initial partition's file names.
+            &lance_index::scalar::InvertedIndexParams::default().num_workers(1),
             true,
         )
         .await

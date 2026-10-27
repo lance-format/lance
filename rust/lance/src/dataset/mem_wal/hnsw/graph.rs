@@ -594,7 +594,8 @@ impl HnswGraph {
             });
         }
 
-        let ef = params.ef.max(params.k);
+        // A beam wider than the graph finds nothing more; cap what it allocates.
+        let ef = params.ef.max(params.k).min(visible_len);
         let limits = BeamLimits {
             ef,
             output_limit: params.k,
@@ -1387,6 +1388,11 @@ mod tests {
             .search(query, SearchParams::new(5, 32), &snapshot)
             .unwrap();
         assert!(result.iter().any(|point| point.id == 42));
+
+        let widest = graph
+            .search(query, SearchParams::new(5, usize::MAX), &snapshot)
+            .unwrap();
+        assert!(widest.iter().any(|point| point.id == 42));
     }
 
     /// Each node's neighbor lists are charged as it is inserted and hold
@@ -1647,5 +1653,55 @@ mod tests {
         let batch = graph.to_lance_hnsw_batch(None).unwrap();
         let loaded = HNSW::load(batch).unwrap();
         assert_eq!(loaded.len(), rows);
+    }
+
+    /// Rows written again under new keys repeat their vectors exactly; each
+    /// distinct vector must keep a reachable copy, including one stored more
+    /// often than a level-0 list holds (8 at `m = 4`). Not every copy is
+    /// reachable: a list holds one copy of a vector, so a search for many
+    /// identical rows may return only some of them. Not run under dot product,
+    /// where a vector's nearest row need not hold the same vector.
+    #[rstest::rstest]
+    fn test_each_repeated_vector_keeps_a_reachable_copy(
+        #[values(2, 12)] copies: usize,
+        #[values(DistanceType::L2, DistanceType::Cosine)] distance_type: DistanceType,
+    ) {
+        let (distinct, dim) = (100, 8);
+        let values = generate_random_array_with_seed::<Float32Type>(distinct * dim, [3; 32]);
+        let rows = distinct * copies;
+        let repeated: Vec<f32> = values
+            .values()
+            .iter()
+            .copied()
+            .cycle()
+            .take(rows * dim)
+            .collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(repeated), dim as i32)
+                .unwrap();
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(rows, 4, dim, distance_type).unwrap());
+        let ids = store.append_batch(Arc::new(vectors), 0).unwrap();
+        let snapshot = store.snapshot();
+        let params = BuildParams::mem_wal_default()
+            .num_edges(4)
+            .ef_construction(16)
+            .seed(1);
+        let graph = HnswGraph::try_new(rows, params).unwrap();
+        graph.insert_batch_serial(ids, &snapshot).unwrap();
+
+        let unreachable = (0..distinct as u32)
+            .filter(|&id| {
+                let query = snapshot.vector(id);
+                let found = graph
+                    .search(query, SearchParams::new(1, rows), &snapshot)
+                    .unwrap();
+                !found.iter().any(|point| snapshot.vector(point.id) == query)
+            })
+            .count();
+        assert_eq!(
+            unreachable, 0,
+            "{unreachable} of {distinct} vectors have no reachable copy"
+        );
     }
 }

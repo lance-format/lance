@@ -31,7 +31,7 @@ use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
-use lance_core::{Error, ROW_ADDR, ROW_ID, Result, box_error};
+use lance_core::{Error, ROW_ADDR, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -1090,19 +1090,13 @@ impl ManifestNamespace {
         Self::string_list_array(values, "object_id")
     }
 
-    fn value_row_id_schema(value_field: Field) -> SchemaRef {
-        Arc::new(ArrowSchema::new(vec![
-            value_field,
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]))
-    }
-
-    /// Like [`Self::value_row_id_schema`], but for a BTree stream: BTree
-    /// training always reads its id column as `ROW_ADDR`, never `ROW_ID` (see
-    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
+    /// Schema for a manifest index training stream: BTree, Bitmap, and
+    /// LabelList all read their id column as `ROW_ADDR`, never `ROW_ID` (see
+    /// `BTREE_ROW_ADDR_DOMAIN_VERSION`, `BITMAP_ROW_ADDR_DOMAIN_VERSION`, and
+    /// `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). The counter these streams number
     /// rows with is already an address, not a row id -- see the single
     /// fragment id 0 invariant in `rewrite_manifest` -- so only the column
-    /// name needs to change, not the values.
+    /// name matters, not the values.
     fn value_row_addr_schema(value_field: Field) -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![
             value_field,
@@ -1180,8 +1174,12 @@ impl ManifestNamespace {
     fn object_type_index_stream(
         object_types: BTreeMap<&'static str, RoaringBitmap>,
     ) -> SendableRecordBatchStream {
+        // Like `object_id_index_stream`, but for Bitmap: Bitmap training also
+        // reads its id column as `ROW_ADDR`, never `ROW_ID` (see
+        // `BITMAP_ROW_ADDR_DOMAIN_VERSION`). Only the column name needs to
+        // change, not the values -- see `value_row_addr_schema`.
         let schema =
-            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+            Self::value_row_addr_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
         let stream_schema = schema.clone();
         let entries = object_types
             .into_iter()
@@ -1238,7 +1236,11 @@ impl ManifestNamespace {
         base_objects_values: Vec<Option<Vec<String>>>,
         base_objects_row_ids: Vec<u64>,
     ) -> SendableRecordBatchStream {
-        let schema = Self::value_row_id_schema(BASE_OBJECTS_VALUE_FIELD.clone());
+        // Like `object_type_index_stream`, but for LabelList: LabelList
+        // training also reads its id column as `ROW_ADDR`, never `ROW_ID`
+        // (see `LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`). Only the column name
+        // needs to change, not the values -- see `value_row_addr_schema`.
+        let schema = Self::value_row_addr_schema(BASE_OBJECTS_VALUE_FIELD.clone());
         let stream_schema = schema.clone();
         let stream = stream::unfold(
             (
@@ -2314,9 +2316,51 @@ impl ManifestNamespace {
             .is_some())
     }
 
+    /// Resolve a relative table location to the storage path that
+    /// [`Self::construct_full_uri`] addresses.
+    ///
+    /// `construct_full_uri` splits on `/` and drops empty segments, and the URL
+    /// segment extension also drops `.` and `..` segments. Reproduce the empty and
+    /// `.` handling so probes and deletes target the same physical directory as the
+    /// writer instead of a percent-encoded single segment (`Path::join`) or an
+    /// `EmptySegment` error for accepted inputs like `a//b`. `..` stays rejected to
+    /// match `register_table`'s traversal contract rather than silently rewriting
+    /// such input. `Path::parse` preserves raw segment bytes, so escaped slashes and
+    /// non-ASCII names stay literal.
+    fn join_location(
+        base: &object_store::path::Path,
+        location: &str,
+    ) -> Result<object_store::path::Path> {
+        let mut canonical = String::new();
+        for segment in location.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == ".." {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Table location must stay within the namespace root, got '{}'",
+                        location
+                    ),
+                }
+                .into());
+            }
+            if !canonical.is_empty() {
+                canonical.push('/');
+            }
+            canonical.push_str(segment);
+        }
+        if canonical.is_empty() {
+            return Ok(base.clone());
+        }
+        Ok(object_store::path::Path::parse(format!(
+            "{base}/{canonical}"
+        ))?)
+    }
+
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
-        Self::path_has_actual_manifests(&self.object_store, &self.base_path.clone().join(location))
-            .await
+        let path = Self::join_location(&self.base_path, location)?;
+        Self::path_has_actual_manifests(&self.object_store, &path).await
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
@@ -3256,12 +3300,23 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
+                // Resolve and validate the target before mutating the manifest so a
+                // root-equivalent location cannot delete the namespace root after the
+                // row is already gone.
+                let table_path = Self::join_location(&self.base_path, info.location.as_str())?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                if table_path == self.base_path {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "Refusing to drop table '{}': location '{}' resolves to the namespace root",
+                            object_id, info.location
+                        ),
+                    }
+                    .into());
+                }
+
                 // Delete from manifest first
                 self.delete_from_manifest(&object_id).boxed().await?;
-
-                // Delete physical data directory using the dir_name from manifest
-                let table_path = self.base_path.clone().join(info.location.as_str());
-                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
                 self.object_store
@@ -3563,7 +3618,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_path = self.base_path.clone().join(dir_name.as_str());
+        let table_path = Self::join_location(&self.base_path, &dir_name)?;
         let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
@@ -3948,7 +4003,7 @@ mod tests {
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
-        DropTableRequest, ListTablesRequest, TableExistsRequest,
+        DropTableRequest, ListTablesRequest, RegisterTableRequest, TableExistsRequest,
     };
     use lance_table::feature_flags::FLAG_UNKNOWN;
     use lance_table::format::Fragment;
@@ -6544,5 +6599,241 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.alter_table_drop_columns(request).await;
         assert!(result.is_err(), "Should fail when table does not exist");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_drop_nested_table_removes_physical_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let nested = std::path::Path::new(temp_path).join("outside/held");
+        std::fs::create_dir_all(nested.join("_versions")).unwrap();
+        std::fs::write(nested.join("_versions/1.manifest"), b"{}").unwrap();
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["nested".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        req.location = "outside/held".to_string();
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop_request = DropTableRequest::new();
+        drop_request.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop_request).await.unwrap();
+        assert!(!nested.exists());
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_real_writer_nested_location_drop_cleans_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Write a real lance dataset at outside/held using Dataset::write
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+                1i64, 2, 3,
+            ]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let nested_uri = format!("{}/outside/held", temp_path);
+        lance::dataset::Dataset::write(Box::new(reader), &nested_uri, None)
+            .await
+            .unwrap();
+
+        let mut ns = CreateNamespaceRequest::new();
+        ns.id = Some(vec!["n".to_string()]);
+        dir_namespace.create_namespace(ns).await.unwrap();
+        // Register + drop
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(
+            !std::path::Path::new(&nested_uri).exists(),
+            "nested data must be removed"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_declare_unicode_name_drop_marker_clean(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        for name in ["plain", "räksmörgås", "growth%"] {
+            let mut req = DeclareTableRequest::new();
+            req.id = Some(vec![name.to_string()]);
+            dir_namespace.declare_table(req).await.unwrap();
+            let mut drop = DropTableRequest::new();
+            drop.id = Some(vec![name.to_string()]);
+            dir_namespace.drop_table(drop).await.unwrap();
+            // List temp dir: only manifest + expected parents, no stray encoded marker
+            let entries: Vec<_> = std::fs::read_dir(temp_path)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "only __manifest should remain, got {:?}",
+                entries
+            );
+        }
+    }
+
+    async fn write_single_column_dataset(uri: &str) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        lance::dataset::Dataset::write(Box::new(reader), uri, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_registered_location_matches_construct_full_uri_canonicalization() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // construct_full_uri maps `a//b` and `c/d//` to `a/b` and `c/d`, so write
+        // the datasets there. `a%2Fb` stays a literal escaped-slash segment.
+        for dir in ["a/b", "c/d", "a%2Fb"] {
+            write_single_column_dataset(&format!("{temp_path}/{dir}")).await;
+        }
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["canon".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        for (name, location) in [
+            ("empty-segments", "a//b"),
+            ("trailing-slashes", "c/d//"),
+            ("escaped-slash", "a%2Fb"),
+        ] {
+            let mut req = RegisterTableRequest::new(location.to_string());
+            req.id = Some(vec!["canon".to_string(), name.to_string()]);
+            dir_namespace.register_table(req).await.unwrap();
+        }
+
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["canon".to_string()]);
+        list.include_declared = Some(false);
+        let listed = dir_namespace.list_tables(list).await.unwrap();
+        assert_eq!(
+            listed.tables,
+            vec!["empty-segments", "escaped-slash", "trailing-slashes"]
+        );
+
+        let mut describe = DescribeTableRequest::new();
+        describe.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        describe.check_declared = Some(true);
+        let described = dir_namespace.describe_table(describe).await.unwrap();
+        assert_eq!(described.is_only_declared, Some(false));
+
+        // Dropping the canonicalized location removes `a/b` and leaves the literal
+        // `a%2Fb` directory untouched.
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a/b")).exists());
+        assert!(std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "trailing-slashes".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/c/d")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "escaped-slash".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+    }
+
+    #[rstest]
+    #[case::empty_location("")]
+    #[case::dot_location(".")]
+    #[tokio::test]
+    async fn test_drop_rejects_root_equivalent_location(#[case] location: &str) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["root".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        let mut req = RegisterTableRequest::new(location.to_string());
+        req.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+
+        // Physical data that a root-directory delete would destroy.
+        std::fs::write(std::path::Path::new(temp_path).join("keep.txt"), b"keep").unwrap();
+
+        // Probing must not turn the whole listing into an error for these rows.
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["root".to_string()]);
+        list.include_declared = Some(false);
+        assert!(
+            dir_namespace
+                .list_tables(list)
+                .await
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        let error = dir_namespace.drop_table(drop).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("namespace root"), "{message}");
+
+        // The manifest row and physical data must both survive the rejected drop.
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        assert!(dir_namespace.table_exists(exists).await.is_ok());
+        assert!(std::path::Path::new(temp_path).join("keep.txt").exists());
+        assert!(std::path::Path::new(temp_path).join("__manifest").exists());
     }
 }

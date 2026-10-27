@@ -35,8 +35,8 @@ use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
 use arrow_schema::{DataType, Field};
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
+use datafusion_execution::SendableRecordBatchStream;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::{collections::HashMap, sync::Arc};
 
@@ -2584,16 +2584,16 @@ mod tests {
         Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{
         ROW_ADDR,
         cache::{LanceCache, WeakLanceCache},
     };
-    use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion_exec::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
@@ -3115,6 +3115,17 @@ mod tests {
         );
     }
 
+    /// Indices that do not override `lookup` refuse it rather than returning
+    /// no matches, so callers can fall back to another plan.
+    #[tokio::test]
+    async fn test_lookup_is_not_supported() {
+        let index =
+            train_and_load::<arrow_array::types::Int32Type>(vec![vec![Some(1), Some(2)]]).await;
+        let keys = Arc::new(arrow_array::Int32Array::from(vec![1]));
+        let err = index.lookup(keys, &NoOpMetricsCollector).err().unwrap();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
     #[tokio::test]
     async fn test_empty_zonemap_index() {
         let tmpdir = TempObjDir::default();
@@ -3458,6 +3469,18 @@ mod tests {
         // Should match all zones since they all contain NaN values
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500); // All rows since NaN is in every zone
+        assert_eq!(result, SearchResult::at_most(expected));
+
+        // The planner uses this raw total-order range to retrieve negative NaNs.
+        // The index file does not record NaN signs, so every NaN-bearing zone
+        // must remain a conservative candidate.
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float32(Some(f32::NEG_INFINITY))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert_range(0..500);
         assert_eq!(result, SearchResult::at_most(expected));
 
         // Test search for a specific finite value that exists in the data

@@ -54,7 +54,7 @@ pub struct InsertBuilder<'a> {
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -64,7 +64,7 @@ impl<'a> InsertBuilder<'a> {
             params: None,
             write_progress: None,
             preassigned_data_file_name: None,
-            keep_field_ids: false,
+            inherited_field_ids: false,
         }
     }
 
@@ -81,12 +81,10 @@ impl<'a> InsertBuilder<'a> {
         self
     }
 
-    /// Keep the field ids the input schema carries when creating a dataset,
-    /// instead of numbering its fields afresh.
-    ///
-    /// For a MemWAL generation, whose columns must keep the base table's ids.
-    pub(crate) fn with_table_field_ids(mut self) -> Self {
-        self.keep_field_ids = true;
+    /// The input's field IDs are an existing table's, so a new table keeps them
+    /// even past the limit for caller-supplied IDs. For a MemWAL generation.
+    pub(crate) fn with_inherited_field_ids(mut self) -> Self {
+        self.inherited_field_ids = true;
         self
     }
 
@@ -175,8 +173,8 @@ impl<'a> InsertBuilder<'a> {
         if let Some(session) = context.params.session.as_ref() {
             commit_builder = commit_builder.with_session(session.clone());
         }
-        if self.keep_field_ids {
-            commit_builder = commit_builder.with_table_field_ids();
+        if self.inherited_field_ids {
+            commit_builder = commit_builder.with_inherited_field_ids();
         }
 
         commit_builder.execute(transaction).await
@@ -258,7 +256,7 @@ impl<'a> InsertBuilder<'a> {
             target_base_info,
             None,
             self.preassigned_data_file_name.clone(),
-            self.keep_field_ids,
+            self.inherited_field_ids,
         ))
         .await?;
 
@@ -884,18 +882,16 @@ mod test {
     #[case::row_offset("_rowoffset")]
     #[case::row_created_at_version("_row_created_at_version")]
     #[case::row_last_updated_at_version("_row_last_updated_at_version")]
+    #[case::empty_name("")]
     #[tokio::test]
-    async fn rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+    async fn rejects_unwritable_top_level_column_names(#[case] name: &str) {
         // Every system column name must be rejected on write. The row-version
         // columns (`_row_created_at_version`, `_row_last_updated_at_version`) are
         // computed at read time and appended by `Projection::to_schema`; a user
         // data column sharing one of those names would otherwise pass ingest and
-        // later collide with the appended field.
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            reserved_name,
-            DataType::Int32,
-            false,
-        )]));
+        // later collide with the appended field. An empty top-level name cannot
+        // be addressed as a field path after the dataset is written.
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
 
@@ -903,10 +899,16 @@ mod test {
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        let err = result.expect_err("writing a reserved system column name should fail");
+        let err = result.expect_err("writing an unwritable top-level column name should fail");
+        assert!(matches!(&err, crate::Error::InvalidInput { .. }), "{err}");
+        let expected_message = if name.is_empty() {
+            "empty name"
+        } else {
+            "reserved name"
+        };
         assert!(
-            err.to_string().contains("reserved name"),
-            "unexpected error for {reserved_name}: {err}"
+            err.to_string().contains(expected_message),
+            "unexpected error for {name:?}: {err}"
         );
     }
 

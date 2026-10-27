@@ -260,6 +260,11 @@ use crate::format::pb::{self, column_encoding};
 use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::{BufferScheduler, EncodingsIo};
 
+mod late_reads;
+
+pub(crate) use late_reads::LateReadGuard;
+use late_reads::{Charge, LateWindow};
+
 /// Candidate batch sizes evaluated during byte-budget planning.
 /// Powers of 4, covering 1–16Ki rows in 8 probes.
 pub const CANDIDATE_BATCH_SIZES: [u32; 8] = [1, 4, 16, 64, 256, 1024, 4096, 16384];
@@ -587,6 +592,11 @@ pub struct DecodeBatchScheduler {
     root_scheduler: RootScheduler,
     pub root_fields: Fields,
     cache: Arc<LanceCache>,
+    /// For a 2.0 list page's items, the batch of the run that scheduled the list,
+    /// which is also the `io` the items are scheduled on. `None` for any other run
+    /// and for list items whose reads bypass backpressure; those runs collect their
+    /// reads in a batch of their own.
+    outer_batch: Option<Arc<RequestBatch>>,
 }
 
 pub struct ColumnInfoIter<'a> {
@@ -1271,6 +1281,7 @@ impl DecodeBatchScheduler {
                 root_scheduler: RootScheduler::Structural(root_scheduler),
                 root_fields,
                 cache,
+                outer_batch: None,
             })
         } else {
             // The old encoding style expected a header column for structs and so we
@@ -1295,6 +1306,7 @@ impl DecodeBatchScheduler {
                 root_scheduler: RootScheduler::Array(root_scheduler.into()),
                 root_fields,
                 cache,
+                outer_batch: None,
             })
         }
     }
@@ -1309,7 +1321,15 @@ impl DecodeBatchScheduler {
             root_scheduler: RootScheduler::Array(root_scheduler),
             root_fields,
             cache,
+            outer_batch: None,
         }
+    }
+
+    /// Nests this run's batch in the batch `guard` was taken on, so the late
+    /// reads of a 2.0 list page's items share the window of the list's run.
+    pub(crate) fn with_outer_batch(mut self, guard: Option<&LateReadGuard>) -> Self {
+        self.outer_batch = guard.map(|guard| guard.batch.clone());
+        self
     }
 
     fn do_schedule_ranges_structural(
@@ -1382,7 +1402,11 @@ impl DecodeBatchScheduler {
                 .unwrap_or_default()
         );
 
-        let mut context = SchedulerContext::new(io, self.cache.clone());
+        let batch = match &self.outer_batch {
+            Some(outer) => RequestBatch::nested_in(outer.clone()),
+            None => RequestBatch::new(io),
+        };
+        let mut context = SchedulerContext::from_batch(batch, self.cache.clone());
         let maybe_root_job = root_scheduler.schedule_ranges(ranges, filter);
         if let Err(schedule_ranges_err) = maybe_root_job {
             schedule_action(Err(schedule_ranges_err));
@@ -1419,6 +1443,9 @@ impl DecodeBatchScheduler {
 
             trace!("Finished scheduling {} ranges", ranges.len());
         }
+        // The pages' background tasks can still queue indirect reads; send them
+        // without waiting for the decoder.
+        context.batch.finish_scheduling();
     }
 
     fn do_schedule_ranges(
@@ -2886,18 +2913,24 @@ pub(crate) const IO_REQUEST_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 type SharedRead = Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Bytes>>, CloneableError>>>;
 
-/// What a pending read receives once its batch is submitted.
+/// What a pending read receives once its batch is submitted, with its charge
+/// if the window sent the read ahead of the decoder.
 enum SubmittedRead {
     /// The read was alone in its batch and owns the request.
-    Alone(BoxFuture<'static, Result<Vec<Bytes>>>),
+    Alone(BoxFuture<'static, Result<Vec<Bytes>>>, Option<Charge>),
     /// The batched request and the position of each of the read's ranges in it.
-    Shared(SharedRead, Vec<usize>),
+    Shared(SharedRead, Vec<usize>, Option<Charge>),
 }
 
 struct PendingRead {
     ranges: Vec<Range<u64>>,
     priority: u64,
     tx: oneshot::Sender<SubmittedRead>,
+    /// The read's share of its run's [`LateWindow`], set once the window sends it
+    /// ahead of the decoder. `None` while queued and for reads sent any other way.
+    charge: Option<Charge>,
+    /// Queued by a scheduling step of a nested batch (a list page's items).
+    is_nested_step: bool,
 }
 
 /// Collects the reads submitted while one scheduling step runs and sends them
@@ -2918,9 +2951,46 @@ struct PendingRead {
 /// same pass (a struct's columns initializing their pages, a scan line's list
 /// columns fetching their items) all queue their reads before the first of
 /// them resumes and submits the lot.
+///
+/// The decoder awaits 2.0 indirect reads (string bytes, list items) only when
+/// it reaches the page, so the tasks that queue them hold a [`LateReadGuard`].
+/// The guards taken during one scheduling step form a group. After the run
+/// calls [`Self::finish_scheduling`], one yield after a group's last guard
+/// drops, the batch sends the queued reads as one request, shared by the groups
+/// that close meanwhile, if they fit in the run's [`LateWindow`]. Reads that do
+/// not fit stay queued until consumed reads make room, a request batch of them
+/// is queued, or the decoder awaits them.
+///
+/// A list page's task schedules its items through a nested batch and awaits
+/// their offsets at once. After the run finishes, awaiting such a nested step
+/// read sends the other nested step reads, and the late reads a full-size
+/// window holds back stay queued.
 pub(crate) struct RequestBatch {
+    shared: Arc<BatchShared>,
+}
+
+struct BatchShared {
     inner: Arc<dyn EncodingsIo>,
-    pending: Arc<Mutex<Vec<PendingRead>>>,
+    /// For the batch of a 2.0 list page's items, the batch of the list's run (also
+    /// `inner`), which merges the reads of this batch's steps with those of the
+    /// other list pages. `None` for a top-level batch.
+    outer: Option<Arc<Self>>,
+    state: Mutex<BatchState>,
+    /// Owned by a top-level batch (no `outer`) and shared by every batch nested
+    /// under it.
+    window: OnceLock<Arc<LateWindow>>,
+}
+
+#[derive(Default)]
+struct BatchState {
+    reads: Vec<PendingRead>,
+    /// The group that a guard taken now joins.
+    next_group: u64,
+    is_scheduling_finished: bool,
+    /// Set while a late flush waits for its yield.
+    is_late_flush_queued: bool,
+    /// How many guards of each group are still held.
+    open_producers: Vec<(u64, usize)>,
 }
 
 impl std::fmt::Debug for RequestBatch {
@@ -2931,9 +3001,24 @@ impl std::fmt::Debug for RequestBatch {
 
 impl RequestBatch {
     pub(crate) fn new(inner: Arc<dyn EncodingsIo>) -> Self {
+        Self::with_outer(inner, None)
+    }
+
+    /// A batch that queues its late reads in `outer`, the batch of the run
+    /// that scheduled this one, and shares its window.
+    pub(crate) fn nested_in(outer: Arc<Self>) -> Self {
+        let outer_shared = outer.shared.clone();
+        Self::with_outer(outer, Some(outer_shared))
+    }
+
+    fn with_outer(inner: Arc<dyn EncodingsIo>, outer: Option<Arc<BatchShared>>) -> Self {
         Self {
-            inner,
-            pending: Arc::new(Mutex::new(Vec::new())),
+            shared: Arc::new(BatchShared {
+                inner,
+                outer,
+                state: Mutex::default(),
+                window: OnceLock::new(),
+            }),
         }
     }
 
@@ -2947,29 +3032,49 @@ impl RequestBatch {
 
     /// Bytes requested by the reads collected so far.
     pub(crate) fn pending_bytes(&self) -> u64 {
-        Self::queued_bytes(&self.pending.lock().unwrap())
+        Self::queued_bytes(&self.shared.state.lock().unwrap().reads)
     }
 
-    /// Submits the collected reads as one request.
+    /// Ends a scheduling step and submits the collected reads as one request.
     pub(crate) fn flush(&self) {
-        Self::flush_pending(&self.inner, &self.pending);
+        let reads = {
+            let mut state = self.shared.state.lock().unwrap();
+            state.next_group += 1;
+            std::mem::take(&mut state.reads)
+        };
+        Self::submit_batch(&self.shared.step_io(), reads);
     }
 
-    fn flush_pending(inner: &Arc<dyn EncodingsIo>, pending: &Mutex<Vec<PendingRead>>) {
-        let pending = std::mem::take(&mut *pending.lock().unwrap());
-        Self::submit_batch(inner, pending);
+    /// Marks the end of the scheduling run and submits the reads already queued.
+    pub(crate) fn finish_scheduling(&self) {
+        let reads = {
+            let mut state = self.shared.state.lock().unwrap();
+            state.is_scheduling_finished = true;
+            state.next_group += 1;
+            std::mem::take(&mut state.reads)
+        };
+        Self::submit_batch(&self.shared.step_io(), reads);
     }
 
     /// Submits `pending` as one request, sorted by file offset, and hands each
     /// read its own slice of the result.
-    fn submit_batch(inner: &Arc<dyn EncodingsIo>, pending: Vec<PendingRead>) {
+    fn submit_batch(inner: &Arc<dyn EncodingsIo>, mut pending: Vec<PendingRead>) {
+        // A read whose future was dropped has nobody to hand its bytes to.
+        pending.retain(|read| !read.tx.is_canceled());
         if pending.is_empty() {
             return;
         }
-        if pending.len() == 1 {
+        // The I/O layer rejects unsorted ranges, so a lone unsorted read takes
+        // the sort and scatter below like any batch.
+        if pending.len() == 1
+            && pending[0]
+                .ranges
+                .is_sorted_by_key(|range| (range.start, range.end))
+        {
             let read = pending.into_iter().next().unwrap();
             let _ = read.tx.send(SubmittedRead::Alone(
                 inner.submit_request(read.ranges, read.priority),
+                read.charge,
             ));
             return;
         }
@@ -3005,38 +3110,49 @@ impl RequestBatch {
             .shared();
         for (read, read_positions) in pending.into_iter().zip(positions) {
             // The receiver is gone only when the read's future was dropped.
-            let _ = read
-                .tx
-                .send(SubmittedRead::Shared(batched.clone(), read_positions));
+            let _ = read.tx.send(SubmittedRead::Shared(
+                batched.clone(),
+                read_positions,
+                read.charge,
+            ));
         }
     }
-}
 
-impl EncodingsIo for RequestBatch {
-    fn submit_request(
+    fn queue(
         &self,
         ranges: Vec<Range<u64>>,
         priority: u64,
+        is_nested_step: bool,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        let mut pending = self.pending.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
+        let is_scheduling_finished = state.is_scheduling_finished;
+        let pending = &mut state.reads;
         // Keep every batch within the budget: a page that shards its reads
         // must not have all its shards collapse into one unbounded read.
         let bytes = ranges
             .iter()
             .map(|range| range.end - range.start)
             .sum::<u64>();
-        if !pending.is_empty() && Self::queued_bytes(&pending) + bytes > IO_REQUEST_BATCH_BYTES {
-            Self::submit_batch(&self.inner, std::mem::take(&mut *pending));
+        if !pending.is_empty() && Self::queued_bytes(pending) + bytes > IO_REQUEST_BATCH_BYTES {
+            // Until the run finishes, the queued reads belong to its current
+            // step, so they go where the step's flush sends them.
+            let io = if is_scheduling_finished {
+                self.shared.inner.clone()
+            } else {
+                self.shared.step_io()
+            };
+            Self::submit_batch(&io, std::mem::take(pending));
         }
         let (tx, mut rx) = oneshot::channel();
         pending.push(PendingRead {
             ranges,
             priority,
             tx,
+            charge: None,
+            is_nested_step,
         });
-        drop(pending);
-        let inner = self.inner.clone();
-        let pending = self.pending.clone();
+        drop(state);
+        let shared = self.shared.clone();
         async move {
             let submitted = match rx.try_recv() {
                 // The step that queued this read already flushed it.
@@ -3046,15 +3162,15 @@ impl EncodingsIo for RequestBatch {
                     // Yield once so the siblings polled in the same pass get
                     // to queue too, then submit them all.
                     tokio::task::yield_now().await;
-                    Self::flush_pending(&inner, &pending);
+                    shared.submit_queued(is_nested_step);
                     rx.await.map_err(|_| {
                         Error::internal("a batched read was dropped before the batch was submitted")
                     })?
                 }
             };
             match submitted {
-                SubmittedRead::Alone(request) => request.await,
-                SubmittedRead::Shared(batched, positions) => {
+                SubmittedRead::Alone(request, _charge) => request.await,
+                SubmittedRead::Shared(batched, positions, _charge) => {
                     let bytes = batched.await.map_err(|err| err.into_inner())?;
                     Ok(positions
                         .into_iter()
@@ -3065,16 +3181,26 @@ impl EncodingsIo for RequestBatch {
         }
         .boxed()
     }
+}
+
+impl EncodingsIo for RequestBatch {
+    fn submit_request(
+        &self,
+        ranges: Vec<Range<u64>>,
+        priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        self.queue(ranges, priority, false)
+    }
 
     fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
-        self.inner.with_bypass_backpressure()
+        self.shared.inner.with_bypass_backpressure()
     }
 
     fn with_io_stats(
         &self,
         stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
     ) -> Option<Arc<dyn EncodingsIo>> {
-        self.inner.with_io_stats(stats)
+        self.shared.inner.with_io_stats(stats)
     }
 }
 
@@ -3102,7 +3228,11 @@ impl<'a> ScopedSchedulerContext<'a> {
 
 impl SchedulerContext {
     pub fn new(io: Arc<dyn EncodingsIo>, cache: Arc<LanceCache>) -> Self {
-        let batch = Arc::new(RequestBatch::new(io));
+        Self::from_batch(RequestBatch::new(io), cache)
+    }
+
+    fn from_batch(batch: RequestBatch, cache: Arc<LanceCache>) -> Self {
+        let batch = Arc::new(batch);
         Self {
             io: batch.clone(),
             batch,
@@ -3121,6 +3251,11 @@ impl SchedulerContext {
     /// Submits the reads the schedulers queued since the last step as one request.
     pub fn flush_io(&self) {
         self.batch.flush();
+    }
+
+    /// A guard for a task that will queue a late read on [`Self::io`].
+    pub(crate) fn late_read_guard(&self) -> LateReadGuard {
+        self.batch.late_read_guard()
     }
 
     pub fn cache(&self) -> &Arc<LanceCache> {

@@ -45,6 +45,7 @@ from .lance import (
     CleanupStats,
     DatasetBasePath,
     FFILanceTableProvider,
+    FragmentAddColumnsCleanup,
     FtsToken,
     ScanStatistics,
     bytes_read_counter,
@@ -69,14 +70,11 @@ from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
 if TYPE_CHECKING:
-    from datetime import datetime
     from pathlib import Path
 
     from lance.commit import CommitLock
-    from lance.dependencies import pandas as pd
     from lance.namespace import LanceNamespace
-
-    ts_types = Union[datetime, pd.Timestamp, str]
+    from lance.util import ts_types
 
 
 __all__ = [
@@ -98,6 +96,7 @@ __all__ = [
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
+    "FragmentAddColumnsCleanup",
     "FragmentMetadata",
     "FtsToken",
     "Index",
@@ -168,6 +167,9 @@ def dataset(
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given
         argument value. If a version is already specified, this arg is ignored.
+        Pandas timestamps are accepted, but ``pandas.NaT`` raises ``ValueError``.
+        Strings use pandas parsing when installed; otherwise they must match
+        ``YYYY-MM-DD HH:MM:SS``. Use ``version`` for version numbers or tags.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
     commit_lock : optional, lance.commit.CommitLock
