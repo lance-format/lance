@@ -4582,6 +4582,43 @@ async fn test_fts_9058_restricted_match_corpus_stability(
     }
 }
 
+#[tokio::test]
+async fn test_fts_9058_restricted_match_with_multiple_segments_and_residual() {
+    let fragments = restricted_match_fragments(&[&[0, 1], &[2, 3], &[4, 5, 6, 7]]);
+    let mut dataset = restricted_match_dataset(&fragments, 0, true).await;
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut dataset,
+        "text",
+        false,
+        fragment_ids[..2]
+            .iter()
+            .map(|fragment_id| vec![*fragment_id])
+            .collect(),
+    )
+    .await;
+
+    let observations = restricted_match_maintenance_observations(
+        &mut dataset,
+        RestrictedMatchDomain::Prefilter,
+        "alpha beta",
+        &[None],
+    )
+    .await;
+    assert_contains!(observations[0].plan.as_ref().unwrap(), "MatchCorpus");
+    assert_restricted_match_oracle(
+        "9058-multiple-segments-with-residual.json",
+        &RESTRICTED_MATCH_CORPUS,
+        RestrictedMatchDomain::Prefilter,
+        &[0, 1],
+        &observations,
+    );
+}
+
 #[rstest]
 #[case::top(0)]
 #[case::offset(1)]
