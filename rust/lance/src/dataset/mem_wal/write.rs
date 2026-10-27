@@ -5907,6 +5907,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_flushed_sstable_counts_blob_sidecar_bytes() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        // Inline, packed and dedicated under the test thresholds.
+        let batch = create_blob_v2_batch(
+            0,
+            &[
+                BlobTestValue::Bytes(b"abc".to_vec()),
+                BlobTestValue::Bytes(b"12345".to_vec()),
+                BlobTestValue::Bytes(vec![7; 4096]),
+            ],
+        );
+        let shard_id = Uuid::new_v4();
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            ShardWriterConfig {
+                shard_id,
+                durable_write: false,
+                ..Default::default()
+            },
+            batch.schema(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer.put(vec![batch]).await.unwrap();
+        let row_bytes = match &writer.mode {
+            WriterMode::MemTable { state, .. } => {
+                state.read().await.memtable.batch_store().row_bytes() as u64
+            }
+            WriterMode::WalOnly { .. } => unreachable!(),
+        };
+        writer.close().await.unwrap();
+
+        let manifest = ShardManifestStore::new(store, &base_path, shard_id, 10)
+            .latest()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manifest.sstables[0].in_memory_bytes,
+            Some(row_bytes + 5 + 4096)
+        );
+    }
+
+    #[tokio::test]
     async fn test_blob_v2_target_is_reused_across_replay_and_flush() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let external_dir = tempfile::tempdir().unwrap();

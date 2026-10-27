@@ -669,7 +669,8 @@ message SsTable {
   string path = 2;
 
   /* Payload size of the rows, as the writer's MemTable accounted for them: the
-     sum over its buffers of the window each one holds.
+     sum over its buffers of the window each one holds, plus the payload of the
+     blob values the generation keeps in packed and dedicated sidecar files.
 
      An estimate of the payload, not a bound on what reading the SSTable costs.
      It excludes the per-array structure a reader materializes, so a consumer
