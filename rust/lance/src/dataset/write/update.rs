@@ -285,22 +285,22 @@ impl UpdateBuilder {
         super::super::versions::validate_write_version(default_version, write_version)?;
         let mut updates = HashMap::new();
 
+        // Blob fields come from the dataset schema: scans drop their extension
+        // metadata, so a scanned field cannot tell blob v2 apart.
         let blob_columns = self
             .updates
             .keys()
-            .filter(|column| {
-                self.dataset
-                    .schema()
-                    .field(column)
-                    .is_some_and(crate::dataset::optimize::field_contains_blob_v2)
+            .filter_map(|column| {
+                let field = self.dataset.schema().field(column)?;
+                crate::dataset::optimize::field_contains_blob_v2(field)
+                    .then(|| (column.clone(), Arc::new(Field::from(field))))
             })
-            .cloned()
-            .collect::<HashSet<_>>();
+            .collect::<HashMap<_, _>>();
         for (column, expr) in &self.updates {
             if let Some(read) = expr
                 .column_refs()
                 .into_iter()
-                .find(|read| blob_columns.contains(&read.name))
+                .find(|read| blob_columns.contains_key(&read.name))
             {
                 return Err(Error::not_supported_source(
                     format!(
@@ -360,7 +360,8 @@ pub struct UpdateJob {
     condition: Option<Expr>,
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
     /// Assigned columns that are blob v2.
-    blob_columns: Arc<HashSet<String>>,
+    /// Assigned columns holding blob v2 fields, as the dataset schema declares them.
+    blob_columns: Arc<HashMap<String, Arc<Field>>>,
     conflict_retries: u32,
     retry_timeout: Duration,
     write_version: ConcreteFileVersion,
@@ -450,12 +451,9 @@ impl UpdateJob {
             // Assigned blob columns enter the rewrite as logical placeholders, so
             // it doesn't read old blobs the assignment overwrites.
             let mut rewrite_fields = scan_schema.fields().to_vec();
-            for column in self.blob_columns.iter() {
+            for (column, field) in self.blob_columns.iter() {
                 let column_idx = scan_schema.index_of(column)?;
-                rewrite_fields[column_idx] = Arc::new(map_blob_fields(
-                    &scan_schema.fields()[column_idx],
-                    &logical_blob_field,
-                ));
+                rewrite_fields[column_idx] = Arc::new(map_blob_fields(field, &logical_blob_field));
             }
             let rewrite_schema = Arc::new(ArrowSchema::new_with_metadata(
                 rewrite_fields,
@@ -482,8 +480,8 @@ impl UpdateJob {
                         .iter()
                         .zip(batch.columns())
                         .map(|(field, column)| {
-                            if blob_columns.contains(field.name()) {
-                                blob_placeholders(column, field)
+                            if let Some(declared) = blob_columns.get(field.name()) {
+                                blob_placeholders(column, declared)
                             } else {
                                 Ok(column.clone())
                             }
@@ -509,7 +507,7 @@ impl UpdateJob {
             .enumerate()
             .filter_map(|(column_idx, field)| {
                 self.blob_columns
-                    .contains(field.name())
+                    .contains_key(field.name())
                     .then_some(column_idx)
             })
             .collect::<Vec<_>>();
@@ -733,7 +731,7 @@ impl UpdateJob {
     fn apply_updates(
         mut batch: RecordBatch,
         updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
-        blob_columns: &HashSet<String>,
+        blob_columns: &HashMap<String, Arc<Field>>,
     ) -> DFResult<RecordBatch> {
         for (column, expr) in updates.iter() {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
@@ -762,8 +760,8 @@ impl UpdateJob {
                     )
                 })?;
                 Arc::new(json_array.into_inner())
-            } else if blob_columns.contains(column) {
-                logical_blobs_in(&new_values, schema.field_with_name(column)?)?
+            } else if let Some(declared) = blob_columns.get(column) {
+                logical_blobs_in(&new_values, declared)?
             } else {
                 new_values
             };
@@ -2904,6 +2902,100 @@ mod tests {
             };
             assert_eq!(got, want, "id {id}");
         }
+    }
+
+    /// Overwriting a blob, at the top level or inside a struct, must not read
+    /// the payload it replaces: the update succeeds with those payloads gone.
+    #[rstest]
+    #[case::top_level("payload", "X'00'")]
+    #[case::in_struct("info", "named_struct('blob', X'00')")]
+    #[tokio::test]
+    async fn test_update_does_not_read_assigned_blobs(#[case] column: &str, #[case] value: &str) {
+        use crate::{BlobArrayBuilder, blob_field};
+
+        const ROWS: usize = 4;
+        let blobs = || {
+            let mut builder = BlobArrayBuilder::new(ROWS);
+            for _ in 0..ROWS {
+                builder.push_bytes(vec![7u8; 1 << 20]).unwrap();
+            }
+            builder.finish().unwrap()
+        };
+        // Only the assigned column holds blobs, so every `.blob` file is its payload.
+        let fields = vec![blob_field("blob", true)];
+        let (field, values): (Field, ArrayRef) = if column == "payload" {
+            (blob_field("payload", true), blobs())
+        } else {
+            let info = StructArray::try_new(fields.clone().into(), vec![blobs()], None).unwrap();
+            (
+                Field::new("info", DataType::Struct(fields.into()), true),
+                Arc::new(info),
+            )
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..ROWS as i64)),
+                values,
+            ],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        // Payloads larger than the inline threshold live in `.blob` files.
+        let sidecars = walkdir(std::path::Path::new(test_dir.as_str()))
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "blob"))
+            .collect::<Vec<_>>();
+        assert!(!sidecars.is_empty());
+        for path in sidecars {
+            std::fs::remove_file(path).unwrap();
+        }
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        assert!(
+            scanner.try_into_batch().await.is_err(),
+            "payloads still readable"
+        );
+
+        let result = UpdateBuilder::new(dataset)
+            .set(column, value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, ROWS as u64);
+    }
+
+    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flat_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walkdir(&path)
+                } else {
+                    vec![path]
+                }
+            })
+            .collect()
     }
 
     #[rstest]
