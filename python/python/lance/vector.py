@@ -74,7 +74,9 @@ def vec_to_table(
     >>> frame = vec_to_table(dd).to_pandas()
     >>> frame["id"].tolist()
     ['vector0', 'vector1']
-    >>> np.testing.assert_allclose(np.stack(frame["vector"]), list(dd.values()), rtol=1e-6)
+    >>> np.testing.assert_allclose(
+    ...     np.stack(frame["vector"]), list(dd.values()), rtol=1e-6
+    ... )
 
     Parameters
     ----------
