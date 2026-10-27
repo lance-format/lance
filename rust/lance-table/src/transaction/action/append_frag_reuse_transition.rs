@@ -369,6 +369,18 @@ mod tests {
         },
         "at least one source and one destination"
     )]
+    #[case::stable_partition_with_too_many_destinations(
+        |manifest: &mut Manifest, actions: &mut Vec<Action>| {
+            let first = reserved_destination(manifest);
+            let count = (1u64 << 16) + 1;
+            manifest.max_fragment_id = Some((first + count - 1) as u32);
+            if let Action::AppendFragReuseTransition(t) = &mut actions[4] {
+                t.mapping = stable_partition();
+                t.destinations = (first..first + count).map(Ref::Committed).collect();
+            }
+        },
+        "65537 destinations"
+    )]
     #[case::source_carrying_an_overlay(
         |manifest: &mut Manifest, _: &mut Vec<Action>| {
             Arc::make_mut(&mut manifest.fragments)[0].overlays.push(DataOverlayFile {
