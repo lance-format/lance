@@ -11,6 +11,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+    PreloadedFragReuseHistory,
 };
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
@@ -2055,6 +2056,72 @@ async fn encode_tagged_frag_reuse_details(
 
 /// Details above this size spill to an external `details.binpb` file.
 pub(crate) const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
+
+/// The current fragment reuse history, read for an action-based commit whose
+/// manifest build cannot read the external details file it lives in. `None`
+/// when the table has no history or keeps it inline, which the build reads
+/// from the entry itself.
+pub(crate) async fn preload_external_frag_reuse_history(
+    dataset: &Dataset,
+) -> lance_core::Result<Option<PreloadedFragReuseHistory>> {
+    let indices = super::load_all_indices(dataset).await?;
+    let Some(entry) = indices
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(None);
+    };
+    let is_external = entry.index_details.as_ref().is_some_and(|details| {
+        FragmentReuseIndexDetails::decode(details.value.as_slice())
+            .is_ok_and(|details| matches!(details.content, Some(Content::External(_))))
+    });
+    if !is_external {
+        return Ok(None);
+    }
+    let content = load_raw_frag_reuse_content(dataset, entry).await?;
+    Ok(Some(PreloadedFragReuseHistory {
+        entry: entry.uuid,
+        content: content.into(),
+    }))
+}
+
+/// Move a fragment reuse history an action-based commit assembled inline to
+/// an external details file once it outgrows the inline limit. The manifest
+/// build does no IO, so it always assembles the history inline.
+pub(crate) async fn spill_frag_reuse_history(
+    dataset: &Dataset,
+    indices: &mut [IndexMetadata],
+) -> lance_core::Result<()> {
+    for entry in indices
+        .iter_mut()
+        .filter(|index| index.name == FRAG_REUSE_INDEX_NAME)
+    {
+        let Some(details) = entry.index_details.as_ref() else {
+            continue;
+        };
+        if details.value.len() <= FRAG_REUSE_INLINE_DETAILS_LIMIT {
+            continue;
+        }
+        let content = extract_raw_frag_reuse_content(details, |_| async {
+            Err(Error::internal(
+                "a fragment reuse history over the inline limit is already external",
+            ))
+        })
+        .await?;
+        let value = encode_tagged_frag_reuse_details(
+            &dataset.object_store,
+            dataset.indices_dir(),
+            entry.uuid,
+            content,
+        )
+        .await?;
+        entry.index_details = Some(Arc::new(prost_types::Any {
+            type_url: details.type_url.clone(),
+            value,
+        }));
+    }
+    Ok(())
+}
 
 /// `InlineContent.Transition.stable_partition` (proto field 4).
 const STABLE_PARTITION_FIELD: u32 = 4;

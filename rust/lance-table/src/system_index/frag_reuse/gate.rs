@@ -43,6 +43,11 @@ pub enum Admission {
     /// index's own entry and nothing else (no fragment, no user segment,
     /// not the history).
     MaintainsMemWalState,
+    /// An action-based transaction, in any table state. Its fragment reuse
+    /// actions are merged onto the current history at every attempt and apply
+    /// enforces the history's rules, and no index action may name the
+    /// history, so there is no snapshot here for the gate to refuse.
+    AppliesActions,
 }
 
 /// Classify `operation` against the table's current state.
@@ -58,6 +63,10 @@ pub fn classify(
     frag_reuse: &FragReuseUpdate,
     migration_next_row_id: Option<u64>,
 ) -> Result<Admission> {
+    if matches!(operation, Operation::CompositeOperation(_)) {
+        return Ok(Admission::AppliesActions);
+    }
+
     // A tagged entry may only reach the manifest through the commit path's
     // assembly, which merges the records the operation's entry adds onto
     // the CURRENT entry at every attempt and validates them; the assembly
@@ -256,15 +265,16 @@ pub fn classify(
         };
     }
 
-    // A tagged history translates row ADDRESSES; stable row ids replace
-    // them, so the migration (a `Merge` committed with
-    // `migration_next_row_id`) is refused while an entry exists. The other
-    // direction is refused where a transition is recorded.
+    // The migration (a `Merge` committed with `migration_next_row_id`)
+    // changes the domain the table's identifiers live in while a tagged
+    // history records row moves, which this release does not carry across.
+    // A tagged history is allowed on a table that already has stable row ids.
     if migration_next_row_id.is_some() {
         return Err(Error::not_supported(
-            "stable row id migration is not supported on a table with a tagged fragment \
-             reuse history: tagged histories translate row addresses, which stable row ids \
-             replace. Trim the history first",
+            "stable row id migration is not supported while the table carries a tagged \
+             fragment reuse history: the migration changes the table's row identifiers, and \
+             carrying the recorded row moves across it is not implemented. Trim the history \
+             first",
         ));
     }
 
@@ -314,16 +324,16 @@ pub fn classify(
         // Replaces only the MemWAL entry; fragments, user segments and the
         // history are carried through unchanged.
         Operation::UpdateMemWalState { .. } => Ok(Admission::MaintainsMemWalState),
+        Operation::CompositeOperation(_) => Ok(Admission::AppliesActions),
         // A bare rewrite beside an entry of a newer version or carrying
         // rewritten indices, or a v0 snapshot, would misinterpret the
-        // history; overlays, clones, base changes and action-based
-        // transactions have no tagged semantics yet. A CreateIndex reaching
-        // here touches the entry without being its trim.
+        // history; overlays, clones and base changes have no tagged
+        // semantics yet. A CreateIndex reaching here touches the entry
+        // without being its trim.
         Operation::Rewrite { .. }
         | Operation::CreateIndex { .. }
         | Operation::DataOverlay { .. }
         | Operation::Clone { .. }
-        | Operation::CompositeOperation(_)
         | Operation::Unknown { .. } => Err(Error::not_supported(
             "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
         )),
@@ -584,6 +594,9 @@ mod tests {
                     path: "memory://base".into(),
                 }],
             },
+            "composite" => Operation::CompositeOperation(
+                crate::transaction::action::CompositeOperation::default(),
+            ),
             _ => unreachable!("{kind}"),
         }
     }
@@ -745,6 +758,24 @@ mod tests {
     )]
     #[case("clone", Table::Tagged, Verdict::NotSupported)]
     #[case("update_bases", Table::Tagged, Verdict::Admit(Admission::MovesNoRows))]
+    // Action-based transactions are admitted in every state; apply enforces
+    // the history's rules.
+    #[case(
+        "composite",
+        Table::Untagged,
+        Verdict::Admit(Admission::AppliesActions)
+    )]
+    #[case("composite", Table::Tagged, Verdict::Admit(Admission::AppliesActions))]
+    #[case(
+        "composite",
+        Table::TaggedWithDirectIndex,
+        Verdict::Admit(Admission::AppliesActions)
+    )]
+    #[case(
+        "composite",
+        Table::TaggedWithTranslatingIndex,
+        Verdict::Admit(Admission::AppliesActions)
+    )]
     fn every_operation_has_a_verdict(
         #[case] kind: &str,
         #[case] state: Table,
@@ -867,6 +898,24 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("id_idx"), "{error}");
         assert!(error.to_string().contains("no fragment bitmap"), "{error}");
+    }
+
+    /// A trim may delete a drained entry while the sticky flag keeps the
+    /// table tagged. That state once let a composite through as untagged;
+    /// it is admitted as one now, like every other state.
+    #[test]
+    fn composite_is_admitted_on_a_flagged_table_without_an_entry() {
+        let (mut manifest, _) = table(Table::Untagged);
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let got = verdict(classify(
+            &sample("composite", &manifest),
+            Some(&manifest),
+            &[],
+            &FragReuseUpdate::None,
+            None,
+        ));
+        assert_eq!(got, Verdict::Admit(Admission::AppliesActions));
     }
 
     #[test]

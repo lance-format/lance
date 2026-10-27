@@ -33,17 +33,21 @@ use crate::format::{
 use crate::rowids::read_row_ids;
 use crate::rowids::version::{SpilledRowLineage, build_version_meta};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::frag_reuse::FragReuseActionInputs;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
 };
 use crate::transaction::validate::schema_fragments_valid;
-use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
+use crate::transaction::{FragReuseUpdate, LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
+
+mod frag_reuse_history;
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -60,6 +64,7 @@ impl Transaction {
     /// action set is a delta, so there is nothing for it to be a delta against
     /// when the dataset does not exist yet. The caller turns the absent case
     /// into an error, which is where the `Option` it holds actually lives.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::transaction) fn build_manifest_from_actions(
         &self,
         composite_operation: &CompositeOperation,
@@ -68,6 +73,7 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
+        frag_reuse: &FragReuseUpdate,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         // No `migration_next_row_id` escape, unlike the legacy guard in
         // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
@@ -116,6 +122,9 @@ impl Transaction {
             self.read_version,
             ReadMarks::of(read_manifest),
         );
+        if let FragReuseUpdate::Actions(inputs) = frag_reuse {
+            state.frag_reuse_inputs = inputs.clone();
+        }
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
@@ -220,6 +229,20 @@ pub(super) struct ApplyState<'a> {
     /// tombstoned.
     tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
 
+    /// Fragments a [`RemoveFragment`](super::RemoveFragment) removed, with its
+    /// `data_change`: a fragment reuse transition may only consume a fragment
+    /// a compaction removed.
+    removed_fragments: HashMap<u64, bool>,
+    /// Committed fields whose values a data-changing tombstone replaced, by
+    /// fragment. On a tagged fragment reuse history the coverage of segments
+    /// translating into the fragment is withdrawn along the lineage.
+    rebound_fields: Vec<(u64, Vec<u32>)>,
+    /// What the operation asks of the fragment reuse history, settled once
+    /// the whole operation has run.
+    frag_reuse: frag_reuse_history::FragReuseChanges,
+    /// What the commit attempt supplied for the history.
+    frag_reuse_inputs: Arc<FragReuseActionInputs>,
+
     /// The version the transaction was built against. Not the current
     /// manifest's version: on a retry the set is replayed onto something newer,
     /// and what an action saw is still the version it read.
@@ -267,6 +290,10 @@ impl<'a> ApplyState<'a> {
             reserved_row_ids: 0,
             touched_index_names: BTreeSet::new(),
             tombstoned_fields: HashMap::new(),
+            removed_fragments: HashMap::new(),
+            rebound_fields: Vec::new(),
+            frag_reuse: Default::default(),
+            frag_reuse_inputs: Default::default(),
         }
     }
 
@@ -285,6 +312,7 @@ impl<'a> ApplyState<'a> {
         self.check_spilled_lineage_is_bound()?;
         self.check_reencodes_are_rebound()?;
         self.check_data_changes_are_refreshed()?;
+        let publishes_frag_reuse = self.finish_frag_reuse_history()?;
 
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
@@ -336,6 +364,9 @@ impl<'a> ApplyState<'a> {
         )?;
         inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         apply_index_object_metadata_flag(&mut manifest, &indices);
+        if publishes_frag_reuse {
+            frag_reuse_history::set_feature_flags(&mut manifest, &indices);
+        }
 
         for base in new_bases {
             manifest.base_paths.insert(base.id, base);
@@ -566,12 +597,13 @@ impl<'a> ApplyState<'a> {
 
     /// Drop a fragment and forget everything recorded about it. `false` if no
     /// such fragment was present.
-    pub(super) fn remove_fragment(&mut self, fragment_id: u64) -> bool {
+    pub(super) fn remove_fragment(&mut self, fragment_id: u64, data_change: bool) -> bool {
         let before = self.fragments.len();
         self.fragments.retain(|fragment| fragment.id != fragment_id);
         if self.fragments.len() == before {
             return false;
         }
+        self.removed_fragments.insert(fragment_id, data_change);
         self.new_fragments.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
@@ -874,6 +906,13 @@ impl<'a> ApplyState<'a> {
         fields: impl IntoIterator<Item = i32>,
     ) -> Result<()> {
         let fields: Vec<i32> = fields.into_iter().collect();
+        self.rebound_fields.push((
+            fragment_id,
+            fields
+                .iter()
+                .filter_map(|field| u32::try_from(*field).ok())
+                .collect(),
+        ));
         prune_rebound_fields_from_indices(
             &mut self.indices,
             fragment_id,

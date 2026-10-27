@@ -156,12 +156,15 @@ fn validate_frag_reuse_with_stable_row_ids_when(
             frag_reuse_entries.len()
         )));
     }
+    // A tagged history (index_version 1) is allowed beside stable row ids as
+    // long as every index stores row addresses, which the check below holds
+    // every index to.
     let frag_reuse_version = frag_reuse_entries[0].index_version;
-    if frag_reuse_version != 0 {
+    if !matches!(frag_reuse_version, 0 | 1) {
         return Err(Error::invalid_input(format!(
             "Cannot commit version {version}: the dataset uses stable row IDs and carries a \
-             fragment reuse index with index_version {frag_reuse_version}, but datasets with \
-             stable row IDs support only index_version 0"
+             fragment reuse index with index_version {frag_reuse_version}, which this build of \
+             Lance does not support"
         )));
     }
     let incompatible = incompatible_indices(indices);
@@ -516,12 +519,20 @@ mod tests {
         )
         .unwrap();
 
+        // A tagged history is allowed beside indices storing row addresses.
+        validate_frag_reuse_with_stable_row_ids_when(
+            &manifest,
+            &[frag_reuse_entry(1), zone_map.clone()],
+            true,
+        )
+        .unwrap();
+
         for (indices, expected) in [
             (
                 vec![frag_reuse_entry(0), frag_reuse_entry(0)],
                 "exactly one is allowed",
             ),
-            (vec![frag_reuse_entry(1)], "support only index_version 0"),
+            (vec![frag_reuse_entry(2)], "index_version 2"),
             (vec![frag_reuse_entry(0), zone_map, bitmap], "`bitmap`"),
         ] {
             let error = validate_frag_reuse_with_stable_row_ids_when(&manifest, &indices, true)

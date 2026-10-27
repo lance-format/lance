@@ -1387,19 +1387,14 @@ pub(crate) async fn do_commit_detached_transaction(
                 let prepared =
                     prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
                         .await?;
-                let (mut manifest, indices) = transaction.build_manifest_prepared(
+                let (mut manifest, mut indices) = transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     &transaction_file,
                     &build_config,
                     None,
                 )?;
-                crate::dataset::write::seeds::apply_seed_feature_flags(
-                    &mut manifest,
-                    &indices,
-                    dataset,
-                )
-                .await?;
+                finish_built_manifest(dataset, transaction, &mut manifest, &mut indices).await?;
                 (manifest, indices)
             }
         };
@@ -1603,6 +1598,42 @@ async fn build_config_for_attempt(
     Ok(config)
 }
 
+/// What an action-based transaction's attempt supplies for the fragment reuse
+/// history: the history itself when it lives in an external file, which
+/// applying the actions cannot read, and this build's notion of a usable
+/// segment, which a trim judges coverage by. `None` for any other operation.
+async fn composite_frag_reuse_update(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<Option<FragReuseUpdate>> {
+    if !matches!(transaction.operation, Operation::CompositeOperation(_)) {
+        return Ok(None);
+    }
+    let history = crate::index::frag_reuse::preload_external_frag_reuse_history(dataset).await?;
+    Ok(Some(FragReuseUpdate::Actions(Arc::new(
+        lance_table::system_index::frag_reuse::FragReuseActionInputs {
+            history,
+            index_is_usable: crate::index::index_is_usable,
+        },
+    ))))
+}
+
+/// The IO a freshly built manifest still needs: an action-based history that
+/// outgrew the inline limit moves to an external file, and the seed feature
+/// flags follow the final index list. One await point, rather than one per
+/// step, keeps the commit loop's future under the `large_futures` limit.
+async fn finish_built_manifest(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    manifest: &mut Manifest,
+    indices: &mut [IndexMetadata],
+) -> Result<()> {
+    if matches!(transaction.operation, Operation::CompositeOperation(_)) {
+        crate::index::frag_reuse::spill_frag_reuse_history(dataset, indices).await?;
+    }
+    crate::dataset::write::seeds::apply_seed_feature_flags(manifest, indices, dataset).await
+}
+
 /// Step one of a commit attempt (`Transaction::prepare_indices`): the index
 /// list as read from the manifest current at this attempt, and the prepared
 /// list an in-place column rewrite has already withdrawn or pruned. For such
@@ -1611,14 +1642,21 @@ async fn build_config_for_attempt(
 /// the lineage without guessing; other operations never interpret the
 /// entry: an append, or a merge that only adds columns, must carry a
 /// history a newer writer recorded through untouched. `frag_reuse` is what
-/// the rebase settled about the entry for this attempt. Nothing flows back
-/// into `transaction`.
+/// the rebase settled about the entry for this attempt; for an action-based
+/// transaction, which settles nothing beforehand, it is derived here. Nothing
+/// flows back into `transaction`.
 async fn prepare_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
     build_config: &lance_table::format::ManifestBuildConfig,
     frag_reuse: FragReuseUpdate,
 ) -> Result<PreparedIndices> {
+    let frag_reuse = match frag_reuse {
+        FragReuseUpdate::None => composite_frag_reuse_update(dataset, transaction)
+            .await?
+            .unwrap_or_default(),
+        settled => settled,
+    };
     let indices = load_all_indices(dataset).await?;
     // Same rewrite set the preparation withdraws from; nothing else interprets the entry.
     let rewrites_in_place = !Transaction::rewritten_physical_columns(
@@ -1929,19 +1967,15 @@ pub(crate) async fn commit_transaction(
                 let prepared =
                     prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
                         .await?;
-                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
+                let (mut manifest, mut indices) = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &build_config,
                     read_version_state,
                 )?;
-                crate::dataset::write::seeds::apply_seed_feature_flags(
-                    &mut manifest,
-                    &indices,
-                    &dataset,
-                )
-                .await?;
+                finish_built_manifest(&dataset, &attempt_transaction, &mut manifest, &mut indices)
+                    .await?;
                 (manifest, indices)
             }
         };
