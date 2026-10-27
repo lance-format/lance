@@ -15,7 +15,7 @@ use url::Url;
 use crate::object_store::WrappingObjectStore;
 use crate::object_store::uri_to_url;
 
-use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
+use super::{ObjectStore, ObjectStoreParams, StorageOptions, tracing::ObjectStoreTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
 
 #[cfg(feature = "aws")]
@@ -80,9 +80,9 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     }
 }
 
-/// Smallest cache size at which [`ObjectStoreRegistry::get_store()`] sweeps out
-/// dead entries.
-const MIN_PRUNE_THRESHOLD: usize = 64;
+/// Default smallest cache size at which [`ObjectStoreRegistry::get_store()`]
+/// sweeps out dead entries; see [`ObjectStoreRegistry::set_min_prune_threshold()`].
+pub const DEFAULT_MIN_PRUNE_THRESHOLD: usize = 64;
 
 /// Statistics for the object store registry cache.
 #[derive(Debug, Clone, Default)]
@@ -126,6 +126,8 @@ pub struct ObjectStoreRegistry {
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
     active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    // Floor for `prune_threshold`; 0 disables the sweep.
+    min_prune_threshold: AtomicUsize,
     // Cache size at which `get_store` sweeps out dead entries before inserting.
     prune_threshold: AtomicUsize,
     // Cache statistics
@@ -142,10 +144,24 @@ impl ObjectStoreRegistry {
         Self {
             providers: RwLock::new(HashMap::new()),
             active_stores: RwLock::new(HashMap::new()),
-            prune_threshold: AtomicUsize::new(MIN_PRUNE_THRESHOLD),
+            min_prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
+            prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Set the smallest cache size at which [`Self::get_store()`] sweeps out
+    /// dead entries (default [`DEFAULT_MIN_PRUNE_THRESHOLD`]); `0` disables the
+    /// sweep. Applies to the whole registry, i.e. to every dataset sharing the
+    /// session. Also settable per call through the
+    /// [`OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION`] storage option, e.g. from
+    /// the storage options a namespace returns in `describe_table`.
+    ///
+    /// [`OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION`]: crate::object_store::OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION
+    pub fn set_min_prune_threshold(&self, threshold: usize) {
+        self.min_prune_threshold.store(threshold, Ordering::Relaxed);
+        self.prune_threshold.store(threshold, Ordering::Relaxed);
     }
 
     /// Get the object store provider for a given scheme.
@@ -282,8 +298,12 @@ impl ObjectStoreRegistry {
     /// A dead entry is only found again if the same key is looked up, which
     /// never happens when every key is distinct (each namespace table gets its
     /// own storage options provider, hence its own key). So before inserting,
-    /// once the cache reaches twice its live size, all dead entries are swept
-    /// out; this keeps the cache bounded at amortized O(1) cost per insert.
+    /// once the cache reaches twice its live size (and at least the minimum
+    /// prune threshold), all dead entries are swept out; this keeps the cache
+    /// bounded at amortized O(1) cost per insert.
+    ///
+    /// If `params` carry the `object_store_cache_prune_threshold` storage
+    /// option, it is applied first via [`Self::set_min_prune_threshold()`].
     pub async fn get_store(
         &self,
         base_path: Url,
@@ -299,6 +319,13 @@ impl ObjectStoreRegistry {
         let Some(provider) = self.get_provider(scheme) else {
             return Err(self.scheme_not_found_error(scheme));
         };
+        if let Some(options) = params.storage_options()
+            && let Some(threshold) =
+                StorageOptions(options.clone()).object_store_cache_prune_threshold()?
+            && threshold != self.min_prune_threshold.load(Ordering::Relaxed)
+        {
+            self.set_min_prune_threshold(threshold);
+        }
 
         // Keyed by the metrics identity rather than the bare prefix: in
         // `dataset` label mode that is the dataset URI, so datasets sharing a
@@ -346,12 +373,12 @@ impl ObjectStoreRegistry {
         {
             // Insert the store into the cache
             let mut cache_lock = self.active_stores.write().ok().expect_ok()?;
-            if cache_lock.len() >= self.prune_threshold.load(Ordering::Relaxed) {
+            let min_threshold = self.min_prune_threshold.load(Ordering::Relaxed);
+            if min_threshold > 0 && cache_lock.len() >= self.prune_threshold.load(Ordering::Relaxed)
+            {
                 cache_lock.retain(|_, weak| weak.strong_count() > 0);
-                self.prune_threshold.store(
-                    (cache_lock.len() * 2).max(MIN_PRUNE_THRESHOLD),
-                    Ordering::Relaxed,
-                );
+                self.prune_threshold
+                    .store((cache_lock.len() * 2).max(min_threshold), Ordering::Relaxed);
             }
             cache_lock.insert(cache_key, Arc::downgrade(&store));
         }
@@ -429,7 +456,8 @@ impl Default for ObjectStoreRegistry {
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
-            prune_threshold: AtomicUsize::new(MIN_PRUNE_THRESHOLD),
+            min_prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
+            prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -453,6 +481,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::object_store::OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION;
     use object_store::ObjectStore as OSObjectStore;
 
     use crate::object_store::providers::memory::MemoryStoreProvider;
@@ -731,7 +760,7 @@ mod tests {
 
         // Every 10th store stays alive; the rest are dropped right away, like
         // datasets opened once per sample, each on a different table.
-        let n = 10 * MIN_PRUNE_THRESHOLD;
+        let n = 10 * DEFAULT_MIN_PRUNE_THRESHOLD;
         let mut alive = vec![];
         for i in 0..n {
             let store = registry
@@ -743,7 +772,7 @@ mod tests {
             }
         }
         // Without pruning this would be `n`.
-        assert!(cache_len() <= 2 * alive.len() + MIN_PRUNE_THRESHOLD);
+        assert!(cache_len() <= 2 * alive.len() + DEFAULT_MIN_PRUNE_THRESHOLD);
         assert_eq!(registry.stats().active_stores, alive.len());
 
         // Live entries survive pruning and are still reused.
@@ -755,6 +784,84 @@ mod tests {
             assert!(Arc::ptr_eq(store, &again));
         }
         assert_eq!(registry.stats().hits, alive.len() as u64);
+    }
+
+    /// Opens `n` stores with distinct keys, each carrying `extra` storage
+    /// options, drops them all, and returns the resulting cache size.
+    async fn cache_len_after_distinct_dropped_stores(
+        registry: &ObjectStoreRegistry,
+        n: usize,
+        extra: &[(&str, &str)],
+    ) -> usize {
+        use crate::object_store::StorageOptionsAccessor;
+        let url = Url::parse("memory://test").unwrap();
+        for i in 0..n {
+            let mut options = HashMap::from([("table".to_string(), i.to_string())]);
+            options.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            let params = ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(options),
+                )),
+                ..Default::default()
+            };
+            registry.get_store(url.clone(), &params).await.unwrap();
+        }
+        registry.active_stores.read().unwrap().len()
+    }
+
+    #[rstest]
+    #[case::disabled("0", 200, 200)]
+    #[case::custom("8", 200, 8)]
+    #[tokio::test]
+    async fn test_prune_threshold_from_storage_option(
+        #[case] threshold: &str,
+        #[case] n: usize,
+        #[case] max_cache_len: usize,
+    ) {
+        // A namespace configures this through the storage options it returns
+        // from `describe_table`.
+        let registry = ObjectStoreRegistry::default();
+        let extra = [(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION, threshold)];
+        let len = cache_len_after_distinct_dropped_stores(&registry, n, &extra).await;
+        assert!(len <= max_cache_len, "cache has {len} entries");
+        assert_eq!(registry.stats().active_stores, 0);
+    }
+
+    #[tokio::test]
+    async fn test_set_min_prune_threshold() {
+        let registry = ObjectStoreRegistry::default();
+        registry.set_min_prune_threshold(0);
+        assert_eq!(
+            cache_len_after_distinct_dropped_stores(&registry, 200, &[]).await,
+            200
+        );
+        // Re-enabling sweeps on the next insert.
+        registry.set_min_prune_threshold(16);
+        assert!(cache_len_after_distinct_dropped_stores(&registry, 1, &[]).await <= 16);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_prune_threshold_option() {
+        use crate::object_store::StorageOptionsAccessor;
+        let registry = ObjectStoreRegistry::default();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION.to_string(),
+                    "lots".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let err = registry
+            .get_store(Url::parse("memory://test").unwrap(), &params)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION),
+            "{err}"
+        );
     }
 
     #[tokio::test]
