@@ -5663,6 +5663,13 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
                 };
         }
 
+        // Float16 samples are widened for coreset training, but residuals and
+        // query preprocessing require centroids in the vector column's type.
+        if get_vector_type(dataset.schema(), column)?.1 == DataType::Float16 {
+            let values = arrow::compute::cast(centroids.values(), &DataType::Float16)?;
+            centroids = FixedSizeListArray::try_new_from_values(values, dimension as i32)?;
+        }
+
         Ok((IvfModel::new(centroids, None), coreset_len))
     }
     .await;
@@ -7905,11 +7912,7 @@ mod tests {
     ) {
         let test_dir = TempStrDir::default();
         let uri = format!("{}/ds", test_dir.as_str());
-        let expected_type = if values.data_type() == &DataType::Float64 {
-            DataType::Float64
-        } else {
-            DataType::Float32
-        };
+        let expected_type = values.data_type().clone();
         let fsl = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "vector",
@@ -8304,6 +8307,123 @@ mod tests {
             .nearest("vector", query.as_ref(), K)
             .unwrap()
             .distance_metric(metric_type)
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let expected_ids = ground_truth["id"].as_primitive::<UInt64Type>().values();
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count() as f32 / K as f32;
+        assert!(recall >= 0.5, "recall: {recall}, row ids: {ids:?}");
+    }
+
+    #[rstest]
+    #[case::float16_streaming_fixed(DataType::Float16, false, Some(1), 1)]
+    #[case::float16_streaming_nullable(DataType::Float16, true, Some(1), 1)]
+    #[case::float16_streaming_without_refinement(DataType::Float16, false, Some(1), 0)]
+    #[case::float32_streaming(DataType::Float32, false, Some(1), 1)]
+    #[case::float16_in_memory(DataType::Float16, false, None, 0)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ivf_rq_build_and_search_float_types(
+        #[case] value_type: DataType,
+        #[case] is_nullable: bool,
+        #[case] streaming_sample_rate: Option<usize>,
+        #[case] refine_passes: usize,
+    ) {
+        const NUM_ROWS: usize = 600;
+        const NUM_PARTITIONS: usize = 257;
+        const DIMENSION: usize = 32;
+        const EXPECTED_ROW: usize = 17;
+        const K: usize = 5;
+
+        let test_dir = TempStrDir::default();
+        let batch = gen_batch()
+            .with_seed(42.into())
+            .col("id", array::step::<UInt64Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>((DIMENSION as u32).into()),
+            )
+            .into_batch_rows((NUM_ROWS as u64).into())
+            .unwrap();
+        let vectors = batch["vector"].as_fixed_size_list();
+        let values = arrow::compute::cast(vectors.values(), &value_type).unwrap();
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap();
+        let query = vectors.value(EXPECTED_ROW);
+        let batch = batch
+            .replace_column_schema_by_name("vector", vectors.data_type().clone(), Arc::new(vectors))
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            batch.schema().field(0).clone(),
+            batch.schema().field(1).clone().with_nullable(is_nullable),
+        ]));
+        let batch = RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap();
+        let mut dataset = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                max_rows_per_file: NUM_ROWS / 2,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut ivf_params = IvfBuildParams::new(NUM_PARTITIONS);
+        ivf_params.sample_rate = 2;
+        ivf_params.streaming_sample_rate = streaming_sample_rate;
+        // Resampled chunks can overlap, so retain enough summaries to split 257 clusters.
+        ivf_params.streaming_coreset_rate = is_nullable.then_some(2);
+        ivf_params.streaming_refine_passes = refine_passes;
+        ivf_params.max_iters = 1;
+        let params = VectorIndexParams::with_ivf_rq_params(
+            MetricType::Cosine,
+            ivf_params,
+            RQBuildParams::new(1),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        drop(dataset);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let model = index.ivf_model();
+        assert_eq!(model.num_partitions(), NUM_PARTITIONS);
+        assert_eq!(model.centroids_array().unwrap().value_type(), value_type);
+
+        let mut scanner = dataset.scan();
+        // Probe and rerank the full fixture to isolate type correctness from
+        // partition training and random one-bit quantization quality.
+        scanner
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(MetricType::Cosine)
+            .minimum_nprobes(NUM_PARTITIONS)
+            .refine(NUM_ROWS.div_ceil(K) as u32);
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfPartition"), "{plan}");
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), K);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(ids[0], EXPECTED_ROW as u64);
+        assert!(
+            result["_distance"]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+
+        let ground_truth = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(MetricType::Cosine)
             .use_index(false)
             .try_into_batch()
             .await
@@ -9137,7 +9257,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::f16("f16", DataType::Float32)]
+    #[case::f16("f16", DataType::Float16)]
     #[case::f32("f32", DataType::Float32)]
     #[case::f64("f64", DataType::Float64)]
     #[case::int8("int8", DataType::Float32)]
