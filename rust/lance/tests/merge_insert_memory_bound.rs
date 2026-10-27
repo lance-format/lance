@@ -2,18 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Regression test: a small partial-schema upsert into a table of wide rows
-//! must run under a memory pool far smaller than the table, on every merge
-//! path, without holding the table in memory.
+//! must run under a memory pool far smaller than the table, through both the
+//! non-indexed plan and the covering-index take path, without holding the
+//! table in memory.
 //!
 //! The merge plan hashes one side of a source/target join. Building that hash
 //! table from the target decoded the whole table per merge, outside any pool:
 //! a table with few rows of several MB each looked small to DataFusion's
 //! row-count heuristics, and the merge session had an unbounded pool. The
-//! scalar-index path scanned the fragments its index does not cover with the
-//! scanner's defaults and coalesced the batches outside the pool, which for
-//! an index covering nothing is the table again. The plan now builds on the
-//! source under `LANCE_MEM_POOL_SIZE`, and both target scans run under a
-//! share of that pool.
+//! indexed path full-joined the target rows it took, emitting the whole target
+//! scan through the join. The plan now builds on the source under
+//! `LANCE_MEM_POOL_SIZE`, and both target scans are budgeted from that pool.
 //!
 //! This file must stay a single-test integration binary: the merge reads the
 //! pool size from the process-global `LANCE_MEM_POOL_SIZE`, so a sibling test
@@ -180,8 +179,8 @@ async fn test_partial_upsert_into_wide_rows_fits_pool() {
     assert!(options.use_spilling());
 
     // 200 rows x 1 MiB in 25 fragments: the table is four times the pool, the
-    // source 4 rows. The btree is built on the first fragment only, so it
-    // covers none of the rows the merge touches.
+    // source 4 rows. The btree is created after the plan-path checks and covers
+    // every fragment for the final take-path check.
     let write_params = WriteParams {
         max_rows_per_file: ROWS_PER_FRAGMENT,
         ..Default::default()
@@ -189,7 +188,6 @@ async fn test_partial_upsert_into_wide_rows_fits_pool() {
     let mut dataset = Dataset::write(rows(0, 1), "memory://", Some(write_params.clone()))
         .await
         .unwrap();
-    create_key_index(&mut dataset).await;
     dataset
         .append(
             rows(ROWS_PER_FRAGMENT as u32, FRAGMENTS - 1),
@@ -199,27 +197,27 @@ async fn test_partial_upsert_into_wide_rows_fits_pool() {
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), FRAGMENTS as usize);
 
-    // Indexed key, index covering nothing: the scalar-index path scans every
-    // appended fragment and patches the column.
-    let (dataset, peak) = upsert(Arc::new(dataset), MergeInsertWriteMode::Auto).await;
-    check(&dataset).await;
-    assert!(peak < PEAK_BYTES, "index path held {peak} bytes");
-
     // Row rewrite: the plan path, which fills `payload` from the target side
     // of the join.
-    let (dataset, peak) = upsert(dataset, MergeInsertWriteMode::RewriteRows).await;
+    let (dataset, peak) = upsert(Arc::new(dataset), MergeInsertWriteMode::RewriteRows).await;
     check(&dataset).await;
     assert!(peak < PEAK_BYTES, "plan path held {peak} bytes");
 
     // Column patch on the plan path: the target scan carries only the key.
-    let mut dataset = Arc::unwrap_or_clone(dataset);
-    dataset.drop_index("key_idx").await.unwrap();
-    let (dataset, _) = upsert(Arc::new(dataset), MergeInsertWriteMode::RewriteColumns).await;
+    let (dataset, peak) = upsert(dataset, MergeInsertWriteMode::RewriteColumns).await;
     check(&dataset).await;
+    assert!(
+        peak < PEAK_BYTES,
+        "RewriteColumns plan path held {peak} bytes"
+    );
 
     // Covering index: the take path.
     let mut dataset = Arc::unwrap_or_clone(dataset);
     create_key_index(&mut dataset).await;
-    let (dataset, _) = upsert(Arc::new(dataset), MergeInsertWriteMode::Auto).await;
+    let (dataset, peak) = upsert(Arc::new(dataset), MergeInsertWriteMode::Auto).await;
     check(&dataset).await;
+    assert!(
+        peak < PEAK_BYTES,
+        "covering-index take path held {peak} bytes"
+    );
 }

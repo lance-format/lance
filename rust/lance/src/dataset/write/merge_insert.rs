@@ -1408,7 +1408,7 @@ impl MergeBudget {
             use_spilling: true,
             ..Default::default()
         };
-        let mut state = get_session_context(&options).state();
+        let mut state = new_session_context(&options).state();
         let config = state.config_mut();
         if let Some(target_partitions) = target_partitions {
             config.options_mut().execution.target_partitions = target_partitions;
