@@ -271,7 +271,7 @@ mod scanner_components {
         IndexType,
         scalar::{
             FullTextSearchQuery, ScalarIndexParams,
-            expression::PlannerIndexExt,
+            expression::create_filter_plan,
             inverted::{
                 query::{FtsSearchParams, MatchQuery},
                 tokenizer::InvertedIndexParams,
@@ -353,8 +353,8 @@ mod scanner_components {
         .await
         .unwrap();
         let info = dataset.scalar_index_info().await.unwrap();
-        let expr = Planner::new(Arc::new(dataset.schema().into()))
-            .create_filter_plan(expr, &info, true)
+        let planner = Planner::new(Arc::new(dataset.schema().into()));
+        let expr = create_filter_plan(planner.optimize_expr(expr).unwrap(), &info, true)
             .unwrap()
             .index_query
             .unwrap();
