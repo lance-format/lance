@@ -136,7 +136,7 @@ impl ExecutionPlan for RowAddrMaskFilterExec {
 
 /// Keep rows whose `_rowid` is selected by the mask (the mask is keyed in the
 /// same `_rowid` space). Null ids are dropped; they cannot be in any allow set.
-fn apply_mask(mask: &RowAddrMask, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
+pub(super) fn apply_mask(mask: &RowAddrMask, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
     let row_id_column = batch.column_by_name(ROW_ID).ok_or_else(|| {
         DataFusionError::Internal(format!(
             "RowAddrMaskFilterExec input missing {ROW_ID} column"

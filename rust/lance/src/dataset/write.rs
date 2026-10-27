@@ -1779,7 +1779,7 @@ pub(crate) async fn write_fragments_internal_impl(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1799,7 +1799,7 @@ pub(crate) async fn write_fragments_internal_impl(
         target_bases_info,
         file_row_counts,
         preassigned_data_file_name,
-        keep_field_ids,
+        inherited_field_ids,
     )
     .await
 }
@@ -1813,20 +1813,26 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
+/// Give a new table its field IDs. `inherited` IDs are an existing table's,
+/// such as a MemWAL generation's, and may exceed the new-table limit.
+pub(crate) fn assign_new_table_field_ids(schema: &mut Schema, inherited: bool) -> Result<()> {
+    if inherited {
+        schema.try_keep_field_ids()
+    } else {
+        schema.try_assign_new_table_field_ids()
+    }
+}
+
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
     normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<Schema> {
     let schema = if dataset.is_none() {
         let mut schema = normalized_converted_schema;
-        if keep_field_ids {
-            schema.try_set_field_id(None)?;
-        } else {
-            schema.try_reassign_field_ids(None)?;
-        }
+        assign_new_table_field_ids(&mut schema, inherited_field_ids)?;
         schema
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
@@ -3322,16 +3328,15 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
-        // New datasets canonicalize incoming field IDs before writing while
-        // preserving the schema's field order.
+        // A new dataset keeps the supplied field IDs, in the schema's field order.
         assert_eq!(
             written_schema
                 .fields_pre_order()
                 .map(|field| field.id)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![3, 0, 1]
         );
-        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 2]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
 
         let path = base_path
             .clone()
@@ -3345,7 +3350,7 @@ mod tests {
             written_schema.clone(),
             0,
             0,
-            2,
+            3,
             None,
         )
         .await
