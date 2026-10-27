@@ -1335,6 +1335,7 @@ impl ManifestNamespace {
             created_at: None,
             base_id: None,
             files: Some(index_files_to_table(trained_index.created_index.files)),
+            fragment_id_map: Default::default(),
         })
     }
 

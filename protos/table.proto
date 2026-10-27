@@ -459,6 +459,17 @@ message IndexMetadata {
    * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
    */
   map<string, string> metadata = 13;
+
+  /* Translation of the fragment part of the row addresses stored in this
+   * segment's files, from the provisional fragment id the segment was written
+   * with to the committed fragment id, for a segment built in the same commit
+   * as the fragments it covers. Fragment ids absent from the map are stored
+   * as committed. Readers apply it before any fragment reuse translation.
+   *
+   * Requires feature flag 1 << 18 in both reader and writer feature flags
+   * while any segment carries a nonempty map.
+   */
+  map<uint32, uint32> fragment_id_map = 14;
 }
 
 // Metadata about a single file within an index segment.

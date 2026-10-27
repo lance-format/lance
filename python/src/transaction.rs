@@ -112,6 +112,7 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            fragment_id_map: Default::default(),
         }))
     }
 }

@@ -2044,6 +2044,7 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
         created_at: None,
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     };
 
     let transaction = Transaction::new(
@@ -2105,6 +2106,7 @@ async fn test_shallow_clone_preserves_the_covering_fence() {
         created_at: None,
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     };
     dataset
         .apply_commit(
@@ -2201,6 +2203,7 @@ async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
         created_at: None,
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     };
     let uuid = index.uuid;
 
@@ -2460,6 +2463,7 @@ mod composite {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
         dataset
             .apply_commit(
@@ -3600,6 +3604,7 @@ mod composite {
             created_at: None,
             dataset_version: None,
             data_change: false,
+            local_fragment_addresses: false,
         }
     }
 
@@ -3980,6 +3985,7 @@ mod composite {
             created_at: metadata.created_at,
             dataset_version: Some(metadata.dataset_version),
             data_change: false,
+            local_fragment_addresses: false,
         })
     }
 
@@ -4699,5 +4705,185 @@ mod composite {
         .await;
 
         commit_expecting_conflict(&dropped, read_version, stale_append).await;
+    }
+}
+
+mod staged_snapshot {
+    //! One Transaction V2 commit that appends data and extends an existing
+    //! index over it, composed with [`StagedSnapshot`].
+
+    use std::sync::Arc;
+
+    use crate::Dataset;
+    use crate::dataset::{InsertBuilder, StagedSnapshot, WriteParams};
+    use crate::index::DatasetIndexExt;
+    use arrow_array::{Int32Array, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use lance_core::ROW_ADDR;
+    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_table::feature_flags::FLAG_LOCAL_FRAGMENT_ADDRESSES;
+    use lance_table::transaction::action::provisional_fragment_id;
+    use roaring::RoaringBitmap;
+
+    fn batch(values: std::ops::Range<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))]).unwrap()
+    }
+
+    /// The row address of every row with `a = value`, and the query plan that
+    /// found them.
+    async fn lookup(dataset: &Dataset, value: i32) -> (Vec<u64>, String) {
+        let mut scanner = dataset.scan();
+        scanner
+            .filter(&format!("a = {value}"))
+            .unwrap()
+            .with_row_address()
+            .project(&["a"])
+            .unwrap();
+        let plan = scanner.explain_plan(true).await.unwrap();
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let addresses = batches
+            .iter()
+            .flat_map(|batch| {
+                batch[ROW_ADDR]
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        (addresses, plan)
+    }
+
+    fn fragment_of(address: u64) -> u32 {
+        RowAddress::from(address).fragment_id()
+    }
+
+    /// The segment the snapshot adds is built before its fragment has an id,
+    /// so its files hold provisional addresses. A concurrent append lands
+    /// first, so the id the commit allocates is not even the one the fragment
+    /// would have had at the read version. Searching the committed index must
+    /// still return the committed address.
+    #[tokio::test]
+    async fn test_one_commit_appends_and_extends_a_btree_index_over_it() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![batch(0..10)])
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                Some("a_idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let read = Arc::new(dataset);
+
+        let snapshot = StagedSnapshot::try_new_experimental(read.clone())
+            .await
+            .unwrap();
+        let (snapshot, appended) = snapshot
+            .append("append 100..110", vec![batch(100..110)])
+            .await
+            .unwrap();
+        let snapshot = snapshot
+            .add_index_segment(
+                "index what was appended",
+                "a_idx",
+                "a",
+                IndexType::BTree,
+                &params,
+                &appended,
+            )
+            .await
+            .unwrap();
+
+        // Before commit, the snapshot already answers from the staged segment,
+        // at the appended fragment's provisional id.
+        let provisional = provisional_fragment_id(0).unwrap();
+        let (staged_hits, staged_plan) = lookup(snapshot.dataset(), 105).await;
+        assert_eq!(staged_hits.len(), 1, "{staged_plan}");
+        assert_eq!(fragment_of(staged_hits[0]), provisional);
+        assert!(staged_plan.contains("ScalarIndexQuery"), "{staged_plan}");
+
+        // A V2 racer: a named operation racing an action set fails closed.
+        let (racer, _) = StagedSnapshot::try_new_experimental(read.clone())
+            .await
+            .unwrap()
+            .append("racing append", vec![batch(200..205)])
+            .await
+            .unwrap();
+        let racer = racer.commit().await.unwrap();
+        let racer_fragment = racer.fragments().last().unwrap().id as u32;
+
+        let committed = snapshot.commit().await.unwrap();
+
+        let appended_fragment = committed.fragments().last().unwrap().id as u32;
+        assert_eq!(committed.fragments().len(), 4);
+        assert_eq!(
+            appended_fragment,
+            racer_fragment + 1,
+            "the racer took the id the append would have had at the read version"
+        );
+
+        let segments = committed.load_indices_by_name("a_idx").await.unwrap();
+        assert_eq!(segments.len(), 2, "the commit extends the existing index");
+        let new_segment = segments
+            .iter()
+            .find(|segment| !segment.fragment_id_map.is_empty())
+            .expect("the new segment records how to translate its addresses");
+        assert_eq!(
+            new_segment.fragment_id_map,
+            [(provisional, appended_fragment)].into()
+        );
+        assert_eq!(
+            new_segment.fragment_bitmap,
+            Some(RoaringBitmap::from_iter([appended_fragment]))
+        );
+        for flags in [
+            committed.manifest.reader_feature_flags,
+            committed.manifest.writer_feature_flags,
+        ] {
+            assert_ne!(flags & FLAG_LOCAL_FRAGMENT_ADDRESSES, 0);
+        }
+
+        // Same session as the snapshot, which cached the segment under its
+        // provisional addresses: the committed read must not be served those.
+        let (hits, plan) = lookup(&committed, 105).await;
+        assert_eq!(hits.len(), 1, "{plan}");
+        assert_eq!(
+            fragment_of(hits[0]),
+            appended_fragment,
+            "the index answers with the committed address"
+        );
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+
+        // A fresh open reads the index list back from storage.
+        let reopened = Dataset::open(committed.uri()).await.unwrap();
+        let (hits, _) = lookup(&reopened, 105).await;
+        assert_eq!(fragment_of(hits[0]), appended_fragment);
+        // The racer's rows are not indexed and are still found by a scan.
+        let (hits, _) = lookup(&reopened, 202).await;
+        assert_eq!(fragment_of(hits[0]), racer_fragment);
     }
 }

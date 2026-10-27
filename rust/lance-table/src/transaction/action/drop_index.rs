@@ -104,6 +104,7 @@ mod tests {
             created_at: None,
             dataset_version: None,
             data_change: false,
+            local_fragment_addresses: false,
         })
     }
 

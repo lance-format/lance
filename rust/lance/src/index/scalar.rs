@@ -17,6 +17,7 @@ pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
 use super::frag_reuse::ResolvedRemapping;
+use super::local_fragment_addresses::{LocalFragmentRemapper, translated_namespace};
 pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
@@ -40,6 +41,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
@@ -796,9 +798,7 @@ pub(crate) async fn open_scalar_index_with_plan(
         dataset, index, staged, purpose, metrics,
     )
     .await?;
-    let cache_id = super::frag_reuse::fri_cache_id(&resolved);
-    let index_cache =
-        super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
+    let index_cache = scalar_index_cache(dataset, index, &resolved);
     let (frag_reuse_index, batch_remapping) =
         match resolved.as_ref().map(|(_, remapping)| remapping) {
             Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
@@ -809,6 +809,16 @@ pub(crate) async fn open_scalar_index_with_plan(
             Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
             None => (None, None),
         };
+    // TODO: compose the local map in front of a tagged history's batch
+    // remapper too; the prototype covers the synchronous remapper only.
+    if batch_remapping.is_some() && !index.fragment_id_map.is_empty() {
+        return Err(Error::not_supported(format!(
+            "segment {} stores provisional fragment ids, which this build cannot yet translate \
+             under a tagged fragment reuse history",
+            index.uuid
+        )));
+    }
+    let frag_reuse_index = LocalFragmentRemapper::compose(index, frag_reuse_index);
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -881,6 +891,22 @@ pub(crate) async fn open_scalar_index_with_plan(
     }
 }
 
+/// Where a scalar segment's decoded content is cached: scoped by what the
+/// content's row addresses were translated through, not only by the segment.
+fn scalar_index_cache(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    resolved: &Option<(Uuid, ResolvedRemapping)>,
+) -> LanceCache {
+    let cache_id = super::frag_reuse::fri_cache_id(resolved);
+    let index_cache =
+        super::frag_reuse::scoped_index_cache(dataset, resolved).for_index(&index.uuid, cache_id);
+    match translated_namespace(index) {
+        Some(namespace) => index_cache.with_key_prefix(&namespace),
+        None => index_cache,
+    }
+}
+
 pub(crate) async fn cached_scalar_index_container(
     dataset: &Dataset,
     uuid: &Uuid,
@@ -890,9 +916,7 @@ pub(crate) async fn cached_scalar_index_container(
     let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, &NoOpMetricsCollector)
         .await
         .ok()?;
-    let cache_id = super::frag_reuse::fri_cache_id(&resolved);
-    let index_cache =
-        super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(uuid, cache_id);
+    let index_cache = scalar_index_cache(dataset, index, &resolved);
     index_cache
         .get_unsized_with_key(&ScalarIndexCacheKey)
         .await
@@ -1189,6 +1213,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         }
     }
 

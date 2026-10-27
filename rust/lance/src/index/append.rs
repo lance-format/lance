@@ -77,6 +77,7 @@ impl IndexMergeResults<'_> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(self.files),
+            fragment_id_map: Default::default(),
         }
     }
 }
@@ -2142,6 +2143,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
         let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
             Uuid::new_v4(),

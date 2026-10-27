@@ -284,6 +284,7 @@ impl GenerationWrite<'_> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         }
     }
 }

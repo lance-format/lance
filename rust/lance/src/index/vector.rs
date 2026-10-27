@@ -2185,6 +2185,7 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(summary.files),
+        fragment_id_map: Default::default(),
     };
 
     let transaction = Transaction::new(

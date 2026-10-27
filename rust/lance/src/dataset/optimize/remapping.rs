@@ -370,6 +370,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            fragment_id_map: Default::default(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -383,6 +384,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            fragment_id_map: Default::default(),
         },
     };
 
@@ -1073,6 +1075,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             // this dataset's own index directory.)
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            fragment_id_map: Default::default(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -1086,6 +1089,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            fragment_id_map: Default::default(),
         },
     };
 

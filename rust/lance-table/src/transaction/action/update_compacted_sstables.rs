@@ -240,6 +240,7 @@ mod tests {
             created_at: None,
             dataset_version: None,
             data_change: true,
+            local_fragment_addresses: false,
         })]);
 
         assert!(progress.conflicts_with(&rebuild));
@@ -262,6 +263,7 @@ mod tests {
             created_at: None,
             dataset_version: None,
             data_change: false,
+            local_fragment_addresses: false,
         })]);
 
         assert!(!progress.conflicts_with(&segment));

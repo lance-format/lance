@@ -87,6 +87,7 @@ pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
+pub(crate) mod local_fragment_addresses;
 pub mod mem_wal;
 pub mod optimize;
 pub mod prefilter;
@@ -1120,6 +1121,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         }
         .validate_covering_fields()?;
         if segment.fields() != expected_fields.as_slice()
@@ -1180,6 +1182,7 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                fragment_id_map: Default::default(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -1201,6 +1204,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            fragment_id_map: Default::default(),
         })
     }))
     .buffered(dataset.object_store.io_parallelism())
@@ -4265,6 +4269,13 @@ impl Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let uuid = &index_meta.uuid;
+        // TODO: translate provisional fragment ids for vector segments too.
+        if !index_meta.fragment_id_map.is_empty() {
+            return Err(Error::not_supported(format!(
+                "vector segment {uuid} stores provisional fragment ids, which this build cannot \
+                 yet translate"
+            )));
+        }
         let object_store = self.object_store_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;
         // Hold the shared allocation before cache accesses can evict it.
@@ -5303,6 +5314,7 @@ mod tests {
                 size_bytes: payload.len() as u64,
                 file_metadata_size_bytes: None,
             }]),
+            fragment_id_map: Default::default(),
         }
     }
 
@@ -5881,6 +5893,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         // The shape every merge_segments impl builds: keyed field only, carried
@@ -9480,6 +9493,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -9521,6 +9535,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -12482,6 +12497,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            fragment_id_map: Default::default(),
         };
 
         let err = dataset

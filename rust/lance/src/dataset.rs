@@ -88,6 +88,7 @@ pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
 pub mod sql;
+pub mod staged_snapshot;
 pub mod statistics;
 mod take;
 /// Transaction definitions for updating datasets
@@ -162,6 +163,7 @@ pub use overlay::writer::{OverlayWriter, WriteOverlayError};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
+pub use staged_snapshot::{StagedFragment, StagedSnapshot};
 pub use take::TakeBuilder;
 use uuid::Uuid;
 pub use write::merge_insert::{

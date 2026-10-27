@@ -165,6 +165,7 @@ mod tests {
                     created_at: None,
                     dataset_version: None,
                     data_change: false,
+                    local_fragment_addresses: false,
                 }),
             ],
             vec![old],
@@ -217,6 +218,7 @@ mod tests {
             created_at: None,
             dataset_version: None,
             data_change: false,
+            local_fragment_addresses: false,
         })]);
 
         assert!(!ours.conflicts_with(&theirs));

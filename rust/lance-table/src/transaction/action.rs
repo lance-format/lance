@@ -120,7 +120,7 @@ pub use add_base::AddBase;
 pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
 pub use add_fragment::AddFragment;
-pub use add_index_segment::AddIndexSegment;
+pub use add_index_segment::{AddIndexSegment, provisional_fragment_id};
 pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
@@ -490,6 +490,7 @@ mod tests {
                 created_at: None,
                 dataset_version: None,
                 data_change,
+                local_fragment_addresses: false,
             });
             assert_eq!(add.is_data_change(), data_change);
             let remove = Action::RemoveIndexSegment(RemoveIndexSegment {

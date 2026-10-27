@@ -11,8 +11,10 @@ use super::{FieldRef, Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -90,6 +92,32 @@ pub struct AddIndexSegment {
     pub dataset_version: Option<u64>,
     /// See [`AddFragment::data_change`](super::AddFragment::data_change).
     pub data_change: bool,
+    /// The segment's files store row addresses under the provisional ids of
+    /// fragments this operation adds (see [`provisional_fragment_id`]), not
+    /// under committed ids, because it was built before they were numbered.
+    ///
+    /// Requires every [`Self::covered_fragments`] entry to be [`Ref::Local`].
+    /// `apply` records the provisional -> committed translation in
+    /// [`IndexMetadata::fragment_id_map`].
+    pub local_fragment_addresses: bool,
+}
+
+/// The fragment id a segment built in the same operation as its fragments
+/// stores for the fragment minted under local token `token`.
+///
+/// Counts down from just below [`RowAddress::TOMBSTONE_FRAG`] so it cannot meet a
+/// committed id, which counts up from zero; apply rejects a table whose ids
+/// would reach it.
+pub fn provisional_fragment_id(token: u32) -> Result<u32> {
+    (RowAddress::TOMBSTONE_FRAG - 1)
+        .checked_sub(token)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "local fragment token {token} has no provisional fragment id; tokens of fragments \
+             covered by a segment with local fragment addresses must be below {}",
+                RowAddress::TOMBSTONE_FRAG
+            ))
+        })
 }
 
 impl AddIndexSegment {
@@ -112,6 +140,7 @@ impl AddIndexSegment {
             .as_ref()
             .map(|fragments| self.resolve_coverage(fragments, state))
             .transpose()?;
+        let fragment_id_map = self.local_fragment_id_map(state)?;
         let base_id = self.base.map(|base| state.resolve_base(base)).transpose()?;
 
         let covering_fields = self
@@ -133,12 +162,51 @@ impl AddIndexSegment {
             created_at: self.created_at,
             base_id,
             files: (!self.files.is_empty()).then(|| self.files.clone()),
+            fragment_id_map,
         };
         // Belt and braces: `lower_covering` builds the legacy form by
         // construction, so a failure here means the two have drifted apart.
         metadata.validate_covering_fields()?;
 
         state.add_index_segment(metadata)
+    }
+
+    /// The provisional -> committed translation of a segment with local
+    /// fragment addresses, or an empty map for one that stores committed ids.
+    ///
+    /// Empty too on a speculative manifest, whose fragments are numbered by
+    /// their provisional ids already.
+    fn local_fragment_id_map(&self, state: &mut ApplyState) -> Result<BTreeMap<u32, u32>> {
+        if !self.local_fragment_addresses {
+            return Ok(BTreeMap::new());
+        }
+        let Some(covered) = &self.covered_fragments else {
+            return Err(Error::invalid_input(format!(
+                "AddIndexSegment for index '{}' has local fragment addresses but no coverage; \
+                 the addresses translate only for the fragments it covers",
+                self.name
+            )));
+        };
+        let mut map = BTreeMap::new();
+        for fragment in covered {
+            let Ref::Local(token) = *fragment else {
+                return Err(Error::invalid_input(format!(
+                    "AddIndexSegment for index '{}' has local fragment addresses but covers \
+                     committed fragment {fragment:?}; such a segment may cover only fragments \
+                     added by the same operation",
+                    self.name
+                )));
+            };
+            let provisional = provisional_fragment_id(token)?;
+            state.note_provisional_fragment(provisional);
+            if state.numbers_fragments_provisionally() {
+                continue;
+            }
+            let committed = state.resolve_fragment(*fragment)?;
+            // `resolve_coverage` already refused an id beyond a u32.
+            map.insert(provisional, committed as u32);
+        }
+        Ok(map)
     }
 
     /// Render the action's independent key/covering declaration as the
@@ -359,6 +427,7 @@ impl From<&AddIndexSegment> for pb_actions::AddIndexSegment {
                 .created_at
                 .map(|created_at| created_at.timestamp_millis() as u64),
             dataset_version: value.dataset_version,
+            local_fragment_addresses: value.local_fragment_addresses,
         }
     }
 }
@@ -420,6 +489,7 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
             created_at,
             dataset_version: message.dataset_version,
             data_change: data_change_from_wire(message.data_change),
+            local_fragment_addresses: message.local_fragment_addresses,
         })
     }
 }
@@ -457,6 +527,7 @@ mod tests {
             created_at: None,
             dataset_version: None,
             data_change: false,
+            local_fragment_addresses: false,
         }
     }
 

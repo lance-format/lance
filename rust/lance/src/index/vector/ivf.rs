@@ -6612,6 +6612,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -6652,6 +6653,7 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -6712,6 +6714,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         // We need to commit this new index to the dataset so it can be found

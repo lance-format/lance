@@ -11,8 +11,8 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
-    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_LOCAL_FRAGMENT_ADDRESSES,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
     managed_blobs_enabled, validate_non_reusable_field_id_flags,
 };
@@ -2167,6 +2167,13 @@ impl Transaction {
         {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+        if indices
+            .iter()
+            .any(|index| !index.fragment_id_map.is_empty())
+        {
+            manifest.reader_feature_flags |= FLAG_LOCAL_FRAGMENT_ADDRESSES;
+            manifest.writer_feature_flags |= FLAG_LOCAL_FRAGMENT_ADDRESSES;
         }
 
         manifest.set_timestamp(config.timestamp_nanos);
@@ -5852,6 +5859,7 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                fragment_id_map: Default::default(),
             }
         }
 

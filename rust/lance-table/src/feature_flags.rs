@@ -125,8 +125,18 @@ pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 /// Reserved and unsupported until writers implement its maintenance rules.
 /// Ordinary readers can ignore this metadata; all covered features share this one bit.
 pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
+/// Some index segment stores row addresses under provisional fragment ids and
+/// carries `IndexMetadata.fragment_id_map` to translate them: it was built in
+/// the same commit as the fragments it covers.
+///
+/// A reader without this bit would return the provisional addresses, which
+/// name no fragment; a writer without it would carry the segment into a
+/// rebuild or remap without the translation. Both must refuse the table.
+/// Derived from the published index list on every commit, like
+/// [`FLAG_COVERED_INDEX_METADATA`].
+pub const FLAG_LOCAL_FRAGMENT_ADDRESSES: u64 = 1 << 18;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 18;
+pub const FLAG_UNKNOWN: u64 = 1 << 19;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -186,9 +196,9 @@ pub fn apply_feature_flags(
     // `build_manifest` decides it from the index list it is committing and sets
     // the bit after calling this; without the carry the second call, from
     // `write_manifest_file`, would clear that decision immediately before the
-    // write.
-    let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
-        & FLAG_COVERED_INDEX_METADATA;
+    // write. The same holds for local fragment addresses.
+    let index_list_flags = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & (FLAG_COVERED_INDEX_METADATA | FLAG_LOCAL_FRAGMENT_ADDRESSES);
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
     let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
     if non_reusable_field_ids {
@@ -266,8 +276,8 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
     }
 
-    manifest.reader_feature_flags |= covered_index_metadata;
-    manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.reader_feature_flags |= index_list_flags;
+    manifest.writer_feature_flags |= index_list_flags;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 
@@ -566,7 +576,7 @@ mod tests {
         // The zone seed bit below it is supported; bits above remain unknown.
         assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
         assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 18);
+        assert_eq!(FLAG_UNKNOWN, 1 << 19);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
     }

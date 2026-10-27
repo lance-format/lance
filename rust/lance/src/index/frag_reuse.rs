@@ -810,6 +810,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         base_id: None,
         // Fragment reuse index is inline (no files)
         files: None,
+        fragment_id_map: Default::default(),
     };
     // Spares the commit's history check from reading the file back.
     if let Some(Content::External(file)) = &proto.content {
@@ -1312,6 +1313,7 @@ pub async fn frag_reuse_entry_appending(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     })
 }
 
@@ -1938,6 +1940,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
         // The row-map files live in their own directories referenced from the
         // transitions, not under this entry's uuid.
         files: None,
+        fragment_id_map: Default::default(),
     })
 }
 
@@ -2311,6 +2314,7 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
             // The relocated entry lives in the clone.
             base_id: None,
             files: entry.files.clone(),
+            fragment_id_map: Default::default(),
         },
         spilled,
     ))
@@ -2502,6 +2506,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         }
     }
 
@@ -3363,6 +3368,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
         let error = dataset
             .apply_commit(
@@ -3799,6 +3805,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
         let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
             .with_detached(true)

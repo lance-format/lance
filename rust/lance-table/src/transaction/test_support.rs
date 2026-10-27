@@ -58,6 +58,7 @@ pub fn sample_index_metadata(name: &str) -> IndexMetadata {
         created_at: Some(Utc::now()),
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     }
 }
 

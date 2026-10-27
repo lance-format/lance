@@ -435,6 +435,7 @@ mod tests {
             created_at: None,
             dataset_version: None,
             data_change: false,
+            local_fragment_addresses: false,
         })]);
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
 

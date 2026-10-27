@@ -551,6 +551,19 @@ message AddIndexSegment {
    * pruning of stale coverage, which would admit older segments.
    */
   optional uint64 dataset_version = 11;
+  /*
+   * The segment's files store row addresses whose fragment part is a
+   * provisional id for a fragment this same operation adds, rather than a
+   * committed id: the segment was built before its fragments were numbered.
+   *
+   * The provisional id of the fragment minted by `AddFragment` with local
+   * token `t` is `u32::MAX - 1 - t` (`u32::MAX` is the tombstone fragment id).
+   * When set, every entry of `covered_fragments` must be `Local`, and apply
+   * records `IndexMetadata.fragment_id_map` from provisional to committed ids
+   * so readers translate the stored addresses. Apply rejects a table whose
+   * fragment ids reach the provisional band.
+   */
+  bool local_fragment_addresses = 13;
 }
 
 /*

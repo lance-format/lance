@@ -159,6 +159,13 @@ macro_rules! define_action_proto {
                     $(Some(pb_actions::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
+                    // Specified on the wire ahead of their implementation.
+                    Some(
+                        pb_actions::action::Action::AppendFragReuseTransition(_)
+                        | pb_actions::action::Action::TrimFragReuse(_),
+                    ) => Err(Error::not_supported(
+                        "the fragment reuse history actions are not implemented yet",
+                    )),
                     // An action written by a newer Lance decodes to no known
                     // variant, because protobuf drops the field it does not
                     // know. Reject rather than skip: silently dropping an
@@ -295,6 +302,7 @@ mod tests {
                 created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
                 dataset_version: Some(3),
                 data_change: false,
+                local_fragment_addresses: false,
             }),
             Action::RemoveIndexSegment(RemoveIndexSegment {
                 uuid: Uuid::from_u128(8),

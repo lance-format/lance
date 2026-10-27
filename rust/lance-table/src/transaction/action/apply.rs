@@ -23,6 +23,7 @@
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
+use super::add_index_segment::provisional_fragment_id;
 use super::query_contract::QueryContract;
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::inherit_sticky_feature_flags;
@@ -35,7 +36,7 @@ use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
 };
-use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
+use crate::transaction::{LogicalIndexSegments, Operation, ReadVersionState, Transaction};
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
@@ -112,6 +113,7 @@ impl Transaction {
             config,
             self.read_version,
             ReadMarks::of(read_manifest),
+            FragmentNumbering::Committed,
         );
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
@@ -124,6 +126,62 @@ impl Transaction {
             read_version_state,
         )
     }
+}
+
+impl Transaction {
+    /// Build the speculative manifest of an action set that is still being
+    /// composed: the read version with the actions applied, but with every
+    /// fragment the set adds numbered by its provisional id (see
+    /// [`provisional_fragment_id`]) instead of off the fragment counter.
+    ///
+    /// This is what a writer reads to build a later step on top of earlier
+    /// ones -- an index segment over fragments the same operation adds stores
+    /// their provisional ids, which commit translates through
+    /// [`IndexMetadata::fragment_id_map`]. The counters are left as the read
+    /// version has them: nothing has been allocated yet.
+    ///
+    /// The result is never committed. Its version is the read version plus one,
+    /// but it is not that version.
+    pub fn build_staged_manifest(
+        &self,
+        read_manifest: &Manifest,
+        read_indices: Vec<IndexMetadata>,
+        config: &ManifestBuildConfig,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let Operation::CompositeOperation(composite_operation) = &self.operation else {
+            return Err(Error::invalid_input(
+                "only an action-based transaction has a staged manifest",
+            ));
+        };
+        if read_manifest.version != self.read_version {
+            return Err(Error::invalid_input(format!(
+                "a staged manifest is built on the version its transaction reads ({}), not \
+                 version {}",
+                self.read_version, read_manifest.version
+            )));
+        }
+        let mut state = ApplyState::new(
+            read_manifest,
+            read_indices,
+            config,
+            self.read_version,
+            ReadMarks::of(read_manifest),
+            FragmentNumbering::Provisional,
+        );
+        for action in composite_operation.iter_actions() {
+            action.apply(&mut state)?;
+        }
+        state.into_manifest(self, "", None, None)
+    }
+}
+
+/// How an apply numbers the fragments the operation adds under local tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FragmentNumbering {
+    /// Off the fragment counter, as a commit does.
+    Committed,
+    /// By provisional id, for a speculative manifest that is not committed.
+    Provisional,
 }
 
 /// The id high-water marks of the version the operation read. A committed id
@@ -221,6 +279,11 @@ pub(super) struct ApplyState<'a> {
     /// manifest's version: on a retry the set is replayed onto something newer,
     /// and what an action saw is still the version it read.
     read_version: u64,
+
+    fragment_numbering: FragmentNumbering,
+    /// The lowest provisional fragment id a segment with local fragment
+    /// addresses stores. Committed fragment ids must stay below it.
+    lowest_provisional_fragment: Option<u32>,
 }
 
 /// A field a [`TombstoneFieldData`](super::TombstoneFieldData) freed.
@@ -238,8 +301,11 @@ impl<'a> ApplyState<'a> {
         build_config: &'a ManifestBuildConfig,
         read_version: u64,
         read_marks: ReadMarks,
+        fragment_numbering: FragmentNumbering,
     ) -> Self {
         Self {
+            fragment_numbering,
+            lowest_provisional_fragment: None,
             current_manifest: manifest,
             read_version,
             read_marks,
@@ -282,6 +348,7 @@ impl<'a> ApplyState<'a> {
         self.check_spilled_lineage_is_bound()?;
         self.check_reencodes_are_rebound()?;
         self.check_data_changes_are_refreshed()?;
+        self.check_ids_stay_below_provisional_band()?;
 
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
@@ -300,6 +367,7 @@ impl<'a> ApplyState<'a> {
             field_high_water,
             config: dataset_config,
             table_metadata,
+            fragment_numbering,
             ..
         } = self;
 
@@ -352,6 +420,14 @@ impl<'a> ApplyState<'a> {
                     .max_fragment_id
                     .map_or(high_water, |current| current.max(high_water)),
             );
+        }
+        // The assembly took the mark from the provisional ids it now holds;
+        // they are not allocations, and the counter must not jump to them.
+        if fragment_numbering == FragmentNumbering::Provisional {
+            manifest.max_fragment_id = fragment_high_water
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| exhausted_err("fragment id", MAX_FRAGMENT_ID))?;
         }
         // Only a table under the non-reusable field id contract records a
         // field mark; elsewhere field ids are derived from the schema and
@@ -614,6 +690,12 @@ impl<'a> ApplyState<'a> {
         if self.fragment_tokens.contains_key(&token) {
             return Err(duplicate_token_err("fragment", token));
         }
+        if self.fragment_numbering == FragmentNumbering::Provisional {
+            let id = u64::from(provisional_fragment_id(token)?);
+            self.fragment_tokens.insert(token, id);
+            self.new_fragments.insert(id);
+            return Ok(id);
+        }
         let id = match self.fragment_high_water {
             None => 0,
             Some(mark) => mark
@@ -625,6 +707,40 @@ impl<'a> ApplyState<'a> {
         self.fragment_tokens.insert(token, id);
         self.new_fragments.insert(id);
         Ok(id)
+    }
+
+    /// Whether fragments minted under local tokens get provisional ids, so a
+    /// segment's provisional addresses already name them and need no map.
+    pub(super) fn numbers_fragments_provisionally(&self) -> bool {
+        self.fragment_numbering == FragmentNumbering::Provisional
+    }
+
+    /// Record that a segment stores `provisional` as a fragment id, which the
+    /// committed fragment ids must never reach.
+    pub(super) fn note_provisional_fragment(&mut self, provisional: u32) {
+        self.lowest_provisional_fragment = Some(
+            self.lowest_provisional_fragment
+                .map_or(provisional, |lowest| lowest.min(provisional)),
+        );
+    }
+
+    fn check_ids_stay_below_provisional_band(&self) -> Result<()> {
+        if self.fragment_numbering == FragmentNumbering::Provisional {
+            return Ok(());
+        }
+        let Some(lowest) = self.lowest_provisional_fragment else {
+            return Ok(());
+        };
+        if let Some(high_water) = self.fragment_high_water
+            && high_water >= u64::from(lowest)
+        {
+            return Err(Error::invalid_input(format!(
+                "the fragment id counter reaches {high_water}, into the provisional fragment ids \
+                 an index segment in this operation stores (from {lowest}); its addresses would \
+                 be ambiguous"
+            )));
+        }
+        Ok(())
     }
 
     /// Claim an id an earlier commit set aside with
@@ -2273,6 +2389,7 @@ mod tests {
         created_at: None,
         dataset_version: None,
         data_change: false,
+        local_fragment_addresses: false,
     }))]
     #[case::remove_segment(|uuid| Action::RemoveIndexSegment(RemoveIndexSegment {
         uuid,

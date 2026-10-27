@@ -740,6 +740,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files,
+            fragment_id_map: Default::default(),
         })
     }
 }

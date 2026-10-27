@@ -685,6 +685,7 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(index_files_to_table(created_index.files)),
+            fragment_id_map: Default::default(),
         };
         // A generic scalar request only resolves to an implementation here.
         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
@@ -854,6 +855,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                fragment_id_map: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &metadata)?;
             let segments = vec![metadata.into_index_segment()?];
@@ -925,6 +927,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                fragment_id_map: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
             segment_metadatas.push(segment);

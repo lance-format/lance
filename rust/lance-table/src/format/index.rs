@@ -3,7 +3,7 @@
 
 //! Metadata for index
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -105,6 +105,11 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// Provisional -> committed fragment ids for the row addresses stored in
+    /// the segment's files. Empty for a segment that stores committed ids,
+    /// which is every segment not built in the same commit as its fragments.
+    pub fragment_id_map: BTreeMap<u32, u32>,
 }
 
 impl IndexMetadata {
@@ -358,6 +363,7 @@ impl DeepSizeOf for IndexMetadata {
                 .map(|fragment_bitmap| fragment_bitmap.serialized_size())
                 .unwrap_or(0)
             + self.files.deep_size_of_children(context)
+            + self.fragment_id_map.len() * 2 * std::mem::size_of::<u32>()
             + self
                 .index_details
                 .as_ref()
@@ -419,6 +425,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
+            fragment_id_map: proto.fragment_id_map.into_iter().collect(),
         };
 
         // This is the single boundary between manifest bytes and
@@ -486,6 +493,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            fragment_id_map: idx.fragment_id_map.clone().into_iter().collect(),
         }
     }
 }
@@ -587,6 +595,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&metadata);
@@ -628,6 +637,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
         let with = |details: Arc<prost_types::Any>| IndexMetadata {
             index_details: Some(details),
@@ -675,6 +685,7 @@ mod tests {
                     size_bytes: 1024,
                     file_metadata_size_bytes: NonZero::new(256),
                 }]),
+                fragment_id_map: Default::default(),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -688,6 +699,7 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                fragment_id_map: Default::default(),
             },
         ];
 
@@ -741,6 +753,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&original);
@@ -812,6 +825,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         }
     }
 

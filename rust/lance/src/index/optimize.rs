@@ -752,6 +752,7 @@ async fn plan_split_rebuild(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        fragment_id_map: Default::default(),
     };
     Ok(Some(SplitInputs {
         reference,
@@ -1142,6 +1143,7 @@ async fn merge_vector_segments(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        fragment_id_map: Default::default(),
     })
 }
 
