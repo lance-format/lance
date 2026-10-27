@@ -56,8 +56,8 @@ tests = [
     "pandas",
     "polars[pyarrow,pandas]",
     "psutil",
-    "pytest",
-    "pytest-xdist",
+    "pytest==8.4.2",
+    "pytest-xdist==3.8.0",
     "tqdm",
     "datafusion>=54,<55",
 ]

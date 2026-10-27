@@ -2756,7 +2756,6 @@ def test_index_after_merge_insert(tmp_path):
     assert dataset.to_table(filter="payload >= 30").num_rows == 20
 
 
-@pytest.mark.xdist_group("lindera")
 def test_lindera_load_config_fallback(tmp_path, lindera_ipadic, monkeypatch):
     data = pa.table(
         {
@@ -2798,7 +2797,6 @@ def test_lindera_load_config_fallback(tmp_path, lindera_ipadic, monkeypatch):
     assert results["_rowid"].to_pylist() == [0]
 
 
-@pytest.mark.xdist_group("lindera")
 def test_lindera_load_config_priority(tmp_path, lindera_ipadic, monkeypatch):
     data = pa.table(
         {
@@ -2832,7 +2830,6 @@ def test_lindera_load_config_priority(tmp_path, lindera_ipadic, monkeypatch):
     assert results["_rowid"].to_pylist() == [0]
 
 
-@pytest.mark.xdist_group("lindera")
 def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
     tmp_path, lindera_ipadic
 ):
@@ -2856,7 +2853,6 @@ def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
     assert results["_rowid"].to_pylist() == [0]
 
 
-@pytest.mark.xdist_group("lindera")
 def test_lindera_ipadic_jp_tokenizer_invalid_user_dict_path(tmp_path, lindera_ipadic):
     data = pa.table(
         {
@@ -2872,7 +2868,6 @@ def test_lindera_ipadic_jp_tokenizer_invalid_user_dict_path(tmp_path, lindera_ip
         )
 
 
-@pytest.mark.xdist_group("lindera")
 def test_lindera_ipadic_jp_tokenizer_csv_user_dict_without_type(
     tmp_path, lindera_ipadic
 ):
@@ -2890,7 +2885,6 @@ def test_lindera_ipadic_jp_tokenizer_csv_user_dict_without_type(
         )
 
 
-@pytest.mark.xdist_group("lindera")
 def test_lindera_ipadic_jp_tokenizer_csv_user_dict(tmp_path, lindera_ipadic):
     data = pa.table(
         {
@@ -2917,7 +2911,6 @@ def test_lindera_ipadic_jp_tokenizer_csv_user_dict(tmp_path, lindera_ipadic):
     assert results["_rowid"].to_pylist() == [0]
 
 
-@pytest.mark.xdist_group("lindera")
 def test_lindera_ipadic_jp_tokenizer_bin_user_dict(tmp_path, lindera_ipadic):
     data = pa.table(
         {
