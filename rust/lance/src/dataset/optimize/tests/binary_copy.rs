@@ -385,6 +385,17 @@ async fn do_test_binary_copy_skipped_after_metadata_only_add_column(version: Lan
     // re-encode fallback untouched, not just the one the scan used to trip on.
     assert_eq!(after["b"].as_ref(), &Int32Array::from(vec![10, 20, 30, 40]));
     assert_eq!(after["c"].null_count(), 4);
+
+    // The fallback must persist the full dataset schema mapping instead of
+    // reusing the input files' two-column mapping.
+    let data_file = &dataset.manifest.fragments[0].files[0];
+    let (expected_fields, expected_column_indices) =
+        lance_file::versions::data_file_columns(version.resolve(), dataset.schema());
+    assert_eq!(data_file.fields.as_ref(), expected_fields.as_slice());
+    assert_eq!(
+        data_file.column_indices.as_ref(),
+        expected_column_indices.as_slice()
+    );
 }
 
 #[tokio::test]
