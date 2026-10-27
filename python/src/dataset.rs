@@ -834,15 +834,14 @@ pub struct Dataset {
 }
 
 impl Dataset {
-    async fn cleanup_policy(
+    async fn cleanup_operation(
         &self,
         older_than_micros: Option<i64>,
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
-        delete_rate_limit: Option<u64>,
         versions: Option<Vec<u64>>,
-    ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
+    ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
             let older_than = Duration::microseconds(v);
@@ -857,13 +856,10 @@ impl Dataset {
         if let Some(v) = error_if_tagged_old_versions {
             builder = builder.error_if_tagged_old_versions(v);
         }
-        if let Some(v) = delete_rate_limit {
-            builder = builder.delete_rate_limit(v)?;
-        }
         if let Some(v) = versions {
             builder = builder.versions(v)?;
         }
-        Ok(builder.build())
+        Ok(self.ds.cleanup(builder.build()))
     }
 }
 
@@ -1699,12 +1695,13 @@ impl Dataset {
         batch.to_pyarrow(self_.py())
     }
 
-    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
+    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None, ignore_deletions = false))]
     fn take_rows<'py>(
         self_: PyRef<'py, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
+        ignore_deletions: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let projection = match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
@@ -1720,11 +1717,13 @@ impl Dataset {
         }
         .infer_error()?;
 
+        let builder = self_
+            .ds
+            .take_builder(&row_indices, projection)
+            .infer_error()?
+            .with_ignore_deletions(ignore_deletions);
         let batch = rt()
-            .block_on(
-                Some(self_.py()),
-                self_.ds.take_rows(&row_indices, projection),
-            )?
+            .block_on(Some(self_.py()), builder.execute())?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
@@ -2167,7 +2166,7 @@ impl Dataset {
 
     /// Fetches the currently checked out version of the dataset.
     fn version(&self) -> PyResult<u64> {
-        Ok(self.ds.version().version)
+        Ok(self.ds.version_id())
     }
 
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
@@ -2298,7 +2297,8 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, delete_concurrency = None))]
+    #[allow(clippy::too_many_arguments)]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2307,20 +2307,26 @@ impl Dataset {
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
         versions: Option<Vec<u64>>,
+        delete_concurrency: Option<usize>,
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
-                let policy = self
-                    .cleanup_policy(
+                let mut operation = self
+                    .cleanup_operation(
                         older_than_micros,
                         retain_versions,
                         delete_unverified,
                         error_if_tagged_old_versions,
-                        delete_rate_limit,
                         versions,
                     )
                     .await?;
-                self.ds.cleanup_with_policy(policy).await
+                if let Some(value) = delete_concurrency {
+                    operation = operation.with_delete_concurrency(value)?;
+                }
+                if let Some(value) = delete_rate_limit {
+                    operation = operation.with_delete_rate_limit(value)?;
+                }
+                operation.execute().await
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(cleanup_stats(stats))
@@ -2340,20 +2346,19 @@ impl Dataset {
         include_files: bool,
         max_files: usize,
     ) -> PyResult<CleanupExplanation> {
+        let _ = delete_rate_limit; // Retained in the signature for existing callers.
         let explanation = rt()
             .block_on(None, async {
-                let policy = self
-                    .cleanup_policy(
+                let operation = self
+                    .cleanup_operation(
                         older_than_micros,
                         retain_versions,
                         delete_unverified,
                         error_if_tagged_old_versions,
-                        delete_rate_limit,
                         versions,
                     )
                     .await?;
-                self.ds
-                    .cleanup(policy)
+                operation
                     .with_max_candidate_files(max_files)
                     .explain()
                     .await
@@ -2643,6 +2648,7 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "ZONEMAP" => IndexType::ZoneMap,
             "BLOOMFILTER" => IndexType::BloomFilter,
+            "MINHASHLSH" => IndexType::MinHashLsh,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
@@ -2680,6 +2686,10 @@ impl Dataset {
             }),
             "BLOOMFILTER" => Box::new(ScalarIndexParams {
                 index_type: "bloomfilter".to_string(),
+                params: None,
+            }),
+            "MINHASHLSH" => Box::new(ScalarIndexParams {
+                index_type: "minhashlsh".to_string(),
                 params: None,
             }),
             "RTREE" => Box::new(ScalarIndexParams {
@@ -3001,6 +3011,10 @@ impl Dataset {
         self.ds.count_fragments()
     }
 
+    fn fragment_ids(&self) -> crate::bitmap::PyBitmap {
+        crate::bitmap::PyBitmap(self.ds.fragment_bitmap().clone())
+    }
+
     fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
         rt().block_on(None, self.ds.num_small_files(max_rows_per_group))
             .map_err(|err| PyIOError::new_err(err.to_string()))
@@ -3238,7 +3252,7 @@ impl Dataset {
                 let dataset = match dataset {
                     Some(dataset)
                         if rust_transaction.read_version != 0
-                            && dataset.version().version != rust_transaction.read_version =>
+                            && dataset.version_id() != rust_transaction.read_version =>
                     {
                         Some(Arc::new(
                             dataset
@@ -4774,7 +4788,7 @@ impl Dataset {
         } else {
             Ok(Ref::Version(
                 self.ds.manifest.branch.clone(),
-                Some(self.ds.version().version),
+                Some(self.ds.version_id()),
             ))
         }
     }

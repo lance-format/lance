@@ -377,7 +377,9 @@ mod tests {
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{ROW_ADDR, ROW_ID};
     use lance_datagen::{array, gen_batch};
     use lance_file::reader::FileReaderOptions;
     use lance_file::version::LanceFileVersion;
@@ -787,6 +789,57 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 1);
         pretty_assertions::assert_eq!(results.num_rows(), 1);
         pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 50);
+    }
+
+    #[rstest]
+    #[case::row_id(false, ROW_ID)]
+    #[case::row_addr(false, ROW_ADDR)]
+    #[case::stable_row_id(true, ROW_ID)]
+    #[case::stable_row_addr(true, ROW_ADDR)]
+    #[tokio::test]
+    async fn test_sql_count_row_selection(#[case] stable_row_ids: bool, #[case] column: &str) {
+        // Both predicates take the row-selection path while COUNT(*) requests
+        // no data fields.
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset_with_params(
+                "memory://",
+                FragmentCount::from(4),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // A stable row id is the row's position here, which differs from its
+        // address outside fragment 0
+        let keys = [(0, 0), (0, 1), (3, 5)].map(|(fragment_id, row_offset)| {
+            let key = if stable_row_ids && column == ROW_ID {
+                u64::from(fragment_id * 10 + row_offset)
+            } else {
+                u64::from(RowAddress::new_from_parts(fragment_id, row_offset))
+            };
+            key.to_string()
+        });
+        let results = ds
+            .sql(&format!(
+                "SELECT COUNT(*) FROM foo WHERE {column} IN ({})",
+                keys.join(", ")
+            ))
+            .table_name("foo")
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(results.len(), 1);
+        pretty_assertions::assert_eq!(results[0].column(0).as_primitive::<Int64Type>().value(0), 3);
     }
 
     #[tokio::test]

@@ -43,6 +43,7 @@ use crate::datafusion::LanceTableProvider;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance_datafusion::udf::register_functions;
+use lance_io::utils::tracking_store::IoStats;
 use object_store::ObjectStoreExt;
 
 #[tokio::test]
@@ -658,15 +659,31 @@ async fn test_inline_transaction() {
     let ds_new = ds.checkout_version(location.version).await.unwrap();
     assert!(ds_new.manifest.transaction_section.is_none());
     assert!(ds_new.manifest.transaction_file.is_some());
-    let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
-    assert_eq!(read_tx, tx);
 
-    // The direct read takes the same external-file fallback.
+    // The handle's own version takes the same external-file fallback without
+    // touching the manifest again.
+    ds_new.object_store.io_stats_incremental();
     let version_transaction = ds_new
         .read_version_transaction(location.version)
         .await
         .unwrap();
-    assert_eq!(version_transaction.transaction, Some(tx));
+    let stats = ds_new.object_store.io_stats_incremental();
+    assert_eq!(version_transaction.transaction, Some(tx.clone()));
+    assert!(
+        stats.read_iops >= 1,
+        "expected the external file to be read"
+    );
+    assert!(
+        stats
+            .requests
+            .iter()
+            .all(|request| request.path != ds_new.manifest_location().path),
+        "manifest must not be re-read: {:#?}",
+        stats.requests
+    );
+
+    let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
+    assert_eq!(read_tx, tx);
 }
 
 #[tokio::test]
@@ -761,6 +778,267 @@ async fn test_read_version_transaction_does_not_populate_caches() {
         matches!(err, crate::Error::DatasetNotFound { .. }),
         "expected DatasetNotFound for a missing version, got {err:?}"
     );
+}
+
+/// Size of the config value used to inflate a manifest well past the 64 KiB
+/// tail prefetch, so a full manifest read is distinguishable from a ranged
+/// transaction read by byte count alone.
+const MANIFEST_PADDING_BYTES: usize = 256 * 1024;
+
+/// Bytes transferred by ranged reads. The tracking store records a HEAD as a
+/// read of the object's full size even though no body is transferred, so plain
+/// `read_bytes` cannot tell a manifest download from a `resolve_version_location`.
+fn ranged_read_bytes(stats: &IoStats) -> u64 {
+    stats
+        .requests
+        .iter()
+        .filter_map(|request| request.range.as_ref())
+        .map(|range| range.end - range.start)
+        .sum()
+}
+
+/// Manifest body bytes of the dataset handle's current version.
+async fn manifest_size(ds: &Dataset) -> u64 {
+    ds.object_store
+        .inner
+        .head(&ds.manifest_location().path)
+        .await
+        .unwrap()
+        .size
+}
+
+#[tokio::test]
+async fn test_read_version_transaction_same_version_skips_manifest_read() {
+    let test_uri = TempStrDir::default();
+    // v1: one fragment. v2: inflate the manifest via config so every later
+    // manifest is >= 256 KiB while the Append transactions stay tiny. v3..v5:
+    // three more fragments.
+    let mut writer = write_versions(&test_uri, 1, true).await;
+    let padding = "x".repeat(MANIFEST_PADDING_BYTES);
+    writer
+        .update_config([("padding", padding.as_str())])
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        writer
+            .append(
+                gen_rows(),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let latest = writer.version().version;
+    assert_eq!(latest, 5);
+    assert_eq!(writer.get_fragments().len(), 4);
+
+    let session = Arc::new(Session::default());
+    let ds = DatasetBuilder::from_uri(&test_uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+    let latest_manifest_size = manifest_size(&ds).await;
+    assert!(latest_manifest_size > MANIFEST_PADDING_BYTES as u64);
+
+    // Cost of `read_transaction()` on an equivalent fresh handle is the yardstick.
+    let yardstick = DatasetBuilder::from_uri(&test_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    yardstick.object_store.io_stats_incremental();
+    let expected_transaction = yardstick.read_transaction().await.unwrap();
+    let yardstick_stats = yardstick.object_store.io_stats_incremental();
+
+    // Same version as the handle: no resolve, no manifest body, just the
+    // transaction message (one block).
+    ds.object_store.io_stats_incremental();
+    let same_version = ds.read_version_transaction(latest).await.unwrap();
+    let stats = ds.object_store.io_stats_incremental();
+    assert_eq!(stats.read_iops, yardstick_stats.read_iops);
+    assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
+    assert!(
+        stats.read_bytes <= 4 * 1024,
+        "expected at most one 4 KiB block, read {} bytes",
+        stats.read_bytes
+    );
+    assert!(stats.read_bytes < latest_manifest_size);
+    assert_eq!(same_version.version, latest);
+    assert_eq!(same_version.timestamp, ds.version().timestamp);
+    assert_eq!(same_version.transaction, expected_transaction);
+    assert!(same_version.transaction.is_some());
+    // The session transaction cache is keyed only by version, so it is not
+    // populated: `read_transaction()` still pays its own storage read.
+    assert_eq!(ds.read_transaction().await.unwrap(), expected_transaction);
+    let stats = ds.object_store.io_stats_incremental();
+    assert_eq!(stats.read_iops, yardstick_stats.read_iops);
+    assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
+
+    // The fallback path (a handle at another version, fresh session so nothing
+    // is cached) reads the whole manifest and must agree with the fast path.
+    let historical = DatasetBuilder::from_uri(&test_uri)
+        .with_version(1)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    historical.object_store.io_stats_incremental();
+    let via_fallback = historical.read_version_transaction(latest).await.unwrap();
+    let stats = historical.object_store.io_stats_incremental();
+    assert!(
+        ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
+        "fallback should read the manifest body: {:#?}",
+        stats.requests
+    );
+    assert_eq!(via_fallback.version, same_version.version);
+    assert_eq!(via_fallback.timestamp, same_version.timestamp);
+    assert_eq!(via_fallback.transaction, same_version.transaction);
+
+    // Missing versions still surface as DatasetNotFound.
+    let err = ds.read_version_transaction(9999).await.unwrap_err();
+    assert!(
+        matches!(err, crate::Error::DatasetNotFound { .. }),
+        "expected DatasetNotFound for a missing version, got {err:?}"
+    );
+
+    // After checkout_version(v_old) the historical handle serves v_old cheaply
+    // and still resolves latest through the fallback.
+    let old_version = 3;
+    let old = ds.checkout_version(old_version).await.unwrap();
+    old.object_store.io_stats_incremental();
+    let old_transaction = old.read_version_transaction(old_version).await.unwrap();
+    let stats = old.object_store.io_stats_incremental();
+    assert!(
+        stats.read_bytes <= 4 * 1024,
+        "expected at most one 4 KiB block, read {} bytes",
+        stats.read_bytes
+    );
+    assert_eq!(old_transaction.version, old_version);
+    assert_eq!(old_transaction.timestamp, old.version().timestamp);
+    assert_eq!(
+        old_transaction.transaction,
+        old.read_transaction().await.unwrap()
+    );
+    assert!(old_transaction.transaction.is_some());
+    assert_ne!(old_transaction.transaction, same_version.transaction);
+    let latest_from_old = old.read_version_transaction(latest).await.unwrap();
+    assert_eq!(latest_from_old.version, latest);
+    assert_eq!(latest_from_old.timestamp, same_version.timestamp);
+    assert_eq!(latest_from_old.transaction, same_version.transaction);
+
+    // A different handle on the same session finds v_old's manifest in the
+    // session cache (populated by checkout_version) and skips the manifest body.
+    let other = DatasetBuilder::from_uri(&test_uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(other.version().version, latest);
+    let metadata_stats_before = session.metadata_cache_stats().await;
+    other.object_store.io_stats_incremental();
+    let via_cached_manifest = other.read_version_transaction(old_version).await.unwrap();
+    let stats = other.object_store.io_stats_incremental();
+    // Resolving the location still costs a HEAD, but the manifest body is not
+    // fetched.
+    assert!(
+        ranged_read_bytes(&stats) <= 4 * 1024,
+        "cached manifest should not be re-read: {:#?}",
+        stats.requests
+    );
+    assert_eq!(via_cached_manifest.version, old_version);
+    assert_eq!(via_cached_manifest.timestamp, old_transaction.timestamp);
+    assert_eq!(via_cached_manifest.transaction, old_transaction.transaction);
+    // Reading another version through the cache does not add cache entries.
+    let metadata_stats_after = session.metadata_cache_stats().await;
+    assert_eq!(
+        metadata_stats_after.num_entries,
+        metadata_stats_before.num_entries
+    );
+
+    // Without the cached manifest the same read pays for the manifest body.
+    let uncached = DatasetBuilder::from_uri(&test_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    uncached.object_store.io_stats_incremental();
+    let via_uncached_manifest = uncached
+        .read_version_transaction(old_version)
+        .await
+        .unwrap();
+    let stats = uncached.object_store.io_stats_incremental();
+    assert!(
+        ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
+        "uncached manifest should be read in full: {:#?}",
+        stats.requests
+    );
+    assert_eq!(
+        via_uncached_manifest.transaction,
+        via_cached_manifest.transaction
+    );
+    assert_eq!(
+        via_uncached_manifest.timestamp,
+        via_cached_manifest.timestamp
+    );
+}
+
+/// A table dropped and recreated at the same URI can reuse a version number
+/// that a long-lived session already holds a cached transaction for. Reading
+/// the recreated table's own version must return its transaction, not the
+/// stale cached one.
+#[tokio::test]
+async fn test_read_version_transaction_after_recreate_at_same_uri() {
+    let uri = TempStrDir::default();
+    let first = write_versions(&uri, 1, true).await;
+    let session = Arc::new(Session::default());
+    let old_reader = DatasetBuilder::from_uri(&uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+    let old_tx = old_reader.read_transaction().await.unwrap().unwrap();
+    assert_eq!(old_tx, first.read_transaction().await.unwrap().unwrap());
+    std::fs::remove_dir_all(uri.as_str()).unwrap();
+
+    // Keep the new transaction outside the manifest tail read so loading the
+    // recreated table cannot overwrite the session's cached transaction.
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        vec![ArrowField::new("key", DataType::Int32, false)],
+        HashMap::from([("padding".to_owned(), "x".repeat(MANIFEST_PADDING_BYTES))]),
+    ));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![42]))]).unwrap();
+    let recreated = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = recreated.read_transaction().await.unwrap().unwrap();
+    assert_ne!(expected.uuid, old_tx.uuid);
+
+    let reopened = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.version().version, 1);
+    assert_ne!(
+        reopened.manifest_location.e_tag,
+        old_reader.manifest_location.e_tag
+    );
+
+    let actual = reopened.read_version_transaction(1).await.unwrap();
+    assert_eq!(actual.timestamp, reopened.version().timestamp);
+    assert_eq!(actual.transaction.unwrap().uuid, expected.uuid);
 }
 
 #[tokio::test]

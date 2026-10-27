@@ -70,6 +70,10 @@ pub fn mem_wal_hnsw_default() -> HnswBuildParams {
         .ef_construction(100)
 }
 
+/// Search breadth a memtable graph uses when the query sets no `ef` (raised to
+/// `k` when `k` is larger).
+pub const DEFAULT_SEARCH_EF: usize = 64;
+
 /// In-memory HNSW index queryable while building.
 pub struct HnswMemIndex {
     field_id: i32,
@@ -157,8 +161,9 @@ impl HnswMemIndex {
         self.len() == 0
     }
 
-    /// Upper bound on heap bytes held, sized by `capacity`: the first insert
-    /// allocates the whole graph, so it is reported before that insert too.
+    /// Upper bound on heap bytes held. The first insert allocates the graph's
+    /// fixed part, sized by `capacity`, so that part is reported before the
+    /// insert too; each node's neighbor lists are charged as it is inserted.
     pub(crate) fn resident_bytes(&self) -> usize {
         match self.state.get() {
             Some(s) => s.graph.resident_bytes() + s.storage.resident_bytes(),
@@ -390,7 +395,7 @@ impl HnswMemIndex {
             )));
         };
 
-        let ef_actual = ef.unwrap_or(k.max(64)).max(k);
+        let ef_actual = ef.unwrap_or(k.max(DEFAULT_SEARCH_EF)).max(k);
         let snapshot = state.storage.snapshot();
         let mut out: Vec<_> = state
             .graph
@@ -569,6 +574,16 @@ async fn write_sq_storage(
     };
     let row_ids = column(ROW_ID)?;
     let vectors = column(FLAT_COLUMN)?;
+    // Cosine search ranks L2 against a normalized query, so stored vectors must
+    // be normalized. The graph is unaffected: raw cosine and normalized L2 order
+    // neighbors identically.
+    let vectors: Arc<dyn Array> = if distance_type == DistanceType::Cosine {
+        Arc::new(lance_linalg::kernels::normalize_fsl(
+            vectors.as_fixed_size_list(),
+        )?)
+    } else {
+        vectors
+    };
     let vectors = vectors.as_fixed_size_list();
     let mut sq = ScalarQuantizer::new(8, dim);
     let bounds: Range<f64> = sq.update_bounds::<Float32Type>(vectors)?;
@@ -845,6 +860,20 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
 
+    /// Runs `insert` on a single Rayon thread.
+    ///
+    /// Inserts build the graph in parallel, and which links survive depends on
+    /// how the threads interleave: now and then a node keeps no incoming edge,
+    /// and no search can reach it. A test that needs one particular row found
+    /// must build the same graph every run.
+    fn on_one_thread<R: Send>(insert: impl FnOnce() -> R + Send) -> R {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(insert)
+    }
+
     fn make_batch(start_id: i32, n: usize, dim: usize) -> RecordBatch {
         let ids: Vec<i32> = (start_id..start_id + n as i32).collect();
         let mut flat: Vec<f32> = Vec::with_capacity(n * dim);
@@ -874,12 +903,12 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids)), Arc::new(fsl)]).unwrap()
     }
 
-    /// The graph is pre-allocated from `capacity`, so its footprint is settled
-    /// before any row arrives and barely moves as rows do. A memory budget that
-    /// samples only row bytes would miss all of it, and one that waited for the
-    /// first insert would miss the allocation that insert triggers.
+    /// The graph's fixed part is sized from `capacity` and committed by the
+    /// first row, so it is charged before that row arrives. Neighbor lists are
+    /// allocated per inserted node, so a slot never filled costs only its share
+    /// of the fixed part, and the charge grows with the rows.
     #[test]
-    fn test_resident_bytes_is_preallocated_not_proportional_to_rows() {
+    fn test_resident_bytes_charges_capacity_up_front_and_neighbors_per_row() {
         let dim = 8;
         let capacity = 4_000;
         let index = || {
@@ -892,35 +921,34 @@ mod tests {
                 64,
             )
         };
+        let filled = |rows: usize| {
+            let index = index();
+            index.insert(&make_batch(0, rows, dim), 0).unwrap();
+            index.resident_bytes()
+        };
 
         let untouched = index().resident_bytes();
+        let one_row = filled(1);
+        let half = filled(capacity / 2);
+        let all_rows = filled(capacity);
 
-        let sparse = index();
-        sparse.insert(&make_batch(0, 1, dim), 0).unwrap();
-        let one_row = sparse.resident_bytes();
-
-        let full = index();
-        full.insert(&make_batch(0, capacity, dim), 0).unwrap();
-        let all_rows = full.resident_bytes();
-
-        // One row already pays for the whole graph: well over a KB per slot of
-        // capacity, and within a small factor of the fully-populated index.
-        assert!(
-            one_row > capacity * 128,
-            "one row should commit the pre-allocated graph, got {one_row} for capacity {capacity}"
-        );
-        assert!(
-            all_rows < one_row * 2,
-            "a full index ({all_rows}) should not dwarf a one-row index ({one_row})"
-        );
-
-        // The charge is visible before the row that commits it, and close
+        // The fixed part is visible before the row that commits it, and close
         // enough to the real thing to admit against. The reservation walks the
         // level ladder in expectation where the graph samples it, so allow a
         // 25% band either way rather than demanding equality.
         assert!(
             untouched.abs_diff(one_row) * 4 < one_row,
-            "reserved {untouched} should track the built graph {one_row} before the first insert"
+            "reserved {untouched} should track the one-row graph {one_row}"
+        );
+        // Slots that were never filled do not carry neighbor lists, so the
+        // charge follows the rows.
+        assert!(
+            one_row < half && half < all_rows,
+            "the charge should grow with rows: {one_row} < {half} < {all_rows}"
+        );
+        assert!(
+            all_rows > one_row * 3,
+            "a full index ({all_rows}) should owe several times a one-row index ({one_row})"
         );
     }
 
@@ -938,7 +966,7 @@ mod tests {
         );
 
         let batch = make_batch(0, n, dim);
-        index.insert(&batch, 0).unwrap();
+        on_one_thread(|| index.insert(&batch, 0)).unwrap();
         assert_eq!(index.len(), n);
 
         let fsl = batch.column_by_name("vector").unwrap().as_fixed_size_list();
@@ -1001,7 +1029,7 @@ mod tests {
             StoredBatch::new(first, 0, 0),
             StoredBatch::new(second.clone(), 75, 1),
         ];
-        index.insert_batches(&stored).unwrap();
+        on_one_thread(|| index.insert_batches(&stored)).unwrap();
         assert_eq!(index.len(), n);
 
         let fsl = second

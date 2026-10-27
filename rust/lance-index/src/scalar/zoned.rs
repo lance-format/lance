@@ -8,12 +8,12 @@
 //! boundaries and computing zone bounds that remain valid after row deletions.
 
 use arrow_array::{ArrayRef, UInt64Array};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::{ROW_ADDR, Result};
-use lance_datafusion::chunker::chunk_concat_stream;
+use lance_datafusion_exec::chunker::chunk_concat_stream;
 use lance_select::RowAddrTreeMap;
 
 //
@@ -300,7 +300,7 @@ mod tests {
     use crate::{metrics::LocalMetricsCollector, scalar::SearchResult};
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::ROW_ADDR;
     use std::sync::Arc;

@@ -129,6 +129,7 @@ impl WalFlushFailure {
 /// blocked on it would hang until some unrelated write happened to move a cursor
 /// again. With nothing cached there is nothing to leave stale — `notify` is a
 /// bare wake-up and every waiter recomputes from the cursors themselves.
+#[derive(Debug)]
 pub struct WriterCursors {
     durable: AtomicUsize,
     /// Bumped whenever a cursor advances or the writer poisons. Carries no
@@ -207,6 +208,21 @@ impl WriterCursors {
             return Err(failure.into_error());
         }
         Ok(())
+    }
+
+    /// Interrupt admission waits, including those inside custom backpressure
+    /// controllers, when the writer can no longer make progress.
+    pub(crate) async fn wait_for_failure(&self) -> Error {
+        let mut receiver = self.notify_rx.clone();
+        loop {
+            receiver.borrow_and_update();
+            if let Err(error) = self.check_poisoned() {
+                return error;
+            }
+            if receiver.changed().await.is_err() {
+                return Error::io("Writer cursor channel closed");
+            }
+        }
     }
 
     pub(crate) fn mark_terminal_failure(&self, error: &Error) {
@@ -869,6 +885,16 @@ impl WalFlusher {
         if start_batch_position >= end_batch_position {
             return Ok(empty_flush_result());
         }
+
+        // Blob descriptors are inserted before their shared packed sidecar is
+        // finalized so several puts can use one object. Finish that object before
+        // any of those descriptors enter the WAL: after the append succeeds,
+        // replay is allowed to expose every descriptor in this range.
+        batch_store.finish_blob_pack().await.map_err(|error| {
+            Error::writer_poisoned(format!(
+                "failed to finalize Blob v2 pack before WAL append: {error}"
+            ))
+        })?;
 
         // Every position in the range must exist. `get` returns `None` only for a
         // position past `committed_len`, so a hole means we were asked to append a
@@ -1964,8 +1990,8 @@ mod tests {
     #[tokio::test]
     async fn test_track_batch_watcher_blocks_until_flush() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let flusher = build_test_flusher(store, &base_path, region_id, 1);
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
 
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));

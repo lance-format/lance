@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
+use futures::{StreamExt, TryStreamExt};
 use lance_core::Result;
 use tracing::instrument;
 
@@ -17,7 +17,10 @@ use crate::dataset::mem_wal::TOMBSTONE;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
+use super::exec::{
+    MEMTABLE_GEN_COLUMN, MemtableGenTagExec, OrderedConcatExec, PkBlockFilterExec,
+    ROW_ADDRESS_COLUMN,
+};
 use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
@@ -61,6 +64,12 @@ pub struct LsmScanPlanner {
     /// See [`super::LsmScanner::with_memtable_filter_indexes`].
     memtable_filter_indexes: bool,
 }
+
+/// Source scans (one per base table, flushed generation and memtable) built
+/// at once when planning an LSM read. Each flushed generation costs a
+/// manifest and a schema read against object storage; 16 in flight keeps a
+/// 100-source read in the low hundreds of milliseconds instead of seconds.
+const SOURCE_SCAN_BUILD_CONCURRENCY: usize = 16;
 
 impl LsmScanPlanner {
     /// Create a new planner.
@@ -133,8 +142,10 @@ impl LsmScanPlanner {
     /// ([`PkBlockFilterExec`]) drops any PK superseded by a newer generation.
     /// Each PK therefore survives in exactly one source, so a plain
     /// `UnionExec` carries at most one row per PK — no cross-source dedup,
-    /// sort, or merge needed. `_memtable_gen` / `_rowaddr` are output-only and
-    /// only produced when the caller opts in.
+    /// sort, or merge needed. Its arms are concatenated in source order, so
+    /// the output order, and with it any limit / offset, is the same on every
+    /// run. `_memtable_gen` / `_rowaddr` are output-only and only produced
+    /// when the caller opts in.
     #[instrument(name = "lsm_plan_scan", level = "debug", skip_all, fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
@@ -174,9 +185,9 @@ impl LsmScanPlanner {
         ))
         .await?;
 
-        // Reverse so the union lists the newest generation first. This is
-        // cosmetic — correctness comes from the per-source dedup and the
-        // cross-gen block-list, not from output ordering.
+        // Reverse so the union lists the newest generation first. Dedup
+        // correctness comes from the per-source dedup and the cross-gen
+        // block-list; this order is only the order rows are emitted in.
         let sources: Vec<_> = sources.into_iter().rev().collect();
 
         // Per-source limit pushdown: an unordered LIMIT needs only
@@ -189,25 +200,47 @@ impl LsmScanPlanner {
         // down safely. The active memtable is in-memory and is never capped.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
 
+        // Building a source's scan opens its dataset: for a flushed
+        // generation that is a manifest read and a schema read against
+        // object storage, ~100 ms each. A store with 20 shards and a modest
+        // backlog has 80-100 such sources, and building them one after
+        // another put every read of it at 8-13 s regardless of how little
+        // data it returned. The opens are independent, so run them with
+        // bounded concurrency and reassemble in source order; everything
+        // after the open (block filter, limit, tagging) is pure and cheap,
+        // so it stays sequential below.
+        // Type-erased, not merely boxed: the `Send` proof recurses through a
+        // boxed future's concrete type but stops at a trait object. An arm
+        // resolves a generation's schema before it scans, which nests deeply
+        // enough to need that. The arms are materialized before streaming so
+        // the stream owns plain trait objects, not a closure over `sources`.
+        let arms: Vec<futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>>> = sources
+            .iter()
+            .map(|source| {
+                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+                let has_block_filter = block_lists
+                    .contains_key(&(source.shard_id(), source.generation()))
+                    && !self.pk_columns.is_empty();
+                let fetch = match (n_needed, is_active, has_block_filter) {
+                    (Some(n), false, false) => Some(n),
+                    _ => None,
+                };
+                Box::pin(self.build_source_scan(source, projection, filter, fetch))
+                    as futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>>
+            })
+            .collect();
+        let scans: Vec<Arc<dyn ExecutionPlan>> = futures::stream::iter(arms)
+            .buffered(SOURCE_SCAN_BUILD_CONCURRENCY)
+            .try_collect()
+            .await?;
+
         let mut source_plans = Vec::new();
-        for source in sources {
+        for (source, scan) in sources.into_iter().zip(scans) {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
             let blocked = block_lists
                 .get(&(source.shard_id(), source.generation()))
                 .cloned();
-            let has_block_filter = blocked.is_some() && !self.pk_columns.is_empty();
-            let fetch = match (n_needed, is_active, has_block_filter) {
-                (Some(n), false, false) => Some(n),
-                _ => None,
-            };
-            // Type-erased, not merely boxed: the `Send` proof recurses
-            // through a boxed future's concrete type but stops at a trait
-            // object. An arm resolves a generation's schema before it
-            // scans, which nests deeply enough to need that.
-            let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
-                Box::pin(self.build_source_scan(&source, projection, filter, fetch));
-            let scan = arm.await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
             // Plain scans refill exactly, so keep the approximate-search
@@ -252,7 +285,7 @@ impl LsmScanPlanner {
         }
 
         // Every arm has to agree before the union: a generation is written under
-        // the schema the shard held when it was sealed, so one sealed before a
+        // the schema the shard held when it was frozen, so one frozen before a
         // column was added does not carry it. `UnionExec` requires schema
         // equality and does not reconcile.
         //
@@ -278,13 +311,15 @@ impl LsmScanPlanner {
             None => Vec::new(),
         };
 
-        // Union, then coalesce into a single partition (UnionExec emits one
-        // per arm; downstream consumers only read partition 0).
+        // Union, then concatenate into a single partition in arm order
+        // (UnionExec emits one per arm; downstream consumers only read
+        // partition 0). Arrival order would differ between runs, so an
+        // offset above would page through a different row order each time.
         let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
             let union = UnionExec::try_new(source_plans)?;
-            Arc::new(CoalescePartitionsExec::new(union))
+            Arc::new(OrderedConcatExec::new(union))
         };
 
         // Project to the canonical output schema, dropping `_rowaddr` /
@@ -394,7 +429,7 @@ impl LsmScanPlanner {
                 );
                 // A predicate the generation can answer is pushed into its scan
                 // under the names it has. One it cannot — because it names a
-                // column sealed before it existed, or a nested one — runs above
+                // column frozen before it existed, or a nested one — runs above
                 // the reconciliation instead, reading its columns from this
                 // scan, so they have to be in it whether the caller asked or
                 // not.
@@ -439,12 +474,19 @@ impl LsmScanPlanner {
                 batch_store,
                 index_store,
                 schema,
+                visible_batch_count,
                 ..
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
-                let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                // Read the same batches the block lists cover, so every row this arm
+                // returns has its older copies blocked.
+                let mut scanner = MemTableScanner::new_at_readable_count(
+                    batch_store.clone(),
+                    index_store.clone(),
+                    schema.clone(),
+                    *visible_batch_count,
+                );
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
 
@@ -586,6 +628,7 @@ mod integration_tests {
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+    use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
@@ -749,7 +792,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
     PkBlockFilterExec: pk_cols=[id]...
@@ -785,7 +828,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     MemtableGenTagExec: gen=gen3
       MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
@@ -801,6 +844,77 @@ mod integration_tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Source scans are built with bounded concurrency and reassembled in
+    /// source order. With more generations than the concurrency bound, every
+    /// key's newest version must still win: a misordered zip of sources and
+    /// scans would attach a block list or generation tag to the wrong arm.
+    #[tokio::test]
+    async fn test_lsm_scan_many_generations_keep_newest_per_key() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[1], "base")]).await,
+        );
+        let shard_id = Uuid::new_v4();
+        let gens = super::SOURCE_SCAN_BUILD_CONCURRENCY * 2 + 3;
+        let mut snapshot = ShardSnapshot::new(shard_id).with_current_generation(gens as u64 + 1);
+        for g in 1..=gens {
+            let uri = format!("{}/_mem_wal/{}/gen_{}", base_uri, shard_id, g);
+            // Every generation rewrites key 1 and adds its own key.
+            create_dataset(
+                &uri,
+                vec![create_test_batch(
+                    &schema,
+                    &[1, g as i32 + 1],
+                    &format!("gen{g}"),
+                )],
+            )
+            .await;
+            snapshot = snapshot.with_sstable(g as u64, format!("gen_{g}"));
+        }
+        let scanner = LsmScanner::new(base, vec![snapshot], vec!["id".to_string()]);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert!(
+                    results
+                        .insert(ids.value(i), names.value(i).to_string())
+                        .is_none(),
+                    "key {} returned twice",
+                    ids.value(i)
+                );
+            }
+        }
+        assert_eq!(results.len(), gens + 1);
+        assert_eq!(results.get(&1), Some(&format!("gen{gens}_1")));
+        for g in 1..=gens {
+            assert_eq!(
+                results.get(&(g as i32 + 1)),
+                Some(&format!("gen{g}_{}", g + 1))
+            );
+        }
     }
 
     #[tokio::test]
@@ -922,7 +1036,7 @@ mod integration_tests {
         assert_eq!(results.get(&6), Some(&"active_6".to_string()));
     }
 
-    /// Regression for the concurrent-read-vs-flush hole: a sealed
+    /// Regression for the concurrent-read-vs-flush hole: a frozen
     /// (frozen-awaiting-flush) memtable is not yet recorded as an
     /// SSTable, but its rows must still be in the scan's read union and
     /// dedup correctly by generation across the active/frozen seam.
@@ -959,7 +1073,7 @@ mod integration_tests {
             .with_sstable(1, "gen_1".to_string())
             .with_sstable(2, "gen_2".to_string());
 
-        // Frozen gen3 (sealed, NOT in the manifest) and active gen4.
+        // Frozen gen3 (NOT in the manifest) and active gen4.
         let (frozen_store, frozen_index) =
             pk_indexed(&[create_test_batch(&schema, &[6, 7], "frozen")]);
         let frozen = InMemoryMemTableRef {
@@ -1147,6 +1261,59 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_lsm_scan_multi_shard_order_is_deterministic() {
+        let schema = create_pk_schema();
+        let shards = [(1u128, [1, 2, 3]), (2u128, [4, 5, 6])];
+        let scan_ids = |reverse_registration: bool| {
+            let schema = schema.clone();
+            let mut shards = shards.to_vec();
+            if reverse_registration {
+                shards.reverse();
+            }
+            async move {
+                let mut scanner = LsmScanner::without_base_table(
+                    schema.clone(),
+                    "memory://multi-shard-order",
+                    vec![],
+                    vec!["id".to_string()],
+                );
+                for (shard, ids) in shards {
+                    let (batch_store, index_store) =
+                        pk_indexed(&[create_test_batch(&schema, &ids, "active")]);
+                    scanner = scanner.with_in_memory_memtables(
+                        Uuid::from_u128(shard),
+                        InMemoryMemTables {
+                            active: InMemoryMemTableRef {
+                                batch_store,
+                                index_store,
+                                schema: schema.clone(),
+                                generation: 1,
+                            },
+                            frozen: vec![],
+                        },
+                    );
+                }
+                let batch = scanner.try_into_batch().await.unwrap();
+                let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+                ids.values().to_vec()
+            }
+        };
+
+        // Shard memtables are held in hash maps; the scan must not inherit
+        // their iteration order, or an offset pages through a different
+        // row order on each read.
+        for reverse_registration in [false, true] {
+            for attempt in 0..10 {
+                assert_eq!(
+                    scan_ids(reverse_registration).await,
+                    vec![4, 5, 6, 1, 2, 3],
+                    "reverse_registration={reverse_registration}, attempt={attempt}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_lsm_scan_with_offset_without_limit() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
@@ -1304,7 +1471,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
       MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
@@ -1370,7 +1537,7 @@ mod integration_tests {
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
-  CoalescePartitionsExec
+  OrderedConcatExec
     UnionExec
     MemtableGenTagExec: gen=gen3
       ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
@@ -2655,6 +2822,70 @@ mod integration_tests {
             !ids.contains(&1) && !ids.contains(&2),
             "deleted ids must not appear, got {:?}",
             ids
+        );
+    }
+
+    /// A row that becomes visible in the active memtable while a scan is being
+    /// planned must not be returned alongside the older copy it replaces: the
+    /// block lists and the memtable arm read the memtable at one count.
+    #[tokio::test]
+    async fn test_lsm_scan_write_during_planning_returns_key_once() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = Uuid::new_v4();
+
+        // Gen 1 (SSTable) holds id=1; the active gen 2 holds only id=2.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![create_test_batch(&schema, &[1], "gen1")]).await;
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let (batch_store, index_store) = pk_indexed(&[create_test_batch(&schema, &[2], "active")]);
+        let memtables = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store: batch_store.clone(),
+                index_store: index_store.clone(),
+                schema: schema.clone(),
+                generation: 2,
+            },
+            frozen: vec![],
+        };
+
+        // The concurrent write: a new version of id=1, appended and indexed so
+        // the active memtable's visible count grows mid-plan.
+        let update = create_test_batch(&schema, &[1], "update");
+        let write = {
+            let batch_store = batch_store.clone();
+            let index_store = index_store.clone();
+            move || {
+                let (position, offset, _) = batch_store.append(update.clone()).unwrap();
+                index_store
+                    .insert_with_batch_position(&update, offset, Some(position))
+                    .unwrap();
+            }
+        };
+        let cache = Arc::new(RunOnOpen::new(1, write));
+
+        let batches: Vec<RecordBatch> = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri,
+            vec![snapshot],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, memtables)
+        .with_sstable_cache(cache.clone())
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+        assert!(cache.has_run(), "the write must land during planning");
+        assert_eq!(
+            collect_sorted_ids(&batches),
+            vec![1, 2],
+            "each key must be returned once"
         );
     }
 }

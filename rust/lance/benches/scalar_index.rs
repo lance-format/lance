@@ -201,7 +201,7 @@ fn bench_warm_indexed(c: &mut Criterion) {
         .block_on(BTreeIndexPlugin.load_index(
             fixture.index_store.clone(),
             &details,
-            0,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
             None,
             &LanceCache::no_cache(),
         ))

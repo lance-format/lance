@@ -483,22 +483,6 @@ impl BlockingDataset {
         Ok(())
     }
 
-    pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
-        Ok(block_on(self.inner.cleanup_with_policy(policy))?)
-    }
-
-    pub fn explain_cleanup_with_policy(
-        &self,
-        policy: CleanupPolicy,
-        max_candidate_files: Option<usize>,
-    ) -> Result<CleanupExplanation> {
-        let mut op = self.inner.cleanup(policy);
-        if let Some(limit) = max_candidate_files {
-            op = op.with_max_candidate_files(limit);
-        }
-        Ok(block_on(op.explain())?)
-    }
-
     pub fn close(&self) {}
 }
 
@@ -3654,21 +3638,57 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jdelete_concurrency: JObject,
+    jdelete_rate_limit: JObject,
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_cleanup_with_policy(&mut env, jdataset, jpolicy))
+    ok_or_throw!(
+        env,
+        inner_cleanup_with_policy(
+            &mut env,
+            jdataset,
+            jpolicy,
+            jdelete_concurrency,
+            jdelete_rate_limit
+        )
+    )
 }
 
 fn inner_cleanup_with_policy<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jdelete_concurrency: JObject,
+    jdelete_rate_limit: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let delete_concurrency = env.get_optional(&jdelete_concurrency, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        usize::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_concurrency is out of range for usize, got {value}"
+            ))
+        })
+    })?;
 
+    let delete_rate_limit = env.get_optional(&jdelete_rate_limit, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        u64::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_rate_limit is out of range for u64, got {value}"
+            ))
+        })
+    })?;
     let stats = {
-        let mut dataset =
+        let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.cleanup_with_policy(policy)
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(concurrency) = delete_concurrency {
+            operation = operation.with_delete_concurrency(concurrency)?;
+        }
+        if let Some(rate) = delete_rate_limit {
+            operation = operation.with_delete_rate_limit(rate)?;
+        }
+        block_on(operation.execute())
     }?;
 
     cleanup_stats_to_java(env, stats)
@@ -3711,7 +3731,11 @@ fn inner_explain_cleanup_with_policy<'local>(
     let explanation = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.explain_cleanup_with_policy(policy, max_candidate_files)
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(limit) = max_candidate_files {
+            operation = operation.with_max_candidate_files(limit);
+        }
+        block_on(operation.explain())
     }?;
 
     cleanup_explanation_to_java(env, explanation)
