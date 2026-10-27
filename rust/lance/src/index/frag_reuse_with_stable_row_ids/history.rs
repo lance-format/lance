@@ -22,7 +22,9 @@ use lance_table::system_index::is_system_index;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::Dataset;
-use crate::dataset::index::frag_reuse::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
+use lance_table::system_index::frag_reuse::retention::{
+    is_index_remap_caught_up, reuse_chain_frag_bitmap,
+};
 use crate::dataset::optimize::commit::normalize_source_fragments;
 use crate::dataset::optimize::execution::live_source_row_addrs;
 use crate::dataset::transaction::{Operation, RewriteGroup};
