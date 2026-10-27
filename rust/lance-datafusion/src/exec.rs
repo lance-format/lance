@@ -228,6 +228,20 @@ pub fn execute_plan(
     execute_plan_with_context(plan, options, task_context)
 }
 
+/// Executes a plan with an existing session context.
+///
+/// This is useful when resources created outside the physical plan, such as
+/// replay spill files, must share the context's memory or disk managers with
+/// operators in the plan. `options` must describe the supplied context.
+pub fn execute_plan_with_session_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    session_ctx: &SessionContext,
+) -> Result<SendableRecordBatchStream> {
+    let task_context = get_task_context(session_ctx, &options)?;
+    execute_plan_with_context(plan, options, task_context)
+}
+
 pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,

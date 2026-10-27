@@ -41,6 +41,12 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 // to determine which side each row came from.  The sentinel is stripped by
 // `prepare_stream_schema` and never written to the dataset.
 pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
+/// Row cap for indexed external-sort output batches; payload rows may be wide.
+const INDEXED_JOIN_BATCH_ROWS: usize = 128;
+/// Byte cap for indexed sort input batches and in-memory replay buffers.
+const MAX_INDEXED_JOIN_BATCH_BYTES: usize = 25 * 1024 * 1024;
+/// Byte cap for each batch entering the partial-update fragment sort.
+const MAX_FRAGMENT_UPDATE_BATCH_BYTES: usize = 25 * 1024 * 1024;
 
 pub mod inserted_rows;
 
@@ -79,14 +85,13 @@ use crate::{
     io::exec::{
         Planner, RowAddrMaskFilterExec, project,
         scalar_index::{IndexLookup, MapIndexExec},
-        utils::ReplayExec,
     },
 };
 use arrow_array::{
     BooleanArray, RecordBatch, RecordBatchIterator, StructArray, UInt32Array, UInt64Array,
     cast::AsArray, types::UInt64Type,
 };
-use arrow_schema::{ArrowError, DataType, Field, Fields, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, Schema, SortOptions};
 use arrow_select::take::take_record_batch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as DFColumn, NullEquality, TableReference};
@@ -101,20 +106,15 @@ use datafusion::{
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
-        display::DisplayableExecutionPlan,
-        joins::{HashJoinExec, PartitionMode},
-        projection::ProjectionExec,
-        repartition::RepartitionExec,
-        sorts::sort::SortExec,
-        stream::RecordBatchStreamAdapter,
-        streaming::PartitionStream,
-        union::UnionExec,
+        display::DisplayableExecutionPlan, joins::SortMergeJoinExec, projection::ProjectionExec,
+        repartition::RepartitionExec, sorts::sort::SortExec, stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream, union::UnionExec,
     },
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::DataFrame,
     scalar::ScalarValue,
 };
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
 use futures::{
     Stream, StreamExt, TryStreamExt,
     stream::{self},
@@ -127,16 +127,16 @@ use lance_core::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{InvalidInputSnafu, box_error},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::tokio::get_num_compute_intensive_cpus,
 };
 use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::BatchStreamGrouper,
     exec::{
-        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, OneShotPartitionStream,
-        analyze_plan, execute_plan, get_session_context, provider_to_stream,
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotPartitionStream, analyze_plan,
+        execute_plan_with_session_context, new_session_context, provider_to_stream,
     },
-    spill::spilling_table_provider,
+    spill::spilling_table_provider_with_job_disk_manager,
     utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -163,6 +163,7 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+mod row_ids;
 
 /// Check a merge source against the target schema. As on append, a legacy
 /// blob input matches a Blob v2 target column; the writer converts it.
@@ -680,8 +681,8 @@ struct MergeInsertParams {
     // When the source is a one-shot stream and `conflict_retries > 0`, the source
     // is spilled (memory, then disk) so it can be replayed on each retry. Set to
     // false to fail fast on contention instead of buffering the stream. Has no
-    // effect on re-scannable sources (materialized batches, files), which never
-    // spill.
+    // effect on re-scannable sources; arbitrary providers may still use bounded
+    // replay within an indexed attempt to preserve one logical snapshot.
     spill_for_retry: bool,
     retry_timeout: Duration,
     // MemWAL SSTables to mark as compacted when this commit succeeds.
@@ -770,7 +771,6 @@ pub(super) struct PatchedFragments {
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
 /// part of a single transaction.
-#[derive(Clone)]
 pub struct MergeInsertJob {
     // The column to merge the new data into
     dataset: Arc<Dataset>,
@@ -779,6 +779,73 @@ pub struct MergeInsertJob {
     // The caller's parameters for the data files this job writes. Kept out of
     // `MergeInsertParams`, which the logical plan compares and hashes.
     write_params: Arc<WriteParams>,
+    // A job-local context shared by retry replay, indexed execution, and
+    // partial-update sorting, including across commit retries.
+    spill_session_context: SessionContext,
+    spill_execution_options: LanceExecutionOptions,
+}
+
+impl Clone for MergeInsertJob {
+    fn clone(&self) -> Self {
+        let spill_execution_options = self.spill_execution_options.clone();
+        Self {
+            dataset: self.dataset.clone(),
+            params: self.params.clone(),
+            write_params: self.write_params.clone(),
+            spill_session_context: new_session_context(&spill_execution_options),
+            spill_execution_options,
+        }
+    }
+}
+
+fn merge_insert_execution_options() -> LanceExecutionOptions {
+    let options = LanceExecutionOptions {
+        use_spilling: true,
+        batch_size: Some(INDEXED_JOIN_BATCH_ROWS),
+        ..Default::default()
+    };
+    // Size the operation-scoped pool with the same CPU ceiling used by the
+    // fragment updater, without setting target_partition on the actual job and
+    // thereby changing plan parallelism everywhere.
+    let pool_sizing_options = LanceExecutionOptions {
+        target_partition: Some(get_num_compute_intensive_cpus().min(8)),
+        ..options.clone()
+    };
+    // Resolve environment-backed limits once so the held context and every
+    // execution attempt use exactly the same resource configuration.
+    LanceExecutionOptions {
+        mem_pool_size: Some(pool_sizing_options.mem_pool_size()),
+        max_temp_directory_size: Some(options.max_temp_directory_size()),
+        ..options
+    }
+}
+
+fn max_fragment_update_partitions(memory_pool_size: u64) -> usize {
+    // The joined update stream is staged before this sort, so no upstream sort
+    // reservation remains live. Budget each downstream partition for its merge
+    // reservation plus one capped input and output/fragment-grouping batch.
+    let sort_spill_reservation = (memory_pool_size / 3).clamp(1, 40 * 1024 * 1024);
+    let working_memory = u64::try_from(MAX_FRAGMENT_UPDATE_BATCH_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2);
+    let partition_budget = sort_spill_reservation.saturating_add(working_memory);
+    usize::try_from((memory_pool_size / partition_budget).max(1)).unwrap_or(usize::MAX)
+}
+
+fn fragment_update_session_context(
+    spill_session_context: &SessionContext,
+    spill_execution_options: &LanceExecutionOptions,
+) -> SessionContext {
+    let target_partitions =
+        get_num_compute_intensive_cpus()
+            .min(8)
+            .min(max_fragment_update_partitions(
+                spill_execution_options.mem_pool_size(),
+            ));
+    let config = spill_session_context
+        .copied_config()
+        .with_target_partitions(target_partitions);
+    SessionContext::new_with_config_rt(config, spill_session_context.runtime_env())
 }
 
 /// Build a merge insert operation.
@@ -948,8 +1015,8 @@ impl MergeInsertBuilder {
     ///
     /// This has no effect on re-scannable sources (materialized batches via
     /// [`MergeInsertJob::execute_batches`], or a [`TableProvider`] via
-    /// [`MergeInsertJob::execute_provider`]), which are replayed directly and never
-    /// spill.
+    /// [`MergeInsertJob::execute_provider`]). Arbitrary providers may still use
+    /// bounded replay within an indexed attempt to preserve one logical snapshot.
     ///
     /// Default is true.
     ///
@@ -1185,9 +1252,16 @@ impl MergeInsertBuilder {
         validate_merge_insert_write_params(&self.write_params)?;
         let mut params = self.params.clone();
         params.data_storage_version = Some(PlanFileVersion(write_version));
+        let spill_execution_options = merge_insert_execution_options();
+        // DataFusion 54.1.0 can retain a rejected spill charge. Keep its manager
+        // operation-scoped so any execution error discards that accounting and
+        // cannot reduce the quota of a later merge job.
+        let spill_session_context = new_session_context(&spill_execution_options);
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params,
+            spill_session_context,
+            spill_execution_options,
             write_params: self.write_params.clone(),
         })
     }
@@ -1273,6 +1347,27 @@ async fn resolve_target_bases(
 enum SchemaComparison {
     FullCompatible,
     Subschema,
+}
+
+/// How repeated scans of a merge source relate to one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceProviderMode {
+    /// The provider can be scanned only once.
+    OneShot,
+    /// Every scan reads the same materialized rows.
+    StableSnapshot,
+    /// The provider can be scanned repeatedly, but each scan may observe different rows.
+    Rescannable,
+}
+
+impl SourceProviderMode {
+    fn supports_retries(self) -> bool {
+        !matches!(self, Self::OneShot)
+    }
+
+    fn has_stable_snapshot(self) -> bool {
+        matches!(self, Self::StableSnapshot)
+    }
 }
 
 /// Wrap a one-shot stream in a non-replayable [`StreamingTable`] provider.
@@ -1383,6 +1478,118 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
     }
 }
 
+/// Presents all partitions from one source scan as a deterministic stream.
+///
+/// The indexed join snapshots this stream when the provider does not guarantee
+/// that repeated scans observe the same rows. FirstSeen sources also receive a
+/// temporary encounter ordinal before either consumer can reorder them.
+#[derive(Debug)]
+struct SequentialSourcePartitionStream {
+    input: Arc<dyn ExecutionPlan>,
+    schema: Arc<Schema>,
+    ordinal_field: Option<Field>,
+    projection_schema: Option<Arc<Schema>>,
+}
+
+impl SequentialSourcePartitionStream {
+    fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        ordinal_field: Option<Field>,
+        projection_schema: Option<Arc<Schema>>,
+    ) -> Result<Self> {
+        let input_schema = projection_schema.clone().unwrap_or_else(|| input.schema());
+        let schema = if let Some(field) = ordinal_field.as_ref() {
+            Arc::new(input_schema.as_ref().try_with_column(field.clone())?)
+        } else {
+            input_schema
+        };
+        Ok(Self {
+            input,
+            schema,
+            ordinal_field,
+            projection_schema,
+        })
+    }
+
+    /// Obtain one provider scan and normalize its partitions into a single,
+    /// deterministic stream.
+    async fn from_provider_scan(
+        provider: &Arc<dyn TableProvider>,
+        context: &SessionContext,
+        ordinal_field: Option<Field>,
+        projection_schema: Option<Arc<Schema>>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let input = provider.scan(&context.state(), None, &[], None).await?;
+        let partition = Arc::new(Self::try_new(input, ordinal_field, projection_schema)?);
+        Ok(Arc::new(StreamingTable::try_new(
+            partition.schema().clone(),
+            vec![partition],
+        )?))
+    }
+}
+
+impl PartitionStream for SequentialSourcePartitionStream {
+    fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> SendableRecordBatchStream {
+        let input = self.input.clone();
+        let partition_count = input.properties().output_partitioning().partition_count();
+        let partition_streams = stream::iter(0..partition_count)
+            .map(move |partition| input.execute(partition, context.clone()))
+            .try_flatten();
+        let projection_schema = self.projection_schema.clone();
+        let partition_streams = partition_streams.map(move |batch| {
+            let batch = batch?;
+            if let Some(projection_schema) = projection_schema.as_ref() {
+                batch
+                    .project_by_schema(projection_schema.as_ref())
+                    .map_err(DataFusionError::from)
+            } else {
+                Ok(batch)
+            }
+        });
+
+        if let Some(ordinal_field) = self.ordinal_field.clone() {
+            let mut next_ordinal = 0_u64;
+            let source_with_ordinals = partition_streams.map(move |batch| {
+                let batch = batch?;
+                let num_rows = u64::try_from(batch.num_rows()).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "merge-insert source batch row count {} exceeds u64::MAX",
+                        batch.num_rows()
+                    ))
+                })?;
+                let end_ordinal = next_ordinal.checked_add(num_rows).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "merge-insert source ordinal overflow at {} with batch row count {}",
+                        next_ordinal,
+                        batch.num_rows()
+                    ))
+                })?;
+                let ordinals = Arc::new(UInt64Array::from_iter_values(next_ordinal..end_ordinal));
+                next_ordinal = end_ordinal;
+                batch
+                    .try_with_column(ordinal_field.clone(), ordinals)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                source_with_ordinals,
+            ))
+        } else {
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                partition_streams,
+            ))
+        }
+    }
+}
+
 /// Re-expose every dataset column the source does not carry under its bare
 /// dataset field name, taking the value from the `target` side of the join.
 ///
@@ -1466,6 +1673,18 @@ fn target_blob_handling(dataset: &Dataset) -> lance_core::datatypes::BlobHandlin
 }
 
 impl MergeInsertJob {
+    /// Clone one execution attempt while preserving the spill manager owned by
+    /// the surrounding retry loop.
+    fn clone_for_retry(&self) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            params: self.params.clone(),
+            write_params: self.write_params.clone(),
+            spill_session_context: self.spill_session_context.clone(),
+            spill_execution_options: self.spill_execution_options.clone(),
+        }
+    }
+
     pub async fn execute_reader(
         self,
         source: impl StreamingWriteSource,
@@ -1577,8 +1796,10 @@ impl MergeInsertJob {
 
     async fn create_indexed_scan_joined_stream(
         &self,
-        source: SendableRecordBatchStream,
+        source_provider: Arc<dyn TableProvider>,
+        source_mode: SourceProviderMode,
         indexed_keys: Vec<(String, IndexMetadata)>,
+        source_projection: Option<Arc<Schema>>,
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
@@ -1586,31 +1807,95 @@ impl MergeInsertJob {
             !indexed_keys.is_empty(),
             "create_indexed_scan_joined_stream requires at least one indexed key"
         );
-        let schema = source.schema();
+        let schema = source_projection
+            .clone()
+            .unwrap_or_else(|| source_provider.schema());
         let add_row_addr = match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => false,
             SchemaComparison::Subschema => true,
         };
 
-        // 1 - Input from user
-        let input = Arc::new(OneShotExec::new(source));
+        // The sort-merge join groups source rows by key. FirstSeen still needs
+        // equal-key rows in their original encounter order, so add a temporary
+        // ordinal before the source is replayed or sorted.
+        let source_ordinal_column =
+            (self.params.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen).then(|| {
+                let mut name = "__merge_source_ordinal".to_string();
+                while schema.column_with_name(&name).is_some() {
+                    name.push('_');
+                }
+                name
+            });
+        let execution_options = self.spill_execution_options.clone();
+        let max_batch_bytes = ((execution_options.mem_pool_size() as usize) / 8)
+            .clamp(1, MAX_INDEXED_JOIN_BATCH_BYTES);
+        let session_ctx = &self.spill_session_context;
+        let disk_manager = session_ctx.runtime_env().disk_manager.clone();
+        let ordinal_field = source_ordinal_column
+            .as_ref()
+            .map(|name| Field::new(name, DataType::UInt64, false));
 
-        // 2 - Fork/Replay the input
-        // Regrettably, this needs to have unbounded capacity, and so we need to fully read
-        // the new data into memory.  In the future, we can do better
-        let shared_input = Arc::new(ReplayExec::new(Capacity::Unbounded, input));
+        // Materialized providers guarantee that repeated scans observe the same
+        // rows. Arbitrary providers do not, so normalize one scan per attempt
+        // into a bounded replay before the index probe and final join diverge.
+        let (source_input, index_input) = if source_mode.has_stable_snapshot() {
+            let source_scan = SequentialSourcePartitionStream::from_provider_scan(
+                &source_provider,
+                session_ctx,
+                ordinal_field.clone(),
+                source_projection.clone(),
+            )
+            .await?;
+            let index_scan = SequentialSourcePartitionStream::from_provider_scan(
+                &source_provider,
+                session_ctx,
+                None,
+                source_projection.clone(),
+            )
+            .await?;
+            (
+                source_scan
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+                index_scan
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+            )
+        } else {
+            let normalized_source = SequentialSourcePartitionStream::from_provider_scan(
+                &source_provider,
+                session_ctx,
+                ordinal_field,
+                source_projection.clone(),
+            )
+            .await?;
+            let source = provider_to_stream(normalized_source).await?;
+            let replayable_source = spilling_table_provider_with_job_disk_manager(
+                source,
+                max_batch_bytes,
+                disk_manager.clone(),
+            )
+            .await?;
+            (
+                replayable_source
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+                replayable_source
+                    .scan(&session_ctx.state(), None, &[], None)
+                    .await?,
+            )
+        };
 
         // 3 - Probe every indexed join column.  For composite keys this is
         //     the AND of one `IsIn` query per indexed column, which yields
         //     a tighter candidate set than probing a single column.  The
-        //     downstream hash join still filters by the full composite key,
+        //     downstream join still filters by the full composite key,
         //     so unindexed `on` columns simply do not prune the candidates.
         let lookup_fields = indexed_keys
             .iter()
             .map(|(col, _)| Ok(schema.field_with_name(col)?.clone()))
             .collect::<Result<Vec<_>>>()?;
-        let index_mapper_input =
-            Arc::new(project(shared_input.clone(), &Schema::new(lookup_fields))?);
+        let index_mapper_input = Arc::new(project(index_input, &Schema::new(lookup_fields))?);
 
         let lookups = indexed_keys
             .iter()
@@ -1635,6 +1920,28 @@ impl MergeInsertJob {
                 Arc::new(RowAddrMask::from_block(stale_row_ids)),
             ));
         }
+
+        // Finish the compact index probe before sorting wide source/target
+        // rows. Otherwise its retained candidate set competes with both sorts
+        // for the same pool. Replaying these row addresses is inexpensive and
+        // spills when needed.
+        let mapped_rows = execute_plan_with_session_context(
+            index_mapper,
+            execution_options.clone(),
+            session_ctx,
+        )?;
+        let mapped_rows = spilling_table_provider_with_job_disk_manager(
+            mapped_rows,
+            max_batch_bytes,
+            disk_manager,
+        )
+        .await?;
+        let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
+        while initial_scan.try_next().await?.is_some() {}
+        drop(initial_scan);
+        let index_mapper = mapped_rows
+            .scan(&session_ctx.state(), None, &[], None)
+            .await?;
 
         // 4 - Take the mapped row ids (TakeExec stays for legacy storage:
         //     the v1 reader cannot serve a FilteredReadExec)
@@ -1723,7 +2030,7 @@ impl MergeInsertJob {
             .on
             .iter()
             .map(|col| {
-                let source_key = Column::new_with_schema(col, shared_input.schema().as_ref())?;
+                let source_key = Column::new_with_schema(col, source_input.schema().as_ref())?;
                 let target_key =
                     Column::new_with_schema(&format!("target_{}", col), target.schema().as_ref())?;
                 Ok::<_, Error>((
@@ -1743,27 +2050,68 @@ impl MergeInsertJob {
             NullEquality::NullEqualsNothing
         };
 
-        let joined = Arc::new(
-            HashJoinExec::try_new(
-                shared_input,
-                target,
-                on_keys,
-                None,
-                &JoinType::Full,
-                None,
-                PartitionMode::CollectLeft,
-                null_equality,
-                false,
-            )
-            .unwrap(),
-        );
-        execute_plan(
-            joined,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
-        )
+        // HashJoinExec cannot spill its build side. Sort both inputs instead,
+        // capping oversized batches so the sorts and the join can spill within
+        // the configured fair memory pool.
+        let sort_options = vec![SortOptions::default(); on_keys.len()];
+        let mut source_ordering = on_keys
+            .iter()
+            .zip(sort_options.iter())
+            .map(|((source_key, _), options)| PhysicalSortExpr {
+                expr: source_key.clone(),
+                options: *options,
+            })
+            .collect::<Vec<_>>();
+        if let Some(source_ordinal_column) = source_ordinal_column.as_ref() {
+            source_ordering.push(PhysicalSortExpr {
+                expr: Arc::new(Column::new_with_schema(
+                    source_ordinal_column,
+                    source_input.schema().as_ref(),
+                )?),
+                options: SortOptions::default(),
+            });
+        }
+        let target_ordering = on_keys
+            .iter()
+            .zip(sort_options.iter())
+            .map(|((_, target_key), options)| PhysicalSortExpr {
+                expr: target_key.clone(),
+                options: *options,
+            })
+            .collect::<Vec<_>>();
+        let source_ordering = LexOrdering::new(source_ordering)
+            .ok_or_else(|| Error::internal("merge-insert source join ordering is empty"))?;
+        let target_ordering = LexOrdering::new(target_ordering)
+            .ok_or_else(|| Error::internal("merge-insert target join ordering is empty"))?;
+        let target_partition_count = target.properties().output_partitioning().partition_count();
+        if target_partition_count != 1 {
+            return Err(Error::internal(format!(
+                "indexed merge-insert target must have exactly one partition before sorting, got {target_partition_count}"
+            )));
+        }
+        let source_input = Arc::new(HardCapBatchSizeExec::new(source_input, max_batch_bytes));
+        let target = Arc::new(HardCapBatchSizeExec::new(target, max_batch_bytes));
+        let source_input = Arc::new(SortExec::new(source_ordering, source_input));
+        let target = Arc::new(SortExec::new(target_ordering, target));
+        let joined: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            source_input,
+            target,
+            on_keys,
+            None,
+            JoinType::Full,
+            sort_options,
+            null_equality,
+        )?);
+        let joined = if let Some(source_ordinal_column) = source_ordinal_column {
+            let output_schema = joined
+                .schema()
+                .as_ref()
+                .without_column(&source_ordinal_column);
+            Arc::new(project(joined, &output_schema)?) as Arc<dyn ExecutionPlan>
+        } else {
+            joined
+        };
+        execute_plan_with_session_context(joined, execution_options, session_ctx)
     }
 
     fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
@@ -1862,7 +2210,9 @@ impl MergeInsertJob {
     /// prefix them with _target.
     async fn create_joined_stream(
         &self,
-        source: SendableRecordBatchStream,
+        source_provider: Arc<dyn TableProvider>,
+        source_mode: SourceProviderMode,
+        source_projection: Option<Arc<Schema>>,
     ) -> Result<SendableRecordBatchStream> {
         if self.params.use_index
             && matches!(
@@ -1877,7 +2227,12 @@ impl MergeInsertJob {
             let indexed_keys = self.indexed_join_keys().await?;
             if indexed_keys.len() == self.params.on.len() {
                 return self
-                    .create_indexed_scan_joined_stream(source, indexed_keys)
+                    .create_indexed_scan_joined_stream(
+                        source_provider,
+                        source_mode,
+                        indexed_keys,
+                        source_projection,
+                    )
                     .await;
             }
         }
@@ -1891,6 +2246,21 @@ impl MergeInsertJob {
             );
         }
 
+        let source = provider_to_stream(source_provider).await?;
+        let source = if let Some(projection_schema) = source_projection {
+            let output_schema = projection_schema.clone();
+            let projected = source.map(move |batch| {
+                batch.and_then(|batch| {
+                    batch
+                        .project_by_schema(projection_schema.as_ref())
+                        .map_err(DataFusionError::from)
+                })
+            });
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, projected))
+                as SendableRecordBatchStream
+        } else {
+            source
+        };
         self.create_full_table_joined_stream(source).await
     }
 
@@ -1901,15 +2271,40 @@ impl MergeInsertJob {
     /// `source` must carry `_rowaddr` plus the columns to write. A null
     /// `_rowaddr` routes the row to a new fragment. Join columns in `on` are
     /// written for new rows but preserved in existing fragments.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Partial updates carry operation-scoped spill resources and caller file-write parameters"
+    )]
     pub(super) async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
-        current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
-        write_version: ConcreteFileVersion,
+        spill_session_context: &SessionContext,
+        spill_execution_options: &LanceExecutionOptions,
+        versions: (u64, ConcreteFileVersion),
         on: &[String],
         write_params: Arc<WriteParams>,
     ) -> Result<PatchedFragments> {
+        let (current_version, write_version) = versions;
+        // Fully stage the joined updates before starting the fragment sort. An
+        // indexed join can keep merge streams for both sorted inputs live while
+        // its output is pulled; draining a disk-backed replay first releases
+        // those upstream reservations before the downstream sort allocates. The
+        // zero memory limit is deliberate: the staging buffer holds plain
+        // RecordBatches outside DataFusion's memory-pool accounting, so any
+        // in-memory allowance would weaken the operation's bounded-memory
+        // contract.
+        let staged_source = spilling_table_provider_with_job_disk_manager(
+            source,
+            0,
+            spill_session_context.runtime_env().disk_manager.clone(),
+        )
+        .await?;
+        provider_to_stream(staged_source.clone())
+            .await?
+            .try_for_each(|_| async { Ok::<(), DataFusionError>(()) })
+            .await?;
+        let source = provider_to_stream(staged_source).await?;
         let source_schema = source.schema();
         let update_projection: Vec<usize> = source_schema
             .fields()
@@ -1928,17 +2323,14 @@ impl MergeInsertJob {
         let target_bases_info = Arc::new(target_bases_info);
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = get_session_context(&LanceExecutionOptions {
-            use_spilling: true,
-            target_partition: Some(get_num_compute_intensive_cpus().min(8)),
-            ..Default::default()
-        });
+        let session_ctx =
+            fragment_update_session_context(spill_session_context, spill_execution_options);
         // Cap input batches at 25 MiB to leave room for DataFusion's per-batch
         // sort overhead and spill/merge reservation. SortExec must reserve an
         // entire input batch even when spilling is enabled. This cap reduces
         // reservation pressure but cannot guarantee success with a small pool
-        // or competing consumers; oversized single rows are rejected.
-        const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
+        // or competing consumers; indivisible oversized rows pass through with
+        // a warning.
         let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
@@ -1953,8 +2345,10 @@ impl MergeInsertJob {
                     let new_children: Vec<Arc<dyn ExecutionPlan>> = children
                         .into_iter()
                         .map(|c| {
-                            Arc::new(HardCapBatchSizeExec::new(c.clone(), MAX_BATCH_BYTES))
-                                as Arc<dyn ExecutionPlan>
+                            Arc::new(HardCapBatchSizeExec::new(
+                                c.clone(),
+                                MAX_FRAGMENT_UPDATE_BATCH_BYTES,
+                            )) as Arc<dyn ExecutionPlan>
                         })
                         .collect();
                     let new_node = node.with_new_children(new_children)?;
@@ -2505,32 +2899,35 @@ impl MergeInsertJob {
     /// A stream can only be read once, so when `conflict_retries > 0` the stream is
     /// spilled (in memory, then to disk) so it can be replayed on each retry. See
     /// [`MergeInsertBuilder::spill_for_retry`] to fail fast instead, and
-    /// [`Self::execute_batches`] / [`Self::execute_provider`] for re-scannable
-    /// sources that never spill.
+    /// [`Self::execute_batches`] / [`Self::execute_provider`] for sources that can
+    /// be scanned again on each retry.
     pub async fn execute(
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let (provider, replayable) = self.stream_source_to_provider(source).await?;
-        self.execute_inner(provider, replayable).await
+        let (provider, source_mode) = self.stream_source_to_provider(source).await?;
+        self.execute_inner(provider, source_mode).await
     }
 
     /// Executes the merge insert job from a re-scannable [`TableProvider`].
     ///
     /// This is the canonical entry point: [`Self::execute`] and
     /// [`Self::execute_batches`] are thin wrappers that build a provider and call
-    /// this method. Because a provider can be scanned repeatedly, retries re-read
-    /// the source directly and never spill to disk. The provider's reported
-    /// statistics (e.g. from a [`MemTable`] or file source) also let DataFusion
-    /// optimize the merge join.
+    /// this method. Retries re-read the provider directly. Within each indexed
+    /// attempt, one scan is captured in a bounded replay so the index probe and
+    /// final join cannot observe different source snapshots. The provider's
+    /// reported statistics (e.g. from a [`MemTable`] or file source) also let
+    /// DataFusion optimize non-indexed merge joins.
     ///
     /// [`MemTable`]: datafusion::datasource::MemTable
     pub async fn execute_provider(
         self,
         provider: Arc<dyn TableProvider>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        // A genuine TableProvider is re-scannable by contract, so retries are safe.
-        self.execute_inner(provider, true).await
+        // TableProvider supports repeated scans, but does not guarantee that
+        // separate scans observe the same rows.
+        self.execute_inner(provider, SourceProviderMode::Rescannable)
+            .await
     }
 
     /// Executes the merge insert job from materialized record batches.
@@ -2544,7 +2941,8 @@ impl MergeInsertJob {
         batches: Vec<RecordBatch>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let provider = self.batches_to_provider(batches)?;
-        self.execute_inner(provider, true).await
+        self.execute_inner(provider, SourceProviderMode::StableSnapshot)
+            .await
     }
 
     /// Like [`Self::execute_batches`] but returns the uncommitted transaction.
@@ -2555,7 +2953,8 @@ impl MergeInsertJob {
         batches: Vec<RecordBatch>,
     ) -> Result<UncommittedMergeInsert> {
         let provider = self.batches_to_provider(batches)?;
-        self.execute_uncommitted_impl(provider).await
+        self.execute_uncommitted_impl(provider, SourceProviderMode::StableSnapshot)
+            .await
     }
 
     /// Wrap materialized batches in a multi-partition in-memory [`MemTable`].
@@ -2596,30 +2995,39 @@ impl MergeInsertJob {
     async fn stream_source_to_provider(
         &self,
         source: SendableRecordBatchStream,
-    ) -> Result<(Arc<dyn TableProvider>, bool)> {
+    ) -> Result<(Arc<dyn TableProvider>, SourceProviderMode)> {
         if self.params.conflict_retries > 0 && self.params.spill_for_retry {
             // Allow buffering up to 100MB in memory before spilling to disk.
-            let provider = spilling_table_provider(source, 100 * 1024 * 1024).await?;
-            Ok((provider, true))
+            let disk_manager = self
+                .spill_session_context
+                .runtime_env()
+                .disk_manager
+                .clone();
+            let provider = spilling_table_provider_with_job_disk_manager(
+                source,
+                100 * 1024 * 1024,
+                disk_manager,
+            )
+            .await?;
+            Ok((provider, SourceProviderMode::StableSnapshot))
         } else {
-            Ok((one_shot_provider(source)?, false))
+            Ok((one_shot_provider(source)?, SourceProviderMode::OneShot))
         }
     }
 
     /// Run the retry loop against a provider, re-scanning it on each attempt.
     ///
-    /// `replayable` indicates whether the provider can be scanned more than once.
-    /// When it cannot (a one-shot stream that was not spilled), retries are
-    /// disabled so we never scan it twice; the operation runs once and surfaces any
-    /// commit conflict directly.
+    /// `source_mode` indicates whether the provider can be scanned more than once
+    /// and whether those scans share one materialized snapshot. One-shot sources
+    /// disable retries; arbitrary providers are re-scanned once per attempt.
     async fn execute_inner(
         self,
         provider: Arc<dyn TableProvider>,
-        replayable: bool,
+        source_mode: SourceProviderMode,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let dataset = self.dataset.clone();
         let config = RetryConfig {
-            max_retries: if replayable {
+            max_retries: if source_mode.supports_retries() {
                 self.params.conflict_retries
             } else {
                 0
@@ -2630,6 +3038,7 @@ impl MergeInsertJob {
         let wrapper = MergeInsertJobWithProvider {
             job: self,
             provider,
+            source_mode,
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
@@ -2644,7 +3053,7 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
-        self.execute_uncommitted_impl(one_shot_provider(stream)?)
+        self.execute_uncommitted_impl(one_shot_provider(stream)?, SourceProviderMode::OneShot)
             .await
     }
 
@@ -2904,6 +3313,8 @@ impl MergeInsertJob {
             self.params.clone(),
             source_skipped_duplicates,
             write_sink,
+            self.spill_session_context.clone(),
+            self.spill_execution_options.clone(),
             source_blob_columns,
             logical_plan::DeferredConditions {
                 update_if: deferred_update_if,
@@ -3154,6 +3565,7 @@ impl MergeInsertJob {
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,
+        source_mode: SourceProviderMode,
     ) -> Result<UncommittedMergeInsert> {
         // Resolve the write mode before the path fork. The v2 plan resolves it
         // again in `create_plan`, but the legacy path below does not go through
@@ -3178,9 +3590,7 @@ impl MergeInsertJob {
 
         let target_bases_info = resolve_target_bases(&self.dataset, &self.params).await?;
 
-        // The slow path consumes a single stream; adapt the provider back into one.
-        let source = provider_to_stream(provider).await?;
-        let source_schema = source.schema();
+        let source_schema = provider.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
         let is_full_schema = check_source_schema(
@@ -3197,27 +3607,18 @@ impl MergeInsertJob {
             },
         )
         .is_ok();
-        let source = if is_full_schema {
-            let target_schema = Schema::from(full_schema);
-            let canonical_schema = Arc::new(canonical_source_schema(
+        let source_projection = if is_full_schema {
+            Some(Arc::new(canonical_source_schema(
                 source_schema.as_ref(),
-                &target_schema,
-            )?);
-            let projection_schema = canonical_schema.clone();
-            let projected = source.map(move |batch| {
-                batch.and_then(|batch| {
-                    batch
-                        .project_by_schema(projection_schema.as_ref())
-                        .map_err(DataFusionError::from)
-                })
-            });
-            Box::pin(RecordBatchStreamAdapter::new(canonical_schema, projected))
-                as SendableRecordBatchStream
+                &Schema::from(full_schema),
+            )?))
         } else {
-            source
+            None
         };
-        let source_schema = source.schema();
-        let joined = self.create_joined_stream(source).await?;
+        let source_schema = source_projection.clone().unwrap_or(source_schema);
+        let joined = self
+            .create_joined_stream(provider, source_mode, source_projection)
+            .await?;
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
@@ -3228,11 +3629,25 @@ impl MergeInsertJob {
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let updating_row_ids = merger.updating_row_ids.clone();
+        let order_updates_first = merger.with_row_id;
         let merger_schema = merger.output_schema().clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
             .try_flatten();
-        let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(merger_schema, stream));
+        let stream = if order_updates_first {
+            row_ids::updates_before_inserts(
+                stream,
+                self.spill_session_context
+                    .runtime_env()
+                    .disk_manager
+                    .clone(),
+            )
+            .await?
+        } else {
+            stream
+        };
 
         // A partial-schema source can patch columns or delete matched rows, but
         // not both in one commit: the writer rejects subschema rows up front and
@@ -3254,7 +3669,7 @@ impl MergeInsertJob {
         let (operation, affected_rows) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
             // `deleted_rows`; it produces no batches.
-            let drained: Vec<RecordBatch> = Box::pin(stream).try_collect().await?;
+            let drained: Vec<RecordBatch> = stream.try_collect().await?;
             debug_assert!(drained.is_empty(), "delete-only merge must not emit rows");
 
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
@@ -3312,10 +3727,14 @@ impl MergeInsertJob {
                 matched_offsets,
             } = Self::update_fragments(
                 self.dataset.clone(),
-                Box::pin(stream),
-                self.dataset.manifest.version + 1,
+                stream,
                 target_bases_info,
-                self.params.write_version(&self.dataset),
+                &self.spill_session_context,
+                &self.spill_execution_options,
+                (
+                    self.dataset.manifest.version + 1,
+                    self.params.write_version(&self.dataset),
+                ),
                 &self.params.on,
                 self.write_params.clone(),
             )
@@ -3346,7 +3765,7 @@ impl MergeInsertJob {
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
                 self.dataset.schema().clone(),
-                Box::pin(stream),
+                stream,
                 self.write_params.as_ref().clone(),
                 target_bases_info,
             )
@@ -3360,12 +3779,9 @@ impl MergeInsertJob {
                         .iter()
                         .map(|f| f.physical_rows.unwrap() as u64);
 
-                    // `Merger` captures IDs only for updated rows, while padding below
-                    // assigns fresh IDs at each fragment's tail. The indexed full outer
-                    // hash join must therefore emit every matched update before its
-                    // unmatched build-side inserts. Keep
-                    // `test_multi_batch_upsert_preserves_stable_row_ids` covering this
-                    // DataFusion ordering contract.
+                    // Only updated rows carry IDs. The write stream explicitly
+                    // stages updates before inserts, preserving capture order,
+                    // so commit can assign fresh IDs to each fragment's tail.
                     let sequences = lance_table::rowids::rechunk_sequences(
                         [row_id_sequence.clone()],
                         fragment_sizes,
@@ -3694,11 +4110,22 @@ pub struct UncommittedMergeInsert {
 }
 
 /// Wrapper struct that combines MergeInsertJob with the source provider for retry functionality
-#[derive(Clone)]
 struct MergeInsertJobWithProvider {
     job: MergeInsertJob,
     provider: Arc<dyn TableProvider>,
+    source_mode: SourceProviderMode,
     attempt_count: Arc<AtomicU32>,
+}
+
+impl Clone for MergeInsertJobWithProvider {
+    fn clone(&self) -> Self {
+        Self {
+            job: self.job.clone_for_retry(),
+            provider: self.provider.clone(),
+            source_mode: self.source_mode,
+            attempt_count: self.attempt_count.clone(),
+        }
+    }
 }
 
 impl RetryExecutor for MergeInsertJobWithProvider {
@@ -3711,8 +4138,8 @@ impl RetryExecutor for MergeInsertJobWithProvider {
 
         // Re-scan the provider on each retry attempt.
         self.job
-            .clone()
-            .execute_uncommitted_impl(self.provider.clone())
+            .clone_for_retry()
+            .execute_uncommitted_impl(self.provider.clone(), self.source_mode)
             .await
     }
 
@@ -3789,6 +4216,8 @@ struct Merger {
     params: MergeInsertParams,
     /// Whether the output schema should include a row address column
     with_row_addr: bool,
+    /// Carry row IDs until full-schema upsert output is ordered for writing.
+    with_row_id: bool,
     /// The output schema of the stream.
     output_schema: Arc<Schema>,
     /// Whether to enable stable row ids
@@ -3851,8 +4280,17 @@ impl Merger {
             }
             _ => None,
         };
+        let with_row_id = enable_stable_row_ids
+            && !with_row_addr
+            && params.insert_not_matched
+            && matches!(
+                params.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            );
         let output_schema = if with_row_addr {
             Arc::new(schema.try_with_column(ROW_ADDR_FIELD.clone())?)
+        } else if with_row_id {
+            Arc::new(schema.try_with_column(ROW_ID_FIELD.clone())?)
         } else {
             schema
         };
@@ -3865,6 +4303,7 @@ impl Merger {
             match_filter,
             params,
             with_row_addr,
+            with_row_id,
             output_schema,
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
@@ -3991,7 +4430,8 @@ impl Merger {
             (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
         };
 
-        let left_cols = Vec::from_iter(0..right_offset);
+        let output_row_col = row_addr_col.or(self.with_row_id.then_some(row_id_col));
+        let output_cols = (0..right_offset).chain(output_row_col).collect::<Vec<_>>();
         let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
@@ -4121,15 +4561,7 @@ impl Merger {
                                 .capture(row_ids.values())?;
                         }
 
-                        let projection = if let Some(row_addr_col) = row_addr_col {
-                            let mut cols = Vec::from_iter(left_cols.iter().cloned());
-                            cols.push(row_addr_col);
-                            cols
-                        } else {
-                            #[allow(clippy::redundant_clone)]
-                            left_cols.clone()
-                        };
-                        let matched = matched.project(&projection)?;
+                        let matched = matched.project(&output_cols)?;
                         // The payload columns of an outer join are always nullable.  We need to restore
                         // non-nullable to columns that were originally non-nullable.  This should be safe
                         // since the not_matched rows should all be valid on the right_cols
@@ -4163,11 +4595,7 @@ impl Merger {
                         take_record_batch(&not_matched, &UInt32Array::from(keep_indices))?;
                 }
             }
-            let left_cols_with_id = left_cols
-                .into_iter()
-                .chain(row_addr_col)
-                .collect::<Vec<_>>();
-            let not_matched = not_matched.project(&left_cols_with_id)?;
+            let not_matched = not_matched.project(&output_cols)?;
             // See comment above explaining this schema replacement
             let not_matched = RecordBatch::try_new(
                 self.output_schema.clone(),
@@ -4245,7 +4673,9 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
+    use async_trait::async_trait;
     use datafusion::common::Column;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::FixedSizeListArrayExt;
@@ -4261,12 +4691,142 @@ mod tests {
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::{Barrier, Notify};
     use url::Url;
 
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    /// Returns rows only from its first scan, simulating a provider whose
+    /// snapshot changes between scans.
+    #[derive(Debug)]
+    struct ChangingScanProvider {
+        first_batch: RecordBatch,
+        scan_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TableProvider for ChangingScanProvider {
+        fn schema(&self) -> Arc<Schema> {
+            self.first_batch.schema()
+        }
+
+        fn table_type(&self) -> datafusion::logical_expr::TableType {
+            datafusion::logical_expr::TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            session: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            let schema = self.first_batch.schema();
+            let scan_number = self.scan_count.fetch_add(1, Ordering::SeqCst);
+            let batch = if scan_number == 0 {
+                self.first_batch.clone()
+            } else {
+                RecordBatch::new_empty(schema.clone())
+            };
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter([Ok(batch)]),
+            ));
+            let partition = Arc::new(OneShotPartitionStream::new(stream));
+            let provider = StreamingTable::try_new(schema, vec![partition])?;
+            provider.scan(session, projection, filters, limit).await
+        }
+    }
+
+    #[test]
+    fn test_fragment_update_partitions_include_working_memory() {
+        assert_eq!(
+            max_fragment_update_partitions(150 * 1024 * 1024),
+            1,
+            "a 150 MiB pool has room for one merge reservation and two capped working batches"
+        );
+    }
+
+    #[test]
+    fn test_merge_insert_pool_scales_without_changing_plan_parallelism() {
+        let options = merge_insert_execution_options();
+        let expected_pool_size = LanceExecutionOptions {
+            use_spilling: true,
+            batch_size: Some(INDEXED_JOIN_BATCH_ROWS),
+            target_partition: Some(get_num_compute_intensive_cpus().min(8)),
+            ..Default::default()
+        }
+        .mem_pool_size();
+
+        assert_eq!(options.mem_pool_size(), expected_pool_size);
+        assert_eq!(options.target_partition, None);
+    }
+
+    #[tokio::test]
+    async fn test_cloned_merge_jobs_do_not_reuse_failed_spill_accounting() {
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut first_job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        first_job.spill_execution_options.max_temp_directory_size = Some(1);
+        first_job.spill_session_context = new_session_context(&first_job.spill_execution_options);
+
+        let second_job = first_job.clone();
+        let first_manager = first_job
+            .spill_session_context
+            .runtime_env()
+            .disk_manager
+            .clone();
+        let second_manager = second_job
+            .spill_session_context
+            .runtime_env()
+            .disk_manager
+            .clone();
+
+        assert!(
+            !Arc::ptr_eq(&first_manager, &second_manager),
+            "cloned executable jobs must own independent disk managers"
+        );
+        let retry_job = second_job.clone_for_retry();
+        assert!(
+            Arc::ptr_eq(
+                &second_manager,
+                &retry_job.spill_session_context.runtime_env().disk_manager
+            ),
+            "retry attempts within one execution must share a disk manager"
+        );
+
+        let mut rejected = first_manager
+            .create_tmp_file("testing rejected merge job spill")
+            .unwrap();
+        rejected.inner().as_file().set_len(2).unwrap();
+        assert!(matches!(
+            rejected.update_disk_usage(),
+            Err(DataFusionError::ResourcesExhausted(_))
+        ));
+        drop(rejected);
+
+        let mut next_spill = second_manager
+            .create_tmp_file("testing independent merge job spill")
+            .unwrap();
+        next_spill.inner().as_file().set_len(1).unwrap();
+        next_spill.update_disk_usage().unwrap();
+        assert_eq!(second_manager.used_disk_space(), 1);
     }
 
     /// The fill's plan depth must not grow with the number of columns the
@@ -4393,13 +4953,19 @@ mod tests {
         .unwrap();
         let update_stream =
             RecordBatchStreamAdapter::new(updates.schema(), futures::stream::iter([Ok(updates)]));
+        let spill_execution_options = merge_insert_execution_options();
+        let spill_session_context = new_session_context(&spill_execution_options);
 
         let error = MergeInsertJob::update_fragments(
             dataset.clone(),
             Box::pin(update_stream),
-            dataset.manifest().version + 1,
             None,
-            dataset.manifest.data_storage_format.lance_file_format(),
+            &spill_session_context,
+            &spill_execution_options,
+            (
+                dataset.manifest().version + 1,
+                dataset.manifest.data_storage_format.lance_file_format(),
+            ),
             &[],
             Arc::new(WriteParams::default()),
         )
@@ -4763,6 +5329,7 @@ mod tests {
                 &self.expected_right_keys,
                 &self.expected_stats,
             )
+            .boxed()
             .await;
 
             let row_ids_after = get_row_ids_for_keys(&ds, &self.test_keys).await;
@@ -5483,17 +6050,36 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::indexed_slow_path(true)]
-    #[case::full_scan_fast_path(false)]
+    #[case::updates_before_inserts(1, 1, 7, 2)]
+    #[case::insert_batches_before_updates(1000, 1, 0, 256)]
+    #[case::insert_batches_between_updates(128, 256, 0, 1024)]
     #[tokio::test]
-    async fn test_multi_batch_upsert_preserves_stable_row_ids(#[case] use_index: bool) {
-        let mut dataset = (*create_test_dataset(
-            "memory://test_multi_batch_upsert_row_ids",
-            LanceFileVersion::default(),
-            true,
-        )
-        .await)
-            .clone();
+    async fn test_multi_batch_upsert_preserves_stable_row_ids(
+        #[case] first_key: u32,
+        #[case] key_step: u32,
+        #[case] first_insert: u32,
+        #[case] insert_range_len: u32,
+        #[values(true, false)] use_index: bool,
+        #[values(64, 1024)] max_rows_per_file: usize,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().to_str().unwrap();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(first_key, key_step))
+            .col("value", array::fill::<UInt32Type>(1))
+            .col("filterme", array::fill_utf8("original".to_string()))
+            .into_dataset_with_params(
+                uri,
+                FragmentCount(2),
+                FragmentRowCount(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
         dataset
             .create_index(
                 &["key"],
@@ -5506,34 +6092,36 @@ mod tests {
             .unwrap();
         let dataset = Arc::new(dataset);
 
-        let initial_keys = [1, 2, 3, 4, 5, 6];
+        let initial_keys = (0..6).map(|i| first_key + i * key_step).collect::<Vec<_>>();
         let initial_row_ids = get_row_ids_for_keys(&dataset, &initial_keys).await;
-        let initial_row_ids = initial_row_ids
-            .values()
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let updated_keys = [2];
-        let updated_row_ids_before = get_row_ids_for_keys(&dataset, &updated_keys).await;
+        let updated_keys = [initial_keys[1], initial_keys[3]];
+        let inserted_keys = (first_insert..first_insert + insert_range_len)
+            .filter(|key| !initial_keys.contains(key))
+            .collect::<Vec<_>>();
+        let midpoint = inserted_keys.len() / 2;
 
-        // Surround an update with inserts in separate source batches. Stable row-id
-        // assignment still relies on the join emitting the update before both inserts.
+        // Input batch order differs from key order. The indexed join must also
+        // handle entire output batches of inserts before or between updates.
         let first_insert_batch = record_batch!(
-            ("key", UInt32, [7]),
-            ("value", UInt32, [70]),
-            ("filterme", Utf8, ["inserted before"])
+            ("key", UInt32, inserted_keys[..midpoint].to_vec()),
+            ("value", UInt32, vec![70; midpoint]),
+            ("filterme", Utf8, vec!["inserted before"; midpoint])
         )
         .unwrap();
         let update_batch = record_batch!(
-            ("key", UInt32, [2]),
-            ("value", UInt32, [20]),
-            ("filterme", Utf8, ["updated"])
+            ("key", UInt32, updated_keys.to_vec()),
+            ("value", UInt32, [20, 20]),
+            ("filterme", Utf8, ["updated", "updated"])
         )
         .unwrap();
         let second_insert_batch = record_batch!(
-            ("key", UInt32, [8]),
-            ("value", UInt32, [80]),
-            ("filterme", Utf8, ["inserted after"])
+            ("key", UInt32, inserted_keys[midpoint..].to_vec()),
+            ("value", UInt32, vec![80; inserted_keys.len() - midpoint]),
+            (
+                "filterme",
+                Utf8,
+                vec!["inserted after"; inserted_keys.len() - midpoint]
+            )
         )
         .unwrap();
         let source_schema = first_insert_batch.schema();
@@ -5551,23 +6139,45 @@ mod tests {
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::InsertAll)
             .use_index(use_index)
+            .with_params(&WriteParams {
+                max_rows_per_file,
+                ..Default::default()
+            })
             .try_build()
             .unwrap()
             .execute_reader(source)
             .await
             .unwrap();
 
-        assert_eq!(stats.num_updated_rows, 1);
-        assert_eq!(stats.num_inserted_rows, 2);
-        let updated_row_ids_after = get_row_ids_for_keys(&dataset, &updated_keys).await;
-        assert_eq!(updated_row_ids_after, updated_row_ids_before);
+        assert_eq!(stats.num_updated_rows, updated_keys.len() as u64);
+        assert_eq!(stats.num_inserted_rows, inserted_keys.len() as u64);
+        drop(dataset);
+        let dataset = Dataset::open(uri).await.unwrap();
+        assert_eq!(
+            dataset.count_rows(None).await.unwrap(),
+            initial_keys.len() + inserted_keys.len()
+        );
+        let row_ids_after = get_row_ids_for_keys(&dataset, &initial_keys).await;
+        assert_eq!(row_ids_after, initial_row_ids);
+        let original_rows = dataset
+            .take_rows(initial_row_ids.values(), dataset.schema().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            original_rows["key"].as_primitive::<UInt32Type>().values(),
+            &initial_keys
+        );
+        assert_eq!(
+            original_rows["value"].as_primitive::<UInt32Type>().values(),
+            &[1, 20, 1, 20, 1, 1]
+        );
 
-        let inserted_row_ids = get_row_ids_for_keys(&dataset, &[7, 8]).await;
+        let inserted_row_ids = get_row_ids_for_keys(&dataset, &inserted_keys).await;
         assert!(
             inserted_row_ids
                 .values()
                 .iter()
-                .all(|row_id| !initial_row_ids.contains(row_id))
+                .all(|row_id| !initial_row_ids.values().contains(row_id))
         );
     }
 
@@ -5833,12 +6443,26 @@ mod tests {
         )
         .unwrap();
 
-        let (ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["path".to_string()])
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["path".to_string()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
-            .unwrap()
+            .unwrap();
+        let job_disk_manager = job.spill_session_context.runtime_env().disk_manager.clone();
+        let fragment_update_context = fragment_update_session_context(
+            &job.spill_session_context,
+            &job.spill_execution_options,
+        );
+        assert!(
+            Arc::ptr_eq(
+                &job_disk_manager,
+                &fragment_update_context.runtime_env().disk_manager
+            ),
+            "indexed execution and partial-update sorting must share one disk manager"
+        );
+
+        let (ds, stats) = job
             .execute_reader(RecordBatchIterator::new([Ok(updates)], upd_schema))
             .await
             .unwrap();
@@ -5983,6 +6607,64 @@ mod tests {
                 "{filter}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_indexed_merge_provider_scans_must_share_a_snapshot() {
+        let test_dir = TempStrDir::default();
+        let initial = record_batch!(("id", UInt32, [2]), ("value", UInt32, [20])).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+            test_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let source = record_batch!(("id", UInt32, [2]), ("value", UInt32, [200])).unwrap();
+        let scan_count = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn TableProvider> = Arc::new(ChangingScanProvider {
+            first_batch: source,
+            scan_count: scan_count.clone(),
+        });
+
+        let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_provider(provider)
+            .await
+            .unwrap();
+
+        assert_eq!(scan_count.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 0);
+        drop(dataset);
+
+        let reopened = Dataset::open(test_dir.as_str()).await.unwrap();
+        let batch = reopened.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<UInt32Type>();
+        let values = batch["value"].as_primitive::<UInt32Type>();
+        let mut rows = ids
+            .values()
+            .iter()
+            .zip(values.values())
+            .map(|(id, value)| (*id, *value))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(2, 200)]);
     }
 
     #[tokio::test]
@@ -13755,30 +14437,40 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .unwrap();
         }
 
-        // Split distinct duplicate values across batches to verify that FirstSeen
-        // preserves source order across the entire stream. On the v2 path, also
-        // verify that NULL keys remain distinct under SQL equality.
-        let (first, second, expected_inserted) = if with_index {
-            (
-                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(1)])).unwrap(),
-                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(2)])).unwrap(),
-                1,
+        // Exercise enough indexed duplicates to force the source sort to
+        // rearrange keys. The first 64 rows contain each key exactly once, so
+        // their values are the expected FirstSeen winners after the sort.
+        let (source_batches, expected_inserted, expected_updated, expected_skipped) = if with_index
+        {
+            let ids = (0..4096).map(|row| (row * 37) % 64).collect::<Vec<i32>>();
+            let values = (0..4096).collect::<Vec<i32>>();
+            let source = RecordBatch::try_new(
+                initial.schema(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(Int32Array::from(values)),
+                ],
             )
+            .unwrap();
+            let source_batches = (0..source.num_rows())
+                .step_by(40)
+                .map(|offset| Ok(source.slice(offset, (source.num_rows() - offset).min(40))))
+                .collect();
+            (source_batches, 63, 1, 4096 - 64)
         } else {
-            (
-                record_batch!(
-                    ("id", Int32, [Some(108), None]),
-                    ("value", Int32, [Some(1), Some(3)])
-                )
-                .unwrap(),
-                record_batch!(
-                    ("id", Int32, [Some(108), None]),
-                    ("value", Int32, [Some(2), Some(4)])
-                )
-                .unwrap(),
-                3,
+            let first = record_batch!(
+                ("id", Int32, [Some(108), None]),
+                ("value", Int32, [Some(1), Some(3)])
             )
+            .unwrap();
+            let second = record_batch!(
+                ("id", Int32, [Some(108), None]),
+                ("value", Int32, [Some(2), Some(4)])
+            )
+            .unwrap();
+            (vec![Ok(first), Ok(second)], 3, 0, 1)
         };
+        let source_schema = source_batches[0].as_ref().unwrap().schema();
 
         let (dataset, stats) =
             MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
@@ -13789,15 +14481,33 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .try_build()
                 .unwrap()
                 .execute_reader(Box::new(RecordBatchIterator::new(
-                    [Ok(first.clone()), Ok(second)],
-                    first.schema(),
+                    source_batches,
+                    source_schema,
                 )))
                 .await
                 .unwrap();
 
         assert_eq!(stats.num_inserted_rows, expected_inserted);
-        assert_eq!(stats.num_updated_rows, 0);
-        assert_eq!(stats.num_skipped_duplicates, 1);
+        assert_eq!(stats.num_updated_rows, expected_updated);
+        assert_eq!(stats.num_skipped_duplicates, expected_skipped);
+
+        if with_index {
+            let result = dataset.scan().try_into_batch().await.unwrap();
+            let ids = result["id"].as_primitive::<Int32Type>();
+            let values = result["value"].as_primitive::<Int32Type>();
+            let actual = ids
+                .values()
+                .iter()
+                .zip(values.values().iter())
+                .map(|(&id, &value)| (id, value))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(actual.len(), 64);
+            for first_row in 0..64 {
+                let id = (first_row * 37) % 64;
+                assert_eq!(actual.get(&id), Some(&first_row));
+            }
+            return;
+        }
 
         let inserted = dataset
             .scan()

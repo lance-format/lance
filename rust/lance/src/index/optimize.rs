@@ -32,6 +32,15 @@
 //! other kinds are rebuilt whole by the single-process optimize, so they stay
 //! one task.
 //!
+//! [`OptimizeOptions::consolidate`] instead selects a suffix of complete vector
+//! segments within a physical-row budget, leaving unindexed fragments alone.
+//! Shared models merge directly; differing models are re-encoded in tasks under
+//! the newest selected model, then merged into one output. All selected coverage
+//! must be present before committing. A caller may retry the same results on a
+//! refreshed dataset after a concurrent append or delete; a changed source owner
+//! or restored source rows require replanning. Tagged fragment reuse is not
+//! supported in this mode.
+//!
 //! Planning is not always cheap: a split vector index that has to be rebuilt
 //! (`retrain`, every segment's fragments gone, or nothing but a definition so
 //! far) is trained by the planner, which writes the model as a segment outside
@@ -39,10 +48,11 @@
 //! unreferenced index directory.
 //!
 //! The commit publishes every merged segment in one `CreateIndex` transaction
-//! anchored at the plan's `read_version`, so conflict detection covers
-//! everything committed since the plan was made, and removes the segments the
-//! results replace. Results may be partial: whatever they do not cover stays
-//! unindexed for the next optimize.
+//! anchored at the plan's `read_version`, and removes the segments the results
+//! replace. Consolidation may reanchor to the caller's refreshed version after
+//! checking that the source data and ownership still permit reusing the output.
+//! Outside consolidation, results may be partial: whatever they do not cover
+//! stays unindexed for the next optimize.
 //!
 //! An engine like Spark drives it as two map stages:
 //!
@@ -57,6 +67,8 @@
 //! with a tagged fragment reuse history, a legacy (v1) vector index and a
 //! scalar index that must be rebuilt from the whole column. Naming such an
 //! index in `OptimizeOptions::index_names` refuses instead.
+
+mod consolidate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -383,6 +395,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     options: &OptimizeOptions,
 ) -> Result<Option<OptimizeIndicesPlan>> {
     validate_partition_rebalancing_options(options)?;
+    consolidate::validate_options(options)?;
     if has_unsupported_frag_reuse_history(dataset, indices).await? {
         log::warn!(
             "Skipping index optimization: the tagged fragment reuse history carries \
@@ -403,6 +416,10 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
         let last = *segments.last().expect("an index has at least one segment");
+        if options.max_rows_to_consolidate.is_some() {
+            consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;
+            continue;
+        }
         let unindexed = dataset.unindexed_fragments(&name).await?;
         // Without an N:1 merge the single-process optimize rebuilds the
         // absorbed segments from scratch, and the only split that reproduces
@@ -1150,7 +1167,10 @@ async fn merge_vector_segments(
 /// The segments the results claim to replace are removed, exactly as the
 /// single-process optimize removes what its merge reports. Fragments those
 /// segments covered that no result covers (a rebuild missing results) go back
-/// to unindexed, and the next optimize indexes them.
+/// to unindexed, and the next optimize indexes them. Consolidation instead
+/// requires complete surviving coverage for every replaced source. When called
+/// on a refreshed dataset, it reuses staged output after concurrent append or
+/// delete, but rejects sources that have been replaced since planning.
 ///
 /// Without results nothing is committed, unless the table requires MemWAL
 /// catch-up: coverage is derived at commit time, so an index that already
@@ -1193,7 +1213,21 @@ pub async fn commit_optimize_indices(
         ));
     }
     let planned = dataset_at_version(dataset, read_version).await?;
-    let committed_segments = load_all_indices(&planned).await?;
+    let mut results = results;
+    let read_version = if options.max_rows_to_consolidate.is_some() {
+        consolidate::validate_commit(dataset, &planned, &mut results).await?;
+        if results.is_empty() {
+            return Ok(());
+        }
+        dataset.manifest.version
+    } else {
+        read_version
+    };
+    let committed_segments = if options.max_rows_to_consolidate.is_some() {
+        load_all_indices(dataset).await?
+    } else {
+        load_all_indices(&planned).await?
+    };
 
     let mut replaced: HashSet<Uuid> = HashSet::new();
     let mut by_name: BTreeMap<String, Vec<IndexMetadata>> = BTreeMap::new();
