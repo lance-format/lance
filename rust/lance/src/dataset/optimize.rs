@@ -3066,12 +3066,20 @@ async fn copy_relabeled_deletion_files(
                 "metadata-only compaction relabel is missing its replacement fragment",
             ));
         };
-        let deletion_base = dataset.dataset_dir_for_deletion(old_deletion_file)?;
-        let deletion_store = dataset.object_store_for_deletion(old_deletion_file).await?;
-        let old_path = deletion_file_path(&deletion_base, old_fragment.id, old_deletion_file);
-        let new_path = deletion_file_path(&deletion_base, new_fragment.id, old_deletion_file);
-        let deletion_data = deletion_store.read_one_all(&old_path).await?;
-        deletion_store.put(&new_path, &deletion_data).await?;
+        let old_deletion_base = dataset.dataset_dir_for_deletion(old_deletion_file)?;
+        let old_deletion_store = dataset.object_store_for_deletion(old_deletion_file).await?;
+        let old_path = deletion_file_path(&old_deletion_base, old_fragment.id, old_deletion_file);
+        let new_path = deletion_file_path(&dataset.base, new_fragment.id, old_deletion_file);
+        let deletion_data = old_deletion_store.read_one_all(&old_path).await?;
+        // The old file may belong to a shallow clone base. The relabeled file is
+        // written by this dataset, so own it locally instead of aliasing a path
+        // that source cleanup can remove.
+        dataset.object_store.put(&new_path, &deletion_data).await?;
+        new_fragment
+            .deletion_file
+            .as_mut()
+            .expect("metadata-only relabel deletion file")
+            .base_id = None;
     }
     Ok(())
 }
@@ -15538,6 +15546,122 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(row_addrs.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_partial_compaction_relabels_shallow_clone_deletion_locally() {
+        fn deletion_files(uri: &str) -> Vec<String> {
+            let deletion_dir = std::path::Path::new(uri).join("_deletions");
+            if !deletion_dir.exists() {
+                return Vec::new();
+            }
+            let mut files = std::fs::read_dir(deletion_dir)
+                .unwrap()
+                .map(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .into_string()
+                        .expect("deletion file names must be UTF-8")
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        }
+
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let data = sample_data();
+        let schema = data.schema();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(0, 1))], schema.clone()),
+            source_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(1, 1))], schema.clone()),
+            source_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut source = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(2, 8))], schema),
+            source_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 8,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.get_fragments().len(), 3);
+        source.delete("a = 2").await.unwrap();
+
+        let source_deletions_before = deletion_files(source_dir.as_str());
+        assert_eq!(source_deletions_before.len(), 1);
+        let mut clone = source
+            .shallow_clone(clone_dir.as_str(), source.version().version, None)
+            .await
+            .unwrap();
+        let old_deletion = clone
+            .manifest
+            .fragments
+            .last()
+            .and_then(|fragment| fragment.deletion_file.clone())
+            .expect("the trailing fragment must carry its source deletion file");
+        assert!(old_deletion.base_id.is_some());
+        let expected = clone.scan().try_into_batch().await.unwrap();
+
+        compact_files(
+            &mut clone,
+            CompactionOptions {
+                target_rows_per_fragment: 2,
+                materialize_deletions: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            deletion_files(source_dir.as_str()),
+            source_deletions_before,
+            "compacting a shallow clone must not write deletion files into its source"
+        );
+        let new_deletion = clone
+            .manifest
+            .fragments
+            .last()
+            .and_then(|fragment| fragment.deletion_file.as_ref())
+            .expect("the relabeled trailing fragment must keep its deletion file");
+        assert_eq!(new_deletion.read_version, old_deletion.read_version);
+        assert_eq!(new_deletion.id, old_deletion.id);
+        assert_eq!(new_deletion.num_deleted_rows, old_deletion.num_deleted_rows);
+        assert_eq!(new_deletion.base_id, None);
+        assert_eq!(clone.scan().try_into_batch().await.unwrap(), expected);
+
+        source
+            .cleanup_old_versions(chrono::Duration::zero(), Some(true), None)
+            .await
+            .unwrap();
+        let reopened = Dataset::open(clone_dir.as_str()).await.unwrap();
+        assert_eq!(
+            reopened.scan().try_into_batch().await.unwrap(),
+            expected,
+            "source cleanup must not remove a deletion file used by the clone"
+        );
     }
 
     /// Writes `sample_data` as 10 fragments of 100 rows each, deletes half of
