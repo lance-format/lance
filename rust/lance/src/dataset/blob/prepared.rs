@@ -230,10 +230,12 @@ pub fn prepared_blob_batch_to_descriptors(batch: &RecordBatch) -> Result<RecordB
     .map_err(|error| Error::internal(format!("convert prepared MemWAL Blob batch: {error}")))
 }
 
-fn collect_prepared_blob_ids(
+/// Call `visit` with the kind, `blob_id` and `blob_size` of every non-null
+/// prepared blob v2 value in `array`, at any depth.
+fn visit_prepared_blobs(
     array: &ArrayRef,
     field: &Arc<ArrowField>,
-    blob_ids: &mut HashSet<u32>,
+    visit: &mut dyn FnMut(BlobKind, u32, u64),
 ) -> Result<()> {
     if blob_v2_layout(field.as_ref()) == Some(BlobV2Layout::Prepared) {
         validate_prepared_blob_array(field.as_ref(), array)?;
@@ -246,14 +248,17 @@ fn collect_prepared_blob_ids(
             .column_by_name("blob_id")
             .expect("validated prepared Blob has blob_id")
             .as_primitive::<UInt32Type>();
+        let sizes = values
+            .column_by_name("blob_size")
+            .expect("validated prepared Blob has blob_size")
+            .as_primitive::<UInt64Type>();
         for row in 0..values.len() {
-            if values.is_valid(row)
-                && matches!(
+            if values.is_valid(row) {
+                visit(
                     BlobKind::try_from(kinds.value(row))?,
-                    BlobKind::Packed | BlobKind::Dedicated
-                )
-            {
-                blob_ids.insert(ids.value(row));
+                    ids.value(row),
+                    sizes.value(row),
+                );
             }
         }
         return Ok(());
@@ -263,26 +268,50 @@ fn collect_prepared_blob_ids(
         ArrowDataType::Struct(children) => {
             let values = array.as_struct();
             for (child_array, child_field) in values.columns().iter().zip(children.iter()) {
-                collect_prepared_blob_ids(child_array, child_field, blob_ids)?;
+                visit_prepared_blobs(child_array, child_field, visit)?;
             }
         }
         ArrowDataType::List(child) => {
-            collect_prepared_blob_ids(array.as_list::<i32>().values(), child, blob_ids)?;
+            visit_prepared_blobs(array.as_list::<i32>().values(), child, visit)?;
         }
         ArrowDataType::LargeList(child) => {
-            collect_prepared_blob_ids(array.as_list::<i64>().values(), child, blob_ids)?;
+            visit_prepared_blobs(array.as_list::<i64>().values(), child, visit)?;
         }
         _ => {}
     }
     Ok(())
 }
 
+fn visit_batch_prepared_blobs(
+    batch: &RecordBatch,
+    visit: &mut dyn FnMut(BlobKind, u32, u64),
+) -> Result<()> {
+    for (array, field) in batch.columns().iter().zip(batch.schema().fields().iter()) {
+        visit_prepared_blobs(array, field, visit)?;
+    }
+    Ok(())
+}
+
 pub fn prepared_blob_ids(batch: &RecordBatch) -> Result<HashSet<u32>> {
     let mut blob_ids = HashSet::new();
-    for (array, field) in batch.columns().iter().zip(batch.schema().fields().iter()) {
-        collect_prepared_blob_ids(array, field, &mut blob_ids)?;
-    }
+    visit_batch_prepared_blobs(batch, &mut |kind, blob_id, _| {
+        if matches!(kind, BlobKind::Packed | BlobKind::Dedicated) {
+            blob_ids.insert(blob_id);
+        }
+    })?;
     Ok(blob_ids)
+}
+
+/// Payload bytes of the prepared blob v2 values in `batch` that sit in packed
+/// or dedicated sidecars rather than in the batch.
+pub fn prepared_sidecar_bytes(batch: &RecordBatch) -> Result<u64> {
+    let mut bytes = 0u64;
+    visit_batch_prepared_blobs(batch, &mut |kind, _, size| {
+        if matches!(kind, BlobKind::Packed | BlobKind::Dedicated) {
+            bytes = bytes.saturating_add(size);
+        }
+    })?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
