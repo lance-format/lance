@@ -1407,6 +1407,76 @@ mod tests {
     }
 
     #[test]
+    fn test_case_matches_float32_comparisons() {
+        let batch = arrow_array::record_batch!((
+            "value",
+            Float32,
+            [Some(1.2), Some(-0.0), Some(0.0), None]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let cases = [
+            (
+                "value = 1.2",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                "CASE WHEN value = 1.2 THEN 1 ELSE 0 END = 1",
+                vec![Some(true), Some(false), Some(false), Some(false)],
+            ),
+            (
+                "CASE value WHEN 1.2 THEN 1 ELSE 0 END = 1",
+                vec![Some(true), Some(false), Some(false), Some(false)],
+            ),
+            (
+                "value = 0.0",
+                vec![Some(false), Some(true), Some(true), None],
+            ),
+            (
+                "CASE value WHEN 0.0 THEN 'z' ELSE 'n' END = 'z'",
+                vec![Some(false), Some(true), Some(true), Some(false)],
+            ),
+            (
+                "CASE WHEN value = 0.0 THEN 'z' ELSE 'n' END = 'z'",
+                vec![Some(false), Some(true), Some(true), Some(false)],
+            ),
+            (
+                "CASE WHEN value = 1.2 THEN CASE value WHEN 0.0 THEN 'zero' ELSE 'pos' END ELSE 'n' END = 'pos'",
+                vec![Some(true), Some(false), Some(false), Some(false)],
+            ),
+            (
+                "CASE value WHEN 0.0 THEN 'first' WHEN -0.0 THEN 'second' ELSE 'n' END = 'first'",
+                vec![Some(false), Some(true), Some(true), Some(false)],
+            ),
+            (
+                "CASE -0.0 WHEN 0.0 THEN 'z' ELSE 'n' END = 'z'",
+                vec![Some(true); 4],
+            ),
+        ];
+        for (filter, expected) in cases {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            if filter.contains("CASE value WHEN 0.0") {
+                assert_eq!(
+                    planner.optimize_expr(expr.clone()).unwrap(),
+                    expr,
+                    "{filter}"
+                );
+            }
+            let result = planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{filter}");
+        }
+    }
+
+    #[test]
     fn test_parse_filter_uint64_literal_above_i64_max() {
         let value = u64::MAX - 1;
         let batch = arrow_array::record_batch!(("id", UInt64, [1, value])).unwrap();
@@ -1421,6 +1491,29 @@ mod tests {
             predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![false, true])
         );
+
+        let expr = planner
+            .optimize_expr(
+                planner
+                    .parse_filter(&format!("CASE id WHEN {value} THEN 1 ELSE 0 END = 1"))
+                    .unwrap(),
+            )
+            .unwrap();
+        let predicates = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
+
+        let error = planner
+            .parse_filter("CASE id WHEN -1 THEN 1 ELSE 0 END = 1")
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("could not convert to literal"));
 
         let expr = planner
             .parse_expr("arrow_cast(NULL, 'Time32(Second)')")

@@ -4,7 +4,7 @@
 //! Rewrites of comparisons against a floating point zero literal.
 
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList};
+use datafusion::logical_expr::{BinaryExpr, Case, Operator, expr::Between, expr::InList};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
 use datafusion_common::tree_node::{Transformed, TreeNode};
@@ -99,6 +99,13 @@ pub fn normalize_zero_comparisons(
     Ok(expr
         .transform_up(|node| {
             let folded = match node {
+                Expr::Case(case) if case.expr.is_some() => {
+                    let expr = Expr::Case(case);
+                    return Ok(match rewrite_node(&expr) {
+                        Some(rewritten) => Transformed::yes(rewritten),
+                        None => Transformed::no(expr),
+                    });
+                }
                 Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_zero_sensitive(op) => {
                     Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(fold(*left)?),
@@ -206,6 +213,58 @@ fn rewrite_bound(bound: &Expr, op: Operator) -> Option<Expr> {
 
 fn rewrite_node(expr: &Expr) -> Option<Expr> {
     match expr {
+        Expr::Case(case) if case.expr.is_some() => {
+            let mut when_then_expr = Vec::with_capacity(case.when_then_expr.len() * 2);
+            let mut changed = false;
+            for (index, (when, then)) in case.when_then_expr.iter().enumerate() {
+                when_then_expr.push((when.clone(), then.clone()));
+                let Expr::Literal(value, metadata) = when.as_ref() else {
+                    continue;
+                };
+                let Some((negative, positive)) = zero_encodings(value) else {
+                    continue;
+                };
+                let other = if value == &negative {
+                    positive
+                } else {
+                    negative
+                };
+                let next_covers_other =
+                    case.when_then_expr
+                        .get(index + 1)
+                        .is_some_and(|(next_when, next_then)| {
+                            next_then == then
+                                && matches!(
+                                    next_when.as_ref(),
+                                    Expr::Literal(next_value, _) if next_value == &other
+                                )
+                        });
+                let previous_covers_other = index
+                    .checked_sub(1)
+                    .and_then(|previous| case.when_then_expr.get(previous))
+                    .is_some_and(|(previous_when, previous_then)| {
+                        previous_then == then
+                            && matches!(
+                                previous_when.as_ref(),
+                                Expr::Literal(previous_value, _) if previous_value == &other
+                            )
+                    });
+                if !next_covers_other && !previous_covers_other {
+                    when_then_expr.push((
+                        Box::new(Expr::Literal(other, metadata.clone())),
+                        then.clone(),
+                    ));
+                    changed = true;
+                }
+            }
+            changed.then(|| {
+                Expr::Case(Case::new(
+                    case.expr.clone(),
+                    when_then_expr,
+                    case.else_expr.clone(),
+                ))
+            })
+        }
         // DataFusion's simplifier expands an `IN` list of three or fewer values
         // over a bare column back into an OR chain of equalities, so a second
         // `optimize_expr` splits this rewrite's own output and re-runs it on each

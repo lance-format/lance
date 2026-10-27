@@ -6,7 +6,7 @@
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
-use datafusion::logical_expr::{Between, ScalarUDFImpl};
+use datafusion::logical_expr::{Between, Case, ScalarUDFImpl};
 use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
@@ -79,6 +79,34 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
     match expr {
+        Expr::Case(case) => {
+            let operand = case
+                .expr
+                .as_ref()
+                .map(|operand| resolve_expr(operand, schema).map(Box::new))
+                .transpose()?;
+            let operand_type = operand
+                .as_ref()
+                .and_then(|operand| resolve_column_type(operand, schema));
+            let when_then_expr = case
+                .when_then_expr
+                .iter()
+                .map(|(when, then)| {
+                    let when = resolve_expr(when, schema)?;
+                    let when = match &operand_type {
+                        Some(data_type) => coerce_expr(&when, data_type)?,
+                        None => when,
+                    };
+                    Ok((Box::new(when), Box::new(resolve_expr(then, schema)?)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let else_expr = case
+                .else_expr
+                .as_ref()
+                .map(|else_expr| resolve_expr(else_expr, schema).map(Box::new))
+                .transpose()?;
+            Ok(Expr::Case(Case::new(operand, when_then_expr, else_expr)))
+        }
         Expr::Between(Between {
             expr: inner_expr,
             low,
@@ -97,22 +125,24 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             }
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            let left = resolve_expr(left, schema)?;
+            let right = resolve_expr(right, schema)?;
             if matches!(op, Operator::And | Operator::Or) {
                 Ok(Expr::BinaryExpr(BinaryExpr {
-                    left: Box::new(resolve_expr(left.as_ref(), schema)?),
+                    left: Box::new(left),
                     op: *op,
-                    right: Box::new(resolve_expr(right.as_ref(), schema)?),
+                    right: Box::new(right),
                 }))
-            } else if let Some(left_type) = resolve_column_type(left.as_ref(), schema) {
-                match right.as_ref() {
+            } else if let Some(left_type) = resolve_column_type(&left, schema) {
+                match &right {
                     Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
-                        left: left.clone(),
+                        left: Box::new(left),
                         op: *op,
-                        right: Box::new(resolve_value(right.as_ref(), &left_type)?),
+                        right: Box::new(resolve_value(&right, &left_type)?),
                     })),
                     // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
                     Expr::BinaryExpr(r) => Ok(Expr::BinaryExpr(BinaryExpr {
-                        left: left.clone(),
+                        left: Box::new(left),
                         op: *op,
                         right: Box::new(Expr::BinaryExpr(BinaryExpr {
                             left: coerce_expr(&r.left, &left_type).map(Box::new)?,
@@ -120,19 +150,31 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                             right: coerce_expr(&r.right, &left_type).map(Box::new)?,
                         })),
                     })),
-                    _ => Ok(expr.clone()),
-                }
-            } else if let Some(right_type) = resolve_column_type(right.as_ref(), schema) {
-                match left.as_ref() {
-                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
-                        left: Box::new(resolve_value(left.as_ref(), &right_type)?),
+                    _ => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(left),
                         op: *op,
-                        right: right.clone(),
+                        right: Box::new(right),
                     })),
-                    _ => Ok(expr.clone()),
+                }
+            } else if let Some(right_type) = resolve_column_type(&right, schema) {
+                match &left {
+                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(resolve_value(&left, &right_type)?),
+                        op: *op,
+                        right: Box::new(right),
+                    })),
+                    _ => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(left),
+                        op: *op,
+                        right: Box::new(right),
+                    })),
                 }
             } else {
-                Ok(expr.clone())
+                Ok(Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(left),
+                    op: *op,
+                    right: Box::new(right),
+                }))
             }
         }
         Expr::InList(in_list) => {
