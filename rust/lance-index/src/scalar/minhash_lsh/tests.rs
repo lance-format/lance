@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 
 use arrow_array::StringArray;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::cache::LanceCache;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
@@ -33,7 +33,7 @@ fn text_stream(rows: &[(Option<&str>, u64)], batch_rows: usize) -> SendableRecor
         Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
         Field::new(ROW_ID, DataType::UInt64, false),
     ]));
-    let batches: Vec<datafusion::error::Result<RecordBatch>> = rows
+    let batches: Vec<datafusion_common::Result<RecordBatch>> = rows
         .chunks(batch_rows.max(1))
         .map(|chunk| {
             let texts = StringArray::from(chunk.iter().map(|(text, _)| *text).collect::<Vec<_>>());

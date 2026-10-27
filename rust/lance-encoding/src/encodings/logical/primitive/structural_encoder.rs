@@ -23,10 +23,10 @@ use lance_core::utils::bit::pad_bytes;
 use lance_core::utils::tokio::spawn_cpu;
 
 use crate::buffer::LanceBuffer;
-use crate::compression::{CompressionStrategy, compress_required_block};
+use crate::compression::{CompressionStrategy, FixedPerValueDecompressor, compress_required_block};
 use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
-    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
+    DICT_MAX_SIZE_META_KEY, DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
     STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
@@ -36,10 +36,11 @@ use crate::decoder::PageEncoding;
 use crate::encoder::{
     EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
 };
-use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
+use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
 };
+use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
 use crate::format::metadata::CompressiveEncoding;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{
@@ -51,8 +52,8 @@ use crate::utils::accumulation::AccumulationQueue;
 use crate::utils::bytepack::BytepackedIntegerEncoder;
 
 use super::{
-    DEFAULT_DICT_DIVISOR, DEFAULT_DICT_MAX_CARDINALITY, DEFAULT_DICT_SIZE_RATIO,
-    DEFAULT_DICT_VALUES_COMPRESSION, FILL_BYTE, MINIBLOCK_ALIGNMENT,
+    DEFAULT_DICT_DIVISOR, DEFAULT_DICT_MAX_CARDINALITY, DEFAULT_DICT_MAX_SIZE_BYTES,
+    DEFAULT_DICT_SIZE_RATIO, DEFAULT_DICT_VALUES_COMPRESSION, FILL_BYTE, MINIBLOCK_ALIGNMENT,
 };
 use super::{constant, dict, miniblock, planar, sparse};
 
@@ -103,9 +104,10 @@ pub(super) enum ComplexNullEncoding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FixedWidthDictionaryEncoding {
-    Exclude64Bit,
-    Include64Bit,
+pub(super) enum DictionaryEncodingPolicy {
+    LegacyU16,
+    LegacyU32,
+    Planar,
 }
 
 pub(super) trait PrimitivePageEncodingBehavior: Send + Sync + Debug {
@@ -235,6 +237,8 @@ struct SerializedMiniBlockPage {
 pub(super) struct DictEncodingBudget {
     pub(super) max_dict_entries: u32,
     pub(super) max_encoded_size: usize,
+    /// Upper bound on the dictionary's value bytes; see `DICT_MAX_SIZE_META_KEY`.
+    pub(super) max_dict_bytes: usize,
 }
 
 pub(super) enum PrimitivePageStructure {
@@ -1472,7 +1476,13 @@ impl PrimitiveStructuralEncoder {
         };
 
         let compressor = compression_strategy.create_per_value(field, &data)?;
-        let (compressed_data, value_encoding) = compressor.compress(data)?;
+        let validity = if compressor.needs_row_validity() {
+            Self::leaf_validity(&repdef, data.num_values() as usize)?
+        } else {
+            None
+        };
+        let (compressed_data, value_encoding) =
+            compressor.compress_with_validity(data, validity.as_ref())?;
 
         let description = match &compressed_data {
             PerValueDataBlock::Fixed(fixed) => EncodingUtils::fixed_full_zip_layout(
@@ -1512,10 +1522,89 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    pub(super) fn dictionary_min_values() -> u64 {
+        env::var("LANCE_ENCODING_DICT_TOO_SMALL")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(100)
+    }
+
+    pub(super) fn try_dictionary_encode(
+        data: &DataBlock,
+        field: &Field,
+        policy: DictionaryEncodingPolicy,
+        num_fallback_values: u64,
+    ) -> Result<Option<(DataBlock, DataBlock)>> {
+        if policy == DictionaryEncodingPolicy::Planar
+            && let DataBlock::FixedSizeList(fsl) = data
+        {
+            if data.num_values() < Self::dictionary_min_values() {
+                return Ok(None);
+            }
+            // The existing per-value representation retains nested dimensions and
+            // child validity. Byte-aligned leaves permit exact whole-row keys.
+            let mut child = fsl.child.as_ref();
+            loop {
+                child = match child {
+                    DataBlock::FixedSizeList(inner) => inner.child.as_ref(),
+                    DataBlock::Nullable(inner) => inner.data.as_ref(),
+                    DataBlock::FixedWidth(inner) if inner.bits_per_value.is_multiple_of(8) => break,
+                    DataBlock::AllNull(_) => break,
+                    _ => return Ok(None),
+                };
+            }
+            let (PerValueDataBlock::Fixed(values), encoding) =
+                PerValueCompressor::compress(&ValueEncoder::default(), data.clone())?
+            else {
+                return Err(Error::internal(
+                    "Fixed-size-list rows must have fixed width",
+                ));
+            };
+            let block = DataBlock::FixedWidth(values.clone());
+            let Some(mut budget) = Self::should_dictionary_encode(&block, field, policy) else {
+                return Ok(None);
+            };
+            // Sparse zipped pages store only materialized rows. Dictionary indices
+            // still cover every slot, so both indices and hidden dictionary items
+            // must fit the budget for that compact payload, not the Arrow buffers.
+            debug_assert!(num_fallback_values <= values.num_values);
+            budget.max_encoded_size = (budget.max_encoded_size as u128
+                * num_fallback_values as u128
+                / values.num_values as u128) as usize;
+            let Some((indices, items)) =
+                dict::encode_fixed_rows(&values, budget.max_dict_entries, budget.max_encoded_size)
+            else {
+                return Ok(None);
+            };
+            let Some(metadata::compressive_encoding::Compression::FixedSizeList(description)) =
+                encoding.compression
+            else {
+                return Err(Error::internal("Fixed-size-list row encoding is missing"));
+            };
+            let count = items.num_values;
+            let items = FixedPerValueDecompressor::decompress(
+                &ValueDecompressor::from_fsl(&description)?,
+                items,
+                count,
+            )?;
+            return Ok(Some((indices, items)));
+        }
+        Ok(
+            Self::should_dictionary_encode(data, field, policy).and_then(|budget| {
+                dict::dictionary_encode(
+                    data,
+                    budget.max_dict_entries,
+                    budget.max_encoded_size,
+                    budget.max_dict_bytes,
+                )
+            }),
+        )
+    }
+
     pub(super) fn should_dictionary_encode(
         data_block: &DataBlock,
         field: &Field,
-        fixed_width_dictionary_encoding: FixedWidthDictionaryEncoding,
+        dictionary_policy: DictionaryEncodingPolicy,
     ) -> Option<DictEncodingBudget> {
         const DEFAULT_SAMPLE_SIZE: usize = 4096;
         const DEFAULT_SAMPLE_UNIQUE_RATIO: f64 = 0.98;
@@ -1525,11 +1614,13 @@ impl PrimitiveStructuralEncoder {
         match data_block {
             DataBlock::FixedWidth(fixed) => {
                 if fixed.bits_per_value == 64
-                    && fixed_width_dictionary_encoding == FixedWidthDictionaryEncoding::Exclude64Bit
+                    && dictionary_policy == DictionaryEncodingPolicy::LegacyU16
                 {
                     return None;
                 }
-                if fixed.bits_per_value != 64 && fixed.bits_per_value != 128 {
+                let vector = dictionary_policy == DictionaryEncodingPolicy::Planar
+                    && matches!(field.data_type(), DataType::FixedSizeList(_, _));
+                if !vector && fixed.bits_per_value != 64 && fixed.bits_per_value != 128 {
                     return None;
                 }
                 if fixed.bits_per_value % 8 != 0 {
@@ -1545,18 +1636,14 @@ impl PrimitiveStructuralEncoder {
         }
 
         // Don't dictionary encode tiny arrays.
-        let too_small = env::var("LANCE_ENCODING_DICT_TOO_SMALL")
-            .ok()
-            .and_then(|val| val.parse().ok())
-            .unwrap_or(100);
+        let too_small = Self::dictionary_min_values();
         if data_block.num_values() < too_small {
             return None;
         }
 
         let num_values = data_block.num_values();
 
-        // Apply divisor threshold and cap. This is intentionally conservative: the goal is to
-        // avoid spending too much CPU trying to estimate very high cardinalities.
+        // Bound actual dictionary construction by the configured cardinality and size budgets.
         let divisor: u64 = field
             .metadata
             .get(DICT_DIVISOR_META_KEY)
@@ -1608,8 +1695,16 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
-        // Avoid probing dictionary encoding on data that appears to be near-unique
-        // or likely to exceed the dictionary budget.
+        let max_dict_bytes: usize = match field.metadata.get(DICT_MAX_SIZE_META_KEY) {
+            Some(val) => val.parse().unwrap_or_else(|_| {
+                panic!("Invalid parameter: dict-max-size is {val} which is not a byte count")
+            }),
+            None => DEFAULT_DICT_MAX_SIZE_BYTES,
+        };
+
+        // A repeated sample can come from either a small dictionary or a high-cardinality
+        // page with short runs. Its unique ratio cannot be extrapolated to the whole page.
+        // Planar leaves that decision to bounded dictionary construction.
         if let Some(sample_unique_ratio) =
             Self::sample_unique_ratio(data_block, DEFAULT_SAMPLE_SIZE)?
         {
@@ -1617,9 +1712,12 @@ impl PrimitiveStructuralEncoder {
                 return None;
             }
 
-            let projected_cardinality = (sample_unique_ratio * num_values as f64).ceil() as u64;
-            if projected_cardinality > threshold_cardinality {
-                return None;
+            // Preserve the existing candidate selection for legacy writers.
+            if dictionary_policy != DictionaryEncodingPolicy::Planar {
+                let projected_cardinality = (sample_unique_ratio * num_values as f64).ceil() as u64;
+                if projected_cardinality > threshold_cardinality {
+                    return None;
+                }
             }
         }
 
@@ -1627,6 +1725,7 @@ impl PrimitiveStructuralEncoder {
         Some(DictEncodingBudget {
             max_dict_entries,
             max_encoded_size,
+            max_dict_bytes,
         })
     }
 
@@ -1687,6 +1786,16 @@ impl PrimitiveStructuralEncoder {
                         HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
                     for idx in indices.iter().copied() {
                         unique.insert(values.get(idx).copied()?);
+                    }
+                    unique.len() as f64 / indices.len() as f64
+                }
+                bits if bits > 0 && bits.is_multiple_of(8) => {
+                    let width = usize::try_from(bits / 8).ok()?;
+                    let mut unique = HashSet::with_capacity(indices.len());
+                    for &index in &indices {
+                        let start = index.checked_mul(width)?;
+                        let end = start.checked_add(width)?;
+                        unique.insert(xxhash_rust::xxh3::xxh3_64(fixed.data.get(start..end)?));
                     }
                     unique.len() as f64 / indices.len() as f64
                 }
@@ -1851,7 +1960,7 @@ impl PrimitiveStructuralEncoder {
         compression_strategy: Arc<dyn CompressionStrategy>,
         miniblock_chunk_size: MiniblockChunkSize,
         complex_null_encoding: ComplexNullEncoding,
-        fixed_width_dictionary_encoding: FixedWidthDictionaryEncoding,
+        dictionary_policy: DictionaryEncodingPolicy,
     ) -> Result<EncodedPage> {
         let PrimitiveEncodeContext {
             column_idx,
@@ -2066,6 +2175,22 @@ impl PrimitiveStructuralEncoder {
         }
 
         if let DataBlock::Dictionary(dict) = data_block {
+            // Merging the buffered chunks can widen dictionary indices beyond
+            // the declared key type (see `concat_dict_arrays`).  The physical
+            // index width must match the schema, so reject the mismatch instead
+            // of persisting a file the reader would later reject as corrupt.
+            if let DataType::Dictionary(key_type, _) = field.data_type() {
+                let declared_key_bits = key_type.byte_width() as u64 * 8;
+                if dict.indices.bits_per_value != declared_key_bits {
+                    return Err(Error::invalid_input(format!(
+                        "Field '{}' is declared as {} but the merged dictionary needs {} bits per index and the declared key type addresses only {} bits; widen the dictionary key type to hold the merged values",
+                        field.name,
+                        field.data_type(),
+                        dict.indices.bits_per_value,
+                        declared_key_bits,
+                    )));
+                }
+            }
             log::debug!(
                 "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
                 column_idx,
@@ -2092,23 +2217,8 @@ impl PrimitiveStructuralEncoder {
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
         // preferred structural encoding.
-        let dict_result = Self::should_dictionary_encode(
-            &data_block,
-            &field,
-            fixed_width_dictionary_encoding,
-        )
-        .and_then(|budget| {
-            log::debug!(
-                "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                column_idx,
-                num_values
-            );
-            dict::dictionary_encode(
-                &data_block,
-                budget.max_dict_entries,
-                budget.max_encoded_size,
-            )
-        });
+        let dict_result =
+            Self::try_dictionary_encode(&data_block, &field, dictionary_policy, num_values)?;
 
         if let Some((indices_data_block, dictionary_data_block)) = dict_result {
             Self::encode_miniblock(
@@ -2434,7 +2544,7 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
                 self.compression.clone(),
                 MiniblockChunkSize::U16,
                 ComplexNullEncoding::RawLevels,
-                FixedWidthDictionaryEncoding::Exclude64Bit,
+                DictionaryEncodingPolicy::LegacyU16,
             )?,
         ))
     }
@@ -2470,7 +2580,7 @@ impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
                 self.compression.clone(),
                 MiniblockChunkSize::U32,
                 ComplexNullEncoding::CompressedLevels,
-                FixedWidthDictionaryEncoding::Include64Bit,
+                DictionaryEncodingPolicy::LegacyU32,
             )?,
         ))
     }

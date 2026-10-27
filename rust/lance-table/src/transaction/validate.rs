@@ -19,8 +19,9 @@ type DataFileIdentity = (Option<u32>, String);
 
 /// Resolve an Arrow-derived operation against the dataset it was read from.
 ///
-/// Overwrite assigns new IDs to every field. Merge matches fields by name and
-/// type, not positional Arrow IDs.
+/// Overwrite assigns new IDs to every field, except that a new table keeps the
+/// IDs its fields carry. Merge matches fields by name and type, not positional
+/// Arrow IDs.
 /// Project may use explicit IDs for renames; its conversion must leave missing
 /// IDs unassigned. New file mappings follow the resolved schema; retained files
 /// are unchanged. Call this at the conversion boundary, before committing the
@@ -55,7 +56,11 @@ pub fn resolve_arrow_field_ids(
         Operation::Overwrite {
             schema, fragments, ..
         } => {
-            let field_id_remap = canonicalize_schema(manifest, schema, None, true)?;
+            let Some(manifest) = manifest else {
+                schema.try_assign_new_table_field_ids()?;
+                return schema.verify_primary_key();
+            };
+            let field_id_remap = canonicalize_schema(Some(manifest), schema, None, true)?;
             resolve_fragment_field_ids(fragments, &field_id_remap, &HashSet::new(), schema)?;
         }
         Operation::Project { schema, .. } => {
@@ -113,7 +118,7 @@ pub fn canonicalize_non_reusable_field_ids(
             schema, fragments, ..
         } => {
             let remap = canonicalize_schema(manifest, schema, None, false)?;
-            remap_fragment_field_ids(fragments, &remap, &HashSet::new());
+            resolve_fragment_field_ids(fragments, &remap, &HashSet::new(), schema)?;
         }
         Operation::Merge {
             schema, fragments, ..
@@ -308,12 +313,10 @@ fn resolve_fragment_field_ids(
 ) -> Result<()> {
     let canonical_ids = schema.field_ids();
     for fragment in fragments {
-        // Raw Arrow overwrite fragments may have been written either by a
-        // standalone writer using the source schema IDs or by a
-        // dataset-aware writer using canonical IDs. Resolve that namespace
-        // once for the whole fragment so split files cannot disagree. If
-        // both interpretations are possible and produce different
-        // identities then there is no safe mapping without provenance.
+        // Overwrite fragments may have been written either with the schema's
+        // own IDs or with the replacement IDs. Decide once for the whole
+        // fragment so split files cannot disagree. If both readings are
+        // possible and give different IDs, there is no safe mapping.
         let fragment_field_ids = fragment
             .referenced_lance_files()
             .filter(|file| !retained_files.contains(&(file.base_id, file.path.clone())))
@@ -333,7 +336,7 @@ fn resolve_fragment_field_ids(
         match (canonical_source, raw_source, raw_changes_identity) {
             (true, true, true) => {
                 return Err(Error::invalid_input(format!(
-                    "Fragment {} has ambiguous raw Arrow field IDs; its file mappings can be interpreted as either source or canonical identities",
+                    "Fragment {} has ambiguous field IDs: its files can be read as using either the schema's IDs or the replacement IDs",
                     fragment.id
                 )));
             }
@@ -658,17 +661,74 @@ fn schema_fragments_valid(
     schema_fragments_modern_valid(schema, fragments)
 }
 
-pub fn schema_fragments_modern_valid(_schema: &Schema, fragments: &[Fragment]) -> Result<()> {
-    // validate that each data file at least contains one field.
+pub fn schema_fragments_modern_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+    // A field is "required" when it, and all of its ancestors, are non-nullable:
+    // it can never be null, so a fragment that stores no data for it violates the
+    // schema. Nullable fields -- and anything under a nullable ancestor -- may be
+    // omitted and are filled with nulls on read (#3016 / #3041).
+    //
+    // Coverage is taken from each data file's *physical* schema
+    // (`DataFile::schema`), not from the raw `fields` list, because a field id in
+    // `fields` does not by itself mean the field's data is present:
+    //   - a packed struct maps one physical column that carries its whole subtree,
+    //     so `DataFile::schema` reports every descendant as present;
+    //   - an ordinary struct reports only the child columns actually stored, never
+    //     a bare structural header (a V2.0 header, or a V2.1 id with
+    //     column_index = -1), and obsolete/retained ids are dropped.
+    // A required leaf must therefore have its own id physically present, and a
+    // required container must have some id from its subtree present.
+    fn subtree_has_present(field: &Field, present: &HashSet<i32>) -> bool {
+        (field.id >= 0 && present.contains(&field.id))
+            || field
+                .children
+                .iter()
+                .any(|c| subtree_has_present(c, present))
+    }
+    fn missing(field: &Field, fragment: &Fragment) -> Error {
+        Error::invalid_input(format!(
+            "Fragment {} does not contain non-nullable field \"{}\" (id {}); \
+             appending data that omits a non-nullable column is not allowed",
+            fragment.id, field.name, field.id
+        ))
+    }
+    fn check(
+        fields: &[Field],
+        required_path: bool,
+        present: &HashSet<i32>,
+        fragment: &Fragment,
+    ) -> Result<()> {
+        for field in fields {
+            let required = required_path && !field.nullable;
+            if field.children.is_empty() {
+                if required && field.id >= 0 && !present.contains(&field.id) {
+                    return Err(missing(field, fragment));
+                }
+            } else {
+                // The container (struct/list) is present iff some id in its subtree
+                // is physically stored; a bare structural header does not qualify
+                // because `DataFile::schema` already excludes it from `present`.
+                if required && !subtree_has_present(field, present) {
+                    return Err(missing(field, fragment));
+                }
+                check(&field.children, required, present, fragment)?;
+            }
+        }
+        Ok(())
+    }
+
     for fragment in fragments {
+        let mut present: HashSet<i32> = HashSet::new();
         for data_file in &fragment.files {
-            if data_file.fields.iter().len() == 0 {
+            // validate that each data file at least contains one field.
+            if data_file.fields.is_empty() {
                 return Err(Error::invalid_input(format!(
                     "Datafile {} does not contain any fields",
                     data_file.path
                 )));
             }
+            present.extend(data_file.schema(schema).fields_pre_order().map(|f| f.id));
         }
+        check(&schema.fields, true, &present, fragment)?;
     }
     Ok(())
 }
@@ -912,7 +972,7 @@ fn merge_schema_valid(
             )));
         }
         if let Some(changes) = shared_field_binding_changes(prior_field, field)
-            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, field.id)
+            && !is_field_binding_fully_rewritten(manifest, &new_fragment_map, prior_field, field)
         {
             return Err(Error::invalid_input(format!(
                 "Merge operation changes field id {} (\"{}\") without rewriting it in \
@@ -988,27 +1048,37 @@ fn file_materializes_field(file_field_ids: &[i32], field: &Field) -> bool {
 fn is_field_binding_fully_rewritten(
     manifest: &Manifest,
     new_fragment_map: &HashMap<u64, &Fragment>,
-    field_id: i32,
+    prior_field: &Field,
+    proposed_field: &Field,
 ) -> bool {
+    // Match the sibling file_materializes_field: STABLE files record only leaf
+    // ids (no struct parent ids), so a plain contains() on a struct's own id
+    // would report a fully-rewritten merge as unmaterialized and reject it.
+    //
+    // The two sides use different fields on purpose. A new file has to carry
+    // data for the binding being proposed, and the files that have to be gone
+    // are the ones carrying the prior binding.
+    let materializes_proposed =
+        |file: &crate::format::DataFile| file_materializes_field(&file.fields, proposed_field);
+    let materializes_prior =
+        |file: &crate::format::DataFile| file_materializes_field(&file.fields, prior_field);
+
     manifest.fragments.iter().all(|prior_fragment| {
         let Some(new_fragment) = new_fragment_map.get(&prior_fragment.id) else {
             return false;
         };
 
-        let is_materialized = new_fragment
-            .files
-            .iter()
-            .any(|file| file.fields.contains(&field_id));
+        let is_materialized = new_fragment.files.iter().any(&materializes_proposed);
         if !is_materialized {
             return false;
         }
 
         prior_fragment
             .referenced_lance_files()
-            .filter(|file| file.fields.contains(&field_id))
+            .filter(|file| materializes_prior(file))
             .all(|prior_file| {
                 !new_fragment.referenced_lance_files().any(|new_file| {
-                    new_file.fields.contains(&field_id)
+                    materializes_proposed(new_file)
                         && new_file.base_id == prior_file.base_id
                         && new_file.path == prior_file.path
                 })
@@ -1158,6 +1228,252 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_modern_valid_rejects_missing_non_nullable_field() {
+        // Schema: id (NOT NULL, id=0), c (NOT NULL, id=1).
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("c", DataType::Boolean, false),
+        ]))
+        .unwrap();
+
+        // A V2 file that physically stores only "id" (column 0) omits the
+        // non-nullable "c" -> commit must be rejected.
+        let missing = DataFile::new(
+            "f.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let mut frag = Fragment::new(0);
+        frag.files.push(missing);
+        let err = schema_fragments_modern_valid(&schema, std::slice::from_ref(&frag)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-nullable field") && msg.contains("\"c\""),
+            "unexpected error: {msg}"
+        );
+
+        // Storing both columns is accepted.
+        let full = DataFile::new(
+            "f.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let mut ok = Fragment::new(0);
+        ok.files.push(full);
+        schema_fragments_modern_valid(&schema, &[ok]).unwrap();
+    }
+
+    #[test]
+    fn test_modern_valid_allows_missing_nullable_field() {
+        // Schema: id (NOT NULL, id=0), opt (nullable, id=1).
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("opt", DataType::Int32, true),
+        ]))
+        .unwrap();
+
+        // Omitting a nullable column is the subschema-insert contract (#3041).
+        let file = DataFile::new(
+            "f.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let mut frag = Fragment::new(0);
+        frag.files.push(file);
+        schema_fragments_modern_valid(&schema, &[frag]).unwrap();
+    }
+
+    #[test]
+    fn test_modern_valid_packed_struct() {
+        // A packed struct maps to a single physical column that carries its whole
+        // subtree, so storing only the parent column must NOT reject the
+        // non-nullable child.
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "p",
+                DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+                false,
+            )
+            .with_metadata(HashMap::from([("packed".to_string(), "true".to_string())])),
+        ]))
+        .unwrap();
+        assert!(schema.fields[0].is_packed_struct());
+        let p_id = schema.fields[0].id;
+
+        let file = DataFile::new(
+            "packed.lance",
+            vec![p_id],
+            vec![0],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(file);
+        schema_fragments_modern_valid(&schema, &[fragment]).unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::all_fields(vec![vec![0, 2, 3]], true, None)]
+    #[case::missing_required_column(vec![vec![2, 3]], true, Some("id"))]
+    #[case::missing_required_child(vec![vec![0, 3]], false, Some("required"))]
+    #[case::missing_nullable_child(vec![vec![0, 2]], true, None)]
+    #[case::missing_nullable_parent(vec![vec![0]], true, None)]
+    #[case::missing_required_parent(vec![vec![0]], false, Some("value"))]
+    #[case::split_files(vec![vec![0, 2], vec![3]], true, None)]
+    #[case::empty_fragment(vec![], true, Some("id"))]
+    fn test_modern_append_field_coverage(
+        #[case] file_fields: Vec<Vec<i32>>,
+        #[case] parent_nullable: bool,
+        #[case] missing_field: Option<&str>,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        // A struct child is required only when it and all of its ancestors are
+        // non-nullable, so coverage comes from the files' physical schema.
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "value",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("required", DataType::Int32, false),
+                        ArrowField::new("optional", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                parent_nullable,
+            ),
+        ]))
+        .unwrap();
+        let make_file = |file_schema: &LanceSchema| {
+            let (fields, column_indices) =
+                lance_file::versions::data_file_columns(version, file_schema);
+            DataFile::new("data.lance", fields, column_indices, version, None, None)
+        };
+        let mut complete = Fragment::new(1);
+        complete.files.push(make_file(&schema));
+        let mut partial = Fragment::new(2);
+        partial.files = file_fields
+            .iter()
+            .map(|fields| make_file(&schema.project_by_ids(fields, false)))
+            .collect();
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(version),
+            HashMap::new(),
+        );
+        let result = validate_operation(
+            Some(&manifest),
+            &Operation::Append {
+                fragments: vec![complete, partial],
+            },
+        );
+        if let Some(missing_field) = missing_field {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("Fragment 2"), "{message}");
+            assert!(message.contains(missing_field), "{message}");
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::v2_0(ConcreteFileVersion::V2_0, vec![0, 1, 2])]
+    #[case::v2_1(ConcreteFileVersion::V2_1, vec![0, -1, 1])]
+    fn test_modern_rejects_structural_header_without_child(
+        #[case] version: ConcreteFileVersion,
+        #[case] columns: Vec<i32>,
+    ) {
+        // id(0), p(1){ x(2) NOT NULL, y(3) NULL } NOT NULL
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "p",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("x", DataType::Int32, false),
+                        ArrowField::new("y", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ]))
+        .unwrap();
+        // The file stores id, the struct header, and p.y -- but NOT required p.x.
+        // A bare structural header (V2.0) or retained id (V2.1 column_index=-1)
+        // must not count as coverage of its children.
+        let file = DataFile::new("partial.lance", vec![0, 1, 3], columns, version, None, None);
+        assert!(!schema.fields[1].is_packed_struct());
+        assert!(file.schema(&schema).field_by_id(2).is_none());
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(1);
+        fragment.files.push(file);
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(version),
+            HashMap::new(),
+        );
+        let operation = Operation::Append {
+            fragments: vec![fragment],
+        };
+        let err = validate_operation(Some(&manifest), &operation).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("\"x\""), "{err}");
+    }
+
+    #[test]
+    fn test_modern_rejects_placeholder_container() {
+        // id(0), p(1){ optional(2) NULL } NOT NULL
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "p",
+                DataType::Struct(vec![ArrowField::new("optional", DataType::Int32, true)].into()),
+                false,
+            ),
+        ]))
+        .unwrap();
+        // p(1) is retained only as a placeholder (column_index=-1) and 99 is an
+        // obsolete id; DataFile::schema omits p, so the NOT NULL container has no
+        // physical data and must be rejected.
+        let file = DataFile::new(
+            "retained.lance",
+            vec![0, 1, 99],
+            vec![0, -1, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        assert!(file.schema(&schema).field_by_id(1).is_none());
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(1);
+        fragment.files.push(file);
+        let err = schema_fragments_modern_valid(&schema, &[fragment]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("\"p\""), "{err}");
+    }
+
     fn activated_manifest() -> Manifest {
         let schema = one_field_schema();
         let mut manifest = manifest_with_file_fields(schema, vec![0]);
@@ -1238,6 +1554,29 @@ mod tests {
                     .contains("greater than the high-water mark 0")
             );
         }
+    }
+
+    #[test]
+    fn resolve_new_table_overwrite_keeps_supplied_field_ids() {
+        let mut schema = one_field_schema();
+        schema.fields[0].id = 5;
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![5])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        resolve_arrow_field_ids(None, &mut operation).unwrap();
+
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = operation
+        else {
+            unreachable!();
+        };
+        assert_eq!(schema.fields[0].id, 5);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[5]);
     }
 
     #[test]
@@ -1475,6 +1814,31 @@ mod tests {
         assert_eq!(fragments[0].files[1].fields.as_ref(), &[2]);
     }
 
+    /// The files already use the replacement IDs (`b`=1, `c`=2) but the schema
+    /// supplies them swapped, so remapping would swap the columns.
+    #[test]
+    fn canonicalize_overwrite_rejects_supplied_ids_that_permute_written_ones() {
+        let manifest = activated_manifest();
+        let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        schema.fields[0].id = 2;
+        schema.fields[1].id = 1;
+        let mut operation = Operation::Overwrite {
+            fragments: vec![fragment_with_file_fields(0, "new.lance", vec![1, 2])],
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+
+        let err =
+            canonicalize_non_reusable_field_ids(Some(&manifest), &mut operation, None).unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
     #[test]
     fn canonicalize_overwrite_rejects_ambiguous_raw_field_ids() {
         let manifest = activated_manifest();
@@ -1494,7 +1858,7 @@ mod tests {
 
         let err = resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
-        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
+        assert!(err.to_string().contains("ambiguous field IDs"));
     }
 
     #[test]
@@ -1642,7 +2006,7 @@ mod tests {
 
         let err = resolve_arrow_field_ids(Some(&manifest), &mut operation).unwrap_err();
 
-        assert!(err.to_string().contains("ambiguous raw Arrow field IDs"));
+        assert!(err.to_string().contains("ambiguous field IDs"));
     }
 
     #[test]
@@ -1776,6 +2140,118 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[rstest::rstest]
+    #[case::top_level("address")]
+    #[case::nested("address.inner")]
+    fn test_merge_struct_binding_change_requires_full_rewrite(#[case] path: &str) {
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "address",
+                DataType::Struct(
+                    vec![ArrowField::new(
+                        "inner",
+                        DataType::Struct(
+                            vec![
+                                ArrowField::new("city", DataType::Utf8, false),
+                                ArrowField::new("country", DataType::Utf8, false),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )]
+                    .into(),
+                ),
+                false,
+            ),
+        ]))
+        .unwrap();
+        let fragment = |id, prefix| {
+            let mut fragment = Fragment::new(id);
+            // STABLE files contain leaf ids, omitting both struct ids (1 and 2).
+            fragment.files = vec![
+                DataFile::new(
+                    format!("{prefix}-{id}.lance"),
+                    vec![0, 3],
+                    vec![0, 1],
+                    ConcreteFileVersion::V2_2,
+                    None,
+                    None,
+                ),
+                DataFile::new(
+                    format!("{prefix}-country-{id}.lance"),
+                    vec![4],
+                    vec![0],
+                    ConcreteFileVersion::V2_2,
+                    None,
+                    None,
+                ),
+            ];
+            fragment
+        };
+        let mut prior_fragments = vec![fragment(0, "old"), fragment(1, "old")];
+        prior_fragments[1].overlays.push(DataOverlayFile {
+            data_file: DataFile::new(
+                "old-overlay.lance",
+                vec![4],
+                vec![0],
+                ConcreteFileVersion::V2_2,
+                None,
+                None,
+            ),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        });
+        let manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(prior_fragments.clone()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_2),
+            HashMap::new(),
+        );
+        let mut new_schema = schema;
+        let field_id = new_schema.field(path).unwrap().id;
+        new_schema.mut_field_by_id(field_id).unwrap().nullable = true;
+        let rewritten_fragments = vec![fragment(0, "new"), fragment(1, "new")];
+        let operation = |fragments| Operation::Merge {
+            fragments,
+            schema: new_schema.clone(),
+            preserves_nullability: false,
+        };
+        validate_operation(Some(&manifest), &operation(rewritten_fragments.clone())).unwrap();
+
+        let mut retained_base = rewritten_fragments.clone();
+        retained_base[1].files[1] = prior_fragments[1].files[1].clone();
+        let mut retained_overlay = rewritten_fragments.clone();
+        retained_overlay[1].overlays = prior_fragments[1].overlays.clone();
+        let mut missing_struct = rewritten_fragments.clone();
+        missing_struct[1].files.clear();
+        missing_struct[1].files.push(DataFile::new(
+            "id-only.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_2,
+            None,
+            None,
+        ));
+        let partial_rewrite = vec![rewritten_fragments[0].clone(), prior_fragments[1].clone()];
+        for fragments in [
+            partial_rewrite,
+            retained_base,
+            retained_overlay,
+            missing_struct,
+        ] {
+            let err = validate_operation(Some(&manifest), &operation(fragments)).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(
+                err.to_string().contains(&format!(
+                    "changes field id {field_id} (\"{path}\") without rewriting it in \
+                     every existing fragment: nullable false -> true"
+                )),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -1975,6 +2451,151 @@ mod tests {
             message.contains("assigns id 1 to new field \"b\"") && message.contains("exhausted"),
             "unexpected error: {}",
             message
+        );
+    }
+
+    /// A Merge that changes a struct's own binding (nullability) with every
+    /// fragment fully rewritten must validate on STABLE data, whose files record
+    /// only leaf ids (no struct ids at all).
+    /// is_field_binding_fully_rewritten used a plain contains(&struct_id) and
+    /// rejected such merges; the nested case additionally needs the field looked
+    /// up in the whole schema rather than only among the top-level fields.
+    #[rstest::rstest]
+    #[case::top_level_struct(false)]
+    #[case::nested_struct(true)]
+    fn test_merge_struct_binding_fully_rewritten_stable_files(#[case] nested: bool) {
+        use arrow_schema::Fields;
+
+        // Field ids, top-level case: id=0, address=1, address.city=2.
+        // Nested case: id=0, address=1, address.inner=2, address.inner.city=3.
+        // STABLE files record only the leaves.
+        let leaf_fields = if nested { vec![0, 3] } else { vec![0, 2] };
+
+        let mk_schema = |flip: bool| {
+            let city = ArrowField::new("city", DataType::Utf8, false);
+            // The struct whose own binding changes is the innermost one.
+            let address_children = if nested {
+                vec![ArrowField::new(
+                    "inner",
+                    DataType::Struct(Fields::from(vec![city])),
+                    flip,
+                )]
+            } else {
+                vec![city]
+            };
+            let arrow_schema = ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new(
+                    "address",
+                    DataType::Struct(Fields::from(address_children)),
+                    !nested && flip,
+                ),
+            ]);
+            LanceSchema::try_from(&arrow_schema).unwrap()
+        };
+        let prior_schema = mk_schema(false);
+        let schema = mk_schema(true);
+
+        let mk_fragment = |path: &str| Fragment {
+            id: 0,
+            files: vec![DataFile::new(
+                path,
+                leaf_fields.clone(),
+                (0..leaf_fields.len() as i32).collect(),
+                ConcreteFileVersion::V2_2,
+                None,
+                None,
+            )],
+            physical_rows: Some(10),
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            prior_schema,
+            Arc::new(vec![mk_fragment("old.lance")]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_2),
+            HashMap::new(),
+        );
+
+        let operation = Operation::Merge {
+            fragments: vec![mk_fragment("new.lance")],
+            schema,
+            preserves_nullability: false,
+        };
+        validate_operation(Some(&manifest), &operation).unwrap();
+    }
+
+    /// The rewrite proof has to match new files against the PROPOSED binding.
+    /// A new file that carries only the prior child materializes the prior
+    /// field while holding no data for the proposed one, and accepting that
+    /// would let a binding change through on data that does not have it.
+    #[test]
+    fn test_merge_struct_binding_checks_the_proposed_field() {
+        use arrow_schema::Fields;
+
+        let mk_schema = |child: &str, struct_nullable: bool| {
+            let arrow_schema = ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new(
+                    "address",
+                    DataType::Struct(Fields::from(vec![ArrowField::new(
+                        child,
+                        DataType::Utf8,
+                        false,
+                    )])),
+                    struct_nullable,
+                ),
+            ]);
+            LanceSchema::try_from(&arrow_schema).unwrap()
+        };
+        // prior: id=0, address=1 (not null), address.city=2
+        // proposed: the struct keeps id 1 and flips to nullable, but its child
+        // is a different field (id 5, above max_field_id)
+        let prior_schema = mk_schema("city", false);
+        let mut proposed_schema = mk_schema("zip", true);
+        proposed_schema.fields[1].children[0].id = 5;
+
+        let mk_fragment = |path: &str, fields: Vec<i32>| Fragment {
+            id: 0,
+            files: vec![DataFile::new(
+                path,
+                fields.clone(),
+                (0..fields.len() as i32).collect(),
+                ConcreteFileVersion::V2_2,
+                None,
+                None,
+            )],
+            physical_rows: Some(10),
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            prior_schema,
+            Arc::new(vec![mk_fragment("old.lance", vec![0, 2])]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_2),
+            HashMap::new(),
+        );
+
+        // The replacement file carries the prior leaf only, so it holds nothing
+        // for the proposed binding.
+        let operation = Operation::Merge {
+            fragments: vec![mk_fragment("new.lance", vec![0, 2])],
+            schema: proposed_schema,
+            preserves_nullability: false,
+        };
+        let err = validate_operation(Some(&manifest), &operation)
+            .expect_err("a replacement without data for the proposed binding must be rejected");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("without rewriting it in every existing fragment"),
+            "unexpected error: {err}"
         );
     }
 

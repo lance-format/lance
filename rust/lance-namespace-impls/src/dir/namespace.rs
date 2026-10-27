@@ -1668,8 +1668,9 @@ impl LanceNamespace for DirectoryNamespace {
         request: GetTableStatsRequest,
     ) -> Result<GetTableStatsResponse> {
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let dataset = Arc::new(
-            self.load_dataset(&table_uri, None, "get_table_stats")
+            self.load_branch_dataset(&table_uri, branch, None, "get_table_stats")
                 .await?,
         );
 
@@ -1839,8 +1840,9 @@ impl LanceNamespace for DirectoryNamespace {
     async fn count_table_rows(&self, request: CountTableRowsRequest) -> Result<i64> {
         self.record_op("count_table_rows");
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let dataset = self
-            .load_dataset(&table_uri, request.version, "count_table_rows")
+            .load_branch_dataset(&table_uri, branch, request.version, "count_table_rows")
             .await?;
 
         let count =

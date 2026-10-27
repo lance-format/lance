@@ -1153,10 +1153,11 @@ impl InvertedIndexParams {
                 }
                 Ok(builder)
             }
-            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
-            "icu/split" => {
-                Ok(TextAnalyzer::builder(IcuTokenizer::default().with_simple_split()).dynamic())
-            }
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default().into_streaming()).dynamic()),
+            "icu/split" => Ok(TextAnalyzer::builder(
+                IcuTokenizer::default().with_simple_split().into_streaming(),
+            )
+            .dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,

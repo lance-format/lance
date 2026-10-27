@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::structural_encoder::{
-    FixedWidthDictionaryEncoding, MiniblockChunkSize, PrimitiveEncodeContext,
+    DictionaryEncodingPolicy, MiniblockChunkSize, PrimitiveEncodeContext,
 };
 use super::*;
 use crate::compression::CompressionStrategy;

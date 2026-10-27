@@ -4,8 +4,8 @@
 //! The 2.3 writer chooses structure independently from value storage.
 
 use super::structural_encoder::{
-    ComplexNullEncoding, ConstantPrimitiveEncoding, FixedWidthDictionaryEncoding,
-    MiniblockChunkSize, PrimitiveEncodeAttempt, PrimitiveEncodeContext, PrimitivePageData,
+    ComplexNullEncoding, ConstantPrimitiveEncoding, DictionaryEncodingPolicy, MiniblockChunkSize,
+    PrimitiveEncodeAttempt, PrimitiveEncodeContext, PrimitivePageData,
     PrimitivePageEncodingBehavior, PrimitivePageStructure, PrimitivePlanContext,
 };
 use super::*;
@@ -251,7 +251,7 @@ impl PrimitivePageEncodingBehavior for PlanarPrimitiveEncoding {
             self.compression.clone(),
             MiniblockChunkSize::U32,
             ComplexNullEncoding::CompressedLevels,
-            FixedWidthDictionaryEncoding::Include64Bit,
+            DictionaryEncodingPolicy::Planar,
         )?;
         let PageEncoding::Structural(layout) = encoded.description else {
             return Err(Error::internal(

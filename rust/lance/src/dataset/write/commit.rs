@@ -57,7 +57,7 @@ pub struct CommitBuilder<'a> {
     activate_non_reusable_field_ids: bool,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -84,7 +84,7 @@ impl<'a> CommitBuilder<'a> {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
-            keep_field_ids: false,
+            inherited_field_ids: false,
         }
     }
 
@@ -300,10 +300,10 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Create the dataset with the field ids its schema already carries; see
-    /// [`InsertBuilder::with_table_field_ids`](super::InsertBuilder::with_table_field_ids).
-    pub(crate) fn with_table_field_ids(mut self) -> Self {
-        self.keep_field_ids = true;
+    /// Create the dataset keeping an existing table's field IDs; see
+    /// [`InsertBuilder::with_inherited_field_ids`](super::InsertBuilder::with_inherited_field_ids).
+    pub(crate) fn with_inherited_field_ids(mut self) -> Self {
+        self.inherited_field_ids = true;
         self
     }
 
@@ -514,7 +514,7 @@ impl<'a> CommitBuilder<'a> {
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
                 session.clone(),
-                self.keep_field_ids,
+                self.inherited_field_ids,
             )
             .await?
         };
@@ -680,13 +680,13 @@ mod tests {
             .execute(transaction)
             .await
             .unwrap();
-        assert_eq!(dataset.schema().field("a").unwrap().id, 0);
+        assert_eq!(dataset.schema().field("a").unwrap().id, 42);
         assert_eq!(dataset.schema().metadata, metadata);
         let committed = dataset.read_transaction().await.unwrap().unwrap();
         let Operation::Overwrite { schema, .. } = committed.operation else {
             panic!("expected Overwrite");
         };
-        assert_eq!(schema.field("a").unwrap().id, 0);
+        assert_eq!(schema.field("a").unwrap().id, 42);
         assert_eq!(schema.metadata, metadata);
     }
 
@@ -748,6 +748,7 @@ mod tests {
                 file_major_version: major_version,
                 file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),
+                file_metadata_size_bytes: None,
                 base_id: None,
             }],
             overlays: vec![],

@@ -60,12 +60,15 @@ const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
+/// Default for `DICT_MAX_SIZE_META_KEY`.
+const DEFAULT_DICT_MAX_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 
 /// Largest level count a direct legacy u16-value/U8-run RLE frame can prove.
 ///
 /// Mini-block level payload sizes are u16. After the eight-byte frame header, each run needs a
 /// two-byte value and a one-byte length, and each U8 run can represent at most 255 levels.
+/// It also bounds out-of-line bitpacked levels, which pack at least one bit per level.
 const MAX_LEGACY_RLE_LEVELS: u64 = ((u16::MAX as u64 - std::mem::size_of::<u64>() as u64)
     / (std::mem::size_of::<u16>() as u64 + std::mem::size_of::<u8>() as u64))
     * u8::MAX as u64;
