@@ -10,10 +10,10 @@
 //! Reading is fail-closed: an action this build does not recognize is an error,
 //! never a silently skipped element. The commit path collects concurrent
 //! transactions with `try_collect`, so a transaction carrying an unknown action
-//! must abort the commit rather than be treated as a no-op. An unrecognized
-//! action is either one this build does not implement yet or one from a newer
-//! Lance -- which protobuf decodes as no variant at all, since it drops the
-//! field it does not know.
+//! must abort the commit rather than be treated as a no-op. Every specified action
+//! is implemented, so an unrecognized one can only come from a newer Lance --
+//! which protobuf decodes as no variant at all, since it drops the field it does
+//! not know.
 
 use super::{Action, CompositeOperation, FieldRef, Ref, UserStep};
 use crate::format::pb_actions;
@@ -159,16 +159,10 @@ macro_rules! define_action_proto {
                     $(Some(pb_actions::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
-                    // The fragment reuse actions are specified but not yet
-                    // implemented. Reject rather than skip: silently dropping
-                    // an action would apply a partial transaction.
-                    Some(other) => Err(Error::not_supported(format!(
-                        "the action-based transaction uses action {other:?}, which is specified \
-                         but not implemented by this version of Lance",
-                    ))),
                     // An action written by a newer Lance decodes to no known
                     // variant, because protobuf drops the field it does not
-                    // know. Reject for the same reason.
+                    // know. Reject rather than skip: silently dropping an
+                    // action would apply a partial transaction.
                     None => Err(Error::not_supported(
                         "an Action in a user operation carried no change this version of Lance \
                          understands; it was either empty or written by a newer version",

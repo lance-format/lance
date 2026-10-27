@@ -4794,4 +4794,422 @@ mod composite {
 
         commit_expecting_conflict(&dropped, read_version, stale_append).await;
     }
+
+    /// The fragment reuse actions against a real dataset, and how index
+    /// builds race the compactions that record them.
+    mod frag_reuse {
+        use super::*;
+        use crate::dataset::WriteMode;
+        use lance_core::utils::address::RowAddress;
+        use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+        use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use lance_table::transaction::action::{
+            AppendFragReuseTransition, FragReuseMapping, TrimFragReuse,
+        };
+        use roaring::RoaringTreemap;
+
+        const ROWS_PER_FRAGMENT: i32 = 5;
+
+        /// Four fragments of five rows; `a` runs 0..20 in fragment order.
+        async fn four_fragments() -> Dataset {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+            let data = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int32Array::from_iter_values(
+                    0..4 * ROWS_PER_FRAGMENT,
+                ))],
+            )
+            .unwrap();
+            InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                    ..Default::default()
+                })
+                .execute(vec![data])
+                .await
+                .unwrap()
+        }
+
+        /// Rewrite `sources` into one new fragment holding their rows in scan
+        /// order, recording the move as a transition when asked.
+        async fn compaction(
+            dataset: &Dataset,
+            sources: &[u64],
+            record_transition: bool,
+        ) -> Vec<Action> {
+            let fragments = sources
+                .iter()
+                .map(|id| {
+                    dataset
+                        .fragments()
+                        .iter()
+                        .find(|fragment| fragment.id == *id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut scan = dataset.scan();
+            scan.with_fragments(fragments.clone());
+            let batch = scan.try_into_batch().await.unwrap();
+            let written = InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 1 << 20,
+                    ..Default::default()
+                })
+                .execute_uncommitted(vec![batch])
+                .await
+                .unwrap();
+            let Operation::Append { fragments: written } = written.operation else {
+                unreachable!()
+            };
+            let [written] = written.as_slice() else {
+                panic!("the rows fit one fragment");
+            };
+
+            let mut actions: Vec<Action> = sources
+                .iter()
+                .map(|source| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(*source),
+                        data_change: false,
+                    })
+                })
+                .collect();
+            actions.push(Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: written.physical_rows.unwrap() as u64,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: false,
+            }));
+            for file in &written.files {
+                actions.push(Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    field_ids: file
+                        .fields
+                        .iter()
+                        .copied()
+                        .map(FieldRef::Committed)
+                        .collect(),
+                    file: without_fields(file.clone()),
+                    data_change: false,
+                    base: None,
+                }));
+            }
+            if record_transition {
+                let mut survivors = RoaringTreemap::new();
+                for fragment in &fragments {
+                    for offset in 0..fragment.physical_rows.unwrap() as u32 {
+                        survivors
+                            .insert(RowAddress::new_from_parts(fragment.id as u32, offset).into());
+                    }
+                }
+                let mut changed_row_addrs = Vec::new();
+                survivors.serialize_into(&mut changed_row_addrs).unwrap();
+                actions.push(Action::AppendFragReuseTransition(
+                    AppendFragReuseTransition {
+                        sources: sources.iter().copied().map(Ref::Committed).collect(),
+                        destinations: vec![Ref::Local(0)],
+                        mapping: FragReuseMapping::OrderedCompaction(pb_fri::OrderedCompaction {
+                            changed_row_addrs,
+                        }),
+                    },
+                ));
+            }
+            actions
+        }
+
+        /// A B-tree segment of `a_idx` over `fragments`, built at `dataset`'s
+        /// version and not yet committed.
+        async fn build_segment(dataset: &Dataset, fragments: Vec<u32>) -> IndexMetadata {
+            let mut dataset = dataset.clone();
+            dataset
+                .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("a_idx".into())
+                .fragments(fragments)
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        }
+
+        fn newest_fragment(dataset: &Dataset) -> u32 {
+            dataset.fragments().iter().map(|f| f.id).max().unwrap() as u32
+        }
+
+        /// The number of transitions the history records, or `None` without one.
+        async fn recorded_transitions(dataset: &Dataset) -> Option<usize> {
+            let indices = load_all_indices(dataset).await.unwrap();
+            let entry = indices
+                .iter()
+                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)?;
+            let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry)
+                .await
+                .unwrap();
+            Some(ledger.transitions().len())
+        }
+
+        /// Every value of `a` that should be there is found exactly once,
+        /// whether the index or a scan answers.
+        async fn assert_each_value_once(dataset: &Dataset, values: std::ops::Range<i32>) {
+            for value in values.clone() {
+                assert_eq!(
+                    dataset
+                        .count_rows(Some(format!("a = {value}")))
+                        .await
+                        .unwrap(),
+                    1,
+                    "a = {value}"
+                );
+            }
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!(
+                        "a >= {} AND a < {}",
+                        values.start, values.end
+                    )))
+                    .await
+                    .unwrap(),
+                values.len()
+            );
+        }
+
+        /// How many rows the index alone returns for `a = value`: a fast
+        /// search skips every fragment no segment serves.
+        async fn indexed_matches(dataset: &Dataset, value: i32) -> usize {
+            let mut scan = dataset.scan();
+            scan.filter(&format!("a = {value}"))
+                .unwrap()
+                .fast_search()
+                .project(&["a"])
+                .unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+
+        /// Removal isn't staleness: an index build and a compaction of the
+        /// fragments it covers both commit, in either order, with or without
+        /// a transition. With one the segment translates onto the
+        /// destination; without one it loses that coverage and the rows are
+        /// scanned. Either way every row is found once.
+        #[rstest::rstest]
+        #[case::build_lands_first_with_transition(true, true)]
+        #[case::build_lands_first_without_transition(true, false)]
+        #[case::compaction_lands_first_with_transition(false, true)]
+        #[case::compaction_lands_first_without_transition(false, false)]
+        #[tokio::test]
+        async fn test_an_index_build_and_a_compaction_both_commit(
+            #[case] build_lands_first: bool,
+            #[case] record_transition: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let compact = compaction(&dataset, &[0, 1], record_transition).await;
+
+            let dataset = if build_lands_first {
+                let dataset = commit(dataset, vec![add_built_segment(segment)]).await;
+                drop(dataset);
+                commit_from_stale(stale, compact).await.unwrap()
+            } else {
+                let dataset = commit(dataset, compact).await;
+                drop(dataset);
+                commit_from_stale(stale, vec![add_built_segment(segment)])
+                    .await
+                    .unwrap()
+            };
+
+            let destination = newest_fragment(&dataset);
+            let served = dataset
+                .load_indices_by_name("a_idx")
+                .await
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment.fragment_bitmap.clone().unwrap_or_default())
+                .collect::<RoaringBitmap>();
+            assert_eq!(
+                served.contains(destination),
+                record_transition,
+                "{served:?}"
+            );
+            if record_transition {
+                for value in 0..2 * ROWS_PER_FRAGMENT {
+                    assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+                }
+            }
+            assert_eq!(
+                recorded_transitions(&dataset).await.is_some(),
+                record_transition
+            );
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// Deleting a whole covered fragment is a removal too, and does not
+        /// fence a concurrent build either.
+        #[tokio::test]
+        async fn test_an_index_build_survives_a_whole_fragment_deletion() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let deleted = commit(
+                dataset,
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(0),
+                    data_change: true,
+                })],
+            )
+            .await;
+            drop(deleted);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(segment)])
+                .await
+                .unwrap();
+
+            assert_eq!(dataset.count_rows(Some("a < 5".into())).await.unwrap(), 0);
+            assert_each_value_once(&dataset, ROWS_PER_FRAGMENT..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A column written into a committed fragment dies with the fragment,
+        /// so that write still conflicts with the fragment's removal.
+        #[tokio::test]
+        async fn test_a_column_written_into_a_fragment_conflicts_with_its_removal() {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let new_column = vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: int32_field("b"),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(0),
+                    file: existing_data_file(&dataset, 0),
+                    field_ids: vec![FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ];
+            let compacted = commit(dataset, compaction_without_files(&[0])).await;
+
+            commit_expecting_conflict(&compacted, read_version, new_column).await;
+        }
+
+        /// The removal half of a compaction, which is all a conflict test
+        /// needs.
+        fn compaction_without_files(sources: &[u64]) -> Vec<Action> {
+            sources
+                .iter()
+                .map(|source| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(*source),
+                        data_change: false,
+                    })
+                })
+                .collect()
+        }
+
+        /// Compactions of disjoint fragments both record their transitions;
+        /// compactions sharing a source conflict through its removal.
+        #[rstest::rstest]
+        #[case::disjoint_sources(&[2, 3], true)]
+        #[case::shared_source(&[1, 2], false)]
+        #[tokio::test]
+        async fn test_two_compactions_recording_transitions(
+            #[case] theirs: &[u64],
+            #[case] both_commit: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let stale = compaction(&dataset, theirs, true).await;
+            let first = commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+
+            if !both_commit {
+                commit_expecting_conflict(&first, read_version, stale).await;
+                return;
+            }
+            let second = commit_from_stale(Arc::new(dataset), stale).await.unwrap();
+            assert_eq!(recorded_transitions(&second).await, Some(2));
+            assert_each_value_once(&second, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A trim planned before a compaction landed judges the history it
+        /// lands on, so the compaction's transition, still needed by the
+        /// index over its sources, survives. Neither conflicts.
+        #[tokio::test]
+        async fn test_a_trim_keeps_a_transition_appended_concurrently() {
+            let dataset = four_fragments().await;
+            let segment = build_segment(&dataset, vec![0, 1, 2, 3]).await;
+            let dataset = commit(dataset, vec![add_built_segment(segment)]).await;
+            let stale = Arc::new(dataset.clone());
+            let compacted =
+                commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+            drop(compacted);
+
+            let trimmed = commit_from_stale(stale, vec![Action::TrimFragReuse(TrimFragReuse {})])
+                .await
+                .unwrap();
+
+            assert_eq!(recorded_transitions(&trimmed).await, Some(1));
+            assert_each_value_once(&trimmed, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A trim that drops a transition an in-flight build will need costs
+        /// that build its coverage of the moved rows, not correctness: both
+        /// commit and the rows are scanned.
+        #[tokio::test]
+        async fn test_a_trim_racing_an_index_build_loses_coverage_not_rows() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let compacted =
+                commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+            let trimmed = commit(compacted, vec![Action::TrimFragReuse(TrimFragReuse {})]).await;
+            assert_eq!(recorded_transitions(&trimmed).await, None);
+            drop(trimmed);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(segment)])
+                .await
+                .unwrap();
+
+            let served = dataset.load_indices_by_name("a_idx").await.unwrap();
+            assert!(
+                served.iter().all(|segment| !segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(newest_fragment(&dataset)))),
+                "{served:?}"
+            );
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A segment built late over a compacted source and a newer one built
+        /// over its destination both cover the moved rows once the history is
+        /// applied. The reader gives direct
+        /// coverage precedence, so no row is counted twice.
+        #[tokio::test]
+        async fn test_a_late_source_segment_beside_a_destination_segment_counts_rows_once() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let late = build_segment(&dataset, vec![1]).await;
+            let compacted = commit(dataset.clone(), compaction(&dataset, &[1], true).await).await;
+            let destination = newest_fragment(&compacted);
+            let direct = build_segment(&compacted, vec![destination]).await;
+            let indexed = commit(compacted, vec![add_built_segment(direct)]).await;
+            drop(indexed);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(late)])
+                .await
+                .unwrap();
+
+            let stored = load_all_indices(&dataset).await.unwrap();
+            assert_eq!(
+                stored.iter().filter(|index| index.name == "a_idx").count(),
+                2
+            );
+            for value in ROWS_PER_FRAGMENT..2 * ROWS_PER_FRAGMENT {
+                assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+            }
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+    }
 }

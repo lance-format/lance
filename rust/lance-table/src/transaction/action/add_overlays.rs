@@ -44,6 +44,15 @@ impl AddOverlays {
                  the flag would only hide the change from consumers that skip non-data commits",
             ));
         }
+        // The same refusal the legacy DataOverlay meets on such a table: the
+        // read path does not yet mask overlaid cells out of segments that
+        // translate into the fragment.
+        if state.carries_tagged_history() {
+            return Err(Error::not_supported(
+                "AddOverlays is not supported on a table with a tagged fragment reuse history \
+                 yet; trim the history or rebuild the indices that translate through it first",
+            ));
+        }
         let fragment_id = state.resolve_fragment(self.fragment)?;
         let committed_version = state.new_version();
         let refreshes_lineage = state.uses_stable_row_ids() && self.fragment.committed().is_some();
