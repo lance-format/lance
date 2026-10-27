@@ -17,8 +17,9 @@ regresses to a plain ``int``.
 """
 
 from pathlib import Path
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
+import lance
 import pyarrow as pa
 from lance.fragment import FragmentMetadata, LanceFragment, write_fragments
 
@@ -57,3 +58,20 @@ def test_fragment_create_accepts_none_max_rows_per_group(tmp_path: Path) -> None
         str(tmp_path / "create"), table, max_rows_per_group=None
     )
     assert fragment.physical_rows == 8
+
+
+def test_update_columns_from_stream_overloads(tmp_path: Path) -> None:
+    dataset = lance.write_dataset(pa.table({"a": range(4)}), str(tmp_path / "ds"))
+    fragment = dataset.get_fragments()[0]
+    rows = fragment.to_table(columns=["a"], with_row_address=True)
+    values = pa.table({"_rowaddr": rows["_rowaddr"], "a": rows["a"]})
+
+    plain: Tuple[FragmentMetadata, List[int]] = fragment.update_columns_from_stream(
+        values
+    )
+    assert plain[0].id == fragment.fragment_id
+
+    with_offsets: Tuple[FragmentMetadata, List[int], bytes] = (
+        fragment.update_columns_from_stream(values, with_offsets=True)
+    )
+    assert len(with_offsets[2]) > 0
