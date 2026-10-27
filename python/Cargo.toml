@@ -105,8 +105,5 @@ debug-assertions = false
 strip = "debuginfo"
 incremental = false
 
-[patch.crates-io]
-object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }
-
 [lints.clippy]
 disallowed_macros = "deny"
