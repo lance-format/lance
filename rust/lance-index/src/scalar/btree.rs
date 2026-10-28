@@ -52,8 +52,10 @@ use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion_common::hash_utils::{RandomState, with_hashes};
+use datafusion_common::utils::normalize_float_zero;
 use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
@@ -723,6 +725,30 @@ where
     }
 }
 
+/// Comparator for floating-point page bounds. DataFusion normalizes `-0.0` to
+/// `+0.0` before comparison, so the page search must use the same equality.
+fn primitive_float_cmp<'a, T>(
+    left: &'a PrimitiveArray<T>,
+    right: &'a PrimitiveArray<T>,
+) -> impl Fn(usize, usize) -> Ordering + 'a
+where
+    T: ArrowPrimitiveType,
+{
+    let canonical = |value: T::Native| {
+        if value.is_zero() {
+            T::Native::ZERO
+        } else {
+            value
+        }
+    };
+    move |i, j| match (left.is_null(i), right.is_null(j)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => canonical(left.value(i)).compare(canonical(right.value(j))),
+    }
+}
+
 /// Satisfies scalar queries by searching the `page_lookup.lance` batch directly.
 ///
 /// The batch holds one row per page with columns `min | max | null_count | page_idx`,
@@ -908,9 +934,9 @@ impl BTreeLookup {
             UInt16 => self.scan_native::<UInt16Type>(mins, maxs, query, page_ids),
             UInt32 => self.scan_native::<UInt32Type>(mins, maxs, query, page_ids),
             UInt64 => self.scan_native::<UInt64Type>(mins, maxs, query, page_ids),
-            Float16 => self.scan_native::<Float16Type>(mins, maxs, query, page_ids),
-            Float32 => self.scan_native::<Float32Type>(mins, maxs, query, page_ids),
-            Float64 => self.scan_native::<Float64Type>(mins, maxs, query, page_ids),
+            Float16 => self.scan_float::<Float16Type>(mins, maxs, query, page_ids),
+            Float32 => self.scan_float::<Float32Type>(mins, maxs, query, page_ids),
+            Float64 => self.scan_float::<Float64Type>(mins, maxs, query, page_ids),
             Decimal128(_, _) => self.scan_native::<Decimal128Type>(mins, maxs, query, page_ids),
             Decimal256(_, _) => self.scan_native::<Decimal256Type>(mins, maxs, query, page_ids),
             Utf8 => Ok(self.scan_accessor(
@@ -967,6 +993,28 @@ impl BTreeLookup {
             primitive_cmp(&mins, &query),
             primitive_cmp(&maxs, &query),
             primitive_cmp(&mins, &mins),
+        ))
+    }
+
+    /// Floating-point variant of [`Self::scan_native`] that treats both signed
+    /// zero encodings as equal, matching DataFusion's comparison semantics.
+    fn scan_float<K: ArrowPrimitiveType>(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        let mins = reinterpret_primitive::<K>(mins)?;
+        let maxs = reinterpret_primitive::<K>(maxs)?;
+        let query = reinterpret_primitive::<K>(query)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            primitive_float_cmp(&mins, &query),
+            primitive_float_cmp(&maxs, &query),
+            primitive_float_cmp(&mins, &mins),
         ))
     }
 
@@ -1673,6 +1721,10 @@ struct PageKeyMatches {
 impl KeysByValue {
     /// Group the non-null entries of `keys` by value; null keys match nothing.
     fn try_new(keys: ArrayRef) -> Result<Self> {
+        // DataFusion normalizes signed zeros before equality comparisons. Doing
+        // the same here keeps both the hash and comparator consistent with
+        // `search(Equals)`.
+        let keys = normalize_float_zero(&keys);
         let random_state = RandomState::default();
         let mut table: HashTable<(u64, u32)> = HashTable::new();
         let mut groups: Vec<Vec<u32>> = Vec::new();
@@ -1704,12 +1756,13 @@ impl KeysByValue {
 
     /// The page rows whose value equals some key.
     fn match_page(&self, values: &ArrayRef, rows: &UInt64Array) -> Result<PageKeyMatches> {
-        let value_eq = make_comparator(values, &self.keys, SortOptions::default())?;
+        let values = normalize_float_zero(values);
+        let value_eq = make_comparator(&values, &self.keys, SortOptions::default())?;
         let mut matches = PageKeyMatches {
             rows: Vec::new(),
             groups: Vec::new(),
         };
-        with_hashes([values], &self.random_state, |hashes| {
+        with_hashes([&values], &self.random_state, |hashes| {
             for idx in (0..values.len()).filter(|idx| values.is_valid(*idx)) {
                 if let Some(&(_, group)) = self.table.find(hashes[idx], |&(_, group)| {
                     value_eq(idx, self.groups[group as usize][0] as usize).is_eq()
@@ -2144,6 +2197,7 @@ impl BTreeIndex {
             &query.to_expr(BTREE_VALUES_COLUMN.to_string()),
             &df_schema,
             &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
         )?)
     }
 
@@ -4684,6 +4738,24 @@ mod tests {
                 .collect();
             assert_eq!(looked_up, searched, "key {key:?}");
         }
+    }
+
+    /// Each signed zero occupies its own page, so lookup also has to select both
+    /// pages before matching values.
+    #[tokio::test]
+    async fn test_lookup_signed_zero_across_pages() {
+        let values: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..128).map(|idx| if idx < 64 { -0.0 } else { 0.0 }),
+        ));
+        let row_ids = (0..128).map(|idx| 1000 + idx).collect::<Vec<u64>>();
+        let (_tmpdir, index) =
+            train_lookup_index(&values, &row_ids, &LanceCache::no_cache(), true).await;
+
+        let keys: ArrayRef = Arc::new(Float64Array::from(vec![0.0, -0.0]));
+        let expected = (0..2_u32)
+            .flat_map(|key_idx| row_ids.iter().map(move |row_id| (key_idx, *row_id)))
+            .collect::<Vec<_>>();
+        assert_eq!(lookup_pairs(index.as_ref(), keys).await, expected);
     }
 
     #[tokio::test]

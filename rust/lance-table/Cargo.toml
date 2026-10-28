@@ -31,6 +31,7 @@ bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 log.workspace = true
+num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -54,6 +55,7 @@ criterion.workspace = true
 pretty_assertions.workspace = true
 proptest.workspace = true
 rstest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 prost-build.workspace = true

@@ -536,6 +536,14 @@ impl SimpleStructDecoder {
 }
 
 impl LogicalPageDecoder for SimpleStructDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        self.children
+            .iter()
+            .flat_map(|child| child.scheduled.iter())
+            .filter_map(|decoder| decoder.max_dictionary_rows())
+            .min()
+    }
+
     fn accept_child(&mut self, mut child: DecoderReady) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();

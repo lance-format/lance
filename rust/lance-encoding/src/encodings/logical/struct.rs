@@ -338,6 +338,13 @@ impl StructuralStructDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        self.children
+            .iter()
+            .filter_map(|child| child.max_dictionary_rows())
+            .min()
+    }
+
     fn accept_page(&mut self, mut child: LoadedPageShard) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();

@@ -329,6 +329,12 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
 
+    /// Maximum batch rows needed to rebuild an oversized stored dictionary with
+    /// its declared key type. `None` leaves normal dictionary batches unchanged.
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns how many of the requested rows can be decoded into one Arrow array
     /// while keeping every i32 offset buffer within `byte_budget` bytes.
     ///
@@ -1717,6 +1723,12 @@ impl BatchDecodeStream {
         );
         self.root_decoder.wait_for_loaded(loaded_need).await?;
 
+        if let Some(limit) = LogicalPageDecoder::max_dictionary_rows(&self.root_decoder) {
+            let clamped = to_take.min(limit);
+            self.rows_remaining += to_take - clamped;
+            to_take = clamped;
+        }
+
         if self.limit_i32_offset_batch_size && has_i32_offsets(self.root_decoder.data_type()) {
             let limit = LogicalPageDecoder::max_rows_to_drain(
                 &self.root_decoder,
@@ -1785,6 +1797,7 @@ trait RootDecoderType {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
     fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
     fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()>;
+    fn max_dictionary_rows(&self) -> Option<u64>;
     /// See [`LogicalPageDecoder::max_rows_to_drain`].  Decoders without i32-offset
     /// accounting place no limit.
     fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
@@ -1795,6 +1808,9 @@ trait RootDecoderType {
     }
 }
 impl RootDecoderType for StructuralStructDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        StructuralFieldDecoder::max_dictionary_rows(self)
+    }
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
         let RootDecoderMessage::LoadedPage(loaded_page) = message else {
             unreachable!()
@@ -1810,6 +1826,9 @@ impl RootDecoderType for StructuralStructDecoder {
     }
 }
 impl RootDecoderType for SimpleStructDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        LogicalPageDecoder::max_dictionary_rows(self)
+    }
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
         let RootDecoderMessage::ArrayPage(array_page) = message else {
             unreachable!()
@@ -1954,6 +1973,12 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
 
         if to_take == 0 {
             return Ok(None);
+        }
+
+        if let Some(limit) = self.root_decoder.max_dictionary_rows() {
+            let clamped = to_take.min(limit);
+            self.rows_remaining += to_take - clamped;
+            to_take = clamped;
         }
 
         let limit = self
@@ -2174,6 +2199,11 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
+        if let Some(limit) = StructuralFieldDecoder::max_dictionary_rows(&self.root_decoder) {
+            let clamped = to_take.min(limit);
+            self.rows_remaining += to_take - clamped;
+            to_take = clamped;
+        }
         let next_task = self.root_decoder.drain_batch_task(to_take)?;
         self.rows_drained += to_take;
         Ok(Some(next_task))
@@ -2724,6 +2754,11 @@ pub fn schedule_and_decode_blocking(
 ///
 /// See [`crate::decoder`] for more information
 pub trait PrimitivePageDecoder: Send + Sync {
+    /// Number of stored dictionary values, if this decoder preserves dictionary encoding.
+    fn dictionary_len(&self) -> Option<u64> {
+        None
+    }
+
     /// Decode data into buffers
     ///
     /// This may be a simple zero-copy from a disk buffer or could involve complex decoding
@@ -3473,6 +3508,11 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
 }
 
 pub trait StructuralPageDecoder: std::fmt::Debug + Send {
+    /// Number of stored dictionary values, if this decoder preserves dictionary encoding.
+    fn dictionary_len(&self) -> Option<u64> {
+        None
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
     fn num_rows(&self) -> u64;
     /// Returns the exact decoded byte count for the next `num_rows` rows
@@ -3521,6 +3561,12 @@ pub trait StructuralDecodeArrayTask: std::fmt::Debug + Send {
 }
 
 pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
+    /// Maximum batch rows needed to rebuild an oversized stored dictionary with
+    /// its declared key type. `None` leaves normal dictionary batches unchanged.
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        None
+    }
+
     /// Add a newly scheduled child decoder
     ///
     /// The default implementation does not expect children and returns

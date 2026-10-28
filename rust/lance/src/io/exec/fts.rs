@@ -9,10 +9,13 @@ use arrow::array::{AsArray, BooleanBuilder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Float32Array, OffsetSizeTrait, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{NullEquality, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, reset_plan_states};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricValue, MetricsSet};
@@ -235,6 +238,13 @@ impl ExecutionPlan for FtsDocumentExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -1193,6 +1203,13 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         vec![Distribution::SinglePartition; self.children().len()]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1544,6 +1561,13 @@ impl ExecutionPlan for CompoundQueryExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2097,6 +2121,13 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2756,6 +2787,13 @@ impl ExecutionPlan for SharedFtsScorerExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
     }
@@ -3355,6 +3393,13 @@ impl ExecutionPlan for MatchQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -3895,6 +3940,13 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -4433,6 +4485,13 @@ impl ExecutionPlan for FlatMatchFilterExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -4488,8 +4547,16 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -4725,6 +4792,13 @@ impl ExecutionPlan for FlatMatchQueryExec {
         // this, EnforceDistribution may round-robin the scan across `target_partitions`
         // and only partition 0 is consumed, silently dropping the other fragments.
         vec![Distribution::SinglePartition; self.children().len()]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -5103,6 +5177,13 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -5599,6 +5680,13 @@ impl ExecutionPlan for PhraseQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -5877,6 +5965,13 @@ impl ExecutionPlan for BoostQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -6152,6 +6247,13 @@ impl ExecutionPlan for BooleanQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -6300,6 +6402,10 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion_physical_expr::PhysicalExpr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -6624,7 +6730,13 @@ mod tests {
         let replaced: Arc<dyn ExecutionPlan> =
             Arc::new(hybrid.with_indexed_input(indexed, scorer).unwrap());
         assert_eq!(replaced.children().len(), 2);
-        assert_eq!(replaced.required_input_distribution().len(), 2);
+        assert_eq!(
+            replaced
+                .input_distribution_requirements()
+                .per_child_distributions()
+                .len(),
+            2
+        );
         // Scanner plans retain execution state, so the comparison needs an
         // independent residual scan over the same immutable dataset snapshot.
         let mut scanner = hybrid.dataset().scan();
@@ -6634,7 +6746,12 @@ mod tests {
             .with_fragments(vec![hybrid.dataset().fragments().last().unwrap().clone()]);
         let mut children = replaced.children().into_iter().cloned().collect::<Vec<_>>();
         children[0] = scanner.create_plan().await.unwrap();
-        let rewritten = replaced.with_new_children(children).unwrap();
+        let rewritten = replaced
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
         let actual = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -6678,7 +6795,12 @@ mod tests {
         assert!(matches!(error, DataFusionError::Plan(_)));
         assert!(error.to_string().contains("bounded limit"));
 
-        let error = Arc::new(hybrid).with_new_children(vec![]).unwrap_err();
+        let error = Arc::new(hybrid)
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("expected 1 children"));
     }
@@ -6714,7 +6836,12 @@ mod tests {
         let replaced: Arc<dyn ExecutionPlan> =
             Arc::new(hybrid.with_indexed_input(input, scorer).unwrap());
         let children = replaced.children().into_iter().cloned().collect();
-        let rewritten = replaced.with_new_children(children).unwrap();
+        let rewritten = replaced
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
         let error = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -6990,8 +7117,8 @@ mod tests {
         assert_eq!(filtered.children().len(), 2);
         assert!(
             filtered
-                .required_input_distribution()
-                .iter()
+                .input_distribution_requirements()
+                .per_child_distributions()
                 .all(|distribution| {
                     matches!(
                         distribution,
@@ -7021,15 +7148,20 @@ mod tests {
         );
         let rebuilt = filtered
             .clone()
-            .with_new_children(vec![
-                expanded_corpus,
-                empty.execution_plan().unwrap().clone(),
-            ])
+            .replace_children(
+                vec![expanded_corpus, empty.execution_plan().unwrap().clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .unwrap();
         assert!(execute_results(rebuilt.as_ref()).await.unwrap().is_empty());
         assert_eq!(rebuilt.metrics().unwrap().output_rows(), Some(0));
         assert_eq!(shared.wait().await.unwrap().num_docs(), 6);
-        let error = filtered.with_new_children(vec![]).unwrap_err();
+        let error = filtered
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("expected 2 children"));
     }
@@ -7046,7 +7178,12 @@ mod tests {
         };
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("got 0 and 0"));
-        let error = owner.with_new_children(vec![]).unwrap_err();
+        let error = owner
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("requires one input"));
     }
@@ -7098,6 +7235,12 @@ mod tests {
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.input]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
         fn with_new_children(
             self: Arc<Self>,
@@ -7226,10 +7369,17 @@ mod tests {
         let union = UnionExec::try_new(vec![indexed, flat]).unwrap();
         let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
         let owner = Arc::new(SharedFtsScorerExec::new(input.clone(), shared));
-        let owner = owner.with_new_children(vec![input]).unwrap();
-        assert_eq!(owner.required_input_distribution().len(), 1);
+        let owner = owner
+            .replace_children(
+                vec![input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        let distributions = owner.input_distribution_requirements();
+        let distributions = distributions.per_child_distributions().collect::<Vec<_>>();
+        assert_eq!(distributions.len(), 1);
         assert!(matches!(
-            owner.required_input_distribution()[0],
+            distributions[0],
             datafusion_physical_expr::Distribution::SinglePartition
         ));
         assert_eq!(owner.schema(), FTS_SCHEMA.clone());
@@ -8122,7 +8272,9 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 279);
 
-        // Rewrite 101 indexed fragments together with 20 appended fragments.
+        let before_compaction = dataset.scan().try_into_batch().await.unwrap();
+        // A task must rewrite a contiguous range to preserve row order. Rewrite
+        // the last 101 indexed fragments together with 20 appended fragments.
         // The staged build covers only 101/121 inputs, so it cannot cover the destination.
         let options = CompactionOptions {
             target_rows_per_fragment: 1000,
@@ -8134,7 +8286,7 @@ mod tests {
                 fragments: dataset
                     .fragments()
                     .iter()
-                    .filter(|f| f.id < 101 || f.id >= 259)
+                    .filter(|f| f.id >= 158)
                     .cloned()
                     .collect(),
             },
@@ -8152,6 +8304,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap(),
+            before_compaction
+        );
         let stored = read_manifest_indexes(
             &dataset.object_store,
             &dataset.manifest_location,
@@ -8225,9 +8381,9 @@ mod tests {
         let coverage = segments[0].fragment_bitmap.as_ref().unwrap();
         assert_eq!(coverage.len(), 158);
         assert!(!coverage.contains(new_fragment as u32));
-        assert!(coverage.iter().all(|id| (101..259).contains(&id)));
+        assert!(coverage.iter().all(|id| (0..158).contains(&id)));
         let index_uuid = segments[0].uuid;
-        let expected_indexed = (202..518)
+        let expected_indexed = (0..316)
             .filter(|id| !has_surviving_deletion || *id != 202)
             .collect::<Vec<_>>();
         let expected_all = (0..558)
@@ -8394,7 +8550,10 @@ mod tests {
             )
             .unwrap(),
         )
-        .with_new_children(vec![])
+        .replace_children(
+            vec![],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<MatchQueryExec>().unwrap();
         assert_eq!(
@@ -8631,7 +8790,10 @@ mod tests {
             )
             .unwrap(),
         )
-        .with_new_children(vec![])
+        .replace_children(
+            vec![],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<PhraseQueryExec>().unwrap();
         assert_eq!(

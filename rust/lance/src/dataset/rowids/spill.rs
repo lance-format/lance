@@ -2410,7 +2410,7 @@ mod tests {
         /// commits, which has to retry against the compacted fragment.
         UpdateAcrossCompaction,
         /// A compaction that rewrites its fragments, then commits after an
-        /// [`Step::Append`] it did not read.
+        /// [`Step::Append`] it did not read; it must retry with a fresh plan.
         CompactionAcrossAppend,
         /// A compaction that rewrites its fragments while a delete of
         /// `i % 11 = 0` commits in them. The compaction has to lose with a
@@ -2727,7 +2727,26 @@ mod tests {
                     self.dataset = stale;
                     self.update("i % 3 = 0").await?;
                 }
-                Step::CompactionAcrossAppend => self.compact_across(Step::Append).await?,
+                Step::CompactionAcrossAppend => {
+                    let error = self
+                        .compact_across(Step::Append)
+                        .await
+                        .expect_err("a stale compaction must retry after an append");
+                    assert!(
+                        matches!(error, Error::RetryableCommitConflict { .. }),
+                        "{error}"
+                    );
+                    assert!(error.to_string().contains("Append"), "{error}");
+                    self.dataset.checkout_latest().await?;
+                    let appended = self.dataset.scan().try_into_batch().await?;
+                    let metrics = compact_files(&mut self.dataset, one_fragment(), None).await?;
+                    assert!(metrics.fragments_removed > 0);
+                    assert_eq!(
+                        self.dataset.scan().try_into_batch().await?,
+                        appended,
+                        "replanned compaction must preserve the appended table's row order"
+                    );
+                }
                 Step::CompactionAcrossDelete => {
                     let error = self
                         .compact_across(Step::Delete("i % 11 = 0"))
@@ -2956,10 +2975,10 @@ mod tests {
         let mut spilled_anything = false;
         for (index, step) in steps.into_iter().enumerate() {
             let label = format!("step {index} ({step:?})");
-            if let Err(error) = inline.apply(step).await {
+            if let Err(error) = Box::pin(inline.apply(step)).await {
                 panic!("{label} failed on the inline table: {error}");
             }
-            if let Err(error) = spilled.apply(step).await {
+            if let Err(error) = Box::pin(spilled.apply(step)).await {
                 panic!("{label} failed on the spilled table: {error}");
             }
             spilled_anything |= assert_twins_agree(&spilled.dataset, &inline.dataset, &label).await;

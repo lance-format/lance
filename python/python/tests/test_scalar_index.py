@@ -6882,8 +6882,9 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
     ]
     # BTree only stores row addresses (bumping its on-disk format version to
     # 1) on a dataset with stable row ids; this dataset doesn't enable them,
-    # so BTree stays at version 0 along with every other index type here.
-    index_versions = [0, 0, 0, 0, 0, 0]
+    # so BTree stays at version 0. New ZoneMap segments are written as
+    # version 1 (ordinary bounds plus the NaN sign split).
+    index_versions = [0, 0, 0, 0, 0, 1]
 
     for i in range(len(indices)):
         assert indices[i].name == names[i]

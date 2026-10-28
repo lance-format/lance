@@ -1374,23 +1374,39 @@ class LanceDataset(pa.dataset.Dataset):
             false, throughput may be higher, but batches will be returned out of
             order and memory use might increase.
         fragments: iterable of LanceFragment, default None
-            If specified, only scan these fragments. If scan_in_order is True, then
-            the fragments will be scanned in the order given.
+            Restrict the search scope to these fragments; an empty iterable returns
+            no rows. Vector search enforces this scope before candidate selection,
+            even with ``prefilter=False``. Index segments cannot return rows outside
+            it. Ordinary scans preserve the given order when ``scan_in_order=True``;
+            vector search ranks results by distance.
         index_segments: iterable of str or uuid.UUID, default None
-            If specified, restrict vector index search to these index segment UUIDs.
-            Only supported for vector search. If fragments is also specified, rows
-            from those fragments not covered by the selected index segments will be
-            searched with flat KNN.
-        prefilter: bool, default False
-            If True then the filter will be applied before the vector query is run.
-            This will generate more correct results but it may be a more costly
-            query.  It's generally good when the filter is highly selective.
+            Restrict vector index search to these segment UUIDs. When omitted, Lance
+            selects a suitable logical index and its relevant segments automatically.
+            With explicit ``fragments`` and ``fast_search=False``, fragments not
+            covered by the selected segments are searched with flat KNN, including
+            fragments covered only by an unselected segment. Without ``fragments``,
+            indexed search searches only the selected segments and does not add
+            appended unindexed fragments.
 
-            If False then the filter will be applied after the vector query is run.
-            This will perform well but the results may have fewer than the requested
-            number of rows (or be empty) if the rows closest to the query do not
-            match the filter.  It's generally good when the filter is not very
-            selective.
+            The list must be nonempty. With index use enabled, UUIDs must identify
+            existing segments of one logical index on the query's vector column.
+            Query metric compatibility is checked when selected segments overlap
+            the fragment scope. With no overlap, ordinary search uses flat KNN with
+            the query metric, or the selected index's metric when unset, while fast
+            search returns no rows.
+            Only supported for vector search.
+            With ``nearest["use_index"]=False``, a flat scan uses the fragment scope
+            rather than segment selection.
+        prefilter: bool, default False
+            If True, select vector top-k from rows matching the SQL filter. This can
+            be more expensive and does not guarantee exact results from an
+            approximate index.
+
+            If False, apply the SQL filter after the combined ANN and flat top-k.
+            Rejected rows are not replaced, so fewer than ``k`` rows (or none) may
+            be returned. This also applies to searches without a vector index.
+            The fragment scope, deletions, and external row masks restrict candidates
+            regardless of this setting.
         use_scalar_index: bool, default True
             Lance will automatically use scalar indices to optimize a query.  In some
             corner cases this can make query performance worse and this parameter can
@@ -1431,7 +1447,10 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then vector search, full text search, and scalar-indexed
             filters will only search indexed fragments, which yields faster
-            search time but may skip recently appended unindexed data.
+            search time but may skip recently appended unindexed data. Vector search
+            skips flat fallback outside the selected segments' coverage and stale
+            overlay rows needing replay. The fragment scope and SQL filter placement
+            still apply. With no usable vector index coverage, the result is empty.
         scan_stats_callback: Callable[[ScanStatistics], None], default None
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
@@ -1474,10 +1493,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         .. note::
 
-            For now, if BOTH filter and nearest is specified, then:
-
-            1. nearest is executed first.
-            2. The results are filtered afterwards.
+            With both ``filter`` and ``nearest``, SQL filtering runs after vector
+            top-k by default. Set ``prefilter=True`` to filter before top-k instead.
+            Both strategies support explicit fragments and mixed ANN and flat search.
 
 
         For debugging ANN results, you can choose to not use the index
@@ -1492,7 +1510,48 @@ class LanceDataset(pa.dataset.Dataset):
                 "k": 10,
                 "q": <query vector>,
                 "use_index": False
-            }
+            })
+
+        Examples
+        --------
+        A segment covers F0/F1 and F2 is appended after indexing. Searching F1/F2
+        combines indexed and unindexed rows; fast search keeps only indexed F1.
+
+        >>> from tempfile import TemporaryDirectory
+        >>> import lance
+        >>> import numpy as np
+        >>> import pyarrow as pa
+        >>> table = pa.table({
+        ...     "id": range(12),
+        ...     "vector": pa.array(
+        ...         [[float(i), 0, 0, 0] for i in range(12)],
+        ...         type=pa.list_(pa.float32(), 4),
+        ...     ),
+        ... })
+        >>> with TemporaryDirectory() as uri:
+        ...     dataset = lance.write_dataset(
+        ...         table.slice(0, 8), uri, max_rows_per_file=4,
+        ...     )
+        ...     dataset = dataset.create_index(
+        ...         "vector", "IVF_FLAT", num_partitions=1,
+        ...         ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+        ...     )
+        ...     dataset = lance.write_dataset(table.slice(8), uri, mode="append")
+        ...     segment_uuid = dataset.describe_indices()[0].segments[0].uuid
+        ...     options = dict(
+        ...         columns=["id"], fragments=dataset.get_fragments()[1:],
+        ...         index_segments=[segment_uuid], prefilter=False,
+        ...         nearest={
+        ...             "column": "vector", "q": [0.0] * 4, "k": 6, "metric": "l2",
+        ...         },
+        ...     )
+        ...     mixed = dataset.scanner(**options, fast_search=False).to_table()
+        ...     fast = dataset.scanner(**options, fast_search=True).to_table()
+        ...     mixed_ids, fast_ids = mixed["id"].to_pylist(), fast["id"].to_pylist()
+        >>> mixed_ids
+        [4, 5, 6, 7, 8, 9]
+        >>> fast_ids
+        [4, 5, 6, 7]
 
         """
         builder = ScannerBuilder(self)
@@ -1686,7 +1745,9 @@ class LanceDataset(pa.dataset.Dataset):
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
         prefilter: bool, optional, default False
-            Run filter before the vector search.
+            If True, select vector top-k from rows matching the SQL filter. If False,
+            filter the top-k result without replacing rejected rows. See
+            :meth:`scanner` for details; approximate indices remain approximate.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
             ``ScannerBuilder.late_materialization`` for more information.
@@ -1740,10 +1801,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Notes
         -----
-        If BOTH filter and nearest is specified, then:
-
-        1. nearest is executed first.
-        2. The results are filtered afterward, unless pre-filter sets to True.
+        With both ``filter`` and ``nearest``, SQL filtering runs after vector top-k
+        by default. Set ``prefilter=True`` to filter before top-k instead. Postfilter
+        may return fewer than ``k`` rows. For fragment and segment selection, use
+        :meth:`scanner` followed by :meth:`LanceScanner.to_table`.
         """
         return self.scanner(
             columns=columns,
@@ -6295,6 +6356,11 @@ class Index:
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
     covering_fields: List[int] = dataclasses.field(default_factory=list)
+    clustering_id: Optional[int] = None
+    """The clustering definition this segment was built under, if any."""
+    metadata: Dict[str, str] = dataclasses.field(default_factory=dict)
+    """Generic metadata attached to this segment. Preserved verbatim, including
+    keys this library does not understand."""
 
 
 class IndexInformation(TypedDict):
@@ -7233,6 +7299,12 @@ class ScannerBuilder:
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
+        """Choose SQL filtering before vector top-k (True) or after it (False).
+
+        Defaults to False. Postfilter does not replace rejected neighbors; prefilter
+        does not guarantee exact ANN results. Fragment scope, deletions, and external
+        row masks restrict candidates in either mode. See :meth:`LanceDataset.scanner`.
+        """
         self._prefilter = prefilter
         return self
 
@@ -7298,6 +7370,15 @@ class ScannerBuilder:
     def with_fragments(
         self, fragments: Optional[Iterable[LanceFragment]]
     ) -> ScannerBuilder:
+        """Set the search scope, or clear it with None.
+
+        An empty iterable yields no rows.
+        Vector search enforces this scope before candidate selection regardless of
+        SQL prefilter placement. Fragments outside selected index coverage use flat
+        KNN unless fast search is enabled. This can be called before or after
+        :meth:`nearest` and :meth:`with_index_segments`.
+        See :meth:`LanceDataset.scanner` for a mixed-search example.
+        """
         if fragments is not None:
             inner_fragments = []
             for f in fragments:
@@ -7316,6 +7397,21 @@ class ScannerBuilder:
     def with_index_segments(
         self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
     ) -> ScannerBuilder:
+        """Select vector index segments, or restore automatic selection with None.
+
+        With index use enabled, UUIDs must identify existing segments of one logical
+        index on the query's vector column. Metric compatibility is checked when
+        selected segments overlap the fragment scope. With no overlap, ordinary
+        search uses flat KNN with the query metric, or the selected index's metric
+        when unset, while fast search returns no rows.
+        An empty iterable is invalid, and segment selection is only supported for
+        vector search.
+        With explicit fragments, uncovered fragments use flat KNN unless fast search
+        is enabled. Without fragments, indexed search searches only these segments.
+        This controls index use rather than flat scans with ``use_index=False``.
+        It can be called before or after :meth:`nearest` and :meth:`with_fragments`.
+        See :meth:`LanceDataset.scanner` for a mixed-search example.
+        """
         self._index_segments = _normalize_index_segment_ids(index_segments)
         return self
 
@@ -7337,6 +7433,12 @@ class ScannerBuilder:
         search_effort: Optional[float] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
+
+        Fragment and segment selection can be configured before or after this method.
+        The fragment scope applies with either SQL prefilter or postfilter. With a
+        suitable index, uncovered fragments use flat KNN unless fast search is enabled;
+        without an index, ordinary search uses flat KNN. See
+        :meth:`LanceDataset.scanner` for a mixed-search example and filtering semantics.
 
         Parameters
         ----------
@@ -7397,10 +7499,14 @@ class ScannerBuilder:
         return self
 
     def fast_search(self, flag: bool) -> ScannerBuilder:
-        """Enable fast search, which only performs search on indexed fragments.
+        """Set whether searches use only indexed data (default: False).
 
-        Users can use `Table::optimize()` or `create_index()` to include new data
-        in an index, thus making new data searchable.
+        Vector search skips flat fallback outside selected segment coverage and stale
+        overlay rows requiring replay. The fragment scope and SQL prefilter placement
+        are unchanged. No usable vector index coverage produces an empty result.
+        Use :meth:`LanceDataset.create_index` or
+        :meth:`DatasetOptimizer.optimize_indices` to index newly appended data.
+        See :meth:`LanceDataset.scanner` for a mixed-search example.
         """
         self._fast_search = flag
         return self
@@ -7941,11 +8047,11 @@ class DatasetOptimizer:
             Controls how much data is read at once when performing binary copy.
             Defaults to 16MB.
         max_source_fragments: int, optional
-            Maximum number of source fragments to compact in a single run.
-            Compaction tasks are included until adding the next task would
-            exceed this limit, allowing compaction to proceed incrementally.
-            Fragments are processed oldest first. If not specified, uses the
-            manifest config value, or applies no limit.
+            Maximum number of fragments whose identities may change in a
+            single run. This includes compacted source fragments and following
+            fragments relabeled to preserve row order. The planner selects
+            candidates from a suffix within this limit. If not specified, uses
+            the manifest config value, or applies no limit.
         max_source_rows: int, optional
             Maximum number of source rows to compact in a single run. Rows are
             counted as live rows (physical rows minus soft-deleted rows).
@@ -7962,7 +8068,9 @@ class DatasetOptimizer:
             Fragment IDs to exclude from compaction planning. Excluded
             fragments remain unchanged and act as boundaries, so fragments
             on opposite sides are not combined into the same compaction task.
-            Duplicate and unknown IDs are ignored.
+            To preserve row order, only candidates after the last present
+            excluded fragment are eligible. Duplicate and unknown IDs are
+            ignored.
         data_storage_version: str, optional
             Output data file version, such as "2.2", "stable", or "next".
             Uses the compaction config target when set, otherwise the dataset's

@@ -11,6 +11,8 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion_common::config::ConfigNonZeroUsize;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, Statistics, utils::get_available_parallelism};
 use datafusion_execution::{
     TaskContext,
@@ -19,10 +21,10 @@ use datafusion_execution::{
     memory_pool::{FairSpillPool, TrackConsumersPool},
     runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
 };
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    SendableRecordBatchStream,
+    ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties, SendableRecordBatchStream, StatisticsArgs,
     coalesce_partitions::CoalescePartitionsExec,
     display::DisplayableExecutionPlan,
     execution_plan::{Boundedness, CardinalityEffect, EmissionType},
@@ -144,6 +146,13 @@ impl ExecutionPlan for OneShotExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -341,7 +350,12 @@ pub fn new_runtime_env(options: &LanceExecutionOptions) -> Arc<RuntimeEnv> {
 pub fn new_task_context(options: &LanceExecutionOptions) -> Result<Arc<TaskContext>> {
     let mut session_config = new_session_config(options);
     if let Some(batch_size) = options.validated_batch_size()? {
-        session_config.options_mut().execution.batch_size = batch_size;
+        session_config.options_mut().execution.batch_size = ConfigNonZeroUsize::try_new(batch_size)
+            .map_err(|_| {
+                Error::invalid_input(format!(
+                    "batch_size must be greater than 0, got {batch_size}"
+                ))
+            })?;
     }
     Ok(Arc::new(
         TaskContext::default()
@@ -649,6 +663,13 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -678,11 +699,16 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![false]
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -717,7 +743,9 @@ impl ExecutionPlan for StrictBatchSizeExec {
 /// batch actually needs to be sliced — batches that are already within the
 /// target range pass through at zero cost.
 ///
-/// If a single row exceeds `max_bytes`, execution fails with an error.
+/// An indivisible row larger than `max_bytes` passes through as a single-row
+/// batch. The downstream operator's memory pool remains the source of truth for
+/// whether that row can be processed safely.
 #[derive(Clone, Debug)]
 pub struct HardCapBatchSizeExec {
     input: Arc<dyn ExecutionPlan>,
@@ -749,6 +777,13 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -773,22 +808,18 @@ impl ExecutionPlan for HardCapBatchSizeExec {
             0,
             max_bytes,
         );
-        // Check that no single-row batch exceeds the limit.
-        let validated = rechunked.map(move |result| {
-            let batch = result?;
-            if batch.num_rows() == 1 && batch.get_array_memory_size() > max_bytes {
-                return Err(DataFusionError::External(Box::new(Error::invalid_input(
-                    format!(
-                        "a single row is {} bytes which exceeds the maximum allowed batch \
-                         size of {} bytes",
-                        batch.get_array_memory_size(),
-                        max_bytes,
-                    ),
-                ))));
+        let rechunked = rechunked.map(move |result| {
+            if let Ok(batch) = &result {
+                let batch_bytes = batch.get_array_memory_size();
+                if batch.num_rows() == 1 && batch_bytes > max_bytes {
+                    warn!(
+                        "HardCapBatchSizeExec cannot split a single-row batch of {batch_bytes} bytes, which exceeds the maximum batch size of {max_bytes} bytes; passing it through unchanged"
+                    );
+                }
             }
-            Ok(batch)
+            result
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, validated)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rechunked)))
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -799,11 +830,16 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![false]
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> datafusion_common::Result<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -900,6 +936,22 @@ mod tests {
             sorted["x"].as_primitive::<Int32Type>(),
             &Int32Array::from(vec![0, 1, 2, 3, 4, 5])
         );
+    }
+
+    #[tokio::test]
+    async fn test_hard_cap_passes_through_oversized_single_row() {
+        let value = "x".repeat(1024);
+        let batch = arrow_array::record_batch!(("value", Utf8, [value.as_str()])).unwrap();
+        let max_bytes = 64;
+        assert!(batch.get_array_memory_size() > max_bytes);
+
+        let input = Arc::new(OneShotExec::from_batch(batch.clone()));
+        let exec = HardCapBatchSizeExec::new(input, max_bytes);
+        let context = Arc::new(TaskContext::default());
+        let mut output = exec.execute(0, context).unwrap();
+
+        assert_eq!(output.next().await.unwrap().unwrap(), batch);
+        assert!(output.next().await.is_none());
     }
 
     #[test]

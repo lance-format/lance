@@ -552,7 +552,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let files = if train {
+                let (files, built_target) = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
                         if vector_params_have_precomputed_ivf(vec_params) {
@@ -570,9 +570,9 @@ impl<'a> CreateIndexBuilder<'a> {
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
-                            files
+                            (files, None)
                         } else {
-                            Box::pin(build_filtered_vector_index(
+                            let built = Box::pin(build_filtered_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
@@ -582,11 +582,12 @@ impl<'a> CreateIndexBuilder<'a> {
                                 fragments,
                                 self.progress.clone(),
                             ))
-                            .await?
+                            .await?;
+                            (built.files, built.target_partition_size)
                         }
                     } else {
                         // Standard full dataset indexing
-                        Box::pin(build_vector_index(
+                        let built = Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -595,21 +596,23 @@ impl<'a> CreateIndexBuilder<'a> {
                             fri,
                             self.progress.clone(),
                         ))
-                        .await?
+                        .await?;
+                        (built.files, built.target_partition_size)
                     }
                 } else {
                     // Create empty vector index
-                    build_empty_vector_index(
+                    let files = build_empty_vector_index(
                         self.dataset,
                         column,
                         &index_name,
                         index_id,
                         vec_params,
                     )
-                    .await?
+                    .await?;
+                    (files, None)
                 };
                 CreatedIndex {
-                    index_details: vector_index_details(vec_params),
+                    index_details: vector_index_details(vec_params, built_target),
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -685,6 +688,8 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(index_files_to_table(created_index.files)),
+            clustering_id: None,
+            metadata: Default::default(),
         };
         // A generic scalar request only resolves to an implementation here.
         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
@@ -854,6 +859,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                clustering_id: None,
+                metadata: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &metadata)?;
             let segments = vec![metadata.into_index_segment()?];
@@ -925,6 +932,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                clustering_id: None,
+                metadata: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
             segment_metadatas.push(segment);
@@ -3533,13 +3542,14 @@ mod tests {
     /// surviving half made the coverage look healthy.
     #[tokio::test]
     async fn test_merge_uncommitted_segments_partly_retired_by_compaction() {
-        // Two undersized fragments and one already at the compaction target, so
-        // compaction rewrites the pair and leaves the third alone.
+        // One fragment at the compaction target followed by two undersized
+        // fragments. Rewriting the trailing pair leaves the first fragment's
+        // staged coverage live without relabeling it.
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(2),
-                lance_datagen::BatchCount::from(2),
+                lance_datagen::RowCount::from(4),
+                lance_datagen::BatchCount::from(1),
             );
         let test_dir = tempfile::tempdir().unwrap();
         let dataset_uri = test_dir.path().to_str().unwrap();
@@ -3547,7 +3557,7 @@ mod tests {
             reader,
             dataset_uri,
             Some(WriteParams {
-                max_rows_per_file: 2,
+                max_rows_per_file: 4,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3557,15 +3567,15 @@ mod tests {
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(4),
-                lance_datagen::BatchCount::from(1),
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(2),
             );
         let mut dataset = Dataset::write(
             reader,
             dataset_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
-                max_rows_per_file: 4,
+                max_rows_per_file: 2,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3597,8 +3607,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Two rows per fragment against a four-row target pairs some fragments
-        // and leaves at least one alone.
+        // Two trailing two-row fragments compact while the leading four-row
+        // fragment keeps its identity.
         crate::dataset::optimize::compact_files(
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
@@ -4281,10 +4291,10 @@ mod tests {
         );
         assert_eq!(count_in_range(&dataset, &merged, 50, 100).await, 50);
 
-        // Phase 2 — retire fragment 0: delete >10% of its rows so compaction
-        // rewrites only frag 0 (frag 1 has no deletions and is at target size).
-        // The committed per-fragment segment now claims a fragment the dataset
-        // no longer has.
+        // Phase 2 — delete >10% of fragment 0's rows so compaction rewrites its
+        // data. Preserving row order in the ID-sorted manifest also relabels the
+        // untouched trailing fragment, so both committed segments must follow
+        // their stable row-id coverage to fresh fragment IDs.
         dataset.delete("id < 16").await.unwrap();
         crate::dataset::optimize::compact_files(
             &mut dataset,
@@ -4303,16 +4313,15 @@ mod tests {
             .collect();
         assert!(!live_frags.contains(0), "compaction should retire frag 0");
 
-        // Filtered merge: coverage drops the retired fragment but keeps the
-        // live one, and the merged page data does not leak the retired row ids
-        // (ids < 16 lived only in frag 0, so the range now returns nothing).
+        // Filtered merge: coverage follows the current fragments, and the
+        // merged page data does not leak the retired row ids (ids < 16 lived
+        // only in frag 0, so the range now returns nothing).
         let merged = dataset
             .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
             .await
             .unwrap();
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert!(!coverage.contains(0), "must drop retired frag 0");
-        assert!(coverage.contains(1), "must keep live frag 1");
+        assert_eq!(coverage, &live_frags);
         assert_eq!(
             count_in_range(&dataset, &merged, 0, 16).await,
             0,
@@ -4803,7 +4812,7 @@ mod tests {
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
                     vec![],
@@ -4829,7 +4838,7 @@ mod tests {
                     Uuid::new_v4(),
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
                     vec![],

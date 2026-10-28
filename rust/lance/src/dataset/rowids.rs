@@ -1234,13 +1234,15 @@ mod test {
 
         /// Wire-level segment kinds of every fragment, and whether the decoded
         /// form folded any of them into a compact `Ranges` segment.
-        fn segment_shapes(dataset: &Dataset) -> (Vec<&'static str>, bool) {
+        fn segment_shapes(dataset: &Dataset) -> (Vec<&'static str>, bool, usize) {
             let mut kinds = Vec::new();
             let mut folded = false;
+            let mut bytes = 0;
             for fragment in dataset.manifest.fragments.iter() {
                 let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
                     panic!("expected inline row ids, got {:?}", fragment.row_id_meta);
                 };
+                bytes += data.len();
                 let wire = pb::RowIdSequence::decode(&data[..]).unwrap();
                 kinds.extend(wire.segments.iter().map(|segment| match segment.segment {
                     Some(pb::u64_segment::Segment::Range(_)) => "range",
@@ -1253,7 +1255,7 @@ mod test {
                     .iter()
                     .any(|segment| matches!(segment, U64Segment::Ranges { .. }));
             }
-            (kinds, folded)
+            (kinds, folded, bytes)
         }
 
         // Deleting a contiguous block inside every fragment leaves each row id
@@ -1278,7 +1280,7 @@ mod test {
         assert_eq!(map_before.len(), 800);
 
         // Without the opt-in the bitmaps stay.
-        let (kinds, folded) = segment_shapes(&dataset);
+        let (kinds, folded, bytes_before) = segment_shapes(&dataset);
         assert!(kinds.contains(&"bitmap") && !folded, "{kinds:?}");
 
         // Opting in re-encodes every eligible fragment in the same commit: on
@@ -1287,8 +1289,12 @@ mod test {
             .update_config([(RANGE_SEGMENTS_CONFIG_KEY, "true")])
             .await
             .unwrap();
-        let (kinds, folded) = segment_shapes(&dataset);
+        let (kinds, folded, bytes_after) = segment_shapes(&dataset);
         assert!(kinds.iter().all(|kind| *kind == "range"), "{kinds:?}");
+        assert!(
+            bytes_after < bytes_before,
+            "{bytes_after} >= {bytes_before}"
+        );
         assert!(
             folded,
             "fragments with 300 contiguous holes each should fold into Ranges"
@@ -1329,7 +1335,7 @@ mod test {
             .checkout_version(dataset.manifest().version)
             .await
             .unwrap();
-        let (kinds, folded) = segment_shapes(&reopened);
+        let (kinds, folded, _) = segment_shapes(&reopened);
         assert!(
             kinds.iter().all(|kind| *kind == "range") && folded,
             "{kinds:?}"
