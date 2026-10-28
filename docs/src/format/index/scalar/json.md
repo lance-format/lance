@@ -38,11 +38,11 @@ If `target_index_version` is absent on a JSON index then we assume that
 index was built before this field existed.  Readers should use version 1
 for a label list index and version 0 for all other indexes.
 
-`target_index_version` does not affect `JSON_INDEX_VERSION` itself, which
-tracks the JSON wrapper's own on-disk format and is unrelated to the target's
-version; nor does it change how an old reader decides whether it can safely
-skip a JSON index whose target it does not understand. That decision is
-based on the target plugin's own declared maximum version.
+`target_index_version` does not affect the wrapper's `IndexMetadata::index_version`
+itself, which tracks the JSON wrapper's own on-disk format and is unrelated
+to the target's version; nor does it change how an old reader decides whether
+it can safely skip a JSON index whose target it does not understand. That
+decision is based on the target plugin's own declared maximum version.
 
 ## Index Details
 

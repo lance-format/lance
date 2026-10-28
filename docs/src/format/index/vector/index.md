@@ -54,11 +54,10 @@ This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
 `index_version` also tracks the row domain of the auxiliary file's `_rowid`
-or `_rowaddr` column. From version 3 onward, a segment built on a dataset with
-stable row ids enabled stores the physical row address (`fragment_id << 32 | offset`)
-of each vector in `_rowaddr` instead of the dataset's logical row id in `_rowid`. A
-segment persisted below version 3 stores row ids throughout, and merging never combines
-segments of differing domain.
+or `_rowaddr` column. From version 3 onward, a segment stores the physical row
+address (`fragment_id << 32 | offset`) of each vector in `_rowaddr` instead of the
+dataset's logical row id in `_rowid`. A segment persisted below version 3 stores
+row ids throughout, and merging never combines segments of differing domain.
 
 ## Storage Layout (V3)
 
@@ -217,7 +216,7 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 
 | Column               | Type                                             | Nullable | Present when                | Description                                                     |
 | -------------------- | ------------------------------------------------ | -------- | --------------------------- | --------------------------------------------------------------- |
-| `_rowid`             | uint64                                           | true     | always                      | Row identifier (a physical row address from `IVF_RQ_INDEX_VERSION` 3 onward; a row id in a segment persisted at version 2) |
+| `_rowid`             | uint64                                           | true     | always                      | Row identifier (a physical row address from 3 onward; a row id in a segment persisted at version <= 2) |
 | `_rabit_codes`       | list<uint8>[ceil(code_dim / 8)]                  | true     | always                      | Binary quantized codes (1 bit per dimension, packed into bytes) |
 | `__add_factors`      | float32                                          | true     | always                      | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | true     | always                      | Scale correction factors for distance computation               |

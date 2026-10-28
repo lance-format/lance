@@ -20,7 +20,7 @@ The FTS index consists of multiple files storing the token dictionary, document 
 
 An FTS index may contain multiple partitions. Each partition has its own set of token, document, and posting list files, prefixed with the partition ID (e.g. `part_0_tokens.lance`, `part_0_docs.lance`, `part_0_invert.lance`). The `metadata.lance` file lists all partition IDs in the index. At query time, every partition must be searched and the results combined to produce the final ranked output. Fewer partitions generally means better query performance, since each partition requires its own token dictionary lookup and posting list scan. The number of partitions is controlled by the training configuration -- specifically `LANCE_FTS_TARGET_SIZE` determines how large each merged partition can grow (see [Training Process](#training-process) for details).
 
-From format version 4 (`INVERTED_INDEX_VERSION_V4`) onward, a segment stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id. A segment persisted before version 4 (`IndexMetadata::index_version`) stores a row id there instead.
+From format version 4 onward, a segment stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id. A segment persisted before version 4 stores a row id there instead.
 
 ### Token Dictionary File Schema
 
