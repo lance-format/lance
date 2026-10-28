@@ -1202,10 +1202,18 @@ fn adjust_child_validity(
         return child.clone();
     }
 
-    // A row is valid only if both the child and the parent are. The union keeps
-    // the bit offset of a sliced parent, which a raw buffer handed to
-    // `ArrayData` at the child's offset would lose.
-    let new_validity = NullBuffer::union(child.nulls(), Some(parent_validity));
+    // ArrayData validates the raw null bitmap against the child's offset even
+    // when NullBuffer describes only the visible rows. Keep both offsets aligned.
+    let new_validity = NullBuffer::union(child.nulls(), Some(parent_validity)).map(|validity| {
+        if validity.inner().offset() == child.offset() {
+            validity
+        } else {
+            let mut builder = BooleanBufferBuilder::new(child.offset() + child.len());
+            builder.append_n(child.offset(), true);
+            builder.append_buffer(validity.inner());
+            NullBuffer::new(builder.build().slice(child.offset(), child.len()))
+        }
+    });
     arrow_array::make_array(
         child
             .to_data()
@@ -1653,6 +1661,66 @@ mod tests {
         new_null_array,
     };
     use arrow_buffer::OffsetBuffer;
+
+    #[rstest::rstest]
+    fn test_adjust_child_validity_sliced_boolean(
+        #[values(0, 1, 7, 8, 9, 1025)] child_offset: usize,
+        #[values(0, 1, 7, 8, 9, 1025)] parent_offset: usize,
+        #[values(false, true)] child_has_nulls: bool,
+    ) {
+        let mut values = vec![Some(false); child_offset];
+        values.extend([
+            Some(true),
+            Some(false),
+            if child_has_nulls { None } else { Some(true) },
+            Some(false),
+        ]);
+        let child: ArrayRef =
+            Arc::new(arrow_array::BooleanArray::from(values).slice(child_offset, 4));
+        let mut validity = vec![false; parent_offset];
+        validity.extend([true, false, true, true]);
+        let parent = arrow_buffer::NullBuffer::from(validity).slice(parent_offset, 4);
+
+        let adjusted = adjust_child_validity(&child, Some(&parent));
+        let adjusted = adjusted.as_boolean();
+        assert_eq!(
+            adjusted.iter().collect::<Vec<_>>(),
+            vec![
+                Some(true),
+                None,
+                if child_has_nulls { None } else { Some(true) },
+                Some(false)
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    fn test_adjust_child_validity_sliced_parent(
+        #[values(0, 1, 7, 8, 9, 1025)] parent_offset: usize,
+        #[values(false, true)] child_has_nulls: bool,
+    ) {
+        let child: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            if child_has_nulls { None } else { Some(3) },
+            Some(4),
+        ]));
+        let mut validity = vec![false; parent_offset];
+        validity.extend([true, false, true, true]);
+        let parent = arrow_buffer::NullBuffer::from(validity).slice(parent_offset, 4);
+
+        let adjusted = adjust_child_validity(&child, Some(&parent));
+        let adjusted = adjusted.as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(
+            adjusted.iter().collect::<Vec<_>>(),
+            vec![
+                Some(1),
+                None,
+                if child_has_nulls { None } else { Some(3) },
+                Some(4)
+            ]
+        );
+    }
 
     #[test]
     fn test_convert_to_floating_point_preserves_inner_nulls() {
