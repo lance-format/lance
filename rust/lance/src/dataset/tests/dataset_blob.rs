@@ -3535,13 +3535,17 @@ async fn blobs_as_logical_keeps_escaped_external_names() {
     let base = TempDir::default();
     // What a lost escape would name instead.
     std::fs::write(base.std_path().join("a"), b"wrong object").unwrap();
-    let objects = [
+    let objects: Vec<_> = [
         ("a#b.bin", "hash"),
         ("a?b.bin", "query"),
         ("a%23b.bin", "percent"),
-    ];
+    ]
+    .into_iter()
+    // A Windows file name cannot hold `?`.
+    .filter(|(name, _)| !(cfg!(windows) && name.contains('?')))
+    .collect();
     let mut links = BlobArrayBuilder::new(objects.len());
-    for (name, payload) in objects {
+    for &(name, payload) in &objects {
         let path = base.std_path().join(name);
         std::fs::write(&path, payload).unwrap();
         links
