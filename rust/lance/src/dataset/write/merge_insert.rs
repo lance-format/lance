@@ -1378,19 +1378,22 @@ fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableP
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
 }
 
-/// One merge's memory budget: the session it plans and executes under, and
-/// the target scan's share of that session's pool.
+/// One merge's memory budget: the session it plans and executes under, the
+/// target scan's share of that session's pool, and the HashJoin build side.
 ///
 /// The session carries Lance's configured pool (`LANCE_MEM_POOL_SIZE`) so an
 /// oversized hash-join build fails with `ResourcesExhausted` instead of
-/// growing. Join reordering is off: the merge joins put the source on the
-/// build side, and DataFusion's statistics-driven swap would otherwise move a
-/// target with few (but wide) rows back onto it. Repartitioning is off too:
-/// the join collects the source once and streams the target through it in
-/// one partition, so no `RepartitionExec` coalesces target batches up to the
-/// session batch size outside the pool, and unmatched source rows come out
-/// in source order. The scan still decodes in parallel; only the probe is
-/// single-threaded.
+/// growing. Sources that can be rescanned start on the build side, preserving
+/// the bounded wide-target behavior. A typed hash-join resource failure triggers
+/// one target-build attempt, which restores the base orientation when the source
+/// is too large and the target is small. A stable snapshot replays the same
+/// rows; a rescannable provider starts a complete new scan, and only the new
+/// scan's rows and statistics contribute to the successful attempt. One-shot
+/// sources cannot replay and use the base target-build orientation directly.
+/// Reordering and repartitioning are disabled when the source is the build
+/// side: DataFusion must not move a target with fewer (but wider) rows back onto
+/// it, and no `RepartitionExec` may coalesce target batches outside the pool.
+/// The scan still decodes in parallel; only the probe is single-threaded.
 ///
 /// The target scan is not pool-tracked, so it gets a quarter of the pool for
 /// its I/O buffer and a quarter for decoded batches, one per decode task;
@@ -1399,11 +1402,12 @@ struct MergeBudget {
     session_ctx: SessionContext,
     scan_io_bytes: u64,
     batch_rows: Option<usize>,
+    build_source: bool,
 }
 
 impl MergeBudget {
     /// A `target_partitions` of `None` keeps DataFusion's default.
-    fn new(dataset: &Dataset, target_partitions: Option<usize>) -> Self {
+    fn new(dataset: &Dataset, target_partitions: Option<usize>, build_source: bool) -> Self {
         let options = LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
@@ -1416,18 +1420,22 @@ impl MergeBudget {
         let decode_fan_out = get_num_compute_intensive_cpus()
             .min(config.target_partitions())
             .max(1) as u64;
-        let scan_io_bytes = scan_io_bytes(options.mem_pool_size(), *DEFAULT_IO_BUFFER_SIZE);
+        let pool_bytes = options.mem_pool_size();
+        let scan_io_bytes = scan_io_bytes(pool_bytes, *DEFAULT_IO_BUFFER_SIZE);
         let batch_rows = target_scan_batch_rows(dataset, scan_io_bytes / decode_fan_out);
-        config.options_mut().optimizer.join_reordering = false;
-        config.options_mut().optimizer.repartition_joins = false;
-        config
-            .options_mut()
-            .optimizer
-            .enable_round_robin_repartition = false;
+        if build_source {
+            config.options_mut().optimizer.join_reordering = false;
+            config.options_mut().optimizer.repartition_joins = false;
+            config
+                .options_mut()
+                .optimizer
+                .enable_round_robin_repartition = false;
+        }
         Self {
             session_ctx: SessionContext::new_with_state(state),
             scan_io_bytes,
             batch_rows,
+            build_source,
         }
     }
 }
@@ -1441,22 +1449,61 @@ fn scan_io_bytes(pool_bytes: u64, configured_io_bytes: u64) -> u64 {
         .min(configured_io_bytes)
 }
 
+fn is_hash_join_resource_exhausted(error: &Error) -> bool {
+    fn is_hash_join(error: &DataFusionError) -> bool {
+        match error {
+            // DataFusion does not expose the allocation consumer structurally.
+            DataFusionError::ResourcesExhausted(message) => message
+                .strip_prefix("Additional allocation failed for ")
+                .is_some_and(|consumer| consumer.starts_with("HashJoinInput")),
+            DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+                is_hash_join(inner)
+            }
+            DataFusionError::Shared(error) => is_hash_join(error),
+            DataFusionError::Collection(errors) => errors.iter().any(is_hash_join),
+            DataFusionError::External(error) => error
+                .downcast_ref::<DataFusionError>()
+                .is_some_and(is_hash_join),
+            _ => false,
+        }
+    }
+
+    fn find_datafusion_error<'a>(
+        mut error: &'a (dyn std::error::Error + 'static),
+    ) -> Option<&'a DataFusionError> {
+        loop {
+            if let Some(error) = error.downcast_ref::<DataFusionError>() {
+                return Some(error);
+            }
+            error = error.source()?;
+        }
+    }
+
+    find_datafusion_error(error).is_some_and(is_hash_join)
+}
+
 /// Rows per target batch so a decoded batch is about `batch_bytes`, from the
 /// fragments' on-disk bytes per row. `None` keeps the scanner's default: rows
 /// are narrow enough for it, or a fragment lacks row counts or file sizes.
+fn target_scan_size(dataset: &Dataset) -> Option<(u64, u64)> {
+    dataset
+        .fragments()
+        .iter()
+        .try_fold((0u64, 0u64), |(rows, bytes), fragment| {
+            let file_bytes = fragment
+                .files
+                .iter()
+                .map(|file| file.file_size_bytes.get().map(|size| size.get()))
+                .sum::<Option<u64>>()?;
+            Some((
+                rows.checked_add(fragment.physical_rows? as u64)?,
+                bytes.checked_add(file_bytes)?,
+            ))
+        })
+}
+
 fn target_scan_batch_rows(dataset: &Dataset, batch_bytes: u64) -> Option<usize> {
-    let (rows, bytes) =
-        dataset
-            .fragments()
-            .iter()
-            .try_fold((0u64, 0u64), |(rows, bytes), fragment| {
-                let file_bytes = fragment
-                    .files
-                    .iter()
-                    .map(|file| file.file_size_bytes.get().map(|size| size.get()))
-                    .sum::<Option<u64>>()?;
-                Some((rows + fragment.physical_rows? as u64, bytes + file_bytes))
-            })?;
+    let (rows, bytes) = target_scan_size(dataset)?;
     if rows == 0 {
         return None;
     }
@@ -2073,7 +2120,7 @@ impl MergeInsertJob {
         //      one of them.
         //      This scan is the whole table when the index covers nothing,
         //      so it runs under the merge budget like the plan path's scan.
-        let budget = MergeBudget::new(&self.dataset, None);
+        let budget = MergeBudget::new(&self.dataset, None, false);
         let unindexed_fragments = self.unindexed_fragments_for_keys(&indexed_keys).await?;
         if !unindexed_fragments.is_empty() || !overlay_stale_rows.is_empty() {
             let mut builder = self.dataset.scan();
@@ -2242,7 +2289,7 @@ impl MergeInsertJob {
         &self,
         source: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
-        let session_ctx = MergeBudget::new(&self.dataset, Some(1)).session_ctx;
+        let session_ctx = MergeBudget::new(&self.dataset, Some(1), false).session_ctx;
         let schema = source.schema();
         let new_data = session_ctx.read_one_shot(source)?;
         let join_cols = self
@@ -3252,16 +3299,17 @@ impl MergeInsertJob {
     }
 
     async fn create_plan(self, provider: Arc<dyn TableProvider>) -> Result<Arc<dyn ExecutionPlan>> {
-        let budget = MergeBudget::new(&self.dataset, None);
+        let budget = MergeBudget::new(&self.dataset, None, true);
         self.create_plan_in(provider, &budget).await
     }
 
     /// Plans the merge under `budget`; execute the plan with its session's
     /// task context.
     ///
-    /// The source is the join's build side and the target streams through it,
-    /// so memory scales with the source rather than the table. See
-    /// [`MergeBudget`] for why DataFusion keeps that order.
+    /// When `budget.build_source` is set, the source is the join's build side
+    /// and the target streams through it, so memory scales with the source
+    /// rather than the table. See [`MergeBudget`] for how the orientation is
+    /// chosen.
     async fn create_plan_in(
         self,
         provider: Arc<dyn TableProvider>,
@@ -3354,6 +3402,16 @@ impl MergeInsertJob {
         let source_df_aliased = source_df.alias("source")?;
         let scan_aliased = scan.alias("target")?;
         let join_type = self.create_plan_join_type();
+        let (left, right, join_type) = if budget.build_source {
+            (source_df_aliased, scan_aliased, join_type)
+        } else {
+            let join_type = match join_type {
+                JoinType::Left => JoinType::Right,
+                JoinType::Right => JoinType::Left,
+                other => other,
+            };
+            (scan_aliased, source_df_aliased, join_type)
+        };
         let dataset_schema: Schema = self.dataset.schema().into();
         // A condition that reads target columns is evaluated after the join
         // on the rows it gates (`MergeConditionExec`), which takes only the
@@ -3368,8 +3426,8 @@ impl MergeInsertJob {
         let (update_condition, deferred_update_if) =
             split(parse_update_condition(&self.params, &dataset_schema)?);
         let (delete_condition, deferred_delete_if) = split(parse_delete_condition(&self.params)?);
-        let mut df = source_df_aliased
-            .join(scan_aliased, join_type, &on_cols_refs, &on_cols_refs, None)?
+        let mut df = left
+            .join(right, join_type, &on_cols_refs, &on_cols_refs, None)?
             .with_column(
                 MERGE_ACTION_COLUMN,
                 merge_insert_action(&self.params, update_condition, delete_condition)?,
@@ -3441,16 +3499,47 @@ impl MergeInsertJob {
         Ok(physical_plan)
     }
 
+    /// Replayable sources first build the source side. A `HashJoinInput`
+    /// resource failure discards that attempt before it produces a transaction,
+    /// then starts one target-build attempt. Stable snapshots replay the same
+    /// rows; rescannable providers are scanned again from the beginning.
     async fn execute_uncommitted_v2(
         self,
         provider: Arc<dyn TableProvider>,
+        source_mode: SourceProviderMode,
     ) -> Result<(
         Transaction,
         MergeStats,
         Option<RowAddrTreeMap>,
         Option<KeyExistenceFilter>,
     )> {
-        let budget = MergeBudget::new(&self.dataset, None);
+        let can_fallback = source_mode.supports_retries();
+        let first = self
+            .clone()
+            .execute_v2_attempt(provider.clone(), can_fallback)
+            .await;
+        match first {
+            Err(error) if can_fallback && is_hash_join_resource_exhausted(&error) => {
+                info!(
+                    "merge_insert source hash table exhausted the memory pool; retrying with the target as the build side"
+                );
+                self.execute_v2_attempt(provider, false).await
+            }
+            result => result,
+        }
+    }
+
+    async fn execute_v2_attempt(
+        self,
+        provider: Arc<dyn TableProvider>,
+        build_source: bool,
+    ) -> Result<(
+        Transaction,
+        MergeStats,
+        Option<RowAddrTreeMap>,
+        Option<KeyExistenceFilter>,
+    )> {
+        let budget = MergeBudget::new(&self.dataset, None, build_source);
         let plan = self.create_plan_in(provider, &budget).await?;
 
         // Execute the plan
@@ -3681,7 +3770,7 @@ impl MergeInsertJob {
 
         if can_use_fast_path {
             let (transaction, stats, affected_rows, inserted_rows_filter) =
-                self.execute_uncommitted_v2(provider).await?;
+                self.execute_uncommitted_v2(provider, source_mode).await?;
             return Ok(UncommittedMergeInsert {
                 transaction,
                 affected_rows,
@@ -12252,35 +12341,11 @@ mod tests {
         ).await.unwrap();
     }
 
-    /// #4583 use case 3: which side of the merge_insert hash join gets buffered
-    /// is decided by the source's statistics, not by the order `create_plan`
-    /// writes the join in. `create_plan` always puts the target on the left, so
-    /// without a swap the target is always the build side.
-    ///
-    /// The target here is one row past DataFusion's
-    /// `hash_join_single_partition_threshold_rows`, and its estimated width puts it
-    /// past the 1 MiB byte threshold too, so the target cannot be collected on
-    /// either count. That leaves the source: a materialized one reports exact
-    /// statistics and fits under the threshold, so `JoinSelection` swaps it onto
-    /// the build side and rewrites `Right` into `Left`. A one-shot stream reports
-    /// `Absent` for everything, neither side qualifies for `CollectLeft`, and the
-    /// plan falls back to a partitioned join whose build side is still the target.
-    ///
-    /// The one-shot provider used below stands in for every non-materialized
-    /// source: `stream_source_to_provider` sends the default path through
-    /// `spilling_table_provider`, which also hands back a `StreamingTable` and so
-    /// reports the same absent statistics.
-    ///
-    /// This is about which side is buffered, not about how much the target reads.
-    /// The target scan projects `other` either way, because the row-rewrite fill
-    /// reads it from the target side of the join.
-    ///
-    /// Both expectations characterise DataFusion's choice rather than any Lance
-    /// logic, and Lance sets no `hash_join_single_partition_threshold*` of its own,
-    /// so this rides on DataFusion's defaults (1 MiB / 128 Ki rows). A DataFusion
-    /// upgrade that changes them fails this test without anything in Lance
-    /// regressing, which is the point: the plan shape is what merge_insert's memory
-    /// use depends on, so a silent change to it should not go unnoticed.
+    /// `create_plan` uses the source-build budget. The target is deliberately
+    /// larger than either DataFusion collect threshold, and both source shapes
+    /// are asserted to be the build side. This pins the explicit operand order
+    /// and disabled join reordering that the bounded plan depends on; it is not
+    /// a test of source statistics driving `JoinSelection`.
     #[tokio::test]
     async fn test_plan_join_builds_on_source_for_both_source_shapes() {
         fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
@@ -12482,6 +12547,30 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_hash_join_resource_exhaustion_detection() {
+        let shared = Arc::new(DataFusionError::ResourcesExhausted(
+            "Additional allocation failed for HashJoinInput".to_string(),
+        ));
+        let shared_error: Error = DataFusionError::Shared(shared.clone()).into();
+        assert!(is_hash_join_resource_exhausted(&shared_error));
+        drop(shared);
+        let unique_error: Error =
+            DataFusionError::Shared(Arc::new(DataFusionError::ResourcesExhausted(
+                "Additional allocation failed for HashJoinInput".to_string(),
+            )))
+            .into();
+        assert!(is_hash_join_resource_exhausted(&unique_error));
+
+        let unrelated: Error = DataFusionError::ResourcesExhausted(
+            "Additional allocation failed for ExternalSorterMerge with top memory consumers \
+             (across reservations) as: HashJoinInput#33 consumed 64.0 MB"
+                .to_string(),
+        )
+        .into();
+        assert!(!is_hash_join_resource_exhausted(&unrelated));
+    }
+
     /// One merge's budget: a bounded pool, no join reordering, and the target
     /// scan and session batches sized from the fragments' on-disk row width.
     #[tokio::test]
@@ -12502,7 +12591,8 @@ mod tests {
         );
         assert_eq!(target_scan_batch_rows(&wide, 1024), Some(1));
 
-        let budget = MergeBudget::new(&wide, None);
+        let budget = MergeBudget::new(&wide, None, true);
+        assert!(budget.build_source);
         let options = LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
@@ -12524,7 +12614,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            MergeBudget::new(&wide, Some(1))
+            MergeBudget::new(&wide, Some(1), true)
                 .session_ctx
                 .state()
                 .config()
@@ -12537,7 +12627,9 @@ mod tests {
             .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(64))
             .await
             .unwrap();
-        assert_eq!(MergeBudget::new(&narrow, None).batch_rows, None);
+        let narrow_budget = MergeBudget::new(&narrow, None, false);
+        assert_eq!(narrow_budget.batch_rows, None);
+        assert!(!narrow_budget.build_source);
     }
 
     #[rstest::rstest]
@@ -12585,7 +12677,7 @@ mod tests {
       ProjectionExec: expr=[key@0 as key, value@1 as value, true as __merge_source_sentinel]
         StreamingTableExec: partition_sizes=1, projection=[key, value]
       CooperativeExec
-      LanceRead: uri=..., projection=[key, other], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--",
+        LanceRead: uri=data, projection=[key, other], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--",
         )
         .await
         .unwrap();

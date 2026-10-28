@@ -163,6 +163,22 @@ async fn check(dataset: &Dataset) {
     assert_eq!(replaced, 4);
 }
 
+async fn tag_counts(dataset: &Dataset) -> (usize, usize) {
+    let batch = dataset
+        .scan()
+        .project(&["tag"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let tags = batch["tag"].as_any().downcast_ref::<StringArray>().unwrap();
+    tags.iter().fold((0, 0), |(new, old), tag| match tag {
+        Some("new") => (new + 1, old),
+        Some("old") => (new, old + 1),
+        other => panic!("unexpected tag {other:?}"),
+    })
+}
+
 #[tokio::test]
 async fn test_partial_upsert_into_wide_rows_fits_pool() {
     unsafe {
@@ -219,5 +235,156 @@ async fn test_partial_upsert_into_wide_rows_fits_pool() {
     assert!(
         peak < PEAK_BYTES,
         "covering-index take path held {peak} bytes"
+    );
+
+    // The source can be larger than both the target and the pool. Building the
+    // source would fail even though the small target fits comfortably.
+    unsafe {
+        std::env::set_var("LANCE_MEM_POOL_SIZE", (16 * 1024 * 1024).to_string());
+    }
+    let wide_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt32, false),
+        Field::new("payload", DataType::Binary, true),
+        Field::new("tag", DataType::Utf8, false),
+    ]));
+    let source_payload = vec![NEW_BYTE; ROW_BYTES as usize];
+    let source_rows = 64;
+    let source = RecordBatch::try_new(
+        wide_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..source_rows)),
+            Arc::new(BinaryArray::from(vec![
+                source_payload.as_slice();
+                source_rows as usize
+            ])),
+            Arc::new(StringArray::from(vec!["new"; source_rows as usize])),
+        ],
+    )
+    .unwrap();
+    for (target_rows, spill_for_retry) in [(1, true), (4, true), (4, false)] {
+        let target = gen_batch()
+            .col("key", array::step::<UInt32Type>())
+            .col(
+                "payload",
+                array::rand_varbin(ByteCount::from(ROW_BYTES), ByteCount::from(ROW_BYTES)),
+            )
+            .col("tag", array::fill_utf8("old".to_string()))
+            .into_reader_rows(RowCount::from(target_rows), BatchCount::from(1));
+        let dataset = Arc::new(Dataset::write(target, "memory://", None).await.unwrap());
+        let target_file_bytes: u64 = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| fragment.metadata().files.iter())
+            .map(|file| file.file_size_bytes.get().unwrap().get())
+            .sum();
+        assert_eq!(
+            target_file_bytes > 2 * 1024 * 1024,
+            target_rows == 4,
+            "the four-row target must cross the old fixed cutoff"
+        );
+
+        let version_before = dataset.version().version;
+        let mut builder = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .use_index(false);
+        builder.spill_for_retry(spill_for_retry);
+        let (dataset, stats) = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, target_rows);
+        assert_eq!(
+            dataset.count_rows(None).await.unwrap(),
+            target_rows as usize
+        );
+        assert_eq!(dataset.version().version, version_before + 1);
+        assert_eq!(tag_counts(&dataset).await, (target_rows as usize, 0));
+    }
+
+    // Repeated payloads make the encoded target smaller than its decoded Arrow
+    // batches. The file size alone must not send this source through the target
+    // hash-table build.
+    let compressed_rows = 32;
+    let compressed_target = RecordBatch::try_new(
+        wide_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..compressed_rows)),
+            Arc::new(BinaryArray::from(vec![
+                source_payload.as_slice();
+                compressed_rows as usize
+            ])),
+            Arc::new(StringArray::from(vec!["old"; compressed_rows as usize])),
+        ],
+    )
+    .unwrap();
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(compressed_target)], wide_schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let encoded_bytes: u64 = dataset
+        .get_fragments()
+        .iter()
+        .flat_map(|fragment| fragment.metadata().files.iter())
+        .map(|file| file.file_size_bytes.get().unwrap().get())
+        .sum();
+    assert!(
+        encoded_bytes <= 2 * 1024 * 1024,
+        "fixture must compress below the old cutoff, got {encoded_bytes}"
+    );
+    let compressed_source_rows = 2;
+    let compressed_source = RecordBatch::try_new(
+        wide_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..compressed_source_rows)),
+            Arc::new(BinaryArray::from(vec![
+                source_payload.as_slice();
+                compressed_source_rows as usize
+            ])),
+            Arc::new(StringArray::from(vec![
+                "new";
+                compressed_source_rows as usize
+            ])),
+        ],
+    )
+    .unwrap();
+    let version_before = dataset.version().version;
+    let mut builder = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()]).unwrap();
+    builder
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .use_index(false);
+    let (dataset, stats) = builder
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new(
+            vec![Ok(compressed_source.clone())],
+            compressed_source.schema(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, compressed_source_rows as u64);
+    assert_eq!(
+        dataset.count_rows(None).await.unwrap(),
+        compressed_rows as usize
+    );
+    assert_eq!(dataset.version().version, version_before + 1);
+    assert_eq!(
+        tag_counts(&dataset).await,
+        (
+            compressed_source_rows as usize,
+            (compressed_rows - compressed_source_rows) as usize
+        )
     );
 }
