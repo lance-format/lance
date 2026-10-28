@@ -22,9 +22,10 @@ package lance.transaction;
  * the stabilization vote does not pass. Support here is read-side
  * fail-closed — rejected on load, with no write path.
  *
- * COMPATIBILITY WARNING. A table version carrying one of these cannot be
- * opened at all by Lance before v12.0.0, and the fix is not backported
- * (issue #9454). Writing V2 is opt-in for that reason.
+ * COMPATIBILITY. Any reader can open a table version carrying one of these,
+ * since the inline transaction is in a manifest field older readers ignore
+ * (#9482). Lance before v14.0.0 fails only when it decodes the transaction
+ * itself, to read history or to check a concurrent commit for conflicts.
  *
  * Why this shape:
  *
