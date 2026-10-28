@@ -85,7 +85,17 @@ fn default_num_workers() -> usize {
     std::cmp::max(1, total_cpus / 2)
 }
 
-fn resolve_num_workers(params: &InvertedIndexParams) -> usize {
+/// Resolve the indexing worker count, including environment defaults and the
+/// available compute parallelism. Input scans can use this count to scale
+/// decoding concurrency to the builder's consumer parallelism.
+///
+/// ```
+/// use lance_index::scalar::inverted::{InvertedIndexParams, builder::resolve_num_workers};
+///
+/// let params = InvertedIndexParams::default().num_workers(1);
+/// assert_eq!(resolve_num_workers(&params), 1);
+/// ```
+pub fn resolve_num_workers(params: &InvertedIndexParams) -> usize {
     let max_workers = get_num_compute_intensive_cpus().max(1);
     params
         .num_workers
