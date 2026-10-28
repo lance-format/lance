@@ -75,7 +75,7 @@ const DETACHED_VERSION_PREFIX: &str = "d";
 /// The file contains `{"version":N}` where `N` is the latest committed version
 /// at the time of writing. It enables O(1)/O(k) latest-version lookup via HEAD
 /// requests on object stores where listing is not lexicographically ordered
-/// (e.g. S3 Express, local filesystem) instead of an O(n) listing.
+/// (e.g. S3 Express) instead of an O(n) listing.
 const VERSION_HINT_FILE: &str = "latest_version_hint.json";
 
 /// How manifest files should be named.
@@ -346,11 +346,14 @@ fn version_hint_globally_enabled() -> bool {
 /// On stores where listing is lexicographically ordered (S3 Standard, GCS,
 /// Azure, ...) the latest version is already resolved in roughly one request,
 /// so the hint would only add a write per commit for nothing. We write (and
-/// read) it only on stores where listing is not lexicographically ordered —
-/// S3 Express and the local filesystem. Can be force-disabled with the
+/// read) it only on non-local stores where listing is not lexicographically
+/// ordered, such as S3 Express. Local directory listing is cheap, and replacing
+/// an open hint file can fail on Windows. Can be force-disabled with the
 /// `LANCE_USE_VERSION_HINT=0` environment variable.
 pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
-    version_hint_globally_enabled() && !object_store.list_is_lexically_ordered
+    version_hint_globally_enabled()
+        && !object_store.is_local()
+        && !object_store.list_is_lexically_ordered
 }
 
 /// Path to the JSON version hint file for a dataset.
@@ -2067,6 +2070,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_version_from_hint(&object_store, &base).await, None);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::no_hint(false)]
+    #[case::open_existing_hint(true)]
+    async fn test_local_store_skips_version_hint(
+        #[case] has_existing_hint: bool,
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        let tempdir = TempObjDir::default();
+        let base = tempdir.clone();
+        let object_store = ObjectStore::local();
+        let hint_path = version_hint_path(&base);
+        let hint_reader = if has_existing_hint {
+            // Simulate a hint left by an older writer and held open by a reader.
+            object_store
+                .put(&hint_path, br#"{"version":1}"#.as_slice())
+                .await
+                .unwrap();
+            Some(std::fs::File::open(lance_io::local::to_local_path(&hint_path)).unwrap())
+        } else {
+            None
+        };
+
+        // Gaps in history must not hide newer local manifests behind a stale hint.
+        for version in [1, 3, 5] {
+            object_store
+                .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
+                .await
+                .unwrap();
+            write_version_hint(&object_store, &base, version).await;
+        }
+        drop(hint_reader);
+
+        assert_eq!(
+            read_version_from_hint(&object_store, &base).await,
+            has_existing_hint.then_some(1)
+        );
+        assert!(!uses_version_hint(&object_store));
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 5);
+        assert_eq!(location.naming_scheme, naming_scheme);
+        let versions = default_list_manifest_locations_since(&base, &object_store, 1)
+            .map_ok(|location| location.version)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(versions, vec![5, 3]);
     }
 
     #[tokio::test]
