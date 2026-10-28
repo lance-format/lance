@@ -321,8 +321,9 @@ mod tests {
     use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
     use crate::dataset::blob::locate::BlobV2DescriptorColumns;
     use arrow::array::AsArray;
-    use arrow_array::RecordBatch;
-    use arrow_schema::Schema;
+    use arrow_array::{ListArray, RecordBatch, StructArray};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field, Schema};
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -352,5 +353,66 @@ mod tests {
         assert_eq!(columns.positions.value(0), offset);
         assert_eq!(columns.sizes.value(0), size);
         assert_eq!(columns.blob_uris.value(0), "_blobs/payload.blob");
+    }
+
+    /// Only packed and dedicated payloads count, at the top level, in a struct
+    /// and as list elements.
+    #[test]
+    fn sidecar_bytes_count_packed_and_dedicated_at_any_depth() {
+        let column = || {
+            let mut builder = BlobDescriptorArrayBuilder::new("blob");
+            for value in [
+                BlobDescriptor::Null,
+                BlobDescriptor::Inline { data: "abc".into() },
+                BlobDescriptor::Packed {
+                    blob_id: 1,
+                    offset: 0,
+                    size: 20,
+                },
+                BlobDescriptor::Dedicated {
+                    blob_id: 2,
+                    size: 1000,
+                },
+                BlobDescriptor::Managed {
+                    base_id: None,
+                    uri: "_blobs/payload.blob".to_string(),
+                    offset: 0,
+                    size: 7,
+                },
+                BlobDescriptor::External {
+                    base_id: 0,
+                    uri: "file:///external.bin".to_string(),
+                    offset: 0,
+                    size: 9,
+                },
+            ] {
+                builder.push(value).unwrap();
+            }
+            builder.finish().unwrap().into_parts()
+        };
+        let (field, top) = column();
+        let field = Arc::new(field);
+        let rows = top.len();
+        let meta = Field::new("meta", DataType::Struct(vec![field.clone()].into()), true);
+        let items = Field::new("items", DataType::List(field.clone()), true);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field.as_ref().clone(), meta, items])),
+            vec![
+                top,
+                Arc::new(StructArray::new(
+                    vec![field.clone()].into(),
+                    vec![column().1],
+                    None,
+                )),
+                Arc::new(ListArray::new(
+                    field,
+                    OffsetBuffer::from_lengths(vec![1; rows]),
+                    column().1,
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        assert_eq!(prepared_sidecar_bytes(&batch).unwrap(), 3 * (20 + 1000));
     }
 }
