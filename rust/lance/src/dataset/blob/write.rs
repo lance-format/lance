@@ -158,6 +158,10 @@ pub struct BlobPreprocessor {
     data_file_key: String,
     blob_id_allocator: BlobIdAllocator,
     is_part: bool,
+    /// Whether the caller fixed this data file's name (a preassigned name, or a
+    /// part's target), so it can have written the sidecars a prepared Packed or
+    /// Dedicated row names.
+    preassigned_data_file: bool,
     current_pack: Option<BlobPack>,
     /// Write-param override for the pack-file roll size. When set, it takes
     /// precedence over each field's `blob-pack-file-size-threshold` metadata for
@@ -367,6 +371,7 @@ impl BlobPreprocessor {
             data_file_key,
             blob_id_allocator: BlobIdAllocator::new(1),
             is_part: false,
+            preassigned_data_file: false,
             current_pack: None,
             pack_file_size_override,
             field_processors,
@@ -387,6 +392,11 @@ impl BlobPreprocessor {
         self
     }
 
+    pub(in crate::dataset) fn with_preassigned_data_file(mut self) -> Self {
+        self.preassigned_data_file = true;
+        self
+    }
+
     pub(in crate::dataset) fn with_part_blob_ids(
         mut self,
         blob_ids: Option<Range<u32>>,
@@ -395,6 +405,7 @@ impl BlobPreprocessor {
             self.blob_id_allocator = BlobIdAllocator::from_range(blob_ids)?;
         }
         self.is_part = true;
+        self.preassigned_data_file = true;
         for processor in &mut self.field_processors {
             processor.force_non_empty_inline_to_sidecar();
         }
@@ -758,33 +769,44 @@ impl BlobPreprocessor {
                     .expect("validated prepared base")
                     .as_primitive::<UInt32Type>();
                 for row in 0..values.len() {
-                    if !values.is_null(row)
-                        && matches!(
-                            BlobKind::try_from(kinds.value(row))?,
-                            BlobKind::Managed | BlobKind::ManagedWithBase
-                        )
-                        && self.managed_base.is_none()
-                    {
-                        return Err(Error::invalid_input(format!(
-                            "Managed blob field '{}' row {row} requires schema metadata {}=true",
-                            field.name(),
-                            MANAGED_BLOBS_META_KEY,
-                        )));
+                    if values.is_null(row) {
+                        continue;
                     }
-                    if !values.is_null(row)
-                        && kinds.is_valid(row)
-                        && kinds.value(row) == BlobKind::ManagedWithBase as u8
-                    {
-                        let id = ids.value(row);
-                        if !self
-                            .external_base_resolver
-                            .as_ref()
-                            .is_some_and(|resolver| resolver.registered_base_ids.contains(id))
+                    match BlobKind::try_from(kinds.value(row))? {
+                        BlobKind::Managed | BlobKind::ManagedWithBase
+                            if self.managed_base.is_none() =>
                         {
                             return Err(Error::invalid_input(format!(
-                                "Managed blob references unknown base_id {id}"
+                                "Managed blob field '{}' row {row} requires schema metadata {}=true",
+                                field.name(),
+                                MANAGED_BLOBS_META_KEY,
                             )));
                         }
+                        BlobKind::ManagedWithBase => {
+                            let id = ids.value(row);
+                            if !self
+                                .external_base_resolver
+                                .as_ref()
+                                .is_some_and(|resolver| resolver.registered_base_ids.contains(id))
+                            {
+                                return Err(Error::invalid_input(format!(
+                                    "Managed blob references unknown base_id {id}"
+                                )));
+                            }
+                        }
+                        kind @ (BlobKind::Packed | BlobKind::Dedicated)
+                            if !self.preassigned_data_file =>
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "Blob v2 field '{}' row {row} is a prepared {kind:?} blob, \
+                                 whose blob_id {} names a sidecar of a data file this write \
+                                 names itself; pass the bytes, or a Managed reference to the \
+                                 object, instead",
+                                field.name(),
+                                ids.value(row),
+                            )));
+                        }
+                        _ => {}
                     }
                 }
 
