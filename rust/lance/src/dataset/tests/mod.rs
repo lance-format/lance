@@ -19,6 +19,7 @@ mod dataset_scanner;
 mod dataset_schema_evolution;
 mod dataset_transactions;
 mod dataset_versioning;
+mod dataset_zone_map_seed_reuse;
 mod dataset_zone_map_seeds;
 mod dataset_zone_map_versions;
 mod fragment_validate_tombstones;
