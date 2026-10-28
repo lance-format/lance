@@ -38,7 +38,6 @@ use futures::{
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
-use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
@@ -75,7 +74,7 @@ const DETACHED_VERSION_PREFIX: &str = "d";
 /// The file contains `{"version":N}` where `N` is the latest committed version
 /// at the time of writing. It enables O(1)/O(k) latest-version lookup via HEAD
 /// requests on object stores where listing is not lexicographically ordered
-/// (e.g. S3 Express) instead of an O(n) listing.
+/// (e.g. S3 Express, local filesystem) instead of an O(n) listing.
 const VERSION_HINT_FILE: &str = "latest_version_hint.json";
 
 /// How manifest files should be named.
@@ -346,14 +345,11 @@ fn version_hint_globally_enabled() -> bool {
 /// On stores where listing is lexicographically ordered (S3 Standard, GCS,
 /// Azure, ...) the latest version is already resolved in roughly one request,
 /// so the hint would only add a write per commit for nothing. We write (and
-/// read) it only on non-local stores where listing is not lexicographically
-/// ordered, such as S3 Express. Local directory listing is cheap, and replacing
-/// an open hint file can fail on Windows. Can be force-disabled with the
+/// read) it only on stores where listing is not lexicographically ordered —
+/// S3 Express and the local filesystem. Can be force-disabled with the
 /// `LANCE_USE_VERSION_HINT=0` environment variable.
 pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
-    version_hint_globally_enabled()
-        && !object_store.is_local()
-        && !object_store.list_is_lexically_ordered
+    version_hint_globally_enabled() && !object_store.list_is_lexically_ordered
 }
 
 /// Path to the JSON version hint file for a dataset.
@@ -368,6 +364,8 @@ fn version_hint_path(base: &Path) -> Path {
 /// never affects correctness (readers verify the hinted version and probe
 /// upward from there). It is a no-op for detached versions and for stores that
 /// do not benefit from a hint (see [`uses_version_hint`]).
+/// Local write failures on Windows are logged at debug level, since readers
+/// holding the hint open can prevent replacement.
 pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
     if is_detached_version(version) || !uses_version_hint(object_store) {
         return;
@@ -375,7 +373,11 @@ pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version
     let hint_path = version_hint_path(base);
     let content = serde_json::to_vec(&VersionHint { version }).expect("serialize version hint");
     if let Err(e) = object_store.put(&hint_path, content.as_slice()).await {
-        warn!("Failed to write version hint file for version {version}: {e}");
+        if cfg!(windows) && object_store.is_local() {
+            debug!("Failed to write version hint file for version {version}: {e}");
+        } else {
+            tracing::warn!("Failed to write version hint file for version {version}: {e}");
+        }
     }
 }
 
@@ -1781,17 +1783,23 @@ impl Default for CommitConfig {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use lance_core::utils::testing::{
+        CountingObjectStore, ProxyObjectStore, ProxyObjectStorePolicy,
+    };
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
+    use tracing::instrument::WithSubscriber;
+    use tracing_mock::{expect, subscriber};
 
     use super::*;
 
@@ -2074,52 +2082,143 @@ mod tests {
 
     #[tokio::test]
     #[rstest::rstest]
-    #[case::no_hint(false)]
-    #[case::open_existing_hint(true)]
-    async fn test_local_store_skips_version_hint(
-        #[case] has_existing_hint: bool,
+    #[case::current_hint(3)]
+    #[case::stale_hint(1)]
+    async fn test_local_incremental_discovery_avoids_listing(
+        #[case] hint_version: u64,
         #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
         naming_scheme: ManifestNamingScheme,
     ) {
         let tempdir = TempObjDir::default();
         let base = tempdir.clone();
-        let object_store = ObjectStore::local();
-        let hint_path = version_hint_path(&base);
-        let hint_reader = if has_existing_hint {
-            // Simulate a hint left by an older writer and held open by a reader.
-            object_store
-                .put(&hint_path, br#"{"version":1}"#.as_slice())
-                .await
-                .unwrap();
-            Some(std::fs::File::open(lance_io::local::to_local_path(&hint_path)).unwrap())
-        } else {
-            None
-        };
+        let mut object_store = ObjectStore::local();
 
-        // Gaps in history must not hide newer local manifests behind a stale hint.
-        for version in [1, 3, 5] {
+        for version in 1..=3 {
             object_store
                 .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
                 .await
                 .unwrap();
-            write_version_hint(&object_store, &base, version).await;
         }
-        drop(hint_reader);
+        write_version_hint(&object_store, &base, hint_version).await;
+
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        object_store.inner = Arc::new(CountingObjectStore::new(
+            object_store.inner.clone(),
+            listing_count.clone(),
+        ));
+
+        // Every commit checks for newer versions, even when already up to date.
+        let versions = default_list_manifest_locations_since(&base, &object_store, 3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(versions.is_empty());
 
         assert_eq!(
-            read_version_from_hint(&object_store, &base).await,
-            has_existing_hint.then_some(1)
+            default_list_manifest_locations_since(&base, &object_store, 1)
+                .map_ok(|location| location.version)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            vec![3, 2]
         );
-        assert!(!uses_version_hint(&object_store));
-        let location = current_manifest_path(&object_store, &base).await.unwrap();
-        assert_eq!(location.version, 5);
-        assert_eq!(location.naming_scheme, naming_scheme);
+        assert_eq!(listing_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            read_version_from_hint(&object_store, &base).await,
+            Some(hint_version)
+        );
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::local(true)]
+    #[case::remote(false)]
+    async fn test_version_hint_write_failure_logging(#[case] is_local: bool) {
+        let tempdir = TempObjDir::default();
+        let base = tempdir.clone();
+        let object_store = if is_local {
+            // Replacing a directory fails on every platform, exercising the
+            // same best-effort error boundary as an open hint on Windows.
+            std::fs::create_dir_all(lance_io::local::to_local_path(&version_hint_path(&base)))
+                .unwrap();
+            ObjectStore::local()
+        } else {
+            let mut object_store = *non_lexical_memory_store();
+            let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+            policy.lock().unwrap().set_before_policy(
+                "fail_hint_write",
+                Arc::new(|method, _| {
+                    if method.starts_with("put") {
+                        return Err(Error::io("simulated hint write failure"));
+                    }
+                    Ok(())
+                }),
+            );
+            object_store.inner =
+                Arc::new(ProxyObjectStore::new(object_store.inner.clone(), policy));
+            object_store
+        };
+        let level = if cfg!(windows) && is_local {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::WARN
+        };
+        let (subscriber, handle) = subscriber::mock()
+            .with_filter(|metadata| metadata.target() == "lance_table::io::commit")
+            .event(expect::event().at_level(level))
+            .only()
+            .run_with_handle();
+        write_version_hint(&object_store, &base, 2)
+            .with_subscriber(subscriber)
+            .await;
+        handle.assert_finished();
+        assert_eq!(read_version_from_hint(&object_store, &base).await, None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_version_hint_held_open_on_windows() {
+        let tempdir = TempObjDir::default();
+        let base = tempdir.clone();
+        let object_store = ObjectStore::local();
+        for version in 1..=2 {
+            object_store
+                .put(
+                    &ManifestNamingScheme::V2.manifest_path(&base, version),
+                    b"".as_slice(),
+                )
+                .await
+                .unwrap();
+        }
+        write_version_hint(&object_store, &base, 1).await;
+
+        // Match Python's read-only open: allow reads, but prevent replacement.
+        const FILE_SHARE_READ: u32 = 1;
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(lance_io::local::to_local_path(&version_hint_path(&base)))
+            .unwrap();
+        let (subscriber, handle) = subscriber::mock()
+            .with_filter(|metadata| metadata.target() == "lance_table::io::commit")
+            .event(expect::event().at_level(tracing::Level::DEBUG))
+            .only()
+            .run_with_handle();
+        write_version_hint(&object_store, &base, 2)
+            .with_subscriber(subscriber)
+            .await;
+        handle.assert_finished();
+        assert_eq!(read_version_from_hint(&object_store, &base).await, Some(1));
         let versions = default_list_manifest_locations_since(&base, &object_store, 1)
             .map_ok(|location| location.version)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(versions, vec![5, 3]);
+        assert_eq!(versions, vec![2]);
+
+        drop(reader);
+        write_version_hint(&object_store, &base, 2).await;
+        assert_eq!(read_version_from_hint(&object_store, &base).await, Some(2));
     }
 
     #[tokio::test]
