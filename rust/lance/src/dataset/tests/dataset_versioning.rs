@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use std::vec;
 
 use crate::Dataset;
@@ -10,6 +12,7 @@ use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::datatypes::Schema;
+use crate::io::commit::load_and_sort_new_transactions;
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
@@ -22,14 +25,15 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
-use crate::dataset::refs::branch_contents_path;
+use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
 use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
 use lance_core::Error;
-use object_store::path::Path;
+use object_store::{ObjectStoreExt as _, path::Path};
 use rstest::rstest;
 use std::cmp::Ordering;
 
@@ -49,6 +53,68 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         "Entries: {:?}",
         entries_names
     );
+}
+
+#[rstest]
+#[case::one_io(1)]
+#[case::two_io(2)]
+fn test_transaction_reads_with_low_io_parallelism(#[case] io_parallelism: usize) {
+    // Isolate the process-wide I/O setting from concurrently running tests.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "dataset::tests::dataset_versioning::test_low_io_transaction_child",
+            "--nocapture",
+        ])
+        .env("LANCE_LOW_IO_TRANSACTION_TEST", "1")
+        .env("LANCE_IO_THREADS", io_parallelism.to_string())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "child process failed: {output:?}");
+}
+
+#[tokio::test]
+async fn test_low_io_transaction_child() {
+    if std::env::var_os("LANCE_LOW_IO_TRANSACTION_TEST").is_none() {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let data = gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(4))
+            .unwrap();
+        let reader = || RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader(),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // An empty history must finish too: no sender will publish a manifest.
+        let (current, transactions) = load_and_sort_new_transactions(&dataset).await.unwrap();
+        assert_eq!(current.version().version, 1);
+        assert!(transactions.is_empty());
+
+        let stale = dataset.clone();
+        dataset.append(reader(), None).await.unwrap();
+        let (current, transactions) = load_and_sort_new_transactions(&stale).await.unwrap();
+        assert_eq!(current.version().version, 2);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].0, 2);
+
+        dataset.delete("key = 1").await.unwrap();
+        assert_eq!(dataset.version().version, 3);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+        assert_eq!(dataset.count_rows(Some("key = 1".into())).await.unwrap(), 0);
+    })
+    .await
+    .expect("transaction reads and delete must progress with one I/O slot");
 }
 
 #[tokio::test]
@@ -389,6 +455,99 @@ async fn test_restore_preserves_row_id_high_water_mark() {
         ids.iter().filter(|id| **id >= mark).count(),
         10,
         "appended rows did not all take fresh ids past {mark}: {ids:?}"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EmptyTableCopy {
+    ShallowClone,
+    Branch,
+    DeepClone,
+}
+
+/// Once every row is deleted no fragment is left to show that the table uses
+/// stable row ids, so only the flag records it. A copy that lost the flag would
+/// hand out row addresses from the namespace the source has already issued ids
+/// from.
+#[rstest]
+#[case::shallow_clone(EmptyTableCopy::ShallowClone)]
+#[case::branch(EmptyTableCopy::Branch)]
+#[case::deep_clone(EmptyTableCopy::DeepClone)]
+#[tokio::test]
+async fn test_copy_of_emptied_table_keeps_stable_row_ids(#[case] copy: EmptyTableCopy) {
+    let test_dir = TempStrDir::default();
+    let source_uri = format!("{}/source", test_dir.as_str());
+    let copy_uri = format!("{}/copy", test_dir.as_str());
+    let batch = u32_batch(0..20);
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 10,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    source.delete("i >= 0").await.unwrap();
+    assert!(source.manifest.fragments.is_empty());
+    assert!(source.manifest.uses_stable_row_ids());
+    let next_row_id = source.manifest.next_row_id;
+    assert_eq!(next_row_id, 20);
+
+    let version = source.version().version;
+    match copy {
+        EmptyTableCopy::ShallowClone => {
+            source
+                .shallow_clone(&copy_uri, version, None)
+                .await
+                .unwrap();
+        }
+        EmptyTableCopy::Branch => {
+            source.create_branch("copy", version, None).await.unwrap();
+        }
+        EmptyTableCopy::DeepClone => {
+            source.deep_clone(&copy_uri, version, None).await.unwrap();
+        }
+    }
+    let open_copy = async || match copy {
+        EmptyTableCopy::Branch => Dataset::open(&source_uri)
+            .await
+            .unwrap()
+            .checkout_branch("copy")
+            .await
+            .unwrap(),
+        EmptyTableCopy::ShallowClone | EmptyTableCopy::DeepClone => {
+            Dataset::open(&copy_uri).await.unwrap()
+        }
+    };
+    let mut copied = open_copy().await;
+    assert!(copied.manifest.fragments.is_empty());
+    assert!(
+        copied.manifest.uses_stable_row_ids(),
+        "the copy lost stable row ids: reader flags {}",
+        copied.manifest.reader_feature_flags
+    );
+    assert_ne!(
+        copied.manifest.writer_feature_flags & FLAG_STABLE_ROW_IDS,
+        0,
+        "the copy lost stable row ids: writer flags {}",
+        copied.manifest.writer_feature_flags
+    );
+    assert_eq!(copied.manifest.next_row_id, next_row_id);
+
+    let batch = u32_batch(20..25);
+    copied
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_row_ids(&open_copy().await).await,
+        (next_row_id..next_row_id + 5).collect::<Vec<_>>()
     );
 }
 
@@ -1079,6 +1238,42 @@ async fn test_cannot_delete_branch_referenced_by_tag() {
 }
 
 #[tokio::test]
+async fn test_list_hierarchical_branches() {
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+    dataset.create_branch("release", 1, None).await.unwrap();
+    dataset
+        .create_branch("features/nested", 1, None)
+        .await
+        .unwrap();
+
+    // OpenDAL-backed stores such as OSS may decode the '%2F' path part and
+    // expose the branch metadata as a nested object during listing.
+    let root_path = dataset.refs.root().unwrap().path;
+    let encoded_path = branch_contents_path(&root_path, "features/nested");
+    let nested_path = Path::parse(format!(
+        "{}/features/nested.json",
+        base_branches_contents_path(&root_path)
+    ))
+    .unwrap();
+    dataset
+        .object_store
+        .inner
+        .copy(&encoded_path, &nested_path)
+        .await
+        .unwrap();
+    dataset.object_store.delete(&encoded_path).await.unwrap();
+
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains_key("release"));
+    assert!(branches.contains_key("features/nested"));
+}
+
+#[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
@@ -1337,6 +1532,41 @@ async fn test_branch() {
         "branch1"
     );
 
+    // Opening a branch version that main does not have (main only has version 1)
+    // must resolve the version on the branch chain.
+    let branch_version_open = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(3))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_version_open.manifest.branch.as_deref(),
+        Some("feature/nathan/branch3")
+    );
+    assert_eq!(branch_version_open.version().version, 3);
+    assert_eq!(
+        branch_version_open.count_rows(None).await.unwrap(),
+        checkout_branch3_at_version3.count_rows(None).await.unwrap()
+    );
+    // A version the branch does not have is still an error, not its latest version.
+    let err = DatasetBuilder::from_uri(&test_uri)
+        .with_branch("feature/nathan/branch3", Some(99))
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::DatasetNotFound { .. }), "{err}");
+    assert!(err.to_string().contains("feature/nathan/branch3"), "{err}");
+
+    // From the branch's own directory, an older version of that branch is checked out on it.
+    let branch_dir_open = DatasetBuilder::from_uri(branch1_dataset.uri())
+        .with_branch("branch1", Some(1))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(branch_dir_open.manifest.branch.as_deref(), Some("branch1"));
+    assert_eq!(branch_dir_open.version().version, 1);
+    assert_eq!(branch_dir_open.count_rows(None).await.unwrap(), 50);
+
     // Opening at a branch-pointing tag through the builder must check out the
     // tag's branch chain, not main's chain at the tag's version number.
     let tag_open = DatasetBuilder::from_uri(&test_uri)
@@ -1406,7 +1636,6 @@ async fn test_branch() {
     // error loudly instead of handing back another branch's data: stage main's
     // manifest under a branch path that was never created, so resolution finds
     // a manifest belonging to main.
-    use object_store::ObjectStoreExt as _;
     let staged_manifest = main_dataset.manifest_location().path.clone();
     let staged_copy = Path::parse(format!(
         "{}/tree/ghost/_versions/{}",

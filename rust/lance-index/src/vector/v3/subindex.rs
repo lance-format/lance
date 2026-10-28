@@ -20,6 +20,19 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
     type BuildParams: Clone + Send + Sync;
 
+    /// Serialize per-partition metadata for a partition the build left empty.
+    ///
+    /// Most sub-indexes store no per-partition rows and return `None`, which
+    /// the writer stores as an empty string. Sub-indexes that still parse
+    /// per-partition metadata for empty partitions (an empty `HNSW` graph must
+    /// round-trip through `read_sub_index_batch`) return the serialized
+    /// metadata here, carrying the segment's build parameters so an empty
+    /// partition cannot misrepresent the parameters readers derive from the
+    /// segment's metadata.
+    fn empty_partition_metadata(_build_params: Option<&Self::BuildParams>) -> Option<String> {
+        None
+    }
+
     /// Load the sub index from a record batch with a single row
     fn load(data: RecordBatch) -> Result<Self>
     where

@@ -24,7 +24,7 @@ use object_store::{
     StaticCredentialProvider,
     aws::{
         AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
-        AwsCredentialProvider,
+        AwsCredentialProvider, S3CopyIfNotExists,
     },
 };
 use tokio::sync::{Mutex, RwLock};
@@ -39,6 +39,10 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
+
+mod conditional_copy;
+
+use conditional_copy::ConditionalS3Store;
 
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
@@ -86,9 +90,8 @@ impl AwsStoreProvider {
         mut resolved_s3_options: ResolvedS3StorageOptions,
         is_s3_express: bool,
         throttle_state: Option<&AimdThrottleState>,
-        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
-        // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
-    ) -> Result<Arc<AmazonS3>> {
+        // Keep the concrete client for paginated listing alongside the copy adapter.
+    ) -> Result<(Arc<dyn OSObjectStore>, Arc<AmazonS3>)> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -132,8 +135,17 @@ impl AwsStoreProvider {
         base_path.set_query(None);
 
         // we can't use parse_url_opts here because we need to manually set the credentials provider
-        let mut builder =
-            AmazonS3Builder::new().with_client_options(storage_options.client_options()?);
+        // Reuse the same transport settings for the completion client, including
+        // settings that with_config would otherwise apply only to this builder.
+        let mut client_options = storage_options.client_options()?;
+        for (key, value) in &resolved_s3_options.options {
+            if let AmazonS3ConfigKey::Client(key) = key {
+                client_options = client_options.with_config(*key, value);
+            }
+        }
+        let mut builder = AmazonS3Builder::new()
+            .with_client_options(client_options.clone())
+            .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
         for (key, value) in resolved_s3_options.options {
             builder = builder.with_config(key, value);
         }
@@ -145,13 +157,27 @@ impl AwsStoreProvider {
 
         builder = builder.with_http_connector(cloud_http_connector(throttle_state, metrics_base));
 
-        Ok(Arc::new(builder.build()?))
+        let use_multipart_copy = builder
+            .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
+            .is_some_and(|mode| mode.trim() == "multipart");
+        let store = Arc::new(builder.clone().build()?);
+        let inner: Arc<dyn OSObjectStore> = if use_multipart_copy {
+            Arc::new(ConditionalS3Store::new(
+                store.clone(),
+                builder,
+                client_options,
+            )?)
+        } else {
+            store.clone()
+        };
+        Ok((inner, store))
     }
 
     async fn build_opendal_s3_store(
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
+        aws_credentials: Option<&AwsCredentialProvider>,
     ) -> Result<Arc<dyn OSObjectStore>> {
         let bucket = base_path
             .host_str()
@@ -169,6 +195,16 @@ impl AwsStoreProvider {
                 "OpendalStore does not currently support an explicit provider_scheme (currently set to {:?})",
                 provider_scheme
             )));
+        }
+
+        // The provider reaches the native store through the params, which this
+        // arm does not pass on, so a request here would be signed with whatever
+        // credentials OpenDAL resolves for itself instead.
+        if aws_credentials.is_some() {
+            return Result::Err(Error::not_supported(
+                "OpendalStore does not currently support an explicit aws_credentials provider"
+                    .to_string(),
+            ));
         }
 
         // Set required OpenDAL configuration
@@ -227,13 +263,17 @@ impl ObjectStoreProvider for AwsStoreProvider {
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
             (
-                self.build_opendal_s3_store(&base_path, &storage_options)
-                    .await?,
+                self.build_opendal_s3_store(
+                    &base_path,
+                    &storage_options,
+                    params.aws_credentials.as_ref(),
+                )
+                .await?,
                 None,
             )
         } else {
             // Use default Amazon S3 implementation
-            let store = self
+            let (inner, store) = self
                 .build_amazon_s3_store(
                     &mut base_path,
                     params,
@@ -243,10 +283,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
                     throttle_state.as_ref(),
                 )
                 .await?;
-            (
-                store.clone() as Arc<dyn OSObjectStore>,
-                Some(store as Arc<dyn PaginatedListStore>),
-            )
+            (inner, Some(store as Arc<dyn PaginatedListStore>))
         };
         let (inner, paginated_lister) =
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
@@ -614,29 +651,35 @@ impl AwsCredentialAdapter {
 impl StorageOptions {
     /// Add values from the environment to storage options.
     ///
-    /// Only adds keys that are not already present, so explicitly-set options
-    /// (including empty-string sentinels) always take precedence over env vars.
+    /// Explicitly-set options (including aliases, case variants, and empty-string
+    /// sentinels) always take precedence over env vars.
     pub fn with_env_s3(&mut self) {
-        for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
-                && let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase())
-                && !self.0.contains_key(config_key.as_ref())
-            {
-                self.0
-                    .insert(config_key.as_ref().to_string(), value.to_string());
-            }
-        }
+        self.merge_env_options(std::env::vars_os(), |key| {
+            AmazonS3ConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
     }
 
-    /// Subset of options relevant for s3 storage
+    /// Return options recognized by [`AmazonS3ConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as `aws_region`)
+    /// wins, followed by case variants of that name. Remaining ties use the
+    /// lexicographically smallest original key. Empty values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::aws::AmazonS3ConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("region".into(), "us-east-1".into()),
+    ///     ("aws_region".into(), "eu-west-1".into()),
+    /// ]));
+    /// assert_eq!(options.as_s3_options()[&AmazonS3ConfigKey::Region], "eu-west-1");
+    /// ```
     pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((s3_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 
     /// Parse the `aws_provider_scheme` storage option, if set.
@@ -688,6 +731,36 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::canonical("aws_region", "region")]
+    #[case::canonical_over_case_variant("aws_region", "AWS_REGION")]
+    #[case::canonical_case_tie("AWS_REGION", "Aws_Region")]
+    #[case::case_variant_over_alias("AWS_REGION", "region")]
+    #[case::lexical_alias("REGION", "region")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_s3_options(),
+                HashMap::from([(AmazonS3ConfigKey::Region, preferred_value.to_string())])
+            );
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MockAwsCredentialsProvider {
@@ -1073,6 +1146,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
+    }
+
+    /// A credential provider handed to the OpenDAL arm would be dropped, and
+    /// the requests signed from the environment instead.
+    #[tokio::test]
+    async fn test_use_opendal_rejects_an_explicit_credential_provider() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AwsStoreProvider;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let params = ObjectStoreParams {
+            aws_credentials: Some(
+                Arc::new(MockAwsCredentialsProvider::default()) as AwsCredentialProvider
+            ),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let err = provider.new_store(url, &params).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "got: {err:?}, expected NotSupported"
+        );
+        assert!(err.to_string().contains("aws_credentials"), "got: {err}");
     }
 
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back

@@ -554,33 +554,43 @@ pub struct MultiMatchQuery {
     pub match_queries: Vec<MatchQuery>,
 }
 
+/// Serializes every leaf under `match_queries`. The legacy `query`, `columns`
+/// and `boost` keys are also written when every leaf names a column, so a reader
+/// that predates `match_queries` degrades as before: it rebuilds default leaves
+/// from the first leaf's terms.
 impl Serialize for MultiMatchQuery {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut map = serializer.serialize_map(Some(3))?;
-
-        let query = self.match_queries.first().ok_or(serde::ser::Error::custom(
+        let first = self.match_queries.first().ok_or(serde::ser::Error::custom(
             "MultiMatchQuery must have at least one MatchQuery".to_string(),
         ))?;
-        map.serialize_entry("query", &query.terms)?;
-        let columns = self
+        let legacy_columns = self
             .match_queries
             .iter()
-            .map(|q| q.column.as_ref().unwrap().clone())
-            .collect::<Vec<String>>();
-        map.serialize_entry("columns", &columns)?;
-        let boosts = self
-            .match_queries
-            .iter()
-            .map(|q| q.boost)
-            .collect::<Vec<f32>>();
-        map.serialize_entry("boost", &boosts)?;
+            .map(|q| q.column.as_deref())
+            .collect::<Option<Vec<&str>>>();
+
+        let mut map =
+            serializer.serialize_map(Some(if legacy_columns.is_some() { 4 } else { 1 }))?;
+        if let Some(columns) = legacy_columns {
+            map.serialize_entry("query", &first.terms)?;
+            map.serialize_entry("columns", &columns)?;
+            let boosts = self
+                .match_queries
+                .iter()
+                .map(|q| q.boost)
+                .collect::<Vec<f32>>();
+            map.serialize_entry("boost", &boosts)?;
+        }
+        map.serialize_entry("match_queries", &self.match_queries)?;
         map.end()
     }
 }
 
+/// Reads `match_queries` when present. Otherwise falls back to the legacy
+/// `{query, columns, boost}` shape, which carries no per-leaf settings.
 impl<'de> Deserialize<'de> for MultiMatchQuery {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -588,15 +598,30 @@ impl<'de> Deserialize<'de> for MultiMatchQuery {
     {
         #[derive(Deserialize)]
         struct MultiMatchQueryData {
-            query: String,
-            columns: Vec<String>,
+            match_queries: Option<Vec<MatchQuery>>,
+            query: Option<String>,
+            columns: Option<Vec<String>>,
             boost: Option<Vec<f32>>,
         }
 
         let data = MultiMatchQueryData::deserialize(deserializer)?;
-        let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
+        if let Some(match_queries) = data.match_queries {
+            if match_queries.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "Cannot create MultiMatchQuery with no match queries",
+                ));
+            }
+            return Ok(Self { match_queries });
+        }
 
-        Self::try_new(data.query, data.columns)
+        let query = data
+            .query
+            .ok_or_else(|| serde::de::Error::missing_field("query"))?;
+        let columns = data
+            .columns
+            .ok_or_else(|| serde::de::Error::missing_field("columns"))?;
+        let boosts = data.boost.unwrap_or(vec![1.0; columns.len()]);
+        Self::try_new(query, columns)
             .map_err(serde::de::Error::custom)?
             .try_with_boosts(boosts)
             .map_err(serde::de::Error::custom)
@@ -1633,6 +1658,96 @@ mod tests {
         assert!(value.get("combined_fields").is_some());
         let round_trip: FtsQuery = serde_json::from_value(value).unwrap();
         assert_eq!(round_trip, wrapped);
+    }
+
+    fn per_leaf_multi_match() -> MultiMatchQuery {
+        MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("alpha beta".to_string())
+                    .with_column(Some("title".to_string()))
+                    .with_operator(Operator::And)
+                    .with_boost(2.0)
+                    .with_fuzziness(None)
+                    .with_document_granularity(DocumentGranularity::Row),
+                MatchQuery::new("gamma delta".to_string())
+                    .with_column(Some("body".to_string()))
+                    .with_operator(Operator::And)
+                    .with_fuzziness(Some(2))
+                    .with_max_expansions(7)
+                    .with_prefix_length(3),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_multi_match_query_serde_round_trip() {
+        let query = FtsQuery::MultiMatch(per_leaf_multi_match());
+        let json = serde_json::to_string(&query).unwrap();
+        let round_trip: FtsQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, query);
+    }
+
+    #[test]
+    fn test_multi_match_query_serde_nested_round_trip() {
+        let query = FtsQuery::Boost(BoostQuery::new(
+            FtsQuery::Boolean(BooleanQuery::new([
+                (Occur::Must, FtsQuery::MultiMatch(per_leaf_multi_match())),
+                (
+                    Occur::MustNot,
+                    FtsQuery::Match(
+                        MatchQuery::new("epsilon".to_string())
+                            .with_column(Some("body".to_string())),
+                    ),
+                ),
+            ])),
+            FtsQuery::MultiMatch(per_leaf_multi_match()),
+            Some(0.3),
+        ));
+        let json = serde_json::to_string(&query).unwrap();
+        let round_trip: FtsQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, query);
+    }
+
+    #[test]
+    fn test_multi_match_query_legacy_serde() {
+        use serde_json::json;
+
+        // Writers predating `match_queries` send only these keys; every leaf is
+        // a default `MatchQuery` over the shared terms.
+        let legacy = json!({
+            "query": "alpha beta",
+            "columns": ["title", "body"],
+            "boost": [2.0, 1.0],
+        });
+        let query: MultiMatchQuery = serde_json::from_value(legacy).unwrap();
+        let expected = MultiMatchQuery::try_new(
+            "alpha beta".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![2.0, 1.0])
+        .unwrap();
+        assert_eq!(query, expected);
+
+        let without_boost: MultiMatchQuery =
+            serde_json::from_value(json!({"query": "alpha", "columns": ["title"]})).unwrap();
+        assert_eq!(without_boost.match_queries[0].boost, 1.0);
+
+        let error = serde_json::from_value::<MultiMatchQuery>(json!({"columns": ["title"]}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing field `query`"), "{error}");
+        let error = serde_json::from_value::<MultiMatchQuery>(json!({"match_queries": []}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no match queries"), "{error}");
+
+        // A reader predating `match_queries` still finds the legacy keys and
+        // degrades as before: the first leaf's terms over every column.
+        let serialized = serde_json::to_value(per_leaf_multi_match()).unwrap();
+        assert_eq!(serialized["query"], "alpha beta");
+        assert_eq!(serialized["columns"], json!(["title", "body"]));
+        assert_eq!(serialized["boost"], json!([2.0, 1.0]));
     }
 
     #[test]

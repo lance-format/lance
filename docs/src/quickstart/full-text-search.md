@@ -90,7 +90,7 @@ ds.create_scalar_index(
     index_type="INVERTED",
     name="text_idx",              # Optional index name (if omitted, default is "text_idx")
     with_position=False,          # Set True to enable phrase queries (stores token positions)
-    base_tokenizer="simple",      # Tokenizer: "simple", "icu", "icu/split", "whitespace", "raw", or "ngram"
+    base_tokenizer="simple",      # Tokenizer: "simple", "code", "icu", "icu/split", "whitespace", "raw", or "ngram"
     language="English",           # Language used for stemming + stop words (only used if `stem` or `remove_stop_words` is True)
     max_token_length=40,          # Drop tokens longer than this length
     lower_case=True,              # Lowercase text before tokenization
@@ -107,6 +107,7 @@ ds.create_scalar_index(
 - **simple**: Splits tokens on whitespace and punctuation
 - **whitespace**: Splits tokens only on whitespace
 - **raw**: No tokenization (useful for exact matching)
+- **code**: Splits code-like text into identifiers and operators for source-code search. Use `analyzer="code"`, which changes the tokenizer defaults. See the [code analyzer](../guide/tokenizer.md#code-analyzer) section for its flags and its FTS format v3 requirement.
 
 Lance also supports multilingual tokenization:
 

@@ -67,8 +67,8 @@ pub const DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES: usize = 200 * 1024;
 /// rows out of the manifest -- row ids and created-at versions, and at
 /// compaction last-updated-at versions too; an update's last-updated-at
 /// version is the commit's and stays inline. Absent or anything else, every
-/// sequence stays inline however large it grows, which is what every released
-/// build does; a table that never sets it stays readable by them.
+/// sequence stays inline however large it grows. This affects new writes only;
+/// readers still load any sequences the table has already spilled.
 pub const SPILL_ROW_LINEAGE_CONFIG_KEY: &str = "lance.row_lineage.spill";
 
 /// Table config key overriding [`DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES`], as a
@@ -78,17 +78,15 @@ pub const INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY: &str = "lance.row_lineage.inl
 /// The largest encoded lineage sequence `dataset` keeps inline, or `None` when
 /// the table does not spill at all.
 ///
-/// Spilling needs the table's opt-in, a build that understands the feature
-/// flag (a build that does not would write a dataset it then refuses to
-/// open), and v2 data files: the format allows the columns only there, since
-/// a legacy v1 file has no `column_indices` to locate them by.
+/// Spilling needs the table's opt-in and v2 data files: the format allows the
+/// columns only there, since a legacy v1 file has no `column_indices` to locate
+/// them by.
 pub fn inline_row_lineage_max_bytes(dataset: &Dataset) -> Result<Option<usize>> {
     let config = dataset.config();
     let enabled = config
         .get(SPILL_ROW_LINEAGE_CONFIG_KEY)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     if !enabled
-        || !lance_table::feature_flags::spilled_row_lineage_enabled()
         || dataset.manifest.data_storage_format.lance_file_format() == ConcreteFileVersion::V1
     {
         return Ok(None);
@@ -742,13 +740,16 @@ mod tests {
     use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
     use crate::dataset::fragment::FileFragment;
     use crate::dataset::optimize::{
-        CompactionMode, CompactionOptions, compact_files, plan_compaction,
+        CompactionMode, CompactionOptions, IgnoreRemap, commit_compaction, compact_files,
+        plan_compaction,
     };
     use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
     use crate::dataset::transaction::Operation;
     use crate::dataset::{
-        ColumnAlteration, NewColumnTransform, UpdateBuilder, WriteMode, WriteParams,
+        ColumnAlteration, MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform,
+        UpdateBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
     };
+    use crate::index::DatasetIndexExt;
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
@@ -758,7 +759,12 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::LanceFileVersion;
-    use lance_table::feature_flags::FLAG_UNSTABLE_SPILLED_ROW_LINEAGE;
+    use lance_index::IndexType;
+    use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_table::feature_flags::{
+        FLAG_SPILLED_ROW_LINEAGE, frag_reuse_with_stable_row_ids_enabled,
+    };
     use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
     use rstest::rstest;
 
@@ -879,10 +885,20 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::default(None)]
+    #[case::disabled(Some("false"))]
     #[tokio::test]
-    async fn only_the_sequences_over_the_limit_spill() {
+    async fn only_the_sequences_over_the_limit_spill(#[case] spill_config: Option<&str>) {
         let dir = TempStrDir::default();
         let mut dataset = tiny_dataset(dir.as_str()).await;
+        if let Some(value) = spill_config {
+            dataset
+                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, value)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(inline_row_lineage_max_bytes(&dataset).unwrap(), None);
         // An appended fragment's row ids are a single `Range` and its versions
         // a single run, so they encode to a few dozen bytes and must never
         // leave the manifest, even next to a sequence that does.
@@ -904,6 +920,10 @@ mod tests {
             .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "true")])
             .await
             .unwrap();
+        assert_eq!(
+            inline_row_lineage_max_bytes(&dataset).unwrap(),
+            Some(DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES)
+        );
         let placed = place_row_lineage(&dataset, &lineage).await.unwrap();
         assert!(
             matches!(placed.row_ids, RowIdMeta::Inline(_)),
@@ -1332,12 +1352,12 @@ mod tests {
             assert_eq!(Some(row_ids.len() as usize), metadata.physical_rows);
         }
         assert_ne!(
-            dataset.manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            dataset.manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
             0,
             "a spilled sequence must set the reader feature flag"
         );
         assert_ne!(
-            dataset.manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+            dataset.manifest.writer_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
             0,
             "a spilled sequence must set the writer feature flag"
         );
@@ -1440,8 +1460,11 @@ mod tests {
     /// one wrote into the data file. Its scan must not return those columns
     /// with the user data: the task appends the lineage columns itself, and a
     /// second copy would clash by name.
+    #[rstest]
+    #[case::keep_spilling(true)]
+    #[case::disable_spilling(false)]
     #[tokio::test]
-    async fn compact_twice_reads_back_in_file_lineage() {
+    async fn compact_twice_reads_back_in_file_lineage(#[case] keep_spilling: bool) {
         let dir = TempStrDir::default();
         let uri = dir.as_str();
         let mut dataset = appended_dataset(uri, 4, 250).await;
@@ -1449,6 +1472,22 @@ mod tests {
         compact_files(&mut dataset, one_fragment(), None)
             .await
             .unwrap();
+        if !keep_spilling {
+            let before = collect_rows(&dataset).await;
+            dataset
+                .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
+                .await
+                .unwrap();
+            // Disabling future spills must not prevent a fresh reader from
+            // opening or loading sequences that are already stored in files.
+            dataset = Dataset::open(uri).await.unwrap();
+            assert_eq!(collect_rows(&dataset).await, before);
+            assert!(dataset.manifest.fragments[0].has_spilled_row_lineage());
+            assert_ne!(
+                dataset.manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
+                0
+            );
+        }
         // Deleting every seventh row makes the compacted fragment compact
         // again on its own, which masks the sequences read back from its file.
         dataset.delete("i % 7 = 0").await.unwrap();
@@ -1464,15 +1503,24 @@ mod tests {
         let metadata = fragments[0].metadata();
         assert_eq!(metadata.physical_rows, Some(before.len()));
         assert_eq!(metadata.files.len(), 1, "{metadata:?}");
-        assert_eq!(
-            metadata.files[0].fields.as_ref(),
-            [
+        let expected_fields: &[i32] = if keep_spilling {
+            &[
                 0,
                 ROW_ID_FIELD_ID,
                 ROW_CREATED_AT_VERSION_FIELD_ID,
-                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+                ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
             ]
-        );
+        } else {
+            &[0]
+        };
+        assert_eq!(metadata.files[0].fields.as_ref(), expected_fields);
+        assert_eq!(metadata.has_spilled_row_lineage(), keep_spilling);
+        for flags in [
+            dataset.manifest.reader_feature_flags,
+            dataset.manifest.writer_feature_flags,
+        ] {
+            assert_eq!(flags & FLAG_SPILLED_ROW_LINEAGE != 0, keep_spilling);
+        }
         assert_eq!(collect_rows(&dataset).await, before);
         dataset.validate().await.unwrap();
 
@@ -1864,8 +1912,8 @@ mod tests {
     /// and the commit stamps their last-updated-at version. On an opted-in
     /// table what the update carries over spills at write time -- it is known
     /// before the commit and a retry cannot change it -- while the commit's
-    /// stamp stays inline. Without the opt-in everything stays inline, as
-    /// every release has, and the lineage is the same.
+    /// stamp stays inline. Without the opt-in everything stays inline and the
+    /// lineage is the same.
     #[rstest]
     #[case::opted_in(true)]
     #[case::not_opted_in(false)]
@@ -1924,12 +1972,12 @@ mod tests {
             // The source fragments were plain appends, so this update is the
             // commit that first spills anything and has to raise the flag.
             assert_ne!(
-                updated.manifest.reader_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                updated.manifest.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
                 0,
                 "a spilled sequence must set the reader feature flag"
             );
             assert_ne!(
-                updated.manifest.writer_feature_flags & FLAG_UNSTABLE_SPILLED_ROW_LINEAGE,
+                updated.manifest.writer_feature_flags & FLAG_SPILLED_ROW_LINEAGE,
                 0,
                 "a spilled sequence must set the writer feature flag"
             );
@@ -2082,6 +2130,8 @@ mod tests {
         /// drop leaves the files it keeps as they are, so the data file still
         /// lists the ids of `i` and `j`, which the schema no longer has.
         Drop,
+        /// The remaining column is all null, leaving only the lineage carrier.
+        DropForNulls,
         /// `i` and `j` are cast. A cast rewrites the columns under new field
         /// ids into a new file and leaves their old ids, now dead, in the data
         /// file.
@@ -2100,6 +2150,7 @@ mod tests {
     /// rather than planning a task that fails.
     #[rstest]
     #[case::drop(CarrierChange::Drop)]
+    #[case::drop_for_nulls(CarrierChange::DropForNulls)]
     #[case::cast(CarrierChange::Cast)]
     #[case::replace(CarrierChange::Replace)]
     #[tokio::test]
@@ -2117,17 +2168,19 @@ mod tests {
 
         // The ids the data file lists for `i` and `j` once the change is made.
         let carrier_user_fields = match change {
-            CarrierChange::Drop => {
-                // `k` lives in a file of its own, so dropping `i` and `j`
-                // leaves the compacted file with no field in the schema.
-                dataset
-                    .add_columns(
-                        NewColumnTransform::SqlExpressions(vec![("k".into(), "i + 1".into())]),
-                        None,
-                        None,
-                    )
-                    .await
-                    .unwrap();
+            CarrierChange::Drop | CarrierChange::DropForNulls => {
+                // Dropping i and j leaves the carrier with no schema field.
+                // An all-null k needs no file, so only the carrier remains.
+                let transform = if matches!(change, CarrierChange::DropForNulls) {
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![Field::new(
+                        "k",
+                        DataType::Int32,
+                        true,
+                    )])))
+                } else {
+                    NewColumnTransform::SqlExpressions(vec![("k".into(), "i + 1".into())])
+                };
+                dataset.add_columns(transform, None, None).await.unwrap();
                 dataset.drop_columns(&["i", "j"]).await.unwrap();
                 [0, 1]
             }
@@ -2189,6 +2242,23 @@ mod tests {
                 .all(|field_id| dataset.schema().field_by_id(*field_id).is_none()),
             "the carrier must have lost every user column: {metadata:?}"
         );
+        if matches!(change, CarrierChange::DropForNulls) {
+            assert_eq!(metadata.files.len(), 1);
+            let reopened = Dataset::open(uri).await.unwrap();
+            reopened.validate().await.unwrap();
+            let batch = reopened.scan().try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), row_ids.len());
+            assert_eq!(batch["k"].null_count(), row_ids.len());
+
+            // With no user file to measure, validation must still read and
+            // check the length of the retained lineage.
+            let mut corrupt = Dataset::open(uri).await.unwrap();
+            Arc::make_mut(&mut Arc::make_mut(&mut corrupt.manifest).fragments)[0].physical_rows =
+                Some(row_ids.len() + 1);
+            let error = corrupt.validate().await.unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+            assert!(error.to_string().contains("physical rows"), "{error}");
+        }
         dataset.validate().await.unwrap();
         // A change may stamp every row as updated, so only the row ids and
         // created-at versions are compared.
@@ -2272,6 +2342,671 @@ mod tests {
                     .to_string()
                     .contains("did not have any fields in common with the dataset schema"),
                 "{error}"
+            );
+        }
+    }
+
+    /// Rows per append in a [`spilled_lineage_reads_like_inline_lineage`]
+    /// table, which starts as four of them.
+    const MATRIX_ROWS_PER_APPEND: i32 = 100;
+
+    /// The new key [`Step::Update`] gives a row. Rows are matched by key
+    /// across the two tables, so keys have to stay unique, which
+    /// [`assert_twins_agree`] checks.
+    const MATRIX_UPDATED_KEY: &str = "i + 100000";
+
+    /// One operation of a [`spilled_lineage_reads_like_inline_lineage`]
+    /// scenario. [`Step::Append`] and [`Step::Upsert`] write `(i, j)` rows, so
+    /// they come before any step that changes the schema.
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        /// Compact every candidate fragment into one, in the given mode.
+        Compact(CompactionMode),
+        /// Compact every candidate fragment into one with `defer_index_remap`.
+        /// The rewrite captures the address each row moved from, and when an
+        /// index covers a rewritten fragment, the commit records the moves in
+        /// a fragment reuse index rather than remapping the index. Builds that
+        /// do not support stable row ids with FRI must reject the commit.
+        CompactDeferringRemap,
+        /// Build a zone map on `j`. It holds row addresses, so a compaction
+        /// that defers its remap leaves it to the fragment reuse index.
+        IndexColumn,
+        /// Append [`MATRIX_ROWS_PER_APPEND`] keys after the largest one.
+        Append,
+        /// Delete the rows matching the predicate.
+        Delete(&'static str),
+        /// Rewrite the rows matching the predicate into a new fragment, with
+        /// the key [`MATRIX_UPDATED_KEY`].
+        Update(&'static str),
+        /// merge_insert of every ninth key and ten new ones, which rewrites
+        /// the matched rows and inserts the others.
+        Upsert,
+        /// merge_insert of `j` for every ninth key, patched into the existing
+        /// fragments. Only a source that is a strict subset of the schema is
+        /// patched in place, so this needs [`Step::AddColumn`] first.
+        PatchColumn,
+        /// Add `k = i * 2` from an SQL expression.
+        AddColumn,
+        /// Cast `j` to `Int64`, which rewrites it in every fragment.
+        CastColumn,
+        /// Drop `j`.
+        DropColumn,
+        /// Add `m = i * 3` through [`Dataset::merge`], a left join on `i`.
+        JoinColumn,
+        /// Replace `j` in every fragment through a `DataReplacement`.
+        ReplaceColumn,
+        /// Restore the version before the latest.
+        RestorePrevious,
+        /// Remove every version but the latest.
+        Cleanup,
+        /// Continue on a shallow clone of the latest version, which reads its
+        /// files from the source table.
+        ShallowClone,
+        /// Continue on a deep clone of the latest version.
+        DeepClone,
+        /// Continue on a branch of the latest version.
+        Branch,
+        /// An update of `i % 3 = 0` built on the version before a compaction
+        /// commits, which has to retry against the compacted fragment.
+        UpdateAcrossCompaction,
+        /// A compaction that rewrites its fragments, then commits after an
+        /// [`Step::Append`] it did not read; it must retry with a fresh plan.
+        CompactionAcrossAppend,
+        /// A compaction that rewrites its fragments while a delete of
+        /// `i % 11 = 0` commits in them. The compaction has to lose with a
+        /// retryable conflict and leave the table as the delete left it.
+        CompactionAcrossDelete,
+    }
+
+    /// One side of a [`spilled_lineage_reads_like_inline_lineage`] scenario.
+    struct Twin {
+        dataset: Dataset,
+        /// Every directory the scenario has written a table to. A clone or a
+        /// branch still reads files from the table it came from, so they all
+        /// live as long as the scenario.
+        dirs: Vec<TempStrDir>,
+    }
+
+    impl Twin {
+        /// Four appends of `(i, j)`, then a config change that opts the table
+        /// into spilling every sequence, or explicitly out of spilling, so
+        /// that both sides commit the same versions.
+        async fn new(spill: bool) -> Self {
+            let dir = TempStrDir::default();
+            let mut dataset = appended_dataset_with(
+                dir.as_str(),
+                4,
+                MATRIX_ROWS_PER_APPEND,
+                UserColumns::WithCopy,
+                None,
+            )
+            .await;
+            if spill {
+                spill_everything(&mut dataset).await;
+            } else {
+                dataset
+                    .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
+                    .await
+                    .unwrap();
+            }
+            Self {
+                dataset,
+                dirs: vec![dir],
+            }
+        }
+
+        async fn keys(&self) -> Vec<i32> {
+            sorted_keys(&self.dataset, None).await
+        }
+
+        async fn append(&mut self) -> Result<()> {
+            let start = self.keys().await.last().map_or(0, |key| key + 1);
+            let batch = keyed_batch(UserColumns::WithCopy, start..start + MATRIX_ROWS_PER_APPEND);
+            let schema = batch.schema();
+            self.dataset
+                .append(RecordBatchIterator::new([Ok(batch)], schema), None)
+                .await
+        }
+
+        async fn update(&mut self, predicate: &str) -> Result<()> {
+            let updated = UpdateBuilder::new(Arc::new(self.dataset.clone()))
+                .update_where(predicate)?
+                .set("i", MATRIX_UPDATED_KEY)?
+                .build()?
+                .execute()
+                .await?;
+            self.dataset = updated.new_dataset.as_ref().clone();
+            Ok(())
+        }
+
+        async fn merge_insert(
+            &mut self,
+            source: RecordBatch,
+            when_not_matched: WhenNotMatched,
+            write_mode: MergeInsertWriteMode,
+        ) -> Result<()> {
+            let schema = source.schema();
+            let (merged, _) =
+                MergeInsertBuilder::try_new(Arc::new(self.dataset.clone()), vec!["i".into()])?
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(when_not_matched)
+                    .write_mode(write_mode)
+                    .try_build()?
+                    .execute_reader(Box::new(RecordBatchIterator::new([Ok(source)], schema)))
+                    .await?;
+            self.dataset = merged.as_ref().clone();
+            Ok(())
+        }
+
+        /// Plan a compaction and rewrite its fragments, run `concurrent`
+        /// against the table, and only then commit the compaction.
+        async fn compact_across(&mut self, concurrent: Step) -> Result<()> {
+            let options = one_fragment();
+            let plan = plan_compaction(&self.dataset, &options).await?;
+            assert!(
+                plan.num_tasks() > 0,
+                "the scenario leaves nothing to compact"
+            );
+            let mut rewritten = Vec::with_capacity(plan.num_tasks());
+            for task in plan.compaction_tasks() {
+                rewritten.push(task.execute(&self.dataset).await?);
+            }
+            match concurrent {
+                Step::Append => self.append().await?,
+                Step::Delete(predicate) => {
+                    self.dataset.delete(predicate).await?;
+                }
+                other => unreachable!("no concurrent {other:?} in the matrix"),
+            }
+            let remap = Arc::new(IgnoreRemap {});
+            commit_compaction(&mut self.dataset, rewritten, remap, &options).await?;
+            Ok(())
+        }
+
+        async fn apply(&mut self, step: Step) -> Result<()> {
+            match step {
+                Step::Compact(mode) => {
+                    let options = CompactionOptions {
+                        compaction_mode: Some(mode),
+                        ..one_fragment()
+                    };
+                    compact_files(&mut self.dataset, options, None).await?;
+                }
+                Step::CompactDeferringRemap => {
+                    let options = CompactionOptions {
+                        defer_index_remap: true,
+                        ..one_fragment()
+                    };
+                    let read_version = self.dataset.version().version;
+                    let result = compact_files(&mut self.dataset, options, None).await;
+                    if !frag_reuse_with_stable_row_ids_enabled() {
+                        // FRI with stable row ids has its own release gate,
+                        // independent of where the row lineage is stored.
+                        let error = result.expect_err("stable row ids with FRI remain gated");
+                        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("stable row IDs and carries a fragment reuse index"),
+                            "{error}"
+                        );
+                        assert_eq!(self.dataset.version().version, read_version);
+                        return Ok(());
+                    }
+                    result?;
+                    if self.dataset.load_index_by_name("j_idx").await?.is_some() {
+                        assert!(
+                            self.dataset
+                                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                                .await?
+                                .is_some(),
+                            "a deferred remap over the zone map must write a fragment reuse index"
+                        );
+                    }
+                }
+                Step::IndexColumn => {
+                    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+                    self.dataset
+                        .create_index(
+                            &["j"],
+                            IndexType::ZoneMap,
+                            Some("j_idx".into()),
+                            &params,
+                            false,
+                        )
+                        .await?;
+                }
+                Step::Append => self.append().await?,
+                Step::Delete(predicate) => {
+                    self.dataset.delete(predicate).await?;
+                }
+                Step::Update(predicate) => self.update(predicate).await?,
+                Step::Upsert => {
+                    let keys = self.keys().await;
+                    let next = keys.last().map_or(0, |key| key + 1);
+                    let source_keys = keys
+                        .iter()
+                        .step_by(9)
+                        .copied()
+                        .chain(next..next + 10)
+                        .collect::<Vec<_>>();
+                    let source = RecordBatch::try_new(
+                        keyed_batch(UserColumns::WithCopy, 0..0).schema(),
+                        vec![
+                            Arc::new(Int32Array::from(source_keys.clone())),
+                            Arc::new(Int32Array::from(source_keys)),
+                        ],
+                    )
+                    .unwrap();
+                    self.merge_insert(
+                        source,
+                        WhenNotMatched::InsertAll,
+                        MergeInsertWriteMode::Auto,
+                    )
+                    .await?;
+                }
+                Step::PatchColumn => {
+                    let keys = self.keys().await.into_iter().step_by(9).collect::<Vec<_>>();
+                    let patched = keys.iter().map(|key| -key).collect::<Vec<_>>();
+                    let source = RecordBatch::try_new(
+                        keyed_batch(UserColumns::WithCopy, 0..0).schema(),
+                        vec![
+                            Arc::new(Int32Array::from(keys)),
+                            Arc::new(Int32Array::from(patched)),
+                        ],
+                    )
+                    .unwrap();
+                    let fragments = self.dataset.manifest.fragments.len();
+                    self.merge_insert(
+                        source,
+                        WhenNotMatched::DoNothing,
+                        MergeInsertWriteMode::RewriteColumns,
+                    )
+                    .await?;
+                    assert_eq!(
+                        self.dataset.manifest.fragments.len(),
+                        fragments,
+                        "a column patch must not add a fragment"
+                    );
+                }
+                Step::AddColumn => {
+                    let transform =
+                        NewColumnTransform::SqlExpressions(vec![("k".into(), "i * 2".into())]);
+                    self.dataset.add_columns(transform, None, None).await?;
+                }
+                Step::CastColumn => {
+                    let cast = ColumnAlteration::new("j".into()).cast_to(DataType::Int64);
+                    self.dataset.alter_columns(&[cast]).await?;
+                }
+                Step::DropColumn => self.dataset.drop_columns(&["j"]).await?,
+                Step::JoinColumn => {
+                    let keys = self.keys().await;
+                    let tripled = keys.iter().map(|key| key * 3).collect::<Vec<_>>();
+                    let schema = Arc::new(ArrowSchema::new(vec![
+                        Field::new("i", DataType::Int32, false),
+                        Field::new("m", DataType::Int32, true),
+                    ]));
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from(keys)),
+                            Arc::new(Int32Array::from(tripled)),
+                        ],
+                    )
+                    .unwrap();
+                    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+                    self.dataset.merge(reader, "i", "i").await?;
+                }
+                Step::ReplaceColumn => {
+                    let projection = self.dataset.schema().project(&["j"])?;
+                    let arrow_projection = Arc::new(ArrowSchema::from(&projection));
+                    let mut replacements = Vec::new();
+                    for fragment in self.dataset.get_fragments() {
+                        let rows = fragment.metadata().physical_rows.unwrap() as i32;
+                        let batch = RecordBatch::try_new(
+                            arrow_projection.clone(),
+                            vec![Arc::new(Int32Array::from_iter_values(
+                                (0..rows).map(|offset| -offset),
+                            ))],
+                        )
+                        .unwrap();
+                        let stream = futures::stream::iter([Ok(batch)]);
+                        replacements.push(fragment.write_columns(stream, &projection).await?);
+                    }
+                    let read_version = self.dataset.manifest.version;
+                    self.dataset = Dataset::commit(
+                        Arc::new(self.dataset.clone()),
+                        Operation::DataReplacement { replacements },
+                        Some(read_version),
+                        None,
+                        None,
+                        Arc::new(Default::default()),
+                        false,
+                    )
+                    .await?;
+                }
+                Step::RestorePrevious => {
+                    let previous = self.dataset.version().version - 1;
+                    let mut restored = self.dataset.checkout_version(previous).await?;
+                    restored.restore().await?;
+                    self.dataset = restored;
+                }
+                Step::Cleanup => {
+                    let policy = CleanupPolicyBuilder::default()
+                        .before_timestamp(Utc::now())
+                        .delete_unverified(true)
+                        .build();
+                    cleanup_old_versions(&self.dataset, policy).await?;
+                }
+                Step::ShallowClone | Step::DeepClone => {
+                    let target = TempStrDir::default();
+                    let version = self.dataset.version().version;
+                    let clone = if matches!(step, Step::ShallowClone) {
+                        self.dataset
+                            .shallow_clone(target.as_str(), version, None)
+                            .await?
+                    } else {
+                        self.dataset
+                            .deep_clone(target.as_str(), version, None)
+                            .await?
+                    };
+                    self.dirs.push(target);
+                    self.dataset = clone;
+                }
+                Step::Branch => {
+                    let version = self.dataset.version().version;
+                    self.dataset = self.dataset.create_branch("matrix", version, None).await?;
+                }
+                Step::UpdateAcrossCompaction => {
+                    let stale = self.dataset.clone();
+                    let metrics = compact_files(&mut self.dataset, one_fragment(), None).await?;
+                    assert!(
+                        metrics.fragments_removed > 0,
+                        "the scenario leaves nothing to compact"
+                    );
+                    self.dataset = stale;
+                    self.update("i % 3 = 0").await?;
+                }
+                Step::CompactionAcrossAppend => {
+                    let error = self
+                        .compact_across(Step::Append)
+                        .await
+                        .expect_err("a stale compaction must retry after an append");
+                    assert!(
+                        matches!(error, Error::RetryableCommitConflict { .. }),
+                        "{error}"
+                    );
+                    assert!(error.to_string().contains("Append"), "{error}");
+                    self.dataset.checkout_latest().await?;
+                    let appended = self.dataset.scan().try_into_batch().await?;
+                    let metrics = compact_files(&mut self.dataset, one_fragment(), None).await?;
+                    assert!(metrics.fragments_removed > 0);
+                    assert_eq!(
+                        self.dataset.scan().try_into_batch().await?,
+                        appended,
+                        "replanned compaction must preserve the appended table's row order"
+                    );
+                }
+                Step::CompactionAcrossDelete => {
+                    let error = self
+                        .compact_across(Step::Delete("i % 11 = 0"))
+                        .await
+                        .expect_err("a compaction must not commit over a delete in its fragments");
+                    assert!(
+                        matches!(error, Error::RetryableCommitConflict { .. }),
+                        "{error}"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The keys of the rows `filter` selects, or of every row, in key order.
+    async fn sorted_keys(dataset: &Dataset, filter: Option<&str>) -> Vec<i32> {
+        let mut scanner = dataset.scan();
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        scanner.project(&["i"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut keys = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Assert that `spilled` reads exactly like `inline` after `step`, and
+    /// that each places and validates its own lineage. Returns whether any
+    /// fragment of `spilled` spills.
+    async fn assert_twins_agree(spilled: &Dataset, inline: &Dataset, step: &str) -> bool {
+        assert_eq!(
+            spilled.version().version,
+            inline.version().version,
+            "versions diverged after {step}"
+        );
+        let rows = collect_rows(inline).await;
+        let expected = by_key(&rows);
+        assert_eq!(expected.len(), rows.len(), "duplicate keys after {step}");
+        assert_eq!(
+            by_key(&collect_rows(spilled).await),
+            expected,
+            "lineage diverged after {step}"
+        );
+        // When a scenario indexes `j`, the filter is answered through the
+        // zone map, and after a deferred remap through the fragment reuse
+        // index as well.
+        if inline.schema().field("j").is_some() {
+            assert_eq!(
+                sorted_keys(spilled, Some("j < 150")).await,
+                sorted_keys(inline, Some("j < 150")).await,
+                "filtered scan after {step}"
+            );
+        }
+
+        for fragment in inline.manifest.fragments.iter() {
+            assert!(
+                !fragment.has_spilled_row_lineage(),
+                "the inline table spilled after {step}: {fragment:?}"
+            );
+        }
+        let spills = spilled
+            .manifest
+            .fragments
+            .iter()
+            .any(|fragment| fragment.has_spilled_row_lineage());
+        for flags in [
+            spilled.manifest.reader_feature_flags,
+            spilled.manifest.writer_feature_flags,
+        ] {
+            assert_eq!(
+                flags & FLAG_SPILLED_ROW_LINEAGE != 0,
+                spills,
+                "the spilled row lineage flag disagrees with the fragments after {step}"
+            );
+        }
+        spilled.validate().await.unwrap();
+        inline.validate().await.unwrap();
+
+        // A take by row id resolves each id through the sequences, so one read
+        // from the wrong offset or the wrong file returns the wrong key.
+        let (keys, row_ids): (Vec<i32>, Vec<u64>) = rows
+            .iter()
+            .step_by(37)
+            .map(|(key, row_id, _, _)| (*key, *row_id))
+            .unzip();
+        let taken = spilled
+            .take_rows(&row_ids, spilled.schema().project(&["i"]).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["i"].as_primitive::<Int32Type>().values().to_vec(),
+            keys,
+            "take by row id after {step}"
+        );
+        spills
+    }
+
+    /// Where a sequence lives must not change what any operation does to it.
+    /// Each scenario runs on a table that spills every sequence it can and on
+    /// one that keeps them all inline. After each step
+    /// the two must hold the same rows with the same ids, created-at and
+    /// last-updated-at versions, both must validate, rows must come back by
+    /// id, and the spilled table must raise the feature flag exactly while a
+    /// fragment spills. At the end both are reopened cold, and every version
+    /// they keep is compared as well.
+    ///
+    /// The tests above pin how each write places lineage. These cover what
+    /// later operations do with it, which is where spilled lineage has broken
+    /// before: an update dropped a fragment's lineage file because no column
+    /// of the schema lived in it.
+    #[rstest]
+    #[case::update_twice(vec![Step::Update("i >= 200"), Step::Update("i % 3 = 0")])]
+    #[case::update_delete_compact(vec![
+        Step::Update("i >= 200"),
+        Step::Delete("i % 7 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::append_after_compaction(vec![
+        Step::Compact(CompactionMode::Reencode),
+        Step::Append,
+        Step::Update("i >= 350"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::binary_copy(vec![
+        Step::Compact(CompactionMode::ForceBinaryCopy),
+        Step::Update("i % 4 = 0"),
+        Step::Delete("i % 5 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::upsert(vec![
+        Step::Compact(CompactionMode::Reencode),
+        Step::Upsert,
+        Step::Update("i % 4 = 0"),
+        Step::Upsert,
+    ])]
+    #[case::patch_column(vec![
+        Step::Compact(CompactionMode::Reencode),
+        Step::AddColumn,
+        Step::PatchColumn,
+        Step::Delete("i % 7 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::schema_changes(vec![
+        Step::Update("i >= 200"),
+        Step::AddColumn,
+        Step::CastColumn,
+        Step::DropColumn,
+        Step::Update("i % 3 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::join_column(vec![
+        Step::Compact(CompactionMode::ForceBinaryCopy),
+        Step::JoinColumn,
+        Step::Update("i % 4 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::replace_column(vec![
+        Step::Compact(CompactionMode::Reencode),
+        Step::ReplaceColumn,
+        Step::Update("i % 4 = 0"),
+        Step::Delete("i % 7 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::deferred_remap(vec![
+        Step::IndexColumn,
+        Step::Update("i >= 200"),
+        Step::Delete("i % 7 = 0"),
+        Step::CompactDeferringRemap,
+        Step::Update("i % 3 = 0"),
+    ])]
+    #[case::compaction_across_append(vec![
+        Step::Update("i >= 200"),
+        Step::CompactionAcrossAppend,
+        Step::Update("i % 3 = 0"),
+    ])]
+    #[case::compaction_across_delete(vec![
+        Step::Update("i >= 200"),
+        Step::CompactionAcrossDelete,
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::update_across_compaction(vec![
+        Step::Update("i >= 200"),
+        Step::UpdateAcrossCompaction,
+        Step::Delete("i % 7 = 0"),
+    ])]
+    #[case::restore(vec![
+        Step::Compact(CompactionMode::Reencode),
+        Step::Update("i % 3 = 0"),
+        Step::RestorePrevious,
+        Step::Update("i % 4 = 0"),
+    ])]
+    #[case::cleanup(vec![
+        Step::Compact(CompactionMode::ForceBinaryCopy),
+        Step::Update("i % 3 = 0"),
+        Step::Cleanup,
+        Step::Delete("i % 7 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::shallow_clone(vec![
+        Step::Compact(CompactionMode::ForceBinaryCopy),
+        Step::Update("i % 3 = 0"),
+        Step::ShallowClone,
+        Step::Update("i % 4 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::deep_clone(vec![
+        Step::Compact(CompactionMode::Reencode),
+        Step::Update("i % 3 = 0"),
+        Step::DeepClone,
+        Step::Delete("i % 7 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[case::branch(vec![
+        Step::Compact(CompactionMode::ForceBinaryCopy),
+        Step::Update("i % 3 = 0"),
+        Step::Branch,
+        Step::Update("i % 4 = 0"),
+        Step::Compact(CompactionMode::Reencode),
+    ])]
+    #[tokio::test]
+    async fn spilled_lineage_reads_like_inline_lineage(#[case] steps: Vec<Step>) {
+        let mut spilled = Twin::new(true).await;
+        let mut inline = Twin::new(false).await;
+        let mut spilled_anything = false;
+        for (index, step) in steps.into_iter().enumerate() {
+            let label = format!("step {index} ({step:?})");
+            if let Err(error) = inline.apply(step).await {
+                panic!("{label} failed on the inline table: {error}");
+            }
+            if let Err(error) = spilled.apply(step).await {
+                panic!("{label} failed on the spilled table: {error}");
+            }
+            spilled_anything |= assert_twins_agree(&spilled.dataset, &inline.dataset, &label).await;
+        }
+        assert!(spilled_anything, "the scenario never spilled any lineage");
+
+        let reopened_spilled = Dataset::open(spilled.dataset.uri()).await.unwrap();
+        let reopened_inline = Dataset::open(inline.dataset.uri()).await.unwrap();
+        assert_twins_agree(&reopened_spilled, &reopened_inline, "a cold reopen").await;
+
+        let mut kept = Vec::with_capacity(2);
+        for twin in [&spilled, &inline] {
+            let versions = twin.dataset.versions().await.unwrap();
+            kept.push(
+                versions
+                    .iter()
+                    .map(|version| version.version)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(kept[0], kept[1], "the two tables keep different versions");
+        for version in kept.swap_remove(0) {
+            let spilled_version = spilled.dataset.checkout_version(version).await.unwrap();
+            let inline_version = inline.dataset.checkout_version(version).await.unwrap();
+            assert_eq!(
+                by_key(&collect_rows(&spilled_version).await),
+                by_key(&collect_rows(&inline_version).await),
+                "version {version} diverged"
             );
         }
     }

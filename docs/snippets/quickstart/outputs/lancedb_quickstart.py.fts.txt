@@ -1,0 +1,3 @@
+   id                      name category  price                      vector  _score
+0   1         red running shoes    shoes   89.0       [1.0, 0.0, 0.0, 0.25]  0.8984
+1   2  blue trail running shoes    shoes  120.0  [0.875, 0.125, 0.0, 0.375]  0.7942

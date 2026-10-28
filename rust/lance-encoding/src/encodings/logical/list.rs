@@ -394,21 +394,20 @@ mod tests {
                 continue;
             };
             match layout.layout.as_ref().unwrap() {
-                crate::format::pb21::page_layout::Layout::MiniBlockLayout(_) => {
+                crate::format::metadata::page_layout::Layout::MiniBlockLayout(_) => {
                     miniblock_pages += 1;
                 }
-                crate::format::pb21::page_layout::Layout::FullZipLayout(_) => {
+                crate::format::metadata::page_layout::Layout::FullZipLayout(_) => {
                     fullzip_pages += 1;
                 }
-                crate::format::pb21::page_layout::Layout::ConstantLayout(layout) => {
+                crate::format::metadata::page_layout::Layout::ConstantLayout(layout) => {
                     if layout.inline_value.is_none()
                         && (layout.num_rep_values > 0 || layout.num_def_values > 0)
                     {
                         structural_only_pages += 1;
                     }
                 }
-                crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
-                crate::format::pb21::page_layout::Layout::SparseLayout(_) => {}
+                crate::format::metadata::page_layout::Layout::BlobLayout(_) => {}
             }
         }
 
@@ -434,7 +433,7 @@ mod tests {
             };
             matches!(
                 layout.layout.as_ref().unwrap(),
-                crate::format::pb21::page_layout::Layout::FullZipLayout(_)
+                crate::format::metadata::page_layout::Layout::FullZipLayout(_)
             )
         });
         assert!(has_fullzip, "expected at least one full-zip page");

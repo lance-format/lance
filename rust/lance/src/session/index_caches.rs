@@ -14,7 +14,8 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
-use lance_index::frag_reuse::CompactFragReuseIndex;
+use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -91,6 +92,8 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
+/// Decoded fragment reuse history with `index_version = 0`, keyed by
+/// `index::frag_reuse::v0_cache_identity`.
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
     pub uuid: &'a Uuid,
@@ -113,6 +116,94 @@ impl CacheKey for FragReuseIndexKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
+/// Decoded fragment reuse details of an external `details.binpb`, keyed by where the
+/// file lives: a shallow clone's entry resolves to the source dataset's file. Each file
+/// is written once, under a fresh entry UUID. A hit does not check the file still exists.
+#[derive(Debug)]
+pub struct FragReuseDetailsKey<'a> {
+    pub store_identity: &'a str,
+    pub path: &'a object_store::path::Path,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl CacheKey for FragReuseDetailsKey<'_> {
+    type ValueType = FragReuseIndexDetails;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "frag_reuse_details/{}:{}/{}/{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.path,
+            self.offset,
+            self.size
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "FragReuseIndexDetails"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-details-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_str(self.path.as_ref());
+        builder.write_u64(self.offset);
+        builder.write_u64(self.size);
+    }
+}
+
+/// Restricted deletion mask of a vector index segment at one dataset version
+/// (`None`: the segment needs no restriction). Building it walks every
+/// fragment of the dataset, hence the cache entry.
+#[derive(Debug)]
+pub struct SegmentOwnershipMaskKey<'a> {
+    pub uuid: &'a Uuid,
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for SegmentOwnershipMaskKey<'_> {
+    type ValueType = Option<Arc<RowAddrMask>>;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "segment_mask/{}/{}:{}/{}/{}",
+            self.uuid,
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "SegmentOwnershipMask"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.segment-ownership-mask-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
     }
 }
 
