@@ -20,7 +20,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray, new_null_array,
 };
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
@@ -28,8 +28,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
 use futures::StreamExt;
+use lance_arrow::FieldExt;
 use lance_arrow::json::{JsonArray, is_json_field};
-use lance_arrow::{FieldExt, RecordBatchExt};
 use lance_core::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_TYPE, BlobHandling};
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -304,7 +304,24 @@ impl UpdateBuilder {
             }
         }
 
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        // An assigned column is read only if a SET expression reads it; the
+        // scanner reads WHERE columns on its own.
+        let read_columns = self
+            .updates
+            .values()
+            .flat_map(|expr| expr.column_refs())
+            .map(|column| column.name.as_str())
+            .collect::<HashSet<_>>();
+        let scan_columns = self
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .filter(|name| !self.updates.contains_key(name) || read_columns.contains(name.as_str()))
+            .collect::<Vec<_>>();
+        let scan_schema = self.dataset.schema().project(&scan_columns)?;
+        let planner = Planner::new(Arc::new((&scan_schema).into()));
 
         for (column, expr) in self.updates {
             let physical_expr = planner.create_physical_expr(&expr)?;
@@ -322,6 +339,7 @@ impl UpdateBuilder {
             condition: self.condition,
             updates,
             blob_columns: Arc::new(blob_columns),
+            scan_columns,
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
             write_version,
@@ -350,10 +368,13 @@ pub struct UpdateData {
 pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
+    /// Evaluated against batches of `scan_columns`.
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
-    /// Assigned columns that are blob v2.
     /// Assigned columns holding blob v2 fields, as the dataset schema declares them.
     blob_columns: Arc<HashMap<String, Arc<Field>>>,
+    /// The top-level columns the update reads: all but the assigned columns
+    /// no SET expression reads.
+    scan_columns: Vec<String>,
     conflict_retries: u32,
     retry_timeout: Duration,
     write_version: ConcreteFileVersion,
@@ -405,17 +426,13 @@ impl UpdateJob {
         // their row ids spill the commit can no longer look them up. Elsewhere
         // the commit looks them up from the inline row ids, and reading them
         // would only build a column for every scanned row.
-        if spill_budget.is_some() {
-            let columns = self
-                .dataset
-                .schema()
-                .fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .chain([ROW_CREATED_AT_VERSION])
-                .collect::<Vec<_>>();
-            scanner.project(&columns)?;
-        }
+        let columns = self
+            .scan_columns
+            .iter()
+            .map(String::as_str)
+            .chain(spill_budget.map(|_| ROW_CREATED_AT_VERSION))
+            .collect::<Vec<_>>();
+        scanner.project(&columns)?;
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -431,7 +448,8 @@ impl UpdateJob {
             make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
 
         let scan_schema = stream.schema();
-        let expected_schema: ArrowSchema = self.dataset.schema().into();
+        let expected_schema: ArrowSchema =
+            (&self.dataset.schema().project(&self.scan_columns)?).into();
         if !has_blob_v2_columns && scan_schema.as_ref() != &expected_schema {
             return Err(Error::internal(format!(
                 "Expected schema {:?} but got {:?}",
@@ -440,48 +458,19 @@ impl UpdateJob {
         }
 
         let stream = if has_blob_v2_columns {
-            // Assigned blob columns enter the rewrite as logical placeholders, so
-            // it doesn't read old blobs the assignment overwrites.
-            let mut rewrite_fields = scan_schema.fields().to_vec();
-            for (column, field) in self.blob_columns.iter() {
-                let column_idx = scan_schema.index_of(column)?;
-                rewrite_fields[column_idx] = Arc::new(map_blob_fields(field, &logical_blob_field));
-            }
-            let rewrite_schema = Arc::new(ArrowSchema::new_with_metadata(
-                rewrite_fields,
-                scan_schema.metadata().clone(),
-            ));
             let rewrite_plan = Arc::new(crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
                 self.dataset.schema(),
-                rewrite_schema.as_ref(),
+                scan_schema.as_ref(),
                 false,
                 false,
             )?);
             let output_schema = rewrite_plan.output_schema().clone();
             let dataset = self.dataset.clone();
-            let blob_columns = self.blob_columns.clone();
             let transformed = stream.then(move |batch_result| {
                 let dataset = dataset.clone();
                 let rewrite_plan = rewrite_plan.clone();
-                let rewrite_schema = rewrite_schema.clone();
-                let blob_columns = blob_columns.clone();
                 async move {
                     let batch = batch_result?;
-                    let columns = rewrite_schema
-                        .fields()
-                        .iter()
-                        .zip(batch.columns())
-                        .map(|(field, column)| {
-                            if let Some(declared) = blob_columns.get(field.name()) {
-                                map_blob_values(column, declared, &|blobs| {
-                                    new_null_logical_blobs(blobs.len())
-                                })
-                            } else {
-                                Ok(column.clone())
-                            }
-                        })
-                        .collect::<DFResult<Vec<_>>>()?;
-                    let batch = RecordBatch::try_new(rewrite_schema, columns)?;
                     rewrite_plan
                         .transform_batch(&dataset, batch)
                         .await
@@ -493,7 +482,25 @@ impl UpdateJob {
         } else {
             stream
         };
-        let schema = stream.schema();
+        let scan_schema = stream.schema();
+        // The rewritten rows in dataset order. Assigned columns the scan skipped
+        // take their dataset field, in the logical layout for blob v2.
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            ArrowSchema::from(self.dataset.schema())
+                .fields()
+                .iter()
+                .map(|field| {
+                    if let Ok(scanned) = scan_schema.field_with_name(field.name()) {
+                        Arc::new(scanned.clone())
+                    } else if let Some(declared) = self.blob_columns.get(field.name()) {
+                        Arc::new(map_blob_fields(declared, &logical_blob_field))
+                    } else {
+                        field.clone()
+                    }
+                })
+                .collect::<Vec<_>>(),
+            scan_schema.metadata().clone(),
+        ));
 
         let updated_blob_column_indices = schema
             .fields()
@@ -522,12 +529,14 @@ impl UpdateJob {
 
         let updates_ref = self.updates.clone();
         let blob_columns = self.blob_columns.clone();
+        let output_schema = schema.clone();
         let stream = stream
             .map(move |batch| {
                 let updates = updates_ref.clone();
                 let blob_columns = blob_columns.clone();
+                let output_schema = output_schema.clone();
                 tokio::task::spawn_blocking(move || {
-                    Self::apply_updates(batch?, updates, &blob_columns)
+                    Self::apply_updates(batch?, &updates, &blob_columns, &output_schema)
                 })
             })
             .buffered(get_num_compute_intensive_cpus())
@@ -722,15 +731,20 @@ impl UpdateJob {
         })
     }
 
+    /// Evaluate every SET expression against the scanned `batch` and lay the
+    /// results out as `output_schema`.
     fn apply_updates(
-        mut batch: RecordBatch,
-        updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
+        batch: RecordBatch,
+        updates: &HashMap<String, Arc<dyn PhysicalExpr>>,
         blob_columns: &HashMap<String, Arc<Field>>,
+        output_schema: &SchemaRef,
     ) -> DFResult<RecordBatch> {
+        let mut assigned = HashMap::with_capacity(updates.len());
         for (column, expr) in updates.iter() {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
-            let schema = batch.schema();
-            let new_values: ArrayRef = if schema.field_with_name(column).is_ok_and(is_json_field)
+            let new_values: ArrayRef = if output_schema
+                .field_with_name(column)
+                .is_ok_and(is_json_field)
                 && matches!(
                     new_values.data_type(),
                     DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
@@ -759,9 +773,19 @@ impl UpdateJob {
             } else {
                 new_values
             };
-            batch = batch.replace_column_by_name(column.as_str(), new_values)?;
+            assigned.insert(column.as_str(), new_values);
         }
-        Ok(batch)
+        let columns = output_schema
+            .fields()
+            .iter()
+            .map(|field| match assigned.remove(field.name().as_str()) {
+                Some(values) => Ok(values),
+                None => batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                    DataFusionError::Internal(format!("update scan is missing '{}'", field.name()))
+                }),
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
     }
 
     /// Use previous found rows ids to delete rows from existing fragments.
@@ -900,21 +924,6 @@ fn map_blob_values(
         }
         _ => values.clone(),
     })
-}
-
-/// Stands in for blob values the update overwrites, so the rewrite never reads their
-/// old payloads. Not a valid blob (a valid parent with all-null children); that is
-/// safe because `apply_updates` replaces the whole column before the writer validates it.
-fn new_null_logical_blobs(num_rows: usize) -> DFResult<ArrayRef> {
-    let children = BLOB_V2_LOGICAL_FIELDS
-        .iter()
-        .map(|field| new_null_array(field.data_type(), num_rows))
-        .collect();
-    Ok(Arc::new(StructArray::try_new(
-        BLOB_V2_LOGICAL_FIELDS.clone(),
-        children,
-        None,
-    )?))
 }
 
 /// Wrap assigned bytes as logical blob v2 values with inline `data`.
@@ -3268,5 +3277,121 @@ mod tests {
             assert_eq!(payloads.iter().nth(row_idx).unwrap(), expected[id]);
             assert_eq!(nested.iter().nth(row_idx).unwrap(), expected[id]);
         }
+    }
+
+    /// `id` steps 0..64; `payload` is 16 KiB per row. Returns the dataset with
+    /// its IO counters reset.
+    async fn payload_dataset() -> Arc<Dataset> {
+        let batch = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "payload",
+                lance_datagen::array::rand_fixedbin(
+                    lance_datagen::ByteCount::from(16 * 1024),
+                    true,
+                ),
+            )
+            .into_batch_rows(RowCount::from(64))
+            .unwrap();
+        let ds = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        ds.object_store.io_stats_incremental();
+        Arc::new(ds)
+    }
+
+    /// An assigned column is read only when a SET expression reads it.
+    #[rstest]
+    #[case::literal("'x'", false)]
+    #[case::reads_itself("payload", true)]
+    #[tokio::test]
+    async fn update_reads_assigned_column_only_if_referenced(
+        #[case] value: &str,
+        #[case] reads_payload: bool,
+    ) {
+        const MATCHED_PAYLOAD_BYTES: u64 = 32 * 16 * 1024;
+        let ds = payload_dataset().await;
+        let result = UpdateBuilder::new(ds.clone())
+            .update_where("id < 32")
+            .unwrap()
+            .set("payload", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 32);
+        let read_bytes = ds.object_store.io_stats_incremental().read_bytes;
+        assert_eq!(
+            read_bytes >= MATCHED_PAYLOAD_BYTES,
+            reads_payload,
+            "read {read_bytes} bytes; matched payloads hold {MATCHED_PAYLOAD_BYTES}"
+        );
+    }
+
+    /// Every SET expression sees the row as scanned, not another assignment's result.
+    #[tokio::test]
+    async fn update_assignments_read_old_values() {
+        let batch = record_batch!(("a", Int32, [1, 2]), ("b", Int32, [10, 20])).unwrap();
+        let ds = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let result = UpdateBuilder::new(Arc::new(ds))
+            .set("a", "b")
+            .unwrap()
+            .set("b", "a")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let actual = result.new_dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            actual,
+            record_batch!(("a", Int32, [10, 20]), ("b", Int32, [1, 2])).unwrap()
+        );
+    }
+
+    /// Assigning every column from literals scans no column at all.
+    #[tokio::test]
+    async fn update_assigning_every_column() {
+        let batch = record_batch!(("a", Int32, [1, 2, 3]), ("b", Utf8, ["x", "y", "z"])).unwrap();
+        let ds = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let result = UpdateBuilder::new(Arc::new(ds))
+            .update_where("a > 1")
+            .unwrap()
+            .set("b", "'w'")
+            .unwrap()
+            .set("a", "0")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 2);
+        let mut scanner = result.new_dataset.scan();
+        scanner.scan_in_order(true);
+        let actual = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            actual,
+            record_batch!(("a", Int32, [1, 0, 0]), ("b", Utf8, ["x", "w", "w"])).unwrap()
+        );
     }
 }
