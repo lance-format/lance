@@ -3362,6 +3362,58 @@ mod tests {
         );
     }
 
+    /// Assigning every column of a blob v2 table from literals scans only row ids.
+    #[rstest]
+    #[tokio::test]
+    async fn update_assigning_every_column_with_blob(
+        #[values(false, true)] with_id: bool,
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        let mut blobs = crate::BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"a").unwrap();
+        blobs.push_bytes(b"b").unwrap();
+        let mut fields = vec![crate::blob_field("payload", true)];
+        let mut columns = vec![blobs.finish().unwrap()];
+        if with_id {
+            fields.push(Field::new("id", DataType::Int32, true));
+            columns.push(Arc::new(Int32Array::from(vec![1, 2])));
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let ds = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut builder = UpdateBuilder::new(Arc::new(ds))
+            .set("payload", "X'00'")
+            .unwrap();
+        if with_id {
+            builder = builder.set("id", "0").unwrap();
+        }
+        let result = builder.build().unwrap().execute().await.unwrap();
+        assert_eq!(result.rows_updated, 2);
+        let mut scanner = result.new_dataset.scan();
+        scanner.project(&["payload"]).unwrap().with_row_id();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        let blobs = result
+            .new_dataset
+            .take_blobs(row_ids.values(), "payload")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 2);
+        for blob in blobs {
+            assert_eq!(blob.unwrap().read().await.unwrap().as_ref(), b"\x00");
+        }
+    }
+
     /// Assigning every column from literals scans no column at all.
     #[tokio::test]
     async fn update_assigning_every_column() {

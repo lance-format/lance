@@ -119,7 +119,8 @@ use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::{
-    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, StructArray, UInt32Array,
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, RecordBatchOptions,
+    StructArray, UInt32Array,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{
@@ -2269,9 +2270,12 @@ impl BlobV2BatchRewritePlan {
                     .await?,
             );
         }
-        Ok(RecordBatch::try_new(
+        // The row count keeps a batch with no output columns (an update that
+        // assigns every column) the size of its input.
+        Ok(RecordBatch::try_new_with_options(
             self.output_schema.clone(),
             output_columns,
+            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
         )?)
     }
 }
