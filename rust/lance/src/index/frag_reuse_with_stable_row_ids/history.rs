@@ -13,9 +13,8 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
-use lance_table::format::{Fragment, IndexMetadata, Manifest, is_detached_version};
+use lance_table::format::{IndexMetadata, Manifest, is_detached_version};
 use lance_table::system_index::frag_reuse::{
     FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion, is_frag_reuse_index_entry,
 };
@@ -512,53 +511,6 @@ fn decode_row_addrs(group: &FragReuseGroup) -> Result<RoaringTreemap> {
     })
 }
 
-fn all_source_row_addrs(fragments: &[Fragment]) -> Result<RoaringTreemap> {
-    let mut row_addrs = RoaringTreemap::new();
-    for fragment in fragments {
-        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
-            Error::internal(format!(
-                "fragment {} is outside the row-address range",
-                fragment.id
-            ))
-        })?;
-        let physical_rows = fragment.physical_rows.ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {} is missing physical_rows during fragment reuse validation",
-                fragment.id
-            ))
-        })?;
-        let physical_rows = u64::try_from(physical_rows).map_err(|_| {
-            Error::internal(format!(
-                "fragment {} physical_rows does not fit in a row address",
-                fragment.id
-            ))
-        })?;
-        let start = u64::from(RowAddress::first_row(fragment_id));
-        let end = start.checked_add(physical_rows).ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {} row-address range overflows",
-                fragment.id
-            ))
-        })?;
-        row_addrs.insert_range(start..end);
-    }
-    Ok(row_addrs)
-}
-
-/// A partial compaction relabels an untouched fragment without rewriting its
-/// rows. Its deletion file moves to the new fragment, so every physical address
-/// moved, including addresses masked by that deletion file.
-fn is_metadata_only_relabel(source: &Fragment, destination: &Fragment) -> bool {
-    let mut source = source.clone();
-    source.id = destination.id;
-    if let (Some(source_deletion), Some(destination_deletion)) =
-        (&mut source.deletion_file, &destination.deletion_file)
-    {
-        source_deletion.base_id = destination_deletion.base_id;
-    }
-    source == *destination
-}
-
 /// Whether two versions record the same moves under the same stamp. Groups
 /// cover disjoint fragments, so their order carries no meaning; fragment order
 /// within a group decides where rows land and must match.
@@ -688,14 +640,7 @@ async fn validate_appended_version(
                 ),
             ));
         }
-        let moved_rows = if let ([source], [destination]) =
-            (sources.as_slice(), destinations.as_slice())
-            && is_metadata_only_relabel(source, destination)
-        {
-            all_source_row_addrs(&sources)?
-        } else {
-            live_source_row_addrs(base, &sources).await?
-        };
+        let moved_rows = live_source_row_addrs(base, &sources).await?;
         if decode_row_addrs(recorded)? != moved_rows {
             return Err(mismatch(
                 position,

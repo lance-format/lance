@@ -7464,50 +7464,6 @@ mod tests {
         }
     }
 
-    /// A partial compaction relabels the untouched suffix without rewriting
-    /// its data. The recorded move must include a relabeled fragment's deleted
-    /// rows too, because the deletion file moves with the data file.
-    #[tokio::test]
-    async fn test_recorded_compaction_accepts_metadata_only_suffix_with_deletions() {
-        let dir = TempStrDir::default();
-        let mut dataset = stable_row_id_dataset(dir.as_str(), 5).await;
-        dataset.delete("i IN (11, 12, 45)").await.unwrap();
-        let before = rows_by_addr(&dataset).await;
-        let options = CompactionOptions {
-            target_rows_per_fragment: 18,
-            defer_index_remap: true,
-            excluded_fragment_ids: vec![0],
-            ..Default::default()
-        };
-        let plan = plan_compaction(&dataset, &options).await.unwrap();
-        let task = plan.compaction_tasks().next().unwrap();
-        assert_eq!(
-            task.task.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        let result = task.execute(&dataset).await.unwrap();
-
-        commit_one(&mut dataset, result, &options).await.unwrap();
-
-        let latest = Dataset::open(dir.as_str()).await.unwrap();
-        let frag_reuse = latest.frag_reuse_index().await.unwrap().unwrap();
-        assert_eq!(frag_reuse.details.versions.len(), 1);
-        let recorded = &frag_reuse.details.versions[0];
-        assert_eq!(recorded.old_frag_ids(), vec![1, 2, 3, 4]);
-        let relabeled = recorded
-            .groups
-            .iter()
-            .find(|group| group.old_frags.iter().any(|fragment| fragment.id == 4))
-            .unwrap();
-        let changed =
-            RoaringTreemap::deserialize_from(Cursor::new(&relabeled.changed_row_addrs)).unwrap();
-        assert_eq!(changed.len(), 10);
-        let deleted_address = u64::from(RowAddress::new_from_parts(4, 5));
-        assert!(changed.contains(deleted_address));
-        assert!(frag_reuse.remap_row_id(deleted_address).is_some());
-        assert_rows_keep_their_ids(&before, &latest).await;
-    }
-
     #[derive(Clone, Copy, Debug)]
     enum RecordingMismatch {
         SomeTasksRecorded,
@@ -9776,7 +9732,7 @@ mod tests {
     }
 
     // Keep racing tasks' source ranges disjoint even when the planner groups
-    // three small fragments. The commit still completes the ordered suffix.
+    // three small fragments.
     async fn execute_first_fragment_pair(
         dataset: &Dataset,
         options: &CompactionOptions,
@@ -10251,10 +10207,9 @@ mod tests {
         }
         let watermarks = frag_reuse_watermarks(&dataset).await;
         let flags = flag_words(&dataset, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS);
-        let untouched = dataset
+        let fragments_before = dataset
             .get_fragments()
             .iter()
-            .filter(|fragment| fragment.id() <= 1)
             .map(|fragment| fragment.id() as u32)
             .collect::<RoaringBitmap>();
         let before = rows_by_addr(&dataset).await;
@@ -10290,6 +10245,12 @@ mod tests {
                 .iter()
                 .filter_map(|index| index.fragment_bitmap.clone())
                 .fold(RoaringBitmap::new(), |coverage, bitmap| coverage | bitmap);
+            let untouched = latest
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<RoaringBitmap>()
+                & fragments_before;
             assert_eq!(coverage, untouched);
             assert_index_answers_like_a_scan(&latest).await;
         }
@@ -10636,9 +10597,9 @@ mod tests {
         assert_rows_keep_their_ids(before, dataset).await;
     }
 
-    /// An unrecorded rewrite finishing first conflicts with the first recorded
-    /// compaction, whether the recorded task sees that rewrite through this
-    /// session's cache or a transaction file, and the retry lands.
+    /// The first recorded compaction lands over an unrecorded rewrite of other
+    /// fragments, whether it sees that rewrite through this session's cache or
+    /// a transaction file, and records only its own sources.
     #[rstest]
     #[tokio::test]
     async fn test_first_recorded_compaction_lands_over_an_unrecorded_rewrite(
@@ -10665,27 +10626,18 @@ mod tests {
         let rewritten = Dataset::open(dir.as_str()).await.unwrap();
         assert!(rewritten.frag_reuse_index().await.unwrap().is_none());
 
-        let error = commit_one(&mut committer, recorded.clone(), &options)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::RetryableCommitConflict { .. }),
-            "{error}"
-        );
-        let mut recommitter = Dataset::open(dir.as_str()).await.unwrap();
-        commit_one(&mut recommitter, recorded, &options)
+        commit_one(&mut committer, recorded, &options)
             .await
             .unwrap();
         let latest = Dataset::open(dir.as_str()).await.unwrap();
-        // The completed suffix records the concurrent tail's metadata relabel
-        // together with the leading pair that this task rewrote.
-        assert_recorded_fragments(&before, &latest, &[0, 1, 4]).await;
+        assert_recorded_fragments(&before, &latest, &[0, 1]).await;
     }
 
-    /// An unrecorded rewrite landing while the first recorded compaction
-    /// commits costs it an attempt, and the retry lands.
+    /// An unrecorded rewrite of other fragments landing while the first
+    /// recorded compaction commits is rebased over, and the recorded
+    /// compaction lands with only its own sources.
     #[tokio::test]
-    async fn test_first_recorded_compaction_retries_past_an_unrecorded_rewrite() {
+    async fn test_first_recorded_compaction_rebases_over_an_unrecorded_rewrite() {
         let dir = TempStrDir::default();
         let mut dataset = stable_row_id_dataset(dir.as_str(), 4).await;
         let handler = Arc::new(RaceBeforeRewrite::default());
@@ -10698,29 +10650,17 @@ mod tests {
             &dataset,
             vec![Race::CompactEagerlyElsewhere { excluded: &[0, 1] }],
         );
-        let error = commit_one(&mut dataset, result.clone(), &options)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::RetryableCommitConflict { .. }),
-            "{error}"
-        );
+        commit_one(&mut dataset, result, &options).await.unwrap();
         assert!(handler.races.lock().unwrap().is_empty());
-        let mut recommitter = Dataset::open(dir.as_str()).await.unwrap();
-        commit_one(&mut recommitter, result, &options)
-            .await
-            .unwrap();
         let latest = Dataset::open(dir.as_str()).await.unwrap();
-        // The failed attempt reserved IDs before the race, so the retry sees
-        // the concurrent output under its later relabeled identity.
-        assert_recorded_fragments(&before, &latest, &[0, 1, 7]).await;
+        assert_recorded_fragments(&before, &latest, &[0, 1]).await;
     }
 
-    /// The first recorded compaction landing while an unrecorded one commits
-    /// costs the unrecorded one an attempt, and its retry lands without
+    /// The first recorded compaction landing while an unrecorded one of other
+    /// fragments commits is rebased over, and the unrecorded one lands without
     /// recording.
     #[tokio::test]
-    async fn test_unrecorded_compaction_retries_past_the_first_recording() {
+    async fn test_unrecorded_compaction_rebases_over_the_first_recording() {
         let dir = TempStrDir::default();
         let mut dataset = stable_row_id_dataset(dir.as_str(), 4).await;
         let handler = Arc::new(RaceBeforeRewrite::default());
@@ -10731,18 +10671,8 @@ mod tests {
         assert!(result.row_addrs.is_none());
 
         handler.arm(&dataset, vec![Race::CompactElsewhere { excluded: &[0, 1] }]);
-        let error = commit_one(&mut dataset, result.clone(), &options)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, Error::RetryableCommitConflict { .. }),
-            "{error}"
-        );
+        commit_one(&mut dataset, result, &options).await.unwrap();
         assert!(handler.races.lock().unwrap().is_empty());
-        let mut recommitter = Dataset::open(dir.as_str()).await.unwrap();
-        commit_one(&mut recommitter, result, &options)
-            .await
-            .unwrap();
         let latest = Dataset::open(dir.as_str()).await.unwrap();
         assert_recorded_fragments(&before, &latest, &[2, 3]).await;
     }

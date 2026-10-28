@@ -745,8 +745,7 @@ def start_recording(
     options = dict(
         target_rows_per_fragment=2_000,
         defer_index_remap=True,
-        # A partial rewrite relabels the trailing suffix, so leave the leading
-        # fragments untouched and record the move of fragments 2 and 3.
+        # Record the move of fragments 2 and 3 only.
         excluded_fragment_ids=[0, 1],
         num_threads=1,
     )
