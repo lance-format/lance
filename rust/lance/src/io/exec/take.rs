@@ -41,7 +41,7 @@ use tracing::error;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
-use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::rowids::row_ids_to_row_addrs;
 use crate::datatypes::Schema;
 use crate::index::prefilter::DatasetPreFilter;
 
@@ -205,9 +205,20 @@ impl TakeStream {
         } else {
             let row_id_array = batch.column_by_name(ROW_ID).expect_ok()?;
 
-            if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+            if self.dataset.manifest.uses_stable_row_ids() {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                Self::resolve_row_addrs(row_id_array, |id| Ok(row_id_index.get(id)?.map(u64::from)))
+                let resolved = row_ids_to_row_addrs(&self.dataset, row_id_array).await?;
+                let valid =
+                    BooleanArray::from(resolved.iter().map(Option::is_some).collect::<Vec<_>>());
+                let addresses = UInt64Array::from(
+                    resolved
+                        .into_iter()
+                        .flatten()
+                        .map(u64::from)
+                        .collect::<Vec<_>>(),
+                );
+                let mask = (addresses.len() != row_id_array.len()).then_some(valid);
+                Ok((Arc::new(addresses), mask))
             } else {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
                 let fragments = row_id_array

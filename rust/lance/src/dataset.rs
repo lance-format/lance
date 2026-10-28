@@ -55,7 +55,7 @@ use object_store::path::Path;
 use prost::Message;
 use rand::{Rng, seq::index::sample as sample_indices};
 use roaring::RoaringBitmap;
-use rowids::get_row_id_index;
+use rowids::row_ids_to_row_addrs;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -78,6 +78,7 @@ pub mod fragment;
 pub(crate) mod fragment_slice;
 mod hash_joiner;
 pub mod index;
+mod lookup;
 pub mod mem_wal;
 mod metadata;
 pub mod optimize;
@@ -271,6 +272,8 @@ pub struct Dataset {
     /// Object stores for additional base paths, normally shared across clones.
     /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
+    /// Immutable lookup preparation, scoped to this handle's snapshot and stores.
+    pub(crate) lookup_cache: Arc<lookup::LookupCache>,
 }
 
 /// The `OnceCell` coalesces concurrent first resolutions into one build.
@@ -966,6 +969,7 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
+            lookup_cache: Default::default(),
         })
     }
 
@@ -3169,14 +3173,16 @@ impl Dataset {
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
-        let (ids, addresses) = if let Some(row_id_index) = get_row_id_index(self).await? {
+        let (ids, addresses) = if self.manifest.uses_stable_row_ids() {
             // Ids absent from the deletion-aware index are deleted; drop
             // them from both lists to keep the zip aligned. ids.len() is an
             // upper bound on the output size, so allocate once up front.
             let mut live_ids = Vec::with_capacity(ids.len());
             let mut addresses = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(address) = row_id_index.get(*id)? {
+            let resolved =
+                row_ids_to_row_addrs(self, &arrow_array::UInt64Array::from(ids.to_vec())).await?;
+            for (id, address) in ids.iter().zip(resolved) {
+                if let Some(address) = address {
                     live_ids.push(*id);
                     addresses.push(u64::from(address));
                 }

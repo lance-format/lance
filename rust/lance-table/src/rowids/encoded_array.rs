@@ -35,6 +35,10 @@ impl EncodedU64Array {
     }
 
     pub fn iter(&self) -> Box<dyn DoubleEndedIterator<Item = u64> + '_> {
+        self.iter_send()
+    }
+
+    pub(super) fn iter_send(&self) -> Box<dyn DoubleEndedIterator<Item = u64> + Send + '_> {
         match self {
             Self::U16 { base, offsets } => {
                 Box::new(offsets.iter().cloned().map(move |o| base + o as u64))
@@ -319,6 +323,10 @@ mod test {
 
     #[test]
     fn test_double_ended_iter() {
+        // Keep the public boxed iterator signature usable by existing callers.
+        let iterate: for<'a> fn(
+            &'a EncodedU64Array,
+        ) -> Box<dyn DoubleEndedIterator<Item = u64> + 'a> = EncodedU64Array::iter;
         let arrays = vec![
             EncodedU64Array::U16 {
                 base: 42,
@@ -332,7 +340,7 @@ mod test {
         ];
         for array in arrays {
             // Should be able to iterate forwards and backwards, and get the same thing.
-            let forwards = array.iter().collect::<Vec<_>>();
+            let forwards = iterate(&array).collect::<Vec<_>>();
             let mut backwards = array.iter().rev().collect::<Vec<_>>();
             backwards.reverse();
             assert_eq!(forwards, backwards);

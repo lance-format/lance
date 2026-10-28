@@ -65,7 +65,7 @@ use super::{
 use crate::dataset::blob::BlobPayloadInventory;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{
-    get_row_id_index, inline_row_lineage_max_bytes, load_spilled_row_lineage,
+    inline_row_lineage_max_bytes, load_spilled_row_lineage, row_ids_to_row_addrs,
     translate_addr_treemap_to_row_ids,
 };
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
@@ -3677,17 +3677,11 @@ impl MergeInsertJob {
 
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
             let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    let mut addresses = Vec::with_capacity(removed_row_ids.len());
-                    for id in &removed_row_ids {
-                        if let Some(address) = row_id_index.get(*id)? {
-                            addresses.push(address.into());
-                        }
-                    }
-                    addresses
-                } else {
-                    removed_row_ids
-                };
+                row_ids_to_row_addrs(&self.dataset, &UInt64Array::from(removed_row_ids))
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .map(u64::from);
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec);
 
             let (updated_fragments, removed_fragment_ids) =
@@ -3807,17 +3801,11 @@ impl MergeInsertJob {
                 let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
                 let removed_row_addr_vec =
-                    if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                        let mut addresses: Vec<u64> = Vec::with_capacity(removed_row_ids.len());
-                        for id in &removed_row_ids {
-                            if let Some(address) = row_id_index.get(*id)? {
-                                addresses.push(address.into());
-                            }
-                        }
-                        addresses
-                    } else {
-                        removed_row_ids
-                    };
+                    row_ids_to_row_addrs(&self.dataset, &UInt64Array::from(removed_row_ids))
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .map(u64::from);
 
                 Ok(RoaringTreemap::from_iter(removed_row_addr_vec))
             }

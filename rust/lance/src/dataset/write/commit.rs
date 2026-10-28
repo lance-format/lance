@@ -574,6 +574,7 @@ impl<'a> CommitBuilder<'a> {
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
                     base_object_stores: Default::default(),
+                    lookup_cache: Default::default(),
                 })
             }
         }
