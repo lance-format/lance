@@ -12,6 +12,8 @@ use arrow_array::{
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
 use crate::blob::{blob_v2_layout, validate_prepared_blob_array};
+use lance_arrow::list::ListArrayExt;
+use lance_arrow::r#struct::StructArrayExt;
 use lance_core::datatypes::{BLOB_V2_DESC_FIELDS, BlobKind, BlobV2Layout};
 use lance_core::{Error, Result};
 
@@ -265,17 +267,21 @@ fn visit_prepared_blobs(
     }
 
     match field.data_type() {
+        // Only the values the rows hold: a sliced list's offsets reach part of
+        // its values, and a null struct masks its children's values.
         ArrowDataType::Struct(children) => {
-            let values = array.as_struct();
+            let values = array.as_struct().normalize_slicing()?.pushdown_nulls()?;
             for (child_array, child_field) in values.columns().iter().zip(children.iter()) {
                 visit_prepared_blobs(child_array, child_field, visit)?;
             }
         }
         ArrowDataType::List(child) => {
-            visit_prepared_blobs(array.as_list::<i32>().values(), child, visit)?;
+            let list = array.as_list::<i32>().filter_garbage_nulls();
+            visit_prepared_blobs(&list.trimmed_values(), child, visit)?;
         }
         ArrowDataType::LargeList(child) => {
-            visit_prepared_blobs(array.as_list::<i64>().values(), child, visit)?;
+            let list = array.as_list::<i64>().filter_garbage_nulls();
+            visit_prepared_blobs(&list.trimmed_values(), child, visit)?;
         }
         _ => {}
     }
@@ -322,8 +328,8 @@ mod tests {
     use crate::dataset::blob::locate::BlobV2DescriptorColumns;
     use arrow::array::AsArray;
     use arrow_array::{ListArray, RecordBatch, StructArray};
-    use arrow_buffer::OffsetBuffer;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -355,64 +361,99 @@ mod tests {
         assert_eq!(columns.blob_uris.value(0), "_blobs/payload.blob");
     }
 
+    /// A prepared blob column holding one value of every kind: null, inline,
+    /// packed (20 bytes), dedicated (1000 bytes), managed and External.
+    fn every_kind() -> (Arc<Field>, ArrayRef) {
+        let mut builder = BlobDescriptorArrayBuilder::new("blob");
+        for value in [
+            BlobDescriptor::Null,
+            BlobDescriptor::Inline { data: "abc".into() },
+            BlobDescriptor::Packed {
+                blob_id: 1,
+                offset: 0,
+                size: 20,
+            },
+            BlobDescriptor::Dedicated {
+                blob_id: 2,
+                size: 1000,
+            },
+            BlobDescriptor::Managed {
+                base_id: None,
+                uri: "_blobs/payload.blob".to_string(),
+                offset: 0,
+                size: 7,
+            },
+            BlobDescriptor::External {
+                base_id: 0,
+                uri: "file:///external.bin".to_string(),
+                offset: 0,
+                size: 9,
+            },
+        ] {
+            builder.push(value).unwrap();
+        }
+        let (field, array) = builder.finish().unwrap().into_parts();
+        (Arc::new(field), array)
+    }
+
+    fn in_struct(
+        field: &Arc<Field>,
+        values: ArrayRef,
+        nulls: Option<NullBuffer>,
+    ) -> (Field, ArrayRef) {
+        let children: Fields = vec![field.clone()].into();
+        (
+            Field::new("meta", DataType::Struct(children.clone()), true),
+            Arc::new(StructArray::new(children, vec![values], nulls)),
+        )
+    }
+
+    /// `values` as one-element lists.
+    fn in_list(field: &Arc<Field>, values: ArrayRef) -> (Field, ArrayRef) {
+        let rows = values.len();
+        (
+            Field::new("items", DataType::List(field.clone()), true),
+            Arc::new(ListArray::new(
+                field.clone(),
+                OffsetBuffer::from_lengths(vec![1; rows]),
+                values,
+                None,
+            )),
+        )
+    }
+
+    fn sidecar_bytes_of(columns: Vec<(Field, ArrayRef)>) -> u64 {
+        let (fields, arrays): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+        prepared_sidecar_bytes(&batch).unwrap()
+    }
+
     /// Only packed and dedicated payloads count, at the top level, in a struct
     /// and as list elements.
     #[test]
     fn sidecar_bytes_count_packed_and_dedicated_at_any_depth() {
-        let column = || {
-            let mut builder = BlobDescriptorArrayBuilder::new("blob");
-            for value in [
-                BlobDescriptor::Null,
-                BlobDescriptor::Inline { data: "abc".into() },
-                BlobDescriptor::Packed {
-                    blob_id: 1,
-                    offset: 0,
-                    size: 20,
-                },
-                BlobDescriptor::Dedicated {
-                    blob_id: 2,
-                    size: 1000,
-                },
-                BlobDescriptor::Managed {
-                    base_id: None,
-                    uri: "_blobs/payload.blob".to_string(),
-                    offset: 0,
-                    size: 7,
-                },
-                BlobDescriptor::External {
-                    base_id: 0,
-                    uri: "file:///external.bin".to_string(),
-                    offset: 0,
-                    size: 9,
-                },
-            ] {
-                builder.push(value).unwrap();
-            }
-            builder.finish().unwrap().into_parts()
-        };
-        let (field, top) = column();
-        let field = Arc::new(field);
-        let rows = top.len();
-        let meta = Field::new("meta", DataType::Struct(vec![field.clone()].into()), true);
-        let items = Field::new("items", DataType::List(field.clone()), true);
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![field.as_ref().clone(), meta, items])),
-            vec![
-                top,
-                Arc::new(StructArray::new(
-                    vec![field.clone()].into(),
-                    vec![column().1],
-                    None,
-                )),
-                Arc::new(ListArray::new(
-                    field,
-                    OffsetBuffer::from_lengths(vec![1; rows]),
-                    column().1,
-                    None,
-                )),
-            ],
-        )
-        .unwrap();
-        assert_eq!(prepared_sidecar_bytes(&batch).unwrap(), 3 * (20 + 1000));
+        let (field, values) = every_kind();
+        let bytes = sidecar_bytes_of(vec![
+            (field.as_ref().clone(), values.clone()),
+            in_struct(&field, values.clone(), None),
+            in_list(&field, values),
+        ]);
+        assert_eq!(bytes, 3 * (20 + 1000));
+    }
+
+    /// Values a sliced list no longer reaches, and values under a null struct,
+    /// are not counted.
+    #[test]
+    fn sidecar_bytes_count_only_the_rows_the_batch_holds() {
+        let (field, values) = every_kind();
+        let (items, list) = in_list(&field, values.clone());
+        // The dedicated value alone.
+        assert_eq!(sidecar_bytes_of(vec![(items, list.slice(3, 1))]), 1000);
+        // Only the packed value's struct is valid.
+        let nulls = NullBuffer::from(vec![false, false, true, false, false, false]);
+        assert_eq!(
+            sidecar_bytes_of(vec![in_struct(&field, values, Some(nulls))]),
+            20
+        );
     }
 }

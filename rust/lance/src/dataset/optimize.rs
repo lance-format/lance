@@ -1566,6 +1566,21 @@ fn classify_rows(
     })
 }
 
+/// The URI of the object at `relative_path` under the base at `base_uri`, each
+/// path segment escaped so characters such as `#` and `?` stay in the name.
+fn external_blob_uri(base_uri: &str, relative_path: &str) -> Result<String> {
+    let mut url = lance_io::object_store::uri_to_url(base_uri)?;
+    url.path_segments_mut()
+        .map_err(|_| {
+            Error::invalid_input(format!(
+                "External blob base '{base_uri}' cannot hold an object path"
+            ))
+        })?
+        .pop_if_empty()
+        .extend(relative_path.split('/'));
+    Ok(url.to_string())
+}
+
 /// Convert a blob v2 descriptor into the logical writer representation.
 ///
 /// Reads blob data lazily using row addresses to avoid materializing all blob
@@ -1675,8 +1690,7 @@ async fn descriptor_to_logical_blob_array(
                             field_name, base_id
                         ))
                     })?;
-                    let absolute_uri = format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
-                    uri_builder.append_value(&absolute_uri);
+                    uri_builder.append_value(external_blob_uri(&base.path, uri_val)?);
                 }
                 let position =
                     (!descriptor.position_col.is_null(i)).then(|| descriptor.position_col.value(i));
@@ -1723,8 +1737,14 @@ async fn descriptor_to_logical_blob_array(
     )?)
 }
 
-fn transformed_arrow_field(field: &LanceField, data_type: ArrowDataType) -> Arc<ArrowField> {
-    let arrow_field = ArrowField::from(field);
+/// `field` as `data_type`, under the name it was scanned as: a nested blob
+/// projected to the top level is named by its path, not its leaf.
+fn transformed_arrow_field(
+    field: &LanceField,
+    input_field: &ArrowField,
+    data_type: ArrowDataType,
+) -> Arc<ArrowField> {
+    let arrow_field = ArrowField::from(field).with_name(input_field.name());
     arrow_field_with_data_type(&arrow_field, data_type)
 }
 
@@ -1806,6 +1826,7 @@ impl BlobV2FieldRewritePlan {
                 Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
                 Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
                     field,
+                    input_field,
                     if preserve_managed {
                         lance_core::datatypes::BLOB_V2_PREPARED_TYPE.clone()
                     } else {
@@ -1834,19 +1855,19 @@ impl BlobV2FieldRewritePlan {
 
         match (field.data_type(), input_field.data_type()) {
             (ArrowDataType::Struct(_), ArrowDataType::Struct(input_children)) => {
-                if field.children.len() != input_children.len() {
-                    return Err(Error::internal(format!(
-                        "Struct field '{}' expected {} children in blob rewrite plan, got {}",
-                        field.name,
-                        field.children.len(),
-                        input_children.len()
-                    )));
-                }
-                let children = field
-                    .children
+                // A projected scan may hold some of the children, in its own order.
+                let children = input_children
                     .iter()
-                    .zip(input_children.iter())
-                    .map(|(child, input_child)| Self::try_new(child, input_child, preserve_managed))
+                    .map(|input_child| {
+                        match field
+                            .children
+                            .iter()
+                            .find(|c| c.name == *input_child.name())
+                        {
+                            Some(child) => Self::try_new(child, input_child, preserve_managed),
+                            None => Ok(Self::passthrough(input_child)),
+                        }
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let output_children = children
                     .iter()

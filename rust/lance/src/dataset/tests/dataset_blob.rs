@@ -3375,6 +3375,56 @@ async fn test_blob_v2_append_rejects_threshold_mismatch_with_non_blob_input_exte
     assert!(message.contains(BLOB_INLINE_SIZE_THRESHOLD_META_KEY));
 }
 
+/// Write `batch` as a V2.2 dataset at `uri`, with `bases` registered.
+async fn write_blob_dataset(uri: &str, batch: RecordBatch, bases: Vec<BasePath>) -> Arc<Dataset> {
+    let schema = batch.schema();
+    Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: true,
+                initial_bases: (!bases.is_empty()).then_some(bases),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+/// `source` scanned as `project` sets the scan up, with row addresses, and
+/// converted by `blobs_as_logical`.
+async fn scan_as_logical(
+    source: &Arc<Dataset>,
+    project: impl FnOnce(&mut crate::dataset::scanner::Scanner),
+) -> RecordBatch {
+    let mut scan = source.scan();
+    project(&mut scan);
+    scan.with_row_address();
+    let scanned = scan.try_into_batch().await.unwrap();
+    source.blobs_as_logical(scanned).await.unwrap()
+}
+
+/// Each row's value in a column of blob bytes.
+fn blob_bytes(values: &ArrayRef) -> Vec<Option<Vec<u8>>> {
+    let values = values.as_binary::<i64>();
+    (0..values.len())
+        .map(|row| values.is_valid(row).then(|| values.value(row).to_vec()))
+        .collect()
+}
+
+/// Every blob of `dataset`'s column picked by `column`, read as bytes.
+async fn read_blob_bytes(
+    dataset: &Dataset,
+    column: impl Fn(&RecordBatch) -> ArrayRef,
+) -> Vec<Option<Vec<u8>>> {
+    let mut scan = dataset.scan();
+    scan.blob_handling(BlobHandling::AllBinary);
+    blob_bytes(&column(&scan.try_into_batch().await.unwrap()))
+}
+
 /// Rows scanned from one dataset become values another dataset is written from:
 /// each stored blob as its bytes and an External blob as its link, at the top
 /// level, inside a struct and as a list element.
@@ -3389,14 +3439,14 @@ async fn blobs_as_logical_writes_another_dataset() {
     let external = TempDir::default();
     let external_path = external.std_path().join("external.bin");
     std::fs::write(&external_path, b"the writer's").unwrap();
-    // Inline, packed, dedicated, empty, null and External.
-    let values: Vec<(i32, Option<Vec<u8>>)> = vec![
-        (1, Some(b"abc".to_vec())),
-        (2, Some(vec![b'p'; 20])),
-        (3, Some(vec![b'd'; 1000])),
-        (4, Some(Vec::new())),
-        (5, None),
-        (6, Some(b"the writer's".to_vec())),
+    // Inline, packed, dedicated, empty, null; the last is External.
+    let values: Vec<Option<Vec<u8>>> = vec![
+        Some(b"abc".to_vec()),
+        Some(vec![b'p'; 20]),
+        Some(vec![b'd'; 1000]),
+        Some(Vec::new()),
+        None,
+        Some(b"the writer's".to_vec()),
     ];
     let blob = || {
         blob_field_with_options(
@@ -3410,9 +3460,9 @@ async fn blobs_as_logical_writes_another_dataset() {
     };
     let column = || {
         let mut builder = BlobArrayBuilder::new(values.len());
-        for (id, value) in &values {
+        for (row, value) in values.iter().enumerate() {
             match value {
-                Some(_) if *id == 6 => builder
+                Some(_) if row == values.len() - 1 => builder
                     .push_uri(format!("file://{}", external_path.display()))
                     .unwrap(),
                 Some(bytes) if bytes.is_empty() => builder.push_empty().unwrap(),
@@ -3425,17 +3475,13 @@ async fn blobs_as_logical_writes_another_dataset() {
     let struct_fields: arrow_schema::Fields = vec![blob()].into();
     let item = Arc::new(blob());
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
         blob(),
         Field::new("meta", DataType::Struct(struct_fields.clone()), true),
         Field::new("items", DataType::List(item.clone()), true),
     ]));
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        schema,
         vec![
-            Arc::new(Int32Array::from(
-                values.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            )),
             column(),
             Arc::new(StructArray::new(struct_fields, vec![column()], None)),
             Arc::new(arrow_array::ListArray::new(
@@ -3447,67 +3493,30 @@ async fn blobs_as_logical_writes_another_dataset() {
         ],
     )
     .unwrap();
-    let params = || WriteParams {
-        data_storage_version: Some(LanceFileVersion::V2_2),
-        allow_external_blob_outside_bases: true,
-        ..Default::default()
-    };
-    let source = Arc::new(
-        Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            &source_dir,
-            Some(params()),
-        )
-        .await
-        .unwrap(),
-    );
+    let source = write_blob_dataset(&source_dir, batch, vec![]).await;
 
-    let mut scan = source.scan();
-    scan.with_row_address();
-    let scanned = scan.try_into_batch().await.unwrap();
-    let logical = source.blobs_as_logical(scanned).await.unwrap();
+    let logical = scan_as_logical(&source, |_| {}).await;
     assert!(logical.column_by_name(lance_core::ROW_ADDR).is_none());
-    let logical_schema = logical.schema();
-    let target = Arc::new(
-        Dataset::write(
-            RecordBatchIterator::new(vec![Ok(logical)], logical_schema),
-            &target_dir,
-            Some(params()),
-        )
-        .await
-        .unwrap(),
-    );
+    let target = write_blob_dataset(&target_dir, logical, vec![]).await;
 
-    let mut scan = target.scan();
-    scan.blob_handling(BlobHandling::AllBinary);
-    let rows = scan.try_into_batch().await.unwrap();
-    let ids = rows["id"].as_primitive::<arrow_array::types::Int32Type>();
-    let blobs = |values: &ArrayRef| -> Vec<(i32, Option<Vec<u8>>)> {
-        let values = values.as_binary::<i64>();
-        (0..rows.num_rows())
-            .map(|row| {
-                (
-                    ids.value(row),
-                    values.is_valid(row).then(|| values.value(row).to_vec()),
-                )
-            })
-            .collect()
-    };
-    let items = rows["items"].as_list::<i32>().values().clone();
-    for read in [
-        blobs(&rows["blob"]),
-        blobs(&rows["meta"].as_struct()["blob"]),
-        blobs(&items),
-    ] {
-        let mut read = read;
-        read.sort_by_key(|(id, _)| *id);
-        assert_eq!(read, values);
-    }
-    let row = (0..rows.num_rows())
-        .find(|&row| ids.value(row) == 6)
-        .unwrap();
+    assert_eq!(
+        read_blob_bytes(&target, |rows| rows["blob"].clone()).await,
+        values
+    );
+    assert_eq!(
+        read_blob_bytes(&target, |rows| rows["meta"].as_struct()["blob"].clone()).await,
+        values
+    );
+    assert_eq!(
+        read_blob_bytes(&target, |rows| rows["items"]
+            .as_list::<i32>()
+            .values()
+            .clone())
+        .await,
+        values
+    );
     let external = target
-        .take_blobs_by_indices(&[row as u64], "blob")
+        .take_blobs_by_indices(&[values.len() as u64 - 1], "blob")
         .await
         .unwrap();
     assert_eq!(
@@ -3517,6 +3526,116 @@ async fn blobs_as_logical_writes_another_dataset() {
     );
 }
 
+/// An External link under a registered base keeps naming the same object when
+/// its name holds characters a URI escapes.
+#[tokio::test]
+async fn blobs_as_logical_keeps_escaped_external_names() {
+    let source_dir = TempStrDir::default();
+    let target_dir = TempStrDir::default();
+    let base = TempDir::default();
+    // What a lost escape would name instead.
+    std::fs::write(base.std_path().join("a"), b"wrong object").unwrap();
+    let objects = [
+        ("a#b.bin", "hash"),
+        ("a?b.bin", "query"),
+        ("a%23b.bin", "percent"),
+    ];
+    let mut links = BlobArrayBuilder::new(objects.len());
+    for (name, payload) in objects {
+        let path = base.std_path().join(name);
+        std::fs::write(&path, payload).unwrap();
+        links
+            .push_uri(url::Url::from_file_path(&path).unwrap().to_string())
+            .unwrap();
+    }
+    let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+    let batch = RecordBatch::try_new(schema, vec![links.finish().unwrap()]).unwrap();
+    let source = write_blob_dataset(
+        &source_dir,
+        batch,
+        vec![BasePath {
+            id: 1,
+            name: Some("external".to_string()),
+            path: url::Url::from_directory_path(base.std_path())
+                .unwrap()
+                .to_string(),
+            is_dataset_root: false,
+        }],
+    )
+    .await;
+
+    let logical = scan_as_logical(&source, |_| {}).await;
+    let target = write_blob_dataset(&target_dir, logical, vec![]).await;
+
+    let expected: Vec<_> = objects
+        .iter()
+        .map(|(_, payload)| Some(payload.as_bytes().to_vec()))
+        .collect();
+    assert_eq!(
+        read_blob_bytes(&target, |rows| rows["blob"].clone()).await,
+        expected
+    );
+}
+
+/// The conversion follows the columns a scan returns: a struct holding only
+/// some of its children, and a nested blob projected beside a top-level blob
+/// of the same name, which keeps its own name.
+#[tokio::test]
+async fn blobs_as_logical_follows_the_scanned_columns() {
+    let dir = TempStrDir::default();
+    let column = |value: &[u8]| {
+        let mut builder = BlobArrayBuilder::new(1);
+        builder.push_bytes(value).unwrap();
+        builder.finish().unwrap()
+    };
+    let children: arrow_schema::Fields = vec![
+        Field::new("before", DataType::Int32, true),
+        blob_field("blob", true),
+        Field::new("after", DataType::Int32, true),
+    ]
+    .into();
+    let schema = Arc::new(Schema::new(vec![
+        blob_field("blob", true),
+        Field::new("meta", DataType::Struct(children.clone()), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            column(b"top"),
+            Arc::new(StructArray::new(
+                children,
+                vec![
+                    Arc::new(Int32Array::from(vec![1])),
+                    column(b"nested"),
+                    Arc::new(Int32Array::from(vec![2])),
+                ],
+                None,
+            )),
+        ],
+    )
+    .unwrap();
+    let source = write_blob_dataset(&dir, batch, vec![]).await;
+    let data = |rows: &RecordBatch, column: &str| blob_bytes(&rows[column].as_struct()["data"]);
+    let nested = vec![Some(b"nested".to_vec())];
+
+    let partial = source.schema().project(&["meta.blob"]).unwrap();
+    let rows = scan_as_logical(&source, |scan| {
+        scan.project_with_schema(&partial).unwrap();
+    })
+    .await;
+    assert_eq!(
+        blob_bytes(&rows["meta"].as_struct()["blob"].as_struct()["data"]),
+        nested
+    );
+
+    let rows = scan_as_logical(&source, |scan| {
+        scan.project(&["meta.blob", "blob"]).unwrap();
+    })
+    .await;
+    assert_eq!(data(&rows, "meta.blob"), nested);
+    assert_eq!(data(&rows, "blob"), vec![Some(b"top".to_vec())]);
+}
+
 /// The row addresses locate each stored blob, so a batch without them is refused.
 #[tokio::test]
 async fn blobs_as_logical_needs_row_addresses() {
@@ -3524,19 +3643,8 @@ async fn blobs_as_logical_needs_row_addresses() {
     let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
     let mut builder = BlobArrayBuilder::new(1);
     builder.push_bytes(b"abc").unwrap();
-    let batch = RecordBatch::try_new(schema.clone(), vec![builder.finish().unwrap()]).unwrap();
-    let dataset = Arc::new(
-        Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            &dir,
-            Some(WriteParams {
-                data_storage_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap(),
-    );
+    let batch = RecordBatch::try_new(schema, vec![builder.finish().unwrap()]).unwrap();
+    let dataset = write_blob_dataset(&dir, batch, vec![]).await;
     let scanned = dataset.scan().try_into_batch().await.unwrap();
     let err = dataset.blobs_as_logical(scanned).await.unwrap_err();
     assert!(err.to_string().contains("_rowaddr"), "{err}");
