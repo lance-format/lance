@@ -351,6 +351,10 @@ name = "rowid_spill"
 harness = false
 
 [[bench]]
+name = "row_id_lookup"
+harness = false
+
+[[bench]]
 name = "concurrent_append"
 harness = false
 
