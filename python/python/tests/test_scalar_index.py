@@ -65,18 +65,17 @@ def set_language_model_path():
 
 
 @pytest.fixture()
-def lindera_ipadic():
-    set_language_model_path()
-    model_path = os.path.join(os.path.dirname(__file__), "models", "lindera", "ipadic")
-    cwd = os.getcwd()
-    try:
-        os.chdir(model_path)
-        with zipfile.ZipFile("main.zip", "r") as zip_ref:
-            zip_ref.extractall()
-        os.chdir(cwd)
-        yield
-    finally:
-        shutil.rmtree(os.path.join(model_path, "main"))
+def lindera_ipadic(tmp_path, monkeypatch):
+    # Configs use paths relative to the Python project root. Give each test
+    # its own root so parallel fixtures cannot overwrite or delete shared files.
+    model_home = tmp_path / "python" / "tests" / "models"
+    source = os.path.join(os.path.dirname(__file__), "models", "lindera")
+    shutil.copytree(source, model_home / "lindera")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LANCE_LANGUAGE_MODEL_HOME", str(model_home))
+    model_path = model_home / "lindera" / "ipadic"
+    with zipfile.ZipFile(model_path / "main.zip", "r") as zip_ref:
+        zip_ref.extractall(model_path)
 
 
 @pytest.fixture()
