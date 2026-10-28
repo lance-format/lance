@@ -1203,7 +1203,11 @@ pub async fn commit_optimize_indices(
         .transaction_properties(options.transaction_properties.clone())
         .build();
         return dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
+            .apply_commit(
+                transaction,
+                &crate::dataset::ManifestWriteConfig::default().with_optimized_index_segments(),
+                &Default::default(),
+            )
             .await;
     }
     let read_version = results[0].read_version;
@@ -1302,7 +1306,11 @@ pub async fn commit_optimize_indices(
     .transaction_properties(options.transaction_properties.clone())
     .build();
     dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
+        .apply_commit(
+            transaction,
+            &crate::dataset::ManifestWriteConfig::default().with_optimized_index_segments(),
+            &Default::default(),
+        )
         .await?;
     Ok(())
 }

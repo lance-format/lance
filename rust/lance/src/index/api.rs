@@ -395,6 +395,19 @@ pub trait DatasetIndexExt {
     /// Discover these indices by name or with unfiltered [`Self::describe_indices`];
     /// single-column query lookup does not select them.
     ///
+    /// Each segment's coverage is checked against this dataset version first.
+    /// A covered fragment whose indexed data changed since the segment was
+    /// built is left out. So is a fragment compaction produced since, unless
+    /// the fragment reuse index still records every rewrite from the
+    /// segment's build to it and the indexed data is unchanged along them: the
+    /// segment holds those rows' addresses from its build. Without a fragment
+    /// reuse index, a segment of stable row ids on a table that has them keeps
+    /// such a fragment, as compaction leaves the ids valid. A segment whose
+    /// build version has been cleaned up keeps none of its coverage, since
+    /// nothing then shows which fragments it was built over. Rows left out are
+    /// scanned, and a commit that would replace a segment still covering them
+    /// is refused.
+    ///
     /// ```
     /// # use lance::{Dataset, Result, index::{DatasetIndexExt, IndexSegment}};
     /// # async fn commit(dataset: &mut Dataset, segment: IndexSegment) -> Result<()> {

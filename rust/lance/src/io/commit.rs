@@ -1332,6 +1332,14 @@ pub(crate) async fn do_commit_detached_transaction(
     let transaction = &transaction;
     validate_detached_non_reusable_field_ids(&dataset.manifest, &transaction.operation)?;
     validate_operation(Some(&dataset.manifest), &transaction.operation)?;
+    // Boxed: it holds a version history across awaits.
+    Box::pin(crate::index::check_published_coverage(
+        dataset,
+        None,
+        transaction,
+        write_config.optimized_index_segments(),
+    ))
+    .await?;
     // Detached commits skip the rebase pipeline, so a rewrite's transition
     // intent would never be assembled or validated (a dummy intent plus a
     // hand-built entry would satisfy the manifest chokepoint unvalidated).
@@ -1858,6 +1866,15 @@ pub(crate) async fn commit_transaction(
             Some(read_version_dataset.schema()),
         )?;
         validate_operation(Some(&dataset.manifest), &attempt_transaction.operation)?;
+        // Against the manifest this attempt replaces, after the rebase. Boxed:
+        // it holds a version history across awaits.
+        Box::pin(crate::index::check_published_coverage(
+            &dataset,
+            Some(&read_version_dataset),
+            &attempt_transaction,
+            write_config.optimized_index_segments(),
+        ))
+        .await?;
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.

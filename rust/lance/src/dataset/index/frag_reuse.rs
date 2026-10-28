@@ -97,6 +97,11 @@ impl Dataset {
 /// This will make that specific index not efficient until the next reindex,
 /// but it will not cause any correctness problem.
 ///
+/// Only indices in the manifest hold versions back. Index segments outside it,
+/// staged or saved from an earlier version, do not; committed later through
+/// [`commit_existing_index_segments`], they leave out the coverage the
+/// remaining history can no longer translate.
+///
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
 ///
@@ -117,6 +122,7 @@ impl Dataset {
 /// ```
 ///
 /// [`compact_files`]: crate::dataset::optimize::compact_files
+/// [`commit_existing_index_segments`]: crate::index::DatasetIndexExt::commit_existing_index_segments
 /// [`remap_column_index`]: crate::dataset::optimize::remapping::remap_column_index
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
     // check against index metadata before auto-remap

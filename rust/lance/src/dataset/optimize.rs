@@ -17920,6 +17920,109 @@ mod tests {
         assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
     }
 
+    #[tokio::test]
+    async fn test_eager_remap_withdraws_retained_overlay_stale_coverage() {
+        async fn query_ids(dataset: &Dataset, filter: &str, use_index: bool) -> Vec<i32> {
+            let mut scanner = dataset.scan();
+            scanner
+                .filter(filter)
+                .unwrap()
+                .use_scalar_index(use_index)
+                .project(&["id"])
+                .unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        let mut dataset = create_base_dataset("memory://").await;
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Fragment 0 keeps an indexed-field overlay and stays uncompacted.
+        dataset = commit_overlay(
+            dataset,
+            0,
+            &[1],
+            OverlayCoverage::dense(bitmap([0])),
+            vec![i32_array([Some(1000)])],
+        )
+        .await;
+        // Fragment 1 reaches the overlay limit through a non-indexed field, so
+        // eager compaction rewrites it but the val index itself stays fresh.
+        for offset in 0..3 {
+            dataset = commit_overlay(
+                dataset,
+                1,
+                &[0],
+                OverlayCoverage::dense(bitmap([offset])),
+                vec![i32_array([Some(100 + offset as i32)])],
+            )
+            .await;
+        }
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                excluded_fragment_ids: vec![0],
+                ..overlay_only_options(2)
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((metrics.fragments_removed, metrics.fragments_added), (1, 1));
+        let compacted_id = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .find(|id| *id != 0)
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let val_index = indices
+            .iter()
+            .find(|index| index.fields == vec![1])
+            .expect("val index present");
+        assert!(
+            val_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(compacted_id),
+            "remapped entries remain valid for the compacted fragment"
+        );
+        assert!(
+            !val_index.fragment_bitmap.as_ref().unwrap().contains(0),
+            "the retained overlay-stale fragment must fall back to the flat path"
+        );
+
+        for filter in ["val = 1000", "val = 0", "val = 10", "val = 110"] {
+            assert_eq!(
+                query_ids(&dataset, filter, true).await,
+                query_ids(&dataset, filter, false).await,
+                "{filter}"
+            );
+        }
+        assert_eq!(query_ids(&dataset, "val = 1000", true).await, vec![0]);
+        assert!(query_ids(&dataset, "val = 0", true).await.is_empty());
+    }
+
     /// Round 6: unlike `migrate_fragments`, the reuse-record normalization
     /// must keep a fully-deleted fragment: the rewrite group still removes
     /// it from the manifest and the transition still consumes it (zero live

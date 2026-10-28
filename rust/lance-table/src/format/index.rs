@@ -183,7 +183,7 @@ impl IndexMetadata {
     /// row rewrite without remapping. Unknown plugin types must lose coverage
     /// of rewritten rows instead of being assumed to store stable row IDs.
     /// Missing details retain the historical native-index behavior.
-    pub(crate) fn can_follow_stable_row_ids(&self) -> bool {
+    pub fn can_follow_stable_row_ids(&self) -> bool {
         if self.results_are_row_addrs() {
             return false;
         }

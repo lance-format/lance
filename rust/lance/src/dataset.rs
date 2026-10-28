@@ -4368,6 +4368,9 @@ pub(crate) struct ManifestWriteConfig {
     /// `cleanup_frag_reuse_index` against the current manifest entry; see
     /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
     tagged_frag_reuse_trim: bool, // default false
+    /// This commit publishes the segments `optimize_indices` built from the
+    /// segments it removes; see `check_published_coverage`.
+    optimized_index_segments: bool, // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -4382,6 +4385,7 @@ impl Default for ManifestWriteConfig {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            optimized_index_segments: false,
         }
     }
 }
@@ -4408,6 +4412,19 @@ impl ManifestWriteConfig {
     /// path derived against the current entry (`FragReuseUpdate::Trim`).
     pub(crate) fn tagged_frag_reuse_trim(&self) -> bool {
         self.tagged_frag_reuse_trim
+    }
+
+    /// Mark this commit as publishing the segments `optimize_indices` built
+    /// from the segments it removes and the fragments its read version left
+    /// unindexed, which vouch for their coverage.
+    pub(crate) fn with_optimized_index_segments(mut self) -> Self {
+        self.optimized_index_segments = true;
+        self
+    }
+
+    /// Whether this commit publishes segments `optimize_indices` built.
+    pub(crate) fn optimized_index_segments(&self) -> bool {
+        self.optimized_index_segments
     }
 
     /// Resolve into the config `Transaction::build_manifest` consumes.

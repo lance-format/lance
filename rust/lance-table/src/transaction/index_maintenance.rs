@@ -9,7 +9,9 @@
 //! drop the index. Getting this wrong does not fail the commit -- it silently
 //! returns stale rows from the index -- so each rule here is paired with a test.
 
-use crate::format::overlay::staleness::{collect_overlay_stale_frags, field_affects_index};
+use crate::format::overlay::staleness::{
+    collect_overlay_stale_frags, field_affects_index, overlaid_fragments,
+};
 use crate::format::{Fragment, IndexMetadata};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::lineage::TaggedLineage;
@@ -857,8 +859,8 @@ impl Transaction {
             {
                 replacement.base_id = None;
             }
-            // Independent remaps preserve the source's historical metadata. Only
-            // a physical merge publishes a new segment's details and version.
+            // Independent remaps preserve the source's index details. Only a
+            // physical merge publishes a new segment's details and version.
             if replacements.len() > 1 {
                 replacement.index_details =
                     Some(Arc::new(rewritten_index.new_index_details.clone()));
@@ -878,6 +880,39 @@ impl Transaction {
             let insert_at = source_indices[0].0;
             indices.retain(|index| !old_ids.contains(&index.uuid));
             indices.insert(insert_at.min(indices.len()), replacement);
+        }
+        Ok(())
+    }
+
+    /// Advance the watermark of indices whose files were rewritten in place.
+    ///
+    /// This runs after overlay-staleness reconciliation, which needs the
+    /// pre-remap watermark to identify an index that predates an overlay folded
+    /// into the rewrite. A rewritten segment can also retain coverage of
+    /// fragments outside the rewrite. Before advancing the watermark makes its
+    /// live overlays appear incorporated, withdraw those fragments' coverage so
+    /// their stale entries keep falling back to the flat path.
+    pub(super) fn advance_rewritten_index_dataset_versions(
+        indices: &mut [IndexMetadata],
+        rewritten_indices: &[RewrittenIndex],
+        fragments: &[Fragment],
+        schema: &Schema,
+        remapped_at_version: u64,
+    ) -> Result<()> {
+        let rewritten_ids = rewritten_indices
+            .iter()
+            .map(|index| index.new_id)
+            .collect::<HashSet<_>>();
+        let overlaid_frags = overlaid_fragments(fragments);
+        for index in indices {
+            if rewritten_ids.contains(&index.uuid) {
+                let mut stale = RoaringBitmap::new();
+                collect_overlay_stale_frags(index, &overlaid_frags, &mut stale, schema)?;
+                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                    *fragment_bitmap -= stale;
+                }
+                index.dataset_version = remapped_at_version;
+            }
         }
         Ok(())
     }
@@ -1771,7 +1806,7 @@ mod tests {
         let mut indices = vec![index];
         Transaction::handle_rewrite_indices(
             &mut indices,
-            &[replacement],
+            std::slice::from_ref(&replacement),
             &[RewriteGroup {
                 old_fragments: vec![Fragment::new(1), Fragment::new(2)],
                 new_fragments: vec![Fragment::new(3)],
@@ -1783,6 +1818,16 @@ mod tests {
         assert_eq!(indices[0].uuid, new_id);
         assert_eq!(indices[0].base_id, None);
         assert_eq!(indices[0].files, Some(vec![]));
+        assert_eq!(indices[0].dataset_version, 3);
+        Transaction::advance_rewritten_index_dataset_versions(
+            &mut indices,
+            std::slice::from_ref(&replacement),
+            &[],
+            &create_test_schema(&[1]),
+            4,
+        )
+        .unwrap();
+        assert_eq!(indices[0].dataset_version, 4);
         assert_eq!(
             indices[0].fragment_bitmap,
             Some(RoaringBitmap::from_iter([3]))
@@ -1807,8 +1852,71 @@ mod tests {
             new_index_files: index.files.clone(),
         };
         let mut indices = vec![index];
-        Transaction::handle_rewrite_indices(&mut indices, &[replacement], &[]).unwrap();
+        Transaction::handle_rewrite_indices(&mut indices, std::slice::from_ref(&replacement), &[])
+            .unwrap();
+        assert_eq!(indices[0].dataset_version, 3);
+        Transaction::advance_rewritten_index_dataset_versions(
+            &mut indices,
+            std::slice::from_ref(&replacement),
+            &[],
+            &create_test_schema(&[1]),
+            4,
+        )
+        .unwrap();
+        assert_eq!(indices[0].dataset_version, 4);
         assert_eq!(indices[0].base_id, Some(7));
+    }
+
+    #[test]
+    fn test_advancing_remapped_watermark_withdraws_retained_overlay_coverage() {
+        let mut retained = Fragment::new(0);
+        retained.overlays = vec![overlay_with_field(1, 5)];
+        let rewritten = Fragment::new(1);
+        let output = Fragment::new(2);
+        let index = create_test_index(
+            "idx",
+            1,
+            2,
+            Some(RoaringBitmap::from_iter([0u32, 1])),
+            false,
+        );
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id: Uuid::new_v4(),
+            new_index_details: index.index_details.as_ref().unwrap().as_ref().clone(),
+            new_index_version: index.index_version as u32,
+            new_index_files: index.files.clone(),
+        };
+        let mut indices = vec![index];
+        Transaction::handle_rewrite_indices(
+            &mut indices,
+            std::slice::from_ref(&replacement),
+            &[RewriteGroup {
+                old_fragments: vec![rewritten],
+                new_fragments: vec![output.clone()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter([0u32, 2]))
+        );
+
+        Transaction::advance_rewritten_index_dataset_versions(
+            &mut indices,
+            std::slice::from_ref(&replacement),
+            &[retained, output],
+            &create_test_schema(&[1]),
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter([2u32])),
+            "retained overlay-stale coverage must be withdrawn before the watermark advances"
+        );
+        assert_eq!(indices[0].dataset_version, 6);
     }
 
     #[test]
