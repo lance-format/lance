@@ -3527,6 +3527,8 @@ def test_portable_blob_reference_requests(portable_blob_references):
     assert "snapshot_retention_v1" in BlobSourceContext.supported_operations()
     assert source.table_identity == "catalog/portable"
     assert source.access_context_key == "workers"
+    snapshot = lance.SnapshotIdentity.from_dataset(dataset, "catalog/portable")
+    assert source.snapshot_identity().encode() == snapshot.encode()
     assert source.branch is None
     assert BlobSourceContext.decode(source.encode()).encode() == source.encode()
     references = BlobRefBatch.decode(references.encode())

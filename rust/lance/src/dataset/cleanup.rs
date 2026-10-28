@@ -42,7 +42,7 @@ use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_ret
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
 use super::refs::{TagContents, normalize_branch};
-use super::retention::{MaintenanceDelete, SnapshotMaintenanceLock, clear_retiring, mark_retiring};
+use super::retention::{MaintenanceDeadline, MaintenanceDelete, SnapshotMaintenanceLock, clear_retiring, mark_retiring};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -80,7 +80,7 @@ use std::os::unix::fs::MetadataExt;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     future,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 use tokio::sync::{OnceCell, Semaphore};
@@ -419,6 +419,7 @@ struct DeleteExecution {
     concurrency: usize,
     permits: tokio::sync::Semaphore,
     limiter: Option<tokio::sync::Mutex<tokio::time::Interval>>,
+    maintenance_deadline: OnceLock<MaintenanceDeadline>,
 }
 
 impl DeleteExecution {
@@ -429,6 +430,7 @@ impl DeleteExecution {
         validate_delete_concurrency(concurrency)?;
         Ok(Arc::new(Self {
             concurrency,
+            maintenance_deadline: OnceLock::new(),
             permits: tokio::sync::Semaphore::new(concurrency),
             limiter: create_delete_limiter(
                 operation
@@ -439,6 +441,7 @@ impl DeleteExecution {
     }
 
     async fn delete(&self, store: &ObjectStore, path: &Path) -> Result<()> {
+        self.check_maintenance_deadline()?;
         // Spend rate permits only when there is concurrency to start the request.
         let _permit = self.permits.acquire().await.map_err(|error| {
             Error::invalid_input(format!("cleanup delete semaphore closed: {error}"))
@@ -446,10 +449,20 @@ impl DeleteExecution {
         if let Some(limiter) = &self.limiter {
             limiter.lock().await.tick().await;
         }
-        match store.delete(path).await {
+        self.check_maintenance_deadline()?;
+        let result = match store.delete(path).await {
             Err(error) if error.is_not_found() => Ok(()),
             result => result,
+        };
+        self.check_maintenance_deadline()?;
+        result
+    }
+
+    fn check_maintenance_deadline(&self) -> Result<()> {
+        if let Some(deadline) = self.maintenance_deadline.get() {
+            deadline.check()?;
         }
+        Ok(())
     }
 
     fn maintenance_deleter(self: &Arc<Self>) -> Arc<MaintenanceDelete> {
@@ -753,6 +766,11 @@ impl<'a> CleanupOperation<'a> {
         let fence =
             SnapshotMaintenanceLock::for_cleanup(self.dataset, execution.maintenance_deleter())
                 .await?;
+        if let Some(fence) = &fence {
+            execution
+                .maintenance_deadline
+                .get_or_init(|| fence.deadline());
+        }
         let result = cleanup.run().await;
         if let Some(fence) = fence {
             fence.release().await?;
@@ -1467,8 +1485,16 @@ impl<'a> CleanupTask<'a> {
         mut inspection: CleanupInspection,
     ) -> Result<CleanupRunResult> {
         if self.action.deletes_files() && self.dataset.object_store.scheme() != "cos" {
+            let execution = self
+                .delete_execution
+                .as_ref()
+                .ok_or_else(|| Error::internal("Cleanup execute requires a deletion context"))?;
             stream::iter(inspection.old_manifests.keys().cloned().collect::<Vec<_>>())
-                .map(|path| async move { mark_retiring(self.dataset, &path).await })
+                .map(|path| async move {
+                    execution.check_maintenance_deadline()?;
+                    mark_retiring(self.dataset, &path).await?;
+                    execution.check_maintenance_deadline()
+                })
                 .buffer_unordered(self.dataset.object_store.io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await?;
@@ -1661,6 +1687,7 @@ impl<'a> CleanupTask<'a> {
                 .map(|file| async move {
                     let file = file?;
                     let outcome = execution.delete(store, &file.path).await;
+                    execution.check_maintenance_deadline()?;
                     Ok::<_, Error>((file, outcome))
                 })
                 .buffer_unordered(execution.concurrency)
@@ -1721,6 +1748,7 @@ impl<'a> CleanupTask<'a> {
                     .await?;
             }
             for (version, identity) in &inspection.retired_records {
+                execution.check_maintenance_deadline()?;
                 if undeleted.contains(version) {
                     continue;
                 }
@@ -1735,6 +1763,7 @@ impl<'a> CleanupTask<'a> {
                     (indices_dir, retained_index_dirs, index_dirs_to_remove),
                     (data_dir, retained_data_dirs, data_dirs_to_remove),
                 ] {
+                    execution.check_maintenance_deadline()?;
                     let verified_dirs = dirs_to_remove.into_inner().map_err(|error| {
                         Error::internal(format!(
                             "Failed to read cleanup directory candidates: {error}"
@@ -2818,6 +2847,11 @@ pub async fn cleanup_cascade_branch(
     let execution = DeleteExecution::try_new(&operation)?;
     let fence =
         SnapshotMaintenanceLock::for_cleanup(dataset, execution.maintenance_deleter()).await?;
+    if let Some(fence) = &fence {
+        execution
+            .maintenance_deadline
+            .get_or_init(|| fence.deadline());
+    }
     let result = cleanup_cascade_branch_run(
         operation,
         CleanupAction::Execute,

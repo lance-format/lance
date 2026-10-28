@@ -72,6 +72,7 @@ from .mem_wal import (
     evaluate_sharding_spec,
 )
 from .progress import IndexProgress
+from .retention import SnapshotIdentity, SnapshotRetention
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -94,6 +95,8 @@ __all__ = [
     "BlobRefReadStream",
     "BlobSnapshotRetention",
     "BlobSourceContext",
+    "SnapshotIdentity",
+    "SnapshotRetention",
     "DedicatedBlobWriter",
     "BlobDescriptorArrayBuilder",
     "PackedBlobWriter",

@@ -135,6 +135,11 @@ public final class BlobReferences {
     public String getAccessContextKey() {
       return description[4];
     }
+
+    /** Snapshot identity shared with ordinary scans, independent of worker routing. */
+    public SnapshotIdentity getSnapshotIdentity() {
+      return SnapshotIdentity.decode(snapshotIdentityNative(encoded));
+    }
   }
 
   /** Nullable reference Arrow array and its source table, serialized for exchange/spill. */
@@ -356,10 +361,11 @@ public final class BlobReferences {
   }
 
   /**
-   * Durable explicit-release GC root. All cleanup clients must use Lance retention coordination. No
-   * expiry/renewal is used. Foreign dataset bases require separate owner protection and are
-   * rejected; external objects follow their own immutability contract. Dropping the token never
-   * releases it. Recover orphaned tags only after all query consumers have stopped.
+   * Durable explicit-release GC root. All cleanup clients must use Lance retention coordination.
+   * Query tags have no expiry or renewal; maintenance owners have fixed expiration. Foreign dataset
+   * bases require separate owner protection and are rejected; external objects follow their own
+   * immutability contract. Dropping the token never releases it. Recover orphaned tags only after
+   * all query consumers have stopped.
    *
    * <p>The coordinator must persist the query ID and encoded source context before acquisition,
    * persist the token before exporting references, and record release intent before release.
@@ -458,6 +464,8 @@ public final class BlobReferences {
 
   private static native byte[] acquireRetentionNative(
       Dataset dataset, byte[] context, String retentionId) throws IOException;
+
+  private static native byte[] snapshotIdentityNative(byte[] context);
 
   private static native byte[] validateRetentionNative(byte[] retention);
 

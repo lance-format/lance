@@ -21,8 +21,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     block_on,
-    blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     error::Result,
+    snapshot_retention::{dataset, java_bytes},
 };
 
 const NATIVE_HANDLE: &str = "nativeHandle";
@@ -56,22 +56,10 @@ fn handle(env: &mut JNIEnv, object: JObject) -> Result<NativeHandle> {
     )
 }
 
-fn dataset(env: &mut JNIEnv, object: JObject) -> Result<Arc<lance::Dataset>> {
-    Ok(Arc::new(
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(object, NATIVE_DATASET) }?
-            .inner
-            .clone(),
-    ))
-}
-
 fn attach<'a>(env: &mut JNIEnv<'a>, class: &str, handle: NativeHandle) -> Result<JObject<'a>> {
     let object = env.new_object(format!("org/lance/BlobReferences${class}"), "()V", &[])?;
     unsafe { env.set_rust_field(&object, NATIVE_HANDLE, handle) }?;
     Ok(object)
-}
-
-fn java_bytes(env: &JNIEnv, bytes: &[u8]) -> Result<jbyteArray> {
-    Ok(env.byte_array_from_slice(bytes)?.into_raw())
 }
 
 fn contexts(env: &mut JNIEnv, values: JObjectArray) -> Result<Vec<BlobSourceContext>> {
@@ -611,6 +599,22 @@ pub extern "system" fn Java_org_lance_BlobReferences_acquireRetentionNative(
                 retention_id,
             ))?;
             java_bytes(&env, &retention.encode())
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_snapshotIdentityNative(
+    mut env: JNIEnv,
+    _class: JObject,
+    context: JByteArray,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        (|| -> Result<_> {
+            let context = BlobSourceContext::decode(&env.convert_byte_array(context)?)?;
+            java_bytes(&env, &context.snapshot_identity()?.encode())
         })(),
         std::ptr::null_mut()
     )

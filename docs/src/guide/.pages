@@ -9,6 +9,7 @@ nav:
     - JSON Support: json.md
     - Data Evolution: data_evolution.md
     - Tags and Branches: tags_and_branches.md
+    - Snapshot Retention: snapshot_retention.md
   - Indexing and Search:
     - Overview: indexing.md
     - Scalar Indexes: scalar_indexing.md

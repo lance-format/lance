@@ -391,137 +391,32 @@ or extends protection by itself.
 
 ## Query lifetime and cleanup
 
-`BlobSnapshotRetention::acquire(dataset, context, retention_id)` protects the exact
-source context with a durable tag before references are issued. Use a globally
-unique ID for each query lifetime. Retrying acquisition with that ID and context
-is idempotent. Do not reuse an ID after release or share it between independent
-queries: their release ownership would also be shared.
-Acquisition/release require write/delete access to `_refs`. Workers only need
-their read bindings. Configure maintenance to retain tagged versions rather than
-erroring on them; Python uses `error_if_tagged_old_versions=False` to clean around
-query roots.
+Use general [snapshot retention](snapshot_retention.md) before issuing references.
+`SnapshotIdentity` identifies an exact dataset snapshot independently of blob
+capabilities and worker routing. `SnapshotRetention` protects that snapshot with
+the existing durable query tags until explicit release. Obtain the identity using
+`BlobSourceContext::snapshot_identity()` in Rust, `source.snapshot_identity()` in
+Python, or `source.getSnapshotIdentity()` in Java. Ordinary scans use the same API
+without creating a blob context.
 
-Acquisition and cleanup use the same table-root maintenance fence across branches
-and processes. Under the fence, acquisition checks the original manifest and
-commit identity and creates the protected tag. Cleanup marks expiring manifests
-before deleting any payload. If cleanup wins the race, acquisition fails; it cannot
-return a usable retention token for a manifest whose files may already be deleted.
-Retirement markers also cover partial cleanup failures that leave an old manifest
-on storage after some of its payloads have been deleted.
-Cleanup shares its delete concurrency and rate limits with coordination-object
-removal. Temporary fences and retirement markers are operational metadata and do
-not contribute to dataset removal statistics or dry-run candidates.
+The original `BlobSnapshotRetention` and Java `BlobReferences.Retention` surfaces
+remain convenience adapters. They delegate to the same general snapshot retention
+and preserve the original blob context in their transport.
 
-Each maintenance attempt publishes its own object under
-`_refs/retention-v1/maintenance/<owner-UUID>`. Zero means that the owner is choosing
-a ticket. Published tickets establish an order, with owner IDs breaking ties.
-An acquisition checks for earlier owners and unfinished choosers before entering.
-Contenders return a conflict; retry the complete operation with backoff. Release
-deletes only that attempt's object, so a delayed DELETE retry cannot remove a later
-owner's fence. There is no time-based lock stealing.
+Acquisition, release, and cleanup coordinate with a table-root maintenance lock.
+Maintenance owners have a fixed expiry of 120 hours by default, configurable using
+`lance.snapshot_retention.lock_expiration_hours`. Each owner records its expiry;
+other callers honor it regardless of their own configuration. Query tags do not
+expire. Fixed lock expiry requires bounded operation/storage-request durations and
+clock agreement; it does not fence a paused owner or cancel submitted requests.
+See [maintenance expiration](snapshot_retention.md#maintenance-lock-expiration)
+for the complete deployment contract.
 
-Hold the retention until all workers, outstanding reads, retries, and lazy result
-consumers have stopped. `release(dataset)` removes its protected tag and is
-idempotent. It accepts an authenticated handle to a later snapshot of the same
-table, so release does not require reopening an expired version. Drop does not
-release retention. There is no automatic expiration or renewal in this version.
-
-```rust
-use lance::{Dataset, Result};
-use lance::blob::reference::{BlobSourceContext, BlobSnapshotRetention};
-
-async fn query_lifetime(dataset: &Dataset, query_id: &str) -> Result<()> {
-    let source = BlobSourceContext::from_dataset(
-        dataset, "catalog/table-incarnation", "query/storage-binding",
-    ).await?;
-    let retention = BlobSnapshotRetention::acquire(dataset, source, query_id).await?;
-    // Capture/export refs, then wait for every consumer and retry to stop.
-    retention.release(dataset).await
-}
-```
-
-### Supported maintenance and storage
-
-Every cleanup process must use the coordination protocol advertised by the
-`snapshot_retention_v1` SDK operation. This includes automatic cleanup and branch
-cleanup. Stop and restart older maintenance processes during rollout, including
-already-open handles. A capability check on a new coordinator cannot fence an old
-handle that is still allowed to delete files. Older uncoordinated cleanup clients,
-forced table/branch deletion, manual tag changes, and deletion outside Lance are
-outside this retention guarantee.
-Before enabling retention, inventory scheduled cleanup jobs and services, verify
-their client capabilities, and assign an owner for recovery of abandoned fences
-and query tags. A deployment that cannot exclude older cleanup clients cannot
-advertise this retention guarantee.
-Coordinated cleanup also needs write/delete access to `_refs/retention-v1` for its
-maintenance fence and retirement markers.
-
-Storage must provide atomic conditional creation and consistent object reads and
-directory listings. Retention fails on backends without these operations. Tencent
-COS is explicitly unsupported; ordinary cleanup remains available there.
-Retention assumes the snapshot's payloads are available when acquired. It does not
-verify every payload or repair deletion/corruption from before coordinated cleanup.
-`SnapshotMaintenanceLock` in `lance::dataset::retention` is a coordination hook for
-maintenance services that need to serialize their own operations with Lance.
-Do not call Lance cleanup or retention acquisition while holding that hook: those
-operations acquire the same fence themselves.
-
-Protection covers source Inline files, Packed/Dedicated sidecars, and Managed
-objects owned by this dataset. Snapshots with foreign dataset roots, including
-shallow clones, are rejected by acquisition: their source owners need a separate
-retention agreement. A tag on a clone cannot prevent cleanup by another table.
-Registered bases outside this table must not be reclaimed by another owner during
-the query. External objects still depend on the external immutability and lifetime
-contract; a Lance tag does not protect their contents.
-
-### Recovery after interruption
-
-The query coordinator must keep a durable recovery record. Persist each phase
-before starting the operation in the next column:
-
-| Durable phase | Recorded state | Next operation |
-| --- | --- | --- |
-| Acquiring | Globally unique query ID and encoded exact source context | Call `acquire` with that context and ID. |
-| Active | Serialized retention token, `tag_name`, and participating workers/retries | Export references and run the query. |
-| Releasing | Token and confirmation that all consumers have stopped | Call `release`. |
-| Released | Acknowledged release and completed query ID | Finish the recovery record; never reuse that ID. |
-
-Recording acquisition intent first covers a crash after tag creation but before
-the token is saved. Persist the active token before issuing any references. If
-saving recovery state fails, keep the query from starting. A lost release response
-must be handled by retrying `release`, not by acquiring the same query again.
-
-Recover an interrupted query in this order:
-
-1. Stop new assignments and retries. Wait for every worker, lazy consumer,
-   outstanding read, and submitted storage request to finish or stop.
-2. If an abandoned maintenance owner blocks progress, stop its operation and drain
-   its storage requests before deleting its object under
-   `_refs/retention-v1/maintenance/`. If ownership cannot be established, quiesce
-   all query coordinators and maintenance clients for the table and drain their
-   storage requests first. An owner object's age or ticket does not prove that it
-   is abandoned. Never delete the whole `_refs` directory.
-3. If a token was saved, decode it and call `release` using an authenticated handle
-   to the same table; a later snapshot is sufficient. If only acquisition intent
-   was saved, reopen the exact recorded snapshot, replay `acquire` with the same
-   context and ID, then release the returned token. This recovers the existing tag
-   idempotently. A failed replay remains a recovery error; never substitute the
-   latest snapshot or silently discard the record.
-4. Mark the query released after release is acknowledged. Retrying release is safe
-   even after cleanup has removed the source version. Resume maintenance using
-   participating clients once abandoned owners have been accounted for.
-
-An orphan `lance-query-<digest>` tag continues to protect its files after the
-coordinator has stopped. Do not delete it merely because it is old. Match it to
-durable query state and verify that every consumer has stopped before release.
-Monitor repeated maintenance conflicts and query tags without an active recovery
-record; neither fences nor tags expire automatically.
-
-Retirement markers are separate from maintenance owner objects. Never clear a
-marker for a manifest still on storage to make acquisition succeed: some of its
-payloads may be gone. Finish deleting the expired manifest under maintenance
-coordination before removing its marker. A marker whose manifest is already
-absent may be removed after maintenance has stopped.
+The coordinator must persist acquisition intent, the active token, and release
+intent. Release only after all workers, retries, outstanding reads, and lazy
+consumers stop. Follow the [interruption recovery procedure](snapshot_retention.md#recovery-after-interruption).
+External object lifetime and foreign dataset owners still require separate
+agreements.
 
 ## Python and Java/JNI bindings
 
@@ -549,7 +444,7 @@ arrays. Workers reopen the exact branch/version with their own storage binding.
 Native driver pointers and credentials are not part of the transport.
 
 This example shows local API use. A distributed coordinator must also persist the
-lifecycle state described in [Recovery after interruption](#recovery-after-interruption)
+lifecycle state described in [Recovery after interruption](snapshot_retention.md#recovery-after-interruption)
 before issuing references to workers.
 
 ```python

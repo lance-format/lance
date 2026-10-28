@@ -90,6 +90,7 @@ pub(crate) mod rowids;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
+mod snapshot_retention;
 pub(crate) mod storage_options;
 pub(crate) mod tracing;
 pub(crate) mod transaction;
@@ -297,6 +298,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<blob_reference::PyBlobRefReader>()?;
     m.add_class::<blob_reference::PyBlobRefReadStream>()?;
     m.add_class::<blob_reference::PyBlobSnapshotRetention>()?;
+    m.add_class::<snapshot_retention::PySnapshotIdentity>()?;
+    m.add_class::<snapshot_retention::PySnapshotRetention>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileWriteSummary>()?;

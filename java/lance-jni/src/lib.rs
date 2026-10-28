@@ -62,6 +62,7 @@ mod otel;
 mod rq_model;
 mod schema;
 mod session;
+mod snapshot_retention;
 mod sql;
 mod storage_options;
 mod task_tracker;

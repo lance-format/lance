@@ -20,15 +20,11 @@ use pyo3::{
 };
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::{dataset::Dataset, error::PythonErrorExt, rt};
-
-fn dataset_inner(dataset: &Bound<'_, PyAny>) -> PyResult<Arc<lance::Dataset>> {
-    Ok(dataset
-        .getattr("_ds")?
-        .extract::<PyRef<'_, Dataset>>()?
-        .ds
-        .clone())
-}
+use crate::{
+    error::PythonErrorExt,
+    rt,
+    snapshot_retention::{PySnapshotIdentity, dataset_inner},
+};
 
 /// Exact snapshot identity and authenticated worker context key, without credentials.
 #[pyclass(
@@ -44,6 +40,12 @@ pub struct PyBlobSourceContext {
 
 #[pymethods]
 impl PyBlobSourceContext {
+    /// Snapshot identity shared with ordinary scans, independent of blob reader settings.
+    fn snapshot_identity(&self) -> PyResult<PySnapshotIdentity> {
+        Ok(PySnapshotIdentity {
+            inner: self.inner.snapshot_identity().infer_error()?,
+        })
+    }
     /// Capture metadata from a resolved LanceDataset, without payload reads or retention.
     ///
     /// table_identity must distinguish table incarnations and catalog/storage
@@ -429,7 +431,7 @@ impl PyBlobRefReadStream {
 /// Explicit-release exact-snapshot GC root requiring coordinated maintenance clients.
 ///
 /// Acquire before exporting refs and release after every worker, retry, read, and
-/// lazy consumer has stopped. There is no expiry or renewal. Foreign dataset
+/// lazy consumer has stopped. Query tags have no expiry or renewal; maintenance owners have fixed expiration. Foreign dataset
 /// roots are unsupported; external object lifetime remains the caller's contract.
 /// Dropping the token does not release it. See the portable blob references guide
 /// for deployment requirements and orphan recovery.

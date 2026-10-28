@@ -2288,6 +2288,66 @@ public class DatasetTest {
   // ===== Blob API tests =====
 
   @Test
+  void testSnapshotRetentionForOrdinaryData(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("retained_data").toString();
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset fixture = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = fixture.createEmptyDataset();
+          Dataset first = fixture.write(empty.version(), 2);
+          Dataset original = fixture.write(first.version(), 2)) {
+        UpdateConfig config =
+            UpdateConfig.builder()
+                .configUpdates(
+                    UpdateMap.builder()
+                        .updates(Map.of("lance.snapshot_retention.lock_expiration_hours", "6"))
+                        .replace(false)
+                        .build())
+                .build();
+        try (Dataset configured =
+            original.newTransactionBuilder().operation(config).build().commit()) {
+          assertEquals(2, configured.getFragments().size());
+          SnapshotIdentity snapshot = SnapshotIdentity.fromDataset(configured, "catalog/ordinary");
+          snapshot = SnapshotIdentity.decode(snapshot.encode());
+          SnapshotRetention retention =
+              SnapshotRetention.acquire(configured, snapshot, "ordinary-query");
+          retention = SnapshotRetention.decode(retention.encode());
+          assertArrayEquals(snapshot.encode(), retention.getSnapshot().encode());
+          try (Dataset latest = Dataset.open().allocator(allocator).uri(path).build()) {
+            latest.delete("true");
+            CleanupPolicy policy =
+                CleanupPolicy.builder()
+                    .withBeforeTimestampMillis(Instant.now().plusSeconds(3600).toEpochMilli())
+                    .withErrorIfTaggedOldVersions(false)
+                    .build();
+            try {
+              latest.cleanup(policy).execute();
+              int rows = 0;
+              int sum = 0;
+              try (LanceScanner scanner = configured.newScan();
+                  ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                  VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+                  IntVector ids = (IntVector) batch.getVector("id");
+                  rows += batch.getRowCount();
+                  for (int i = 0; i < batch.getRowCount(); i++) {
+                    sum += ids.get(i);
+                  }
+                }
+              }
+              assertEquals(4, rows);
+              assertEquals(2, sum);
+            } finally {
+              retention.release(latest);
+            }
+            retention.release(latest);
+            assertTrue(latest.cleanup(policy).execute().getDataFilesRemoved() >= 2);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
   void testPortableBlobReferences(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("portable_blobs").toString();
     try (RootAllocator allocator = new RootAllocator();
@@ -2304,6 +2364,9 @@ public class DatasetTest {
       Retention retention = Retention.acquire(original, source, "portable-query");
       retention = Retention.decode(retention.encode());
       assertArrayEquals(source.encode(), retention.getContext().encode());
+      assertArrayEquals(
+          SnapshotIdentity.fromDataset(original, "catalog/portable").encode(),
+          source.getSnapshotIdentity().encode());
       try {
         List<Batch> batches = capturePortableBlobBatches(original, source, allocator);
         try (Dataset latest = Dataset.open().allocator(allocator).uri(path).build()) {

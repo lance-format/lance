@@ -1871,6 +1871,55 @@ def test_scheduler_error_mode_storage_option(tmp_path: Path):
         lance.dataset(uri, storage_options={"scheduler_error_mode": "invalid"})
 
 
+def test_snapshot_retention_protects_ordinary_data(tmp_path):
+    from lance.retention import SnapshotIdentity, SnapshotRetention
+
+    original = pa.table({"value": pa.array([1, None], type=pa.int32())})
+    dataset = lance.write_dataset(original, tmp_path / "retained", max_rows_per_file=1)
+    dataset.update_config({"lance.snapshot_retention.lock_expiration_hours": "6"})
+    assert len(dataset.get_fragments()) == 2
+    snapshot = SnapshotIdentity.from_dataset(dataset, "catalog/ordinary")
+    snapshot = SnapshotIdentity.decode(snapshot.encode())
+    assert snapshot.version == dataset.version
+    assert snapshot.table_identity == "catalog/ordinary"
+    assert snapshot.branch is None
+    assert len(snapshot.snapshot_id) == 32
+    token = SnapshotRetention.acquire(dataset, snapshot, str(uuid.uuid4()))
+    token = SnapshotRetention.decode(token.encode())
+    assert token.snapshot.encode() == snapshot.encode()
+    assert token.tag_name in dataset.tags.list()
+    latest = lance.write_dataset(
+        pa.table({"value": pa.array([3, 4], type=pa.int32())}),
+        dataset.uri,
+        mode="overwrite",
+    )
+    try:
+        latest.cleanup_old_versions(
+            older_than=timedelta(hours=-1), error_if_tagged_old_versions=False
+        )
+        assert dataset.to_table().equals(original)
+        assert snapshot.version in [item["version"] for item in latest.versions()]
+    finally:
+        token.release(latest)
+    token.release(latest)
+    stats = latest.cleanup_old_versions(older_than=timedelta(hours=-1))
+    assert stats.data_files_removed == 2
+    assert snapshot.version not in [item["version"] for item in latest.versions()]
+    with pytest.raises((ValueError, OSError)):
+        SnapshotRetention.acquire(dataset, snapshot, str(uuid.uuid4()))
+
+
+@pytest.mark.parametrize("hours", ["0", "-1", "1.5", "", "18446744073709551615"])
+def test_snapshot_retention_rejects_invalid_lock_expiration(tmp_path, hours):
+    dataset = lance.write_dataset(pa.table({"value": [1, 2]}), tmp_path / "retained")
+    dataset.update_config({"lance.snapshot_retention.lock_expiration_hours": hours})
+    snapshot = lance.SnapshotIdentity.from_dataset(dataset, "catalog/ordinary")
+    with pytest.raises(ValueError, match="lock_expiration_hours"):
+        lance.SnapshotRetention.acquire(dataset, snapshot, str(uuid.uuid4()))
+    with pytest.raises(OSError, match="lock_expiration_hours"):
+        dataset.cleanup_old_versions()
+
+
 def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

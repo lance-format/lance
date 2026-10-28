@@ -10,6 +10,7 @@ EXECUTION_PROTO_PATHS = {
     "protos/ann.proto",
     "protos/blob_reference.proto",
     "protos/cache_diagnostics.proto",
+    "protos/snapshot_retention.proto",
     "protos/filtered_read.proto",
     "protos/fts.proto",
     "protos/snapshot.proto",
