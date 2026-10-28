@@ -959,6 +959,55 @@ def test_index_with_no_centroid_movement(tmp_path):
     validate_vector_index(dataset, "vector", sample_size=8)
 
 
+def test_torch_cosine_ivf_pq_recall(tmp_path):
+    """Accelerated cosine IVF_PQ must be as accurate as the CPU build.
+
+    The torch path used to train the PQ codebook with cosine (unit codewords)
+    on residuals of unnormalized vectors, while the index searches it as an L2
+    codebook over residuals of normalized vectors.
+    """
+    torch = pytest.importorskip("torch")
+
+    rng = np.random.default_rng(42)
+    num_rows, dim = 4096, 32
+    centers = rng.standard_normal((32, dim), dtype=np.float32)
+    mat = centers[rng.integers(0, 32, num_rows)]
+    mat += 0.5 * rng.standard_normal((num_rows, dim), dtype=np.float32)
+    # cosine ignores the norm, so give the rows different norms
+    mat *= rng.uniform(0.5, 5.0, (num_rows, 1)).astype(np.float32)
+    tbl = vec_to_table(data=mat).append_column("id", pa.array(np.arange(num_rows)))
+
+    unit = mat / np.linalg.norm(mat, axis=1, keepdims=True)
+    queries = mat[rng.choice(num_rows, 100, replace=False)]
+    k = 10
+
+    def recall(accelerator, uri):
+        ds = lance.write_dataset(tbl, uri)
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            metric="cosine",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator=accelerator,
+        )
+        hits = 0
+        for q in queries:
+            gt = np.argsort(-(unit @ q))[:k]
+            res = ds.to_table(
+                columns=["id"],
+                nearest={"column": "vector", "q": q, "k": k, "nprobes": 4},
+            )
+            hits += len(set(gt.tolist()) & set(res["id"].to_pylist()))
+        return hits / (len(queries) * k)
+
+    cpu_recall = recall(None, tmp_path / "cpu")
+    torch_recall = recall(torch.device("cpu"), tmp_path / "torch")
+    assert torch_recall >= cpu_recall - 0.1, (
+        f"torch recall {torch_recall} vs cpu recall {cpu_recall}"
+    )
+
+
 def test_index_with_pq_codebook(tmp_path):
     dim = 16
     rng = np.random.default_rng(42)
@@ -1969,6 +2018,35 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         )
 
 
+def test_ivf_centroids_file_num_partitions_mismatch(dataset, tmp_path: Path):
+    centroids = np.random.randn(4, 128).astype(np.float32)
+    centroids_dir = tmp_path / "centroids"
+    centroids_dir.mkdir()
+    centroids_file = centroids_dir / "centroids.npy"
+    np.save(centroids_file, centroids)
+
+    with pytest.raises(ValueError, match="has 4 clusters, but num_partitions=8"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            ivf_centroids_file=str(centroids_file),
+            num_partitions=8,
+            num_sub_vectors=8,
+        )
+
+    # Omitting num_partitions is the case that shows the file's count is what
+    # sets the partition count; with num_partitions=4 the assertion would hold
+    # either way.
+    indexed = dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        ivf_centroids_file=str(centroids_file),
+        num_sub_vectors=8,
+    )
+    stats = indexed.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["num_partitions"] == 4
+
+
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
     ds = lance.write_dataset(
         dataset.to_table(), tmp_path / "indexed_skip_transpose.lance"
@@ -2478,20 +2556,49 @@ def test_index_cast_centroids(tmp_path):
     )
 
 
-def test_fragment_scan_disallowed_on_ann(dataset):
-    q = np.random.randn(128)
-    with pytest.raises(
-        ValueError, match="This operation is not supported for fragment scan"
-    ):
-        scanner = dataset.scanner(
-            columns=["id"],
-            nearest={
-                "column": "vector",
-                "q": q,
-            },
-            fragments=[LanceFragment(dataset, 0)],
-        )
-        scanner.explain_plan(True)
+@pytest.fixture
+def fragment_vector_dataset(tmp_path):
+    table = pa.table(
+        {
+            "id": range(12),
+            "vector": pa.array(
+                [[float(i), 0.0, 0.0, 0.0] for i in range(12)],
+                type=pa.list_(pa.float32(), 4),
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table.slice(0, 8), tmp_path, max_rows_per_file=4)
+    dataset = dataset.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+    )
+    segment = str(dataset.describe_indices()[0].segments[0].uuid)
+    dataset = lance.write_dataset(table.slice(8), dataset.uri, mode="append")
+    return dataset, segment
+
+
+@pytest.mark.parametrize("as_string", [False, True], ids=["uuid", "string"])
+def test_fragment_scan_default_postfilter(fragment_vector_dataset, as_string):
+    dataset, segment = fragment_vector_dataset
+    # The binding sets fragments before nearest; both filtering flags use defaults.
+    scanner = dataset.scanner(
+        columns=["id", "_distance"],
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[segment if as_string else uuid.UUID(segment)],
+        nearest={"column": "vector", "q": np.zeros(4, dtype=np.float32), "k": 6},
+        filter="id % 2 = 1",
+    )
+    plan = scanner.explain_plan()
+    assert "ANNSubIndex" in plan and "KNNVectorDistance" in plan, plan
+    assert "UnionExec" in plan, plan
+    result = scanner.to_table()
+    ids = result["id"].to_pylist()
+    expected_ids = [5, 7, 9]
+    assert len(set(ids) & set(expected_ids)) / len(expected_ids) == 1.0, plan
+    assert ids == expected_ids, plan
+    assert result["_distance"].to_pylist() == [25.0, 49.0, 81.0]
 
 
 def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
@@ -2788,6 +2895,9 @@ def test_retrain_indices(tmp_path, retrain):
         index_type="IVF_FLAT",
         num_partitions=1,
         ivf_centroids=old_centroid,
+        # A retrain sizes partitions from the target the index records. Pin it
+        # at the 128 rows the table ends with so the retrain keeps one partition.
+        target_partition_size=128,
         index_file_version=IndexFileVersion.V3,
     )
     indexed_dataset = lance.write_dataset(
@@ -3426,6 +3536,37 @@ def test_scanner_rejects_unknown_index_segments(tmp_path):
                 "k": 10,
             },
             index_segments=[uuid.uuid4()],
+        ).to_table()
+
+
+def test_scanner_rejects_invalid_index_segment_uuid(fragment_vector_dataset):
+    dataset, _ = fragment_vector_dataset
+    with pytest.raises(ValueError, match="invalid index segment uuid 'not-a-uuid'"):
+        dataset.scanner(
+            nearest={"column": "vector", "q": np.zeros(4), "k": 5},
+            fragments=dataset.get_fragments()[1:],
+            index_segments=["not-a-uuid"],
+        ).to_table()
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        pytest.param(str(uuid.UUID(int=0)), id="single-string"),
+        pytest.param(uuid.UUID(int=0), id="single-uuid"),
+        pytest.param([123], id="integer-element"),
+        pytest.param([None], id="none-element"),
+    ],
+)
+def test_scanner_rejects_index_segment_types(fragment_vector_dataset, segments):
+    dataset, _ = fragment_vector_dataset
+    with pytest.raises(
+        TypeError, match="index_segments must be an iterable of str or uuid.UUID"
+    ):
+        dataset.scanner(
+            nearest={"column": "vector", "q": np.zeros(4), "k": 5},
+            fragments=dataset.get_fragments()[1:],
+            index_segments=segments,
         ).to_table()
 
 

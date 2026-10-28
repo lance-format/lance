@@ -36,9 +36,9 @@
 //! generations with no value for it.
 //!
 //! A generation frozen before an index joined the maintained set is flushed
-//! without a vector or full-text index for it, and search over both is
-//! index-only, so its rows answer neither until compaction folds them into the
-//! base table.
+//! without a vector or full-text index for it. Vector search scans such a
+//! generation flat; full-text search over it is index-only, so its rows do not
+//! answer one until compaction folds them into the base table.
 
 use std::any::Any;
 use std::collections::HashMap;

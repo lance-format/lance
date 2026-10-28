@@ -1143,6 +1143,8 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             version: m.version,
             branch: m.branch.clone(),
+            clustering: Vec::new(),
+            max_clustering_id: 0,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1260,6 +1262,108 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
     use roaring::RoaringBitmap;
+
+    #[test]
+    fn clustering_proto_retains_definitions_references_and_generic_metadata() {
+        let metadata = HashMap::from([
+            ("org.example.cluster.bucket".into(), "[0, 100)".into()),
+            (
+                "org.example.unknown".into(),
+                "  opaque value: 東京  ".into(),
+            ),
+            ("org.example.empty".into(), String::new()),
+        ]);
+        // Test the persisted messages only; runtime maintenance is not enabled yet.
+        let manifest = pb::Manifest {
+            writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
+            max_clustering_id: 7,
+            clustering: vec![
+                pb::Clustering {
+                    id: 1,
+                    columns: vec![0, 1],
+                    provider: "org.example.cluster".into(),
+                    version: 8,
+                },
+                pb::Clustering {
+                    id: 5,
+                    columns: vec![1],
+                    provider: "org.example.other".into(),
+                    version: 9,
+                },
+            ],
+            table_metadata: HashMap::from([
+                (
+                    "org.example.cluster.1.boundaries".into(),
+                    "[0, 100, 200]".into(),
+                ),
+                (
+                    "org.example.cluster.1.unknown_option".into(),
+                    "  opaque value: 東京  ".into(),
+                ),
+            ]),
+            fragments: vec![
+                pb::DataFragment {
+                    id: 1,
+                    clustering_id: Some(1),
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                },
+                pb::DataFragment {
+                    id: 2,
+                    clustering_id: Some(5),
+                    ..Default::default()
+                },
+                pb::DataFragment {
+                    id: 3,
+                    clustering_id: None,
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::Manifest::decode(manifest.encode_to_vec().as_slice()).unwrap(),
+            manifest
+        );
+        assert_eq!(manifest.reader_feature_flags, 0);
+        let segments = pb::IndexSection {
+            indices: vec![pb::IndexMetadata {
+                name: "vectors".into(),
+                fields: vec![1],
+                clustering_id: Some(5),
+                metadata,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            pb::IndexSection::decode(segments.encode_to_vec().as_slice()).unwrap(),
+            segments
+        );
+        assert_eq!(manifest.clustering.len(), 2);
+        assert_eq!(manifest.max_clustering_id, 7);
+        assert_eq!(manifest.fragments[2].clustering_id, None);
+        let allocation_only = pb::Manifest {
+            writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
+            max_clustering_id: manifest.max_clustering_id,
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::Manifest::decode(allocation_only.encode_to_vec().as_slice()).unwrap(),
+            allocation_only
+        );
+        // Proto presence distinguishes an absent reference from an invalid zero.
+        let zero = pb::DataFragment {
+            clustering_id: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::DataFragment::decode(zero.encode_to_vec().as_slice())
+                .unwrap()
+                .clustering_id,
+            Some(0)
+        );
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same

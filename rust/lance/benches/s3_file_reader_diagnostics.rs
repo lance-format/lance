@@ -29,7 +29,7 @@ use lance::dataset::fragment::{FileFragment, FragReadConfig};
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts};
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::PageEncoding;
-use lance_encoding::format::pb21;
+use lance_encoding::format::metadata;
 use lance_file::reader::{
     DEFAULT_READ_CHUNK_SIZE, FileReader as LanceFileReader, FileReaderOptions,
 };
@@ -579,12 +579,12 @@ fn projection_name(columns: &Option<Vec<String>>) -> String {
 fn page_layout_kind(encoding: &PageEncoding) -> &'static str {
     match encoding {
         PageEncoding::Legacy(_) => "legacy",
+        PageEncoding::Planar(_) => "planar",
         PageEncoding::Structural(layout) => match layout.layout.as_ref() {
-            Some(pb21::page_layout::Layout::MiniBlockLayout(_)) => "miniblock",
-            Some(pb21::page_layout::Layout::ConstantLayout(_)) => "constant",
-            Some(pb21::page_layout::Layout::FullZipLayout(_)) => "fullzip",
-            Some(pb21::page_layout::Layout::BlobLayout(_)) => "blob",
-            Some(pb21::page_layout::Layout::SparseLayout(_)) => "sparse",
+            Some(metadata::page_layout::Layout::MiniBlockLayout(_)) => "miniblock",
+            Some(metadata::page_layout::Layout::ConstantLayout(_)) => "constant",
+            Some(metadata::page_layout::Layout::FullZipLayout(_)) => "fullzip",
+            Some(metadata::page_layout::Layout::BlobLayout(_)) => "blob",
             None => "missing",
         },
     }

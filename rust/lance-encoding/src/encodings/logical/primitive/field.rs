@@ -7,14 +7,14 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::vec;
 
-use arrow_array::{Array, make_array};
+use arrow_array::{Array, cast::AsArray, make_array};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::FuturesOrdered;
 use futures::{FutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_arrow::DataTypeExt;
+use lance_arrow::{DataTypeExt, r#struct::StructArrayExt};
 use lance_core::Result;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Field;
@@ -23,15 +23,16 @@ use log::{debug, trace};
 
 use crate::EncodingsIo;
 use crate::compression::DecompressionStrategy;
+use crate::data::{concat_decoded_arrays, dictionary_batch_limit};
 use crate::decoder::{
     ColumnInfo, DecodePageTask, DecodedArray, FilterExpression, IO_REQUEST_BATCH_BYTES,
-    LoadedPageShard, MessageType, PageInfo, RequestBatch, ScheduledScanLine, SchedulerContext,
-    StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
+    LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch, ScheduledScanLine,
+    SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
     StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
 };
 use crate::encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler};
-use crate::format::pb21::PageLayout;
-use crate::format::{ProtobufUtils21, pb21};
+use crate::format::metadata::PageLayout;
+use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation};
 
 use super::{
@@ -39,7 +40,7 @@ use super::{
     MiniBlockScheduler, NoCachedPageData, PageDataCacheKey, PageInitialization,
     SimpleAllNullScheduler, StructuralPageScheduler,
 };
-use super::{constant, sparse};
+use super::{constant, planar, sparse};
 
 #[derive(Debug)]
 struct StructuralPrimitiveFieldSchedulingJob<'a> {
@@ -352,7 +353,7 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
-        use pb21::page_layout::Layout;
+        use metadata::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
             Layout::MiniBlockLayout(mini_block) => Box::new(MiniBlockScheduler::try_new(
                 &page_info.buffer_offsets_and_sizes,
@@ -361,16 +362,6 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
-            Layout::SparseLayout(sparse_layout) => {
-                Box::new(sparse::SparseStructuralScheduler::try_new(
-                    &page_info.buffer_offsets_and_sizes,
-                    page_info.priority,
-                    page_info.num_rows,
-                    target_field.data_type(),
-                    sparse_layout,
-                    decompressors,
-                )?)
-            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -386,7 +377,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = constant_layout
                     .layers
                     .iter()
-                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
@@ -435,7 +426,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = blob
                     .layers
                     .iter()
-                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
@@ -464,6 +455,30 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<PageInfoAndScheduler> {
+        if let PageEncoding::Planar(layout) = &page_info.encoding {
+            let scheduler = if layout.sparse().is_some() {
+                Box::new(sparse::planar::PlanarSparseScheduler::try_new(
+                    page_info,
+                    layout,
+                    target_field,
+                    decompressors,
+                )?) as Box<dyn StructuralPageScheduler>
+            } else {
+                planar::validate_page(page_info, layout, target_field, decompressors)?;
+                Self::page_layout_to_scheduler(
+                    page_info,
+                    &layout.dense_execution_layout()?,
+                    decompressors,
+                    cache_repetition_index,
+                    target_field,
+                )?
+            };
+            return Ok(PageInfoAndScheduler {
+                page_index,
+                row_range,
+                scheduler,
+            });
+        }
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
             page_info,
@@ -662,6 +677,9 @@ impl StructuralPrimitiveFieldScheduler {
         // Serve cache hits in place; the rest are misses we must read.
         let mut misses = Vec::with_capacity(positions.len());
         for page_idx in positions {
+            self.page_schedulers[page_idx]
+                .scheduler
+                .set_cache(cache.clone());
             let page = &self.page_schedulers[page_idx];
             if !page.scheduler.needs_initialization() {
                 continue;
@@ -865,13 +883,21 @@ impl StructuralCompositeDecodeArrayTask {
         }
         // SAFETY: The array buffers have already been validated and the null buffer length
         // matches the array. We are only attaching the null buffer here.
-        Ok(make_array(unsafe {
+        let array = make_array(unsafe {
             array
                 .to_data()
                 .into_builder()
                 .nulls(Some(validity))
                 .build_unchecked()
-        }))
+        });
+        if let Some(struct_array) = array.as_struct_opt() {
+            // Packed structs (including blob descriptors) restore validity at the
+            // parent level. Field access reads the child arrays directly, so those
+            // arrays must also mask values beneath a null parent.
+            Ok(Arc::new(struct_array.pushdown_nulls()?))
+        } else {
+            Ok(array)
+        }
     }
 }
 
@@ -894,7 +920,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             arrays.push(array);
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
-        let array = arrow_select::concat::concat(&array_refs)?;
+        let array = concat_decoded_arrays(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
         let array = Self::restore_validity(array, &mut repdef)?;
@@ -973,6 +999,14 @@ impl StructuralPrimitiveFieldDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        self.page_decoders
+            .iter()
+            .filter_map(|page| page.dictionary_len())
+            .filter_map(|len| dictionary_batch_limit(self.field.data_type(), len))
+            .min()
+    }
+
     fn accept_page(&mut self, child: LoadedPageShard) -> Result<()> {
         assert!(child.path.is_empty());
         self.page_decoders.push_back(child.decoder);
@@ -1077,7 +1111,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
 
-    use arrow_array::Array;
+    use arrow_array::{Array, ArrayRef, Int32Array, StructArray, cast::AsArray};
     use arrow_schema::{DataType, Field as ArrowField};
     use bytes::Bytes;
 
@@ -1090,16 +1124,40 @@ mod tests {
         CachedPage, CachedPageData, PageCacheView, PageDataCacheKey, SimpleAllNullScheduler,
         StructuralPageScheduler,
     };
-    use crate::format::pb21;
+    use crate::format::metadata;
+    use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler};
     use crate::testing::SimulatedScheduler;
 
     use super::{
-        PageInfoAndScheduler, StructuralPrimitiveFieldDecoder, StructuralPrimitiveFieldScheduler,
-        map_ranges_to_pages, pages_overlapping_ranges,
+        PageInfoAndScheduler, StructuralCompositeDecodeArrayTask, StructuralPrimitiveFieldDecoder,
+        StructuralPrimitiveFieldScheduler, map_ranges_to_pages, pages_overlapping_ranges,
     };
 
     #[derive(Debug)]
     struct CacheMarker(u8);
+
+    #[test]
+    fn test_packed_struct_restores_child_validity() {
+        let array = StructArray::new(
+            vec![Arc::new(ArrowField::new("value", DataType::Int32, false))].into(),
+            vec![Arc::new(Int32Array::from(vec![5, 0, 7])) as ArrayRef],
+            None,
+        );
+        let mut repdef = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(vec![0, 1, 0]),
+            vec![DefinitionInterpretation::NullableItem].into(),
+            3,
+        )]);
+        let result =
+            StructuralCompositeDecodeArrayTask::restore_validity(Arc::new(array), &mut repdef)
+                .unwrap();
+        let result = result.as_struct();
+        assert_eq!(result.null_count(), 1);
+        assert_eq!(result.column(0).nulls(), result.nulls());
+        assert!(result.column(0).is_null(1));
+        result.to_data().validate_full().unwrap();
+    }
 
     impl lance_core::cache::DeepSizeOf for CacheMarker {
         fn deep_size_of_children(&self, _context: &mut lance_core::cache::Context) -> usize {
@@ -1585,10 +1643,10 @@ mod tests {
             .map(|page_index| PageInfo {
                 num_rows: ROWS_PER_PAGE,
                 priority: page_index * ROWS_PER_PAGE,
-                encoding: PageEncoding::Structural(pb21::PageLayout {
-                    layout: Some(pb21::page_layout::Layout::ConstantLayout(
-                        pb21::ConstantLayout {
-                            layers: vec![pb21::RepDefLayer::RepdefNullableItem as i32],
+                encoding: PageEncoding::Structural(metadata::PageLayout {
+                    layout: Some(metadata::page_layout::Layout::ConstantLayout(
+                        metadata::ConstantLayout {
+                            layers: vec![metadata::RepDefLayer::RepdefNullableItem as i32],
                             ..Default::default()
                         },
                     )),
@@ -1772,6 +1830,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_batch_sorts_a_lone_unsorted_read() {
+        let io = Arc::new(RecordingScheduler::default());
+        let batch = RequestBatch::new(io.clone());
+        let read = batch.submit_request(vec![300..308, 100..108, 200..208], 1);
+        batch.flush();
+        assert_eq!(
+            io.requests.lock().unwrap().as_slice(),
+            &[vec![100..108, 200..208, 300..308]],
+            "the I/O layer only accepts ranges sorted by offset"
+        );
+        let starts = read
+            .await
+            .unwrap()
+            .iter()
+            .map(|bytes| u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(starts, [300, 100, 200], "results come back in caller order");
+    }
+
+    /// Fails every request with the error its function builds.
+    #[derive(Debug)]
+    struct FailingScheduler(fn() -> lance_core::Error);
+
+    impl crate::EncodingsIo for FailingScheduler {
+        fn submit_request(
+            &self,
+            _ranges: Vec<Range<u64>>,
+            _priority: u64,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Vec<Bytes>>> {
+            futures::FutureExt::boxed(std::future::ready(Err((self.0)())))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Cause;
+
+    impl std::fmt::Display for Cause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "typed cause")
+        }
+    }
+
+    impl std::error::Error for Cause {}
+
+    fn chain_has_cause(error: &lance_core::Error) -> bool {
+        let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(error) = next {
+            if error.is::<Cause>() {
+                return true;
+            }
+            next = error.source();
+        }
+        false
+    }
+
+    #[rstest::rstest]
+    #[case::io_source(
+        || lance_core::Error::io_source(Box::new(Cause)),
+        chain_has_cause
+    )]
+    #[case::invalid_input(
+        || lance_core::Error::invalid_input_source(Box::new(Cause)),
+        chain_has_cause
+    )]
+    #[case::corrupt_file(
+        || lance_core::Error::corrupt_file_named("data.lance", "bad page"),
+        |e: &lance_core::Error| matches!(e.find_root(), lance_core::Error::CorruptFile { path, .. } if path.as_ref() == "data.lance")
+    )]
+    #[case::internal(|| lance_core::Error::internal("bug"), |_: &lance_core::Error| true)]
+    #[case::timeout(|| lance_core::Error::timeout("slow"), |_: &lance_core::Error| true)]
+    #[case::not_found(|| lance_core::Error::not_found("data.lance"), |e: &lance_core::Error| e.is_not_found())]
+    #[case::wrapped_not_found(
+        || lance_core::Error::wrapped(Box::new(lance_core::Error::not_found("data.lance"))),
+        |e: &lance_core::Error| e.is_not_found()
+    )]
+    #[case::commit_status_unknown(
+        || lance_core::Error::commit_status_unknown_source(7, Box::new(Cause)),
+        |e: &lance_core::Error| e.is_commit_status_unknown() && chain_has_cause(e)
+    )]
+    #[case::external(
+        || lance_core::Error::external(Box::new(Cause)),
+        |e: &lance_core::Error| e.external_source().is_some_and(|source| source.is::<Cause>())
+    )]
+    #[case::fenced(
+        || lance_core::Error::fenced_by_peer("epoch 7"),
+        |e: &lance_core::Error| e.fence_reason() == Some(lance_core::error::FenceReason::PeerClaimedEpoch)
+    )]
+    #[case::backpressure(|| lance_core::Error::backpressure("full"), |e: &lance_core::Error| e.is_backpressure())]
+    #[tokio::test]
+    async fn request_batch_shares_the_original_error(
+        #[case] failure: fn() -> lance_core::Error,
+        #[case] check: fn(&lance_core::Error) -> bool,
+    ) {
+        let expected = failure();
+        assert!(check(&expected), "{expected:?}");
+        let batch = RequestBatch::new(Arc::new(FailingScheduler(failure)));
+        let first = batch.submit_request(vec![0..8], 0);
+        let second = batch.submit_request(vec![8..16], 0);
+        batch.flush();
+        for error in [first.await.unwrap_err(), second.await.unwrap_err()] {
+            // The batch hands out `Error::Shared` while other readers still hold
+            // the error, so compare the variant it wraps.
+            assert_eq!(
+                std::mem::discriminant(error.find_root()),
+                std::mem::discriminant(&expected),
+                "{error:?}"
+            );
+            assert_eq!(error.to_string(), expected.to_string());
+            assert!(check(&error), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn request_batch_flush_keeps_collecting_and_awaiting_flushes() {
         let io = Arc::new(RecordingScheduler::default());
         let batch = RequestBatch::new(io.clone());
@@ -1869,12 +2040,11 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(shard, range)| {
-                        drop(io.submit_request(vec![range.clone()], range.start));
+                        let read = io.submit_request(vec![range.clone()], range.start);
                         PageLoadTask {
-                            decoder_fut: std::future::ready(Err(lance_core::Error::internal(
-                                "fake page",
-                            )))
-                            .boxed(),
+                            decoder_fut: read
+                                .map(|_| Err(lance_core::Error::internal("fake page")))
+                                .boxed(),
                             // The page's rows are reported once, on the first shard.
                             num_rows: if shard == 0 { num_rows } else { 0 },
                         }

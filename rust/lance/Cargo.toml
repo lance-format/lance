@@ -64,6 +64,7 @@ rustc-hash = "2.1"
 fst.workspace = true
 itertools.workspace = true
 moka.workspace = true
+num-traits.workspace = true
 object_store = { workspace = true }
 pin-project.workspace = true
 prost.workspace = true
@@ -140,7 +141,7 @@ geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
 parquet = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls"] }
 
 # Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
 # Not part of the default test run: CI runs it from the `arrow-ordering-compat`

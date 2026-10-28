@@ -16,6 +16,7 @@ use crate::feature_flags::{
     ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
     managed_blobs_enabled, validate_non_reusable_field_id_flags,
 };
+use crate::format::overlay::staleness::field_affects_index;
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
@@ -507,6 +508,27 @@ impl Transaction {
                 &manifest.fragments,
             );
             if !rewrites.is_empty() {
+                // Old user indices can have unknown coverage. There is no safe
+                // fragment bitmap to narrow when their indexed values change.
+                for index in current_indices
+                    .iter()
+                    .filter(|index| index.fragment_bitmap.is_none() && !is_system_index(index))
+                {
+                    for (fragment, fields) in &rewrites {
+                        if fields.iter().any(|field| {
+                            i32::try_from(*field).is_ok_and(|field| {
+                                field_affects_index(field, &index.fields, &manifest.schema)
+                            })
+                        }) {
+                            return Err(Error::invalid_input(format!(
+                                "Cannot rewrite indexed columns in fragment {fragment}: index {} \
+                                 (segment {}) has unknown fragment coverage. Migrate or rebuild \
+                                 the index before rewriting its columns",
+                                index.name, index.uuid
+                            )));
+                        }
+                    }
+                }
                 let lineage =
                     crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
                         &current_indices,
@@ -727,7 +749,6 @@ impl Transaction {
             .iter()
             .any(|idx| idx.name == MEM_WAL_INDEX_NAME)
             .then(|| Self::logical_index_segments(&original_indices));
-        drop(original_indices);
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already, or this is
@@ -1088,8 +1109,23 @@ impl Transaction {
                 )?;
 
                 if next_row_id.is_some() {
-                    // We can re-use indices, but need to rewrite the fragment bitmaps
-                    debug_assert!(rewritten_indices.is_empty());
+                    // We can re-use indices, but need to rewrite the fragment bitmaps.
+                    //
+                    // An address-domain index the commit path remapped eagerly (no FRI,
+                    // no deferral) is already fully migrated here: its uuid, files and
+                    // bitmap were rewritten in place by `handle_rewrite_indices`, below,
+                    // exactly as a non-stable-row-id rewrite migrates one. The per-index
+                    // loop that follows must not touch those again, so it skips any index
+                    // whose uuid is one `handle_rewrite_indices` just produced.
+                    let remapped_new_ids: HashSet<Uuid> =
+                        rewritten_indices.iter().map(|idx| idx.new_id).collect();
+                    if !rewritten_indices.is_empty() {
+                        Self::handle_rewrite_indices(
+                            &mut final_indices,
+                            rewritten_indices,
+                            &ordered_groups,
+                        )?;
+                    }
                     // If there is an FRI and the index uses addresses then we can
                     // migrate fragment support.
                     //
@@ -1099,20 +1135,27 @@ impl Transaction {
                     for index in final_indices.iter_mut() {
                         // Its bitmap is lineage, not coverage, and a straddling
                         // group would fail the recalculation.
-                        if is_frag_reuse_index_entry(index) {
+                        if is_frag_reuse_index_entry(index)
+                            || remapped_new_ids.contains(&index.uuid)
+                        {
                             continue;
                         }
                         let results_are_row_addrs = index.results_are_row_addrs();
+                        let can_follow_stable_row_ids = index.can_follow_stable_row_ids();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap = if results_are_row_addrs && !deferred_remap {
+                            *fragment_bitmap = if !(can_follow_stable_row_ids
+                                || (results_are_row_addrs && deferred_remap))
+                            {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
                                 // can simply follow its data to the new fragments. An
-                                // address-domain index cannot: its stored addresses point into
-                                // the fragments the rewrite dropped. Claiming coverage of the
-                                // new fragments would make it answer queries with addresses
-                                // that no longer resolve, so drop the rewritten fragments from
-                                // its coverage instead and let the scanner fall back to a full
-                                // scan for them.
+                                // address-domain index this commit did not remap above
+                                // cannot. Neither can a plugin whose identifier domain is
+                                // unknown: its stored addresses may point into fragments the
+                                // rewrite dropped. Claiming coverage of the new fragments
+                                // would make it answer queries with addresses that no longer
+                                // resolve, so drop the rewritten fragments from its coverage
+                                // instead and let the scanner fall back to a full scan for
+                                // them.
                                 Self::drop_rewritten_fragments(fragment_bitmap, &ordered_groups)
                             } else {
                                 Self::recalculate_fragment_bitmap(fragment_bitmap, &ordered_groups)?
@@ -1131,7 +1174,7 @@ impl Transaction {
                 // base data. Any index older than one of those overlays was built on
                 // the pre-overlay values, so drop the rewritten fragment from its
                 // coverage to keep it from serving stale values.
-                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
+                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups, &schema);
 
                 match (frag_reuse_index, assembly) {
                     // Tagged history: splice the entry the commit path
@@ -1653,6 +1696,37 @@ impl Transaction {
             }
         };
 
+        // A removed fragment can remain in a stored index bitmap. Reusing its
+        // reserved id would make unrelated new rows appear indexed. Overwrite
+        // discards all indices and assigns fresh ids, so it has no such claim.
+        if !matches!(self.operation, Operation::Overwrite { .. }) && !original_indices.is_empty() {
+            let existing: RoaringBitmap = current_manifest
+                .into_iter()
+                .flat_map(|manifest| manifest.fragments.iter())
+                .filter_map(|fragment| u32::try_from(fragment.id).ok())
+                .collect();
+            for fragment in &final_fragments {
+                let Ok(id) = u32::try_from(fragment.id) else {
+                    continue;
+                };
+                if !existing.contains(id)
+                    && let Some(index) = original_indices.iter().find(|index| {
+                        index
+                            .fragment_bitmap
+                            .as_ref()
+                            .is_some_and(|bitmap| bitmap.contains(id))
+                    })
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot claim fragment id {id}: index {} (segment {}) still records \
+                         coverage for that id. Reserve a fresh fragment id",
+                        index.name, index.uuid
+                    )));
+                }
+            }
+        }
+        drop(original_indices);
+
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
@@ -1990,9 +2064,9 @@ impl Transaction {
                             .copied()
                             .chain(std::iter::once(0)),
                     )?;
-                } else if manifest.has_managed_blobs()
-                    && let Some(existing) = manifest.base_paths.get(&base_to_add.id)
-                {
+                } else if let Some(existing) = manifest.base_paths.get(&base_to_add.id) {
+                    // Files refer to their base by ID, so rebinding an ID would
+                    // redirect every file already stored through it.
                     return Err(Error::invalid_input(format!(
                         "Cannot replace base ID {} bound to {:?} with {:?}",
                         base_to_add.id, existing.path, base_to_add.path
@@ -2290,6 +2364,144 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::update("update")]
+    #[case::merge("merge")]
+    #[case::data_replacement("data_replacement")]
+    fn legacy_rewrite_rejects_unknown_index_coverage(
+        #[case] kind: &str,
+        #[values(false, true)] tagged: bool,
+    ) {
+        let mut manifest = manifest_with_file("a.lance");
+        let mut indices = vec![sample_index_metadata("id_idx")];
+        indices[0].fragment_bitmap = None;
+        if tagged {
+            indices.push(tagged_entry(&[(&[5], &[0])]));
+        } else {
+            manifest.reader_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
+        }
+        let mut operation = in_place_rewrite(kind, &manifest, vec![0]);
+        if let Operation::Update { update_mode, .. } = &mut operation {
+            *update_mode = Some(UpdateMode::RewriteColumns);
+        }
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let error = transaction
+            .build_manifest(Some(&manifest), indices, "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("id_idx"), "{message}");
+        assert!(message.contains("unknown fragment coverage"), "{message}");
+        assert!(message.contains("Migrate or rebuild"), "{message}");
+    }
+
+    #[rstest]
+    #[case::parent_rewritten(0, 1)]
+    #[case::child_rewritten(1, 0)]
+    fn legacy_rewrite_rejects_unknown_nested_index_coverage(
+        #[case] rewritten: u32,
+        #[case] indexed: i32,
+    ) {
+        let mut manifest = sample_manifest();
+        manifest.schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("child", DataType::Int32, true)].into()),
+            true,
+        )]))
+        .unwrap();
+        let mut index = sample_index_metadata("nested_idx");
+        index.fields = vec![indexed];
+        index.fragment_bitmap = None;
+        let transaction = Transaction::new(
+            manifest.version,
+            in_place_rewrite("update", &manifest, vec![rewritten]),
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![index], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("nested_idx"));
+        assert!(error.to_string().contains("unknown fragment coverage"));
+    }
+
+    #[rstest]
+    #[case::append("append")]
+    #[case::update("update")]
+    #[case::merge("merge")]
+    #[case::rewrite("rewrite")]
+    fn legacy_fragment_claim_rejects_stale_index_coverage(#[case] kind: &str) {
+        let manifest = sample_manifest_with_fragments(0..3);
+        let mut index = sample_index_metadata("id_idx");
+        index.fragment_bitmap = Some(RoaringBitmap::from_iter([0, 1, 2]));
+        let config = default_build_config();
+        let delete = Transaction::new(
+            manifest.version,
+            Operation::Delete {
+                updated_fragments: vec![],
+                deleted_fragment_ids: vec![1],
+                predicate: "id = 1".into(),
+            },
+            None,
+        );
+        let (manifest, indices) = delete
+            .build_manifest(Some(&manifest), vec![index], "delete", &config)
+            .unwrap();
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(1));
+        let reserve = Transaction::new(
+            manifest.version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        );
+        let (manifest, indices) = reserve
+            .build_manifest(Some(&manifest), indices, "reserve", &config)
+            .unwrap();
+        assert_eq!(manifest.max_fragment_id(), Some(3));
+
+        for id in [1, 3] {
+            let new_fragments = vec![Fragment::new(id)];
+            let operation = match kind {
+                "append" => Operation::Append {
+                    fragments: new_fragments,
+                },
+                "update" => crate::transaction::test_support::update_txn(new_fragments).operation,
+                "merge" => Operation::Merge {
+                    fragments: manifest
+                        .fragments
+                        .iter()
+                        .cloned()
+                        .chain(new_fragments)
+                        .collect(),
+                    schema: manifest.schema.clone(),
+                    preserves_nullability: true,
+                },
+                "rewrite" => Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![manifest.fragments[0].clone()],
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                },
+                _ => unreachable!(),
+            };
+            let transaction = Transaction::new(manifest.version, operation, None);
+            let result =
+                transaction.build_manifest(Some(&manifest), indices.clone(), "claim", &config);
+            if id == 1 {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                let message = error.to_string();
+                assert!(message.contains("Cannot claim fragment id 1"), "{message}");
+                assert!(message.contains("id_idx"), "{message}");
+            } else {
+                let (out, _) = result.unwrap();
+                assert!(out.fragments.iter().any(|fragment| fragment.id == 3));
+            }
+        }
+    }
+
     /// An in-place rewrite of a column that a translating segment indexes,
     /// on a fragment the segment reaches only through the history, is
     /// admitted; the segment cannot withdraw that fragment from its bitmap,
@@ -2412,6 +2624,10 @@ mod tests {
     #[test]
     fn tagged_history_retires_an_emptied_segment_only_beside_a_serving_sibling() {
         let mut manifest = manifest_with_file("a.lance");
+        let mut unrelated_field = manifest.schema.fields[0].clone();
+        unrelated_field.id = 1;
+        unrelated_field.name = "other".into();
+        manifest.schema.fields.push(unrelated_field);
         manifest.fragments = Arc::new(vec![
             Fragment::new(0).with_file(
                 "a.lance",
@@ -2434,6 +2650,7 @@ mod tests {
         sibling.fragment_bitmap = Some([1u32].into_iter().collect());
         let mut unknown = sample_index_metadata("other_idx");
         unknown.uuid = Uuid::new_v4();
+        unknown.fields = vec![1];
         unknown.fragment_bitmap = None;
         let transaction = Transaction::new(
             manifest.version,
@@ -3770,6 +3987,124 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_build_manifest_keeps_fragment_ids_sorted() {
+        let manifest = sample_manifest_with_fragments(0..4);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                    new_fragments: vec![Fragment::new(0)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+
+        let (rewritten, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let fragment_ids = rewritten
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids, vec![0, 3, 4]);
+    }
+
+    #[test]
+    fn test_rewrite_after_row_adding_update_keeps_fragment_ids_sorted() {
+        let manifest = sample_manifest_with_fragments(0..3);
+        let update = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                new_fragments: vec![Fragment::new(0)],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+        let (updated, _) = update
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "update-txn",
+                &default_build_config(),
+            )
+            .unwrap();
+
+        let rewrite = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(0)],
+                    new_fragments: vec![Fragment::new(0)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+        let (rewritten, _) = rewrite
+            .build_manifest(
+                Some(&updated),
+                vec![],
+                "rewrite-txn",
+                &default_build_config(),
+            )
+            .unwrap();
+
+        let fragment_ids = rewritten
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_merge_build_manifest_keeps_fragment_ids_sorted() {
+        let mut manifest = sample_manifest_with_fragments(0..3);
+        for fragment in Arc::make_mut(&mut manifest.fragments) {
+            fragment.files.push(DataFile::new(
+                format!("fragment-{}.lance", fragment.id),
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ));
+        }
+        let fragments = manifest.fragments.iter().rev().cloned().collect::<Vec<_>>();
+        let operation = Operation::Merge {
+            fragments,
+            schema: manifest.schema.clone(),
+            preserves_nullability: true,
+        };
+        validate_operation(Some(&manifest), &operation).unwrap();
+        let transaction = Transaction::new(manifest.version, operation, None);
+
+        let (merged, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let fragment_ids = merged
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fragment_ids, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn test_remove_tombstoned_data_files() {
         // Create a fragment with mixed data files: some normal, some fully tombstoned
         let mut fragment = Fragment::new(1);
@@ -3782,6 +4117,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3793,6 +4129,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3804,6 +4141,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 
@@ -3815,6 +4153,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),
+            file_metadata_size_bytes: None,
             base_id: None,
         });
 

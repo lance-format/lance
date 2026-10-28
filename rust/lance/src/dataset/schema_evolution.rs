@@ -247,6 +247,9 @@ pub(super) async fn add_columns_to_fragments(
     // the names are wrong.
     let version = dataset.manifest.data_storage_format.lance_file_format();
     let check_names = |output_schema: &ArrowSchema| {
+        // Invalid output names can fail field-path resolution while staging
+        // columns, before the manifest write boundary validates the full schema.
+        Schema::try_from(output_schema)?.validate_writable()?;
         for field in &dataset.schema().fields {
             if let Ok(out_field) = output_schema.field_with_name(&field.name) {
                 let ds_field = ArrowField::from(field);
@@ -582,7 +585,10 @@ async fn reject_partial_add_on_mem_wal(dataset: &Dataset, only_nulls: bool) -> R
     ))
 }
 
-async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
+pub(super) async fn cleanup_new_column_data_files(
+    fragments: &[FileFragment],
+    new_fragments: &[Fragment],
+) {
     let Some(first_fragment) = fragments.first() else {
         return;
     };
@@ -804,17 +810,22 @@ async fn add_columns_from_stream(
                     }
                 }
 
-                let new_batch =
-                    arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
-
                 // Reject nulls the dataset's file format cannot store (e.g. integer
                 // nulls on Legacy), matching the hash-join based merge path, instead
                 // of silently writing them as default values.
-                for (field, column) in new_batch.schema().fields().iter().zip(new_batch.columns()) {
-                    HashJoiner::check_lance_support_null(field.name(), column, updater.dataset())?;
+                for batch in &batches {
+                    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                        HashJoiner::check_lance_support_null(
+                            field.name(),
+                            column,
+                            updater.dataset(),
+                        )?;
+                    }
                 }
 
-                updater.update(new_batch).await?;
+                // Concatenating these could overflow 32-bit offsets once they hold
+                // more than 2 GiB of variable-width values.
+                updater.update_batches(batches).await?;
             }
             updater.finish().await
         }
@@ -1713,10 +1724,11 @@ mod test {
     }
 
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use arrow_array::builder::BinaryBuilder;
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, BinaryArray, Int32Array, LargeStringArray, ListArray, RecordBatchIterator,
-        StringArray, StructArray,
+        ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, ListArray,
+        RecordBatchIterator, StringArray, StructArray, record_batch,
     };
     use arrow_buffer::OffsetBuffer;
 
@@ -1730,6 +1742,109 @@ mod test {
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
         t
+    }
+
+    #[rstest]
+    #[case::row_id("_rowid")]
+    #[case::row_address("_rowaddr")]
+    #[case::row_offset("_rowoffset")]
+    #[case::created_version("_row_created_at_version")]
+    #[case::updated_version("_row_last_updated_at_version")]
+    #[tokio::test]
+    async fn schema_changes_reject_reserved_column_names(#[case] name: &str) -> Result<()> {
+        let batch = arrow_array::record_batch!(("id", Int32, [Some(1), None]))?;
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let version = dataset.version().version;
+        let error = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename(name.into())])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(&format!("path '{name}'")));
+        assert!(error.to_string().contains("reserved name"));
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            name,
+            DataType::Int32,
+            true,
+        )]));
+        let output = RecordBatch::try_new(output_schema.clone(), vec![batch["id"].clone()])?;
+        let transforms = [
+            NewColumnTransform::SqlExpressions(vec![(name.into(), "id + 1".into())]),
+            NewColumnTransform::AllNulls(output_schema.clone()),
+            NewColumnTransform::Stream(
+                RecordBatchIterator::new([Ok(output.clone())], output_schema.clone()).into_stream(),
+            ),
+            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                [Ok(output)],
+                output_schema.clone(),
+            ))),
+            NewColumnTransform::BatchUDF(BatchUDF {
+                mapper: Box::new(|_| {
+                    panic!("reserved names must be rejected before running the UDF")
+                }),
+                output_schema,
+                result_checkpoint: None,
+            }),
+        ];
+        for transform in transforms {
+            let error = dataset
+                .add_columns(transform, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(&format!("path '{name}'")));
+            assert!(error.to_string().contains("reserved name"));
+            assert_eq!(dataset.version().version, version);
+        }
+        let actual = dataset.scan().with_row_id().try_into_batch().await?;
+        assert_eq!(actual["id"].as_ref(), batch["id"].as_ref());
+        assert!(actual.column_by_name("_rowid").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_changes_allow_nested_system_column_names() -> Result<()> {
+        let batch = arrow_array::record_batch!(("id", Int32, [1, 2]))?;
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(reader, "memory://", None).await?;
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "nested",
+                    DataType::Struct(vec![ArrowField::new("_rowid", DataType::Int32, true)].into()),
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("nested._rowid".into()).rename("_rowaddr".into())
+            ])
+            .await?;
+        assert!(dataset.schema().field("nested._rowaddr").is_some());
+        assert_eq!(
+            dataset
+                .scan()
+                .with_row_id()
+                .try_into_batch()
+                .await?
+                .num_rows(),
+            2
+        );
+        Ok(())
     }
 
     fn file_paths_in(dir: impl AsRef<StdPath>) -> Vec<String> {
@@ -1809,6 +1924,36 @@ mod test {
         // (Quick validation that the future is Send)
         let res = require_send(fut).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
+
+        let version = dataset.version().version;
+        let reserved_batch = record_batch!(("_rowid", Int32, [0, 1, 2, 3, 4]))?;
+        let reserved_schema = reserved_batch.schema();
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(reserved_batch)],
+                    reserved_schema,
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("reserved name"), "{err}");
+        assert_eq!(dataset.version().version, version);
+
+        let err = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("".into(), "id + 1".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("empty name"), "{err}");
+        assert_eq!(dataset.version().version, version);
 
         // Can add a column that is independent of any existing ones
         dataset
@@ -2765,6 +2910,179 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_add_columns_stream_batches_preserve_deleted_row_alignment() -> Result<()> {
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..12))],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://stream-batch-deletion-alignment",
+            Some(WriteParams {
+                max_rows_per_file: 6,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // This leaves a fully deleted read batch [4..6), as well as deleted
+        // rows at the boundary of the neighboring read batches.
+        dataset.delete("i >= 2 AND i < 10").await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("binary", DataType::Binary, true),
+            ArrowField::new("string", DataType::Utf8, true),
+            ArrowField::new("fixed", DataType::Int32, true),
+        ]));
+        let output_batch = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"b0".as_ref()),
+                    Some(b"b1".as_ref()),
+                    Some(b"b10".as_ref()),
+                    Some(b"b11".as_ref()),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("s0"),
+                    None,
+                    Some("s10"),
+                    Some("s11"),
+                ])),
+                Arc::new(Int32Array::from(
+                    [0, 1, 10, 11]
+                        .into_iter()
+                        .map(|value| Some(value * 10))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )?;
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(output_batch.slice(0, 1)),
+                Ok(output_batch.slice(1, 0)),
+                Ok(output_batch.slice(1, 2)),
+                Ok(output_batch.slice(3, 1)),
+            ],
+            output_schema.clone(),
+        );
+        dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(4))
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 4);
+        let expected_binary = BinaryArray::from(vec![
+            Some(b"b0".as_ref()),
+            Some(b"b1".as_ref()),
+            Some(b"b10".as_ref()),
+            Some(b"b11".as_ref()),
+        ]);
+        let expected_string = StringArray::from(vec![Some("s0"), None, Some("s10"), Some("s11")]);
+        let expected_fixed = Int32Array::from(vec![Some(0), Some(10), Some(100), Some(110)]);
+        assert_eq!(
+            data.column_by_name("binary").unwrap().as_ref(),
+            &expected_binary
+        );
+        assert_eq!(
+            data.column_by_name("string").unwrap().as_ref(),
+            &expected_string
+        );
+        assert_eq!(
+            data.column_by_name("fixed").unwrap().as_ref(),
+            &expected_fixed
+        );
+        Ok(())
+    }
+
+    #[ignore = "requires ~5 GiB RAM; run manually"]
+    #[tokio::test]
+    async fn test_add_columns_binary_column_over_2gib() -> Result<()> {
+        const NUM_ROWS: usize = 1_100;
+        const VALUE_SIZE: usize = 2 * 1024 * 1024;
+        const STREAM_BATCH_SIZE: usize = 10;
+
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..NUM_ROWS as i32))],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://add-columns-over-2gib",
+            Some(WriteParams {
+                max_rows_per_file: NUM_ROWS + 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        let mut output_batches = Vec::with_capacity(NUM_ROWS / STREAM_BATCH_SIZE);
+        for start in (0..NUM_ROWS).step_by(STREAM_BATCH_SIZE) {
+            let end = (start + STREAM_BATCH_SIZE).min(NUM_ROWS);
+            let mut builder = BinaryBuilder::with_capacity(end - start, (end - start) * VALUE_SIZE);
+            for row in start..end {
+                let mut value = vec![0; VALUE_SIZE];
+                value[0] = (row % 251) as u8;
+                builder.append_value(value);
+            }
+            output_batches.push(Ok(RecordBatch::try_new(
+                output_schema.clone(),
+                vec![Arc::new(builder.finish())],
+            )?));
+        }
+
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    output_batches,
+                    output_schema,
+                ))),
+                None,
+                Some(NUM_ROWS as u32),
+            )
+            .await?;
+        dataset.validate().await?;
+
+        let mut scanner = dataset.scan();
+        scanner.batch_size(STREAM_BATCH_SIZE);
+        let mut stream = scanner.try_into_stream().await?;
+        let mut rows_seen = 0;
+        while let Some(batch) = stream.try_next().await? {
+            let payload = batch
+                .column_by_name("payload")
+                .ok_or_else(|| Error::internal("payload column missing from scan"))?
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::internal("payload column has unexpected type"))?;
+            for row in 0..payload.len() {
+                assert_eq!(payload.value(row).len(), VALUE_SIZE);
+                assert_eq!(payload.value(row)[0], ((rows_seen + row) % 251) as u8);
+            }
+            rows_seen += payload.len();
+        }
+        assert_eq!(rows_seen, NUM_ROWS);
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_add_columns_cleans_up_blob_v2_data_on_stream_error(
@@ -2850,6 +3168,79 @@ mod test {
             "cleanup must not modify external files"
         );
         dataset.validate().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fragment_add_columns_cleanup_owns_only_staged_files() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let external_dir = tempfile::tempdir()?;
+        let external_path = external_dir.path().join("blob.bin");
+        fs::write(&external_path, b"external")?;
+        let external_baseline_files = file_paths_in(external_dir.path());
+        let external_baseline_payload = fs::read(&external_path)?;
+
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                initial_bases: Some(vec![BasePath::new(
+                    1,
+                    external_dir.path().to_string_lossy().to_string(),
+                    Some("external".to_string()),
+                    false,
+                )]),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let mut blob_builder = crate::BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_path.to_string_lossy())?;
+        let blob_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let blob_batch = RecordBatch::try_new(blob_schema.clone(), vec![blob_builder.finish()?])?;
+        let blob_reader = RecordBatchIterator::new(vec![Ok(blob_batch)], blob_schema);
+
+        let staged = fragments[0]
+            .add_columns_with_cleanup(
+                NewColumnTransform::Reader(Box::new(blob_reader)),
+                None,
+                None,
+            )
+            .await?;
+        assert!(data_file_paths_in(test_uri).len() > baseline_files.len());
+
+        staged.cleanup.cleanup().await;
+
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "cleanup must remove only the staged fragment data"
+        );
+        assert_eq!(
+            file_paths_in(external_dir.path()),
+            external_baseline_files,
+            "cleanup must preserve files in external bases"
+        );
+        assert_eq!(fs::read(external_path)?, external_baseline_payload);
 
         Ok(())
     }
@@ -4119,6 +4510,258 @@ mod test {
         Ok(())
     }
 
+    async fn dataset_with_all_null_column(
+        test_uri: &str,
+        num_rows: usize,
+        max_rows_per_file: Option<usize>,
+        max_rows_per_group: Option<usize>,
+    ) -> Result<Dataset> {
+        let batch = arrow_array::record_batch!((
+            "id",
+            Int64,
+            (1..=num_rows).map(|value| value as i64).collect::<Vec<_>>()
+        ))?;
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        if let Some(max_rows_per_file) = max_rows_per_file {
+            write_params.max_rows_per_file = max_rows_per_file;
+        }
+        if let Some(max_rows_per_group) = max_rows_per_group {
+            write_params.max_rows_per_group = max_rows_per_group;
+        }
+
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params)).await?;
+
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "x",
+                    DataType::Int64,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+
+        Ok(dataset)
+    }
+
+    fn assert_file_less_fragments(
+        dataset: &Dataset,
+        num_rows: usize,
+        expected_fragment_rows: &[usize],
+    ) {
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), expected_fragment_rows.len());
+        let mut total_physical_rows = 0;
+        for (fragment, expected_rows) in fragments.iter().zip(expected_fragment_rows) {
+            assert!(
+                fragment.metadata.files.is_empty(),
+                "fragment {} should not contain data files",
+                fragment.id()
+            );
+            assert_eq!(fragment.metadata.physical_rows, Some(*expected_rows));
+            total_physical_rows += expected_rows;
+        }
+        assert_eq!(total_physical_rows, num_rows);
+    }
+
+    async fn dataset_with_only_all_null_column(
+        test_uri: &str,
+        num_rows: usize,
+        max_rows_per_file: Option<usize>,
+        max_rows_per_group: Option<usize>,
+        expected_fragment_rows: &[usize],
+    ) -> Result<Dataset> {
+        let mut dataset =
+            dataset_with_all_null_column(test_uri, num_rows, max_rows_per_file, max_rows_per_group)
+                .await?;
+
+        dataset.drop_columns(&["id"]).await?;
+
+        let dataset = Dataset::open(test_uri).await?;
+        assert_file_less_fragments(&dataset, num_rows, expected_fragment_rows);
+        dataset.validate().await?;
+
+        Ok(dataset)
+    }
+
+    #[rstest]
+    #[case::single_fragment(9, None, None, &[9])]
+    #[case::multi_fragment(8, Some(4), Some(2), &[4, 4])]
+    #[tokio::test]
+    async fn test_scan_all_null_column_after_dropping_only_physical_column(
+        #[case] num_rows: usize,
+        #[case] max_rows_per_file: Option<usize>,
+        #[case] max_rows_per_group: Option<usize>,
+        #[case] expected_fragment_rows: &[usize],
+    ) -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_only_all_null_column(
+            &test_dir,
+            num_rows,
+            max_rows_per_file,
+            max_rows_per_group,
+            expected_fragment_rows,
+        )
+        .await?;
+
+        assert_eq!(dataset.count_rows(None).await?, num_rows);
+
+        let data = dataset.scan().try_into_batch().await?;
+
+        let expected_schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Int64, true)]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows);
+
+        let x = data["x"].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(x.len(), num_rows);
+        assert_eq!(x.null_count(), num_rows);
+
+        let mut scanner = dataset.scan();
+        // Start in the first fragment and cross into the second when present.
+        let offset = if expected_fragment_rows.len() > 1 {
+            expected_fragment_rows[0] - 2
+        } else {
+            2
+        };
+        scanner.limit(Some(3), Some(offset as i64))?;
+        let limited = scanner.try_into_batch().await?;
+        assert_eq!(limited.num_rows(), 3);
+        let x = limited["x"].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(x.null_count(), 3);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::single_fragment(9, None, None, &[9])]
+    #[case::multi_fragment(8, Some(4), Some(2), &[4, 4])]
+    #[tokio::test]
+    async fn test_append_readded_column_after_dropping_only_physical_column(
+        #[case] num_existing_rows: usize,
+        #[case] max_rows_per_file: Option<usize>,
+        #[case] max_rows_per_group: Option<usize>,
+        #[case] expected_fragment_rows: &[usize],
+    ) -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let mut dataset = dataset_with_only_all_null_column(
+            &test_dir,
+            num_existing_rows,
+            max_rows_per_file,
+            max_rows_per_group,
+            expected_fragment_rows,
+        )
+        .await?;
+
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "id",
+                    DataType::Int64,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let append_batch =
+            arrow_array::record_batch!(("x", Int64, [None::<i64>]), ("id", Int64, [Some(42_i64)]))?;
+        let append_schema = append_batch.schema();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(append_batch)], append_schema),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        let dataset = Dataset::open(&test_dir).await?;
+        dataset.validate().await?;
+        let data = dataset.scan().try_into_batch().await?;
+
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("x", DataType::Int64, true),
+            ArrowField::new("id", DataType::Int64, true),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_existing_rows + 1);
+
+        let x = data["x"].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(x.len(), num_existing_rows + 1);
+        assert_eq!(x.null_count(), num_existing_rows + 1);
+
+        let id = data["id"].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id.len(), num_existing_rows + 1);
+        for row_idx in 0..num_existing_rows {
+            assert!(id.is_null(row_idx));
+        }
+        assert_eq!(id.value(num_existing_rows), 42);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::single_fragment(8, vec![8])]
+    #[case::multi_fragment(4, vec![4, 4])]
+    #[tokio::test]
+    async fn test_scan_file_less_fragments_with_deletions_after_dropping_only_physical_column(
+        #[case] rows_per_fragment: usize,
+        #[case] expected_fragment_rows: Vec<usize>,
+    ) -> Result<()> {
+        let num_rows = 8;
+        let test_dir = TempStrDir::default();
+        let mut dataset =
+            dataset_with_all_null_column(&test_dir, num_rows, Some(rows_per_fragment), Some(2))
+                .await?;
+
+        let delete_result = dataset.delete("id = 2 OR id = 6").await?;
+        assert_eq!(delete_result.num_deleted_rows, 2);
+        assert_eq!(dataset.count_deleted_rows().await?, 2);
+
+        dataset.drop_columns(&["id"]).await?;
+
+        let dataset = Dataset::open(&test_dir).await?;
+        assert_file_less_fragments(&dataset, num_rows, &expected_fragment_rows);
+        assert_eq!(dataset.count_rows(None).await?, num_rows - 2);
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment.metadata.deletion_file.is_some())
+        );
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+
+        let expected_schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Int64, true)]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows - 2);
+
+        let x = data["x"].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(x.len(), num_rows - 2);
+        assert_eq!(x.null_count(), num_rows - 2);
+
+        let limited = dataset
+            .scan()
+            .limit(Some(3), Some(2))?
+            .try_into_batch()
+            .await?;
+        assert_eq!(limited.num_rows(), 3);
+        assert_eq!(limited["x"].null_count(), 3);
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_add_column_all_nulls_legacy() -> Result<()> {
         let num_rows = 100;
@@ -4531,6 +5174,45 @@ mod test {
             metadata.clone(),
         );
         assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("_rowid".into())])
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("reserved name"), "{err}");
+        assert_eq!(dataset.manifest.version, 3);
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("".into())])
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("empty name"), "{err}");
+        assert_eq!(dataset.manifest.version, 3);
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.d".into()).rename("_rowid".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 4);
+        assert!(dataset.schema().field("b._rowid").is_some());
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("y".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 5);
+        assert!(dataset.schema().field("b._rowid").is_some());
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b._rowid".into()).rename("d".into())])
+            .await?;
+        assert_eq!(dataset.manifest.version, 6);
+
+        let mut restored = dataset.checkout_version(5).await?;
+        restored.restore().await?;
+        assert_eq!(restored.manifest.version, 7);
+        assert!(restored.schema().field("b._rowid").is_some());
+        assert!(restored.schema().field("y").is_some());
 
         Ok(())
     }

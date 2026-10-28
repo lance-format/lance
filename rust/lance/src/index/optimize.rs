@@ -32,6 +32,15 @@
 //! other kinds are rebuilt whole by the single-process optimize, so they stay
 //! one task.
 //!
+//! [`OptimizeOptions::consolidate`] instead selects a suffix of complete vector
+//! segments within a physical-row budget, leaving unindexed fragments alone.
+//! Shared models merge directly; differing models are re-encoded in tasks under
+//! the newest selected model, then merged into one output. All selected coverage
+//! must be present before committing. A caller may retry the same results on a
+//! refreshed dataset after a concurrent append or delete; a changed source owner
+//! or restored source rows require replanning. Tagged fragment reuse is not
+//! supported in this mode.
+//!
 //! Planning is not always cheap: a split vector index that has to be rebuilt
 //! (`retrain`, every segment's fragments gone, or nothing but a definition so
 //! far) is trained by the planner, which writes the model as a segment outside
@@ -39,10 +48,11 @@
 //! unreferenced index directory.
 //!
 //! The commit publishes every merged segment in one `CreateIndex` transaction
-//! anchored at the plan's `read_version`, so conflict detection covers
-//! everything committed since the plan was made, and removes the segments the
-//! results replace. Results may be partial: whatever they do not cover stays
-//! unindexed for the next optimize.
+//! anchored at the plan's `read_version`, and removes the segments the results
+//! replace. Consolidation may reanchor to the caller's refreshed version after
+//! checking that the source data and ownership still permit reusing the output.
+//! Outside consolidation, results may be partial: whatever they do not cover
+//! stays unindexed for the next optimize.
 //!
 //! An engine like Spark drives it as two map stages:
 //!
@@ -57,6 +67,8 @@
 //! with a tagged fragment reuse history, a legacy (v1) vector index and a
 //! scalar index that must be rebuilt from the whole column. Naming such an
 //! index in `OptimizeOptions::index_names` refuses instead.
+
+mod consolidate;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -130,6 +142,9 @@ pub struct OptimizeIndexTask {
     /// How many of `old_segments` to fold in, as
     /// [`OptimizeOptions::num_indices_to_merge`] counts them.
     pub num_indices_to_merge: Option<usize>,
+    /// Allow IVF partition splitting and joining within the task's merge window.
+    /// Split builds keep this disabled so their results share the reference model.
+    pub enable_partition_rebalancing: bool,
     /// Rebuild the index from a freshly trained model.
     pub retrain: bool,
 }
@@ -314,6 +329,24 @@ fn skip_unless_named(name: &str, named: bool, reason: &str) -> Result<Option<Spl
     Ok(None)
 }
 
+fn validate_partition_rebalancing_options(options: &OptimizeOptions) -> Result<()> {
+    if !options.enable_partition_rebalancing {
+        return Ok(());
+    }
+    if options.num_indices_to_merge == Some(0) {
+        return Err(Error::invalid_input(
+            "enable_partition_rebalancing requires num_indices_to_merge to be positive or unset, got Some(0)",
+        ));
+    }
+    if options.max_rows_per_task.is_some() || options.max_rows_per_segment.is_some() {
+        return Err(Error::invalid_input(format!(
+            "enable_partition_rebalancing cannot be combined with max_rows_per_task={:?} or max_rows_per_segment={:?}; partition rebalancing requires an unbounded merge task",
+            options.max_rows_per_task, options.max_rows_per_segment,
+        )));
+    }
+    Ok(())
+}
+
 /// Plan the optimization of the dataset's indices.
 ///
 /// See the module documentation for what the plan contains and which indices
@@ -361,6 +394,8 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     indices: &[IndexMetadata],
     options: &OptimizeOptions,
 ) -> Result<Option<OptimizeIndicesPlan>> {
+    validate_partition_rebalancing_options(options)?;
+    consolidate::validate_options(options)?;
     if has_unsupported_frag_reuse_history(dataset, indices).await? {
         log::warn!(
             "Skipping index optimization: the tagged fragment reuse history carries \
@@ -381,6 +416,10 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
         let last = *segments.last().expect("an index has at least one segment");
+        if options.max_rows_to_consolidate.is_some() {
+            consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;
+            continue;
+        }
         let unindexed = dataset.unindexed_fragments(&name).await?;
         // Without an N:1 merge the single-process optimize rebuilds the
         // absorbed segments from scratch, and the only split that reproduces
@@ -466,6 +505,7 @@ async fn plan_unsplit_index(
         reference: last.clone(),
         old_segments: segments.iter().map(|segment| (*segment).clone()).collect(),
         num_indices_to_merge: options.num_indices_to_merge,
+        enable_partition_rebalancing: options.enable_partition_rebalancing,
         retrain: options.retrain,
     });
     plan.merges.push(OptimizeIndexMerge {
@@ -707,7 +747,7 @@ async fn plan_split_rebuild(
     }
     let uuid = Uuid::new_v4();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let files = build_vector_model_segment(
+    let built = build_vector_model_segment(
         dataset,
         field_path,
         name,
@@ -724,11 +764,14 @@ async fn plan_split_rebuild(
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
-        index_details: Some(Arc::new(vector_index_details(&params))),
+        index_details: Some(Arc::new(vector_index_details(
+            &params,
+            built.target_partition_size,
+        ))),
         index_version: params.index_type().version(),
         created_at: Some(Utc::now()),
         base_id: None,
-        files: Some(files),
+        files: Some(built.files),
     };
     Ok(Some(SplitInputs {
         reference,
@@ -881,6 +924,7 @@ async fn pack_split_index(
                 fragments,
                 reference: reference.clone(),
                 num_indices_to_merge: Some(absorbed_by_task.len()),
+                enable_partition_rebalancing: false,
                 old_segments: absorbed_by_task.clone(),
                 retrain: false,
             });
@@ -910,15 +954,17 @@ impl OptimizeIndexTask {
         dataset: &Dataset,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<Option<IndexSegmentResult>> {
+        let mut options = OptimizeOptions::default().progress(progress);
+        options.num_indices_to_merge = self.num_indices_to_merge;
+        options.enable_partition_rebalancing = self.enable_partition_rebalancing;
+        options.retrain = self.retrain;
+        validate_partition_rebalancing_options(&options)?;
         let dataset = Arc::new(dataset_at_version(dataset, self.read_version).await?);
         let fragments = dataset
             .get_fragments_from_ids(&self.fragments)?
             .into_iter()
             .map(|fragment| fragment.metadata().clone())
             .collect::<Vec<_>>();
-        let mut options = OptimizeOptions::default().progress(progress);
-        options.num_indices_to_merge = self.num_indices_to_merge;
-        options.retrain = self.retrain;
         let results = if self.old_segments.is_empty() && segment_has_vector_details(&self.reference)
         {
             let field = keyed_field(&dataset, &self.reference)?;
@@ -1124,7 +1170,10 @@ async fn merge_vector_segments(
 /// The segments the results claim to replace are removed, exactly as the
 /// single-process optimize removes what its merge reports. Fragments those
 /// segments covered that no result covers (a rebuild missing results) go back
-/// to unindexed, and the next optimize indexes them.
+/// to unindexed, and the next optimize indexes them. Consolidation instead
+/// requires complete surviving coverage for every replaced source. When called
+/// on a refreshed dataset, it reuses staged output after concurrent append or
+/// delete, but rejects sources that have been replaced since planning.
 ///
 /// Without results nothing is committed, unless the table requires MemWAL
 /// catch-up: coverage is derived at commit time, so an index that already
@@ -1167,7 +1216,21 @@ pub async fn commit_optimize_indices(
         ));
     }
     let planned = dataset_at_version(dataset, read_version).await?;
-    let committed_segments = load_all_indices(&planned).await?;
+    let mut results = results;
+    let read_version = if options.max_rows_to_consolidate.is_some() {
+        consolidate::validate_commit(dataset, &planned, &mut results).await?;
+        if results.is_empty() {
+            return Ok(());
+        }
+        dataset.manifest.version
+    } else {
+        read_version
+    };
+    let committed_segments = if options.max_rows_to_consolidate.is_some() {
+        load_all_indices(dataset).await?
+    } else {
+        load_all_indices(&planned).await?
+    };
 
     let mut replaced: HashSet<Uuid> = HashSet::new();
     let mut by_name: BTreeMap<String, Vec<IndexMetadata>> = BTreeMap::new();

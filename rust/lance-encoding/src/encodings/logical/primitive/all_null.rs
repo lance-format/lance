@@ -22,8 +22,8 @@ use crate::compression::{BlockDecompressor, DecompressionStrategy, create_rle_de
 use crate::data::{AllNullDataBlock, DataBlock};
 use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
 use crate::encodings::physical::rle::{RleDecompressor, RleRuns};
-use crate::format::pb21::CompressiveEncoding;
-use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::metadata::CompressiveEncoding;
+use crate::format::metadata::compressive_encoding::Compression;
 use crate::repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level};
 
 use super::{
@@ -1169,8 +1169,8 @@ mod tests {
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
     use crate::encodings::logical::primitive::tests::encoded_u16_frame;
     use crate::encodings::physical::rle::{RleDecompressor, RleRuns, RunLengthWidth};
-    use crate::format::pb21::compressive_encoding::Compression;
-    use crate::format::{ProtobufUtils21, pb21};
+    use crate::format::metadata::compressive_encoding::Compression;
+    use crate::format::{EncodingUtils, metadata};
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
 
     use super::{
@@ -1636,10 +1636,10 @@ mod tests {
 
     #[test]
     fn complex_all_null_level_codec_validates_rle_metadata() {
-        let encoding = pb21::CompressiveEncoding {
-            compression: Some(Compression::Rle(Box::new(pb21::Rle {
+        let encoding = metadata::CompressiveEncoding {
+            compression: Some(Compression::Rle(Box::new(metadata::Rle {
                 values: None,
-                run_lengths: Some(Box::new(ProtobufUtils21::flat(8, None))),
+                run_lengths: Some(Box::new(EncodingUtils::flat(8, None))),
             }))),
         };
 

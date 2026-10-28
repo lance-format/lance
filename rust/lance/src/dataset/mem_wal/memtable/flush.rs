@@ -472,11 +472,11 @@ impl MemTableFlusher {
             session: self.session.clone(),
             ..Default::default()
         };
-        // The generation's columns keep the base table's field ids: reads and
-        // the merge into base resolve them by id, across renames and drops.
+        // The batches carry the base table's field ids and the new table keeps
+        // them, however large: reads and the merge into base find columns by id.
         let mut builder = InsertBuilder::new(uri.as_str())
             .with_params(&write_params)
-            .with_table_field_ids();
+            .with_inherited_field_ids();
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
         }
@@ -827,20 +827,34 @@ impl MemTableFlusher {
         let gen_path = gen_path.to_string();
 
         self.manifest_store
-            .commit_update(epoch, |current| {
+            .try_commit_update(epoch, |current| {
+                // Advancing over a failed generation would make WAL replay
+                // skip rows that never reached an SSTable. Check inside the CAS loop.
+                if generation != current.current_generation {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot flush generation {generation} for shard {}: expected current_generation={}",
+                        self.shard_id, current.current_generation
+                    )));
+                }
+                let next_generation = generation.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Generation {generation} overflows for shard {}",
+                        self.shard_id
+                    ))
+                })?;
                 let mut sstables = current.sstables.clone();
                 sstables.push(size.sstable(generation, gen_path.clone()));
 
-                ShardManifest {
+                Ok(ShardManifest {
                     version: current.next_version(),
                     replay_after_wal_entry_position: covered_wal_entry_position,
                     wal_entry_position_last_seen: current
                         .wal_entry_position_last_seen
                         .max(covered_wal_entry_position),
-                    current_generation: generation + 1,
+                    current_generation: next_generation,
                     sstables,
                     ..current.clone()
-                }
+                })
             })
             .await
     }
@@ -912,6 +926,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V2;
+    use rstest::rstest;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1121,6 +1136,45 @@ mod tests {
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
         assert_eq!(updated_manifest.sstables.len(), 1);
+    }
+
+    #[rstest]
+    #[case::gap(2)]
+    #[case::stale(0)]
+    #[tokio::test]
+    async fn test_flusher_requires_contiguous_generation(#[case] generation: u64) {
+        let fixture = FlushFixture::new().await;
+        let before = fixture.manifest_store.latest().await.unwrap().unwrap();
+        let size = FlushedSize {
+            in_memory_bytes: Some(4),
+            physical_rows: Some(1),
+            primary_key_bytes: None,
+        };
+        let error = fixture
+            .flusher
+            .update_manifest(fixture.epoch, generation, "uncommitted_gen", 2, size)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("Cannot flush generation {generation} for shard"))
+        );
+        assert!(error.to_string().contains("expected current_generation=1"));
+        let after = fixture
+            .manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.current_generation, before.current_generation);
+        assert_eq!(
+            after.replay_after_wal_entry_position,
+            before.replay_after_wal_entry_position
+        );
+        assert!(after.sstables.is_empty());
     }
 
     /// A later generation is refused; a published one is reported without a

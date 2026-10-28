@@ -16,7 +16,7 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_arrow::json::JsonEncoding;
@@ -76,6 +76,9 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
+// Bound the payload copied into each v3 write batch. A single posting can
+// exceed this target; it remains indivisible in the current format.
+const POSTING_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -317,7 +320,7 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
-        old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+        old_data_filters: &[Option<crate::scalar::OldIndexDataFilter>],
     ) -> Result<Vec<IndexFile>> {
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
@@ -330,7 +333,7 @@ impl InvertedIndexBuilder {
         }
 
         let mut files = self
-            .merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
+            .merge_existing_segments(dest_store, old_segments, old_data_filters)
             .await?;
 
         let new_data = document_input(new_data, doc_col)?;
@@ -349,13 +352,21 @@ impl InvertedIndexBuilder {
         &mut self,
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
-        old_data_filter: Option<&crate::scalar::OldIndexDataFilter>,
+        old_data_filters: &[Option<crate::scalar::OldIndexDataFilter>],
     ) -> Result<Vec<IndexFile>> {
+        if old_data_filters.len() != old_segments.len() {
+            return Err(Error::invalid_input(format!(
+                "inverted merge: expected one old-data filter per source segment \
+                 (segments={}, filters={})",
+                old_segments.len(),
+                old_data_filters.len()
+            )));
+        }
         let num_workers = resolve_num_workers(&self.params);
         let memory_limit_bytes = resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let mut merged: Option<InnerBuilder> = None;
         let mut files = Vec::new();
-        for index in old_segments {
+        for (index, old_data_filter) in old_segments.iter().zip(old_data_filters) {
             if old_data_filter.is_none() {
                 self.deleted_fragments
                     .extend(index.deleted_fragments().iter());
@@ -487,6 +498,8 @@ impl InvertedIndexBuilder {
                     progress
                         .stage_progress("tokenize_docs", tokenized_count)
                         .await?;
+                    // A ready async-channel receiver does not consume Tokio's cooperative budget.
+                    tokio::task::yield_now().await;
                 }
                 worker.finish().await
             });
@@ -1101,6 +1114,10 @@ impl InnerBuilder {
                 mapping.insert(*row_id, None);
             }
         }
+        // Remapping rebuilds every posting list, which is wasted work when nothing is dropped.
+        if mapping.is_empty() {
+            return Ok(());
+        }
         self.remap(&RowAddrRemap::direct(mapping)).await
     }
 
@@ -1297,7 +1314,10 @@ impl InnerBuilder {
                             &mut batch_builder,
                             format_version,
                         )?;
-                        if batch_builder.len() >= batch_rows {
+                        if batch_builder.len() >= batch_rows
+                            || (format_version == InvertedListFormatVersion::V3
+                                && batch_builder.payload_bytes() >= POSTING_BATCH_BYTES)
+                        {
                             batch = Some(batch_builder.finish()?);
                             break;
                         }
@@ -3123,7 +3143,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream::{self, BoxStream};
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
@@ -4640,8 +4660,15 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::single_worker(1)]
+    #[case::multiple_workers(3)]
     #[tokio::test]
-    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats(
+        #[case] workers: usize,
+        #[values(false, true)] with_position: bool,
+        #[values(128, 256)] block_size: usize,
+    ) -> Result<()> {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -4657,14 +4684,18 @@ mod tests {
             None,
             Some("hello"),
         ]);
-        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let batches = (0..batch.num_rows())
+            .map(|row| Ok(batch.slice(row, 1)))
+            .collect::<Vec<_>>();
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(batches));
         let params =
             InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
-                .with_position(false)
+                .with_position(with_position)
                 .remove_stop_words(true)
                 .stem(false)
                 .max_token_length(Some(6))
-                .num_workers(1);
+                .block_size(block_size)?
+                .num_workers(workers);
 
         let mut builder = InvertedIndexBuilder::new(params);
         builder
@@ -5729,7 +5760,7 @@ mod tests {
             let first_callback_started = first_callback_started.clone();
             async move {
                 first_callback_started.notified().await;
-                Err(datafusion::error::DataFusionError::Execution(
+                Err(datafusion_common::DataFusionError::Execution(
                     "injected stream failure".to_owned(),
                 ))
             }

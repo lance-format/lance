@@ -1988,6 +1988,8 @@ public class Dataset implements Closeable {
   // ===== BlobFile / Blob dataset entry points (JNI) =====
   private native List<BlobFile> nativeTakeBlobs(List<Long> rowIds, String column);
 
+  private native List<BlobFile> nativeTakeBlobsByAddresses(List<Long> rowAddresses, String column);
+
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
   private static void checkReadBufferSize(long bufferSize) {
@@ -2022,7 +2024,10 @@ public class Dataset implements Closeable {
    * with Rust/Python.
    *
    * <p>Pass logical row IDs read from {@code _rowid}, not physical row addresses from {@code
-   * _rowaddr}.
+   * _rowaddr}. Use {@link #takeBlobsByAddresses(List, String)} for physical addresses.
+   *
+   * <p>Results preserve request order and duplicates. Valid empty blobs have size zero. Missing or
+   * deleted row IDs fail the entire call.
    *
    * <pre>{@code
    * long rowId = 42L; // Example value from the _rowid column.
@@ -2065,7 +2070,87 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Open {@link BlobFile} handles for physical row addresses on a blob column.
+   *
+   * <p>Pass addresses read from {@code _rowaddr} in this dataset snapshot. Each address encodes
+   * {@code (fragmentId << 32) | rowOffset}; the {@code long} carries the unsigned 64-bit bit
+   * pattern unchanged. Addresses can change after compaction. Use {@link #takeBlobs(List, String)}
+   * for logical {@code _rowid} values or {@link #takeBlobsByIndices(List, String)} for row offsets
+   * in dataset order.
+   *
+   * <p>Results preserve request order and duplicates. Null blobs produce null list elements; valid
+   * empty blobs produce handles with size zero. Missing or deleted addresses fail the entire call.
+   * Callers must close every non-null handle.
+   *
+   * <pre>{@code
+   * List<BlobFile> blobs = dataset.takeBlobsByAddresses(List.of(rowAddress), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param rowAddresses non-empty list of physical addresses from the {@code _rowaddr} column
+   * @param column blob column name
+   * @return one element per requested address, including duplicates and null blobs
+   * @throws IllegalArgumentException if the dataset is closed, the selector list is null, empty, or
+   *     contains null, or the column name is null or empty
+   */
+  public List<BlobFile> takeBlobsByAddresses(List<Long> rowAddresses, String column) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          rowAddresses != null && !rowAddresses.isEmpty(), "rowAddresses cannot be null or empty");
+      for (int i = 0; i < rowAddresses.size(); i++) {
+        Preconditions.checkArgument(
+            rowAddresses.get(i) != null, "rowAddresses[%s] cannot be null", i);
+      }
+      Preconditions.checkArgument(
+          column != null && !column.isEmpty(), "column cannot be null or empty");
+      return nativeTakeBlobsByAddresses(rowAddresses, column);
+    }
+  }
+
+  /**
+   * Open {@link BlobFile} handles by physical address and set sequential read-ahead size.
+   *
+   * <p>Uses the selector and result semantics of {@link #takeBlobsByAddresses(List, String)}.
+   *
+   * <pre>{@code
+   * List<BlobFile> blobs = dataset.takeBlobsByAddresses(List.of(rowAddress), "images", 4096L);
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param rowAddresses non-empty list of physical addresses from the {@code _rowaddr} column
+   * @param column blob column name
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   * @return one element per requested address, including duplicates and null blobs
+   * @throws IllegalArgumentException if {@code bufferSize} is negative or selection is invalid
+   * @throws IOException if configuring read-ahead fails; all opened handles are closed on failure
+   */
+  public List<BlobFile> takeBlobsByAddresses(
+      List<Long> rowAddresses, String column, long bufferSize) throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobsByAddresses(rowAddresses, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
+  }
+
+  /**
    * Open {@link BlobFile} handles for given row indices on a blob column.
+   *
+   * <p>Indices are zero-based offsets among live rows in dataset order. Results preserve request
+   * order and duplicates. Valid empty blobs have size zero. Out-of-range indices fail the entire
+   * call.
    *
    * <pre>{@code
    * List<BlobFile> blobs = dataset.takeBlobsByIndices(List.of(0L), "images");

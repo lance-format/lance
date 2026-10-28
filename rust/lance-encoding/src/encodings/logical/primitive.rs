@@ -3,21 +3,17 @@
 
 use std::{any::Any, collections::VecDeque, fmt::Debug, ops::Range, sync::Arc, vec};
 
-use crate::format::pb21::{self, CompressiveEncoding};
+use crate::format::metadata::{self, CompressiveEncoding};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
-    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder},
+    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder, LanceCache},
     error::Error,
-    utils::bit::pad_bytes,
 };
 
-use crate::{
-    compression::{DecompressionStrategy, MiniBlockDecompressor},
-    data::DataBlock,
-};
+use crate::{compression::DecompressionStrategy, data::DataBlock};
 use lance_core::Result;
 
 use crate::{
@@ -30,15 +26,15 @@ use crate::{
 
 // Reached only by `sparse.rs` tests through `use super::*`.
 #[cfg(test)]
-use crate::{format::ProtobufUtils21, repdef::CompositeRepDefUnraveler};
+use crate::format::EncodingUtils;
 
 pub mod blob;
 mod chunk_index;
 pub mod constant;
 pub mod dict;
 pub mod fullzip;
-mod layout;
 pub mod miniblock;
+mod planar;
 pub(crate) mod sparse;
 
 mod all_null;
@@ -64,12 +60,15 @@ const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
+/// Default for `DICT_MAX_SIZE_META_KEY`.
+const DEFAULT_DICT_MAX_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 
 /// Largest level count a direct legacy u16-value/U8-run RLE frame can prove.
 ///
 /// Mini-block level payload sizes are u16. After the eight-byte frame header, each run needs a
 /// two-byte value and a one-byte length, and each U8 run can represent at most 255 levels.
+/// It also bounds out-of-line bitpacked levels, which pack at least one bit per level.
 const MAX_LEGACY_RLE_LEVELS: u64 = ((u16::MAX as u64 - std::mem::size_of::<u64>() as u64)
     / (std::mem::size_of::<u16>() as u64 + std::mem::size_of::<u8>() as u64))
     * u8::MAX as u64;
@@ -168,6 +167,10 @@ impl PageInitializationBuffers {
 /// A trait for figuring out how to schedule the data within
 /// a single page.
 trait StructuralPageScheduler: std::fmt::Debug + Send {
+    /// Attach the reader's file-scoped cache for independently cached value data.
+    /// Legacy schedulers keep their existing initialization-only cache behavior.
+    fn set_cache(&mut self, _cache: Arc<LanceCache>) {}
+
     /// Whether this page requires initialized metadata before scheduling.
     fn needs_initialization(&self) -> bool {
         true
@@ -214,14 +217,6 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>>;
-}
-
-/// Metadata describing the decoded size of a mini-block
-#[derive(Debug)]
-struct ChunkMeta {
-    num_values: u64,
-    chunk_size_bytes: u64,
-    offset_bytes: u64,
 }
 
 /// A chunk that has been loaded by the miniblock scheduler (but not

@@ -5,12 +5,14 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::types::Int32Type;
+use arrow_array::builder::{ListBuilder, StringBuilder};
+use arrow_array::types::{Int8Type, Int32Type};
 use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Int8Array, PrimitiveArray, StringArray, new_null_array,
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array,
+    PrimitiveArray, StringArray, UInt16Array, new_null_array,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -21,19 +23,23 @@ use crate::buffer::LanceBuffer;
 use crate::compression::DefaultDecompressionStrategy;
 use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
-    DICT_VALUES_COMPRESSION_LEVEL_META_KEY, DICT_VALUES_COMPRESSION_META_KEY,
-    STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
+    DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
 };
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::decoder::PageEncoding;
+use crate::encodings::logical::primitive::dict::dictionary_encode;
 use crate::encodings::logical::primitive::miniblock::{MiniBlockChunk, MiniBlockCompressed};
 use crate::encodings::logical::primitive::{MiniBlockScheduler, StructuralPageScheduler};
-use crate::format::pb21;
-use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::metadata;
+use crate::format::metadata::compressive_encoding::Compression;
 use crate::repdef::build_control_word_iterator;
-use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
+use crate::testing::{
+    TestCases, TestEncoding, check_round_trip_encoding_of_data,
+    check_round_trip_encoding_of_data_with_expected,
+};
 
-use super::{FixedWidthDictionaryEncoding, MiniblockChunkSize, PrimitiveStructuralEncoder};
+use super::{DictionaryEncodingPolicy, MiniblockChunkSize, PrimitiveStructuralEncoder};
 
 #[test]
 fn test_is_narrow() {
@@ -145,6 +151,32 @@ fn test_fullzip_fixed_rejects_non_byte_aligned_values() {
         err.to_string().contains("byte aligned"),
         "unexpected error: {err}"
     );
+}
+
+// https://github.com/lance-format/lance/issues/8558
+#[tokio::test]
+async fn test_take_multichunk_string_lists() {
+    let mut list_builder = ListBuilder::new(StringBuilder::new());
+    for row in 0..3 {
+        for item in 0..512 {
+            list_builder
+                .values()
+                .append_value(format!("r{row:03}i{item:06}xaaaa"));
+        }
+        list_builder.append(true);
+    }
+    let list_array: ArrayRef = Arc::new(list_builder.finish());
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        STRUCTURAL_ENCODING_META_KEY.to_string(),
+        STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+    );
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralU16)
+        .with_indices(vec![0, 2]);
+
+    check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await;
 }
 
 async fn test_minichunk_size_helper(
@@ -259,7 +291,7 @@ async fn test_large_dictionary_general_compression() {
             // Navigate to the dictionary encoding in the page layout
             if let Some(PageEncoding::Structural(page_layout)) =
                 &col.final_pages.first().map(|p| &p.description)
-                && let Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) =
+                && let Some(metadata::page_layout::Layout::MiniBlockLayout(mini_block)) =
                     &page_layout.layout
                 && let Some(dictionary_encoding) = &mini_block.dictionary
             {
@@ -269,9 +301,9 @@ async fn test_large_dictionary_general_compression() {
                         let compression = general.compression.as_ref().unwrap();
                         assert!(
                             compression.scheme()
-                                == pb21::CompressionScheme::CompressionAlgorithmLz4
+                                == metadata::CompressionScheme::CompressionAlgorithmLz4
                                 || compression.scheme()
-                                    == pb21::CompressionScheme::CompressionAlgorithmZstd,
+                                    == metadata::CompressionScheme::CompressionAlgorithmZstd,
                             "Expected LZ4 or Zstd compression for large dictionary"
                         );
                     }
@@ -285,11 +317,12 @@ async fn test_large_dictionary_general_compression() {
 
 fn dictionary_encoding_from_page(
     page: &crate::encoder::EncodedPage,
-) -> &crate::format::pb21::CompressiveEncoding {
+) -> &crate::format::metadata::CompressiveEncoding {
     let PageEncoding::Structural(layout) = &page.description else {
         panic!("Expected structural page encoding");
     };
-    let pb21::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap() else {
+    let metadata::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap()
+    else {
         panic!("Expected mini-block layout");
     };
     layout
@@ -363,7 +396,7 @@ async fn test_dict_values_general_compression_default_lz4_for_variable_dict_valu
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmLz4
+        metadata::CompressionScheme::CompressionAlgorithmLz4
     );
 }
 
@@ -377,7 +410,7 @@ async fn test_dict_values_general_compression_default_lz4_for_fixed_dict_values(
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmLz4
+        metadata::CompressionScheme::CompressionAlgorithmLz4
     );
 }
 
@@ -396,7 +429,7 @@ async fn test_dict_values_general_compression_zstd() {
     let compression = general.compression.as_ref().unwrap();
     assert_eq!(
         compression.scheme(),
-        pb21::CompressionScheme::CompressionAlgorithmZstd
+        metadata::CompressionScheme::CompressionAlgorithmZstd
     );
 }
 
@@ -543,6 +576,374 @@ async fn test_dictionary_encode_float64() {
     check_round_trip_encoding_of_data(vec![array], &test_cases, metadata).await;
 }
 
+#[rstest::rstest]
+#[case::dense(false)]
+#[case::nullable(true)]
+#[tokio::test]
+async fn test_planar_dictionary_encode_repeated_float64(#[case] nullable: bool) {
+    let num_values = 262_144u64;
+    // Spread repeated values across the sample blocks instead of repeating the same
+    // short prefix at every block boundary.
+    let values = (0..num_values)
+        .map(|i| {
+            let value = (((i * 7919) ^ (i >> 7)) % 2048) as f64 / 100.0;
+            (!nullable || i % 8 != 0).then_some(value)
+        })
+        .collect::<Vec<_>>();
+    let array = Arc::new(Float64Array::from(values)) as ArrayRef;
+    let block = DataBlock::from_array(array.clone()).remove_outer_validity();
+    let ratio = PrimitiveStructuralEncoder::sample_unique_ratio(&block, 4096)
+        .unwrap()
+        .unwrap();
+    assert!(ratio < 0.98);
+    assert!(
+        ratio * num_values as f64 > 100_000.0,
+        "the old sample projection must reject this 2,048-value dictionary"
+    );
+    let field = lance_core::datatypes::Field::try_from(&arrow_schema::Field::new(
+        "values",
+        DataType::Float64,
+        nullable,
+    ))
+    .unwrap();
+    let budget = PrimitiveStructuralEncoder::should_dictionary_encode(
+        &block,
+        &field,
+        DictionaryEncodingPolicy::Planar,
+    )
+    .expect("repeated values should reach dictionary construction");
+    assert_eq!(budget.max_dict_entries, 100_000);
+
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024 * 1024])
+        .with_ingest_batch_counts([1])
+        .with_slicing_modes([false])
+        .with_batch_size(65_536)
+        .with_range(0..num_values)
+        .with_indices(vec![0, 1, 127, 128, 65_535, 65_536, num_values - 1])
+        .with_expected_encoding("dictionary");
+    check_round_trip_encoding_of_data(vec![array], &test_cases, HashMap::new()).await;
+}
+
+#[rstest::rstest]
+#[case::dense(false, false, false, false, "lz4")]
+#[case::null_vectors(true, false, false, false, "lz4")]
+#[case::null_children(false, true, false, false, "lz4")]
+#[case::nested(true, true, true, false, "lz4")]
+#[case::sparse(true, true, false, true, "lz4")]
+#[case::uncompressed(false, true, false, false, "none")]
+#[case::zstd(false, false, false, false, "zstd")]
+#[tokio::test]
+async fn test_planar_dictionary_encode_repeated_vectors(
+    #[case] null_vectors: bool,
+    #[case] null_children: bool,
+    #[case] nested: bool,
+    #[case] sparse: bool,
+    #[case] compression: &str,
+) {
+    const ROWS: usize = 2048;
+    const DIMENSION: usize = 512;
+    let values = Float32Array::from(
+        (0..ROWS * DIMENSION)
+            .map(|i| {
+                let row = (i / DIMENSION) % 17;
+                let column = i % DIMENSION;
+                (!null_children || !(row + column).is_multiple_of(7))
+                    .then_some((row * DIMENSION + column) as f32 / 10.0)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+        if nested { DIMENSION / 2 } else { DIMENSION } as i32,
+        Arc::new(values),
+        nested.then(|| {
+            NullBuffer::from(
+                (0..ROWS * 2)
+                    .map(|i| !i.is_multiple_of(9))
+                    .collect::<Vec<_>>(),
+            )
+        }),
+    ));
+    if nested {
+        array = Arc::new(FixedSizeListArray::new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                array.data_type().clone(),
+                true,
+            )),
+            2,
+            array,
+            None,
+        ));
+    }
+    if null_vectors {
+        let data = array
+            .to_data()
+            .into_builder()
+            .nulls(Some(NullBuffer::from(
+                (0..ROWS).map(|i| !i.is_multiple_of(8)).collect::<Vec<_>>(),
+            )))
+            .build()
+            .unwrap();
+        array = arrow_array::make_array(data);
+    }
+    let mut metadata = HashMap::from([(
+        DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+        compression.to_string(),
+    )]);
+    if sparse {
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            "sparse".to_string(),
+        );
+    }
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024 * 1024])
+        .with_ingest_batch_counts([1, 2])
+        .with_slicing_modes([false])
+        .with_batch_size(256)
+        .with_range(0..ROWS as u64)
+        .with_indices(vec![0, 1, 7, 8, 127, 128, 1023, 2047])
+        .with_expected_encoding("dictionary");
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::index_budget(32_768, 64, 100, 8192)]
+#[case::item_budget(2048, 64, 100, 512)]
+#[case::narrow_vectors(2048, 16, 400, 512)]
+#[tokio::test]
+async fn test_sparse_vector_dictionary_hidden_payload(
+    #[case] rows: usize,
+    #[case] dimension: usize,
+    #[case] valid: usize,
+    #[case] patterns: usize,
+    #[values("lz4", "none")] compression: &str,
+) {
+    // Arrow retains arbitrary child values beneath null vectors. These repeated
+    // hidden values must not make a dictionary look cheaper than sparse storage.
+    let values = Float32Array::from(
+        (0..rows * dimension)
+            .map(|i| {
+                let row = i / dimension;
+                let pattern = if row < valid { 0 } else { 1 + row % patterns };
+                let mut bits = (pattern * dimension + i % dimension) as u32;
+                bits ^= bits >> 16;
+                bits = bits.wrapping_mul(0x7feb_352d);
+                bits ^= bits >> 15;
+                bits = bits.wrapping_mul(0x846c_a68b);
+                bits ^= bits >> 16;
+                f32::from_bits(0x3f80_0000 | (bits & 0x007f_ffff))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let array = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+        dimension as i32,
+        Arc::new(values),
+        Some(NullBuffer::from(
+            (0..rows).map(|i| i < valid).collect::<Vec<_>>(),
+        )),
+    )) as ArrayRef;
+    let mut metadata = HashMap::from([(
+        DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+        compression.to_string(),
+    )]);
+    // Narrow vectors need an explicit sparse request; wide mostly-null vectors
+    // must also be protected when the writer selects sparse storage automatically.
+    if dimension < 64 {
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            "sparse".to_string(),
+        );
+    }
+    let field = arrow_schema::Field::new("vectors", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let candidate = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let mut fallback_metadata = metadata.clone();
+    fallback_metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "1000000".to_string());
+    let field = arrow_schema::Field::new("vectors", array.data_type().clone(), true)
+        .with_metadata(fallback_metadata);
+    let fallback = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let candidate_bytes: usize = candidate.data.iter().map(|buffer| buffer.len()).sum();
+    let fallback_bytes: usize = fallback.data.iter().map(|buffer| buffer.len()).sum();
+    assert!(
+        candidate_bytes <= fallback_bytes,
+        "dictionary candidate {candidate_bytes} bytes exceeds sparse fallback {fallback_bytes} bytes"
+    );
+    for (page, is_candidate) in [(&candidate, true), (&fallback, false)] {
+        let PageEncoding::Planar(layout) = &page.description else {
+            panic!("expected a planar page");
+        };
+        match layout
+            .values
+            .as_ref()
+            .and_then(|values| values.codec.as_ref())
+        {
+            Some(crate::format::pb23::value_plane::Codec::Zipped(_)) => {}
+            Some(crate::format::pb23::value_plane::Codec::Chunked(values)) => {
+                assert_eq!(values.dictionary.is_some(), is_candidate && dimension < 64);
+            }
+            other => panic!("expected a non-dictionary fallback, got {other:?}"),
+        }
+    }
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![32 * 1024 * 1024])
+        .with_ingest_batch_counts([1])
+        .with_slicing_modes([false])
+        .with_batch_size(256)
+        .with_range(0..rows as u64)
+        .with_indices(vec![0, valid as u64 - 1, valid as u64, rows as u64 - 1]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::rgb("u8", false)]
+#[case::depth("u16", true)]
+#[case::dense_depth("u16_dense", false)]
+#[case::nested_nullable("nested", true)]
+#[case::null_children("null_children", false)]
+#[tokio::test]
+async fn test_tensor_per_value_compression(
+    #[case] kind: &str,
+    #[case] sparse: bool,
+    #[values("zstd", "lz4", "none")] compression: &str,
+) {
+    const ROWS: usize = 32;
+    const DIMENSION: usize = 1030;
+    let child: ArrayRef = match kind {
+        "u16_dense" => Arc::new(arrow_array::UInt16Array::from_iter_values(
+            (0..ROWS * DIMENSION).map(|i| (i / DIMENSION + i % 5) as u16),
+        )),
+        "u8" => Arc::new(arrow_array::UInt8Array::from_iter_values(
+            (0..ROWS * DIMENSION).map(|i| (i / DIMENSION + i % 5) as u8),
+        )),
+        "null_children" => Arc::new(arrow_array::UInt16Array::new_null(ROWS * DIMENSION)),
+        _ => Arc::new(arrow_array::UInt16Array::from_iter(
+            (0..ROWS * DIMENSION).map(|i| (i % 7 != 0).then_some((i / DIMENSION + i % 5) as u16)),
+        )),
+    };
+    let dimension = if kind == "nested" {
+        DIMENSION / 2
+    } else {
+        DIMENSION
+    };
+    let mut array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new(
+            "item",
+            child.data_type().clone(),
+            true,
+        )),
+        dimension as i32,
+        child,
+        None,
+    ));
+    if kind == "nested" {
+        array = Arc::new(FixedSizeListArray::new(
+            Arc::new(arrow_schema::Field::new(
+                "item",
+                array.data_type().clone(),
+                true,
+            )),
+            2,
+            array,
+            None,
+        ));
+    }
+    if sparse {
+        array = arrow_array::make_array(
+            array
+                .to_data()
+                .into_builder()
+                .nulls(Some(NullBuffer::from(
+                    (0..ROWS).map(|i| i % 4 == 0).collect::<Vec<_>>(),
+                )))
+                .build()
+                .unwrap(),
+        );
+    }
+    let metadata = HashMap::from([
+        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
+        (COMPRESSION_LEVEL_META_KEY.to_string(), "3".to_string()),
+        // Exercise the configured codec independently of automatic selection.
+        ("lance-encoding:axis-delta".to_string(), "off".to_string()),
+    ]);
+    let field = arrow_schema::Field::new("tensor", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let PageEncoding::Planar(layout) = page.description else {
+        panic!("expected Planar page")
+    };
+    let Some(crate::format::pb23::value_plane::Codec::Zipped(values)) =
+        layout.values.and_then(|v| v.codec)
+    else {
+        panic!("expected independently addressed tensors");
+    };
+    assert_eq!(
+        matches!(
+            values.addressing,
+            Some(crate::format::pb23::zipped_values::Addressing::BitsPerOffset(_))
+        ),
+        compression != "none"
+    );
+    assert_eq!(
+        matches!(
+            values.compression.as_ref().unwrap().compression,
+            Some(Compression::General(_))
+        ),
+        compression != "none"
+    );
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024])
+        .with_ingest_batch_counts([4])
+        .with_slicing_modes([true])
+        .with_batch_size(7)
+        .with_range(3..29)
+        .with_indices(vec![0, 3, 4, 7, 8, 17, 28, 31]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::unique(2048, 2048, 2)]
+#[case::entry_budget(128, 64, 8)]
+fn test_planar_vector_dictionary_rejects_unhelpful_candidates(
+    #[case] rows: usize,
+    #[case] distinct: usize,
+    #[case] divisor: u64,
+) {
+    let values = Float64Array::from(
+        (0..rows)
+            .flat_map(|i| [(i % distinct) as f64, 1.0])
+            .collect::<Vec<_>>(),
+    );
+    let array = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new("item", DataType::Float64, false)),
+        2,
+        Arc::new(values),
+        None,
+    )) as ArrayRef;
+    let field =
+        arrow_schema::Field::new("vectors", array.data_type().clone(), false).with_metadata(
+            HashMap::from([(DICT_DIVISOR_META_KEY.to_string(), divisor.to_string())]),
+        );
+    let field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    assert!(
+        PrimitiveStructuralEncoder::try_dictionary_encode(
+            &DataBlock::from_array(array),
+            &field,
+            DictionaryEncodingPolicy::Planar,
+            rows as u64,
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
 // Dictionary encoding decision tests
 fn create_test_fixed_data_block(
     num_values: u64,
@@ -631,13 +1032,52 @@ fn test_should_dictionary_encode() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
+        DictionaryEncodingPolicy::LegacyU16,
     );
 
     assert!(
         result.is_some(),
         "Should use dictionary encode based on size"
     );
+}
+
+#[tokio::test]
+async fn test_encode_skips_dictionary_above_max_dict_size() {
+    use crate::constants::DICT_MAX_SIZE_META_KEY;
+
+    // 2000 values of 64 bytes with 500 distinct: the dictionary alone is 32 KiB,
+    // well within the size ratio, so only the byte cap can veto it.
+    let array = Arc::new(StringArray::from_iter_values(
+        (0..2000).map(|i| format!("{:064}", i % 500)),
+    )) as ArrayRef;
+
+    let field = arrow_schema::Field::new("test", DataType::Utf8, false);
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralU32).await;
+    assert!(
+        miniblock_layout(&page).dictionary.is_some(),
+        "a 32 KiB dictionary must be used under the default cap"
+    );
+
+    let metadata = HashMap::from([(DICT_MAX_SIZE_META_KEY.to_string(), "4096".to_string())]);
+    let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+    let page = encode_first_page(field, array, TestEncoding::StructuralU32).await;
+    assert!(
+        miniblock_layout(&page).dictionary.is_none(),
+        "a dictionary over lance-encoding:dict-max-size must not be written"
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "dict-max-size is 8MiB")]
+async fn test_encode_rejects_unparsable_max_dict_size() {
+    use crate::constants::DICT_MAX_SIZE_META_KEY;
+
+    let array = Arc::new(StringArray::from_iter_values(
+        (0..2000).map(|i| format!("{:064}", i % 500)),
+    )) as ArrayRef;
+    let metadata = HashMap::from([(DICT_MAX_SIZE_META_KEY.to_string(), "8MiB".to_string())]);
+    let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+    encode_first_page(field, array, TestEncoding::StructuralU32).await;
 }
 
 #[test]
@@ -678,7 +1118,7 @@ fn test_should_dictionary_encode_sorted_low_cardinality() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Include64Bit,
+        DictionaryEncodingPolicy::LegacyU32,
     );
 
     assert!(
@@ -705,7 +1145,7 @@ fn test_should_not_dictionary_encode_sorted_high_cardinality_short_runs() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Include64Bit,
+        DictionaryEncodingPolicy::LegacyU32,
     );
 
     assert!(
@@ -743,7 +1183,7 @@ fn test_should_not_dictionary_encode_unsupported_bits() {
     let result = PrimitiveStructuralEncoder::should_dictionary_encode(
         &block,
         &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
+        DictionaryEncodingPolicy::LegacyU16,
     );
 
     assert!(
@@ -752,8 +1192,11 @@ fn test_should_not_dictionary_encode_unsupported_bits() {
     );
 }
 
-#[test]
-fn test_should_not_dictionary_encode_near_unique_sample() {
+#[rstest::rstest]
+#[case::legacy_u16(DictionaryEncodingPolicy::LegacyU16)]
+#[case::legacy_u32(DictionaryEncodingPolicy::LegacyU32)]
+#[case::planar(DictionaryEncodingPolicy::Planar)]
+fn test_should_not_dictionary_encode_near_unique_sample(#[case] policy: DictionaryEncodingPolicy) {
     use crate::constants::DICT_SIZE_RATIO_META_KEY;
     use lance_core::datatypes::Field as LanceField;
 
@@ -766,16 +1209,47 @@ fn test_should_not_dictionary_encode_near_unique_sample() {
         arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
     let field = LanceField::try_from(&arrow_field).unwrap();
 
-    let result = PrimitiveStructuralEncoder::should_dictionary_encode(
-        &block,
-        &field,
-        FixedWidthDictionaryEncoding::Exclude64Bit,
-    );
+    let result = PrimitiveStructuralEncoder::should_dictionary_encode(&block, &field, policy);
 
     assert!(
         result.is_none(),
         "Should not probe dictionary encoding for near-unique data"
     );
+}
+
+#[rstest::rstest]
+#[case::cardinality(8, 1.0)]
+#[case::encoded_size(2, 0.25)]
+fn test_planar_dictionary_probe_preserves_budgets(#[case] divisor: u64, #[case] size_ratio: f64) {
+    let block = create_test_fixed_data_block(4096, 2048, 64);
+    let field =
+        arrow_schema::Field::new("values", DataType::UInt64, false).with_metadata(HashMap::from([
+            (DICT_DIVISOR_META_KEY.to_string(), divisor.to_string()),
+            (DICT_SIZE_RATIO_META_KEY.to_string(), size_ratio.to_string()),
+        ]));
+    let field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    let budget = PrimitiveStructuralEncoder::should_dictionary_encode(
+        &block,
+        &field,
+        DictionaryEncodingPolicy::Planar,
+    )
+    .expect("a repeated sample should reach bounded dictionary construction");
+    assert_eq!(budget.max_dict_entries, (4096 / divisor) as u32);
+    assert_eq!(
+        budget.max_encoded_size,
+        (block.data_size() as f64 * size_ratio) as usize
+    );
+    assert!(
+        dictionary_encode(
+            &block,
+            budget.max_dict_entries,
+            budget.max_encoded_size,
+            budget.max_dict_bytes,
+        )
+        .is_none(),
+        "actual construction must abort at the unchanged budget"
+    );
+    assert!(dictionary_encode(&block, 4096, block.data_size() as usize, usize::MAX).is_some());
 }
 
 #[test]
@@ -877,20 +1351,24 @@ fn variable_offset_test_array(lengths: &[usize], num_rows: usize) -> ArrayRef {
     })))
 }
 
-fn miniblock_layout(page: &crate::encoder::EncodedPage) -> &pb21::MiniBlockLayout {
-    let PageEncoding::Structural(layout) = &page.description else {
-        panic!("expected structural page encoding");
+fn miniblock_layout(page: &crate::encoder::EncodedPage) -> metadata::MiniBlockLayout {
+    let layout = match &page.description {
+        PageEncoding::Structural(layout) => layout.clone(),
+        PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+        _ => panic!("expected structural page encoding"),
     };
-    let Some(pb21::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref() else {
+    let Some(metadata::page_layout::Layout::MiniBlockLayout(layout)) = layout.layout.as_ref()
+    else {
         panic!("expected mini-block page layout");
     };
-    layout
+    layout.clone()
 }
 
 fn variable_offset_compression(
     page: &crate::encoder::EncodedPage,
-) -> &pb21::compressive_encoding::Compression {
-    let value_encoding = miniblock_layout(page).value_compression.as_ref().unwrap();
+) -> metadata::compressive_encoding::Compression {
+    let layout = miniblock_layout(page);
+    let value_encoding = layout.value_compression.as_ref().unwrap();
     let Compression::Variable(variable) = value_encoding.compression.as_ref().unwrap() else {
         panic!("expected Variable value compression");
     };
@@ -899,6 +1377,7 @@ fn variable_offset_compression(
         .as_deref()
         .and_then(|offsets| offsets.compression.as_ref())
         .unwrap()
+        .clone()
 }
 
 fn variable_value_wire_bytes(page: &crate::encoder::EncodedPage) -> usize {
@@ -964,7 +1443,7 @@ async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [us
         &buffer_offsets_and_sizes,
         0,
         page.num_rows,
-        miniblock_layout(page),
+        &miniblock_layout(page),
         &decompression,
     )
     .unwrap();
@@ -986,7 +1465,7 @@ async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [us
         &buffer_offsets_and_sizes,
         0,
         page.num_rows,
-        miniblock_layout(page),
+        &miniblock_layout(page),
         &decompression,
     )
     .unwrap();
@@ -1053,7 +1532,7 @@ async fn test_v2_3_generic_offsets_preserve_legacy_and_take_io() {
 
 #[tokio::test]
 async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let val = vec![0xABu8; 33];
     let arr: ArrayRef = Arc::new(
@@ -1083,7 +1562,7 @@ async fn test_constant_layout_out_of_line_fixed_size_binary_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_out_of_line_utf8_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::StringArray::from_iter_values(
         std::iter::repeat_n("hello", 512),
@@ -1100,15 +1579,18 @@ async fn test_constant_layout_out_of_line_utf8_v2_2() {
     assert!(layout.inline_value.is_none());
     assert_eq!(page.data.len(), 1);
 
+    // No definition levels here, so the row count of a mid-page read comes from `drain`
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(100..300)
+        .with_indices(vec![1, 150, 400]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
 #[tokio::test]
 async fn test_constant_layout_null_padded_large_value_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     // One large non-null value plus many nulls still qualifies for constant
     // encoding.  Materializing the scalar for every slot (including nulls)
@@ -1135,7 +1617,7 @@ async fn test_constant_layout_null_padded_large_value_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_null_padded_binary_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let big = vec![0xCDu8; 32 * 1024 * 1024];
     let mut values: Vec<Option<&[u8]>> = vec![None; 1200];
@@ -1159,7 +1641,7 @@ async fn test_constant_layout_null_padded_binary_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_nullable_item_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![
         Some(7),
@@ -1182,13 +1664,15 @@ async fn test_constant_layout_nullable_item_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..4)
+        .with_indices(vec![1, 4]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
 #[tokio::test]
 async fn test_constant_layout_list_repdef_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::builder::{Int32Builder, ListBuilder};
 
     let mut builder = ListBuilder::new(Int32Builder::new());
@@ -1227,13 +1711,15 @@ async fn test_constant_layout_list_repdef_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..3)
+        .with_indices(vec![1, 3]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
 #[tokio::test]
 async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::builder::{FixedSizeListBuilder, Int32Builder};
 
     let mut builder = FixedSizeListBuilder::new(Int32Builder::new(), 3);
@@ -1269,7 +1755,7 @@ async fn test_constant_layout_fixed_size_list_not_used_v2_2() {
 
 #[tokio::test]
 async fn test_constant_layout_not_written_before_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7; 1024]));
     let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -1291,7 +1777,7 @@ async fn test_constant_layout_not_written_before_v2_2() {
 
 #[tokio::test]
 async fn test_all_null_constant_layout_still_works_v2_2() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
 
     let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None, None, None]));
     let field = arrow_schema::Field::new("c", DataType::Int32, true);
@@ -1392,7 +1878,7 @@ fn test_encode_decode_complex_all_null_vals_roundtrip() {
 
 #[tokio::test]
 async fn test_complex_all_null_compression_gated_by_version() {
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     use arrow_array::ListArray;
 
     let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
@@ -1558,6 +2044,29 @@ async fn test_dictionary_round_trip_high_cardinality_strings() {
     .await;
 }
 
+/// Three single-value dictionary chunks merged into one page leave the merged
+/// dictionary values as a run of identical entries, so the writer RLE-compresses
+/// the dictionary values block.  The mini-block reader must accept the encodings
+/// the writer emits (regression: it rejected `Compression::Rle`, so no scan
+/// could read a file the writer had just produced).
+#[tokio::test]
+async fn test_dictionary_round_trip_rle_encoded_dictionary_values() {
+    use arrow_array::{UInt32Array, UInt64Array, types::UInt32Type};
+
+    let single_value = |rows: usize| -> ArrayRef {
+        let values = Arc::new(UInt64Array::from(vec![5_881_210_131_331_364_753u64]));
+        let keys = UInt32Array::from(vec![0u32; rows]);
+        Arc::new(DictionaryArray::<UInt32Type>::try_new(keys, values).unwrap())
+    };
+    let chunks: Vec<ArrayRef> = (0..3).map(|_| single_value(2)).collect();
+
+    let test_cases = TestCases::default()
+        .with_encoding(TestEncoding::StructuralU32)
+        .with_page_sizes(vec![4096]);
+
+    check_round_trip_encoding_of_data(chunks, &test_cases, HashMap::new()).await;
+}
+
 /// Values above the 32 KiB per-value threshold take the per-value zstd path.
 /// Mixed with nulls, empty and small values, at several levels (and the
 /// default when no level is set), every page is zstd and every value survives.
@@ -1593,4 +2102,331 @@ async fn test_per_value_zstd_round_trip_large_values_with_nulls() {
         )
         .await;
     }
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_axis_delta_per_value_compression(
+    #[values("off", "on:1", "auto:1", "auto", "default")] mode: &str,
+    #[values("zstd", "lz4", "none")] compression: &str,
+    #[values(false, true)] nullable: bool,
+    #[values("fullzip", "sparse")] structure: &str,
+) {
+    const ROWS: usize = 16;
+    const DIM: usize = 3 * 17 * 23;
+    let child: ArrayRef = Arc::new(arrow_array::Int32Array::from(
+        (0..ROWS * DIM)
+            .map(|i| (i as i32 * 107) - 1_000_000)
+            .collect::<Vec<_>>(),
+    ));
+    let array: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(arrow_schema::Field::new(
+            "item",
+            child.data_type().clone(),
+            true,
+        )),
+        DIM as i32,
+        child,
+        nullable.then(|| NullBuffer::from((0..ROWS).map(|i| i % 3 != 0).collect::<Vec<_>>())),
+    ));
+    let mut metadata = HashMap::from([
+        (
+            "lance-encoding:structural-encoding".to_string(),
+            structure.to_string(),
+        ),
+        ("lance-encoding:axis-delta".to_string(), mode.to_string()),
+        (COMPRESSION_META_KEY.to_string(), compression.to_string()),
+    ]);
+    if mode == "default" {
+        metadata.remove("lance-encoding:axis-delta");
+    }
+    metadata.insert(
+        "ARROW:extension:name".into(),
+        "arrow.fixed_shape_tensor".into(),
+    );
+    metadata.insert(
+        "ARROW:extension:metadata".into(),
+        r#"{"shape":[23,17,3]}"#.into(),
+    );
+    let field = arrow_schema::Field::new("pixels", array.data_type().clone(), true)
+        .with_metadata(metadata.clone());
+    let page = encode_first_page(field, array.clone(), TestEncoding::StructuralSparse).await;
+    let PageEncoding::Planar(layout) = page.description else {
+        panic!("expected Planar")
+    };
+    let Some(crate::format::pb23::value_plane::Codec::Zipped(values)) =
+        layout.values.and_then(|v| v.codec)
+    else {
+        panic!("expected Zipped")
+    };
+    let mut codec = values.compression.as_ref().unwrap();
+    if let Some(Compression::General(general)) = &codec.compression {
+        codec = general.values.as_ref().unwrap();
+    }
+    assert_eq!(
+        matches!(codec.compression, Some(Compression::AxisDelta(_))),
+        mode != "off"
+            && !((mode.starts_with("auto") || mode == "default") && compression == "none")
+    );
+    let tests = TestCases::default()
+        .with_encoding(TestEncoding::StructuralSparse)
+        .with_page_sizes(vec![8 * 1024])
+        .with_ingest_batch_counts([4])
+        .with_slicing_modes([true])
+        .with_batch_size(3)
+        .with_range(3..15)
+        .with_indices(vec![0, 1, 3, 8, 14, 15]);
+    check_round_trip_encoding_of_data(vec![array], &tests, metadata).await;
+}
+
+#[rstest::rstest]
+#[case::scalar("scalar")]
+#[case::strings("strings")]
+#[case::float_vector("float")]
+#[case::noise("noise")]
+#[case::repeated_vector("repeated")]
+#[case::inner_nulls("inner_nulls")]
+#[case::small_tensor("small")]
+#[case::invalid_extension("invalid_extension")]
+#[tokio::test]
+async fn test_default_axis_delta_preserves_other_encodings(
+    #[case] kind: &str,
+    #[values("lz4", "zstd", "none", "unset")] compression: &str,
+    #[values(
+        TestEncoding::StructuralSparse,
+        TestEncoding::StructuralU32,
+        TestEncoding::StructuralU16
+    )]
+    version: TestEncoding,
+) {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    let mut rng = StdRng::seed_from_u64(601);
+    const ROWS: usize = 128;
+    let dimension = if kind == "small" { 2 } else { 1024 };
+    let array: ArrayRef = match kind {
+        "scalar" => Arc::new(arrow_array::Int32Array::from(
+            (0..ROWS as i32).collect::<Vec<_>>(),
+        )),
+        "strings" => Arc::new(StringArray::from(
+            (0..ROWS)
+                .map(|i| format!("value {i} {}", "abc".repeat(i % 7)))
+                .collect::<Vec<_>>(),
+        )),
+        _ => {
+            let values: ArrayRef = if kind == "float" {
+                Arc::new(Float32Array::from(
+                    (0..ROWS * dimension)
+                        .map(|_| rng.random::<f32>())
+                        .collect::<Vec<_>>(),
+                ))
+            } else {
+                Arc::new(arrow_array::UInt32Array::from(
+                    (0..ROWS * dimension)
+                        .map(|i| {
+                            if kind == "inner_nulls" && i % 7 == 0 {
+                                None
+                            } else {
+                                Some(if kind == "repeated" {
+                                    (i % dimension) as u32
+                                } else {
+                                    rng.random()
+                                })
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            };
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(arrow_schema::Field::new(
+                    "item",
+                    values.data_type().clone(),
+                    true,
+                )),
+                dimension as i32,
+                values,
+                None,
+            ))
+        }
+    };
+    let mut metadata = HashMap::new();
+    if compression != "unset" {
+        metadata.insert(COMPRESSION_META_KEY.into(), compression.into());
+    }
+    if kind == "invalid_extension" {
+        metadata.insert(
+            "ARROW:extension:name".into(),
+            "arrow.fixed_shape_tensor".into(),
+        );
+        metadata.insert("ARROW:extension:metadata".into(), "invalid-json".into());
+    }
+    let field = arrow_schema::Field::new("value", array.data_type().clone(), false)
+        .with_metadata(metadata.clone());
+    let automatic = encode_first_page(field, array.clone(), version).await;
+    if matches!(
+        kind,
+        "float" | "noise" | "inner_nulls" | "small" | "invalid_extension"
+    ) {
+        // Auto must preserve raw storage when compression has no sampled benefit
+        // or the tensor is unsupported. Stable writers already use raw storage.
+        metadata.remove(COMPRESSION_META_KEY);
+    }
+    metadata.insert("lance-encoding:axis-delta".into(), "off".into());
+    let field =
+        arrow_schema::Field::new("value", array.data_type().clone(), false).with_metadata(metadata);
+    let disabled = encode_first_page(field, array, version).await;
+    assert_eq!(
+        format!("{:?}", automatic.description),
+        format!("{:?}", disabled.description)
+    );
+    assert_eq!(automatic.data.len(), disabled.data.len());
+    for (automatic, disabled) in automatic.data.iter().zip(&disabled.data) {
+        assert_eq!(automatic.as_ref(), disabled.as_ref());
+    }
+}
+
+fn int8_dictionary_with_all_values() -> ArrayRef {
+    let values: Vec<u16> = (0..127u16).collect();
+    let keys: Vec<i8> = (0..127)
+        .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+        .collect();
+    Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap(),
+    )
+}
+
+#[rstest::rstest]
+// Both chunks land in one page, which the writer merges.
+#[case::one_page(4096, vec![TestEncoding::StructuralU32])]
+// Each chunk is its own page, so the reader merges the two decoded dictionaries
+// for a batch that spans both pages.
+#[case::page_per_chunk(
+    64,
+    vec![TestEncoding::Array, TestEncoding::StructuralU16, TestEncoding::StructuralU32]
+)]
+#[tokio::test]
+async fn test_dictionary_merge_keeps_declared_key_type_round_trip(
+    #[case] page_size: u64,
+    #[case] encodings: Vec<TestEncoding>,
+) {
+    // Two Dictionary(Int8, UInt16) chunks, each holding all 127 values an Int8
+    // key can address.  Arrow's lossy concat merge over-counts the union (hash
+    // collisions in its interner) and overflows Int8, although the exact union
+    // fits.  The column must round-trip with its declared key type.
+    let a = int8_dictionary_with_all_values();
+    let b = int8_dictionary_with_all_values();
+    // Build the expected array directly: `concat` hits the same Arrow
+    // interner overflow, so the test harness cannot derive it.
+    let values: Vec<u16> = (0..127u16).collect();
+    let permutation: Vec<i8> = (0..127)
+        .map(|i| ((i as u64).wrapping_mul(2_654_435_761) % 127) as i8)
+        .collect();
+    let mut keys = permutation.clone();
+    keys.extend_from_slice(&permutation);
+    let expected: ArrayRef = Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap(),
+    );
+    let test_cases = TestCases::default()
+        .with_encodings(encodings)
+        .with_page_sizes(vec![page_size])
+        .with_batch_size(1000);
+    check_round_trip_encoding_of_data_with_expected(
+        vec![a, b],
+        Some(expected),
+        &test_cases,
+        HashMap::new(),
+    )
+    .await;
+}
+
+fn disjoint_int8_dictionary(offset: u16) -> ArrayRef {
+    let values: Vec<u16> = (0..100u16).map(|value| value + offset).collect();
+    let keys: Vec<i8> = (0..100).map(|i| i as i8).collect();
+    Arc::new(
+        DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(keys),
+            Arc::new(UInt16Array::from(values)),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn test_dictionary_merge_overflow_is_rejected_at_write() {
+    // Two chunks with disjoint dictionaries whose exact union (200 values)
+    // cannot be addressed by Int8 indices.  The writer must reject the
+    // mismatch instead of persisting indices wider than the declared key.
+    use crate::encoder::{
+        ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+    };
+    use crate::repdef::RepDefBuilder;
+    use crate::testing::{create_test_field_encoder, test_encoding_strategy};
+
+    let a = disjoint_int8_dictionary(0);
+    let b = disjoint_int8_dictionary(1000);
+    let field = ArrowField::new("d", a.data_type().clone(), false);
+    let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
+    let encoding_strategy = test_encoding_strategy(TestEncoding::StructuralU32);
+    let mut column_index_seq = ColumnIndexSequence::default();
+    let encoding_options = EncodingOptions {
+        cache_bytes_per_column: 1024 * 1024,
+        max_page_bytes: 32 * 1024 * 1024,
+        keep_original_array: true,
+        buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+    };
+    let mut encoder = create_test_field_encoder(
+        encoding_strategy.as_ref(),
+        &lance_field,
+        &mut column_index_seq,
+        &encoding_options,
+    )
+    .unwrap();
+
+    let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+    let mut error = None;
+    for (index, array) in [a, b].into_iter().enumerate() {
+        let row_number = (index * 100) as u64;
+        match encoder.maybe_encode(
+            array,
+            &mut external_buffers,
+            RepDefBuilder::default(),
+            row_number,
+            100,
+        ) {
+            Ok(tasks) => {
+                for task in tasks {
+                    if let Err(err) = task.await {
+                        error = Some(err);
+                        break;
+                    }
+                }
+            }
+            Err(err) => error = Some(err),
+        }
+        if error.is_some() {
+            break;
+        }
+    }
+    if error.is_none() {
+        for task in encoder.flush(&mut external_buffers).unwrap() {
+            if let Err(err) = task.await {
+                error = Some(err);
+                break;
+            }
+        }
+    }
+
+    let error = error.expect("oversized dictionary merge must be rejected");
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(
+        error.to_string().contains("widen the dictionary key type"),
+        "unexpected error: {error}"
+    );
 }

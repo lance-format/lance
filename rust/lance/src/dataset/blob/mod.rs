@@ -18,7 +18,8 @@ pub(super) use external::{
 };
 pub use file::BlobFile;
 pub(super) use locate::{collect_blob_v2_descriptor_files, data_file_key_from_path};
-pub(super) use managed::{field_contains_blob, managed_paths, preserve_managed_descriptors};
+pub use managed::preserve_managed_descriptors;
+pub(super) use managed::{field_contains_blob, managed_paths};
 pub use materialize::{
     BlobMaterializationAdmission, BlobMaterializationContext, MaterializedBlobBatch,
     blob_v2_descriptor_schema, materialize_blob_v2_binary_batch,

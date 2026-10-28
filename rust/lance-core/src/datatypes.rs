@@ -23,7 +23,7 @@ pub use field::{
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
-    BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
+    BlobHandling, FieldRef, NEW_TABLE_FIELD_ID_LIMIT, OnMissing, Projectable, Projection, Schema,
     escape_field_path_for_project, format_field_path, format_field_path_minimal, parse_field_path,
     validate_fixed_size_list_dimensions,
 };

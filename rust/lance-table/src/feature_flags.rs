@@ -119,11 +119,14 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// Required for data files containing version 1 zone-level statistics seeds.
 /// Their min/max exclude NaNs, which are counted separately by sign. Set in
 /// both reader and writer feature flags and preserve across commits.
-///
-/// Reserved: support for these seeds is not implemented yet.
 pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
+/// Writer-only protection for clustering definitions, ID allocation, references,
+/// and generic fragment/index segment metadata maintenance.
+/// Reserved and unsupported until writers implement its maintenance rules.
+/// Ordinary readers can ignore this metadata; all covered features share this one bit.
+pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 17;
+pub const FLAG_UNKNOWN: u64 = 1 << 18;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -141,6 +144,7 @@ const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 
 const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -338,7 +342,8 @@ fn supported_flags_when(
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
-    mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, false);
+    mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
+    mark_supported(&mut supported, FLAG_OBJECT_METADATA, false);
     supported
 }
 
@@ -530,10 +535,31 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
-    fn test_zone_write_seed_flag_is_reserved_and_sticky() {
+    fn test_object_metadata_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(FLAG_OBJECT_METADATA));
+        assert!(!can_write_dataset(FLAG_OBJECT_METADATA));
+        assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
+        // The zone seed bit below it is supported; bits above remain unknown.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 18);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_zone_write_seed_flag_is_supported_and_sticky() {
         assert_eq!(FLAG_ZONE_WRITE_SEEDS, 1 << 16);
-        assert!(!can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert!(!can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        // This build implements version 1 seeds: flagged datasets stay
+        // readable and writable here, while pre-flag builds refuse them.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
 
         let mut manifest = empty_manifest();
         manifest.reader_feature_flags = FLAG_ZONE_WRITE_SEEDS;
@@ -542,12 +568,8 @@ mod tests {
         assert_eq!(manifest.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
         assert_eq!(manifest.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
 
-        let read_error = ensure_can_read_manifest(&manifest).unwrap_err();
-        assert!(matches!(read_error, Error::NotSupported { .. }));
-        assert!(read_error.to_string().contains("Please upgrade"));
-        let write_error = ensure_can_write_manifest(&manifest).unwrap_err();
-        assert!(matches!(write_error, Error::NotSupported { .. }));
-        assert!(write_error.to_string().contains("Please upgrade"));
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
 
         let mut destination = empty_manifest();
         inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();

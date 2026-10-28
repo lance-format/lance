@@ -9,6 +9,7 @@ use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use log::trace;
 
+use crate::data::dictionary_batch_limit;
 use crate::decoder::{ColumnBuffers, PageBuffers};
 use crate::decoder::{
     DrainLimit, FieldScheduler, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder, SchedulingJob,
@@ -20,6 +21,7 @@ use crate::{array_encoding::physical::decoder_from_array_encoding, data::DataBlo
 use lance_core::{Error, Result, datatypes::Field};
 
 use crate::{
+    EncodingsIo,
     decoder::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PageEncoding, PageInfo,
         PageScheduler, PrimitivePageDecoder, PriorityRange, ScheduledScanLine, SchedulerContext,
@@ -183,9 +185,13 @@ impl SchedulingJob for PrimitiveFieldSchedulingJob<'_> {
         self.global_row_offset += cur_page.num_rows;
         self.page_idx += 1;
 
+        // A page that queues a read once its first reads arrive (a string
+        // page's bytes) keeps this I/O until then, which holds back the late
+        // reads of its scheduling step.
+        let page_io: Arc<dyn EncodingsIo> = Arc::new(context.late_read_guard());
         let physical_decoder = cur_page.scheduler.schedule_ranges(
             &ranges_in_page,
-            context.io(),
+            &page_io,
             priority.current_priority(),
         );
 
@@ -326,6 +332,11 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 }
 
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        let dictionary_len = self.physical_decoder.as_ref()?.dictionary_len()?;
+        dictionary_batch_limit(&self.data_type, dictionary_len)
+    }
+
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {

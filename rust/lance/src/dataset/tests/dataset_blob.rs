@@ -54,6 +54,60 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 #[rstest]
+#[case::inline("blob.kind = 0", vec![Some(1), None, Some(2)])]
+#[case::null("blob.kind IS NULL", vec![Some(1), Some(0), Some(0), Some(2), Some(0)])]
+#[tokio::test]
+async fn test_released_blob_descriptor_nulls(
+    #[case] predicate: &str,
+    #[case] remaining: Vec<Option<u8>>,
+) {
+    let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+    let mut dataset = Dataset::open(dir.path_str().as_str()).await.unwrap();
+    // This released fixture has a null blob beside non-null blobs in one fragment.
+    for child in ["kind", "position", "size", "blob_id", "blob_uri"] {
+        let column = format!("blob.{child}");
+        let batch = dataset
+            .scan()
+            .project(&[column.as_str()])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 6);
+        assert_eq!(batch.column(0).null_count(), 1);
+        assert!(batch.column(0).is_null(2));
+
+        let batch = dataset
+            .scan()
+            .project(&[column.as_str()])
+            .unwrap()
+            .filter(&format!("{column} IS NULL"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert!(batch.column(0).is_null(0));
+    }
+    dataset.delete(predicate).await.unwrap();
+    let batch = dataset
+        .scan()
+        .project(&["blob.kind"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<UInt8Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        remaining,
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn managed_append_preserves_primary_base_root_semantics(
     #[values(false, true)] is_dataset_root: bool,
