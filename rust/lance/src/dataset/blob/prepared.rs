@@ -11,6 +11,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 
+use super::external::arrow_field_contains_blob_v2;
 use crate::blob::{blob_v2_layout, validate_prepared_blob_array};
 use lance_arrow::list::ListArrayExt;
 use lance_arrow::r#struct::StructArrayExt;
@@ -239,6 +240,10 @@ fn visit_prepared_blobs(
     field: &Arc<ArrowField>,
     visit: &mut dyn FnMut(BlobKind, u32, u64),
 ) -> Result<()> {
+    // Normalizing a subtree can copy its values, so skip those without blobs.
+    if !arrow_field_contains_blob_v2(field) {
+        return Ok(());
+    }
     if blob_v2_layout(field.as_ref()) == Some(BlobV2Layout::Prepared) {
         validate_prepared_blob_array(field.as_ref(), array)?;
         let values = array.as_struct();

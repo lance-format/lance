@@ -3578,11 +3578,13 @@ async fn blobs_as_logical_keeps_escaped_external_names() {
 }
 
 /// The conversion follows the columns a scan returns: a struct holding only
-/// some of its children, and a nested blob projected beside a top-level blob
-/// of the same name, which keeps its own name.
+/// some of its children, written to another dataset, and a nested blob
+/// projected beside a top-level blob of the same name, which keeps its own
+/// name.
 #[tokio::test]
 async fn blobs_as_logical_follows_the_scanned_columns() {
     let dir = TempStrDir::default();
+    let target_dir = TempStrDir::default();
     let column = |value: &[u8]| {
         let mut builder = BlobArrayBuilder::new(1);
         builder.push_bytes(value).unwrap();
@@ -3618,13 +3620,15 @@ async fn blobs_as_logical_follows_the_scanned_columns() {
     let data = |rows: &RecordBatch, column: &str| blob_bytes(&rows[column].as_struct()["data"]);
     let nested = vec![Some(b"nested".to_vec())];
 
+    // A struct scan keeps the dataset's shape, so it can be written as is.
     let partial = source.schema().project(&["meta.blob"]).unwrap();
     let rows = scan_as_logical(&source, |scan| {
         scan.project_with_schema(&partial).unwrap();
     })
     .await;
+    let target = write_blob_dataset(&target_dir, rows, vec![]).await;
     assert_eq!(
-        blob_bytes(&rows["meta"].as_struct()["blob"].as_struct()["data"]),
+        read_blob_bytes(&target, |rows| rows["meta"].as_struct()["blob"].clone()).await,
         nested
     );
 

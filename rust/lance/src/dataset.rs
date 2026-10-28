@@ -1949,6 +1949,12 @@ impl Dataset {
     /// which is dropped from the result. Blobs inside structs and lists are
     /// converted too. Every payload in the batch is read into memory, so bound
     /// the scan's batch size.
+    ///
+    /// Each column keeps the name it was scanned as, so a nested blob projected
+    /// to the top level is named by its path (`meta.blob`), which a dataset
+    /// cannot be written with: rename it, or scan with
+    /// [`Scanner::project_with_schema`](crate::dataset::scanner::Scanner::project_with_schema)
+    /// to keep the struct.
     pub async fn blobs_as_logical(self: &Arc<Self>, batch: RecordBatch) -> Result<RecordBatch> {
         optimize::transform_blob_v2_batch(self, self.schema(), batch, false).await
     }
