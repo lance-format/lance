@@ -850,7 +850,6 @@ impl InvertedIndex {
                                     operator,
                                     impact_scorer.as_ref(),
                                     metrics.as_ref(),
-                                    false,
                                 )
                                 .await?;
                             if postings.is_empty() {
@@ -1110,7 +1109,7 @@ impl InvertedIndex {
                                     params.as_ref(),
                                     operator,
                                     metrics.as_ref(),
-                                    PostingLoadOptions::cache_aware_exact(false),
+                                    PostingLoadOptions::cache_aware_exact(),
                                     partition_term_ids,
                                 )
                                 .await?
