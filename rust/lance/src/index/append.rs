@@ -1381,7 +1381,7 @@ pub async fn index_field_path(
             metadata.uuid
         ))
     })?;
-    let raw_field_path = dataset.schema().field_path(field_id)?;
+    let raw_field_path = dataset.index_schema()?.field_path(field_id)?;
     let details = super::scalar::fetch_index_details(dataset, &raw_field_path, metadata).await?;
     let resolved_fts = if details.type_url.ends_with("InvertedIndexDetails") {
         let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
@@ -1522,8 +1522,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         ));
     };
 
-    let column = dataset
-        .schema()
+    let schema = dataset.index_schema()?;
+    let column = schema
         .field_by_id(old_indices[0].fields[0])
         .ok_or(Error::index(format!(
             "Append index: column {} does not exist",

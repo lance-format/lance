@@ -26,7 +26,8 @@ pub(super) fn empty_value_row_id_stream(
     dataset: &Dataset,
     field_id: i32,
 ) -> Result<SendableRecordBatchStream> {
-    let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
+    let schema = dataset.index_schema()?;
+    let field = schema.field_by_id(field_id).ok_or_else(|| {
         Error::invalid_input(format!(
             "merge_existing_index_segments: field id {} does not exist",
             field_id
@@ -144,7 +145,7 @@ pub(crate) async fn merge_segments(
             segments[0].uuid
         ))
     })?;
-    let field_path = dataset.schema().field_path(field_id)?;
+    let field_path = dataset.index_schema()?.field_path(field_id)?;
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let (fragment_bitmap, old_data_filters) =

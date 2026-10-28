@@ -2706,9 +2706,9 @@ impl Scanner {
                 return Ok(self);
             }
             // Verify early that the fields exist
+            let schema = self.dataset.index_schema()?;
             for column in ordering {
-                self.dataset
-                    .schema()
+                schema
                     .field(&column.column_name)
                     .ok_or(Error::invalid_input(format!(
                         "Column {} not found",
@@ -2828,7 +2828,7 @@ impl Scanner {
         dataset: &Dataset,
         arrow_schema: &ArrowSchema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        let lance_schema = dataset.schema();
+        let lance_schema = dataset.index_schema()?;
         let field_path = lance_schema
             .resolve_case_insensitive(column_name)
             .ok_or_else(|| {

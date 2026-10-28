@@ -645,6 +645,7 @@ mod test {
     use lance_core::utils::deletion::DeletionVector;
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
@@ -654,6 +655,7 @@ mod test {
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
         scanner::test_dataset::TestVectorDataset,
     };
+    use crate::index::DatasetIndexExt;
 
     use super::*;
 
@@ -1819,17 +1821,32 @@ mod test {
     /// An update keeps the old copy of a row under a deletion vector and writes
     /// its id again in a new fragment. Ignoring deletions must still resolve
     /// the id to the live copy, which takes that fragment's deletion vector.
+    #[rstest]
+    #[case::unindexed(false)]
+    #[case::btree(true)]
     #[tokio::test]
-    async fn test_take_rows_ignore_deletions_after_update() {
+    async fn test_take_rows_ignore_deletions_after_update(#[case] with_btree: bool) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
-        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
             .await
             .unwrap();
+        if with_btree {
+            dataset
+                .create_index(
+                    &[lance_core::ROW_ID],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
         let dataset = UpdateBuilder::new(Arc::new(dataset))
             .update_where("i = 1")
             .unwrap()
@@ -1859,8 +1876,11 @@ mod test {
 
     /// Ignoring deletions resolves and reads the rows without touching a
     /// deletion file, and hands back the deleted rows with their stored values.
+    #[rstest]
+    #[case::unindexed(false)]
+    #[case::btree_after_delete(true)]
     #[tokio::test]
-    async fn test_take_rows_ignore_deletions() {
+    async fn test_take_rows_ignore_deletions(#[case] with_btree: bool) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             max_rows_per_group: 2,
@@ -1872,6 +1892,20 @@ mod test {
             .await
             .unwrap();
         dataset.delete("i in (1, 7)").await.unwrap();
+        if with_btree {
+            dataset
+                .create_index(
+                    &[lance_core::ROW_ID],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        // Training can populate the deletion cache; measure the take itself.
+        dataset.metadata_cache.clear().await;
         let dataset = Arc::new(dataset);
 
         let reads_deletion_file = |dataset: &Dataset| {

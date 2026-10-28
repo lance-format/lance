@@ -1123,6 +1123,13 @@ impl Dataset {
         LanceSchema(self_.ds.schema().clone())
     }
 
+    #[getter(index_schema)]
+    fn index_schema(self_: PyRef<'_, Self>) -> PyResult<LanceSchema> {
+        Ok(LanceSchema(
+            self_.ds.index_schema().infer_error()?.into_owned(),
+        ))
+    }
+
     fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let metadata_options: HashMap<String, Option<String>> =

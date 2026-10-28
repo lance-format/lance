@@ -66,7 +66,9 @@ use lance_index::scalar::{
     lance_format::LanceIndexStore,
 };
 use lance_index::{IndexCriteria, IndexType};
+use lance_table::format::RowIdMeta;
 use lance_table::format::{Fragment, IndexMetadata};
+use lance_table::rowids::{read_row_ids, segment::U64Segment};
 use log::info;
 use prost::{Message, Name};
 use tracing::instrument;
@@ -94,12 +96,10 @@ impl TrainingRequest {
         column: &str,
         criteria: &TrainingCriteria,
     ) -> Result<SendableRecordBatchStream> {
-        let column_field = dataset
-            .schema()
-            .field(column)
-            .ok_or(Error::invalid_input_source(
-                format!("No column with name {}", column).into(),
-            ))?;
+        let schema = dataset.index_schema()?;
+        let column_field = schema.field(column).ok_or(Error::invalid_input_source(
+            format!("No column with name {}", column).into(),
+        ))?;
 
         let mut fields = Vec::with_capacity(3);
         fields.push(arrow_schema::Field::new(
@@ -175,7 +175,13 @@ pub(crate) async fn scan_training_data(
 
     // Note: we don't need to sort for TrainingOrdering::Addresses because
     // Lance will return data in the order of the row_address by default.
-    if TrainingOrdering::Values == criteria.ordering {
+    let row_ids_are_sorted = column == ROW_ID
+        && match &selection {
+            Some(TrainingRows::Fragments(fragments)) => row_id_scan_is_sorted(fragments)?,
+            None => row_id_scan_is_sorted(dataset.fragments())?,
+            Some(TrainingRows::Rows(_)) => false,
+        };
+    if TrainingOrdering::Values == criteria.ordering && !row_ids_are_sorted {
         scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
             column.to_string(),
         )]))?;
@@ -230,6 +236,30 @@ pub(crate) async fn scan_training_data(
     });
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
+}
+
+/// Prove value order from compact inline metadata, without loading spilled
+/// columns or expanding ranges. Arrays and spills take the ordinary sort path.
+fn row_id_scan_is_sorted(fragments: &[Fragment]) -> Result<bool> {
+    let mut previous = None;
+    for fragment in fragments {
+        let Some(RowIdMeta::Inline(bytes)) = &fragment.row_id_meta else {
+            return Ok(false);
+        };
+        let sequence = read_row_ids(bytes)?;
+        for segment in sequence.segments() {
+            if matches!(segment, U64Segment::Array(_)) {
+                return Ok(false);
+            }
+            if let Some(range) = segment.range() {
+                if previous.is_some_and(|last| last >= *range.start()) {
+                    return Ok(false);
+                }
+                previous = Some(*range.end());
+            }
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) async fn load_training_data(
@@ -447,12 +477,10 @@ pub(super) async fn build_scalar_index(
             source.into()
         }
     } else {
-        let field = dataset
-            .schema()
-            .field(column)
-            .ok_or(Error::invalid_input_source(
-                format!("No column with name {}", column).into(),
-            ))?;
+        let schema = dataset.index_schema()?;
+        let field = schema.field(column).ok_or(Error::invalid_input_source(
+            format!("No column with name {}", column).into(),
+        ))?;
         field.into()
     };
 
@@ -696,7 +724,7 @@ pub async fn load_scalar_segment_params(
             segment.keyed_fields()
         ))
     })?;
-    let column = dataset.schema().field_path(field_id)?;
+    let column = dataset.index_schema()?.field_path(field_id)?;
     let details = IndexDetails(fetch_index_details(dataset, &column, segment).await?);
     if details.is_vector() {
         return Err(Error::invalid_input(format!(
@@ -912,13 +940,11 @@ pub(crate) async fn infer_scalar_index_details(
     let index_dir = dataset
         .indice_files_dir(index)?
         .join(index.uuid.to_string());
-    let col = dataset
-        .schema()
-        .field(column)
-        .ok_or(Error::internal(format!(
-            "Index refers to column {} which does not exist in dataset schema",
-            column
-        )))?;
+    let schema = dataset.index_schema()?;
+    let col = schema.field(column).ok_or(Error::internal(format!(
+        "Index refers to column {} which does not exist in dataset schema",
+        column
+    )))?;
 
     let bitmap_page_lookup = index_dir.clone().join(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.clone().join(METADATA_FILE);

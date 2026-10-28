@@ -9016,10 +9016,15 @@ async fn test_manifest_read_recovers_from_stale_size() {
 }
 
 #[rstest]
-#[case::btree("btree", Some(2))]
-#[case::bitmap("bitmap", None)]
+#[case::btree("btree", Some(2), "value")]
+#[case::row_id_btree("btree", Some(2), "_rowid")]
+#[case::bitmap("bitmap", None, "value")]
 #[tokio::test]
-async fn test_load_scalar_segment_params(#[case] index_type: &str, #[case] zone_size: Option<u64>) {
+async fn test_load_scalar_segment_params(
+    #[case] index_type: &str,
+    #[case] zone_size: Option<u64>,
+    #[case] column: &str,
+) {
     let test_uri = TempStrDir::default();
     let batch = arrow_array::record_batch!(
         (
@@ -9036,6 +9041,7 @@ async fn test_load_scalar_segment_params(#[case] index_type: &str, #[case] zone_
         &test_uri,
         Some(WriteParams {
             max_rows_per_file: 3,
+            enable_stable_row_ids: column == "_rowid",
             ..Default::default()
         }),
     )
@@ -9051,7 +9057,7 @@ async fn test_load_scalar_segment_params(#[case] index_type: &str, #[case] zone_
         });
     }
     dataset
-        .create_index(&["value"], IndexType::Scalar, None, &params, false)
+        .create_index(&[column], IndexType::Scalar, None, &params, false)
         .await
         .unwrap();
     drop(dataset);
@@ -9070,7 +9076,7 @@ async fn test_load_scalar_segment_params(#[case] index_type: &str, #[case] zone_
         assert_eq!(recovered.params, None);
     }
     let opened = dataset
-        .open_scalar_index("value", &indices[0].uuid, &NoOpMetricsCollector)
+        .open_scalar_index(column, &indices[0].uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
     assert_eq!(recovered, opened.derive_index_params().unwrap());
@@ -9087,7 +9093,7 @@ async fn test_load_scalar_segment_params(#[case] index_type: &str, #[case] zone_
     );
 
     dataset
-        .create_index(&["value"], IndexType::Scalar, None, &recovered, true)
+        .create_index(&[column], IndexType::Scalar, None, &recovered, true)
         .await
         .unwrap();
     let result = dataset

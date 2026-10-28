@@ -364,16 +364,23 @@ impl<'a> PhysicalDataFileIdentity<'a> {
     }
 }
 
-/// Where each field `indexed_field_ids` depend on is stored in `fragment`:
-/// the indexed fields themselves, and a packed struct holding one. Other
-/// fields sharing a file do not matter.
-fn fragment_field_files<'a>(
+#[derive(PartialEq, Eq)]
+struct IndexedFragmentData<'a> {
+    files: HashMap<i32, PhysicalDataFileIdentity<'a>>,
+    /// Inline values are part of a virtual column's identity just as its file
+    /// is when spilled. Comparing files alone would miss a changed inline ID.
+    row_ids: Option<&'a lance_table::format::RowIdMeta>,
+}
+
+/// The physical sources of the indexed fields, including inline row IDs.
+/// Other fields sharing a data file do not affect this identity.
+fn fragment_indexed_data<'a>(
     dataset: &'a Dataset,
     fragment: &'a Fragment,
     indexed_field_ids: &HashSet<i32>,
-) -> Option<HashMap<i32, PhysicalDataFileIdentity<'a>>> {
+) -> Option<IndexedFragmentData<'a>> {
     let indexed = indexed_field_ids.iter().copied().collect::<Vec<_>>();
-    fragment
+    let files = fragment
         .files
         .iter()
         .flat_map(|file| {
@@ -386,7 +393,12 @@ fn fragment_field_files<'a>(
                         .map(|identity| (*field_id, identity))
                 })
         })
-        .collect()
+        .collect::<Option<HashMap<_, _>>>()?;
+    let row_ids = indexed_field_ids
+        .contains(&lance_core::ROW_ID_FIELD_ID)
+        .then_some(fragment.row_id_meta.as_ref())
+        .flatten();
+    Some(IndexedFragmentData { files, row_ids })
 }
 
 /// Whether `fragment` has an overlay on an `indexed` field committed after `version`.
@@ -578,9 +590,9 @@ async fn indexed_data_differs(
     let (Some(then), Some(now)) = (before.fragment(fragment), after.fragment(fragment)) else {
         return Ok(true);
     };
-    let files_then = fragment_field_files(&before.dataset, then, indexed);
+    let files_then = fragment_indexed_data(&before.dataset, then, indexed);
     if files_then.is_none()
-        || files_then != fragment_field_files(&after.dataset, now, indexed)
+        || files_then != fragment_indexed_data(&after.dataset, now, indexed)
         || indexed_overlays(then, indexed, after.dataset.schema())
             != indexed_overlays(now, indexed, after.dataset.schema())
     {
@@ -789,8 +801,9 @@ async fn fresh_fragments(
 /// column was rewritten, and the segment would answer with the obsolete value.
 fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
+    let schema = dataset.index_schema()?;
     for field_id in fields {
-        let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
+        let field = schema.field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
             ))
@@ -884,13 +897,13 @@ async fn prune_stale_segment_coverage(
                     // A fragment the remap added may have no counterpart at
                     // this version to compare; the overlay check still applies.
                     let changed_files = historical_fragment.is_some_and(|historical_fragment| {
-                        let historical_files = fragment_field_files(
+                        let historical_files = fragment_indexed_data(
                             &historical,
                             historical_fragment,
                             &indexed_field_ids,
                         );
                         let current_files =
-                            fragment_field_files(dataset, current_fragment, &indexed_field_ids);
+                            fragment_indexed_data(dataset, current_fragment, &indexed_field_ids);
                         historical_files.is_none() || historical_files != current_files
                     });
                     let changed_overlays = prune_newer_overlays
@@ -2083,7 +2096,7 @@ pub(crate) async fn remap_index(
         .fields
         .first()
         .expect("An index existed with no fields");
-    let field_path = dataset.schema().field_path(*field_id)?;
+    let field_path = dataset.index_schema()?.field_path(*field_id)?;
 
     let new_id = Uuid::new_v4();
 
@@ -2699,6 +2712,7 @@ impl DatasetIndexExt for Dataset {
         criteria: Option<IndexCriteria<'b>>,
     ) -> Result<Vec<Arc<dyn IndexDescription>>> {
         let indices = self.load_indices().await?;
+        let schema = self.index_schema()?;
         let mut indices = if let Some(criteria) = criteria {
             indices.iter().filter(|idx| {
                 if idx.index_details.is_none() {
@@ -2713,9 +2727,9 @@ impl DatasetIndexExt for Dataset {
                 let fields = idx
                     .keyed_fields()
                     .iter()
-                    .filter_map(|id| self.schema().field_by_id(*id))
+                    .filter_map(|id| schema.field_by_id(*id))
                     .collect::<Vec<_>>();
-                match index_matches_criteria(idx, &criteria, &fields, false, self.schema()) {
+                match index_matches_criteria(idx, &criteria, &fields, false, &schema) {
                     Ok(matched) => matched,
                     Err(err) => {
                         log::warn!("Could not describe index {}: {}", idx.name, err);
@@ -3017,7 +3031,8 @@ impl DatasetIndexExt for Dataset {
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()> {
-        let Some(field) = self.schema().field(column) else {
+        let schema = self.index_schema()?;
+        let Some(field) = schema.field(column) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column}' does not exist"
             )));
@@ -3275,6 +3290,7 @@ impl DatasetIndexExt for Dataset {
         criteria: IndexCriteria<'b>,
     ) -> Result<Option<IndexMetadata>> {
         let indices = self.load_indices().await?;
+        let schema = self.index_schema()?;
 
         let mut indices = indices
             .iter()
@@ -3303,15 +3319,9 @@ impl DatasetIndexExt for Dataset {
             let indices = indices.collect::<Vec<_>>();
             let has_multiple = indices.len() > 1;
             for idx in indices {
-                let field = self.schema().field_by_id(field_id);
+                let field = schema.field_by_id(field_id);
                 if let Some(field) = field
-                    && index_matches_criteria(
-                        idx,
-                        &criteria,
-                        &[field],
-                        has_multiple,
-                        self.schema(),
-                    )?
+                    && index_matches_criteria(idx, &criteria, &[field], has_multiple, &schema)?
                 {
                     let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                         bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
@@ -3529,7 +3539,7 @@ pub(crate) fn optimizable_indices<'a>(
         // merge_indices_with_unindexed_frags.
         if !options.retrain
             && options.num_indices_to_merge.is_none_or(|n| n == 0)
-            && index_group_is_scalar(dataset, &deltas)
+            && index_group_is_scalar(dataset, &deltas)?
             && index_group_has_no_unindexed(dataset, &deltas)
         {
             continue;
@@ -3540,14 +3550,14 @@ pub(crate) fn optimizable_indices<'a>(
     Ok(optimizable)
 }
 
-fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> Result<bool> {
     let Some(field_id) = deltas.first().and_then(|d| d.fields.first()) else {
-        return false;
+        return Ok(false);
     };
-    match dataset.schema().field_by_id(*field_id) {
+    Ok(match dataset.index_schema()?.field_by_id(*field_id) {
         Some(field) => !is_vector_field(field.data_type()),
         None => false,
-    }
+    })
 }
 
 fn index_group_has_no_unindexed(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
@@ -3660,7 +3670,7 @@ async fn index_statistics_scalar(
     metadatas: Vec<IndexMetadata>,
 ) -> Result<String> {
     let field_id = metadatas[0].fields[0];
-    let field_path = ds.schema().field_path(field_id)?;
+    let field_path = ds.index_schema()?.field_path(field_id)?;
 
     let (indices_stats, index_uri, num_indices, updated_at) =
         collect_regular_indices_statistics(ds, metadatas, &field_path).await?;
@@ -4898,7 +4908,7 @@ impl DatasetIndexInternalExt for Dataset {
         &self,
         indices: &[IndexMetadata],
     ) -> Result<ScalarIndexInfo> {
-        let schema = self.schema();
+        let schema = self.index_schema()?;
         let mut indexed_fields = Vec::new();
         // (column, index_name) → union of every contributing IndexMetadata's
         // fragment_bitmap. Multiple entries can land here for delta-merged
@@ -5073,20 +5083,19 @@ impl DatasetIndexInternalExt for Dataset {
         // them to exist and type-match would reject a target that can hold this
         // index perfectly well.
         let keyed_fields = source_index.keyed_fields();
+        let source_schema = source_dataset.index_schema()?;
+        let target_schema = self.index_schema()?;
         let mut field_paths = Vec::with_capacity(keyed_fields.len());
         for field_id in keyed_fields.iter() {
-            let source_field = source_dataset
-                .schema()
-                .field_by_id(*field_id)
-                .ok_or_else(|| {
-                    Error::index(format!(
-                        "Field with id {} not found in source dataset",
-                        field_id
-                    ))
-                })?;
-            let source_field_path = source_dataset.schema().field_path(*field_id)?;
+            let source_field = source_schema.field_by_id(*field_id).ok_or_else(|| {
+                Error::index(format!(
+                    "Field with id {} not found in source dataset",
+                    field_id
+                ))
+            })?;
+            let source_field_path = source_schema.field_path(*field_id)?;
 
-            let target_field = self.schema().field(&source_field_path).ok_or_else(|| {
+            let target_field = target_schema.field(&source_field_path).ok_or_else(|| {
                 Error::index(format!(
                     "Field '{}' required by index '{}' not found in target dataset",
                     source_field_path, index_name
@@ -6837,6 +6846,52 @@ mod tests {
         assert_eq!(details.type_url, "/lance.index.pb.BTreeIndexDetails");
         assert_eq!(IndexDetails(details).get_plugin().unwrap().name(), "BTree");
         assert!(index_type_is_known(&indices[0]));
+        // Loading a value-order lookup permutation must preserve the frozen
+        // reader's address-sorted bitmap results for released index files.
+        let metrics = lance_index::metrics::NoOpMetricsCollector;
+        let index = crate::index::scalar::open_scalar_index(&dataset, "x", &indices[0], &metrics)
+            .await
+            .unwrap();
+        assert!(!dataset.manifest.uses_stable_row_ids());
+        assert!(!index.results_are_row_addresses());
+        let keys = arrow_array::Int64Array::from(vec![
+            Some(17),
+            None,
+            Some(500),
+            Some(999),
+            Some(17),
+            Some(1000),
+        ]);
+        let addresses = dataset.lookup_row_addresses("x", &keys).await.unwrap();
+        assert_eq!(
+            addresses
+                .into_iter()
+                .map(|address| address.map(u64::from))
+                .collect::<Vec<_>>(),
+            vec![Some(17), None, Some(500), Some(999), Some(17), None],
+        );
+        let result = index
+            .search(
+                &lance_index::scalar::SargableQuery::IsIn(
+                    [17, 500, 999]
+                        .into_iter()
+                        .map(|value| datafusion::scalar::ScalarValue::Int64(Some(value)))
+                        .collect(),
+                ),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .row_addrs()
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect::<Vec<_>>(),
+            vec![17, 500, 999],
+        );
     }
 
     #[tokio::test]

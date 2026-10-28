@@ -648,6 +648,68 @@ def test_enable_stable_row_ids(tmp_path: Path):
     assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
+def test_row_id_btree_index(tmp_path: Path):
+    data = pa.table({"i": range(12)})
+    ds = lance.write_dataset(
+        data, tmp_path, enable_stable_row_ids=True, max_rows_per_file=4
+    )
+    ds.create_scalar_index("_rowid", "BTREE", name="row_ids")
+    with pytest.deprecated_call():
+        assert ds.list_indices()[0]["fields"] == ["_rowid"]
+    assert ds.describe_indices()[0].fields == [-3]
+    assert ds.schema.names == ["i"]
+    assert ds._take_rows([9, 1, 9])["i"].to_pylist() == [9, 1, 9]
+    assert ds.to_table(filter="i >= 8")["i"].to_pylist() == [8, 9, 10, 11]
+
+    ds = lance.write_dataset(pa.table({"i": [12, 13]}), tmp_path, mode="append")
+    assert ds._take_rows([13, 1, 13])["i"].to_pylist() == [13, 1, 13]
+    ds.delete("i = 1")
+    ds.update({"i": "100"}, where="i = 5")
+    assert ds._take_rows([5, 9, 5])["i"].to_pylist() == [100, 9, 100]
+    before_compaction = lance.dataset(tmp_path, version=ds.version)
+    ds.update_config(
+        {"lance.row_lineage.spill": "true", "lance.row_lineage.inline_max_bytes": "0"}
+    )
+    ds.optimize.compact_files(target_rows_per_fragment=32)
+    assert ds._take_rows([13, 5, 9])["i"].to_pylist() == [13, 100, 9]
+    assert before_compaction._take_rows([13, 5, 9])["i"].to_pylist() == [13, 100, 9]
+    ds.optimize.optimize_indices()
+    reopened = lance.dataset(tmp_path)
+    with pytest.deprecated_call():
+        assert reopened.list_indices()[0]["fields"] == ["_rowid"]
+    assert reopened._take_rows([13, 5, 9])["i"].to_pylist() == [13, 100, 9]
+
+
+def test_row_id_btree_requires_stable_ids(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"i": [1, 2]}), tmp_path)
+    with pytest.raises(KeyError, match="_rowid not found in schema"):
+        ds.create_scalar_index("_rowid", "BTREE")
+
+
+@pytest.mark.parametrize("start_empty", [True, False])
+def test_row_id_btree_empty_and_reinsert(tmp_path: Path, start_empty: bool):
+    data = pa.table({"i": pa.array([] if start_empty else range(4), type=pa.int64())})
+    ds = lance.write_dataset(
+        data, tmp_path, enable_stable_row_ids=True, max_rows_per_file=2
+    )
+    ds.create_scalar_index("_rowid", "BTREE", name="row_ids")
+    ds.delete("true")
+    assert ds.count_rows() == 0
+    assert ds.describe_indices()[0].fields == [-3]
+    assert ds._take_rows([]).num_rows == 0
+    empty_version = ds.version
+
+    ds = lance.write_dataset(pa.table({"i": [10, 11]}), tmp_path, mode="append")
+    first_id = 0 if start_empty else 4
+    keys = [first_id + 1, first_id, first_id + 1]
+    assert ds._take_rows(keys)["i"].to_pylist() == [11, 10, 11]
+    ds.optimize.optimize_indices()
+    reopened = lance.dataset(tmp_path)
+    assert reopened.describe_indices()[0].fields == [-3]
+    assert reopened._take_rows(keys)["i"].to_pylist() == [11, 10, 11]
+    assert lance.dataset(tmp_path, version=empty_version).count_rows() == 0
+
+
 @pytest.mark.parametrize("enable_stable_row_ids", [True, False])
 @pytest.mark.parametrize(
     "rows",
@@ -3040,7 +3102,10 @@ def test_merge_insert_subcols_preserves_nested_blob(tmp_path: Path, container: s
     "base_version,patch_version",
     [("2.0", "2.2"), ("2.2", "2.0"), ("2.1", "2.3"), ("2.3", "2.1")],
 )
-def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_version):
+@pytest.mark.parametrize("has_row_id_index", [False, True])
+def test_merge_insert_subcols_in_place(
+    tmp_path: Path, base_version, patch_version, has_row_id_index
+):
     """`write_mode("rewrite_columns")` patches the source columns into the
     fragments that already hold the matched rows.
 
@@ -3061,7 +3126,11 @@ def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_versi
         tmp_path / "dataset",
         max_rows_per_file=5,
         data_storage_version=base_version,
+        enable_stable_row_ids=has_row_id_index,
     )
+    if has_row_id_index:
+        dataset.create_scalar_index("_rowid", "BTREE", name="row_ids")
+    original = lance.dataset(dataset.uri, version=dataset.version)
     fragments_before = [f.fragment_id for f in dataset.get_fragments()]
 
     new_values = pa.table(
@@ -3099,6 +3168,10 @@ def test_merge_insert_subcols_in_place(tmp_path: Path, base_version, patch_versi
         expected.filter(pc.greater_equal(expected["b"], 20)).select(["c", "b", "a"])
     )
     assert dataset.take([9, 3, 0, 4, 3]) == expected.take([9, 3, 0, 4, 3])
+    assert original.to_table() == initial_data
+    if has_row_id_index:
+        assert dataset._take_rows([9, 3, 0, 4, 3]) == expected.take([9, 3, 0, 4, 3])
+        assert original._take_rows([3, 4]) == initial_data.take([3, 4])
 
     # Patching columns cannot add rows, so asking for it explicitly on a merge
     # that also inserts is rejected rather than quietly rewriting whole rows.

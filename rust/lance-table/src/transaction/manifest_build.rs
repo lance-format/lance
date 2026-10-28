@@ -833,7 +833,12 @@ impl Transaction {
                         f.deletion_file = updated.deletion_file.clone();
                     }
                 });
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
+                Self::retain_relevant_indices(
+                    &mut final_indices,
+                    &schema,
+                    &final_fragments,
+                    next_row_id.is_some(),
+                )
             }
             Operation::Update {
                 removed_fragment_ids,
@@ -1044,7 +1049,12 @@ impl Transaction {
                 let mut target_ids: HashSet<u64> = HashSet::new();
                 target_ids.extend(new_fragments.iter().map(|f| f.id));
                 final_fragments.extend(new_fragments);
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
+                Self::retain_relevant_indices(
+                    &mut final_indices,
+                    &schema,
+                    &final_fragments,
+                    next_row_id.is_some(),
+                );
 
                 if !compacted_sstables.is_empty() {
                     update_mem_wal_index_compacted_sstables(
@@ -1344,7 +1354,12 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
+                Self::retain_relevant_indices(
+                    &mut final_indices,
+                    &schema,
+                    &final_fragments,
+                    next_row_id.is_some(),
+                )
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -1369,7 +1384,12 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
+                Self::retain_relevant_indices(
+                    &mut final_indices,
+                    &schema,
+                    &final_fragments,
+                    next_row_id.is_some(),
+                )
             }
             Operation::Restore { .. } => {
                 unreachable!()

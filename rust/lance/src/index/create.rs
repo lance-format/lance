@@ -186,6 +186,7 @@ impl<'a> CreateIndexBuilder<'a> {
             ));
         }
         let column_input = &self.columns[0];
+        let index_schema = self.dataset.index_schema()?;
         let scalar_fts_request = self.index_type == IndexType::Scalar
             && self
                 .params
@@ -257,7 +258,7 @@ impl<'a> CreateIndexBuilder<'a> {
             .unwrap_or(column_input);
         // Use case-insensitive lookup for both simple and nested paths.
         // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
-        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(lookup_column) else {
+        let Some(field_path) = index_schema.resolve_case_insensitive(lookup_column) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column_input}' does not exist"
             )));
@@ -287,6 +288,14 @@ impl<'a> CreateIndexBuilder<'a> {
             .as_ref()
             .map(|resolved| resolved.canonical_path.as_str())
             .unwrap_or(quoted_column.as_str());
+
+        if field.id == lance_core::ROW_ID_FIELD_ID
+            && !((self.index_type == IndexType::Scalar || self.index_type == IndexType::BTree)
+                && self.params.as_any().downcast_ref::<ScalarIndexParams>()
+                    .is_some_and(|params| params.index_type.eq_ignore_ascii_case("btree")))
+        {
+            return Err(Error::invalid_input("Only BTREE indices are supported on _rowid"));
+        }
 
         // A fragment list naming the whole table is a whole-table build, not a
         // subset: `effective_vector_fragments` normalizes it to `None` so a
@@ -773,7 +782,8 @@ impl<'a> CreateIndexBuilder<'a> {
         }
 
         let column_input = &self.columns[0];
-        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
+        let index_schema = self.dataset.index_schema()?;
+        let Some(field_path) = index_schema.resolve_case_insensitive(column_input) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column_input}' does not exist"
             )));

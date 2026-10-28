@@ -685,7 +685,7 @@ pub struct PyIndexDescription {
     /// The short type of the index (may not be unique)
     pub index_type: String,
     /// The ids of the fields that the index is built on
-    pub fields: Vec<u32>,
+    pub fields: Vec<i32>,
     /// The full paths of the fields that the index is built on
     /// (dotted, with backtick-quoted segments for non-identifier names)
     pub field_names: Vec<String>,
@@ -707,8 +707,8 @@ impl PyIndexDescription {
             .iter()
             .map(|field| {
                 dataset
-                    .schema()
-                    .field_path_minimal(*field as i32)
+                    .index_schema()
+                    .and_then(|schema| schema.field_path_minimal(*field as i32))
                     .unwrap_or_else(|_| "<unknown>".to_string())
             })
             .collect();
@@ -723,7 +723,7 @@ impl PyIndexDescription {
 
         Self {
             name: index.name().to_string(),
-            fields: index.field_ids().to_vec(),
+            fields: index.field_ids().iter().map(|id| *id as i32).collect(),
             field_names,
             index_type: index.index_type().to_string(),
             segments,

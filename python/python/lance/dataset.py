@@ -3641,7 +3641,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-        lance_field = self._ds.lance_schema.field_case_insensitive(column)
+        lance_field = self._ds.index_schema.field_case_insensitive(column)
 
         if isinstance(index_type, str):
             index_type = index_type.upper()
@@ -4053,6 +4053,15 @@ class LanceDataset(pa.dataset.Dataset):
                 "category",
                 "BTREE",
             )
+
+        On a dataset created with ``enable_stable_row_ids=True``, a BTree on
+        ``_rowid`` can serve row-ID takes. It is an ordinary scalar index:
+        ``dataset.optimize.optimize_indices()`` incorporates newly appended fragments,
+        and takes scan any fragments the index does not yet cover.
+
+        .. code-block:: python
+
+            dataset.create_scalar_index("_rowid", "BTREE")
 
         Scalar indices can only speed up scans for basic filters using
         equality, comparison, range (e.g. ``my_col BETWEEN 0 AND 100``), and set

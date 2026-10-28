@@ -517,6 +517,38 @@ of this, it's recommended to rewrite files before re-building indices.
 
 <!-- TODO: remove this last comment once stable row ids are default. -->
 
+### Look up stable row IDs with a BTree
+
+On a dataset created with `enable_stable_row_ids=True`, an ordinary BTree on
+`_rowid` can resolve stable IDs to physical row addresses without loading the
+whole dataset's reverse mapping into memory:
+
+```python
+dataset.create_scalar_index("_rowid", "BTREE", name="row_ids")
+```
+
+This index is opt-in. New fragments are not automatically indexed; use
+`dataset.optimize.optimize_indices()` to bring its coverage up to date. Compact
+inline row-ID ranges can be resolved directly, even without an index. Other
+uncovered fragments fall back to scanning their `_rowid` values, so a warmed
+lookup can still be expensive when a large part of the dataset is uncovered.
+
+Compaction preserves stable IDs but changes physical row addresses. The default
+compaction path eagerly remaps this BTree and preserves its existing coverage.
+Index maintenance can then consolidate segments and index previously uncovered
+fragments:
+
+```python
+dataset.optimize.compact_files(target_rows_per_fragment=1024 * 1024)
+dataset.optimize.optimize_indices()
+```
+
+Any uncovered fragments remain queryable through direct inline-range lookup or
+scanning. Old dataset versions continue to use their own data and
+index metadata. Keeping coverage through deferred address remapping on a
+stable-row-ID table depends on Fragment Reuse Index support in the deployed
+build; it is not enabled in release builds of this implementation.
+
 ### Cleanup old versions
 
 Lance is an immutable format — every write creates a new version. The new version
