@@ -33,7 +33,9 @@ pub type ShardId = Uuid;
 pub struct SsTable {
     pub generation: u64,
     pub path: String,
-    /// Payload size of the rows, as the writer's MemTable accounted for them.
+    /// Payload size of the rows, as the writer's MemTable accounted for them,
+    /// plus the payload of the blob values the generation keeps in packed and
+    /// dedicated sidecar files.
     ///
     /// An estimate of the payload, not a bound on what reading the SSTable
     /// costs: it excludes the per-array structure a reader materializes, so a
