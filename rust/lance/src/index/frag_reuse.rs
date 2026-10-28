@@ -64,43 +64,13 @@ impl std::fmt::Debug for ResolvedRemapping {
     }
 }
 
-/// Cache key for fragment reuse history with `index_version = 0` and the
-/// mappings decoded from it.
-///
-/// A writer can change the history without changing its UUID. Include the
-/// history contents and storage location in the key so we don't reuse an old
-/// mapping. Referenced files are immutable once published.
-pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uuid {
-    fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lance.frag_reuse.v0_cache_identity");
-    hasher.update(entry.uuid.as_bytes());
-    if let Some(base_id) = entry.base_id {
-        hasher.update(&base_id.to_le_bytes());
-        if let Some(base) = dataset.manifest.base_paths.get(&base_id) {
-            hasher.update(&[u8::from(base.is_dataset_root)]);
-            update_sized(&mut hasher, base.path.as_bytes());
-        }
-    }
-    if let Some(details) = &entry.index_details {
-        update_sized(&mut hasher, details.type_url.as_bytes());
-        update_sized(&mut hasher, &details.value);
-    }
-    let mut identity = [0; 16];
-    identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-    Uuid::from_bytes(identity)
-}
-
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the history, by its
-/// [`v0_cache_identity`], identify cached content. Under a tagged history the
-/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
-/// for transitions a segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the FRI entry's UUID
+/// identify cached content. Under a tagged history the FRI UUID is
+/// deliberately left out: every rewrite and trim mints a new one, even for
+/// transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
@@ -503,9 +473,7 @@ pub(crate) async fn plan_staged_segments(
     Ok(Some(plans))
 }
 
-/// Resolve the FRI remapper shared by scalar and vector index loading, with
-/// its cache identity: [`v0_cache_identity`] for `index_version = 0`, or the
-/// entry UUID for tagged history.
+/// Resolve the FRI remapper shared by scalar and vector index loading.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -542,7 +510,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
     if fri.index_version == 0 {
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
             (
-                v0_cache_identity(dataset, fri),
+                legacy.uuid,
                 ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
             )
         }));

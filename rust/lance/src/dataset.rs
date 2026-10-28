@@ -2716,23 +2716,6 @@ impl Dataset {
         self.object_store(index.base_id).await
     }
 
-    /// This table as a reader of `manifest`, another manifest of it, sees its
-    /// files: through that manifest's base paths, with base stores opened
-    /// afresh when those differ, since `base_object_stores` caches by id alone.
-    pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
-        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
-            self.base_object_stores.clone()
-        } else {
-            Default::default()
-        };
-        Self {
-            fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
-            manifest,
-            base_object_stores,
-            ..self.clone()
-        }
-    }
-
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
         match deletion_file.base_id.as_ref() {
             Some(base_id) => {

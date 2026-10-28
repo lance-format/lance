@@ -1091,10 +1091,7 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
         if let Some(fri) = fri {
             assert_eq!(fri.index_version, 0);
             let (uuid, remapping) = resolved.unwrap();
-            assert_eq!(
-                uuid,
-                super::super::frag_reuse::v0_cache_identity(dataset, fri)
-            );
+            assert_eq!(uuid, fri.uuid);
             let super::super::frag_reuse::ResolvedRemapping::V0(remapper) = remapping else {
                 panic!("V1 must use the synchronous remapper");
             };
