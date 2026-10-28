@@ -33,14 +33,11 @@
 //! stabilization vote does not pass. Nothing in this module is a
 //! compatibility contract.
 //!
-//! Committing a [`CompositeOperation`] is a durable compatibility break, not
-//! merely a feature an older reader ignores: a table version carrying one
-//! cannot be *opened* by Lance before v12.0.0. Those releases decode the
-//! manifest's inline transaction while opening the table, and an operation
-//! they do not know decodes to no operation at all, which fails the open. The
-//! fix shipped in v12.0.0 and is not expected to be backported, so writing one
-//! raises that table's minimum reader version. See
-//! <https://github.com/lance-format/lance/issues/9454>.
+//! Any reader can open a table version committed as a [`CompositeOperation`],
+//! since the inline transaction lives in a manifest field older readers ignore
+//! (<https://github.com/lance-format/lance/pull/9482>). Lance before v14.0.0
+//! fails only when it decodes the transaction itself, to read history or to
+//! check a concurrent commit for conflicts.
 
 /// The action vocabulary, as one list.
 ///
