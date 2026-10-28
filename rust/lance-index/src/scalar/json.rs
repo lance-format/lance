@@ -65,6 +65,30 @@ impl JsonIndex {
     }
 }
 
+/// The pre-migration, row-id-domain version for `builtin`'s on-disk format, if it has
+/// one (BTree, Bitmap, and LabelList are the only builtins with a second, address-domain
+/// format -- see `BTREE_ROW_ID_DOMAIN_VERSION`, `BITMAP_ROW_ID_DOMAIN_VERSION`, and
+/// `LABEL_LIST_ROW_ID_DOMAIN_VERSION`).
+fn legacy_row_id_domain_version(builtin_name: &str) -> Option<u32> {
+    [
+        (
+            BuiltinIndexType::BTree,
+            crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
+        ),
+        (
+            BuiltinIndexType::Bitmap,
+            crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
+        ),
+        (
+            BuiltinIndexType::LabelList,
+            crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
+        ),
+    ]
+    .into_iter()
+    .find(|(builtin, _)| builtin_name.eq_ignore_ascii_case(builtin.as_str()))
+    .map(|(_, version)| version)
+}
+
 impl DeepSizeOf for JsonIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.target_index.deep_size_of_children(context) + self.path.deep_size_of_children(context)
@@ -1076,7 +1100,7 @@ impl BasicTrainer for JsonIndexPlugin {
             &Field::new("", target_type, true),
         )?;
 
-        let target_index = target_trainer
+        let mut target_index = target_trainer
             .train_index(
                 converted_stream,
                 index_store,
@@ -1085,6 +1109,17 @@ impl BasicTrainer for JsonIndexPlugin {
                 progress,
             )
             .await?;
+
+        // BTree, Bitmap, and LabelList's `BasicTrainer::train_index` always reports the
+        // current (address-domain) version: that generic path has no dataset awareness
+        // to tell whether a row id and a row address coincide, unlike `build_scalar_index`
+        // in the `lance` crate, which downgrades to the row-id-domain version itself for
+        // exactly that reason. A JSON-wrapped target is never built on a stable-row-id
+        // dataset (`build_scalar_index`'s guard refuses one), so a row id and a row
+        // address always coincide here, and the row-id-domain version is always correct.
+        if let Some(floor_version) = legacy_row_id_domain_version(target_plugin.name()) {
+            target_index.index_version = floor_version;
+        }
 
         let index_details = crate::pb::JsonIndexDetails {
             path,
@@ -1169,25 +1204,8 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         // is that this is an old index written before `target_index_version` was added.
         // These indexes were the old versions that stored row ids and not row addresses.
         let target_index_version = json_details.target_index_version.unwrap_or_else(|| {
-            [
-                (
-                    BuiltinIndexType::BTree,
-                    crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
-                ),
-                (
-                    BuiltinIndexType::Bitmap,
-                    crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
-                ),
-                (
-                    BuiltinIndexType::LabelList,
-                    crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
-                ),
-            ]
-            .into_iter()
-            .find(|(builtin, _)| target_plugin.name().eq_ignore_ascii_case(builtin.as_str()))
-            .map(|(_, version)| version)
-            // Minhash, ngram, and rtree
-            .unwrap_or(0)
+            // Minhash, ngram, and rtree have no row-id-domain version of their own.
+            legacy_row_id_domain_version(target_plugin.name()).unwrap_or(0)
         });
 
         let target_index = target_plugin
