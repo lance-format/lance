@@ -810,17 +810,22 @@ async fn add_columns_from_stream(
                     }
                 }
 
-                let new_batch =
-                    arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
-
                 // Reject nulls the dataset's file format cannot store (e.g. integer
                 // nulls on Legacy), matching the hash-join based merge path, instead
                 // of silently writing them as default values.
-                for (field, column) in new_batch.schema().fields().iter().zip(new_batch.columns()) {
-                    HashJoiner::check_lance_support_null(field.name(), column, updater.dataset())?;
+                for batch in &batches {
+                    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                        HashJoiner::check_lance_support_null(
+                            field.name(),
+                            column,
+                            updater.dataset(),
+                        )?;
+                    }
                 }
 
-                updater.update(new_batch).await?;
+                // Concatenating these could overflow 32-bit offsets once they hold
+                // more than 2 GiB of variable-width values.
+                updater.update_batches(batches).await?;
             }
             updater.finish().await
         }
@@ -1719,6 +1724,7 @@ mod test {
     }
 
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use arrow_array::builder::BinaryBuilder;
     use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, ListArray,
@@ -2901,6 +2907,179 @@ mod test {
             "expected the add_blanks rejection, got: {err}"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_stream_batches_preserve_deleted_row_alignment() -> Result<()> {
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..12))],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://stream-batch-deletion-alignment",
+            Some(WriteParams {
+                max_rows_per_file: 6,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // This leaves a fully deleted read batch [4..6), as well as deleted
+        // rows at the boundary of the neighboring read batches.
+        dataset.delete("i >= 2 AND i < 10").await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("binary", DataType::Binary, true),
+            ArrowField::new("string", DataType::Utf8, true),
+            ArrowField::new("fixed", DataType::Int32, true),
+        ]));
+        let output_batch = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"b0".as_ref()),
+                    Some(b"b1".as_ref()),
+                    Some(b"b10".as_ref()),
+                    Some(b"b11".as_ref()),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("s0"),
+                    None,
+                    Some("s10"),
+                    Some("s11"),
+                ])),
+                Arc::new(Int32Array::from(
+                    [0, 1, 10, 11]
+                        .into_iter()
+                        .map(|value| Some(value * 10))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )?;
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(output_batch.slice(0, 1)),
+                Ok(output_batch.slice(1, 0)),
+                Ok(output_batch.slice(1, 2)),
+                Ok(output_batch.slice(3, 1)),
+            ],
+            output_schema.clone(),
+        );
+        dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(4))
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 4);
+        let expected_binary = BinaryArray::from(vec![
+            Some(b"b0".as_ref()),
+            Some(b"b1".as_ref()),
+            Some(b"b10".as_ref()),
+            Some(b"b11".as_ref()),
+        ]);
+        let expected_string = StringArray::from(vec![Some("s0"), None, Some("s10"), Some("s11")]);
+        let expected_fixed = Int32Array::from(vec![Some(0), Some(10), Some(100), Some(110)]);
+        assert_eq!(
+            data.column_by_name("binary").unwrap().as_ref(),
+            &expected_binary
+        );
+        assert_eq!(
+            data.column_by_name("string").unwrap().as_ref(),
+            &expected_string
+        );
+        assert_eq!(
+            data.column_by_name("fixed").unwrap().as_ref(),
+            &expected_fixed
+        );
+        Ok(())
+    }
+
+    #[ignore = "requires ~5 GiB RAM; run manually"]
+    #[tokio::test]
+    async fn test_add_columns_binary_column_over_2gib() -> Result<()> {
+        const NUM_ROWS: usize = 1_100;
+        const VALUE_SIZE: usize = 2 * 1024 * 1024;
+        const STREAM_BATCH_SIZE: usize = 10;
+
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..NUM_ROWS as i32))],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://add-columns-over-2gib",
+            Some(WriteParams {
+                max_rows_per_file: NUM_ROWS + 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        let mut output_batches = Vec::with_capacity(NUM_ROWS / STREAM_BATCH_SIZE);
+        for start in (0..NUM_ROWS).step_by(STREAM_BATCH_SIZE) {
+            let end = (start + STREAM_BATCH_SIZE).min(NUM_ROWS);
+            let mut builder = BinaryBuilder::with_capacity(end - start, (end - start) * VALUE_SIZE);
+            for row in start..end {
+                let mut value = vec![0; VALUE_SIZE];
+                value[0] = (row % 251) as u8;
+                builder.append_value(value);
+            }
+            output_batches.push(Ok(RecordBatch::try_new(
+                output_schema.clone(),
+                vec![Arc::new(builder.finish())],
+            )?));
+        }
+
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    output_batches,
+                    output_schema,
+                ))),
+                None,
+                Some(NUM_ROWS as u32),
+            )
+            .await?;
+        dataset.validate().await?;
+
+        let mut scanner = dataset.scan();
+        scanner.batch_size(STREAM_BATCH_SIZE);
+        let mut stream = scanner.try_into_stream().await?;
+        let mut rows_seen = 0;
+        while let Some(batch) = stream.try_next().await? {
+            let payload = batch
+                .column_by_name("payload")
+                .ok_or_else(|| Error::internal("payload column missing from scan"))?
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::internal("payload column has unexpected type"))?;
+            for row in 0..payload.len() {
+                assert_eq!(payload.value(row).len(), VALUE_SIZE);
+                assert_eq!(payload.value(row)[0], ((rows_seen + row) % 251) as u8);
+            }
+            rows_seen += payload.len();
+        }
+        assert_eq!(rows_seen, NUM_ROWS);
         Ok(())
     }
 

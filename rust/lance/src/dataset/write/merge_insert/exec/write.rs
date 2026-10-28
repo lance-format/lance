@@ -31,6 +31,7 @@ use lance_table::rowids::version::rechunk_version_sequences;
 use lance_table::rowids::{RowIdSequence, rechunk_sequences, write_row_ids};
 use roaring::RoaringTreemap;
 
+use crate::dataset::blob::BlobPayloadInventory;
 use crate::dataset::rowids::place_carried_row_lineage;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
@@ -51,7 +52,7 @@ use crate::{
                 MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
                 exec::MergeInsertMetrics,
             },
-            write_fragments_internal,
+            write_fragments_internal_impl,
         },
     },
 };
@@ -283,6 +284,7 @@ pub struct FullSchemaMergeInsertExec {
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
+    created_blob_payloads: BlobPayloadInventory,
     source_skipped_duplicates: Arc<AtomicU64>,
     source_blob_columns: Vec<String>,
     /// The caller's write parameters for the data files this node writes.
@@ -334,6 +336,7 @@ impl FullSchemaMergeInsertExec {
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
+            created_blob_payloads: BlobPayloadInventory::default(),
             source_skipped_duplicates,
             source_blob_columns,
             write_params,
@@ -364,6 +367,12 @@ impl FullSchemaMergeInsertExec {
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())
+    }
+
+    /// The managed blob payloads this execution created, whether or not it
+    /// completed.
+    pub(crate) fn created_blob_payloads(&self) -> &BlobPayloadInventory {
+        &self.created_blob_payloads
     }
 
     /// Returns the filter for inserted row keys if the execution has completed.
@@ -678,6 +687,7 @@ impl FullSchemaMergeInsertExec {
     /// Consume all output groups concurrently, retaining update-first order.
     /// A failed writer closes the splitter and waits for its sibling so every
     /// completed file is available for cleanup before the error is returned.
+    #[allow(clippy::too_many_arguments)]
     async fn write_groups(
         dataset: &Dataset,
         params: &MergeInsertParams,
@@ -686,6 +696,7 @@ impl FullSchemaMergeInsertExec {
         write_params: &WriteParams,
         source_blob_columns: &[String],
         target_bases: Option<Vec<TargetBaseInfo>>,
+        created_blob_payloads: &BlobPayloadInventory,
     ) -> lance_core::Result<(Vec<Fragment>, usize)> {
         let writes = streams.into_iter().map(|stream| {
             let splitter = splitter.clone();
@@ -730,7 +741,7 @@ impl FullSchemaMergeInsertExec {
                         Box::pin(RecordBatchStreamAdapter::new(schema, validated))
                             as SendableRecordBatchStream
                     };
-                    let (fragments, _) = write_fragments_internal(
+                    let (fragments, _) = write_fragments_internal_impl(
                         params.write_version(dataset),
                         Some(dataset),
                         dataset.object_store.clone(),
@@ -739,6 +750,10 @@ impl FullSchemaMergeInsertExec {
                         stream,
                         write_params.clone(),
                         target_bases,
+                        None,
+                        None,
+                        false,
+                        Some(created_blob_payloads.clone()),
                     )
                     .await?;
                     Ok(fragments)
@@ -1171,6 +1186,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
+            created_blob_payloads: self.created_blob_payloads.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             source_blob_columns: self.source_blob_columns.clone(),
             write_params: self.write_params.clone(),
@@ -1292,6 +1308,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let compacted_sstables = self.params.compacted_sstables.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let source_blob_columns = self.source_blob_columns.clone();
+        let created_blob_payloads = self.created_blob_payloads.clone();
         let caller_write_params = self.write_params.clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
@@ -1328,6 +1345,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 &write_params,
                 checked_source_blob_columns,
                 target_bases_info,
+                &created_blob_payloads,
             )
             .await?;
             let lineage_result: lance_core::Result<()> = async {
@@ -1666,6 +1684,7 @@ mod tests {
                 &params,
                 &[],
                 None,
+                &BlobPayloadInventory::default(),
             ),
         )
         .await
