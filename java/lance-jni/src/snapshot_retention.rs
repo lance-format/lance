@@ -16,11 +16,11 @@ use crate::{
 };
 
 pub(crate) fn dataset(env: &mut JNIEnv, object: JObject) -> Result<Arc<lance::Dataset>> {
-    Ok(Arc::new(
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(object, NATIVE_DATASET) }?
-            .inner
-            .clone(),
-    ))
+    let _monitor = env.lock_obj(&object)?;
+    let native = unsafe { env.get_rust_field::<_, _, BlockingDataset>(&object, NATIVE_DATASET) }?;
+    let dataset = native.inner.clone();
+    drop(native);
+    Ok(Arc::new(dataset))
 }
 
 pub(crate) fn java_bytes(env: &JNIEnv, bytes: &[u8]) -> Result<jbyteArray> {

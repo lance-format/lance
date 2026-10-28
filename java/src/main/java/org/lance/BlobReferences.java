@@ -17,21 +17,23 @@ import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
 /**
- * Portable Blob V2 capture, transport, planned reads, and explicit snapshot retention.
+ * Portable Blob V2 capture, transport, and planned reads.
  *
  * <p>Locations and contexts are opaque protobuf messages validated by Rust. Workers must open the
  * exact source snapshot with independently resolved credentials. Check {@link
  * #getProtocolVersion()} and {@link #getSupportedCapabilities()} before scheduling workers. Capture
- * does not retain a snapshot; acquire {@link Retention} before issuing references.
+ * does not retain a snapshot; acquire {@link SnapshotRetention} before issuing references.
  *
  * <p>All indices, versions, offsets, lengths, and budgets use unsigned 64-bit values represented by
  * Java long bit patterns. Use {@link Long#parseUnsignedLong(String)} when needed. Native validation
@@ -39,7 +41,8 @@ import java.util.Objects;
  *
  * <pre>{@code
  * SourceContext source = SourceContext.fromDataset(dataset, "catalog/table", "worker/storage");
- * Retention retention = Retention.acquire(dataset, source, uniqueQueryId);
+ * SnapshotRetention retention =
+ *     SnapshotRetention.acquire(dataset, source.getSnapshotIdentity(), uniqueQueryId);
  * try (Capture capture = Capture.create(dataset, source, fieldId);
  *      Reader reader = Reader.create(List.of(source), List.of(workerDataset), 8 << 20, 32 << 20)) {
  *   Batch refs = capture.capture(source, scannedBatch, "blob", allocator);
@@ -101,8 +104,12 @@ public final class BlobReferences {
         String accessContextKey,
         boolean assumeImmutableExternal)
         throws IOException {
-      return new SourceContext(
-          captureContextNative(dataset, tableIdentity, accessContextKey, assumeImmutableExternal));
+      Preconditions.checkNotNull(dataset);
+      try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+        return new SourceContext(
+            captureContextNative(
+                dataset, tableIdentity, accessContextKey, assumeImmutableExternal));
+      }
     }
 
     /** Validate a source message from another process before binding it. */
@@ -217,7 +224,10 @@ public final class BlobReferences {
     private Capture() {}
 
     public static Capture create(Dataset dataset, SourceContext context, int fieldId) {
-      return createCaptureNative(dataset, context.encoded, fieldId);
+      Preconditions.checkNotNull(dataset);
+      try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+        return createCaptureNative(dataset, context.encoded, fieldId);
+      }
     }
 
     /**
@@ -295,11 +305,19 @@ public final class BlobReferences {
         List<Dataset> datasets,
         long ioBufferSizeBytes,
         long materializationReadaheadBytes) {
-      return createReaderNative(
-          encodeContexts(contexts),
-          datasets.toArray(new Dataset[0]),
-          ioBufferSizeBytes,
-          materializationReadaheadBytes);
+      Preconditions.checkNotNull(datasets);
+      Dataset[] bindings = datasets.toArray(new Dataset[0]);
+      List<LockManager.ReadLock> readLocks = new ArrayList<>(bindings.length);
+      try {
+        for (Dataset dataset : bindings) {
+          Preconditions.checkNotNull(dataset);
+          readLocks.add(dataset.acquireReadLock());
+        }
+        return createReaderNative(
+            encodeContexts(contexts), bindings, ioBufferSizeBytes, materializationReadaheadBytes);
+      } finally {
+        for (int i = readLocks.size() - 1; i >= 0; i--) readLocks.get(i).close();
+      }
     }
 
     /** Submit a finite request set. Validation happens before payload I/O. */
@@ -360,53 +378,6 @@ public final class BlobReferences {
     }
   }
 
-  /**
-   * Durable explicit-release GC root. All cleanup clients must use Lance retention coordination.
-   * Query tags have no expiry or renewal; maintenance owners have fixed expiration. Foreign dataset
-   * bases require separate owner protection and are rejected; external objects follow their own
-   * immutability contract. Dropping the token never releases it. Recover orphaned tags only after
-   * all query consumers have stopped.
-   *
-   * <p>The coordinator must persist the query ID and encoded source context before acquisition,
-   * persist the token before exporting references, and record release intent before release.
-   * Recover a lost release response by retrying release with the saved token.
-   */
-  public static final class Retention {
-    private final byte[] encoded;
-
-    private Retention(byte[] encoded) {
-      this.encoded = encoded;
-    }
-
-    /** Acquire before issuing refs; retentionId must be globally unique to this query. */
-    public static Retention acquire(Dataset dataset, SourceContext context, String retentionId)
-        throws IOException {
-      return new Retention(acquireRetentionNative(dataset, context.encoded, retentionId));
-    }
-
-    public byte[] encode() {
-      return encoded.clone();
-    }
-
-    /** Validate a transported token. Decoding does not acquire retention. */
-    public static Retention decode(byte[] encoded) {
-      return new Retention(validateRetentionNative(encoded));
-    }
-
-    public SourceContext getContext() {
-      return SourceContext.decode(retentionContextNative(encoded));
-    }
-
-    public String getTagName() {
-      return retentionTagNative(encoded);
-    }
-
-    /** Idempotent. Release only after every worker, retry, and outstanding read has stopped. */
-    public void release(Dataset dataset) throws IOException {
-      releaseRetentionNative(dataset, encoded);
-    }
-  }
-
   private static byte[][] encodeContexts(List<SourceContext> contexts) {
     byte[][] encoded = new byte[contexts.size()][];
     for (int i = 0; i < contexts.size(); i++) encoded[i] = contexts.get(i).encoded;
@@ -462,17 +433,5 @@ public final class BlobReferences {
 
   private static native long reservedBytesNative(Reader reader, boolean io);
 
-  private static native byte[] acquireRetentionNative(
-      Dataset dataset, byte[] context, String retentionId) throws IOException;
-
   private static native byte[] snapshotIdentityNative(byte[] context);
-
-  private static native byte[] validateRetentionNative(byte[] retention);
-
-  private static native byte[] retentionContextNative(byte[] retention);
-
-  private static native String retentionTagNative(byte[] retention);
-
-  private static native void releaseRetentionNative(Dataset dataset, byte[] retention)
-      throws IOException;
 }

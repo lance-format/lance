@@ -26,7 +26,6 @@ from lance.blob import (
     BlobRefBatch,
     BlobRefCapture,
     BlobRefReader,
-    BlobSnapshotRetention,
     BlobSourceContext,
     BlobType,
 )
@@ -3494,7 +3493,9 @@ def portable_blob_references(tmp_path):
         data_storage_version="2.2",
     )
     source = BlobSourceContext.from_dataset(dataset, "catalog/portable", "workers")
-    retention = BlobSnapshotRetention.acquire(dataset, source, str(uuid.uuid4()))
+    retention = lance.SnapshotRetention.acquire(
+        dataset, source.snapshot_identity(), str(uuid.uuid4())
+    )
     try:
         batch = (
             dataset.to_table(
@@ -3626,17 +3627,15 @@ def test_portable_blob_references_in_separate_process(
     token_path = tmp_path / "retention.bin"
     token_path.write_bytes(retention.encode())
     dataset.delete("true")
-    dataset.cleanup_old_versions(
-        older_than=timedelta(0), error_if_tagged_old_versions=False
-    )
+    dataset.cleanup_old_versions(older_than=timedelta(0))
     script = textwrap.dedent("""
         import sys
         from pathlib import Path
         import lance
         refs = lance.BlobRefBatch.decode(Path(sys.argv[1]).read_bytes())
         source = refs.contexts[0]
-        retention = lance.BlobSnapshotRetention.decode(Path(sys.argv[2]).read_bytes())
-        assert retention.context.encode() == source.encode()
+        retention = lance.SnapshotRetention.decode(Path(sys.argv[2]).read_bytes())
+        assert retention.snapshot.encode() == source.snapshot_identity().encode()
         worker = lance.dataset(source.table_uri, version=source.version)
         with lance.BlobRefReader([(source, worker)], io_buffer_size_bytes=1024,
                                  materialization_readahead_bytes=1024) as reader:

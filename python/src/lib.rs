@@ -297,9 +297,12 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<blob_reference::PyBlobRefCapture>()?;
     m.add_class::<blob_reference::PyBlobRefReader>()?;
     m.add_class::<blob_reference::PyBlobRefReadStream>()?;
-    m.add_class::<blob_reference::PyBlobSnapshotRetention>()?;
     m.add_class::<snapshot_retention::PySnapshotIdentity>()?;
     m.add_class::<snapshot_retention::PySnapshotRetention>()?;
+    m.add(
+        "RefConflictError",
+        m.py().get_type::<error::RefConflictError>(),
+    )?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileWriteSummary>()?;

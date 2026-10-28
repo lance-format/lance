@@ -13,6 +13,8 @@
  */
 package org.lance;
 
+import org.apache.arrow.util.Preconditions;
+
 import java.io.IOException;
 
 /**
@@ -42,7 +44,10 @@ public final class SnapshotRetention {
   /** Protect the exact snapshot before work. retentionId must identify one query lifetime. */
   public static SnapshotRetention acquire(
       Dataset dataset, SnapshotIdentity snapshot, String retentionId) throws IOException {
-    return new SnapshotRetention(acquireNative(dataset, snapshot.encode(), retentionId));
+    Preconditions.checkNotNull(dataset);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return new SnapshotRetention(acquireNative(dataset, snapshot.encode(), retentionId));
+    }
   }
 
   /** Validate a token without acquiring or renewing protection. */
@@ -67,7 +72,10 @@ public final class SnapshotRetention {
 
   /** Idempotently release after all workers, reads, and retries have stopped. */
   public void release(Dataset dataset) throws IOException {
-    releaseNative(dataset, encoded);
+    Preconditions.checkNotNull(dataset);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      releaseNative(dataset, encoded);
+    }
   }
 
   private static native byte[] acquireNative(Dataset dataset, byte[] snapshot, String retentionId)

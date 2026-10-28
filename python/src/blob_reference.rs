@@ -10,7 +10,7 @@ use arrow_schema::Field;
 use lance::blob::reference::{
     BLOB_REFERENCE_CAPABILITIES, BLOB_REFERENCE_OPERATIONS, BLOB_REFERENCE_PROTOCOL_VERSION,
     BlobMaterializationContext, BlobReadRange, BlobRefBatch, BlobRefBinding, BlobRefCapture,
-    BlobRefReadSession, BlobRefReader, BlobSnapshotRetention, BlobSourceContext,
+    BlobRefReadSession, BlobRefReader, BlobSourceContext,
 };
 use lance_core::utils::address::RowAddress;
 use pyo3::{
@@ -425,68 +425,5 @@ impl PyBlobRefReadStream {
         _traceback: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         self.close(py)
-    }
-}
-
-/// Explicit-release exact-snapshot GC root requiring coordinated maintenance clients.
-///
-/// Acquire before exporting refs and release after every worker, retry, read, and
-/// lazy consumer has stopped. Query tags have no expiry or renewal; maintenance owners have fixed expiration. Foreign dataset
-/// roots are unsupported; external object lifetime remains the caller's contract.
-/// Dropping the token does not release it. See the portable blob references guide
-/// for deployment requirements and orphan recovery.
-///
-/// Persist the query ID and encoded context before acquisition, save the token
-/// before exporting refs, and record release intent before release. Recover a lost
-/// release response by retrying release with that saved token.
-#[pyclass(name = "BlobSnapshotRetention", module = "lance.blob", frozen)]
-pub struct PyBlobSnapshotRetention {
-    inner: BlobSnapshotRetention,
-}
-
-#[pymethods]
-impl PyBlobSnapshotRetention {
-    /// Acquire before issuing references. retention_id must be unique to this query.
-    #[staticmethod]
-    fn acquire(
-        py: Python<'_>,
-        dataset: &Bound<'_, PyAny>,
-        context: &PyBlobSourceContext,
-        retention_id: String,
-    ) -> PyResult<Self> {
-        let dataset = dataset_inner(dataset)?;
-        let context = context.inner.clone();
-        let inner = rt()
-            .block_on(Some(py), async move {
-                BlobSnapshotRetention::acquire(&dataset, context, retention_id).await
-            })?
-            .infer_error()?;
-        Ok(Self { inner })
-    }
-    fn encode<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.inner.encode())
-    }
-    #[staticmethod]
-    fn decode(bytes: &[u8]) -> PyResult<Self> {
-        Ok(Self {
-            inner: BlobSnapshotRetention::decode(bytes).infer_error()?,
-        })
-    }
-    #[getter]
-    fn context(&self) -> PyBlobSourceContext {
-        PyBlobSourceContext {
-            inner: self.inner.context().clone(),
-        }
-    }
-    #[getter]
-    fn tag_name(&self) -> &str {
-        self.inner.tag_name()
-    }
-    /// Idempotent. Call after every worker, retry, and outstanding read has stopped.
-    fn release(&self, py: Python<'_>, dataset: &Bound<'_, PyAny>) -> PyResult<()> {
-        let dataset = dataset_inner(dataset)?;
-        let inner = self.inner.clone();
-        rt().block_on(Some(py), async move { inner.release(&dataset).await })?
-            .infer_error()
     }
 }

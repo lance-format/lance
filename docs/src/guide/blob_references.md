@@ -399,11 +399,9 @@ the existing durable query tags until explicit release. Obtain the identity usin
 Python, or `source.getSnapshotIdentity()` in Java. Ordinary scans use the same API
 without creating a blob context.
 
-The original `BlobSnapshotRetention` and Java `BlobReferences.Retention` surfaces
-remain convenience adapters. They delegate to the same general snapshot retention
-and preserve the original blob context in their transport.
-
 Acquisition, release, and cleanup coordinate with a table-root maintenance lock.
+Acquisition and release share the lock; cleanup holds it exclusively. Internal
+query tags protect their snapshots without triggering cleanup's user-tag error.
 Maintenance owners have a fixed expiry of 120 hours by default, configurable using
 `lance.snapshot_retention.lock_expiration_hours`. Each owner records its expiry;
 other callers honor it regardless of their own configuration. Query tags do not
@@ -421,10 +419,11 @@ agreements.
 ## Python and Java/JNI bindings
 
 Python exposes `BlobSourceContext`, `BlobRefCapture`, `BlobRefBatch`,
-`BlobRefReader`, `BlobRefReadStream`, and `BlobSnapshotRetention` from `lance.blob`
+`BlobRefReader`, and `BlobRefReadStream` from `lance.blob`
 and `lance`. Java exposes the corresponding operations through
 `org.lance.BlobReferences`, with `SourceContext`, `Capture`, `Batch`, `Reader`,
-`ReadStream`, and `Retention` types.
+and `ReadStream` types. Both use the general `SnapshotRetention` API for query
+lifetime protection.
 
 Query the protocol version, source capabilities, and supported SDK operations
 before scheduling workers. Python provides
@@ -450,12 +449,15 @@ before issuing references to workers.
 ```python
 import uuid
 from lance.blob import (
-    BlobRefCapture, BlobRefReader, BlobSnapshotRetention, BlobSourceContext,
+    BlobRefCapture, BlobRefReader, BlobSourceContext,
 )
+from lance.retention import SnapshotRetention
 
 def read_values(dataset, worker_dataset, consume):
     source = BlobSourceContext.from_dataset(dataset, "catalog/table", "workers")
-    retention = BlobSnapshotRetention.acquire(dataset, source, str(uuid.uuid4()))
+    retention = SnapshotRetention.acquire(
+        dataset, source.snapshot_identity(), str(uuid.uuid4()),
+    )
     try:
         field_id = dataset.lance_schema.field("blob").id()
         with BlobRefCapture(dataset, source, field_id) as capture:

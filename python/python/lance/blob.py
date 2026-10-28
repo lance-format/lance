@@ -27,9 +27,6 @@ from .lance import (
     BlobRefReadStream as BlobRefReadStream,
 )
 from .lance import (
-    BlobSnapshotRetention as BlobSnapshotRetention,
-)
-from .lance import (
     BlobSourceContext as BlobSourceContext,
 )
 from .lance import (

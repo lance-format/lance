@@ -1894,9 +1894,7 @@ def test_snapshot_retention_protects_ordinary_data(tmp_path):
         mode="overwrite",
     )
     try:
-        latest.cleanup_old_versions(
-            older_than=timedelta(hours=-1), error_if_tagged_old_versions=False
-        )
+        latest.cleanup_old_versions(older_than=timedelta(hours=-1))
         assert dataset.to_table().equals(original)
         assert snapshot.version in [item["version"] for item in latest.versions()]
     finally:
@@ -1907,6 +1905,34 @@ def test_snapshot_retention_protects_ordinary_data(tmp_path):
     assert snapshot.version not in [item["version"] for item in latest.versions()]
     with pytest.raises((ValueError, OSError)):
         SnapshotRetention.acquire(dataset, snapshot, str(uuid.uuid4()))
+
+
+@pytest.mark.parametrize("operation", ["acquire", "release", "cleanup"])
+def test_snapshot_retention_conflicts_have_distinct_exception(tmp_path, operation):
+    from lance.retention import RefConflictError, SnapshotIdentity, SnapshotRetention
+
+    assert RefConflictError is lance.RefConflictError
+    dataset_path = tmp_path / "retained"
+    dataset = lance.write_dataset(pa.table({"value": [1, 2]}), dataset_path)
+    snapshot = SnapshotIdentity.from_dataset(dataset, "catalog/conflict")
+    token = SnapshotRetention.acquire(dataset, snapshot, "query")
+    owner = dataset_path / "_refs/retention-v1/maintenance" / str(uuid.uuid4())
+    owner.parent.mkdir(parents=True, exist_ok=True)
+    owner.write_text(
+        '{"ticket":1,"expires_at":"2100-01-01T00:00:00Z","mode":"exclusive"}'
+    )
+    try:
+        with pytest.raises(RefConflictError, match="maintenance lock"):
+            if operation == "acquire":
+                SnapshotRetention.acquire(dataset, snapshot, "other-query")
+            elif operation == "release":
+                token.release(dataset)
+            else:
+                dataset.cleanup_old_versions()
+    finally:
+        owner.unlink()
+        token.release(dataset)
+    assert not dataset.tags.list()
 
 
 @pytest.mark.parametrize("hours", ["0", "-1", "1.5", "", "18446744073709551615"])

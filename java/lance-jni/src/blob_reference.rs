@@ -9,12 +9,12 @@ use arrow_schema::{DataType, Schema};
 use jni::{
     JNIEnv,
     objects::{JBooleanArray, JByteArray, JLongArray, JObject, JObjectArray, JString},
-    sys::{jboolean, jbyteArray, jint, jintArray, jlong, jobjectArray, jstring},
+    sys::{jboolean, jbyteArray, jint, jintArray, jlong, jobjectArray},
 };
 use lance::blob::reference::{
     BLOB_REFERENCE_CAPABILITIES, BLOB_REFERENCE_OPERATIONS, BLOB_REFERENCE_PROTOCOL_VERSION,
     BlobMaterializationContext, BlobReadRange, BlobRefBatch, BlobRefBinding, BlobRefCapture,
-    BlobRefReadSession, BlobRefReader, BlobSnapshotRetention, BlobSourceContext, blob_ref_field,
+    BlobRefReadSession, BlobRefReader, BlobSourceContext, blob_ref_field,
 };
 use lance_core::utils::address::RowAddress;
 use tokio::sync::Mutex;
@@ -45,15 +45,17 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 
 fn handle(env: &mut JNIEnv, object: JObject) -> Result<NativeHandle> {
     // Clone before any blocking operation so cancel/close can access the handle.
-    Ok(
-        unsafe { env.get_rust_field::<_, _, NativeHandle>(object, NATIVE_HANDLE) }
-            .map_err(|error| {
-                invalid(format!(
-                    "Blob reference resource is closed or unavailable: {error}"
-                ))
-            })?
-            .clone(),
-    )
+    // close() holds this monitor while take_rust_field frees the native box.
+    let _monitor = env.lock_obj(&object)?;
+    let native = unsafe { env.get_rust_field::<_, _, NativeHandle>(&object, NATIVE_HANDLE) }
+        .map_err(|error| {
+            invalid(format!(
+                "Blob reference resource is closed or unavailable: {error}"
+            ))
+        })?;
+    let handle = native.clone();
+    drop(native);
+    Ok(handle)
 }
 
 fn attach<'a>(env: &mut JNIEnv<'a>, class: &str, handle: NativeHandle) -> Result<JObject<'a>> {
@@ -580,31 +582,6 @@ pub extern "system" fn Java_org_lance_BlobReferences_reservedBytesNative(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_BlobReferences_acquireRetentionNative(
-    mut env: JNIEnv,
-    _class: JObject,
-    source: JObject,
-    context: JByteArray,
-    retention_id: JString,
-) -> jbyteArray {
-    ok_or_throw_with_return!(
-        env,
-        (|| -> Result<_> {
-            let dataset = dataset(&mut env, source)?;
-            let context = BlobSourceContext::decode(&env.convert_byte_array(context)?)?;
-            let retention_id: String = env.get_string(&retention_id)?.into();
-            let retention = block_on(BlobSnapshotRetention::acquire(
-                &dataset,
-                context,
-                retention_id,
-            ))?;
-            java_bytes(&env, &retention.encode())
-        })(),
-        std::ptr::null_mut()
-    )
-}
-
-#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_BlobReferences_snapshotIdentityNative(
     mut env: JNIEnv,
     _class: JObject,
@@ -618,76 +595,4 @@ pub extern "system" fn Java_org_lance_BlobReferences_snapshotIdentityNative(
         })(),
         std::ptr::null_mut()
     )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_BlobReferences_validateRetentionNative(
-    mut env: JNIEnv,
-    _class: JObject,
-    retention: JByteArray,
-) -> jbyteArray {
-    ok_or_throw_with_return!(
-        env,
-        (|| -> Result<_> {
-            java_bytes(
-                &env,
-                &BlobSnapshotRetention::decode(&env.convert_byte_array(retention)?)?.encode(),
-            )
-        })(),
-        std::ptr::null_mut()
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_BlobReferences_retentionContextNative(
-    mut env: JNIEnv,
-    _class: JObject,
-    retention: JByteArray,
-) -> jbyteArray {
-    ok_or_throw_with_return!(
-        env,
-        (|| -> Result<_> {
-            java_bytes(
-                &env,
-                &BlobSnapshotRetention::decode(&env.convert_byte_array(retention)?)?
-                    .context()
-                    .encode(),
-            )
-        })(),
-        std::ptr::null_mut()
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_BlobReferences_retentionTagNative(
-    mut env: JNIEnv,
-    _class: JObject,
-    retention: JByteArray,
-) -> jstring {
-    ok_or_throw_with_return!(
-        env,
-        (|| -> Result<_> {
-            let retention = BlobSnapshotRetention::decode(&env.convert_byte_array(retention)?)?;
-            Ok(env.new_string(retention.tag_name())?.into_raw())
-        })(),
-        std::ptr::null_mut()
-    )
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_BlobReferences_releaseRetentionNative(
-    mut env: JNIEnv,
-    _class: JObject,
-    source: JObject,
-    retention: JByteArray,
-) {
-    ok_or_throw_without_return!(
-        env,
-        (|| -> Result<_> {
-            let dataset = dataset(&mut env, source)?;
-            let retention = BlobSnapshotRetention::decode(&env.convert_byte_array(retention)?)?;
-            block_on(retention.release(&dataset))?;
-            Ok(())
-        })()
-    );
 }

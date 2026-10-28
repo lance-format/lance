@@ -23,8 +23,6 @@ use tracing::warn;
 use crate::Dataset;
 use crate::dataset::snapshot::{SnapshotIdentity, canonical_uri, pb};
 
-// Preserve the original public path while general retention remains independent of blob contexts.
-pub use crate::blob::reference::BlobSnapshotRetention;
 use crate::dataset::refs::{TagContents, tag_path};
 use crate::utils::temporal::utc_now;
 
@@ -43,6 +41,18 @@ pub const LOCK_EXPIRATION_HOURS_KEY: &str = "lance.snapshot_retention.lock_expir
 struct MaintenanceOwner {
     ticket: u64,
     expires_at: DateTime<Utc>,
+    mode: MaintenanceMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MaintenanceMode {
+    Shared,
+    Exclusive,
+}
+
+pub(crate) fn is_retention_tag(name: &str, tag: &TagContents) -> bool {
+    name.starts_with(TAG_PREFIX) && tag.metadata.contains_key(SNAPSHOT_ID_KEY)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,7 +113,8 @@ fn retirement_path(dataset: &Dataset, manifest: &Path) -> Result<Path> {
         .join(blake3::hash(manifest.as_ref().as_bytes()).to_hex().as_str()))
 }
 
-/// An exclusive, storage-backed fence between retention acquisition and cleanup.
+/// A storage-backed fence between snapshot retention operations and cleanup.
+/// Public acquisition is exclusive; query acquisition and release share the fence.
 ///
 /// Contention returns [`Error::RefConflict`]; callers may retry the whole operation.
 /// Owners expire after [`DEFAULT_LOCK_EXPIRATION_HOURS`] unless the table config
@@ -147,18 +158,25 @@ impl SnapshotMaintenanceLock {
         if dataset.object_store.scheme() == "cos" {
             return Ok(None);
         }
-        Self::acquire_inner(dataset, Some(delete)).await.map(Some)
+        Self::acquire_inner(dataset, Some(delete), MaintenanceMode::Exclusive)
+            .await
+            .map(Some)
     }
 
-    /// Acquire the table-root fence, shared by every branch and worker process.
+    /// Acquire the exclusive table-root fence across all branches and worker processes.
     /// Storage must implement atomic conditional creation and consistent reads/listing.
     pub async fn acquire(dataset: &Dataset) -> Result<Self> {
-        Self::acquire_inner(dataset, None).await
+        Self::acquire_inner(dataset, None, MaintenanceMode::Exclusive).await
+    }
+
+    async fn for_retention(dataset: &Dataset) -> Result<Self> {
+        Self::acquire_inner(dataset, None, MaintenanceMode::Shared).await
     }
 
     async fn acquire_inner(
         dataset: &Dataset,
         delete: Option<Arc<MaintenanceDelete>>,
+        mode: MaintenanceMode,
     ) -> Result<Self> {
         let directory = retention_dir(dataset)?.join("maintenance");
         let owner = uuid::Uuid::new_v4().to_string();
@@ -167,19 +185,10 @@ impl SnapshotMaintenanceLock {
         let mut record = MaintenanceOwner {
             ticket: 0,
             expires_at: deadline.expires_at,
+            mode,
         };
         // Zero announces that this owner is choosing a ticket. Every attempt has
         // its own key: a retried DELETE must never remove a subsequent owner's lock.
-        dataset
-            .object_store
-            .put_if_absent(&path, serde_json::to_vec(&record)?.into())
-            .await
-            .map_err(|error| match error {
-                StoreError::NotSupported { source } => Error::not_supported(format!(
-                    "Snapshot retention requires atomic conditional creation: {source}"
-                )),
-                error => error.into(),
-            })?;
         let fence = Self {
             store: dataset.object_store.clone(),
             path,
@@ -187,17 +196,28 @@ impl SnapshotMaintenanceLock {
             deadline,
         };
         let result = async {
+            fence.store.put_if_absent(&fence.path, serde_json::to_vec(&record)?.into())
+                .await.map_err(|error| match error {
+                    StoreError::NotSupported { source } => Error::not_supported(format!(
+                        "Snapshot retention requires atomic conditional creation: {source}"
+                    )),
+                    error => error.into(),
+                })?;
             fence.check_valid()?;
             let ticket = maintenance_tickets(&fence, &directory).await?
-                .iter().map(|(_, ticket)| *ticket).max().unwrap_or(0)
+                .iter().map(|(_, record)| record.ticket).max().unwrap_or(0)
                 .checked_add(1).ok_or_else(|| Error::invalid_input("Snapshot maintenance ticket overflow"))?;
             fence.check_valid()?;
             record.ticket = ticket;
             fence.store.put(&fence.path, &serde_json::to_vec(&record)?).await?;
             // Publishing before checking ensures a later chooser gets a higher
             // ticket. Concurrent choosers break ties by their unique owner IDs.
-            for (other_owner, other_ticket) in maintenance_tickets(&fence, &directory).await? {
-                if other_owner != owner && (other_ticket == 0 || (other_ticket, &other_owner) < (ticket, &owner)) {
+            for (other_owner, other) in maintenance_tickets(&fence, &directory).await? {
+                // Shared query operations never exclude each other, even while
+                // choosing tickets. Cleanup conflicts with either owner mode.
+                if other_owner != owner
+                    && (mode == MaintenanceMode::Exclusive || other.mode == MaintenanceMode::Exclusive)
+                    && (other.ticket == 0 || (other.ticket, &other_owner) < (ticket, &owner)) {
                     return Err(Error::RefConflict { message: format!(
                         "Snapshot maintenance lock {} is held; retry after the operation finishes. \
                          The owner's recorded expiration is honored independently of this caller's configuration",
@@ -209,7 +229,12 @@ impl SnapshotMaintenanceLock {
             Ok(())
         }.await;
         if let Err(error) = result {
-            fence.release().await?;
+            // A failed conditional create may already have reached storage.
+            // This UUID belongs only to this attempt, so remove it even when
+            // storage reported an error instead of acknowledging creation.
+            if let Err(release_error) = fence.release().await {
+                warn!(%release_error, "Failed to remove unsuccessful snapshot maintenance owner");
+            }
             return Err(error);
         }
         Ok(fence)
@@ -245,7 +270,7 @@ impl SnapshotMaintenanceLock {
 async fn maintenance_tickets(
     fence: &SnapshotMaintenanceLock,
     directory: &Path,
-) -> Result<Vec<(String, u64)>> {
+) -> Result<Vec<(String, MaintenanceOwner)>> {
     let store = &fence.store;
     let names = store.read_dir(directory.clone()).await?;
     let mut tickets = Vec::with_capacity(names.len());
@@ -272,7 +297,7 @@ async fn maintenance_tickets(
             }
             continue;
         }
-        tickets.push((name, record.ticket));
+        tickets.push((name, record));
     }
     Ok(tickets)
 }
@@ -284,6 +309,7 @@ async fn maintenance_tickets(
 /// token does not release it; a coordinator can recover orphaned tags after a crash.
 /// Acquisition is idempotent for the same snapshot identity and globally unique `retention_id`.
 /// Reusing that ID for independent queries would give them shared release ownership.
+/// Serialize acquisition and release for the same ID; independent queries may run concurrently.
 /// Persist that ID and the encoded snapshot identity before acquiring, then persist the token
 /// before issuing work. Record release intent before releasing, so recovery can
 /// retry release instead of accidentally acquiring protection again.
@@ -339,7 +365,7 @@ impl SnapshotRetention {
             snapshot,
             tag_name: format!("{TAG_PREFIX}{}", identity.finalize().to_hex()),
         };
-        let fence = SnapshotMaintenanceLock::acquire(dataset).await?;
+        let fence = SnapshotMaintenanceLock::for_retention(dataset).await?;
         let result = retention.acquire_fenced(dataset, &fence).await;
         // Acquisition never deletes files. An unsuccessful/uncertain tag write can
         // only leave an extra GC root, so its fence can be released on error too.
@@ -462,10 +488,8 @@ impl SnapshotRetention {
                 token.protocol_version,
             )));
         }
-        Self::from_parts(SnapshotIdentity::decode(&token.snapshot)?, token.tag_name)
-    }
-
-    pub(crate) fn from_parts(snapshot: SnapshotIdentity, tag_name: String) -> Result<Self> {
+        let snapshot = SnapshotIdentity::decode(&token.snapshot)?;
+        let tag_name = token.tag_name;
         let suffix = tag_name
             .strip_prefix(TAG_PREFIX)
             .ok_or_else(|| Error::invalid_input("Invalid retention tag prefix"))?;
@@ -483,7 +507,7 @@ impl SnapshotRetention {
                 "Retention release dataset has a different table URI",
             ));
         }
-        let fence = SnapshotMaintenanceLock::acquire(dataset).await?;
+        let fence = SnapshotMaintenanceLock::for_retention(dataset).await?;
         let path = tag_path(&dataset.refs.root()?.path, &self.tag_name);
         let result = async {
             match TagContents::from_path(&path, &dataset.object_store).await {
@@ -625,14 +649,26 @@ mod tests {
         .unwrap()
     }
 
+    #[rstest]
+    #[case::exclusive(MaintenanceMode::Exclusive, MaintenanceMode::Exclusive)]
+    #[case::reader_writer(MaintenanceMode::Shared, MaintenanceMode::Exclusive)]
+    #[case::writer_reader(MaintenanceMode::Exclusive, MaintenanceMode::Shared)]
+    #[case::readers(MaintenanceMode::Shared, MaintenanceMode::Shared)]
     #[tokio::test]
-    async fn maintenance_contention_never_admits_two_owners() {
+    async fn maintenance_contention_respects_owner_modes(
+        #[case] first_mode: MaintenanceMode,
+        #[case] second_mode: MaintenanceMode,
+    ) {
         let (dataset, _) = maintenance_dataset().await;
         let (first, second) = tokio::join!(
-            SnapshotMaintenanceLock::acquire(&dataset),
-            SnapshotMaintenanceLock::acquire(&dataset)
+            SnapshotMaintenanceLock::acquire_inner(&dataset, None, first_mode),
+            SnapshotMaintenanceLock::acquire_inner(&dataset, None, second_mode)
         );
-        assert!(first.is_err() || second.is_err());
+        if first_mode == MaintenanceMode::Shared && second_mode == MaintenanceMode::Shared {
+            assert!(first.is_ok() && second.is_ok());
+        } else {
+            assert!(first.is_err() || second.is_err());
+        }
         for result in [first, second] {
             match result {
                 Ok(fence) => {
@@ -659,6 +695,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn independent_queries_share_acquisition_and_release() {
+        let (dataset, _) = maintenance_dataset().await;
+        let snapshot = SnapshotIdentity::from_dataset(&dataset, "catalog/shared")
+            .await
+            .unwrap();
+        let reader = SnapshotMaintenanceLock::for_retention(&dataset)
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            SnapshotRetention::acquire(&dataset, snapshot.clone(), "first"),
+            SnapshotRetention::acquire(&dataset, snapshot, "second"),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_ne!(first.tag_name(), second.tag_name());
+        let error = SnapshotMaintenanceLock::acquire(&dataset)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        let (first, second) = tokio::join!(first.release(&dataset), second.release(&dataset));
+        first.unwrap();
+        second.unwrap();
+        assert!(dataset.tags().list().await.unwrap().is_empty());
+        reader.release().await.unwrap();
+        let cleanup = SnapshotMaintenanceLock::acquire(&dataset).await.unwrap();
+        let error = SnapshotMaintenanceLock::for_retention(&dataset)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        cleanup.release().await.unwrap();
+    }
+
+    #[rstest]
+    #[case::timeout(false)]
+    #[case::already_exists(true)]
+    #[tokio::test]
+    async fn failed_owner_creation_removes_only_its_own_applied_write(
+        #[case] already_exists: bool,
+    ) {
+        let (dataset, policy) = maintenance_dataset().await;
+        let active = SnapshotMaintenanceLock::for_retention(&dataset)
+            .await
+            .unwrap();
+        policy.lock().unwrap().set_after_put_policy(
+            "lost_owner_response",
+            Arc::new(move |_, path| {
+                if path.as_ref().contains("retention-v1/maintenance/") {
+                    if already_exists {
+                        return Err(StoreError::AlreadyExists {
+                            path: path.to_string(),
+                            source: "lost owner response".into(),
+                        }
+                        .into());
+                    }
+                    return Err(Error::io("lost owner response"));
+                }
+                Ok(())
+            }),
+        );
+        let error = SnapshotMaintenanceLock::acquire(&dataset)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("lost owner response"));
+        policy
+            .lock()
+            .unwrap()
+            .clear_after_put_policy("lost_owner_response");
+        let owners = dataset
+            .object_store
+            .read_dir(retention_dir(&dataset).unwrap().join("maintenance"))
+            .await
+            .unwrap();
+        assert_eq!(owners, vec![active.path.filename().unwrap().to_string()]);
+        active.release().await.unwrap();
+        SnapshotMaintenanceLock::acquire(&dataset)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_owner_cleanup_preserves_the_creation_error() {
+        let (dataset, policy) = maintenance_dataset().await;
+        policy.lock().unwrap().set_after_put_policy(
+            "lost_owner_response",
+            Arc::new(|_, path| {
+                if path.as_ref().contains("retention-v1/maintenance/") {
+                    return Err(Error::io("lost owner response"));
+                }
+                Ok(())
+            }),
+        );
+        policy.lock().unwrap().set_before_policy(
+            "failed_owner_removal",
+            Arc::new(|operation, path| {
+                if operation == "delete" && path.as_ref().contains("retention-v1/maintenance/") {
+                    return Err(Error::io("owner removal failed"));
+                }
+                Ok(())
+            }),
+        );
+        let error = SnapshotMaintenanceLock::acquire(&dataset)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("lost owner response"));
+        assert!(!error.to_string().contains("owner removal failed"));
+        policy
+            .lock()
+            .unwrap()
+            .clear_before_policy("failed_owner_removal");
+        policy
+            .lock()
+            .unwrap()
+            .clear_after_put_policy("lost_owner_response");
+        let directory = retention_dir(&dataset).unwrap().join("maintenance");
+        let owners = dataset
+            .object_store
+            .read_dir(directory.clone())
+            .await
+            .unwrap();
+        assert_eq!(owners.len(), 1);
+        dataset
+            .object_store
+            .delete(&directory.join(owners[0].as_str()))
+            .await
+            .unwrap();
+        SnapshotMaintenanceLock::acquire(&dataset)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_cleanup_retains_query_tags_and_errors_only_for_user_tags() {
+        let (original, _) = maintenance_dataset().await;
+        let snapshot = SnapshotIdentity::from_dataset(&original, "catalog/cleanup")
+            .await
+            .unwrap();
+        let retention = SnapshotRetention::acquire(&original, snapshot, "query")
+            .await
+            .unwrap();
+        let obsolete = overwrite_maintenance_dataset(&original).await;
+        let latest = overwrite_maintenance_dataset(&obsolete).await;
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() + TimeDelta::hours(1))
+            .build();
+        let stats = latest.cleanup(policy.clone()).execute().await.unwrap();
+        assert_eq!(stats.old_versions, 1);
+        assert_eq!(
+            original.scan().try_into_batch().await.unwrap(),
+            record_batch!(("value", Int32, [1, 2])).unwrap()
+        );
+        assert!(
+            original
+                .object_store
+                .exists(&original.manifest_location().path)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !original
+                .object_store
+                .exists(&obsolete.manifest_location().path)
+                .await
+                .unwrap()
+        );
+        // A user tag on the same retained version must still trigger the default policy.
+        latest
+            .tags()
+            .create("lance-query-user-tag", original.version_id())
+            .await
+            .unwrap();
+        let error = latest.cleanup(policy.clone()).execute().await.unwrap_err();
+        assert!(matches!(error, Error::Cleanup { .. }));
+        assert!(error.to_string().contains("lance-query-user-tag"));
+        assert!(!error.to_string().contains(retention.tag_name()));
+        latest.tags().delete("lance-query-user-tag").await.unwrap();
+        retention.release(&latest).await.unwrap();
+        assert_eq!(
+            latest.cleanup(policy).execute().await.unwrap().old_versions,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn maintenance_release_retry_cannot_remove_new_owner() {
         let (dataset, _) = maintenance_dataset().await;
         let first = SnapshotMaintenanceLock::acquire(&dataset).await.unwrap();
@@ -682,6 +913,7 @@ mod tests {
         let record = MaintenanceOwner {
             ticket: 0,
             expires_at: utc_now() + TimeDelta::hours(120),
+            mode: MaintenanceMode::Exclusive,
         };
         dataset
             .object_store
@@ -967,6 +1199,7 @@ mod tests {
         let record = MaintenanceOwner {
             ticket,
             expires_at: utc_now() + TimeDelta::hours(120),
+            mode: MaintenanceMode::Exclusive,
         };
         dataset
             .object_store

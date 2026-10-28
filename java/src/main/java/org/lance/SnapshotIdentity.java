@@ -13,6 +13,8 @@
  */
 package org.lance;
 
+import org.apache.arrow.util.Preconditions;
+
 import java.io.IOException;
 
 /**
@@ -40,7 +42,10 @@ public final class SnapshotIdentity {
   /** Capture the loaded snapshot; tableIdentity must distinguish table incarnations. */
   public static SnapshotIdentity fromDataset(Dataset dataset, String tableIdentity)
       throws IOException {
-    return new SnapshotIdentity(fromDatasetNative(dataset, tableIdentity));
+    Preconditions.checkNotNull(dataset);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return new SnapshotIdentity(fromDatasetNative(dataset, tableIdentity));
+    }
   }
 
   /** Validate a transported identity without acquiring protection. */

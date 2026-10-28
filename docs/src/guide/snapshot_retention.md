@@ -16,6 +16,8 @@ Acquire before issuing work that depends on the snapshot. Use a globally unique
 `retention_id` for each query lifetime. Acquisition with the same identity and ID
 is idempotent. Never reuse an ID after release or share it between independent
 queries: either owner could release their shared protection.
+Serialize acquisition and release for a single query ID; independent queries may
+acquire or release concurrently.
 
 ```python
 import uuid
@@ -47,8 +49,9 @@ async fn query(dataset: &Dataset, query_id: &str) -> Result<()> {
 
 The durable tag is named `lance-query-<digest>`, derived from the generic snapshot
 identity and retention ID. Cleanup preserves the protected snapshot and its
-referenced files. Configure cleanup to clean around old tagged versions rather
-than erroring on them; Python uses `error_if_tagged_old_versions=False`.
+referenced files while cleaning unrelated versions. Internal query tags never
+trigger `error_if_tagged_old_versions`; that option applies only to user tags.
+Do not manually delete query tags while their consumers are active.
 
 `release(dataset)` is idempotent and accepts an authenticated handle to a later
 snapshot of the same table. Encoding, decoding, or dropping a token does not
@@ -56,15 +59,15 @@ release protection. **Query tags have no automatic expiration or renewal.**
 
 Blob source contexts expose `snapshot_identity()` in Rust/Python and
 `getSnapshotIdentity()` in Java. Different worker routing keys and external-blob
-capabilities do not change that snapshot identity. The existing
-`BlobSnapshotRetention` and Java `BlobReferences.Retention` APIs remain convenience
-adapters to the same general retention implementation.
+capabilities do not change that snapshot identity. Blob callers pass this identity
+to the same `SnapshotRetention` API used by ordinary scans.
 
 ## Maintenance lock expiration
 
 Acquisition, release, and cleanup coordinate through a table-root maintenance
-lock across branches and processes. The lock is held only for the individual
-operation; cleanup holds it for its entire run. Workers reading retained files
+lock across branches and processes. Acquisition and release hold shared locks,
+so independent queries do not exclude each other. Cleanup holds an exclusive lock
+for its entire run and excludes both operations. Workers reading retained files
 do not hold the maintenance lock.
 
 Maintenance owners have a **fixed lifetime of 120 hours** by default. Set the
@@ -94,9 +97,31 @@ never shortens an existing owner's recorded lifetime.
 
 Each attempt creates its own object under
 `_refs/retention-v1/maintenance/<owner-UUID>`. Its JSON contains an immutable
-`expires_at` timestamp and a `ticket`. Ticket zero announces that the owner is
-choosing an ordering number. Published `(ticket, UUID)` pairs establish priority.
-Contenders return `RefConflict`; retry the whole operation with backoff.
+`expires_at` timestamp, a `ticket`, and a `mode` (`shared` or `exclusive`). Ticket
+zero announces that the owner is choosing an ordering number. Published
+`(ticket, UUID)` pairs establish priority among conflicting modes. Shared owners
+ignore other shared owners, including those choosing a ticket. A failed creation
+response triggers best-effort removal of that attempt's UUID, since storage may
+already have applied the write.
+
+Contention returns Rust `Error::RefConflict`, Python `lance.RefConflictError`, or
+Java `LanceRefConflictException`. For maintenance contention, retry the complete
+operation after backoff; preserve the token when retrying release. Other internal
+failures retain their distinct exception types.
+
+After persisting release intent, a coordinator can keep its journal entry when
+release is contended. Other failures propagate to its error handler:
+
+```python
+from lance import RefConflictError
+
+def try_release(dataset, retention) -> bool:
+    try:
+        retention.release(dataset)
+    except RefConflictError:
+        return False  # Keep the token and schedule a later release attempt.
+    return True  # Release was acknowledged; complete the journal entry.
+```
 
 Later attempts ignore expired owners and try to remove their objects, including
 owners abandoned while choosing a ticket. Removal uses cleanup's shared delete

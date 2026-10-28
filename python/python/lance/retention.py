@@ -4,6 +4,9 @@
 """Explicit snapshot protection for ordinary scans and deferred blob reads."""
 
 from .lance import (
+    RefConflictError as RefConflictError,
+)
+from .lance import (
     SnapshotIdentity as SnapshotIdentity,
 )
 from .lance import (

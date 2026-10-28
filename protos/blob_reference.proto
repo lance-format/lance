@@ -69,14 +69,3 @@ message ReferenceBatch {
   repeated SourceContext contexts = 2;
   bytes arrow_ipc = 3;
 }
-
-/* Explicit-release retention token. Possession does not acquire retention.
- * Forward it intact and release only after every consumer and retry has stopped.
- */
-message SnapshotRetention {
-  uint32 protocol_version = 1;
-  // Encoded SourceContext, forwarded without re-encoding its manifest image.
-  bytes context = 2;
-  // Protected tag owned exclusively by this query retention.
-  string tag_name = 3;
-}

@@ -1020,11 +1020,15 @@ impl<'a> CleanupTask<'a> {
         };
         let inspection = self.process_manifests(&tagged_versions, inspection).await?;
 
-        if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
-            return Err(tagged_old_versions_cleanup_error(
-                &tags,
-                &inspection.tagged_old_versions,
-            ));
+        if self.policy.error_if_tagged_old_versions {
+            // Query roots protect files without blocking cleanup of other versions.
+            let user_tags = tags.into_iter().filter(|(name, tag)| {
+                !super::retention::is_retention_tag(name, tag)
+                    && tag.branch.as_deref() == current_branch.as_deref()
+            }).collect::<HashMap<_, _>>();
+            if user_tags.values().any(|tag| inspection.tagged_old_versions.contains(&tag.version)) {
+                return Err(tagged_old_versions_cleanup_error(&user_tags, &inspection.tagged_old_versions));
+            }
         }
 
         final_result.merge(
@@ -2627,7 +2631,8 @@ pub struct CleanupPolicy {
     pub versions: Option<HashSet<u64>>,
     /// If true, delete unverified data files even if they are recent
     pub delete_unverified: bool,
-    /// If true, return an Error if a tagged version is old
+    /// If true, return an error if a user-tagged version is old.
+    /// Internal query retention tags always retain their snapshots without an error.
     pub error_if_tagged_old_versions: bool,
     /// If clean the referenced branches
     pub clean_referenced_branches: bool,

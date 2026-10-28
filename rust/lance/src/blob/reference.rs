@@ -42,10 +42,8 @@ pub use crate::dataset::blob::{
     BlobReadRange, BlobRefBinding, BlobRefDemand, BlobRefReadStream, BlobRefReader, BlobRefRequest,
     ReadBlobRef,
 };
-mod retention;
 use crate::dataset::snapshot::{SnapshotIdentity, pb as snapshot_pb};
 pub(crate) use crate::dataset::snapshot::{canonical_uri, matches_loaded_manifest};
-pub use retention::BlobSnapshotRetention;
 
 pub(crate) mod pb {
     include!("../pb/lance.blob.reference.rs");
@@ -1876,9 +1874,13 @@ mod tests {
         let cloned_source = BlobSourceContext::from_dataset(&cloned, "catalog/clone", "workers")
             .await
             .unwrap();
-        let error = BlobSnapshotRetention::acquire(&cloned, cloned_source.clone(), "foreign-owner")
-            .await
-            .unwrap_err();
+        let error = crate::SnapshotRetention::acquire(
+            &cloned,
+            cloned_source.snapshot_identity().unwrap(),
+            "foreign-owner",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("foreign dataset base"));
         let (clone_field, clone_addresses, clone_descriptors) = capture_inputs(&cloned).await;
@@ -2452,21 +2454,22 @@ mod tests {
         let source = BlobSourceContext::from_dataset(&dataset, "catalog/retention", "workers")
             .await
             .unwrap();
-        let retention = BlobSnapshotRetention::acquire(&dataset, source.clone(), "query-1")
-            .await
-            .unwrap();
-        let duplicate = BlobSnapshotRetention::acquire(&dataset, source.clone(), "query-1")
-            .await
-            .unwrap();
-        assert_eq!(retention.tag_name(), duplicate.tag_name());
-        let generic = crate::SnapshotRetention::acquire(
+        let retention = crate::SnapshotRetention::acquire(
             &dataset,
             source.snapshot_identity().unwrap(),
             "query-1",
         )
         .await
         .unwrap();
-        assert_eq!(retention.tag_name(), generic.tag_name());
+        let duplicate = crate::SnapshotRetention::acquire(
+            &dataset,
+            source.snapshot_identity().unwrap(),
+            "query-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(retention.tag_name(), duplicate.tag_name());
+        assert_eq!(retention.snapshot(), &source.snapshot_identity().unwrap());
         let other_binding =
             BlobSourceContext::from_dataset(&dataset, "catalog/retention", "different-workers")
                 .await
@@ -2481,11 +2484,11 @@ mod tests {
         );
         assert_eq!(
             retention.encode(),
-            BlobSnapshotRetention::decode(&retention.encode())
+            crate::SnapshotRetention::decode(&retention.encode())
                 .unwrap()
                 .encode()
         );
-        let captured = capture_ref_batch(&dataset, retention.context()).await;
+        let captured = capture_ref_batch(&dataset, &source).await;
         let requests = captured.read_requests(&[2], &[u64::MAX], &[None]).unwrap();
         let budget = BlobMaterializationContext::try_new(1024, 1024).unwrap();
         let held = budget.admission().reserve(1024).await.unwrap();
@@ -2596,9 +2599,13 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            BlobSnapshotRetention::acquire(&dataset, source, "too-late")
-                .await
-                .is_err()
+            crate::SnapshotRetention::acquire(
+                &dataset,
+                source.snapshot_identity().unwrap(),
+                "too-late"
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -2651,9 +2658,13 @@ mod tests {
             .await
             .unwrap();
         let fence = SnapshotMaintenanceLock::acquire(&dataset).await.unwrap();
-        let error = BlobSnapshotRetention::acquire(&dataset, source.clone(), "racing")
-            .await
-            .unwrap_err();
+        let error = crate::SnapshotRetention::acquire(
+            &dataset,
+            source.snapshot_identity().unwrap(),
+            "racing",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::RefConflict { .. }));
         assert!(error.to_string().contains("maintenance lock"));
         assert!(dataset.tags().list().await.unwrap().is_empty());
@@ -2661,9 +2672,13 @@ mod tests {
             .await
             .unwrap();
         fence.release().await.unwrap();
-        let error = BlobSnapshotRetention::acquire(&dataset, source, "after-partial-delete")
-            .await
-            .unwrap_err();
+        let error = crate::SnapshotRetention::acquire(
+            &dataset,
+            source.snapshot_identity().unwrap(),
+            "after-partial-delete",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("selected by cleanup"));
         assert!(dataset.tags().list().await.unwrap().is_empty());
