@@ -26,7 +26,7 @@ use arrow_array::{
 use arrow_array::{
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, new_null_array,
 };
-use arrow_buffer::MutableBuffer;
+use arrow_buffer::{BooleanBufferBuilder, MutableBuffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
 use arrow_select::{interleave::interleave, take::take};
@@ -1159,12 +1159,23 @@ fn adjust_child_validity(
         }
     };
 
+    // ArrayData applies the child's offset to its raw null bitmap. Realign
+    // logical validity bits when the bitmap uses a different bit offset.
+    let null_bit_buffer = if new_validity.inner().offset() == child.offset() {
+        new_validity.into_inner().into_inner()
+    } else {
+        let mut builder = BooleanBufferBuilder::new(child.offset() + child.len());
+        builder.append_n(child.offset(), true);
+        builder.append_buffer(new_validity.inner());
+        builder.build().into_inner()
+    };
+
     // Create new array with adjusted validity
     arrow_array::make_array(
         arrow_data::ArrayData::try_new(
             child.data_type().clone(),
             child.len(),
-            Some(new_validity.into_inner().into_inner()),
+            Some(null_bit_buffer),
             child.offset(),
             child.to_data().buffers().to_vec(),
             child.to_data().child_data().to_vec(),
@@ -1555,6 +1566,66 @@ mod tests {
         new_null_array,
     };
     use arrow_buffer::OffsetBuffer;
+
+    #[rstest::rstest]
+    fn test_adjust_child_validity_sliced_boolean(
+        #[values(0, 1, 7, 8, 9, 1025)] child_offset: usize,
+        #[values(0, 1, 7, 8, 9, 1025)] parent_offset: usize,
+        #[values(false, true)] child_has_nulls: bool,
+    ) {
+        let mut values = vec![Some(false); child_offset];
+        values.extend([
+            Some(true),
+            Some(false),
+            if child_has_nulls { None } else { Some(true) },
+            Some(false),
+        ]);
+        let child: ArrayRef =
+            Arc::new(arrow_array::BooleanArray::from(values).slice(child_offset, 4));
+        let mut validity = vec![false; parent_offset];
+        validity.extend([true, false, true, true]);
+        let parent = arrow_buffer::NullBuffer::from(validity).slice(parent_offset, 4);
+
+        let adjusted = adjust_child_validity(&child, Some(&parent));
+        let adjusted = adjusted.as_boolean();
+        assert_eq!(
+            adjusted.iter().collect::<Vec<_>>(),
+            vec![
+                Some(true),
+                None,
+                if child_has_nulls { None } else { Some(true) },
+                Some(false)
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    fn test_adjust_child_validity_sliced_parent(
+        #[values(0, 1, 7, 8, 9, 1025)] parent_offset: usize,
+        #[values(false, true)] child_has_nulls: bool,
+    ) {
+        let child: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(2),
+            if child_has_nulls { None } else { Some(3) },
+            Some(4),
+        ]));
+        let mut validity = vec![false; parent_offset];
+        validity.extend([true, false, true, true]);
+        let parent = arrow_buffer::NullBuffer::from(validity).slice(parent_offset, 4);
+
+        let adjusted = adjust_child_validity(&child, Some(&parent));
+        let adjusted = adjusted.as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(
+            adjusted.iter().collect::<Vec<_>>(),
+            vec![
+                Some(1),
+                None,
+                if child_has_nulls { None } else { Some(3) },
+                Some(4)
+            ]
+        );
+    }
 
     #[test]
     fn test_convert_to_floating_point_preserves_inner_nulls() {
