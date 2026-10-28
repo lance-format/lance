@@ -488,6 +488,7 @@ impl Scanner {
             let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
+                .with_blob_handling(self.blob_handling.clone())
                 .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
 

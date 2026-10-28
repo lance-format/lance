@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use arrow_array::{Array, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{Array, ArrayRef, cast::AsArray, make_array, types::UInt64Type};
 use arrow_data::ArrayData;
 use arrow_schema::Field;
 use lance::blob::reference::{
     BLOB_REFERENCE_CAPABILITIES, BLOB_REFERENCE_OPERATIONS, BLOB_REFERENCE_PROTOCOL_VERSION,
     BlobMaterializationContext, BlobReadRange, BlobRefBatch, BlobRefBinding, BlobRefCapture,
-    BlobRefReadSession, BlobRefReader, BlobSourceContext,
+    BlobRefReadSession, BlobRefReader, BlobSourceContext, NestedBlobRefBatch,
 };
 use lance_core::utils::address::RowAddress;
 use pyo3::{
@@ -201,6 +204,76 @@ impl PyBlobRefBatch {
     }
 }
 
+/// Flat references and a nested Arrow index mapping preserving offsets and parent nulls.
+#[pyclass(name = "NestedBlobRefBatch", module = "lance.blob", frozen)]
+pub struct PyNestedBlobRefBatch {
+    inner: NestedBlobRefBatch,
+}
+
+#[pymethods]
+impl PyNestedBlobRefBatch {
+    /// Rebuild after engine shape operations or remapping the flat reference context table.
+    #[staticmethod]
+    fn from_arrow(references: &PyBlobRefBatch, indices: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let indices = arrow_array::RecordBatch::from_pyarrow_bound(indices)?;
+        Ok(Self {
+            inner: NestedBlobRefBatch::try_new(references.inner.clone(), indices).infer_error()?,
+        })
+    }
+
+    #[staticmethod]
+    fn decode(bytes: &[u8]) -> PyResult<Self> {
+        Ok(Self {
+            inner: NestedBlobRefBatch::decode(bytes).infer_error()?,
+        })
+    }
+
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new(py, &self.inner.encode().infer_error()?))
+    }
+
+    #[getter]
+    fn references(&self) -> PyBlobRefBatch {
+        PyBlobRefBatch {
+            inner: self.inner.references().clone(),
+        }
+    }
+
+    /// One-column RecordBatch retaining the selected container path with uint64 reference indices.
+    #[getter]
+    fn indices<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.indices().to_pyarrow(py)
+    }
+}
+
+fn capture_inputs(
+    field: &Bound<'_, PyAny>,
+    row_addresses: &Bound<'_, PyAny>,
+    descriptors: &Bound<'_, PyAny>,
+) -> PyResult<(Field, Vec<RowAddress>, ArrayRef)> {
+    let field = Field::from_pyarrow_bound(field)?;
+    let addresses = make_array(ArrayData::from_pyarrow_bound(row_addresses)?);
+    let addresses = addresses
+        .as_primitive_opt::<UInt64Type>()
+        .ok_or_else(|| PyValueError::new_err("row_addresses must be a uint64 Arrow array"))?;
+    if addresses.null_count() != 0 {
+        return Err(PyValueError::new_err(
+            "row_addresses must not contain nulls",
+        ));
+    }
+    let addresses = addresses
+        .values()
+        .iter()
+        .copied()
+        .map(RowAddress::from)
+        .collect();
+    Ok((
+        field,
+        addresses,
+        make_array(ArrayData::from_pyarrow_bound(descriptors)?),
+    ))
+}
+
 /// Reuse scanned Blob V2 descriptors; capture performs no payload reads or HEADs.
 #[pyclass(name = "BlobRefCapture", module = "lance.blob")]
 pub struct PyBlobRefCapture {
@@ -232,23 +305,7 @@ impl PyBlobRefCapture {
         row_addresses: &Bound<'_, PyAny>,
         descriptors: &Bound<'_, PyAny>,
     ) -> PyResult<PyBlobRefBatch> {
-        let field = Field::from_pyarrow_bound(field)?;
-        let addresses = make_array(ArrayData::from_pyarrow_bound(row_addresses)?);
-        let addresses = addresses
-            .as_primitive_opt::<UInt64Type>()
-            .ok_or_else(|| PyValueError::new_err("row_addresses must be a uint64 Arrow array"))?;
-        if addresses.null_count() != 0 {
-            return Err(PyValueError::new_err(
-                "row_addresses must not contain nulls",
-            ));
-        }
-        let addresses = addresses
-            .values()
-            .iter()
-            .copied()
-            .map(RowAddress::from)
-            .collect::<Vec<_>>();
-        let descriptors = make_array(ArrayData::from_pyarrow_bound(descriptors)?);
+        let (field, addresses, descriptors) = capture_inputs(field, row_addresses, descriptors)?;
         let descriptors = descriptors
             .as_struct_opt()
             .ok_or_else(|| PyValueError::new_err("descriptors must be a struct Arrow array"))?
@@ -267,6 +324,33 @@ impl PyBlobRefCapture {
             })?
             .infer_error()?;
         Ok(PyBlobRefBatch { inner })
+    }
+
+    /// Capture one selected leaf below Struct/List/LargeList using the original root scan field.
+    /// The result retains null containers, empty lists, and list ordinals through an Arrow mapping.
+    fn capture_nested(
+        &self,
+        py: Python<'_>,
+        scan_source: &PyBlobSourceContext,
+        field: &Bound<'_, PyAny>,
+        row_addresses: &Bound<'_, PyAny>,
+        descriptors: &Bound<'_, PyAny>,
+    ) -> PyResult<PyNestedBlobRefBatch> {
+        let (field, addresses, descriptors) = capture_inputs(field, row_addresses, descriptors)?;
+        let scan_source = scan_source.inner.clone();
+        let capture = self.inner.clone();
+        let inner = rt()
+            .block_on(Some(py), async move {
+                capture
+                    .lock()
+                    .await
+                    .as_mut()
+                    .ok_or_else(|| lance::Error::invalid_input("BlobRefCapture is closed"))?
+                    .capture_nested(&scan_source, &field, &addresses, &descriptors)
+                    .await
+            })?
+            .infer_error()?;
+        Ok(PyNestedBlobRefBatch { inner })
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -366,6 +450,21 @@ impl PyBlobRefReader {
     #[getter]
     fn io_reserved_bytes(&self) -> PyResult<u64> {
         self.context.io_reserved_bytes().infer_error()
+    }
+    /// Cumulative session counters; reservation peaks cover the reader's shared native context.
+    /// Payload counters count scheduler submissions, not backend retries or only successful reads.
+    #[getter]
+    fn metrics(&self) -> PyResult<HashMap<String, u64>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("BlobRefReader lock is poisoned"))?;
+        let reader = reader
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("BlobRefReader is closed"))?;
+        let metrics = serde_json::to_value(reader.metrics().infer_error()?)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        serde_json::from_value(metrics).map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
     /// Close the factory. Existing streams and returned Arrow arrays retain their owners.
     fn close(&self) -> PyResult<()> {

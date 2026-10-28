@@ -294,6 +294,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<blob_reference::PyBlobSourceContext>()?;
     m.add_class::<blob_reference::PyBlobRefBatch>()?;
+    m.add_class::<blob_reference::PyNestedBlobRefBatch>()?;
     m.add_class::<blob_reference::PyBlobRefCapture>()?;
     m.add_class::<blob_reference::PyBlobRefReader>()?;
     m.add_class::<blob_reference::PyBlobRefReadStream>()?;

@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi, to_ffi};
-use arrow_array::{Array, RecordBatch, StructArray, cast::AsArray, types::UInt64Type};
-use arrow_schema::{DataType, Schema};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, cast::AsArray, types::UInt64Type};
+use arrow_schema::{DataType, Field, Schema};
 use jni::{
     JNIEnv,
-    objects::{JBooleanArray, JByteArray, JLongArray, JObject, JObjectArray, JString},
+    objects::{JBooleanArray, JByteArray, JLongArray, JObject, JObjectArray, JString, JValue},
     sys::{jboolean, jbyteArray, jint, jintArray, jlong, jobjectArray},
 };
 use lance::blob::reference::{
     BLOB_REFERENCE_CAPABILITIES, BLOB_REFERENCE_OPERATIONS, BLOB_REFERENCE_PROTOCOL_VERSION,
     BlobMaterializationContext, BlobReadRange, BlobRefBatch, BlobRefBinding, BlobRefCapture,
-    BlobRefReadSession, BlobRefReader, BlobSourceContext, blob_ref_field,
+    BlobRefReadSession, BlobRefReader, BlobSourceContext, NestedBlobRefBatch, blob_ref_field,
 };
 use lance_core::utils::address::RowAddress;
 use tokio::sync::Mutex;
@@ -108,6 +108,28 @@ fn export_batch(batch: RecordBatch, array: jlong, schema: jlong) -> Result<()> {
         std::ptr::write_unaligned(schema as *mut FFI_ArrowSchema, ffi_schema);
     }
     Ok(())
+}
+
+fn capture_inputs(batch: &RecordBatch, column: &str) -> Result<(Field, ArrayRef, Vec<RowAddress>)> {
+    let field = batch.schema().field_with_name(column)?.clone();
+    let descriptors = batch
+        .column_by_name(column)
+        .ok_or_else(|| invalid(format!("Missing descriptor column {column}")))?
+        .clone();
+    let addresses = batch
+        .column_by_name(lance_core::ROW_ADDR)
+        .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+        .ok_or_else(|| invalid("Scan batch must contain physical uint64 _rowaddr"))?;
+    if addresses.null_count() != 0 {
+        return Err(invalid("_rowaddr must not contain nulls"));
+    }
+    let addresses = addresses
+        .values()
+        .iter()
+        .copied()
+        .map(RowAddress::from)
+        .collect();
+    Ok((field, descriptors, addresses))
 }
 
 #[unsafe(no_mangle)]
@@ -379,24 +401,10 @@ pub extern "system" fn Java_org_lance_BlobReferences_captureNative(
             let source = BlobSourceContext::decode(&env.convert_byte_array(scan_source)?)?;
             let column: String = env.get_string(&column)?.into();
             let batch = import_batch(array, schema)?;
-            let field = batch.schema().field_with_name(&column)?.clone();
-            let descriptors = batch
-                .column_by_name(&column)
-                .and_then(|column| column.as_struct_opt())
+            let (field, descriptors, addresses) = capture_inputs(&batch, &column)?;
+            let descriptors = descriptors
+                .as_struct_opt()
                 .ok_or_else(|| invalid(format!("Missing descriptor struct column {column}")))?;
-            let addresses = batch
-                .column_by_name(lance_core::ROW_ADDR)
-                .and_then(|column| column.as_primitive_opt::<UInt64Type>())
-                .ok_or_else(|| invalid("Scan batch must contain physical uint64 _rowaddr"))?;
-            if addresses.null_count() != 0 {
-                return Err(invalid("_rowaddr must not contain nulls"));
-            }
-            let addresses = addresses
-                .values()
-                .iter()
-                .copied()
-                .map(RowAddress::from)
-                .collect::<Vec<_>>();
             let batch = block_on(async {
                 capture
                     .lock()
@@ -407,6 +415,140 @@ pub extern "system" fn Java_org_lance_BlobReferences_captureNative(
             java_bytes(&env, &batch.encode()?)
         })(),
         std::ptr::null_mut()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_captureNestedNative(
+    mut env: JNIEnv,
+    _class: JObject,
+    capture: JObject,
+    scan_source: JByteArray,
+    column: JString,
+    array: jlong,
+    schema: jlong,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        (|| -> Result<_> {
+            let NativeHandle::Capture(capture) = handle(&mut env, capture)? else {
+                return Err(invalid("Expected a blob capture handle"));
+            };
+            let source = BlobSourceContext::decode(&env.convert_byte_array(scan_source)?)?;
+            let column: String = env.get_string(&column)?.into();
+            let batch = import_batch(array, schema)?;
+            let (field, descriptors, addresses) = capture_inputs(&batch, &column)?;
+            let nested = block_on(async {
+                capture
+                    .lock()
+                    .await
+                    .capture_nested(&source, &field, &addresses, &descriptors)
+                    .await
+            })?;
+            java_bytes(&env, &nested.encode()?)
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_validateNestedBatchNative(
+    mut env: JNIEnv,
+    _class: JObject,
+    encoded: JByteArray,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        (|| -> Result<_> {
+            let batch = NestedBlobRefBatch::decode(&env.convert_byte_array(encoded)?)?;
+            java_bytes(&env, &batch.encode()?)
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_importNestedBatchNative(
+    mut env: JNIEnv,
+    _class: JObject,
+    references: JByteArray,
+    array: jlong,
+    schema: jlong,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        (|| -> Result<_> {
+            let references = BlobRefBatch::decode(&env.convert_byte_array(references)?)?;
+            let batch = NestedBlobRefBatch::try_new(references, import_batch(array, schema)?)?;
+            java_bytes(&env, &batch.encode()?)
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_nestedReferencesNative(
+    mut env: JNIEnv,
+    _class: JObject,
+    encoded: JByteArray,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        (|| -> Result<_> {
+            let batch = NestedBlobRefBatch::decode(&env.convert_byte_array(encoded)?)?;
+            java_bytes(&env, &batch.references().encode()?)
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_exportNestedIndicesNative(
+    mut env: JNIEnv,
+    _class: JObject,
+    encoded: JByteArray,
+    array: jlong,
+    schema: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        (|| -> Result<_> {
+            let batch = NestedBlobRefBatch::decode(&env.convert_byte_array(encoded)?)?;
+            export_batch(batch.indices().clone(), array, schema)
+        })()
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_metricsNative<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JObject,
+    reader: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        (|| -> Result<_> {
+            let NativeHandle::Reader(reader) = handle(&mut env, reader)? else {
+                return Err(invalid("Expected a blob reader handle"));
+            };
+            let values: HashMap<String, u64> =
+                serde_json::from_value(serde_json::to_value(reader.reader.metrics()?)?)?;
+            let map = env.new_object("java/util/HashMap", "()V", &[])?;
+            for (key, value) in values {
+                let key = env.new_string(key)?;
+                let value =
+                    env.new_object("java/lang/Long", "(J)V", &[JValue::Long(value as i64)])?;
+                env.call_method(
+                    &map,
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[JValue::Object(&key), JValue::Object(&value)],
+                )?;
+                env.delete_local_ref(key)?;
+                env.delete_local_ref(value)?;
+            }
+            Ok(map)
+        })()
     )
 }
 

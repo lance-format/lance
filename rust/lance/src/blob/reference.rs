@@ -35,6 +35,11 @@ use crate::Dataset;
 
 mod bindings;
 pub use bindings::BlobRefReadSession;
+mod metrics;
+pub use metrics::BlobRefMetrics;
+pub(crate) use metrics::ReaderMetrics;
+mod nested;
+pub use nested::NestedBlobRefBatch;
 
 pub use crate::dataset::blob::capture::BlobRefCapture;
 pub use crate::dataset::blob::{
@@ -54,6 +59,8 @@ pub const BLOB_REFERENCE_CAPABILITIES: &[u32] = &[1, 2];
 /// SDK operations available independently of the source transport capabilities.
 pub const BLOB_REFERENCE_OPERATIONS: &[&str] = &[
     "capture_top_level",
+    "capture_nested",
+    "reader_metrics_v1",
     "read_whole",
     "read_range",
     "streaming",
@@ -1221,15 +1228,14 @@ mod tests {
 
     #[cfg_attr(coverage, coverage(off))]
     async fn capture_dataset(uri: &str) -> Arc<Dataset> {
-        let mut blobs = BlobArrayBuilder::new(6);
-        for bytes in [
-            Some(b"abc".as_slice()),
-            Some(b"abcde"),
-            Some(b"abcdefghij"),
-            None,
-            Some(b""),
-            Some(b"uv"),
-        ] {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../test_data/blob_reference_v1/conformance.json"
+        ))
+        .unwrap();
+        let payloads = fixture["payloads"].as_array().unwrap();
+        let mut blobs = BlobArrayBuilder::new(payloads.len());
+        for value in payloads {
+            let bytes = value.as_str().map(str::as_bytes);
             if let Some(bytes) = bytes {
                 blobs.push_bytes(bytes).unwrap();
             } else {
@@ -1677,6 +1683,114 @@ mod tests {
                 }
                 (None, None) => {}
                 other => panic!("Unexpected captured value {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_reference_conformance_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../test_data/blob_reference_v1/conformance.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            fixture["protocol_version"].as_u64().unwrap(),
+            u64::from(BLOB_REFERENCE_PROTOCOL_VERSION)
+        );
+        let dataset = capture_dataset("memory://").await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/conformance", "workers")
+            .await
+            .unwrap();
+        let references = capture_ref_batch(&dataset, &source).await;
+        let references = BlobRefBatch::decode(&references.encode().unwrap()).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source, dataset).unwrap()],
+            BlobMaterializationContext::try_new(1024, 1024).unwrap(),
+        )
+        .unwrap();
+        let requests = fixture["requests"].as_array().unwrap();
+        let indices = requests
+            .iter()
+            .map(|request| request["reference_index"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        let request_indices = requests
+            .iter()
+            .map(|request| {
+                request["request_index"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let ranges = requests
+            .iter()
+            .map(|request| {
+                request["range"].as_array().map(|range| {
+                    BlobReadRange::new(range[0].as_u64().unwrap(), range[1].as_u64().unwrap())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut stream = reader
+            .read(
+                references
+                    .read_requests(&indices, &request_indices, &ranges)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut results = HashMap::new();
+        while let Some(result) = stream.try_next().await.unwrap() {
+            results.insert(result.request_index, result.data.map(|data| data.to_vec()));
+        }
+        for (request, index) in requests.iter().zip(request_indices) {
+            assert_eq!(
+                results[&index].as_deref(),
+                request["expected"].as_str().map(str::as_bytes)
+            );
+        }
+        for range in fixture["invalid_ranges"].as_array().unwrap() {
+            let offset = range["offset"].as_str().unwrap().parse().unwrap();
+            let length = range["length"].as_str().unwrap().parse().unwrap();
+            let error = reader
+                .read(
+                    references
+                        .read_requests(&[2], &[0], &[Some(BlobReadRange::new(offset, length))])
+                        .unwrap(),
+                )
+                .err()
+                .unwrap();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("range"));
+        }
+        assert_eq!(reader.metrics().unwrap().duplicate_demands, 1);
+    }
+
+    #[tokio::test]
+    async fn portable_capture_reads_released_blob_descriptors() {
+        let directory = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+        let dataset = Arc::new(Dataset::open(&directory.path_str()).await.unwrap());
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/released", "workers")
+            .await
+            .unwrap();
+        let references = capture_ref_batch(&dataset, &source).await;
+        for (index, expected) in [
+            Some(vec![b'p'; 16]),
+            Some(b"inline".to_vec()),
+            None,
+            Some(Vec::new()),
+            Some(vec![b'd'; 32]),
+            Some(b"inline".to_vec()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match (references.reference(index).unwrap(), expected) {
+                (Some(reference), Some(expected)) => assert_eq!(
+                    read_one_ref(&dataset, &source, reference).await.as_ref(),
+                    expected
+                ),
+                (None, None) => (),
+                other => panic!("Unexpected released-fixture value {other:?}"),
             }
         }
     }
@@ -2173,6 +2287,17 @@ mod tests {
         assert_eq!(recorded.head_requests.load(Ordering::Acquire), 0);
         // Eight physical bytes plus fourteen logical bytes, including duplicates.
         assert_eq!(budget.reserved_bytes().unwrap(), 22);
+        let metrics = reader.metrics().unwrap();
+        assert_eq!(metrics.descriptor_requests, 0);
+        assert_eq!(metrics.metadata_requests, 0);
+        assert_eq!(metrics.payload_requests, 1);
+        assert_eq!(metrics.payload_bytes, 8);
+        assert_eq!(metrics.coalesced_bytes, 8);
+        assert_eq!(metrics.requested_logical_bytes, 14);
+        assert_eq!(metrics.returned_logical_bytes, 14);
+        assert_eq!(metrics.duplicate_demands, 1);
+        assert_eq!(metrics.peak_reserved_bytes, 22);
+        assert_eq!(metrics.peak_io_reserved_bytes, 8);
         let clone = results
             .iter()
             .find(|result| result.request_index == 90)
@@ -2849,6 +2974,11 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("exceeds length 8"), "{error}");
+        let metrics = reader.metrics().unwrap();
+        assert_eq!(metrics.metadata_requests, 1);
+        assert_eq!(metrics.payload_bytes, 3);
+        assert_eq!(metrics.requested_logical_bytes, 3);
+        assert_eq!(metrics.returned_logical_bytes, 3);
     }
 
     #[rstest]

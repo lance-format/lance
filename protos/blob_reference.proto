@@ -69,3 +69,15 @@ message ReferenceBatch {
   repeated SourceContext contexts = 2;
   bytes arrow_ipc = 3;
 }
+
+/* Capture of one Blob V2 leaf below structs/lists. references is an encoded
+ * ReferenceBatch. indices_ipc contains one Arrow batch and one column preserving
+ * the selected container path, list offsets, and nulls, with uint64 leaves that
+ * index references. Null leaves denote SQL null; other struct fields are omitted.
+ * This execution envelope does not change any persisted descriptor or locator.
+ */
+message NestedReferenceBatch {
+  uint32 protocol_version = 1;
+  bytes references = 2;
+  bytes indices_ipc = 3;
+}

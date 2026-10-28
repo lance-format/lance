@@ -39,6 +39,9 @@ from .lance import (
     ManagedBlobWriter as ManagedBlobWriter,
 )
 from .lance import (
+    NestedBlobRefBatch as NestedBlobRefBatch,
+)
+from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
 
