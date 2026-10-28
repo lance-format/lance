@@ -1948,23 +1948,32 @@ impl Dataset {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
     }
 
-    /// Turn the blob v2 columns of `batch` into values another dataset can be
-    /// written from: the payload bytes of every blob this dataset stores, and an
-    /// External blob's absolute URI and byte range.
+    /// Scan every row of this dataset with its blob v2 columns as values another
+    /// dataset can be written from: the payload bytes of every blob this dataset
+    /// stores, and an External blob's absolute URI and byte range, at any depth.
     ///
-    /// `batch` must be scanned from this dataset with blob v2 columns as
-    /// descriptors (the default) and with [`ROW_ADDR`],
-    /// which is dropped from the result. Blobs inside structs and lists are
-    /// converted too. Every payload in the batch is read into memory, so bound
-    /// the scan's batch size.
-    ///
-    /// Each column keeps the name it was scanned as, so a nested blob projected
-    /// to the top level is named by its path (`meta.blob`), which a dataset
-    /// cannot be written with: rename it, or scan with
-    /// [`Scanner::project_with_schema`](crate::dataset::scanner::Scanner::project_with_schema)
-    /// to keep the struct.
-    pub async fn blobs_as_logical(self: &Arc<Self>, batch: RecordBatch) -> Result<RecordBatch> {
-        optimize::transform_blob_v2_batch(self, self.schema(), batch, false).await
+    /// Each batch holds the payloads of its blobs in memory.
+    pub async fn scan_blobs_as_logical(self: &Arc<Self>) -> Result<DatasetRecordBatchStream> {
+        let mut scan = self.scan();
+        scan.with_row_address();
+        let batches = scan.try_into_stream().await?;
+        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+            self.schema(),
+            lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
+            false,
+            false,
+        )?);
+        let schema = plan.output_schema().clone();
+        let dataset = self.clone();
+        let batches = batches
+            .and_then(move |batch| {
+                let (plan, dataset) = (plan.clone(), dataset.clone());
+                async move { plan.transform_batch(&dataset, batch).await }
+            })
+            .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)));
+        Ok(DatasetRecordBatchStream::new(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches),
+        )))
     }
 
     /// Take [BlobFile] by row indices (offsets in the dataset).
