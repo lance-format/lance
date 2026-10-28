@@ -708,7 +708,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
 #[case(LanceFileVersion::V2_3)]
 #[tokio::test]
 async fn test_binary_copy_remaps_unstable_row_ids(#[case] version: LanceFileVersion) {
-    do_binary_copy_remaps_unstable_row_ids(version).await;
+    Box::pin(do_binary_copy_remaps_unstable_row_ids(version)).await;
 }
 
 async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {

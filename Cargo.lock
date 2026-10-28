@@ -5270,6 +5270,7 @@ dependencies = [
  "lance-select",
  "lance-testing",
  "log",
+ "num-traits",
  "object_store 0.14.2",
  "pretty_assertions",
  "proptest",

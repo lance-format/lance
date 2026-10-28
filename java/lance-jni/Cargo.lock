@@ -4479,6 +4479,7 @@ dependencies = [
  "lance-io",
  "lance-select",
  "log",
+ "num-traits",
  "object_store 0.14.2",
  "prost",
  "prost-build",

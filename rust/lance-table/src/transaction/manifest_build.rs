@@ -70,12 +70,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Table config key that opts a table into writing clustered deletions as
-/// `Range` segments (`U64Segment::Ranges`). Set it to `true` with
-/// `update_config`.
+/// Table config key that opts a table into re-encoding its inline row id
+/// sequences in the smallest wire form (`RowIdSequence::reencode`), clustered
+/// deletions included as `Range` segments (`U64Segment::Ranges`). Set it to
+/// `true` with `update_config`.
 ///
-/// Manifests written afterwards re-encode bitmap row id segments as runs of
-/// `Range` segments where that is smaller. That is the
+/// Manifests written afterwards re-encode the row ids of every fragment a
+/// commit changes where that is smaller. That is the
 /// existing wire format, so any version reads the result, but a reader without
 /// the compact in-memory form handles thousands of segments per fragment
 /// slowly. That is why it is opt-in rather than the default.
@@ -93,7 +94,7 @@ fn range_segments_enabled(manifest: &Manifest) -> bool {
         .is_some_and(|value| str_is_truthy(value))
 }
 
-/// Re-encode inline row id sequences as runs of `Range` segments when the
+/// Re-encode inline row id sequences in their smallest wire form when the
 /// table has opted in.
 ///
 /// Fragments that the previous manifest already re-encoded are left alone
@@ -128,9 +129,14 @@ fn apply_range_segments(
         if unchanged.get(&fragment.id) == Some(&data.as_ptr()) {
             continue;
         }
-        let mut sequence = read_row_ids(&data[..])?;
-        if sequence.use_range_segments() {
-            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+        let sequence = read_row_ids(&data[..])?;
+        let encoded = write_row_ids(&sequence.reencode());
+        // Smaller wins. So does breaking `Range` runs that a reader would fold
+        // across a gap: the row id index then sees one interval covering every
+        // piece in between, which cost one table 278 GB of merged map; on that
+        // table the fragments concerned grew by 4 MB in all.
+        if encoded.len() < data.len() || sequence.range_runs_span_a_gap() {
+            fragment.row_id_meta = Some(RowIdMeta::Inline(encoded.into()));
         }
     }
     Ok(())
@@ -4399,6 +4405,97 @@ mod tests {
         assert_eq!(fragments[0].files.len(), 2);
         assert_eq!(fragments[0].files[0].path, "normal.lance");
         assert_eq!(fragments[0].files[1].path, "mixed.lance");
+    }
+
+    /// The hook takes a re-encoding that is larger when the old bytes hold
+    /// `Range` runs a reader folds across a gap: three short runs 1M apart are
+    /// 48 bytes of `Range` segments that fold into one `Ranges` spanning 2M
+    /// ids, and come back as a `Range` and two hole-free `RangeWithHoles`.
+    #[test]
+    fn test_range_segments_hook_breaks_wide_folds_even_when_larger() {
+        fn inline_bytes(manifest: &Manifest) -> Vec<u8> {
+            match &manifest.fragments[0].row_id_meta {
+                Some(RowIdMeta::Inline(data)) => data.to_vec(),
+                other => panic!("expected inline row ids, got {other:?}"),
+            }
+        }
+        fn wire_kinds(bytes: &[u8]) -> Vec<&'static str> {
+            use prost::Message;
+            pb::RowIdSequence::decode(bytes)
+                .unwrap()
+                .segments
+                .iter()
+                .map(|segment| match segment.segment {
+                    Some(pb::u64_segment::Segment::Range(_)) => "range",
+                    Some(pb::u64_segment::Segment::RangeWithHoles(_)) => "holes",
+                    _ => "other",
+                })
+                .collect()
+        }
+        let mut row_ids = RowIdSequence::from(0u64..100);
+        row_ids.extend(RowIdSequence::from(1_000_000u64..1_000_100));
+        row_ids.extend(RowIdSequence::from(2_000_000u64..2_000_100));
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+        fragment.physical_rows = Some(300);
+        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        manifest
+            .config
+            .insert(RANGE_SEGMENTS_CONFIG_KEY.to_string(), "true".to_string());
+        let before = inline_bytes(&manifest);
+        assert_eq!(wire_kinds(&before), ["range", "range", "range"]);
+
+        apply_range_segments(&mut manifest, None).unwrap();
+        let after = inline_bytes(&manifest);
+        assert!(
+            after.len() > before.len(),
+            "{} <= {}",
+            after.len(),
+            before.len()
+        );
+        assert_eq!(
+            wire_kinds(&after),
+            ["range", "holes", "range", "holes", "range"]
+        );
+        assert_eq!(
+            read_row_ids(&after).unwrap().iter().collect::<Vec<_>>(),
+            row_ids.iter().collect::<Vec<_>>()
+        );
+
+        // Decoded afresh, the result has nothing left to break and is kept.
+        let mut again = make_stable_row_id_manifest(vec![manifest.fragments[0].clone()]);
+        again.config = manifest.config.clone();
+        apply_range_segments(&mut again, None).unwrap();
+        assert_eq!(inline_bytes(&again), after);
+
+        // Repairing a gap leaves an unrelated unsorted array as it is: the
+        // bytes grow by the breaker alone, not by a `Range` per id.
+        let mut row_ids = RowIdSequence::from(0u64..100);
+        row_ids.extend(RowIdSequence::from(1_000_000u64..1_000_100));
+        let descending: Vec<u64> = (2_000_000..2_020_000u64).rev().collect();
+        row_ids.extend(RowIdSequence::from(descending.as_slice()));
+        let mut fragment = Fragment::new(0);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids).into()));
+        fragment.physical_rows = Some(20_200);
+        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        manifest
+            .config
+            .insert(RANGE_SEGMENTS_CONFIG_KEY.to_string(), "true".to_string());
+        let before = inline_bytes(&manifest);
+        apply_range_segments(&mut manifest, None).unwrap();
+        let after = inline_bytes(&manifest);
+        assert_eq!(wire_kinds(&after), ["range", "holes", "range", "other"]);
+        assert!(
+            after.len() <= before.len() + 64,
+            "repairing one gap expanded unrelated data: {} -> {} bytes",
+            before.len(),
+            after.len()
+        );
+        assert!(!read_row_ids(&after).unwrap().range_runs_span_a_gap());
+        assert_eq!(
+            read_row_ids(&after).unwrap().iter().collect::<Vec<_>>(),
+            row_ids.iter().collect::<Vec<_>>()
+        );
     }
 
     /// When a fragment has no existing last_updated_at_version_meta (None), a

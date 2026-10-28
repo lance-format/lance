@@ -1530,6 +1530,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let groups = [RewriteGroup {
             old_fragments: vec![Fragment::new(6), Fragment::new(7)],
@@ -1777,7 +1779,7 @@ mod tests {
         let latest = Dataset::open(uri).await.unwrap();
         assert_eq!(latest.manifest.version, version);
         assert_same_history(&history(&latest).await, recorded);
-        assert_deferred_compaction_records(uri, before).await;
+        Box::pin(assert_deferred_compaction_records(uri, before)).await;
     }
 
     /// Restoring a detached version promotes its history onto the main chain
@@ -1917,7 +1919,7 @@ mod tests {
         assert_eq!(latest.manifest.version, dataset.manifest.version + 1);
         assert_eq!(history(&latest).await.len(), recorded.len() + 1);
         assert_translations_hold(&before, dir.as_str()).await;
-        assert_deferred_compaction_records(dir.as_str(), &before).await;
+        Box::pin(assert_deferred_compaction_records(dir.as_str(), &before)).await;
         let latest = Dataset::open(dir.as_str()).await.unwrap();
         assert_answers_through(&latest, "i_idx", "i >= 50").await;
     }
