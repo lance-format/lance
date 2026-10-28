@@ -42,3 +42,8 @@ handle any breaking changes introduced in the major version.
 
 Each project maintains its own detailed release process in a file named `release_process.md`.
 Changes to any project-specific release process are treated as normal code modifications and can be approved by a maintainer with write access.
+
+Project-specific instructions:
+
+- [Lance release process](https://github.com/lance-format/lance/blob/main/release_process.md)
+- [LanceDB release process](https://github.com/lancedb/lancedb/blob/main/release_process.md)
