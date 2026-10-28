@@ -921,3 +921,44 @@ class TestBackfillAndRefreshExtraOptions:
         no_extras_set_body = capturing_server.captured_bodies[-1]
 
         assert no_extras_set_body == plain_body
+
+
+class _ThrottlingHandler(BaseHTTPRequestHandler):
+    """Answers every GET with a spec-shaped throttling error."""
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
+        body = json.dumps({"code": 21, "error": "Too many requests"}).encode()
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", "2")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        pass
+
+
+@pytest.fixture
+def throttling_server():
+    server = HTTPServer(("127.0.0.1", 0), _ThrottlingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+def test_throttling_error_exposes_retry_after(throttling_server):
+    client = connect(
+        "rest", {"uri": f"http://127.0.0.1:{throttling_server.server_port}"}
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        client.list_namespaces(ListNamespacesRequest(id=["parent"]))
+
+    error = exc_info.value
+    assert type(error).__name__ == "ThrottlingError"
+    assert error.retry_after == 2.0
