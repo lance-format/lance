@@ -24,7 +24,7 @@ not recover.
 
 ### Target Version
 
-Every index has a version is stored in the `IndexMetadata`. A JSON-wrapped
+Every index has a version that is stored in the `IndexMetadata`. A JSON-wrapped
 target has no `IndexMetadata` entry of its own to record a version in, and
 most target types do not otherwise self-describe their version inside their
 own files (MinHash LSH, which stamps `minhash_lsh_index_version` into its
