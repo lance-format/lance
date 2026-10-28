@@ -31,6 +31,7 @@ pub fn default_build_config() -> ManifestBuildConfig {
         disable_transaction_file: false,
         migration_next_row_id: None,
         activate_non_reusable_field_ids: false,
+        clustering_definitions: None,
         spilled_row_lineage: Default::default(),
     }
 }
@@ -58,6 +59,8 @@ pub fn sample_index_metadata(name: &str) -> IndexMetadata {
         created_at: Some(Utc::now()),
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     }
 }
 

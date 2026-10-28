@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::{MultipartUpload, PutMode, PutMultipartOptions, PutOptions};
+use object_store::{MultipartUpload, ObjectStoreExt};
 use object_store::{ObjectStore, path::Path};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
@@ -112,7 +112,6 @@ pub struct ObjectWriter {
     cursor: usize,
     upload_parallelism: NonZeroUsize,
     buffer: Vec<u8>,
-    put_mode: PutMode,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
 }
@@ -246,7 +245,7 @@ enum UploadState {
 
 /// Methods for state transitions.
 impl UploadState {
-    fn started_to_putting_single(&mut self, path: Arc<Path>, buffer: Vec<u8>, put_mode: PutMode) {
+    fn started_to_putting_single(&mut self, path: Arc<Path>, buffer: Vec<u8>) {
         // To get owned self, we temporarily swap with Done.
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
@@ -255,26 +254,16 @@ impl UploadState {
                 let started_at = Instant::now();
                 let fut = async move {
                     let size = buffer.len();
-                    let res = store
-                        .put_opts(
-                            &path,
-                            buffer.into(),
-                            PutOptions {
-                                mode: put_mode,
-                                ..Default::default()
-                            },
+                    let res = store.put(&path, buffer.into()).await.map_err(|source| {
+                        UploadFailure::new(
+                            format!(
+                                "single PUT of {path} failed after {:?} ({size} bytes, {})",
+                                started_at.elapsed(),
+                                upload_settings()
+                            ),
+                            source,
                         )
-                        .await
-                        .map_err(|source| {
-                            UploadFailure::new(
-                                format!(
-                                    "single PUT of {path} failed after {:?} ({size} bytes, {})",
-                                    started_at.elapsed(),
-                                    upload_settings()
-                                ),
-                                source,
-                            )
-                        })?;
+                    })?;
                     Ok(WriteResult {
                         size,
                         e_tag: res.e_tag,
@@ -337,21 +326,12 @@ impl ObjectWriter {
     /// Creates a writer, rejecting `LANCE_UPLOAD_CONCURRENCY=0` before allocating
     /// an upload buffer or issuing any requests.
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
-        Self::new_with_mode(object_store, path, PutMode::Overwrite).await
-    }
-
-    pub(crate) async fn new_with_mode(
-        object_store: &LanceObjectStore,
-        path: &Path,
-        put_mode: PutMode,
-    ) -> Result<Self> {
-        Self::with_upload_parallelism(object_store, path, put_mode, max_upload_parallelism())
+        Self::with_upload_parallelism(object_store, path, max_upload_parallelism())
     }
 
     fn with_upload_parallelism(
         object_store: &LanceObjectStore,
         path: &Path,
-        put_mode: PutMode,
         upload_parallelism: usize,
     ) -> Result<Self> {
         let upload_parallelism = NonZeroUsize::new(upload_parallelism).ok_or_else(|| {
@@ -365,7 +345,6 @@ impl ObjectWriter {
             upload_parallelism,
             path: Arc::new(path.clone()),
             buffer: Vec::with_capacity(initial_upload_size()),
-            put_mode,
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
     }
@@ -547,19 +526,9 @@ impl AsyncWrite for ObjectWriter {
                     UploadState::Started(store) => {
                         let path = mut_self.path.clone();
                         let store = store.clone();
-                        let put_mode = mut_self.put_mode.clone();
                         let started_at = Instant::now();
                         let fut = Box::pin(async move {
-                            store
-                                .put_multipart_opts(
-                                    path.as_ref(),
-                                    PutMultipartOptions {
-                                        mode: put_mode,
-                                        ..Default::default()
-                                    },
-                                )
-                                .await
-                                .map_err(|source| {
+                            store.put_multipart(path.as_ref()).await.map_err(|source| {
                                     UploadFailure::new(
                                         format!(
                                             "failed to create multipart upload for {path} after {:?} ({})",
@@ -666,8 +635,7 @@ impl AsyncWrite for ObjectWriter {
                     // If we didn't start a multipart upload, we can just do a single put.
                     let part = std::mem::take(&mut mut_self.buffer);
                     let path = mut_self.path.clone();
-                    let put_mode = mut_self.put_mode.clone();
-                    self.state.started_to_putting_single(path, part, put_mode);
+                    self.state.started_to_putting_single(path, part);
                 }
                 UploadState::InProgress {
                     upload,
@@ -1519,7 +1487,7 @@ mod tests {
     fn test_zero_upload_parallelism_rejected() {
         let store = LanceObjectStore::memory();
         let path = Path::from("zero-concurrency.lance");
-        let error = ObjectWriter::with_upload_parallelism(&store, &path, PutMode::Overwrite, 0)
+        let error = ObjectWriter::with_upload_parallelism(&store, &path, 0)
             .err()
             .expect("zero concurrency must be rejected");
 
@@ -1543,13 +1511,9 @@ mod tests {
         let store = LanceObjectStore::memory();
         let path = Path::from("round-trip.lance");
         let mut writer = match upload_parallelism {
-            Some(upload_parallelism) => ObjectWriter::with_upload_parallelism(
-                &store,
-                &path,
-                PutMode::Overwrite,
-                upload_parallelism,
-            )
-            .unwrap(),
+            Some(upload_parallelism) => {
+                ObjectWriter::with_upload_parallelism(&store, &path, upload_parallelism).unwrap()
+            }
             None => ObjectWriter::new(&store, &path).await.unwrap(),
         };
         let size = (initial_upload_size() * full_parts)
@@ -1574,13 +1538,9 @@ mod tests {
         let observations = store.observations.clone();
         let mut lance_store = LanceObjectStore::memory();
         lance_store.inner = Arc::new(store);
-        let mut writer = ObjectWriter::with_upload_parallelism(
-            &lance_store,
-            &Path::from("gated-tail.lance"),
-            PutMode::Overwrite,
-            1,
-        )
-        .unwrap();
+        let mut writer =
+            ObjectWriter::with_upload_parallelism(&lance_store, &Path::from("gated-tail.lance"), 1)
+                .unwrap();
         let payload = (0..initial_upload_size() + 16)
             .map(|i| i as u8)
             .collect::<Vec<_>>();

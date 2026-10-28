@@ -21,9 +21,9 @@ use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array, new_nu
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
+use datafusion_physical_plan::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
@@ -2905,7 +2905,7 @@ mod tests {
         let sorted_row_ids = arrow::compute::take(row_ids.as_ref(), &indices, None).unwrap();
         RecordBatch::try_new(batch.schema(), vec![sorted_values, sorted_row_ids]).unwrap()
     }
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;

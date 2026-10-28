@@ -6,10 +6,10 @@
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::ListArray;
 use arrow_schema::Field;
-use datafusion::functions::regex::regexplike::RegexpLikeFunc;
-use datafusion::functions::string::contains::ContainsFunc;
-use datafusion::functions_nested::array_has;
 use datafusion_common::{Column, scalar::ScalarValue};
+use datafusion_functions::regex::regexplike::RegexpLikeFunc;
+use datafusion_functions::string::contains::ContainsFunc;
+use datafusion_functions_nested::array_has;
 use std::collections::HashSet;
 use std::{any::Any, ops::Bound, sync::Arc};
 
@@ -20,7 +20,7 @@ use datafusion_expr::{
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::Result;
 
-use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
+use lance_datafusion_exec::udf::CONTAINS_TOKENS_UDF;
 
 use crate::IndexParams;
 pub use crate::metrics::MetricsCollector;

@@ -32,6 +32,7 @@ pub use read::{
     ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, take_blobs_by_addresses,
 };
 pub(super) use read::{take_blobs, validate_blob_column};
+pub use write::BlobPayloadInventory;
 pub use write::BlobPreprocessor;
 pub(super) use write::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,

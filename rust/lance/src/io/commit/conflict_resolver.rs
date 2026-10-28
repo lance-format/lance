@@ -1357,17 +1357,26 @@ impl<'a> TransactionRebase<'a> {
                     // the rewritten rows under their old fragments. On an untagged table
                     // the remap was deferred if the rewrite carries a reuse update
                     // (visible only in the process that committed it) or the latest
-                    // reuse index records it.
+                    // reuse index records it. On a stable-row-id table only the latest
+                    // reuse index counts: a cleanup there may have trimmed the record
+                    // since, leaving an index built before the rewrite nothing to
+                    // translate through.
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    let deferred = frag_reuse_index
+                    let is_recorded = self
+                        .untagged_reuse
                         .as_ref()
-                        .is_some_and(|entry| !is_tagged(entry))
-                        || self
-                            .untagged_reuse
-                            .as_ref()
-                            .is_some_and(|reuse| reuse.records(groups));
+                        .is_some_and(|reuse| reuse.records(groups));
+                    let has_stable_row_ids = self
+                        .untagged_reuse
+                        .as_ref()
+                        .is_some_and(|reuse| reuse.manifest.uses_stable_row_ids());
+                    let deferred = is_recorded
+                        || (!has_stable_row_ids
+                            && frag_reuse_index
+                                .as_ref()
+                                .is_some_and(|entry| !is_tagged(entry)));
                     if deferred {
                         if let Some(reuse) = &self.untagged_reuse
                             && !reuse.withdraw_folded_overlays(groups, new_indices)
@@ -1404,8 +1413,8 @@ impl<'a> TransactionRebase<'a> {
                             .iter()
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         {
-                            // this should not happen today since we don't support committing
-                            // a mixture of frag_reuse_index and other indices.
+                            // A frag_reuse_index replacement mixed with other indices is a
+                            // shape this resolver does not reason about, so refuse it.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
@@ -1551,14 +1560,36 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Rewrite {
             groups,
             frag_reuse_index,
+            rewritten_indices,
             ..
         } = &self.transaction.operation
         {
+            // Compaction reserves a new ID suffix after planning. A concurrent
+            // row addition can then sort before its replacements, so retry the
+            // compaction. Stable-partition rewrites carry their own tagged row
+            // mapping and keep the existing append rebase behavior.
+            let is_stable_partition_rewrite = self.reuse.added_transitions.as_ref().is_some_and(
+                |transitions| {
+                    !transitions.is_empty()
+                        && transitions.iter().all(|transition| {
+                            matches!(
+                                transition.mapping,
+                                Some(lance_table::format::pb::fragment_reuse_index_details::transition::Mapping::StablePartition(_))
+                            )
+                        })
+                },
+            );
             match &other_transaction.operation {
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
-                Operation::Append { .. }
-                | Operation::ReserveFragments { .. }
+                Operation::Append { .. } => {
+                    if !is_stable_partition_rewrite {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -1568,17 +1599,30 @@ impl<'a> TransactionRebase<'a> {
                     updated_fragments,
                     deleted_fragment_ids,
                     ..
-                }
-                | Operation::Update {
-                    updated_fragments,
-                    removed_fragment_ids: deleted_fragment_ids,
-                    ..
                 } => {
                     if updated_fragments
                         .iter()
                         .map(|f| f.id)
                         .chain(deleted_fragment_ids.iter().copied())
                         .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::Update {
+                    updated_fragments,
+                    removed_fragment_ids: deleted_fragment_ids,
+                    new_fragments,
+                    ..
+                } => {
+                    if (!is_stable_partition_rewrite && !new_fragments.is_empty())
+                        || updated_fragments
+                            .iter()
+                            .map(|f| f.id)
+                            .chain(deleted_fragment_ids.iter().copied())
+                            .any(|id| self.modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
@@ -1599,7 +1643,11 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::Rewrite { groups, .. } => {
+                Operation::Rewrite {
+                    groups,
+                    rewritten_indices: other_rewritten_indices,
+                    ..
+                } => {
                     // Double consumption: the committed rewrite replaced
                     // fragments our tagged transitions read from or produce,
                     // so appending our transitions would record row movement
@@ -1645,6 +1693,40 @@ impl<'a> TransactionRebase<'a> {
                                 .into(),
                             ));
                         }
+                    }
+                    // A replaced source invalidates a physical segment merge even
+                    // when the concurrent rewrite also relabels our suffix fragments.
+                    // Diagnose this before the retryable fragment-overlap check.
+                    let mut replacement_source_counts = HashMap::new();
+                    for rewritten_index in rewritten_indices {
+                        *replacement_source_counts
+                            .entry(rewritten_index.new_id)
+                            .or_insert(0) += 1;
+                    }
+                    let merged_sources = rewritten_indices
+                        .iter()
+                        .filter(|rewritten_index| {
+                            replacement_source_counts[&rewritten_index.new_id] > 1
+                        })
+                        .map(|rewritten_index| rewritten_index.old_id)
+                        .collect::<HashSet<_>>();
+                    let replaced_source =
+                        other_rewritten_indices.iter().find_map(|rewritten_index| {
+                            (rewritten_index.old_id != rewritten_index.new_id
+                                && merged_sources.contains(&rewritten_index.old_id))
+                            .then_some(rewritten_index.old_id)
+                        });
+                    if let Some(source_id) = replaced_source {
+                        return Err(Error::incompatible_transaction_source(
+                            format!(
+                                "A concurrent rewrite at version {} replaced source index \
+                                 segment {}, which this rewrite planned to merge. The stale \
+                                 compaction plan can never succeed as committed; replan \
+                                 compaction from the latest dataset.",
+                                other_version, source_id
+                            )
+                            .into(),
+                        ));
                     }
                     if groups
                         .iter()
@@ -1695,9 +1777,9 @@ impl<'a> TransactionRebase<'a> {
                         // cleanup trim); `finish_rewrite` works from the
                         // CURRENT manifest entry every attempt.
                         (Some(_), true) => {
-                            // An FRI replacement commits alone. A CreateIndex
-                            // mixing it with user indices is a shape this
-                            // resolver does not reason about (the user-index
+                            // A cleanup commits an FRI replacement alone. A
+                            // CreateIndex mixing it with user indices is a shape
+                            // this resolver does not reason about (the user-index
                             // straddle check below never runs for it), so
                             // refuse it instead of guessing.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
@@ -1765,8 +1847,8 @@ impl<'a> TransactionRebase<'a> {
                         }
                         // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), false) => {
-                            // this should not happen today since we don't support committing
-                            // a mixture of frag_reuse_index and other indices.
+                            // As above, a replacement mixed with other indices is
+                            // refused rather than reasoned about.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 Err(self
                                     .incompatible_conflict_err(other_transaction, other_version))
@@ -2883,12 +2965,12 @@ impl<'a> TransactionRebase<'a> {
                         new_entry,
                         current_entry,
                     } => {
-                        *new_indices = vec![new_entry];
-                        *removed_indices = vec![current_entry];
+                        *new_indices = vec![*new_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                     TaggedTrimOutcome::Delete { current_entry } => {
                         new_indices.clear();
-                        *removed_indices = vec![current_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                 }
                 return Ok(self.transaction);
@@ -3315,6 +3397,57 @@ fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
     union
 }
 
+/// Refuse a concurrent transaction that could hand one of an allocating
+/// clustering submission's key field ids to another column.
+///
+/// A definition keys on field ids the writer resolved in `read_schema`, a
+/// snapshot that still used reusable ids. Until the allocation itself
+/// activates the non-reusable contract, a schema replacement in the window
+/// (an overwrite, a drop, a restore, or a merge that does not keep every read
+/// field under its id with the same name, parent and type) may reassign an id,
+/// and a drop followed by a re-add with the same name and type hides that in
+/// the final shape. So the transaction, not the landing schema, is judged.
+/// Appends, deletes, updates, index builds and additive merges rebase as usual.
+pub(crate) fn refuse_field_identity_change(
+    read_schema: &lance_core::datatypes::Schema,
+    other_transaction: &Transaction,
+    other_version: u64,
+) -> Result<()> {
+    let may_change_identity = match &other_transaction.operation {
+        Operation::Overwrite { .. } | Operation::Project { .. } | Operation::Restore { .. } => true,
+        Operation::Merge { schema, .. } => !keeps_every_field_identity(read_schema, schema),
+        _ => false,
+    };
+    if may_change_identity {
+        return Err(Error::incompatible_transaction_source(
+            format!(
+                "This UpdateConfig allocates clustering definitions keyed on field ids read \
+                 before concurrent transaction {} at version {other_version}, which may have \
+                 given one of those ids to another column; reload the table and rebuild the list.",
+                other_transaction.operation
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every field of `read` is still the same field (name, parent, type) under
+/// the same id in `landing`. Added fields are fine; a missing, renamed or
+/// retyped one is not.
+fn keeps_every_field_identity(
+    read: &lance_core::datatypes::Schema,
+    landing: &lance_core::datatypes::Schema,
+) -> bool {
+    read.fields_pre_order().all(|field| {
+        landing.field_by_id(field.id).is_some_and(|landed| {
+            landed.name == field.name
+                && landed.parent_id == field.parent_id
+                && landed.data_type() == field.data_type()
+        })
+    })
+}
+
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
@@ -3472,6 +3605,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let operation = Operation::Rewrite {
             groups: vec![],
@@ -4152,6 +4287,59 @@ mod tests {
         Retryable,
     }
 
+    #[rstest::rstest]
+    #[case::append(false)]
+    #[case::update(true)]
+    fn test_compaction_rewrite_retries_row_additions(#[case] is_update: bool) {
+        let operation = Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![Fragment::new(0)],
+                new_fragments: vec![Fragment::new(2)],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, operation.clone(), None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(&operation).collect::<HashSet<_>>(),
+            affected_rows: None,
+            frag_reuse_base: None,
+            untagged_reuse: None,
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            current_lineage: None,
+            current_live: None,
+            current_schema: None,
+            read_fragments: None,
+            read_schema: None,
+            staged_replay: false,
+            reuse: Default::default(),
+        };
+        let other_operation = if is_update {
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                new_fragments: vec![Fragment::new(3)],
+                fields_modified: vec![],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            }
+        } else {
+            Operation::Append {
+                fragments: vec![Fragment::new(3)],
+            }
+        };
+        let other = Transaction::new(0, other_operation, None);
+
+        assert!(matches!(
+            rebase.check_txn(&other, 1),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
+    }
+
     #[test]
     fn test_conflicts() {
         use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
@@ -4168,6 +4356,8 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -4348,7 +4538,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Compatible,    // delete
                     Retryable,     // merge
@@ -4370,7 +4560,7 @@ mod tests {
                     frag_reuse_index: None,
                 },
                 [
-                    Compatible,    // append
+                    Retryable,     // append
                     Retryable,     // create index
                     Retryable,     // delete
                     Retryable,     // merge
@@ -5428,6 +5618,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let mut rebase = TransactionRebase {
             transaction: Transaction::new(
@@ -5539,6 +5731,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let column_index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5632,6 +5826,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5707,6 +5903,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -5755,6 +5953,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5820,6 +6020,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5864,6 +6066,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let replaced = index(Uuid::new_v4());
         let concurrently_removed = index(Uuid::new_v4());
@@ -5917,6 +6121,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -5930,6 +6136,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let rewrite = Transaction::new(
             1,
@@ -6000,6 +6208,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -6013,6 +6223,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // The rewrite's own `old_fragments` are what the SRID inference reads:
@@ -6721,6 +6933,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -8761,16 +8975,24 @@ mod tests {
 
         /// An on-disk tagged fixture (fragments 10 and 11, four rows each,
         /// values 0..8) plus two two-row appended fragments (100..102 and
-        /// 102..104): with `target_rows_per_fragment: 4` only the appended
-        /// fragments are compaction candidates, so a real `compact_files`
-        /// stays disjoint from a stable-partition rewrite of 10 and 11.
-        async fn disk_tagged_fixture_with_small_fragments(uri: &str) -> Dataset {
+        /// 102..104). The appended fragments have higher IDs, so compacting
+        /// their suffix leaves the tagged fragments' identities intact.
+        async fn disk_tagged_fixture_with_small_fragments(
+            uri: &str,
+            extra_rows: Option<std::ops::Range<i32>>,
+        ) -> Dataset {
             // Order matters: the two-row fragments are appended and indexed
             // BEFORE the tagging rewrite, so deferred compaction of them
             // must record a transition (uncovered fragments would commit a
             // plain rewrite instead; see
             // `uncovered_deferred_compaction_commits_plain_rewrite`).
-            let dataset = disk_fixture(uri, 2, 4).await;
+            let mut dataset = disk_fixture(uri, 2, 4).await;
+            reserve(&mut dataset, 40).await;
+            let dataset = if let Some(rows) = extra_rows {
+                append_rows(&dataset, rows).await
+            } else {
+                dataset
+            };
             let dataset = append_rows(&dataset, 100..102).await;
             let mut dataset = append_rows(&dataset, 102..104).await;
             dataset
@@ -8783,7 +9005,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            reserve(&mut dataset, 40).await;
             let old_fragments: Vec<Fragment> = dataset
                 .fragments()
                 .iter()
@@ -9093,7 +9314,7 @@ mod tests {
         #[tokio::test]
         async fn real_deferred_compaction_rebases_over_concurrent_sp_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             // The compactor opens BEFORE the rewrite commits: its plan and
             // its commit read-version anchor at the pre-rewrite snapshot.
@@ -9106,7 +9327,7 @@ mod tests {
                 .filter(|f| f.id == 10 || f.id == 11)
                 .cloned()
                 .collect();
-            let (b_transition, b_destinations) = prepare_partition(&sp_writer, &[10, 11], 50).await;
+            let (b_transition, b_destinations) = prepare_partition(&sp_writer, &[10, 11], 20).await;
             let read_version = sp_writer.manifest.version;
             commit_sp(
                 &sp_writer,
@@ -9142,7 +9363,7 @@ mod tests {
         #[tokio::test]
         async fn sp_rebases_over_real_deferred_compaction_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let sp_writer = fresh_session(dir.as_str()).await;
             let b_old: Vec<Fragment> = sp_writer
@@ -9187,7 +9408,7 @@ mod tests {
         #[tokio::test]
         async fn tagged_compactions_disjoint_both_land_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let oc_writer = fresh_session(dir.as_str()).await;
             let b_old: Vec<Fragment> = oc_writer
@@ -9233,7 +9454,7 @@ mod tests {
         #[tokio::test]
         async fn tagged_compactions_overlapping_rejected_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let mut loser = fresh_session(dir.as_str()).await;
             let mut winner = fresh_session(dir.as_str()).await;
@@ -9277,6 +9498,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             let ours = Transaction::new(
                 1,
@@ -9328,7 +9551,7 @@ mod tests {
         #[tokio::test]
         async fn overlapping_compaction_and_sp_rejected_fresh_session() {
             let dir = TempStrDir::default();
-            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+            disk_tagged_fixture_with_small_fragments(dir.as_str(), None).await;
 
             let sp_writer = fresh_session(dir.as_str()).await;
             let small_ids: Vec<u64> = sp_writer
@@ -9379,11 +9602,25 @@ mod tests {
         #[tokio::test]
         async fn sp_compaction_sp_three_way_disjoint_merge() {
             let dir = TempStrDir::default();
-            let dataset = disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
-            // A fourth region for the second stable-partition writer.
-            let mut dataset = append_rows(&dataset, 200..204).await;
+            // A fourth region before the compactable suffix for the second
+            // stable-partition writer.
+            let mut dataset =
+                disk_tagged_fixture_with_small_fragments(dir.as_str(), Some(200..204)).await;
             reserve(&mut dataset, 100).await;
-            let extra_id = dataset.fragments().last().unwrap().id;
+            let small_id = dataset
+                .fragments()
+                .iter()
+                .find(|fragment| fragment.physical_rows == Some(2))
+                .unwrap()
+                .id;
+            let extra_id = dataset
+                .fragments()
+                .iter()
+                .find(|fragment| {
+                    fragment.id != 10 && fragment.id != 11 && fragment.physical_rows == Some(4)
+                })
+                .unwrap()
+                .id;
 
             // Both racing writers open before the first rewrite commits.
             let mut compactor = fresh_session(dir.as_str()).await;
@@ -9407,7 +9644,7 @@ mod tests {
                 .filter(|f| f.id == 10 || f.id == 11)
                 .cloned()
                 .collect();
-            let (w1_transition, w1_destinations) = prepare_partition(&dataset, &[10, 11], 80).await;
+            let (w1_transition, w1_destinations) = prepare_partition(&dataset, &[10, 11], 20).await;
             let w1_version = dataset.manifest.version;
             commit_sp(
                 &dataset,
@@ -9443,7 +9680,7 @@ mod tests {
             // Fixture rewrite + writers 1 and 3, plus the compaction.
             assert_eq!(count_mappings(&ledger), (3, 1));
             assert!(ledger.consumer(10).is_some());
-            assert!(ledger.consumer(2).is_some());
+            assert!(ledger.consumer(u32::try_from(small_id).unwrap()).is_some());
             assert!(ledger.consumer(extra_id as u32).is_some());
             let mut expected: Vec<i32> = (0..8).collect();
             expected.extend(100..104);

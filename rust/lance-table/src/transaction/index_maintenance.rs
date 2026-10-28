@@ -9,6 +9,7 @@
 //! drop the index. Getting this wrong does not fail the commit -- it silently
 //! returns stale rows from the index -- so each rule here is paired with a test.
 
+use crate::format::clustering::ChangedReferences;
 use crate::format::overlay::staleness::{collect_overlay_stale_frags, field_affects_index};
 use crate::format::{Fragment, IndexMetadata};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
@@ -22,6 +23,7 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 impl Transaction {
@@ -520,6 +522,21 @@ impl Transaction {
         schema: &Schema,
     ) {
         for group in groups {
+            // Order-preserving partial compaction represents untouched trailing
+            // fragments as exact metadata copies with a new ID. Their overlays
+            // are still live and must not invalidate index coverage.
+            if let ([old_fragment], [new_fragment]) = (
+                group.old_fragments.as_slice(),
+                group.new_fragments.as_slice(),
+            ) {
+                let mut relabeled_fragment = new_fragment.clone();
+                relabeled_fragment.id = old_fragment.id;
+                relabeled_fragment.deletion_file = old_fragment.deletion_file.clone();
+                if relabeled_fragment == *old_fragment {
+                    continue;
+                }
+            }
+
             // field id -> newest overlay committed_version supplying that field
             let mut overlaid_field_versions: HashMap<i32, u64> = HashMap::new();
             for old_frag in &group.old_fragments {
@@ -748,12 +765,11 @@ impl Transaction {
     }
 
     pub(super) fn handle_rewrite_indices(
-        indices: &mut [IndexMetadata],
+        indices: &mut Vec<IndexMetadata>,
         rewritten_indices: &[RewrittenIndex],
         groups: &[RewriteGroup],
     ) -> Result<()> {
         let mut modified_indices = HashSet::new();
-
         for rewritten_index in rewritten_indices {
             if !modified_indices.insert(rewritten_index.old_id) {
                 return Err(Error::invalid_input(format!(
@@ -761,29 +777,112 @@ impl Transaction {
                     rewritten_index.old_id
                 )));
             }
+        }
+
+        let mut handled_new_ids = HashSet::new();
+        for rewritten_index in rewritten_indices {
+            if !handled_new_ids.insert(rewritten_index.new_id) {
+                continue;
+            }
+
+            let replacements = rewritten_indices
+                .iter()
+                .filter(|candidate| candidate.new_id == rewritten_index.new_id)
+                .collect::<Vec<_>>();
+            if replacements.iter().any(|replacement| {
+                replacement.new_index_details != rewritten_index.new_index_details
+                    || replacement.new_index_version != rewritten_index.new_index_version
+                    || replacement.new_index_files != rewritten_index.new_index_files
+            }) {
+                return Err(Error::invalid_input(format!(
+                    "Compaction produced inconsistent metadata for replacement index {}",
+                    rewritten_index.new_id
+                )));
+            }
+
+            let old_ids = replacements
+                .iter()
+                .map(|replacement| replacement.old_id)
+                .collect::<HashSet<_>>();
+            let mut source_indices = indices
+                .iter()
+                .enumerate()
+                .filter(|(_, index)| old_ids.contains(&index.uuid))
+                .map(|(position, index)| (position, index.clone()))
+                .collect::<Vec<_>>();
 
             // Skip indices that no longer exist (may have been removed by concurrent operation)
-            let Some(index) = indices
-                .iter_mut()
-                .find(|idx| idx.uuid == rewritten_index.old_id)
-            else {
+            if source_indices.is_empty() {
                 continue;
-            };
+            }
+            if source_indices.len() != replacements.len() {
+                return Err(Error::invalid_input(format!(
+                    "Cannot partially apply merged index replacement {}: found {} of {} source segments",
+                    rewritten_index.new_id,
+                    source_indices.len(),
+                    replacements.len()
+                )));
+            }
 
-            index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
-                index.fragment_bitmap.as_ref().ok_or_else(|| {
+            let first_source = &source_indices[0].1;
+            if source_indices.iter().any(|(_, source)| {
+                source.name != first_source.name
+                    || source.fields != first_source.fields
+                    || source.covering_fields != first_source.covering_fields
+            }) {
+                return Err(Error::invalid_input(format!(
+                    "Cannot merge index segments with different names or fields into {}",
+                    rewritten_index.new_id
+                )));
+            }
+
+            let mut old_fragment_bitmap = RoaringBitmap::new();
+            for (_, source) in &source_indices {
+                old_fragment_bitmap |= source.fragment_bitmap.as_ref().ok_or_else(|| {
                     Error::invalid_input(format!(
                         "Cannot rewrite index {} which did not store fragment bitmap",
-                        index.uuid
+                        source.uuid
                     ))
-                })?,
+                })?;
+            }
+
+            let mut replacement = first_source.clone();
+            replacement.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
+                &old_fragment_bitmap,
                 groups,
             )?);
-            index.uuid = rewritten_index.new_id;
+            replacement.uuid = rewritten_index.new_id;
+            if replacements
+                .iter()
+                .any(|replacement| replacement.old_id != replacement.new_id)
+            {
+                replacement.base_id = None;
+            }
+            // Independent remaps preserve the source's historical metadata. Only
+            // a physical merge publishes a new segment's details and version,
+            // and a merged segment is a new object: it carries neither the
+            // first source's clustering reference nor its metadata.
+            if replacements.len() > 1 {
+                replacement.index_details =
+                    Some(Arc::new(rewritten_index.new_index_details.clone()));
+                replacement.index_version = rewritten_index.new_index_version as i32;
+                replacement.clustering_id = None;
+                replacement.metadata = Default::default();
+            }
+            replacement.dataset_version = source_indices
+                .iter()
+                .map(|(_, source)| source.dataset_version)
+                .min()
+                .unwrap_or(replacement.dataset_version);
             // Update file sizes to match the new index files. When not available
             // (e.g., from older writers), clear the old file sizes to avoid
             // using stale sizes from the pre-remap index.
-            index.files = rewritten_index.new_index_files.clone();
+            replacement.files = rewritten_index.new_index_files.clone();
+
+            source_indices.sort_by_key(|(position, _)| *position);
+            let insert_at = source_indices[0].0;
+            indices.retain(|index| !old_ids.contains(&index.uuid));
+            indices.insert(insert_at.min(indices.len()), replacement);
         }
         Ok(())
     }
@@ -805,6 +904,7 @@ impl Transaction {
         fragment_id: &mut u64,
         version: u64,
         _next_row_id: Option<&u64>,
+        changed_clustering_references: &mut ChangedReferences,
     ) -> Result<()> {
         // Index fragment positions up front so each rewrite group is located in
         // O(1). Scanning and splicing/retaining the fragment list per group is
@@ -844,6 +944,10 @@ impl Transaction {
 
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
                 .collect::<Vec<_>>();
+            // These are this commit's outputs, whichever path places them.
+            for fragment in &new_fragments {
+                changed_clustering_references.fragment(fragment);
+            }
 
             // Version metadata for rewritten fragments is handled by the compaction code
             // (recalc_versions_for_rewritten_fragments) which preserves version information
@@ -971,6 +1075,7 @@ mod tests {
             &mut fragment_id,
             version,
             None,
+            &mut ChangedReferences::default(),
         )
         .unwrap();
 
@@ -1006,6 +1111,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1032,6 +1138,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1056,6 +1163,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         )
         .unwrap();
 
@@ -1087,6 +1195,7 @@ mod tests {
             &mut fragment_id,
             42,
             None,
+            &mut ChangedReferences::default(),
         );
 
         let error = result.unwrap_err();
@@ -1559,6 +1668,214 @@ mod tests {
         assert!(indices.is_empty());
     }
 
+    #[rstest::rstest]
+    #[case::complete(None)]
+    #[case::inconsistent(Some("inconsistent metadata"))]
+    #[case::missing(Some("source segments"))]
+    #[case::incomplete_coverage(Some("split of indexed and non-indexed"))]
+    fn test_handle_rewrite_indices_merges_source_segments(#[case] expected_error: Option<&str>) {
+        let mut first = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        let mut second = create_test_index(
+            "vector_idx",
+            1,
+            4,
+            Some(RoaringBitmap::from_iter([2])),
+            true,
+        );
+        first.base_id = Some(0);
+        second.base_id = Some(0);
+        // Differently labelled sources: the merged segment inherits neither.
+        first.clustering_id = Some(1);
+        first.metadata = HashMap::from([("org.example.k".to_string(), "a".to_string())]);
+        second.clustering_id = Some(2);
+        second.metadata = HashMap::from([("org.example.k".to_string(), "b".to_string())]);
+        let first_id = first.uuid;
+        let second_id = second.uuid;
+        let merged_id = Uuid::new_v4();
+        let details = prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+            value: vec![1, 2, 3],
+        };
+        let mut rewritten_indices = vec![
+            RewrittenIndex {
+                old_id: first_id,
+                new_id: merged_id,
+                new_index_details: details.clone(),
+                new_index_version: 2,
+                new_index_files: None,
+            },
+            RewrittenIndex {
+                old_id: second_id,
+                new_id: merged_id,
+                new_index_details: details.clone(),
+                new_index_version: 2,
+                new_index_files: None,
+            },
+        ];
+        let groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+            new_fragments: vec![Fragment::new(5)],
+        }];
+        let mut indices = vec![first, second];
+
+        match expected_error {
+            Some("inconsistent metadata") => rewritten_indices[1].new_index_version += 1,
+            Some("source segments") => {
+                indices.pop();
+            }
+            Some("split of indexed and non-indexed") => {
+                rewritten_indices.pop();
+            }
+            _ => {}
+        }
+        if let Some(expected) = expected_error {
+            let error =
+                Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups)
+                    .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(expected), "{error}");
+            return;
+        }
+
+        Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups).unwrap();
+
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, merged_id);
+        assert_eq!(indices[0].dataset_version, 3);
+        assert_eq!(indices[0].index_version, 2);
+        assert_eq!(indices[0].base_id, None);
+        assert_eq!(indices[0].index_details.as_deref(), Some(&details));
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([5])
+        );
+        assert_eq!(
+            indices[0].clustering_id, None,
+            "a merged segment is a new object"
+        );
+        assert!(indices[0].metadata.is_empty());
+    }
+
+    /// A single-source remap is the same segment under a new UUID: it keeps
+    /// its clustering reference and metadata.
+    #[test]
+    fn test_handle_rewrite_indices_single_source_remap_keeps_labels() {
+        let mut source = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        source.clustering_id = Some(1);
+        source.metadata = HashMap::from([("org.example.k".to_string(), "a".to_string())]);
+        let old_id = source.uuid;
+        let new_id = Uuid::new_v4();
+        let rewritten_indices = vec![RewrittenIndex {
+            old_id,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            },
+            new_index_version: 1,
+            new_index_files: None,
+        }];
+        let groups = vec![RewriteGroup {
+            old_fragments: vec![Fragment::new(1)],
+            new_fragments: vec![Fragment::new(5)],
+        }];
+        let mut indices = vec![source];
+        Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &groups).unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, new_id);
+        assert_eq!(indices[0].clustering_id, Some(1));
+        assert_eq!(
+            indices[0].metadata,
+            HashMap::from([("org.example.k".to_string(), "a".to_string())])
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None)]
+    #[case::opaque(Some(prost_types::Any {
+        type_url: "future.index".into(),
+        value: vec![0x98, 0x06, 0x01],
+    }))]
+    // JsonIndexDetails { path: "x", target_details: {}, target_data_type: 999 }.
+    #[case::json_future_type(Some(prost_types::Any {
+        type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".into(),
+        value: vec![0x0a, 0x01, b'x', 0x12, 0x00, 0x18, 0xe7, 0x07],
+    }))]
+    fn test_handle_rewrite_indices_preserves_single_source_metadata(
+        #[case] details: Option<prost_types::Any>,
+    ) {
+        let mut index =
+            create_test_index("idx", 1, 3, Some(RoaringBitmap::from_iter([1, 2])), true);
+        index.index_details = details.map(Arc::new);
+        index.index_version = 0;
+        index.base_id = Some(7);
+        let source_details = index.index_details.clone();
+        let new_id = Uuid::new_v4();
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: "different".into(),
+                value: vec![],
+            },
+            new_index_version: 2,
+            new_index_files: Some(vec![]),
+        };
+        let mut indices = vec![index];
+        Transaction::handle_rewrite_indices(
+            &mut indices,
+            &[replacement],
+            &[RewriteGroup {
+                old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                new_fragments: vec![Fragment::new(3)],
+            }],
+        )
+        .unwrap();
+        assert_eq!(indices[0].index_details, source_details);
+        assert_eq!(indices[0].index_version, 0);
+        assert_eq!(indices[0].uuid, new_id);
+        assert_eq!(indices[0].base_id, None);
+        assert_eq!(indices[0].files, Some(vec![]));
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter([3]))
+        );
+    }
+
+    #[test]
+    fn test_handle_rewrite_indices_keeps_identity_routing() {
+        let mut index = create_test_index(
+            "vector_idx",
+            1,
+            3,
+            Some(RoaringBitmap::from_iter([1])),
+            true,
+        );
+        index.base_id = Some(7);
+        let replacement = RewrittenIndex {
+            old_id: index.uuid,
+            new_id: index.uuid,
+            new_index_details: index.index_details.as_ref().unwrap().as_ref().clone(),
+            new_index_version: index.index_version as u32,
+            new_index_files: index.files.clone(),
+        };
+        let mut indices = vec![index];
+        Transaction::handle_rewrite_indices(&mut indices, &[replacement], &[]).unwrap();
+        assert_eq!(indices[0].base_id, Some(7));
+    }
+
     #[test]
     fn test_prune_overlay_stale_fields_from_indices() {
         // Fragment 0 carried an overlay on field 1 committed at v5, and was
@@ -1759,6 +2076,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1823,6 +2142,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 

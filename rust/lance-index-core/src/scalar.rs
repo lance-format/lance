@@ -8,8 +8,8 @@ use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array}
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
+use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::Expr;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};

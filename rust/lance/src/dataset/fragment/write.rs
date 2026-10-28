@@ -245,6 +245,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             crate::dataset::write::seeds::SeedCollector::disabled(),
             None,
             None,
+            None,
         )
         .await
     }

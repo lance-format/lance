@@ -960,6 +960,16 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             // fragments back (a manual Delete/Update/Merge commit). Sorting
             // newest-last is deferred to the manifest reload after commit.
             overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
+            // Tolerate objects predating these attributes; absent means no
+            // clustering reference and no generic metadata.
+            clustering_id: match ob.getattr("clustering_id") {
+                Ok(value) => value.extract::<Option<u32>>()?,
+                Err(_) => None,
+            },
+            metadata: match ob.getattr("metadata") {
+                Ok(value) => value.extract()?,
+                Err(_) => Default::default(),
+            },
         }))
     }
 }
@@ -1003,6 +1013,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             created_at_version_meta,
             last_updated_at_version_meta,
             overlays,
+            self.0.clustering_id,
+            self.0.metadata.clone(),
         ))
     }
 }

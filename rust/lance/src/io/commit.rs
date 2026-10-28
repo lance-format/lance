@@ -63,6 +63,9 @@ use crate::dataset::{
     write_manifest_file,
 };
 use crate::index::DatasetIndexInternalExt;
+use crate::index::frag_reuse_with_stable_row_ids::history::{
+    ReadSnapshot, validate_frag_reuse_history,
+};
 use crate::index::vector::details::infer_missing_vector_details;
 use crate::index::{index_is_usable, load_all_indices};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -435,14 +438,11 @@ async fn do_commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &DSMetadataCache,
     session: Arc<Session>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
-    if !keep_field_ids {
-        canonicalize_non_reusable_field_ids(None, &mut transaction.operation, None)?;
-    } else if let Operation::Overwrite { schema, .. } = &transaction.operation {
-        // Canonicalization would have checked the schema it renumbered.
-        schema.validate()?;
+    if let Operation::Overwrite { schema, .. } = &mut transaction.operation {
+        crate::dataset::write::assign_new_table_field_ids(schema, inherited_field_ids)?;
         schema.verify_primary_key()?;
     }
     let transaction = &transaction;
@@ -788,7 +788,7 @@ pub(crate) async fn commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     metadata_cache: &crate::session::caches::DSMetadataCache,
     session: Arc<Session>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
@@ -801,7 +801,7 @@ pub(crate) async fn commit_new_dataset(
         manifest_naming_scheme,
         metadata_cache,
         session,
-        keep_field_ids,
+        inherited_field_ids,
     )
     .await
 }
@@ -857,21 +857,37 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     crate::dataset::versions::check_manifest_storage_version(manifest)
 }
 
-/// Reject a manifest in which two fragments share an id. Per-fragment state is
-/// keyed by fragment id — deletion file paths, cached row id sequences, row
-/// addresses — so a duplicate makes it ambiguous which rows that state describes.
+/// Reject a manifest in which fragment identities are ambiguous or out of order.
+/// Per-fragment state is keyed by fragment id — deletion file paths, cached row
+/// id sequences, row addresses — so a duplicate makes it ambiguous which rows
+/// that state describes.
 ///
 /// Runs after the legacy fixups above, so a dataset that needs a rollback for some
-/// other reason is diagnosed with that first. Relies on `build_manifest` leaving
-/// the fragments sorted by id.
+/// other reason is diagnosed with that first.
 fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
-    if let Some(pair) = manifest.fragments.windows(2).find(|p| p[0].id == p[1].id) {
+    let mut fragment_ids = HashSet::with_capacity(manifest.fragments.len());
+    if let Some(fragment) = manifest
+        .fragments
+        .iter()
+        .find(|fragment| !fragment_ids.insert(fragment.id))
+    {
         return Err(Error::invalid_input(format!(
             "The commit would produce two fragments with id {}. Fragment ids must be \
              unique. Datasets written by Lance 0.16 and earlier may already contain \
              duplicate ids; those have to be rewritten, or rolled back to a version \
              without the duplicate.",
-            pair[0].id
+            fragment.id
+        )));
+    }
+    if let Some(fragments) = manifest
+        .fragments
+        .windows(2)
+        .find(|fragments| fragments[0].id > fragments[1].id)
+    {
+        return Err(Error::invalid_input(format!(
+            "The commit would place fragment {} before lower fragment id {}. Fragment ids must \
+             remain sorted in increasing order",
+            fragments[0].id, fragments[1].id
         )));
     }
     Ok(())
@@ -1314,6 +1330,13 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    // Definitions are allocated against the version chain: a detached
+    // manifest's ids and field-identity activation would be invisible to it.
+    if write_config.has_clustering_definitions() {
+        return Err(Error::invalid_input(
+            "a clustering definitions list cannot be committed detached",
+        ));
+    }
     let mut transaction = transaction.clone();
     canonicalize_non_reusable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
     let transaction = &transaction;
@@ -1423,6 +1446,24 @@ pub(crate) async fn do_commit_detached_transaction(
             &recovered_coverage,
             manifest.version,
         )?;
+
+        // Checked against the manifest the detached one is built on, which need
+        // not be the transaction's read version.
+        if let Err(error) = validate_frag_reuse_history(
+            &transaction.operation,
+            dataset,
+            ReadSnapshot::Version {
+                base: dataset,
+                version: transaction.read_version,
+            },
+            &manifest,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            return Err(error);
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -1746,7 +1787,8 @@ pub(crate) async fn commit_transaction(
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index
     // covering every fragment live here holds every row compaction had copied
-    // in by then.
+    // in by then. Fragment reuse history refusals are classified against it,
+    // never against a rebased read version.
     //
     // The Arc is kept rather than cloned out: `load_all_indices` returns shared
     // cached data, so the common case is a cache hit rather than a read.
@@ -1778,6 +1820,15 @@ pub(crate) async fn commit_transaction(
     // Track the transaction file written in the current loop iteration so we can
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
+
+    // An allocating clustering submission from a reusable-id snapshot: judge
+    // every transaction in its window for field-identity changes; see
+    // `refuse_field_identity_change`. Decided from the version the transaction
+    // read, not from the handle it was submitted through, which may already
+    // be at a later, activated version.
+    let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
+        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+    .then(|| read_version_dataset.schema().clone());
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -1818,8 +1869,28 @@ pub(crate) async fn commit_transaction(
                     .into(),
                 ));
             }
+            // A cleaned-up version may have replaced a key field; an identity
+            // window with a hole cannot be judged, so it is refused.
+            if identity_fence.is_some() && !missing.is_empty() {
+                return Err(Error::commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "versions {missing:?} between this submission's read version and the \
+                         latest were cleaned up, so the field identity of its clustering keys \
+                         cannot be checked; reload the table and rebuild the list"
+                    )
+                    .into(),
+                ));
+            }
 
             for (other_version, other_transaction) in other_transactions.iter() {
+                if let Some(read_schema) = &identity_fence {
+                    conflict_resolver::refuse_field_identity_change(
+                        read_schema,
+                        other_transaction,
+                        *other_version,
+                    )?;
+                }
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
@@ -1942,6 +2013,24 @@ pub(crate) async fn commit_transaction(
             &recovered_coverage,
             target_version,
         )?;
+
+        // Before the write, so a refusal is final rather than a commit outcome
+        // to verify. Every attempt checks against the manifest it replaces.
+        if let Err(error) = validate_frag_reuse_history(
+            &transaction.operation,
+            &dataset,
+            ReadSnapshot::Loaded {
+                dataset: &read_version_dataset,
+                indices: read_version_indices.as_slice(),
+            },
+            &manifest,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+            return Err(error);
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -2147,6 +2236,24 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[test]
+    fn test_check_fragment_ids_requires_sorted_order() {
+        let manifest = Manifest::new(
+            Schema::try_from(&ArrowSchema::empty()).unwrap(),
+            Arc::new(vec![Fragment::new(5), Fragment::new(2)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let error = check_fragment_ids(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Fragment ids must remain sorted in increasing order")
+        );
+    }
 
     #[rstest::rstest]
     #[case::unset(None, DEFAULT_COMMIT_RETRY_TIMEOUT)]
@@ -3041,6 +3148,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -3054,6 +3163,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -3092,6 +3203,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -3105,6 +3218,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
@@ -3150,6 +3265,8 @@ mod tests {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         let mut manifest = Manifest::new(
@@ -3712,6 +3829,8 @@ mod tests {
             physical_rows: Some(100),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         Manifest::new(
             schema,
@@ -3748,6 +3867,8 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         Manifest::new(
             Schema::default(),
@@ -3996,6 +4117,8 @@ mod tests {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let fragments = vec![
             make_fragment(0, vec![shared_a.clone(), shared_b.clone()]),
@@ -4321,6 +4444,8 @@ mod tests {
             physical_rows: Some(100),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let manifest = Manifest::new(
             schema,
@@ -4407,6 +4532,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -4453,6 +4580,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let transaction = Transaction::new(
             42,

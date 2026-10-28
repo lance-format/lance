@@ -97,8 +97,10 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
         false
     }
 
+    /// The example delegates its storage to ZoneMap, so it supports exactly
+    /// the file versions that plugin writes and reads.
     fn version(&self) -> u32 {
-        0
+        ZoneMapIndexPlugin.version()
     }
 
     fn new_query_parser(

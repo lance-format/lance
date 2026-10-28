@@ -883,6 +883,12 @@ struct MiniBlockDecoder {
 /// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
 /// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
+    fn dictionary_len(&self) -> Option<u64> {
+        self.dictionary
+            .as_ref()
+            .map(|dictionary| dictionary.num_values())
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let mut items_desired = num_rows;
         let mut need_preamble = false;

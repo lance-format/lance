@@ -11,7 +11,7 @@ use futures::TryStreamExt;
 
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Int32Type};
+use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::address::RowAddress;
@@ -43,7 +43,7 @@ use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
-use crate::dataset::scanner::RowAddrTreeMap;
+use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::frag_reuse_reader::tests::persist_fixture;
@@ -852,6 +852,245 @@ async fn test_vector_overlay_stale_dropped_under_fast_search() {
         !ids.contains(&40),
         "fast_search skips re-score, so id=40 should be absent, got {ids:?}"
     );
+}
+
+#[rstest]
+#[case::postfilter("postfilter")]
+#[case::fast("fast")]
+#[case::allow("allow")]
+#[case::block("block")]
+#[case::empty("empty")]
+#[case::deleted_overlay("deleted")]
+#[case::batch("batch")]
+#[case::compacted_overlay("compact")]
+#[tokio::test]
+async fn test_vector_overlay_fragment_search(
+    #[case] mode: &str,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_vector_overlay_dataset(stable_row_ids).await;
+    let mut near = vec_query();
+    near[1] = 1.0;
+    let mut far = vec_query();
+    far[1] = 50.0;
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let tail = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![64, 65])),
+            fsl(vec![near, far], VEC_DIM),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(tail)], schema), None)
+        .await
+        .unwrap();
+    // A newer overlay outside the requested fragments must never join the stale take.
+    dataset = commit_overlay(
+        dataset,
+        "excluded_vector",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0])),
+        vec![fsl(vec![vec_query()], VEC_DIM)],
+    )
+    .await;
+    if mode == "deleted" {
+        dataset.delete("id = 40").await.unwrap();
+    }
+    let metadata = dataset.load_indices().await.unwrap();
+    let index = metadata
+        .iter()
+        .find(|index| index.fields == vec![1])
+        .unwrap();
+    for fragment in dataset.fragments().iter().filter(|f| f.id < 2) {
+        assert!(
+            fragment
+                .overlays
+                .iter()
+                .all(|overlay| overlay.committed_version > index.dataset_version)
+        );
+    }
+    if mode == "compact" {
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                // Keep the short appended tail out of the candidate bin. Exclusions
+                // now only permit planning in the suffix after the last excluded ID.
+                target_rows_per_fragment: 1,
+                max_overlays_per_fragment: Some(0),
+                excluded_fragment_ids: vec![0],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 1);
+        let compacted = dataset.fragments().iter().find(|f| f.id > 2).unwrap();
+        assert!(compacted.overlays.is_empty());
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices
+                .iter()
+                .filter(|index| index.fields == vec![1])
+                .all(|index| !index
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(compacted.id as u32))
+        );
+    }
+    let fragments: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .filter(|f| f.id != 0)
+        .cloned()
+        .collect();
+    let source = dataset
+        .scan()
+        .with_fragments(fragments.clone())
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let source_ids = source["id"].as_primitive::<Int32Type>();
+    let row_ids = source["_rowid"].as_primitive::<UInt64Type>();
+    let allowed = |id: i32| match mode {
+        "allow" => [32, 33, 34, 41, 64, 65].contains(&id),
+        "block" => ![40, 64].contains(&id),
+        "empty" => false,
+        _ => true,
+    };
+    let mut queries = vec![vec_query()];
+    if mode == "batch" {
+        let mut second = vec_query();
+        second[1] = 10.25;
+        queries.push(second);
+    }
+    let mut scan = dataset.scan();
+    scan.with_fragments(fragments);
+    let index_ids = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.fields == vec![1])
+        .map(|index| index.uuid)
+        .collect();
+    scan.with_index_segments(index_ids).unwrap();
+    let key: ArrayRef = if mode == "batch" {
+        fsl(queries.clone(), VEC_DIM)
+    } else {
+        Arc::new(arrow_array::Float32Array::from(queries[0].clone()))
+    };
+    scan.nearest("vec", key.as_ref(), 5).unwrap().nprobes(1);
+    scan.filter("id % 2 = 0")
+        .unwrap()
+        .prefilter(false)
+        .project(&["id"])
+        .unwrap();
+    if mode == "fast" {
+        scan.fast_search();
+    }
+    if matches!(mode, "allow" | "empty") {
+        scan.with_row_id_prefilter(RowAddrMask::from_allowed(
+            (0..source.num_rows())
+                .filter(|row| allowed(source_ids.value(*row)))
+                .map(|row| row_ids.value(row))
+                .collect(),
+        ));
+    } else if mode == "block" {
+        scan.with_row_id_prefilter(RowAddrMask::from_block(
+            (0..source.num_rows())
+                .filter(|row| !allowed(source_ids.value(*row)))
+                .map(|row| row_ids.value(row))
+                .collect(),
+        ));
+    }
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(!plan.contains("ANNIvfBatch"), "{plan}");
+    if mode != "compact" {
+        assert!(plan.contains("ANNSubIndex"), "{plan}");
+    }
+    if mode == "fast" {
+        assert!(!plan.contains("UnionExec"), "{plan}");
+    } else if mode != "compact" {
+        assert!(plan.contains("UnionExec"), "{plan}");
+    }
+    let result = scan.try_into_batch().await.unwrap();
+    if mode == "batch" {
+        let field = result.schema().field(0).clone();
+        assert_eq!(field.name(), "query_index");
+        assert_eq!(field.data_type(), &DataType::Int32);
+        assert!(!field.is_nullable());
+    }
+    for (query_index, query) in queries.iter().enumerate() {
+        let mut expected = Vec::new();
+        for row in 0..source.num_rows() {
+            let id = source_ids.value(row);
+            if !allowed(id) || (mode == "fast" && (id >= 64 || [35, 40].contains(&id))) {
+                continue;
+            }
+            let vector = source["vec"].as_fixed_size_list().value(row);
+            let distance = vector
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .zip(query)
+                .map(|(value, query)| (f64::from(*value) - f64::from(*query)).powi(2))
+                .sum::<f64>();
+            expected.push((id, distance));
+        }
+        expected.sort_by(|left, right| left.1.total_cmp(&right.1));
+        expected.truncate(5);
+        expected.retain(|(id, _)| id % 2 == 0);
+        let rows: Vec<_> = (0..result.num_rows())
+            .filter(|row| {
+                mode != "batch"
+                    || result["query_index"]
+                        .as_primitive::<Int32Type>()
+                        .value(*row)
+                        == query_index as i32
+            })
+            .collect();
+        let actual_ids: Vec<_> = rows
+            .iter()
+            .map(|row| result["id"].as_primitive::<Int32Type>().value(*row))
+            .collect();
+        assert_eq!(
+            actual_ids,
+            expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "{plan}"
+        );
+        let unique: RoaringBitmap = actual_ids.iter().map(|id| *id as u32).collect();
+        assert_eq!(unique.len() as usize, rows.len());
+        if !expected.is_empty() {
+            let recall = expected
+                .iter()
+                .filter(|(id, _)| unique.contains(*id as u32))
+                .count() as f64
+                / expected.len() as f64;
+            assert_eq!(recall, 1.0);
+        }
+        for (row, (_, distance)) in rows.iter().zip(&expected) {
+            let actual = f64::from(
+                result["_distance"]
+                    .as_primitive::<Float32Type>()
+                    .value(*row),
+            );
+            assert!(
+                actual.is_finite() && (actual - distance).abs() <= 1e-5 + 1e-6 * distance.abs(),
+                "{plan}"
+            );
+        }
+        if mode == "postfilter" {
+            assert!(
+                actual_ids.contains(&40) && actual_ids.contains(&64) && actual_ids.contains(&32)
+            );
+        }
+    }
 }
 
 /// A batch (multi-vector) nearest query must fall back to the per-query indexed loop when a
