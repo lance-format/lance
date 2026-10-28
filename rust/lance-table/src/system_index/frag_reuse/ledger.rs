@@ -60,6 +60,7 @@ pub struct Transition {
     sources: Vec<pb::FragmentDigest>,
     destinations: Vec<pb::FragmentDigest>,
     mapping: Mapping,
+    legacy_dataset_version: Option<u64>,
 }
 
 impl Transition {
@@ -82,6 +83,14 @@ impl Transition {
     /// Mapping semantics for a supported index version.
     pub fn mapping(&self) -> &Mapping {
         &self.mapping
+    }
+
+    /// Some for a transition lifted from a v0 `Version` (wire field 1): that
+    /// version's `dataset_version`, the stamp the v0 `data_predates_version`
+    /// rule compares a segment against. None for a tagged transition, whose
+    /// provenance is never swapped.
+    pub fn legacy_dataset_version(&self) -> Option<u64> {
+        self.legacy_dataset_version
     }
 }
 
@@ -182,15 +191,18 @@ impl FragReuseLedger {
                     let version = pb::Version::decode(require_message(tag, payload)?)
                         .map_err(|e| corrupt(e.to_string()))?;
                     for group in version.groups {
-                        transitions.push(decode_transition(pb::Transition {
-                            sources: group.old_fragments,
-                            destinations: group.new_fragments,
-                            mapping: Some(transition::Mapping::OrderedCompaction(
-                                pb::OrderedCompaction {
-                                    changed_row_addrs: group.changed_row_addrs,
-                                },
-                            )),
-                        })?);
+                        transitions.push(decode_transition(
+                            pb::Transition {
+                                sources: group.old_fragments,
+                                destinations: group.new_fragments,
+                                mapping: Some(transition::Mapping::OrderedCompaction(
+                                    pb::OrderedCompaction {
+                                        changed_row_addrs: group.changed_row_addrs,
+                                    },
+                                )),
+                            },
+                            Some(version.dataset_version),
+                        )?);
                     }
                 }
                 2 => {
@@ -226,7 +238,7 @@ impl FragReuseLedger {
                     }
                     let decoded =
                         pb::Transition::decode(raw).map_err(|e| corrupt(e.to_string()))?;
-                    transitions.push(decode_transition(decoded)?);
+                    transitions.push(decode_transition(decoded, None)?);
                 }
                 _ => {
                     // An unknown envelope record does not participate in
@@ -395,7 +407,10 @@ fn validate_digests(digests: &[pb::FragmentDigest], is_destination: bool) -> Res
     Ok(live_rows)
 }
 
-fn decode_transition(value: pb::Transition) -> Result<Transition> {
+fn decode_transition(
+    value: pb::Transition,
+    legacy_dataset_version: Option<u64>,
+) -> Result<Transition> {
     if value.sources.is_empty() {
         return Err(corrupt("transition has no source fragments"));
     }
@@ -458,6 +473,7 @@ fn decode_transition(value: pb::Transition) -> Result<Transition> {
         sources: value.sources,
         destinations: value.destinations,
         mapping,
+        legacy_dataset_version,
     })
 }
 

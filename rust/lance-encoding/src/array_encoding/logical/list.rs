@@ -4,7 +4,7 @@
 use std::{
     collections::VecDeque,
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
 };
 
 use arrow_array::{
@@ -27,8 +27,8 @@ use crate::{
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, DrainLimit, FieldScheduler, FilterExpression,
-        ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding,
-        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        LateReadGuard, ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask,
+        PageEncoding, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -342,6 +342,8 @@ async fn indirect_schedule_task(
     io: Arc<dyn EncodingsIo>,
     cache: Arc<LanceCache>,
     priority: Box<dyn PriorityRange>,
+    late_read_guard: Option<LateReadGuard>,
+    decoder_interest: Weak<()>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();
     // We know the offsets are a primitive array and thus will not need additional
@@ -370,6 +372,11 @@ async fn indirect_schedule_task(
             validity,
         });
     }
+    if decoder_interest.strong_count() == 0 {
+        return Err(Error::internal(
+            "the list page decoder was dropped before its items were scheduled",
+        ));
+    }
     let item_ranges = item_ranges.into_iter().collect::<Vec<_>>();
     let num_items = item_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
@@ -382,7 +389,8 @@ async fn indirect_schedule_task(
         Arc::new(indirect_root_scheduler),
         root_fields.clone(),
         cache,
-    );
+    )
+    .with_outer_batch(late_read_guard.as_ref());
     let mut root_decoder = SimpleStructDecoder::new(root_fields, num_items);
 
     let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
@@ -478,7 +486,11 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         } else {
             base_io
         };
+        // Held until the items are scheduled, so their reads join this step's
+        // group. Skipped when the items' reads bypass the batch.
+        let late_read_guard = Arc::ptr_eq(&io, context.io()).then(|| context.late_read_guard());
         let cache = context.cache().clone();
+        let decoder_interest = Arc::new(());
 
         // Immediately spawn the indirect scheduling
         let indirect_fut = tokio::spawn(indirect_schedule_task(
@@ -490,6 +502,8 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
             io,
             cache,
             priority.box_clone(),
+            late_read_guard,
+            Arc::downgrade(&decoder_interest),
         ));
 
         // Return a decoder
@@ -502,6 +516,7 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
             items_field: self.scheduler.items_field.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
+            _decoder_interest: decoder_interest,
             offset_type: self.scheduler.offset_type.clone(),
             data_type: self.scheduler.list_type.clone(),
         });
@@ -616,6 +631,8 @@ impl FieldScheduler for ListFieldScheduler {
 #[derive(Debug)]
 struct ListPageDecoder {
     unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
+    /// Lets the indirect scheduling task skip the items once this decoder is gone.
+    _decoder_interest: Arc<()>,
     // offsets and validity will have already been decoded as part of the indirect I/O
     offsets: Arc<[u64]>,
     validity: BooleanBuffer,
@@ -1428,6 +1445,7 @@ mod tests {
     fn list_decoder_overflow_reports_row_span() {
         let mut decoder = ListPageDecoder {
             unloaded: None,
+            _decoder_interest: Arc::default(),
             offsets: Arc::<[u64]>::from(vec![0_u64, 1, 2, 3, 3 + i32::MAX as u64 + 1]),
             validity: BooleanBuffer::from_iter([true, true, true, true]),
             item_decoder: None,
@@ -1453,6 +1471,7 @@ mod tests {
         let items_field = Arc::new(Field::new("item", DataType::Int32, true));
         ListPageDecoder {
             unloaded: None,
+            _decoder_interest: Arc::default(),
             validity: BooleanBuffer::new_set(offsets.len() - 1),
             num_rows: offsets.len() as u64 - 1,
             offsets: offsets.into(),

@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use datafusion::{execution::SessionState, logical_expr::Expr};
+use datafusion::{
+    execution::SessionState,
+    logical_expr::{Expr, registry::FunctionRegistry},
+};
 
 use crate::aggregate::Aggregate;
+use crate::signed_zero::COMPARE_FLOATS_UDF;
 use datafusion_common::DFSchema;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -28,17 +32,84 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Copy `state` with the functions Lance's own rewrites emit, which the decoder
+/// has to resolve by name even when the caller registered none of Lance's UDFs.
+fn decode_state(state: &SessionState) -> Result<SessionState> {
+    let mut state = state.clone();
+    state.register_udf(COMPARE_FLOATS_UDF.clone())?;
+    Ok(state)
+}
+
 /// FixedSizeList has no Substrait producer support in datafusion-substrait.
 /// Other unsupported types (Null, Float16) are encoded as UserDefined and
 /// handled by `remove_extension_types` on the decode side.
 fn is_substrait_compatible(data_type: &DataType) -> bool {
     match data_type {
         DataType::FixedSizeList(_, _) => false,
-        DataType::List(inner) => is_substrait_compatible(inner.data_type()),
+        DataType::List(inner) | DataType::LargeList(inner) => {
+            is_substrait_compatible(inner.data_type())
+        }
+        DataType::Map(entries, _) => is_substrait_compatible(entries.data_type()),
         DataType::Struct(fields) => fields
             .iter()
             .all(|f| is_substrait_compatible(f.data_type())),
         _ => true,
+    }
+}
+
+/// Validates that every input field referenced by an expression can be
+/// represented by DataFusion's Substrait producer.
+///
+/// This is a preflight check for callers that prune unsupported fields before
+/// calling [`encode_substrait`]. It distinguishes an unsupported transport from
+/// an expression that references a field missing from the input schema. The
+/// producer may still reject unsupported expression operators during encoding.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use arrow_schema::{DataType, Field, Schema};
+/// use datafusion::prelude::col;
+/// use lance_core::Error;
+/// use lance_datafusion::substrait::validate_substrait_expr;
+///
+/// let schema = Schema::new(vec![Field::new(
+///     "vector",
+///     DataType::FixedSizeList(
+///         Arc::new(Field::new("item", DataType::Float32, true)),
+///         4,
+///     ),
+///     true,
+/// )]);
+/// let error = validate_substrait_expr(&col("vector").is_null(), &schema).unwrap_err();
+/// assert!(matches!(error, Error::NotSupported { .. }));
+/// ```
+pub fn validate_substrait_expr(expr: &Expr, schema: &ArrowSchema) -> Result<()> {
+    let mut columns = expr.column_refs().into_iter().collect::<Vec<_>>();
+    columns.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    let mut unsupported_columns = Vec::new();
+    for column in columns {
+        let field = schema.field_with_name(&column.name).map_err(|_| {
+            Error::schema(format!(
+                "Substrait expression references column '{}' which is missing from the input schema",
+                column.name
+            ))
+        })?;
+        if !is_substrait_compatible(field.data_type()) {
+            unsupported_columns.push(format!("'{}' ({})", column.name, field.data_type()));
+        }
+    }
+
+    if unsupported_columns.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::not_supported(format!(
+            "Substrait expression transport cannot encode predicates referencing unsupported columns: {}",
+            unsupported_columns.join(", ")
+        )))
     }
 }
 
@@ -528,7 +599,7 @@ pub async fn parse_substrait(
 
     let mut expr_container =
         datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
-            state,
+            &decode_state(state)?,
             &extended_expr,
         )
         .await?;
@@ -617,7 +688,8 @@ pub async fn parse_aggregate_rel_with_extensions(
     extensions: &Extensions,
 ) -> Result<Aggregate> {
     let df_schema = DFSchema::try_from(input_schema.as_ref().clone())?;
-    let consumer = DefaultSubstraitConsumer::new(extensions, state);
+    let state = decode_state(state)?;
+    let consumer = DefaultSubstraitConsumer::new(extensions, &state);
     let group_by = parse_groupings(aggregate_rel, &df_schema, &consumer).await?;
     let aggregates = parse_measures(aggregate_rel, &df_schema, &consumer).await?;
 
@@ -733,11 +805,12 @@ async fn parse_measures(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_array::{Float64Array, ListArray, RecordBatch, cast::AsArray, types::Float64Type};
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
     use datafusion::{
         execution::SessionState,
         logical_expr::{BinaryExpr, Case, Operator},
-        prelude::{Expr, SessionContext},
+        prelude::{Expr, SessionContext, col, lit},
     };
     use datafusion_common::{Column, ScalarValue};
     use datafusion_substrait::substrait::proto::{
@@ -761,7 +834,7 @@ mod tests {
     use prost::Message;
     use rstest::rstest;
 
-    use crate::substrait::{encode_substrait, parse_substrait};
+    use crate::substrait::{encode_substrait, parse_substrait, validate_substrait_expr};
 
     fn session_state() -> SessionState {
         let ctx = SessionContext::new();
@@ -1330,9 +1403,88 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]);
 
-        // Encoding with the full schema would fail, but pruning removes the FSL column
+        let supported_expr = col("id").is_not_null().and(col("name").is_not_null());
+        validate_substrait_expr(&supported_expr, &schema).unwrap();
+
+        // Encoding with the full schema would fail, but pruning removes the FSL column.
+        // The compound filter verifies references on both sides retain their mappings.
         let pruned = prune_schema_for_substrait(&schema);
         assert_eq!(pruned.fields().len(), 2); // id and name only
+        assert_substrait_roundtrip(pruned, supported_expr).await;
+    }
+
+    #[rstest]
+    #[case::is_null(col("vector").is_null())]
+    #[case::is_not_null(col("vector").is_not_null())]
+    #[case::compound(
+        col("before")
+            .gt(lit(0_i64))
+            .and(col("vector").is_null())
+            .and(col("after").lt(lit(10_i64)))
+    )]
+    fn test_validate_substrait_expr_rejects_fixed_size_list(#[case] expr: Expr) {
+        let schema = Schema::new(vec![
+            Field::new("before", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+            Field::new("after", DataType::Int64, true),
+        ]);
+
+        let error = validate_substrait_expr(&expr, &schema)
+            .expect_err("FixedSizeList predicates are not supported by Substrait transport");
+        assert!(matches!(error, lance_core::Error::NotSupported { .. }));
+        assert!(
+            error.to_string().contains("'vector' (FixedSizeList"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_schema_for_substrait_nested_list_types() {
+        // The producer recurses into LargeList and Map children, so an FSL
+        // nested under them must still be pruned.
+        use crate::substrait::prune_schema_for_substrait;
+
+        let fsl = |width: i32| {
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), width)
+        };
+        let map_of = |value: DataType| {
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", value, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        };
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("map_ok", map_of(DataType::Int32), true),
+            Field::new(
+                "ll_ok",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "ll_fsl",
+                DataType::LargeList(Arc::new(Field::new("item", fsl(16), true))),
+                true,
+            ),
+            Field::new("map_fsl", map_of(fsl(8)), true),
+        ]);
+
+        let pruned = prune_schema_for_substrait(&schema);
+        let names: Vec<&str> = pruned.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "map_ok", "ll_ok"]);
+        // The encoder writes the whole schema, so a filter on another column
+        // only encodes once those columns are gone.
         assert_substrait_roundtrip(pruned, id_filter("test-id")).await;
     }
 
@@ -1607,6 +1759,114 @@ mod tests {
             "Expected SUM aggregate, got: {}",
             agg.aggregates[1].schema_name()
         );
+    }
+
+    /// The float sign rewrites emit an internal UDF, which a plain session state
+    /// cannot resolve unless decoding registers it. Decoding also drops the
+    /// literal metadata that marks the rewrite's own ranges, and the scanner
+    /// optimizes the decoded filter again, so that second pass must not change
+    /// the answer either.
+    #[rstest]
+    #[case::column_comparison("a = b")]
+    #[case::nan_bound("a < CAST('NaN' AS DOUBLE)")]
+    #[case::array_has("array_has(l, 0.0)")]
+    #[case::upper_bound("a < 1.0")]
+    #[case::lower_bound("a > 1.0")]
+    #[case::two_sided_bound("a BETWEEN 0.0 AND 1.0")]
+    #[case::negative_infinity_lower_bound("a BETWEEN CAST('-inf' AS DOUBLE) AND 1.0")]
+    #[tokio::test]
+    async fn test_substrait_roundtrip_float_sign_rewrites(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+            Field::new_list("l", Field::new_list_field(DataType::Float64, true), true),
+        ]));
+        let nan = f64::NAN;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![
+                    Some(-nan),
+                    Some(nan),
+                    Some(-0.0),
+                    Some(f64::NEG_INFINITY),
+                    Some(2.0),
+                    None,
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(nan),
+                    Some(-nan),
+                    Some(0.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                ])),
+                Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+                    Some(vec![Some(-0.0)]),
+                    Some(vec![Some(0.0)]),
+                    Some(vec![]),
+                    Some(vec![None]),
+                    None,
+                    Some(vec![Some(1.0)]),
+                ])),
+            ],
+        )
+        .unwrap();
+        let planner = crate::planner::Planner::new(schema.clone());
+        let answers = |expr: &Expr| {
+            let result = planner
+                .create_physical_expr(expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            result.as_boolean().iter().collect::<Vec<_>>()
+        };
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let decoded = parse_substrait(bytes.as_slice(), schema, &session_state())
+            .await
+            .unwrap();
+        let reoptimized = planner.optimize_expr(decoded).unwrap();
+        assert_eq!(answers(&reoptimized), answers(&expr), "{reoptimized}");
+    }
+
+    /// Aggregate decoding resolves functions through its own consumer, so it has
+    /// to register the internal UDF as well.
+    #[tokio::test]
+    async fn test_substrait_aggregate_decodes_float_sign_rewrites() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Float64, true),
+        ]));
+        let planner = crate::planner::Planner::new(schema.clone());
+        let expr = planner
+            .optimize_expr(planner.parse_filter("a = b").unwrap())
+            .unwrap();
+        let bytes = encode_substrait(expr.clone(), schema.clone(), &session_state()).unwrap();
+        let envelope = ExtendedExpression::decode(bytes.as_slice()).unwrap();
+        let Some(ExprType::Expression(grouping)) = envelope.referred_expr[0].expr_type.clone()
+        else {
+            panic!("expected a scalar expression");
+        };
+        let bytes = create_aggregate_plan(
+            vec![],
+            vec![grouping],
+            vec![Grouping {
+                #[allow(deprecated)]
+                grouping_expressions: vec![],
+                expression_references: vec![0],
+            }],
+            envelope.extensions,
+        );
+        let aggregate =
+            crate::substrait::parse_substrait_aggregate(&bytes, schema, &session_state())
+                .await
+                .unwrap();
+        assert_eq!(aggregate.group_by, vec![expr]);
     }
 
     // ==================== LIKE and starts_with tests ====================

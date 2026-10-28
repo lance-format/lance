@@ -33,6 +33,7 @@ use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use super::vector_search::ProbeBounds;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
+use crate::dataset::utils::SchemaAdapter;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -48,9 +49,8 @@ struct LsmVectorQuery {
     k: usize,
     /// IVF partition probe bounds for indexed arms.
     probe_bounds: ProbeBounds,
-    /// Re-rank base candidates with exact distances when set (refine factor is
-    /// treated as a boolean; the LSM merge needs exact base distances).
-    refine: bool,
+    /// Refine factor for the base and SSTable arms; `None` leaves them unrefined.
+    refine_factor: Option<u32>,
     /// Distance metric; `None` defaults to L2 (matching the unindexed memtable arm).
     metric_type: Option<DistanceType>,
 }
@@ -238,6 +238,8 @@ pub struct LsmScanner {
     /// Over-fetch multiple for block-listed sources in search plans
     /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
     overfetch_factor: Option<f64>,
+    /// See [`Self::with_memtable_filter_indexes`].
+    memtable_filter_indexes: bool,
 }
 
 impl LsmScanner {
@@ -285,6 +287,7 @@ impl LsmScanner {
             sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
+            memtable_filter_indexes: false,
         }
     }
 
@@ -292,7 +295,7 @@ impl LsmScanner {
     /// SSTables) without including a base Lance table.
     ///
     /// This is useful when the caller owns the base read path separately and
-    /// only needs the WAL's contribution: active memtable ∪ L0 SSTables.
+    /// only needs the WAL's contribution: active memtable ∪ SSTables.
     /// Deduplication semantics are unchanged — newer generations
     /// still win on PK conflicts.
     ///
@@ -331,6 +334,7 @@ impl LsmScanner {
             sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
+            memtable_filter_indexes: false,
         }
     }
 
@@ -350,7 +354,7 @@ impl LsmScanner {
         self
     }
 
-    /// Supply [`Self::schema`] with each field's id, so a sealed generation's
+    /// Supply [`Self::schema`] with each field's id, so a flushed generation's
     /// columns resolve to the table's by id rather than by name. A rename keeps
     /// the id and moves the name, so without this a renamed column reads as
     /// absent. Built with
@@ -410,6 +414,15 @@ impl LsmScanner {
     /// default, so behavior is unchanged unless opted in.
     pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
+        self
+    }
+
+    /// Answer a filtered scan of in-memory memtables from their filter indexes,
+    /// keeping a match only when it is its key's newest visible version. A
+    /// filter matching too many rows to check one by one reads every in-memory
+    /// row instead. Off by default: every in-memory row is read.
+    pub fn with_memtable_filter_indexes(mut self, enabled: bool) -> Self {
+        self.memtable_filter_indexes = enabled;
         self
     }
 
@@ -490,7 +503,7 @@ impl LsmScanner {
             key: key.slice(0, key.len()),
             k,
             probe_bounds: ProbeBounds::default(),
-            refine: false,
+            refine_factor: None,
             metric_type: None,
         });
         Ok(self)
@@ -528,12 +541,11 @@ impl LsmScanner {
         self
     }
 
-    /// Re-rank base-table candidates with exact distances so they are directly
-    /// comparable to the exact memtable distances in the cross-source merge.
-    /// The factor is treated as a boolean today. No-op unless `nearest` was set.
+    /// Re-rank base and SSTable candidates by exact distance over `refine_factor`
+    /// times as many. `0` clears it; no-op unless `nearest` was set.
     pub fn refine(mut self, refine_factor: u32) -> Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.refine = refine_factor > 0;
+            q.refine_factor = (refine_factor > 0).then_some(refine_factor);
         }
         self
     }
@@ -633,7 +645,8 @@ impl LsmScanner {
             distance_type,
         )
         .with_identity_schema(Arc::clone(&self.identity_schema))
-        .with_filter(self.filter.clone());
+        .with_filter(self.filter.clone())
+        .with_refine_factor(nearest.refine_factor);
         if let BaseSource::Table(dataset) = &self.base {
             planner = planner.with_dataset(dataset.clone());
         }
@@ -660,7 +673,7 @@ impl LsmScanner {
                 per_source_k,
                 nearest.probe_bounds,
                 self.projection.as_deref(),
-                nearest.refine,
+                false,
                 overfetch_factor,
             )
             .await?;
@@ -775,6 +788,7 @@ impl LsmScanner {
             base_schema,
             Arc::clone(&self.identity_schema),
         );
+        planner = planner.with_memtable_filter_indexes(self.memtable_filter_indexes);
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
@@ -814,7 +828,16 @@ impl LsmScanner {
     }
 
     /// Execute the scan and return a stream of record batches.
+    ///
+    /// Lance JSON columns are returned as Arrow JSON, as
+    /// [`crate::dataset::scanner::Scanner::try_into_stream`] does.
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
+        let stream = self.execute_plan().await?;
+        Ok(SchemaAdapter::new(stream.schema()).to_logical_stream(stream))
+    }
+
+    /// Execute the scan without converting Lance JSON columns to Arrow JSON.
+    async fn execute_plan(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
@@ -842,7 +865,8 @@ impl LsmScanner {
 
     /// Count the number of rows that match the query.
     pub async fn count_rows(&self) -> Result<u64> {
-        let stream = self.try_into_stream().await?;
+        // Counting needs no JSON conversion, so skip decoding the values.
+        let stream = self.execute_plan().await?;
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
@@ -2172,8 +2196,15 @@ mod tests {
         use arrow_array::{Int32Array, StringArray};
 
         let store = BatchStore::with_capacity(8);
-        let mut index = IndexStore::new();
-        index.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let index = IndexStore::from_specs(
+            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+                "id_idx", 0, "id",
+            )],
+            &lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
+            100,
+            8,
+        )
+        .unwrap();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

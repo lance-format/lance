@@ -407,6 +407,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -870,8 +872,6 @@ mod tests {
     /// so the rows and the number describing them would disagree.
     #[tokio::test]
     async fn a_stale_generation_against_latest_head_publishes_nothing() {
-        use lance_table::format::Fragment;
-
         let shard = Uuid::new_v4();
         let dataset = test_dataset_with_mem_wal().await;
         let version = dataset.manifest.version;
@@ -891,6 +891,10 @@ mod tests {
         let version_before = dataset.manifest.version;
         let fragments_before = dataset.get_fragments().len();
 
+        // Reuse written data so schema validation cannot mask the stale generation.
+        let mut new_fragment = dataset.fragments()[0].clone();
+        new_fragment.id = 999;
+
         // Built against the LATEST version, so there is nothing stale for the
         // conflict resolver to catch, and carrying a real row mutation.
         let stale = Transaction::new(
@@ -898,7 +902,7 @@ mod tests {
             Operation::Update {
                 removed_fragment_ids: vec![],
                 updated_fragments: vec![],
-                new_fragments: vec![Fragment::new(999)],
+                new_fragments: vec![new_fragment],
                 fields_modified: vec![],
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
                 fields_for_preserving_frag_bitmap: vec![],
@@ -917,6 +921,7 @@ mod tests {
         // refused by apply-time generation validation, not by something
         // incidental about the fragment.
         let err = result.expect_err("a stale generation must fail the whole commit");
+        assert!(matches!(err, crate::Error::InvalidInput { .. }));
         assert!(
             err.to_string().contains("Stale SSTable compaction"),
             "expected stale-generation rejection, got {err}"

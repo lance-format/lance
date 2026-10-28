@@ -19,6 +19,7 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 };
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
+use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
 use prost::Message;
@@ -63,13 +64,43 @@ impl std::fmt::Debug for ResolvedRemapping {
     }
 }
 
+/// Cache key for fragment reuse history with `index_version = 0` and the
+/// mappings decoded from it.
+///
+/// A writer can change the history without changing its UUID. Include the
+/// history contents and storage location in the key so we don't reuse an old
+/// mapping. Referenced files are immutable once published.
+pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uuid {
+    fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lance.frag_reuse.v0_cache_identity");
+    hasher.update(entry.uuid.as_bytes());
+    if let Some(base_id) = entry.base_id {
+        hasher.update(&base_id.to_le_bytes());
+        if let Some(base) = dataset.manifest.base_paths.get(&base_id) {
+            hasher.update(&[u8::from(base.is_dataset_root)]);
+            update_sized(&mut hasher, base.path.as_bytes());
+        }
+    }
+    if let Some(details) = &entry.index_details {
+        update_sized(&mut hasher, details.type_url.as_bytes());
+        update_sized(&mut hasher, &details.value);
+    }
+    let mut identity = [0; 16];
+    identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(identity)
+}
+
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the FRI entry's UUID
-/// identify cached content. Under a tagged history the FRI UUID is
-/// deliberately left out: every rewrite and trim mints a new one, even for
-/// transitions a segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the history, by its
+/// [`v0_cache_identity`], identify cached content. Under a tagged history the
+/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
+/// for transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
@@ -352,6 +383,33 @@ async fn fri_query_plan(
         .await
 }
 
+/// Why the reader derives no coverage for the registered segment `index` on
+/// this snapshot, or `None` when it derives coverage (or identity) for it.
+/// Maintenance that rewrites a segment (remap) decides its eligibility from
+/// this before touching any file.
+pub(crate) async fn segment_coverage_reason(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> lance_core::Result<Option<MissingCoverageReason>> {
+    let stored = super::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(None);
+    };
+    if fri.index_version != 1 {
+        return Ok(None);
+    }
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
+    Ok(match plan.segments.get(&index.uuid) {
+        Some(SegmentRemappingPlan::MissingCoverage(reason)) => Some(*reason),
+        Some(_) => None,
+        None => Some(MissingCoverageReason::NoDerivedCoverage),
+    })
+}
+
 /// Why the reader derives no coverage for `source`, from what it can see of
 /// the segment without opening its files.
 async fn missing_coverage_reason(
@@ -445,7 +503,9 @@ pub(crate) async fn plan_staged_segments(
     Ok(Some(plans))
 }
 
-/// Resolve the FRI remapper shared by scalar and vector index loading.
+/// Resolve the FRI remapper shared by scalar and vector index loading, with
+/// its cache identity: [`v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -482,7 +542,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
     if fri.index_version == 0 {
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
             (
-                legacy.uuid,
+                v0_cache_identity(dataset, fri),
                 ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
             )
         }));
@@ -782,6 +842,8 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         base_id: None,
         // Fragment reuse index is inline (no files)
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     // Spares the commit's history check from reading the file back.
     if let Some(Content::External(file)) = &proto.content {
@@ -1284,6 +1346,8 @@ pub async fn frag_reuse_entry_appending(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 
@@ -1443,6 +1507,42 @@ pub(crate) fn legacy_version_transitions(version: &pb_fri::Version) -> Vec<pb_fr
         .collect()
 }
 
+/// Refuse a bare group of a transition-carrying rewrite by the bare-rewrite
+/// rule (`gate::covered_bare_rewrite`).
+fn refuse_covered_bare_group(
+    group: &RewriteGroup,
+    indices: &[IndexMetadata],
+) -> lance_core::Result<()> {
+    let rewritten: RoaringBitmap = group
+        .old_fragments
+        .iter()
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect();
+    let fragments = || {
+        group
+            .old_fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>()
+    };
+    match covered_bare_rewrite(&rewritten, indices) {
+        None => Ok(()),
+        Some(BareRewriteRefusal::Covered { index, overlap }) => Err(Error::invalid_input(format!(
+            "rewrite group of fragments {:?} carries no fragment reuse transition but index \
+             {index} covers fragments {:?} of it; record a transition for the group or rebuild \
+             the index before the rewrite",
+            fragments(),
+            overlap.iter().collect::<Vec<_>>(),
+        ))),
+        Some(BareRewriteRefusal::UnknownCoverage { index }) => Err(Error::invalid_input(format!(
+            "rewrite group of fragments {:?} carries no fragment reuse transition and index \
+             {index} has no fragment bitmap, so its coverage is unknown; record a transition \
+             for the group or rebuild the index before the rewrite",
+            fragments(),
+        ))),
+    }
+}
+
 /// Assemble the tagged FRI entry a rewrite commits, and return it with the
 /// `dataset_version` of the entry it appended onto.
 ///
@@ -1462,11 +1562,8 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     transitions: &[pb_fri::Transition],
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
-    // The spec excludes tagged histories on stable-row-id tables: the FRI is
-    // address-based, and under stable row ids a rewrite's rows keep their
-    // ids, so there is no address translation to record. The planner blocks
-    // the deferred-compaction combination already; this covers a hand-built
-    // rewrite committed directly.
+    // Deferred compaction records v0 entries on stable-row-id tables, so only a
+    // hand-built tagged rewrite committed directly reaches this.
     if dataset.manifest.uses_stable_row_ids() {
         return Err(Error::not_supported(
             "Tagged fragment reuse histories are address-based and excluded on \
@@ -1480,10 +1577,13 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         ));
     }
 
+    let stored = super::load_all_indices(dataset).await?;
+
     // Bind the covered rewrite groups to the transitions, one to one and in
     // order. A group is covered when its old fragments appear among the
     // transitions' sources; a group straddling covered and uncovered sources
-    // is rejected (see `ordered_rewrite_groups`).
+    // is rejected (see `ordered_rewrite_groups`). A bare group follows the
+    // bare-rewrite rule against the index list of this attempt.
     let source_ids: HashSet<u64> = transitions
         .iter()
         .flat_map(|transition| transition.sources.iter().map(|source| source.id))
@@ -1496,6 +1596,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             .filter(|frag| source_ids.contains(&frag.id))
             .count();
         if covered == 0 {
+            refuse_covered_bare_group(group, &stored)?;
             continue;
         }
         if covered != group.old_fragments.len() {
@@ -1728,7 +1829,6 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     }
 
     // Carry the current entry's content bytes over verbatim.
-    let stored = super::load_all_indices(dataset).await?;
     let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
     let (mut content, base_bitmap, base_entry_version) = match existing {
         None => (Vec::new(), RoaringBitmap::new(), None),
@@ -1874,6 +1974,8 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
         // The row-map files live in their own directories referenced from the
         // transitions, not under this entry's uuid.
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 
@@ -2247,6 +2349,8 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
             // The relocated entry lives in the clone.
             base_id: None,
             files: entry.files.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         },
         spilled,
     ))
@@ -2438,6 +2542,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -3299,6 +3405,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let error = dataset
             .apply_commit(
@@ -3735,6 +3843,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
             .with_detached(true)
@@ -4925,13 +5035,15 @@ mod tests {
             let error = crate::io::commit::commit_new_dataset(
                 &dataset.object_store,
                 None,
-                dataset.commit_handler.as_ref(),
+                &dataset.commit_handler,
                 &clone.base,
+                clone.uri(),
                 &transaction,
                 &Default::default(),
                 clone.manifest_location.naming_scheme,
                 dataset.metadata_cache.as_ref(),
-                dataset.session.store_registry(),
+                dataset.session.clone(),
+                false,
             )
             .await
             .unwrap_err();

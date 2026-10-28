@@ -139,7 +139,11 @@ pub enum Operation {
     /// specification for resolution, coverage, and versioning rules.
     DataOverlay { groups: Vec<DataOverlayGroup> },
     /// Merge a new column in
-    /// 'fragments' is the final fragments include all data files, the new fragments must align with old ones at rows.
+    /// 'fragments' is the final fragment list: the merged version of every existing
+    /// fragment (aligned with the old one at rows) and, optionally, brand-new fragments
+    /// listed after them. New fragments use id 0 (assigned a fresh id at commit time) or
+    /// a pre-reserved id; either way, on stable row id datasets they are also assigned
+    /// row ids at commit time, like Append. New fragments must not carry row id metadata.
     /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
     Merge {
         fragments: Vec<Fragment>,
@@ -249,6 +253,12 @@ pub enum Operation {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
     },
+
+    /// An operation written by a newer version of Lance that this version does
+    /// not recognize. It can be read but never re-encoded or committed, and it
+    /// is assumed to conflict with everything.
+    #[non_exhaustive]
+    Unknown {},
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -296,6 +306,7 @@ impl std::fmt::Display for Operation {
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::DataOverlay { .. } => write!(f, "DataOverlay"),
+            Self::Unknown { .. } => write!(f, "Unknown"),
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
@@ -416,6 +427,7 @@ impl Operation {
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
             Self::DataOverlay { .. } => "DataOverlay",
+            Self::Unknown { .. } => "Unknown",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",

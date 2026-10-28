@@ -45,7 +45,8 @@ pub(in crate::index) async fn merge_segments(
         .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged).await?;
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+            .await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut source_filters = Vec::with_capacity(old_data_filters.len());
@@ -95,6 +96,8 @@ pub(in crate::index) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }

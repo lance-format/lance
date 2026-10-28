@@ -9,10 +9,12 @@ use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{ColumnarValue, PlanProperties};
@@ -166,6 +168,13 @@ impl ExecutionPlan for LancePushdownScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

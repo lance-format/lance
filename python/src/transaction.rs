@@ -11,10 +11,12 @@ use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
-use lance::datatypes::Schema;
+use lance::datatypes::{Field, Schema};
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::system_index::mem_wal::CompactedSsTable;
 use pyo3::exceptions::PyValueError;
+use pyo3::types::{PyDict, PyList};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
@@ -28,7 +30,11 @@ impl FromPyObject<'_, '_> for PyLance<IndexFile> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let path = ob.getattr("path")?.extract()?;
         let size_bytes = ob.getattr("size_bytes")?.extract()?;
-        Ok(Self(IndexFile { path, size_bytes }))
+        Ok(Self(IndexFile {
+            path,
+            size_bytes,
+            file_metadata_size_bytes: None,
+        }))
     }
 }
 
@@ -94,6 +100,17 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             Err(_) => Vec::new(),
         };
 
+        // Tolerate objects predating these attributes; absent means no
+        // clustering reference and no generic metadata.
+        let clustering_id: Option<u32> = match ob.getattr("clustering_id") {
+            Ok(value) => value.extract::<Option<u32>>()?,
+            Err(_) => None,
+        };
+        let metadata: HashMap<String, String> = match ob.getattr("metadata") {
+            Ok(value) => value.extract()?,
+            Err(_) => HashMap::new(),
+        };
+
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
@@ -106,6 +123,8 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            clustering_id,
+            metadata,
         }))
     }
 }
@@ -144,19 +163,27 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let cls = namespace
             .getattr("Index")
             .expect("Failed to get Index class");
-        cls.call1((
-            uuid,
-            name.clone(),
-            fields.clone(),
-            dataset_version,
-            fragment_ids,
-            index_version,
-            created_at,
-            base_id,
-            files,
-            index_details,
-            covering_fields.clone(),
-        ))
+        // PyO3 accepts at most twelve positional arguments in one tuple; the
+        // two trailing dataclass fields go by keyword.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "clustering_id"), self.0.clustering_id)?;
+        kwargs.set_item(intern!(py, "metadata"), self.0.metadata.clone())?;
+        cls.call(
+            (
+                uuid,
+                name.clone(),
+                fields.clone(),
+                dataset_version,
+                fragment_ids,
+                index_version,
+                created_at,
+                base_id,
+                files,
+                index_details,
+                covering_fields.clone(),
+            ),
+            Some(&kwargs),
+        )
     }
 }
 
@@ -411,6 +438,37 @@ impl FromPyObject<'_, '_> for PyUpdateMode {
     }
 }
 
+fn import_compacted_sstables(values: &Bound<'_, PyAny>) -> PyResult<Vec<CompactedSsTable>> {
+    if values.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut tables = Vec::new();
+    for item in values.try_iter()? {
+        let item = item?;
+        let shard_id: String = item.getattr("shard_id")?.extract()?;
+        let generation: u64 = item.getattr("generation")?.extract()?;
+        let shard_id = uuid::Uuid::parse_str(&shard_id).map_err(|err| {
+            PyValueError::new_err(format!(
+                "compacted_sstables shard_id must be a UUID, got {shard_id}: {err}"
+            ))
+        })?;
+        tables.push(CompactedSsTable::new(shard_id, generation));
+    }
+    Ok(tables)
+}
+
+fn export_compacted_sstables<'py>(
+    py: Python<'py>,
+    tables: &[CompactedSsTable],
+) -> PyResult<Bound<'py, PyAny>> {
+    let cls = py.import("lance.mem_wal")?.getattr("CompactedSsTable")?;
+    let mut items = Vec::with_capacity(tables.len());
+    for table in tables {
+        items.push(cls.call1((table.shard_id.to_string(), table.generation))?);
+    }
+    Ok(PyList::new(py, items)?.into_any())
+}
+
 impl FromPyObject<'_, '_> for PyLance<Operation> {
     type Error = PyErr;
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
@@ -502,12 +560,17 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .transpose()?
                     .map(UpdatedFragmentOffsets);
 
+                let compacted_sstables = match ob.getattr("compacted_sstables") {
+                    Ok(value) => import_compacted_sstables(&value)?,
+                    Err(_) => Vec::new(),
+                };
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    compacted_sstables: vec![],
+                    compacted_sstables,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
@@ -560,11 +623,16 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             "Rewrite" => {
                 let groups = extract_vec(&ob.getattr("groups")?)?;
                 let rewritten_indices = extract_vec(&ob.getattr("rewritten_indices")?)?;
+                let frag_reuse_index = match ob.getattr("frag_reuse_index") {
+                    Ok(value) if !value.is_none() => {
+                        Some(value.extract::<PyLance<IndexMetadata>>()?.0)
+                    }
+                    _ => None,
+                };
                 let op = Operation::Rewrite {
                     groups,
                     rewritten_indices,
-                    // TODO: pass frag_reuse_index when available
-                    frag_reuse_index: None,
+                    frag_reuse_index,
                 };
                 Ok(Self(op))
             }
@@ -644,6 +712,13 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 };
                 Ok(Self(op))
             }
+            "UpdateMemWalState" => {
+                let compacted_sstables = match ob.getattr("compacted_sstables") {
+                    Ok(value) => import_compacted_sstables(&value)?,
+                    Err(_) => Vec::new(),
+                };
+                Ok(Self(Operation::UpdateMemWalState { compacted_sstables }))
+            }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
             ))),
@@ -706,6 +781,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 updated_fragment_offsets,
+                compacted_sstables,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -738,6 +814,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                                 })
                                 .collect::<HashMap<u64, Vec<u8>>>()
                         });
+                let compacted_sstables = export_compacted_sstables(py, compacted_sstables)?;
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -749,6 +826,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     updated_fragment_offsets,
+                    compacted_sstables,
                 ))
             }
             Operation::DataReplacement { replacements } => {
@@ -810,14 +888,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
-                ..
+                frag_reuse_index,
             } => {
                 let groups_py = export_vec(py, groups.as_slice())?;
                 let rewritten_indices_py = export_vec(py, rewritten_indices.as_slice())?;
+                let frag_reuse_index = match frag_reuse_index {
+                    Some(index) => PyLance(index).into_pyobject(py)?.into_any(),
+                    None => py.None().into_bound(py),
+                };
                 let cls = namespace
                     .getattr("Rewrite")
                     .expect("Failed to get Rewrite class");
-                cls.call1((groups_py, rewritten_indices_py))
+                cls.call1((groups_py, rewritten_indices_py, frag_reuse_index))
             }
             Operation::CreateIndex {
                 new_indices,
@@ -893,6 +975,13 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
+            Operation::UpdateMemWalState { compacted_sstables } => {
+                let compacted_sstables = export_compacted_sstables(py, compacted_sstables)?;
+                let cls = namespace
+                    .getattr("UpdateMemWalState")
+                    .expect("Failed to get UpdateMemWalState class");
+                cls.call1((compacted_sstables,))
+            }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {}",
                 unsupported.name()
@@ -912,11 +1001,15 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
+        let tag = match ob.getattr("tag") {
+            Ok(value) if !value.is_none() => Some(value.extract()?),
+            _ => None,
+        };
         Ok(Self(Transaction {
             read_version,
             uuid,
             operation,
-            tag: None,
+            tag,
             transaction_properties,
         }))
     }
@@ -945,6 +1038,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
             py_transaction.setattr("transaction_properties", py_dict)?;
+        }
+        if let Some(tag) = &self.0.tag {
+            py_transaction.setattr("tag", tag)?;
         }
         // Unwrap due to infallible
         Ok(py_transaction.into_pyobject(py).unwrap())
@@ -1090,11 +1186,18 @@ fn extract_schema(schema: &Bound<'_, PyAny>) -> PyResult<Schema> {
 }
 
 fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
-    // Note: the field ids here are wrong.
-    Schema::try_from(arrow_schema).map_err(|e| {
-        PyValueError::new_err(format!(
-            "Failed to convert Arrow schema to Lance schema: {}",
-            e
-        ))
+    let fields = arrow_schema
+        .fields
+        .iter()
+        .map(|field| Field::try_from(field.as_ref()))
+        .collect::<lance_core::Result<_>>()
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {e}"
+            ))
+        })?;
+    Ok(Schema {
+        fields,
+        metadata: arrow_schema.metadata.clone(),
     })
 }
