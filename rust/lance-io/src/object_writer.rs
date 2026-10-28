@@ -1896,7 +1896,8 @@ mod tests {
         let temp_file_path = named_temp.path().to_owned();
         let (std_file, temp_path) = named_temp.into_parts();
         let file = tokio::fs::File::from_std(std_file);
-        let mut writer = LocalWriter::new(file, os_path, temp_path, Arc::new(IOTracker::default()));
+        let mut writer = LocalWriter::new(file, os_path, temp_path, Arc::new(IOTracker::default()))
+            .with_fsync(true);
         writer.write_all(b"data").await.unwrap();
 
         *INJECTED_CLOSE_FAILURE.lock().unwrap() = Some(std::path::PathBuf::from(
