@@ -616,26 +616,22 @@ same id, name, or path.
     stabilization vote does not pass. Discussion:
     [#5960](https://github.com/lance-format/lance/discussions/5960).
 
-!!! danger "Writing Transaction V2 breaks compatibility with readers before v12.0.0"
+!!! note "Readers before v14.0.0 cannot decode a `CompositeOperation`"
 
-    A table version committed as a `CompositeOperation` **cannot be opened** by
-    Lance before v12.0.0 — not merely read as history. Those releases decode the
-    manifest's inline transaction section while opening the table, and an
-    operation they do not recognize decodes to no operation at all, which fails
-    the open. The fix
-    ([#7740](https://github.com/lance-format/lance/pull/7740)) shipped in
-    v12.0.0 and is not expected to be backported to earlier release lines; see
-    [#9454](https://github.com/lance-format/lance/issues/9454).
-
-    Treat this as durable, not transitional. Writing a `CompositeOperation` is
-    opt-in for exactly this reason, and a table that has one anywhere in its
-    history raises the minimum reader version for that table to v12.0.0.
+    Any reader can open and scan a table version committed as a
+    `CompositeOperation`: the inline transaction lives in manifest field 23,
+    which older readers ignore
+    ([#9482](https://github.com/lance-format/lance/pull/9482), v14.0.0). A
+    reader before v14.0.0 that decodes the transaction itself, to read the
+    transaction history or to check a concurrent commit for conflicts, fails
+    on the unrecognized operation. For conflict checking that failure aborts
+    the older writer's commit, which is the safe outcome.
 
 Every operation above is a single named verb. A transaction may instead carry a
 `CompositeOperation`: an ordered list of granular *actions* that apply
 atomically as one manifest change. This lets one commit express a change no
-single named operation covers, such as appending a fragment and updating an
-index together, and makes the transaction a true diff of the manifest rather
+single named operation covers, such as appending a fragment and updating table
+config together, and makes the transaction a true diff of the manifest rather
 than a description of intent.
 
 <details>
@@ -649,15 +645,16 @@ than a description of intent.
 
 A `CompositeOperation` holds `UserStep`s, each a human-recognizable step with
 a description, which in turn hold the granular `Action`s applied to the
-manifest. The two levels exist so the transaction history stays readable when
-several operations are squashed into one: the descriptions survive, while the
-action lists are flattened on apply.
+manifest. The two levels support multi-statement transactions: each statement
+becomes one step, so the transaction history still shows what each statement
+did, while all of the steps' actions apply as one atomic change.
 
 Actions are deltas rather than post-images, and an action that allocates a new
-identifier (a field, fragment, or base id) names it with a local placeholder
-that resolves against the target's counters at apply time. Both properties are
-what let a composite operation be replayed against a newer version, or onto a
-different branch, without rewriting it.
+identifier (a field, fragment, or base id) names it with a local placeholder.
+When building the manifest before commit, the local placeholders are translated
+into concrete identifiers. Both properties, true deltas and local placeholders,
+are what let a composite operation be replayed against a newer version, or onto
+a different branch, without rewriting it.
 
 A committed identifier, by contrast, must already exist at the operation's
 read version. Apply rejects a committed fragment, field, or base id above the
@@ -677,13 +674,6 @@ declaration whose two lists overlap can only be represented by a manifest
 declaring `FLAG_INDEPENDENT_COVERING_FIELDS`; until a release implements that
 flag, apply rejects the overlapping form and lowers a disjoint one to the
 legacy subset representation.
-
-Field references are `FieldRef`s rather than the `Ref` that fragments and
-bases use, because a field id is signed: an `AddDataFile` binds a data file's
-columns with the same ids its `DataFile.fields` would carry, including the
-reserved negative ids of the hidden row lineage columns. A data file inside an
-action leaves `fields` and `base_id` unset, and apply stamps them from the
-action's `field_ids` and `base`.
 
 Actions apply in order, with one exception: `ReserveFragmentIds` and
 `ReserveRowIds` are summed and taken after the operation's own mints, wherever
@@ -741,7 +731,9 @@ Apply validates the transition without reading any file, and rejects it unless:
   destinations' physical rows;
 - no source is consumed by any other transition, in the history or in the same
   operation;
-- no index on the table stores stable row ids rather than row addresses;
+- every index on the table returns row addresses. The history translates row
+  addresses, so it would mistranslate an index that returns stable row ids,
+  which only a table with stable row ids can have;
 - a stable partition has between 1 and 65,536 destinations.
 
 Apply then creates the history if the table has none, converts a version 0
@@ -813,13 +805,10 @@ feature. Readers are affected in two places:
   does not recognize. Implementations must reject it rather than treat it as a
   no-op, so that a concurrent V2 commit aborts an in-flight commit instead of
   being silently skipped.
-- Transactions are usually inlined into the manifest. A reader that fails when
-  an inline transaction does not decode cannot open such a table at all.
-  Implementations must tolerate an undecodable inline transaction and continue
-  opening the table, because the transaction contents are not needed to read
-  data. In the Rust implementation this has been true only since v12.0.0, which
-  is what makes writing Transaction V2 a compatibility break against earlier
-  releases rather than a graceful degradation.
+- Transactions are usually inlined into the manifest. Opening a table never
+  requires decoding them (see
+  [Inline Transaction Sections](#inline-transaction-sections)), so an
+  undecodable inline `CompositeOperation` does not prevent reading data.
 
 Conflict resolution between two `CompositeOperation`s is computed from the
 actions themselves. Between a `CompositeOperation` and any named operation it
