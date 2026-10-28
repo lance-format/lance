@@ -198,9 +198,7 @@ impl UpdateBuilder {
             .context(InvalidInputSnafu {})?;
         // A string assigned to a JSON field is logical JSON, not its LargeBinary storage.
         // Keep it as UTF-8 here so `apply_updates` can validate and encode it as JSONB.
-        let is_json_string = schema
-            .field_with_name(column.as_ref())
-            .is_ok_and(is_json_field)
+        let is_json_string = schema.field_with_name(&field.name).is_ok_and(is_json_field)
             && matches!(
                 &src_type,
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
@@ -220,7 +218,8 @@ impl UpdateBuilder {
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
 
-        self.updates.insert(column.as_ref().to_string(), expr);
+        // Key by the resolved name: `column` may be quoted.
+        self.updates.insert(field.name.clone(), expr);
         Ok(self)
     }
 
@@ -799,6 +798,11 @@ impl UpdateJob {
                 }),
             })
             .collect::<DFResult<Vec<_>>>()?;
+        if let Some(column) = assigned.keys().next() {
+            return Err(DataFusionError::Internal(format!(
+                "update output has no column '{column}'"
+            )));
+        }
         Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
     }
 
@@ -3373,6 +3377,32 @@ mod tests {
         assert_eq!(
             actual,
             record_batch!(("a", Int32, [10, 20]), ("b", Int32, [1, 2])).unwrap()
+        );
+    }
+
+    /// A quoted column name assigns the field it resolves to.
+    #[tokio::test]
+    async fn update_quoted_column_name() {
+        let batch = record_batch!(("a", Int32, [1, 2]), ("b", Int32, [10, 20])).unwrap();
+        let ds = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let result = UpdateBuilder::new(Arc::new(ds))
+            .set("`a`", "b + 1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let actual = result.new_dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            actual,
+            record_batch!(("a", Int32, [11, 21]), ("b", Int32, [10, 20])).unwrap()
         );
     }
 
