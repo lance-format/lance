@@ -18031,6 +18031,21 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         }
     }
 
+    fn collect_exact_source_widths(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
+        if let Ok(stats) = plan.partition_statistics(None)
+            && matches!(
+                stats.num_rows,
+                datafusion::common::stats::Precision::Exact(_)
+            )
+            && let datafusion::common::stats::Precision::Exact(bytes) = stats.total_byte_size
+        {
+            out.push(bytes);
+        }
+        for child in plan.children() {
+            collect_exact_source_widths(child, out);
+        }
+    }
+
     /// Use case 3: planning against the provider exposes its exact source
     /// statistics to the optimizer.
     #[tokio::test]
@@ -18068,6 +18083,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             ],
         )
         .unwrap();
+        let source_batch_bytes = new_data.get_array_memory_size();
         let provider: Arc<dyn TableProvider> =
             Arc::new(MemTable::try_new(schema.clone(), vec![vec![new_data]]).unwrap());
 
@@ -18084,6 +18100,13 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert!(
             row_counts.contains(&source_rows),
             "source provider's exact row count ({source_rows}) should reach the plan; got {row_counts:?}"
+        );
+        let mut source_widths = Vec::new();
+        collect_exact_source_widths(&plan, &mut source_widths);
+        assert!(
+            source_widths.contains(&source_batch_bytes),
+            "the source provider's exact batch bytes ({source_batch_bytes}) should reach the plan; \
+             got {source_widths:?}"
         );
     }
 
