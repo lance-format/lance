@@ -8,6 +8,7 @@ use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey, RowVersionSequenceKey};
 use crate::{Error, Result};
+use arrow_array::UInt64Array;
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
@@ -202,6 +203,13 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
+/// Build the legacy in-memory reverse index explicitly.
+///
+/// This API remains available for callers that need the complete mapping.
+/// Normal live-row reads and writes use [`row_ids_to_row_addrs`] instead, which
+/// resolves batches through an ordinary BTree without building this map. Explicit
+/// takes that ignore deletions retain sequence-based resolution for stored rows
+/// that index maintenance may already have removed from the BTree.
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
     get_row_id_index_with(dataset, true).await
 }
@@ -238,6 +246,35 @@ pub(crate) async fn get_row_id_index_with(
         .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
         .await?;
     Ok(Some(index))
+}
+
+/// Resolve row IDs to live addresses, preserving order, duplicates, and misses.
+///
+/// Stable IDs use compact inline ranges directly, an ordinary BTree on `_rowid`
+/// for other covered fragments, and a column scan for the remainder. Null,
+/// missing, and deleted stable IDs
+/// yield `None`. Without stable IDs, each non-null ID is already an address
+/// and is returned unchanged; the caller applies physical deletion filtering.
+///
+/// ```
+/// # use arrow_array::UInt64Array;
+/// # use lance::{Dataset, Result, dataset::rowids::row_ids_to_row_addrs};
+/// # async fn example(dataset: &Dataset) -> Result<()> {
+/// let ids = UInt64Array::from(vec![Some(7), None, Some(7)]);
+/// let addresses = row_ids_to_row_addrs(dataset, &ids).await?;
+/// assert_eq!(addresses[0], addresses[2]);
+/// assert_eq!(addresses[1], None);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn row_ids_to_row_addrs(
+    dataset: &Dataset,
+    row_ids: &UInt64Array,
+) -> Result<Vec<Option<RowAddress>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(row_ids.iter().map(|id| id.map(RowAddress::from)).collect());
+    }
+    Box::pin(dataset.lookup_row_addresses(lance_core::ROW_ID, row_ids)).await
 }
 
 /// Map a set of physical row addresses to their stable row ids
@@ -303,7 +340,7 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
 
 /// Resolve row addresses to row ids, positionally: `addr = (fragment << 32) | offset`
 /// looks up `offset` in the fragment's [`RowIdSequence`]. The inverse companion of
-/// [`get_row_id_index`].
+/// [`row_ids_to_row_addrs`].
 ///
 /// Returns one entry per input address, in order. Addresses that no longer
 /// resolve — a missing fragment, an out-of-range offset, or a `None` input —
@@ -519,12 +556,15 @@ mod test {
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array,
+        record_batch,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::datatypes::Schema;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
-    use lance_datagen::Dimension;
+    use lance_datagen::{ArrayGeneratorExt, Dimension};
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_table::rowids::segment::U64Segment;
@@ -538,6 +578,340 @@ mod test {
             false,
         )]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))]).unwrap()
+    }
+
+    async fn row_id_lookup_dataset() -> Dataset {
+        lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_inline_range_lookup_offsets_and_snapshot_changes() {
+        let mut dataset = row_id_lookup_dataset().await;
+        let keys = UInt64Array::from(vec![Some(0), Some(100), Some(101), Some(2), None]);
+        let original = row_ids_to_row_addrs(&dataset, &keys).await.unwrap();
+        let old_snapshot = dataset.clone();
+        let mut sequence = RowIdSequence::from(100..102);
+        sequence.extend(RowIdSequence::from(0..2));
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[0].row_id_meta = Some(RowIdMeta::Inline(
+            lance_table::rowids::write_row_ids(&sequence).into(),
+        ));
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(0, 2)),
+                Some(RowAddress::new_from_parts(0, 0)),
+                Some(RowAddress::new_from_parts(0, 1)),
+                None,
+                None
+            ],
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&old_snapshot, &keys).await.unwrap(),
+            original
+        );
+
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[1].row_id_meta = Some(RowIdMeta::Inline(
+            lance_table::rowids::write_row_ids(&RowIdSequence::from(0..4)).into(),
+        ));
+        let error = row_ids_to_row_addrs(&dataset, &keys).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not unique for key at position 0")
+        );
+        assert_eq!(
+            row_ids_to_row_addrs(&dataset, &UInt64Array::from(vec![9]))
+                .await
+                .unwrap(),
+            vec![Some(RowAddress::new_from_parts(2, 1))]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::signed("i")]
+    #[case::unsigned("u")]
+    #[tokio::test]
+    async fn test_row_id_btree_unique_key_lookup(
+        #[case] column: &str,
+        #[values(1, 8193)] repeats: usize,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "i",
+                lance_datagen::array::cycle::<Int32Type>(vec![7, 8, 7, 9])
+                    .with_nulls(&[false, true, false, false]),
+            )
+            .col(
+                "u",
+                lance_datagen::array::cycle::<UInt64Type>(vec![7, 8, 7, 9])
+                    .with_nulls(&[false, true, false, false]),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+            .await
+            .unwrap();
+        let keys: ArrayRef = match column {
+            "i" => Arc::new(Int32Array::from(vec![
+                Some(7),
+                None,
+                Some(9),
+                Some(7),
+                Some(99),
+            ])),
+            "u" => Arc::new(UInt64Array::from(vec![
+                Some(7),
+                None,
+                Some(9),
+                Some(7),
+                Some(99),
+            ])),
+            _ => unreachable!(),
+        };
+        let null_value: ArrayRef = match column {
+            "i" => Arc::new(Int32Array::from(vec![8])),
+            "u" => Arc::new(UInt64Array::from(vec![8])),
+            _ => unreachable!(),
+        };
+        let key_positions =
+            UInt32Array::from_iter_values((0..repeats).flat_map(|_| 0..keys.len() as u32));
+        let keys = arrow_select::take::take(&keys, &key_positions, None).unwrap();
+        for indexed_fragments in 0..=2 {
+            if indexed_fragments == 1 {
+                let params = ScalarIndexParams::default();
+                let fragment_id = dataset.fragments()[0].id as u32;
+                dataset
+                    .create_index_builder(&[column], IndexType::BTree, &params)
+                    .fragments(vec![fragment_id])
+                    .await
+                    .unwrap();
+            } else if indexed_fragments == 2 {
+                dataset.optimize_indices(&Default::default()).await.unwrap();
+            }
+            assert_eq!(
+                dataset
+                    .lookup_row_addresses(column, null_value.as_ref())
+                    .await
+                    .unwrap(),
+                vec![None],
+                "a null value must not match its underlying buffer value"
+            );
+            let error = dataset
+                .lookup_row_addresses(column, keys.as_ref())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("not unique for key at position 0")
+            );
+        }
+        dataset.delete("_rowaddr = 0").await.unwrap();
+        let resolved = dataset
+            .lookup_row_addresses(column, keys.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            [
+                Some(RowAddress::new_from_parts(1, 0)),
+                None,
+                Some(RowAddress::new_from_parts(1, 1)),
+                Some(RowAddress::new_from_parts(1, 0)),
+                None,
+            ]
+            .repeat(repeats)
+        );
+        let error = dataset
+            .lookup_row_addresses("i", &UInt64Array::from(vec![7]))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("expected Int32"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum U64ScanLayout {
+        Sorted,
+        Descending,
+        InteriorInversion,
+        Nullable,
+        AllNull,
+    }
+
+    #[rstest::rstest]
+    #[case::sorted(U64ScanLayout::Sorted)]
+    #[case::descending(U64ScanLayout::Descending)]
+    #[case::interior_inversion(U64ScanLayout::InteriorInversion)]
+    #[case::nullable(U64ScanLayout::Nullable)]
+    #[case::all_null(U64ScanLayout::AllNull)]
+    #[tokio::test]
+    async fn test_uncovered_u64_lookup_matches_scan(
+        #[case] layout: U64ScanLayout,
+        #[values(false, true)] has_partial_index: bool,
+    ) {
+        let mut values = (0..255)
+            .map(Some)
+            .chain([Some(u64::MAX)])
+            .collect::<Vec<_>>();
+        match layout {
+            U64ScanLayout::Sorted => {}
+            U64ScanLayout::Descending => values.reverse(),
+            U64ScanLayout::InteriorInversion => {
+                // Both fragment endpoints remain ordered despite these inversions.
+                values.swap(32, 33);
+                values.swap(160, 161);
+            }
+            U64ScanLayout::Nullable => values[65] = None,
+            U64ScanLayout::AllNull => values.fill(None),
+        }
+        let batch = record_batch!(("u", UInt64, values)).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(batch.slice(0, 128)), Ok(batch.slice(128, 128))],
+            batch.schema(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        if has_partial_index {
+            let fragment_id = dataset.fragments()[0].id as u32;
+            dataset
+                .create_index_builder(&["u"], IndexType::BTree, &ScalarIndexParams::default())
+                .fragments(vec![fragment_id])
+                .await
+                .unwrap();
+        }
+        let keys = UInt64Array::from(vec![
+            Some(9999),
+            Some(65),
+            None,
+            Some(u64::MAX),
+            Some(0),
+            Some(65),
+            Some(128),
+            Some(255),
+            Some(511),
+            Some(9999),
+        ])
+        .slice(1, 8);
+        let single_key = UInt64Array::from(vec![Some(65), None, Some(65)]);
+        let dense_keys = UInt64Array::from(
+            (0..256)
+                .map(Some)
+                .chain([None, Some(u64::MAX), Some(65)])
+                .collect::<Vec<_>>(),
+        );
+        for is_after_delete in [false, true] {
+            if is_after_delete {
+                dataset.delete("u = 65 OR u = 128").await.unwrap();
+            }
+            let scan = dataset
+                .scan()
+                .with_row_address()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let expected = scan["u"]
+                .as_primitive::<UInt64Type>()
+                .iter()
+                .zip(scan[ROW_ADDR].as_primitive::<UInt64Type>().values())
+                .filter_map(|(value, &address)| {
+                    value.map(|value| (value, RowAddress::from(address)))
+                })
+                .collect::<HashMap<_, _>>();
+            for keys in [&keys, &single_key, &dense_keys] {
+                let actual = dataset.lookup_row_addresses("u", keys).await.unwrap();
+                assert_eq!(
+                    actual,
+                    keys.iter()
+                        .map(|key| key.and_then(|key| expected.get(&key).copied()))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_uncovered_sorted_u64_lookup_rejects_duplicates(
+        #[values(false, true)] has_partial_index: bool,
+    ) {
+        let mut values = (0..256).collect::<Vec<u64>>();
+        values[136] = 135;
+        let batch = record_batch!(("u", UInt64, values)).unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(batch.slice(0, 128)), Ok(batch.slice(128, 128))],
+            batch.schema(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        if has_partial_index {
+            let fragment_id = dataset.fragments()[0].id as u32;
+            dataset
+                .create_index_builder(&["u"], IndexType::BTree, &ScalarIndexParams::default())
+                .fragments(vec![fragment_id])
+                .await
+                .unwrap();
+        }
+        let keys = UInt64Array::from(vec![Some(135), None, Some(135), Some(511), Some(0)]);
+        let error = dataset.lookup_row_addresses("u", &keys).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not unique for key at position 0")
+        );
+
+        let fragment = dataset.fragments()[1].id as u32;
+        let removed = RowAddress::new_from_parts(fragment, 7);
+        dataset
+            .delete(&format!("{ROW_ADDR} = {}", u64::from(removed)))
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.lookup_row_addresses("u", &keys).await.unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(fragment, 8)),
+                None,
+                Some(RowAddress::new_from_parts(fragment, 8)),
+                None,
+                Some(RowAddress::new_from_parts(
+                    dataset.fragments()[0].id as u32,
+                    0
+                )),
+            ]
+        );
     }
 
     #[tokio::test]

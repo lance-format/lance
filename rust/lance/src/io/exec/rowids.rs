@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::ColumnStatistics;
 use datafusion::common::stats::Precision;
@@ -17,9 +17,10 @@ use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
-use datafusion_physical_plan::Statistics;
+use datafusion_physical_expr::projection::project_ordering;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::{ExecutionPlanProperties, Statistics};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
@@ -27,23 +28,20 @@ use lance_core::{
     Error as LanceError, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_OFFSET, ROW_OFFSET_FIELD,
     Result as LanceResult,
 };
-use lance_table::rowids::RowIdIndex;
 
 use crate::Dataset;
-use crate::dataset::rowids::get_row_id_index;
-use crate::utils::future::SharedPrerequisite;
+use crate::dataset::rowids::row_ids_to_row_addrs;
 
 /// Add a `_rowaddr` column to a stream of record batches that have a `_rowid`.
 ///
 /// It's generally more efficient to scan the `_rowaddr` column, but this can be
 /// useful when reading secondary indices, which only have the `_rowid` column.
+/// Missing or deleted stable IDs become null addresses; input order and row count
+/// are preserved.
 #[derive(Clone)]
 pub struct AddRowAddrExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
-    /// Task to get the rowid index. Is not initialized until the first call to
-    /// `execute`.
-    row_id_index: OnceLock<Arc<SharedPrerequisite<Option<Arc<RowIdIndex>>>>>,
     /// Position in the input schema where the rowids are located
     rowid_pos: usize,
     /// Position in the output schema where to insert the row address
@@ -104,22 +102,25 @@ impl AddRowAddrExec {
             input_schema.metadata().clone(),
         ));
 
-        let row_id_index = OnceLock::new();
-
-        // Is just a simple projections, so it inherits the partitioning and
-        // execution mode from parent.
+        let orderings = input
+            .equivalence_properties()
+            .oeq_class()
+            .iter()
+            .filter_map(|ordering| project_ordering(ordering, &output_schema));
+        let equivalence_properties =
+            EquivalenceProperties::new_with_orderings(output_schema.clone(), orderings);
+        // Lookup preserves the driving side's order, including repeated keys.
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
+                .with_eq_properties(equivalence_properties),
         );
 
         Ok(Self {
             input,
             dataset,
-            row_id_index,
             rowid_pos,
             rowaddr_pos,
             output_schema,
@@ -128,54 +129,20 @@ impl AddRowAddrExec {
         })
     }
 
-    fn compute_row_addrs(
-        row_ids: &ArrayRef,
-        row_id_index: Option<&RowIdIndex>,
-    ) -> Result<ArrayRef> {
+    async fn compute_row_addrs(dataset: &Dataset, row_ids: &ArrayRef) -> Result<ArrayRef> {
         let row_id_values = row_ids.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
             DataFusionError::Internal("AddRowAddrExec: rowid column is not a UInt64Array".into())
         })?;
-        if let Some(row_id_index) = row_id_index {
-            if row_id_values.null_count() > 0 {
-                let mut builder = arrow::array::UInt64Builder::with_capacity(row_id_values.len());
-                for rowid in row_id_values.iter() {
-                    if let Some(rowid) = rowid {
-                        if let Some(row_addr) =
-                            row_id_index.get(rowid).map_err(DataFusionError::from)?
-                        {
-                            builder.append_value(row_addr.into());
-                        } else {
-                            return Err(DataFusionError::Internal(format!(
-                                "AddRowAddrExec: rowid not found in index: {}",
-                                rowid
-                            )));
-                        }
-                    } else {
-                        builder.append_null();
-                    }
-                }
-                Ok(Arc::new(builder.finish()))
-            } else {
-                // Fast path - no branching for null values
-                let mut rowaddrs: Vec<u64> = Vec::with_capacity(row_id_values.len());
-                for rowid in row_id_values.values() {
-                    if let Some(row_addr) =
-                        row_id_index.get(*rowid).map_err(DataFusionError::from)?
-                    {
-                        rowaddrs.push(row_addr.into());
-                    } else {
-                        return Err(DataFusionError::Internal(format!(
-                            "AddRowAddrExec: rowid not found in index: {}",
-                            rowid
-                        )));
-                    }
-                }
-                Ok(Arc::new(UInt64Array::from(rowaddrs)))
-            }
-        } else {
-            // No index, then we should just copy the rowids
-            Ok(row_ids.clone())
+        if !dataset.manifest.uses_stable_row_ids() {
+            return Ok(row_ids.clone());
         }
+        let addresses = row_ids_to_row_addrs(dataset, row_id_values).await?;
+        Ok(Arc::new(UInt64Array::from(
+            addresses
+                .into_iter()
+                .map(|address| address.map(u64::from))
+                .collect::<Vec<_>>(),
+        )))
     }
 
     fn do_execute(
@@ -183,14 +150,7 @@ impl AddRowAddrExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let index_prereq = self
-            .row_id_index
-            .get_or_init(|| {
-                let dataset = self.dataset.clone();
-                let fut = async move { get_row_id_index(dataset.as_ref()).await };
-                SharedPrerequisite::spawn(fut)
-            })
-            .clone();
+        let dataset = self.dataset.clone();
 
         let input_stream = self.input.execute(partition, context)?;
 
@@ -201,16 +161,12 @@ impl AddRowAddrExec {
         let elapsed_compute = baseline.elapsed_compute().clone();
         let stream = input_stream.then(move |batch_result| {
             let output_schema = output_schema.clone();
-            let index_prereq = index_prereq.clone();
+            let dataset = dataset.clone();
             let elapsed_compute = elapsed_compute.clone();
             async move {
                 let batch = batch_result?;
-                index_prereq.wait_ready().await?;
-                let row_id_index = index_prereq.get_ready();
-                let index_ref = row_id_index.as_deref();
-
+                let row_addr = Self::compute_row_addrs(&dataset, batch.column(rowid_pos)).await?;
                 let _t = elapsed_compute.timer();
-                let row_addr = Self::compute_row_addrs(batch.column(rowid_pos), index_ref)?;
 
                 let mut columns = Vec::with_capacity(batch.num_columns() + 1);
                 let existing_columns = batch.columns();
@@ -256,6 +212,10 @@ impl ExecutionPlan for AddRowAddrExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -314,8 +274,16 @@ impl ExecutionPlan for AddRowAddrExec {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
         })?;
         let row_addr_col_stats = ColumnStatistics {
-            null_count: row_id_col_stats.null_count,
-            distinct_count: row_id_col_stats.distinct_count,
+            null_count: if self.dataset.manifest.uses_stable_row_ids() {
+                Precision::Absent
+            } else {
+                row_id_col_stats.null_count
+            },
+            distinct_count: if self.dataset.manifest.uses_stable_row_ids() {
+                Precision::Absent
+            } else {
+                row_id_col_stats.distinct_count
+            },
             sum_value: Precision::Absent,
             max_value: Precision::Absent,
             min_value: Precision::Absent,
@@ -329,16 +297,22 @@ impl ExecutionPlan for AddRowAddrExec {
             .num_rows
             .map(|n| n * 8)
             .add(&Precision::Exact(base_size));
-        if row_id_col_stats
-            .null_count
-            .get_value()
-            .map(|v| *v > 0)
-            .unwrap_or_default()
+        if self.dataset.manifest.uses_stable_row_ids()
+            || row_id_col_stats
+                .null_count
+                .get_value()
+                .map(|v| *v > 0)
+                .unwrap_or_default()
         {
             // Account for null buffer.
             added_byte_size = added_byte_size.add(&stats.num_rows.map(|n| n.div_ceil(8).max(64)));
         }
         stats.total_byte_size = stats.total_byte_size.add(&added_byte_size);
+        if self.dataset.manifest.uses_stable_row_ids() {
+            // Misses can introduce a validity bitmap even when every input ID
+            // is non-null; its presence is only known after lookup.
+            stats.total_byte_size = stats.total_byte_size.to_inexact();
+        }
         stats
             .column_statistics
             .insert(self.rowaddr_pos, row_addr_col_stats);
@@ -622,11 +596,17 @@ impl ExecutionPlan for AddRowOffsetExec {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, RecordBatchIterator, record_batch};
+    use arrow_array::{Array, Int32Array, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field};
-    use datafusion::physical_plan::StatisticsArgs;
-    use datafusion::physical_plan::StatisticsContext;
-    use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
+    use datafusion::physical_optimizer::{
+        PhysicalOptimizerRule, ensure_requirements::EnsureRequirements,
+    };
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
+    use datafusion::{
+        config::ConfigOptions, datasource::memory::MemorySourceConfig, prelude::SessionContext,
+    };
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
+    use datafusion_physical_plan::sorts::sort::SortExec;
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
     use lance_datafusion::exec::OneShotExec;
@@ -725,7 +705,13 @@ mod test {
     async fn test_row_ids_with_nulls() {
         let dataset = sample_dataset_with_rowid_index().await;
 
-        let rowids = Arc::new(UInt64Array::from(vec![Some(0), None, Some(2)]));
+        let rowids = Arc::new(UInt64Array::from(vec![
+            Some(2),
+            None,
+            Some(0),
+            Some(2),
+            Some(99),
+        ]));
         let schema = Schema::new(vec![ROW_ID_FIELD.clone()]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![rowids.clone()]).unwrap();
 
@@ -734,7 +720,14 @@ mod test {
 
         assert_eq!(
             result.as_ref(),
-            Arc::new(UInt64Array::from(vec![Some(0), None, Some(2 << 32)])).as_ref() as &dyn Array
+            Arc::new(UInt64Array::from(vec![
+                Some(2 << 32),
+                None,
+                Some(0),
+                Some(2 << 32),
+                None
+            ]))
+            .as_ref() as &dyn Array
         );
     }
 
@@ -768,14 +761,57 @@ mod test {
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
         assert_eq!(stats.column_statistics.len(), 2);
-        assert_eq!(stats.column_statistics[0].null_count, Precision::Exact(1));
+        assert_eq!(stats.column_statistics[0].null_count, Precision::Absent);
         assert_eq!(stats.column_statistics[1].null_count, Precision::Exact(1));
 
         let actual_byte_size = result
             .columns()
             .iter()
             .fold(0, |acc, col| acc + col.get_array_memory_size());
-        assert_eq!(stats.total_byte_size, Precision::Exact(actual_byte_size));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(actual_byte_size));
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_preserve_input_ordering() {
+        let dataset = sample_dataset_with_rowid_index().await;
+        let batch = arrow_array::record_batch!(("_rowid", UInt64, [2, 0, 1])).unwrap();
+        let input = Arc::new(OneShotExec::from_batch(batch));
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+            col(ROW_ID, &input.schema()).unwrap(),
+        )])
+        .unwrap();
+        let sorted = Arc::new(SortExec::new(ordering, input));
+        let exec = AddRowAddrExec::try_new(sorted, dataset, 0).unwrap();
+        let expected = LexOrdering::new([PhysicalSortExpr::new_default(
+            col(ROW_ID, &exec.schema()).unwrap(),
+        )])
+        .unwrap();
+        assert_eq!(exec.maintains_input_order(), vec![true]);
+        assert_eq!(exec.properties().output_ordering(), Some(&expected));
+
+        let redundant = Arc::new(SortExec::new(expected, Arc::new(exec)));
+        let optimized = EnsureRequirements::new()
+            .optimize(redundant, &ConfigOptions::new())
+            .unwrap();
+        let rendered = datafusion_physical_plan::displayable(optimized.as_ref())
+            .indent(false)
+            .to_string();
+        assert_eq!(rendered.matches("SortExec:").count(), 1, "{rendered}");
+        let batches =
+            datafusion_physical_plan::collect(optimized, SessionContext::new().task_ctx())
+                .await
+                .unwrap();
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch[ROW_ID]
+                    .as_primitive::<arrow_array::types::UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 
     #[rstest]

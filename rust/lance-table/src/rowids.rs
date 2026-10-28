@@ -264,8 +264,10 @@ impl RowIdSequence {
         Ok(Self(vec![U64Segment::from_iter(row_ids)]))
     }
 
+    /// Iterate without expanding the encoded sequence. The iterator can move
+    /// between tasks while an async caller processes bounded batches.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
-        self.0.iter().flat_map(|segment| segment.iter())
+        self.0.iter().flat_map(|segment| segment.iter_send())
     }
 
     pub fn len(&self) -> u64 {

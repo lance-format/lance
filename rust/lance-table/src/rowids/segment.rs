@@ -300,6 +300,10 @@ impl FromIterator<u64> for U64Segment {
 
 impl U64Segment {
     pub fn iter(&self) -> Box<dyn DoubleEndedIterator<Item = u64> + '_> {
+        self.iter_send()
+    }
+
+    pub(super) fn iter_send(&self) -> Box<dyn DoubleEndedIterator<Item = u64> + Send + '_> {
         match self {
             Self::Range(range) => Box::new(range.clone()),
             Self::RangeWithHoles { range, holes } => {
@@ -322,8 +326,8 @@ impl U64Segment {
                     (start + offsets.start as u64)..(start + offsets.end as u64)
                 }))
             }
-            Self::SortedArray(array) => Box::new(array.iter()),
-            Self::Array(array) => Box::new(array.iter()),
+            Self::SortedArray(array) => Box::new(array.iter_send()),
+            Self::Array(array) => Box::new(array.iter_send()),
         }
     }
 
@@ -1105,8 +1109,11 @@ mod test {
         }
 
         fn check_segment_iter(segment: &U64Segment) {
+            let iterate: for<'a> fn(
+                &'a U64Segment,
+            ) -> Box<dyn DoubleEndedIterator<Item = u64> + 'a> = U64Segment::iter;
             // Should be able to iterate forwards and backwards, and get the same thing.
-            let forwards = segment.iter().collect::<Vec<_>>();
+            let forwards = iterate(segment).collect::<Vec<_>>();
             let mut backwards = segment.iter().rev().collect::<Vec<_>>();
             backwards.reverse();
             assert_eq!(forwards, backwards);
