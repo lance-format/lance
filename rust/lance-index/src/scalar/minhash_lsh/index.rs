@@ -6,7 +6,9 @@
 //! prewarming, and the rebuilds that update, remap or merge segments.
 
 use super::*;
+use crate::cache_pb::{MinHashBandPageHeader, MinHashSignatureChunkHeader};
 use crate::scalar::RowAddrTranslatorRef;
+use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 use std::collections::VecDeque;
@@ -42,6 +44,62 @@ impl BandPage {
     }
 }
 
+impl CacheCodecImpl for BandPage {
+    const TYPE_ID: &'static str = "lance.scalar.MinHashLshBandPage";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+        if self.keys.len() != self.doc_ids.len() {
+            return Err(Error::invalid_input(format!(
+                "MinHash band page has {} keys but {} document IDs",
+                self.keys.len(),
+                self.doc_ids.len()
+            )));
+        }
+        writer.write_header(&MinHashBandPageHeader {
+            num_rows: self.keys.len() as u64,
+        })?;
+        let writer = writer.raw_writer();
+        for key in &self.keys {
+            writer.write_all(&key.to_le_bytes())?;
+        }
+        for doc_id in &self.doc_ids {
+            writer.write_all(&doc_id.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let header: MinHashBandPageHeader = reader.read_header()?;
+        let body = reader.body();
+        if header.num_rows.checked_mul(12) != Some(body.len() as u64) {
+            return Err(Error::io(format!(
+                "MinHash band page has {} body bytes for {} rows",
+                body.len(),
+                header.num_rows
+            )));
+        }
+        let num_rows = header.num_rows as usize;
+        let (keys, doc_ids) = body.split_at(num_rows * 8);
+        Ok(Self {
+            keys: keys
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .copied()
+                .map(u64::from_le_bytes)
+                .collect(),
+            doc_ids: doc_ids
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
+                .collect(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BandPageKey {
     page: u32,
@@ -56,6 +114,10 @@ impl CacheKey for BandPageKey {
 
     fn type_name() -> &'static str {
         "MinHashLshBandPage"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<BandPage>())
     }
 
     fn schema() -> CacheKeySchema {
@@ -76,6 +138,77 @@ pub(super) struct SignatureChunk {
     signatures: Vec<SignatureValue>,
 }
 
+impl CacheCodecImpl for SignatureChunk {
+    const TYPE_ID: &'static str = "lance.scalar.MinHashLshSignatureChunk";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let num_rows = self.row_ids.len();
+        let num_hashes = match self.signatures.len().checked_div(num_rows) {
+            None if self.signatures.is_empty() => 0,
+            Some(width)
+                if width > 0
+                    && width <= MAX_NUM_HASHES as usize
+                    && self.signatures.len().is_multiple_of(num_rows) =>
+            {
+                width as u32
+            }
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "MinHash signature chunk has {} values for {num_rows} rows",
+                    self.signatures.len()
+                )));
+            }
+        };
+        writer.write_header(&MinHashSignatureChunkHeader {
+            num_rows: num_rows as u64,
+            num_hashes,
+        })?;
+        let writer = writer.raw_writer();
+        for row_id in &self.row_ids {
+            writer.write_all(&row_id.to_le_bytes())?;
+        }
+        for signature in &self.signatures {
+            writer.write_all(&signature.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let header: MinHashSignatureChunkHeader = reader.read_header()?;
+        let body = reader.body();
+        let row_bytes = 8 + u64::from(header.num_hashes) * 2;
+        if header.num_hashes > MAX_NUM_HASHES
+            || (header.num_rows > 0 && header.num_hashes == 0)
+            || header.num_rows.checked_mul(row_bytes) != Some(body.len() as u64)
+        {
+            return Err(Error::io(format!(
+                "MinHash signature chunk has {} body bytes for {} rows with {} hashes",
+                body.len(),
+                header.num_rows,
+                header.num_hashes
+            )));
+        }
+        let (row_ids, signatures) = body.split_at(header.num_rows as usize * 8);
+        Ok(Self {
+            row_ids: row_ids
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .copied()
+                .map(u64::from_le_bytes)
+                .collect(),
+            signatures: signatures
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
+                .collect(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SignatureChunkKey {
     chunk: u32,
@@ -90,6 +223,10 @@ impl CacheKey for SignatureChunkKey {
 
     fn type_name() -> &'static str {
         "MinHashLshSignatureChunk"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<SignatureChunk>())
     }
 
     fn schema() -> CacheKeySchema {
@@ -1353,4 +1490,97 @@ pub async fn merge_minhash_indices(
         .rebuild_from(signature_sources, None, dest_store)
         .await?;
     first.created_index(files)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use lance_core::cache::{CacheDecode, CacheEntry};
+    use lance_core::utils::tempfile::TempDir;
+    use rstest::rstest;
+
+    fn disk_roundtrip(codec: CacheCodec, entry: CacheEntry) -> CacheEntry {
+        let dir = TempDir::default();
+        let path = dir.std_path().join("minhash.cache");
+        codec
+            .serialize(&entry, &mut std::fs::File::create(&path).unwrap())
+            .unwrap();
+        drop(entry);
+        let bytes = Bytes::from(std::fs::read(path).unwrap());
+        let result = codec.deserialize(&bytes).hit().unwrap();
+        for len in 0..bytes.len() {
+            assert!(matches!(
+                codec.deserialize(&bytes.slice(..len)),
+                CacheDecode::Miss(_)
+            ));
+        }
+        result
+    }
+
+    #[rstest]
+    #[case::empty(vec![], vec![])]
+    #[case::repeated_keys(vec![0, 0, u64::MAX], vec![0, u32::MAX, 42])]
+    fn band_page_cache_codec(#[case] keys: Vec<u64>, #[case] doc_ids: Vec<u32>) {
+        let codec = BandPageKey::codec().expect("band pages must support disk caching");
+        let restored = disk_roundtrip(
+            codec,
+            Arc::new(BandPage {
+                keys: keys.clone(),
+                doc_ids: doc_ids.clone(),
+            }),
+        );
+        let restored = restored.downcast_ref::<BandPage>().unwrap();
+        assert_eq!(restored.keys, keys);
+        assert_eq!(restored.doc_ids, doc_ids);
+    }
+
+    #[rstest]
+    #[case::empty(vec![], vec![])]
+    #[case::one_hash(vec![0, u64::MAX], vec![0, u16::MAX])]
+    #[case::two_hashes(vec![7, 1_u64 << 32], vec![0, 1, u16::MAX, 32768])]
+    fn signature_chunk_cache_codec(#[case] row_ids: Vec<u64>, #[case] signatures: Vec<u16>) {
+        let codec = SignatureChunkKey::codec().expect("signature chunks must support disk caching");
+        let restored = disk_roundtrip(
+            codec,
+            Arc::new(SignatureChunk {
+                row_ids: row_ids.clone(),
+                signatures: signatures.clone(),
+            }),
+        );
+        let restored = restored.downcast_ref::<SignatureChunk>().unwrap();
+        assert_eq!(restored.row_ids, row_ids);
+        assert_eq!(restored.signatures, signatures);
+    }
+
+    #[rstest]
+    #[case::zero_width(1, 0)]
+    #[case::too_wide(1, MAX_NUM_HASHES + 1)]
+    #[case::overflow(u64::MAX, 1)]
+    #[case::missing_values(1, 2)]
+    fn signature_chunk_cache_rejects_invalid_shape(#[case] num_rows: u64, #[case] num_hashes: u32) {
+        let mut body = Vec::new();
+        CacheEntryWriter::new(&mut body)
+            .write_header(&MinHashSignatureChunkHeader {
+                num_rows,
+                num_hashes,
+            })
+            .unwrap();
+        let bytes = Bytes::from(body);
+        let error =
+            SignatureChunk::deserialize(&mut CacheEntryReader::new(&bytes, 0, 1)).unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("MinHash signature chunk"));
+    }
+
+    #[test]
+    fn band_page_cache_rejects_overflow() {
+        let mut body = Vec::new();
+        CacheEntryWriter::new(&mut body)
+            .write_header(&MinHashBandPageHeader { num_rows: u64::MAX })
+            .unwrap();
+        let bytes = Bytes::from(body);
+        let error = BandPage::deserialize(&mut CacheEntryReader::new(&bytes, 0, 1)).unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("MinHash band page"));
+    }
 }

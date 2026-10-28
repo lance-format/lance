@@ -101,6 +101,21 @@ enum PositionStorage {
  * ---------------------------------------------------------------------------
  */
 
+/* A MinHash band page: num_rows little-endian uint64 band keys followed by
+ * num_rows little-endian uint32 document IDs.
+ */
+message MinHashBandPageHeader {
+  uint64 num_rows = 1;
+}
+
+/* A MinHash signature chunk: num_rows little-endian uint64 row IDs followed
+ * by num_rows * num_hashes little-endian uint16 signature values.
+ */
+message MinHashSignatureChunkHeader {
+  uint64 num_rows = 1;
+  uint32 num_hashes = 2;
+}
+
 /* Header for a serialized `BTreeIndexState` cache entry, followed by a single
  * Arrow IPC section holding the page-lookup batch.
  */
