@@ -17,7 +17,7 @@ The N-gram index stores tokenized text as trigrams with their posting lists:
 1. `ngram_postings.lance` - Trigram tokens and their posting lists
 
 From format version 1 (`NGRAM_INDEX_VERSION`) onward, a segment stores physical
-row addresses in `posting_list` instead of the dataset's logical row id
+row addresses in `posting_list` instead of the dataset's logical row id.
 
 ### File Schema
 
