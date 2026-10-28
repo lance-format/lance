@@ -3515,7 +3515,7 @@ impl MergeInsertJob {
     )> {
         let can_fallback = source_mode.supports_retries();
         let first = self
-            .clone()
+            .clone_for_retry()
             .execute_v2_attempt(provider.clone(), can_fallback)
             .await;
         match first {

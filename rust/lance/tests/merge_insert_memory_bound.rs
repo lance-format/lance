@@ -20,7 +20,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 
 use arrow_array::types::UInt32Type;
 use arrow_array::{Array, BinaryArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
@@ -387,4 +387,109 @@ async fn test_partial_upsert_into_wide_rows_fits_pool() {
             (compressed_rows - compressed_source_rows) as usize
         )
     );
+
+    // Source replay and patch staging must share one operation-scoped disk
+    // quota across the source-build attempt and its target-build fallback.
+    fn disk_bytes(path: &std::path::Path) -> u64 {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    disk_bytes(&path)
+                } else {
+                    entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                }
+            })
+            .sum()
+    }
+
+    let scratch = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("TMPDIR", scratch.path());
+        std::env::set_var("LANCE_MEM_POOL_SIZE", (512 * 1024 * 1024).to_string());
+        std::env::set_var(
+            "LANCE_MAX_TEMP_DIRECTORY_SIZE",
+            (160 * 1024 * 1024).to_string(),
+        );
+        std::env::remove_var("LANCE_BYPASS_SPILLING");
+    }
+    let quota_rows = 112usize;
+    let target = RecordBatch::try_new(
+        wide_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..quota_rows as u32)),
+            Arc::new(BinaryArray::from_vec(vec![&[]; quota_rows])),
+            Arc::new(StringArray::from(vec!["old"; quota_rows])),
+        ],
+    )
+    .unwrap();
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(target)], wide_schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let quota_source_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt32, false),
+        Field::new("payload", DataType::Binary, true),
+    ]));
+    let source = RecordBatch::try_new(
+        quota_source_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..quota_rows as u32)),
+            Arc::new(BinaryArray::from(vec![
+                source_payload.as_slice();
+                quota_rows
+            ])),
+        ],
+    )
+    .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let peak_spill_bytes = Arc::new(AtomicU64::new(0));
+    let monitor = {
+        let stop = stop.clone();
+        let peak_spill_bytes = peak_spill_bytes.clone();
+        let path = scratch.path().to_owned();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                peak_spill_bytes.fetch_max(disk_bytes(&path), Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    let result = MergeInsertBuilder::try_new(dataset, vec!["key".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .use_index(false)
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new(
+            vec![Ok(source)],
+            quota_source_schema,
+        ))
+        .await;
+    stop.store(true, Ordering::Relaxed);
+    monitor.join().unwrap();
+
+    match result {
+        Ok((dataset, stats)) => panic!(
+            "merge succeeded despite replay plus patch staging exceeding 160 MiB: \
+             version={}, updated={}, peak_spill_bytes={}",
+            dataset.version().version,
+            stats.num_updated_rows,
+            peak_spill_bytes.load(Ordering::Relaxed)
+        ),
+        Err(error) => assert!(
+            error.to_string().contains("allowable limit"),
+            "unexpected error: {error}"
+        ),
+    }
 }
