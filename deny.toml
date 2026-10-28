@@ -86,6 +86,8 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
     { id = "RUSTSEC-2026-0195", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
     { id = "RUSTSEC-2026-0002", reason = "`lru` 0.12.x pulled transitively via goosefs-sdk; fixed in >=0.16.3, goosefs-sdk must upgrade first" },
+    { id = "RUSTSEC-2024-0449", reason = "`unsafe-libyaml` is unmaintained with no patched release; `substrait` 0.63 and `serde_yaml_ng` for lindera depend on it" },
+    { id = "RUSTSEC-2026-0403", reason = "expires 2026-11-03: fixed in `zstd-safe` 8.2.0 which requires `zstd` 0.14; `arrow-ipc` 58 only accepts `zstd` 0.13, and both Lance and Arrow use bulk decompression rather than the affected `DCtx::decompress_stream`" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
