@@ -390,6 +390,7 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
         upper_bound: None,
         minimum_nprobes: LIGHTWEIGHT_PQ_PARTITIONS,
         maximum_nprobes: Some(LIGHTWEIGHT_PQ_PARTITIONS),
+        search_effort: 0.5,
         ef: None,
         refine_factor: None,
         metric_type: Some(DistanceType::L2),
