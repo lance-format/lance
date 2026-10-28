@@ -4696,6 +4696,7 @@ mod tests {
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
+    use std::io::Write;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::{Barrier, Notify};
     use url::Url;
@@ -4816,21 +4817,26 @@ mod tests {
             "retry attempts within one execution must share a disk manager"
         );
 
-        let mut rejected = first_manager
+        let rejected = first_manager
             .create_tmp_file("testing rejected merge job spill")
             .unwrap();
-        rejected.inner().as_file().set_len(2).unwrap();
-        assert!(matches!(
-            rejected.update_disk_usage(),
-            Err(DataFusionError::ResourcesExhausted(_))
-        ));
+        let mut writer = rejected.open_writer().unwrap();
+        let error = writer.write_all(&[0, 0]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("used disk space during the spilling process has exceeded")
+        );
+        drop(writer);
         drop(rejected);
 
-        let mut next_spill = second_manager
+        let next_spill = second_manager
             .create_tmp_file("testing independent merge job spill")
             .unwrap();
-        next_spill.inner().as_file().set_len(1).unwrap();
-        next_spill.update_disk_usage().unwrap();
+        let mut writer = next_spill.open_writer().unwrap();
+        writer.write_all(&[0]).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
         assert_eq!(second_manager.used_disk_space(), 1);
     }
 
