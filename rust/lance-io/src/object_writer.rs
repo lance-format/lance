@@ -717,6 +717,55 @@ pub struct LocalWriter {
     fsync: bool,
 }
 
+#[cfg(test)]
+static INJECTED_CLOSE_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+fn close_file(file: std::fs::File, path: &std::path::Path) -> io::Result<()> {
+    #[cfg(not(test))]
+    let _ = path;
+
+    let result = close_file_raw(file);
+
+    #[cfg(test)]
+    if result.is_ok() {
+        let mut injected = INJECTED_CLOSE_FAILURE.lock().unwrap();
+        if injected.as_deref() == Some(path) {
+            *injected = None;
+            return Err(io::Error::other("injected close failure"));
+        }
+    }
+
+    result
+}
+
+#[cfg(target_family = "unix")]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    use std::os::fd::IntoRawFd;
+
+    nix::unistd::close(file.into_raw_fd()).map_err(|error| error.into())
+}
+
+#[cfg(target_family = "windows")]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+
+    // SAFETY: `into_raw_handle` transfers ownership of the handle, and
+    // `CloseHandle` consumes it exactly once.
+    let result = unsafe { windows_sys::Win32::Foundation::CloseHandle(file.into_raw_handle()) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    drop(file);
+    Ok(())
+}
+
 #[derive(Default)]
 enum LocalWriteState {
     Writing(Box<WritingState>),
@@ -796,10 +845,17 @@ impl LocalWriter {
                     ))
                 })?;
             }
-            // The open handle must be closed before replacing the destination on Windows.
-            drop(file);
+            let file = file.into_std().await;
+            let final_path_for_close = final_path.clone();
 
             tokio::task::spawn_blocking(move || -> Result<String> {
+                close_file(file, std::path::Path::new(&local_path)).map_err(|e| {
+                    Error::io(format!(
+                        "failed to close temp file for {}: {}",
+                        final_path_for_close, e
+                    ))
+                })?;
+
                 temp_path.persist(&local_path).map_err(|e| {
                     Error::io(format!(
                         "failed to persist temp file to {}: {}",
@@ -1827,6 +1883,28 @@ mod tests {
 
         let error = Writer::shutdown(&mut writer).await.unwrap_err();
         assert!(error.to_string().contains("failed to sync temp file"));
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_close_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("close_failed.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, Arc::new(IOTracker::default()));
+        writer.write_all(b"data").await.unwrap();
+
+        *INJECTED_CLOSE_FAILURE.lock().unwrap() = Some(std::path::PathBuf::from(
+            crate::local::to_local_path(&writer.path),
+        ));
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(error.to_string().contains("failed to close temp file"));
         assert!(!file_path.exists());
         assert!(!temp_file_path.exists());
     }

@@ -4493,6 +4493,7 @@ dependencies = [
  "log",
  "metrics",
  "moka",
+ "nix",
  "object_store 0.14.2",
  "object_store_opendal",
  "opendal",
@@ -4512,6 +4513,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

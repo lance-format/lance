@@ -5069,6 +5069,7 @@ dependencies = [
  "mock_instant",
  "mockall",
  "moka",
+ "nix 0.31.3",
  "object_store 0.14.2",
  "object_store_opendal",
  "opendal",
@@ -5092,6 +5093,7 @@ dependencies = [
  "tracing-mock",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
