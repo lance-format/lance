@@ -1057,8 +1057,15 @@ impl MiniBlockScheduler {
                 .into();
             let dictionary_data_alignment = match dictionary_encoding.compression.as_ref().unwrap()
             {
-                // The offsets inside may be 64-bit
-                Compression::Variable(_) => 8,
+                // The header is two offsets wide, so this aligns the offsets too
+                Compression::Variable(variable) => match variable
+                    .offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.compression.as_ref())
+                {
+                    Some(Compression::Flat(offsets)) if offsets.bits_per_value == 64 => 8,
+                    _ => 4,
+                },
                 Compression::Flat(_) => 16,
                 Compression::General(_) => 1,
                 Compression::FixedSizeList(_) => 1,
@@ -3006,11 +3013,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::utf8(Arc::new(StringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 4)]
-    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 8)]
+    #[case::utf8(Arc::new(StringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 4, false)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 8, true)]
     fn test_miniblock_variable_dictionary_offsets_aligned(
         #[case] values: ArrayRef,
         #[case] offset_alignment: usize,
+        #[case] copied: bool,
     ) {
         let (payload, dictionary_encoding) = VariableEncoder::default()
             .compress(DataBlock::from_array(values))
@@ -3044,6 +3052,8 @@ mod tests {
         padded[start..start + payload.len()].copy_from_slice(&payload);
         let bytes = Bytes::from(padded).slice(start..start + payload.len());
         assert_eq!(bytes.as_ptr() as usize % 8, 4);
+        let header_len = 2 * offset_alignment;
+        let offsets_in_place = bytes.as_ptr().wrapping_add(header_len);
 
         let decoded = dictionary
             .dictionary_decompressor
@@ -3058,6 +3068,7 @@ mod tests {
 
         let offsets = &decoded.as_variable_width_ref().unwrap().offsets;
         assert_eq!(offsets.as_ptr().align_offset(offset_alignment), 0);
+        assert_eq!(offsets.as_ptr() != offsets_in_place, copied);
     }
 
     #[test]
