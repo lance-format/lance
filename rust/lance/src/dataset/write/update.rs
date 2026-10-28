@@ -902,7 +902,9 @@ fn map_blob_values(
     })
 }
 
-/// All-null children under a valid parent; stands in for blob values about to be overwritten.
+/// Stands in for blob values the update overwrites, so the rewrite never reads their
+/// old payloads. Not a valid blob (a valid parent with all-null children); that is
+/// safe because `apply_updates` replaces the whole column before the writer validates it.
 fn new_null_logical_blobs(num_rows: usize) -> DFResult<ArrayRef> {
     let children = BLOB_V2_LOGICAL_FIELDS
         .iter()
