@@ -3,18 +3,20 @@
 
 //! Abstract scalar index traits and types for Lance index plugins
 
-use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Schema};
+use crate::remapping::{RowAddrTranslator, materialize_remap};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
+use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::Expr;
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -22,6 +24,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
+use std::sync::LazyLock;
 use std::{any::Any, sync::Arc};
 
 use crate::metrics::MetricsCollector;
@@ -292,6 +295,17 @@ pub trait IndexReader: Send + Sync {
             .buffered(batch_readahead.max(1) as usize);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+    /// Whether the decoder behind this reader splits batches before their i32
+    /// offsets overflow.
+    ///
+    /// Callers streaming rows of unbounded size (e.g. large posting lists) may
+    /// request multi-row batches only when this returns `true`: a decoder that
+    /// splits by row count alone can overflow its i32 offsets within a single
+    /// batch. When it returns `false`, such callers should request one row per
+    /// batch instead, which still reads the file in one sequential pass.
+    fn guarantees_byte_splitting(&self) -> bool {
+        false
+    }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file
@@ -350,6 +364,23 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Return a store that submits its I/O at the given base priority.
     fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore>;
+
+    /// Return a store whose reads work against a budget of `bytes` rather than the store's
+    /// own, for a caller that needs to hold less data in flight than the store would.
+    ///
+    /// The budget is what bounds a read's memory: a whole-file read is scheduled eagerly, so
+    /// its outstanding bytes are capped by the budget, not by how far ahead of the consumer
+    /// it reads. The cap is soft — the scheduler goes over it rather than stall a read — and
+    /// it is per store, so a caller reading several at once holds one budget per store unless
+    /// it narrows each.
+    ///
+    /// The budget lives in the scheduler, so unlike [`IndexStore::with_io_priority`] this
+    /// cannot share the original's — expect an implementation to build one, and call this
+    /// per scope, not per request. Do not cache the result:
+    /// [`IndexStore::is_same_storage_binding`] compares storage, not budgets. A store that
+    /// prefetches nothing may return itself, but must say so explicitly, since a caller
+    /// that silently gets no bound cannot tell.
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore>;
 
     /// Copy a range of batches from an index file from this store to another
     ///
@@ -490,7 +521,7 @@ pub enum TrainingOrdering {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingCriteria {
     pub ordering: TrainingOrdering,
     pub needs_row_ids: bool,
@@ -529,23 +560,25 @@ pub struct UpdateCriteria {
 
 /// Filter used when merging existing scalar-index rows during update.
 ///
-/// The caller must pick a filter mode that matches the row-id semantics of the
-/// dataset:
-/// - address-style row IDs: fragment filtering is valid
-/// - stable row IDs: use exact row-id membership instead
+/// When we are doing an update we have an opportunity (not a requirement) to
+/// prune fragments from the index.  This can happen because the fragment was
+/// deleted or because it was invalidated (the indexed column was modified).
+/// Pruning these rows can lead to a smaller, more efficient index.  However,
+/// we will always subtract these fragments from the result either way so this
+/// is only an optimization opportunity and not a correctness requirement.
+///
+/// Legacy indexes that store row IDs needed to use a less efficient RowAddrTreeMap
+/// for this approach.  As these indexes fade from support we can hopefully remove
+/// this branch.
 #[derive(Debug, Clone)]
 pub enum OldIndexDataFilter {
     /// Keeps track of which fragments are still valid and which are no longer valid.
-    ///
-    /// This is valid for address-style row IDs.
     Fragments {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
-    /// Keep old rows whose row IDs are in this exact allow-list.
-    ///
-    /// This is required for stable row IDs, where row IDs are opaque and
-    /// should not be interpreted as encoded row addresses.
+    /// Keep old rows whose identifier is in this exact allow-list, used for id-domain
+    /// indexes when stable row id is enabled.
     RowIds(RowAddrTreeMap),
 }
 
@@ -622,6 +655,51 @@ impl SearchOptions {
     }
 }
 
+/// Column of a [`ScalarIndex::lookup`] batch holding, for each match, the
+/// position in the looked-up keys of the key that matched.
+pub const LOOKUP_KEY_INDEX: &str = "key_index";
+
+static LOOKUP_ROW_ID_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| lookup_schema_with_row_column(ROW_ID));
+static LOOKUP_ROW_ADDR_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| lookup_schema_with_row_column(ROW_ADDR));
+
+fn lookup_schema_with_row_column(row_column: &str) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(LOOKUP_KEY_INDEX, DataType::UInt32, false),
+        Field::new(row_column, DataType::UInt64, false),
+    ]))
+}
+
+/// The schema of the batches [`ScalarIndex::lookup`] streams.
+///
+/// The second column is the matched row, named [`ROW_ADDR`] when the index
+/// reports row addresses (see [`ScalarIndex::results_are_row_addresses`]) and
+/// [`ROW_ID`] otherwise.
+pub fn lookup_schema(results_are_row_addresses: bool) -> SchemaRef {
+    if results_are_row_addresses {
+        LOOKUP_ROW_ADDR_SCHEMA.clone()
+    } else {
+        LOOKUP_ROW_ID_SCHEMA.clone()
+    }
+}
+
+/// Build one [`ScalarIndex::lookup`] batch: match `i` pairs the key at
+/// position `key_indices[i]` with row `rows[i]`.
+pub fn lookup_batch(
+    results_are_row_addresses: bool,
+    key_indices: Vec<u32>,
+    rows: Vec<u64>,
+) -> Result<RecordBatch> {
+    Ok(RecordBatch::try_new(
+        lookup_schema(results_are_row_addresses),
+        vec![
+            Arc::new(UInt32Array::from(key_indices)),
+            Arc::new(UInt64Array::from(rows)),
+        ],
+    )?)
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -648,15 +726,35 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         self.search(query, metrics).await
     }
 
+    /// Find the rows whose indexed value equals each of `keys`.
+    ///
+    /// Streams one row per match in batches with [`lookup_schema`]: the
+    /// key's position in `keys` and the matched row. A key matching several
+    /// rows yields one match per row, a key matching nothing yields none, and
+    /// matches come in no particular order. A key matches exactly the rows
+    /// `search` returns for an equality query on it, so for floats `-0.0`
+    /// and `0.0` are distinct and NaN matches NaN. A null key never matches,
+    /// not even a null indexed value. `keys` must have the index's value type.
+    ///
+    /// Like [`Self::search`], the rows may include deleted rows, so callers
+    /// must filter them, and any fragment-reuse remapping the index was loaded
+    /// with is already applied.
+    ///
+    /// Indices that cannot answer exact-equality lookups return
+    /// [`Error::NotSupported`], which is the default.
+    fn lookup<'a>(
+        &'a self,
+        _keys: ArrayRef,
+        _metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        Err(Error::not_supported(format!(
+            "{} index does not support key lookup",
+            self.index_type()
+        )))
+    }
+
     /// Returns true if this index reports matches as physical row addresses
     /// (`fragment_id << 32 | offset`) rather than row ids
-    ///
-    /// Address-domain indices (e.g. zone map, bloom filter) are built over the
-    /// `_rowaddr` column. On a dataset with stable row ids the address and
-    /// row-id domains diverge, so these results must be translated back to row
-    /// ids (via the per-fragment row-id sequences, known only at the dataset
-    /// layer) before they are combined with row-id results or handed to the
-    /// scan. The default (row-id domain) needs no translation.
     fn results_are_row_addresses(&self) -> bool {
         false
     }
@@ -665,11 +763,61 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn can_remap(&self) -> bool;
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
+    ///
+    /// Legacy remapping API using an in-memory mapping. Retained for existing
+    /// callers and plugins; new tagged fragment reuse maintenance goes through
+    /// [`Self::remap_streaming`], whose default implementation prepares a
+    /// complete in-memory mapping and calls this method once.
     async fn remap(
         &self,
         mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex>;
+
+    /// The fragments whose row addresses this index's files may hold, or
+    /// `None` when the index cannot tell.
+    ///
+    /// Only the in-memory fallback of [`Self::remap_streaming`] reads it: an
+    /// address left out of the mapping it prepares stays unchanged through
+    /// [`Self::remap`], so the fallback maps every address of every listed
+    /// fragment explicitly, and declines when the list is unknown. An
+    /// implementation that overrides this must list every fragment its files
+    /// can hold addresses for, including fragments the index no longer claims
+    /// in its declared coverage (a retired source, or one withdrawn after an
+    /// in-place rewrite). Not needed by indices that implement
+    /// `remap_streaming` themselves.
+    fn stored_fragments(&self) -> Option<RoaringBitmap> {
+        None
+    }
+
+    /// Remap the row ids through a translator whose payload may need reads,
+    /// creating a new remapped version of this index in `dest_store`.
+    ///
+    /// The default implementation keeps existing indices working: a
+    /// synchronous translator is handed to [`Self::remap`] as it is, and a
+    /// batch translator is first materialized into a complete in-memory
+    /// mapping ([`materialize_remap`], bounded by the translator's budget and
+    /// requiring [`Self::stored_fragments`]) before one call to
+    /// [`Self::remap`]. That fallback costs the mapping's memory and reads the
+    /// index once more; it declines with a
+    /// [`RemapUnavailable`](crate::remapping::RemapUnavailable) it cannot
+    /// prove a complete mapping within budget. Built-in indices override this
+    /// to translate one unit of work at a time (a page, a partition, a spill
+    /// batch) without any map sized to the source rows.
+    async fn remap_streaming(
+        &self,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        match translator {
+            RowAddrTranslator::Sync(mapping) => self.remap(mapping.as_ref(), dest_store).await,
+            RowAddrTranslator::Batch(remapper) => {
+                let mapping =
+                    materialize_remap(remapper.as_ref(), self.stored_fragments().as_ref()).await?;
+                self.remap(&mapping, dest_store).await
+            }
+        }
+    }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
     ///

@@ -31,7 +31,6 @@ use lance_file::{
     versions as file_versions,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::scalar::seed::IndexSeedWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -39,6 +38,7 @@ use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
 use super::Dataset;
+use super::blob::BlobPayloadInventory;
 use super::fragment::{
     FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
     write::FragmentCreateBuilder,
@@ -49,7 +49,8 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
-use super::write::{self, GenericWriter, TargetBaseInfo, WriteParams, WriterOptions};
+use super::write::seeds::SeedCollector;
+use super::write::{self, GenericWriter, TargetBaseInfo, WriteMode, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
@@ -105,20 +106,6 @@ pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOpti
     }
 }
 
-async fn create_seed_writers(
-    version: ConcreteFileVersion,
-    dataset: Option<&Dataset>,
-    params: &WriteParams,
-) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
-    match version {
-        ConcreteFileVersion::V1 => Ok(Vec::new()),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => write::create_seed_writers_current(dataset, params).await,
-    }
-}
-
 fn create_current_file_writer(
     version: ConcreteFileVersion,
     object_writer: Box<dyn ObjectWriter>,
@@ -145,13 +132,18 @@ pub async fn write_fragments(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    inherited_field_ids: bool,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
     // set them aside before the schema is checked against the dataset's and
     // put them back on the schema that is written. This has to come before
     // the blob promotion, which gives every negative field id a new one.
-    let (normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
+    let (mut normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
+    if dataset.is_none() {
+        write::assign_new_table_field_ids(&mut normalized_schema, inherited_field_ids)?;
+    }
     let normalized_schema = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
             write::promote_legacy_blob_schema(&normalized_schema)?
@@ -164,6 +156,7 @@ pub async fn write_fragments(
         normalized_schema,
         &params,
         schema_compare_options(version),
+        inherited_field_ids,
     )?;
     schema.fields.extend(lineage_fields);
     match version {
@@ -174,7 +167,9 @@ pub async fn write_fragments(
             write::validate_blob_v2_write_schema(&schema)?;
         }
     }
-    let seed_writers = create_seed_writers(version, dataset, &params).await?;
+    // Overwrite drops every index, so its seeds would have no consumer.
+    let consult_indices = !matches!(params.mode, WriteMode::Overwrite);
+    let seeds = SeedCollector::for_write(version, dataset, &schema, consult_indices).await?;
     let fragments = write_fragments_direct(
         version,
         dataset,
@@ -184,9 +179,10 @@ pub async fn write_fragments(
         data,
         params,
         target_bases_info,
-        seed_writers,
+        seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await?;
     Ok((fragments, schema))
@@ -227,6 +223,23 @@ fn split_row_lineage_fields(schema: Schema) -> Result<(Schema, Vec<Field>)> {
     ))
 }
 
+/// Zero row limits cannot be honored: a zero `max_rows_per_file` panics when
+/// a V2 stream is split into files, and on V1 a zero `max_rows_per_group`
+/// chunks the input into no batches, so nothing is written.
+pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -> Result<()> {
+    if params.max_rows_per_file == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_file must be greater than zero",
+        ));
+    }
+    if matches!(version, ConcreteFileVersion::V1) && params.max_rows_per_group == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_group must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn write_fragments_direct(
     version: ConcreteFileVersion,
@@ -237,10 +250,12 @@ pub async fn write_fragments_direct(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-    seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    seeds: SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<Vec<Fragment>> {
+    validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
         if file_row_counts.contains(&0) {
             return Err(Error::invalid_input(
@@ -249,11 +264,6 @@ pub async fn write_fragments_direct(
         }
         match version {
             ConcreteFileVersion::V1 => {
-                if params.max_rows_per_group == 0 {
-                    return Err(Error::invalid_input(
-                        "max_rows_per_group must be greater than zero when file row counts are specified",
-                    ));
-                }
                 let max_rows_per_group = params.max_rows_per_group;
                 let batch_row_counts =
                     file_row_counts
@@ -300,9 +310,10 @@ pub async fn write_fragments_direct(
         },
         external_base_resolver,
         target_bases_info,
-        seed_writers,
+        seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await
 }
@@ -666,6 +677,7 @@ pub async fn open_writer(
             };
             if schema.fields_pre_order().any(Field::is_blob_v2) {
                 write::open_current_blob_v2_writer(
+                    version,
                     create_file_writer,
                     object_store,
                     schema,
@@ -700,16 +712,17 @@ pub async fn open_update_writer(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    let options = WriterOptions::update(
+        dataset.session.store_registry(),
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    );
     open_writer(
         version,
         &dataset.object_store,
         schema,
         &dataset.base,
-        WriterOptions::update(
-            dataset.session.store_registry(),
-            external_base_resolver,
-            allow_external_blob_outside_bases,
-        ),
+        options,
     )
     .await
 }

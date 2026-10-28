@@ -38,7 +38,9 @@ reqwest = { workspace = true, optional = true, features = [
     "gzip",
     "http2",
     "stream",
-    "rustls-tls-native-roots",
+    "rustls",
+    "query",
+    "form",
 ] }
 # Directory implementation dependencies (always enabled)
 url = { workspace = true }
@@ -93,6 +95,7 @@ tempfile.workspace = true
 wiremock.workspace = true
 rstest.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 
 [[example]]
 name = "manifest_bench"

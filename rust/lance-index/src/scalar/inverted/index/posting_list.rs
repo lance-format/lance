@@ -422,14 +422,34 @@ impl CompressedPostingList {
         }
     }
 
-    pub(super) fn with_packed_first_docs(
-        mut self,
-        states: Arc<[OnceLock<Box<[u32]>>]>,
+    /// A view of one slot of a packed posting group, sharing the group's
+    /// lazily decoded block heads.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_packed_slot(
+        blocks: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        posting_tail_codec: PostingTailCodec,
+        block_size: usize,
+        impacts: Option<ImpactSkipData>,
+        first_docs_states: Arc<[OnceLock<Box<[u32]>>]>,
         slot: usize,
     ) -> Self {
-        debug_assert!(slot < states.len());
-        self.first_docs = FirstDocsState::Packed { states, slot };
-        self
+        debug_assert!(block_size.is_power_of_two());
+        debug_assert!(slot < first_docs_states.len());
+        Self {
+            max_score,
+            length,
+            blocks,
+            posting_tail_codec,
+            block_size,
+            positions: None,
+            impacts,
+            first_docs: FirstDocsState::Packed {
+                states: first_docs_states,
+                slot,
+            },
+        }
     }
 
     /// Block sizes are validated powers of two, so per-doc hot loops derive
@@ -693,42 +713,5 @@ impl EncodedBlocks {
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &[u8]> {
         (0..self.len()).map(|index| self.block(index))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(super) struct EncodedPositionBlocks {
-    offsets: Vec<u32>,
-    bytes: Vec<u8>,
-}
-
-impl EncodedPositionBlocks {
-    pub(super) fn size(&self) -> usize {
-        self.offsets.capacity() * std::mem::size_of::<u32>() + self.bytes.capacity()
-    }
-
-    pub(super) fn block(&self, index: usize) -> &[u8] {
-        let start = self.offsets[index] as usize;
-        let end = self
-            .offsets
-            .get(index + 1)
-            .map(|offset| *offset as usize)
-            .unwrap_or(self.bytes.len());
-        &self.bytes[start..end]
-    }
-
-    pub(super) fn push_encoded_block(&mut self, block: &[u8]) -> usize {
-        let start = self.bytes.len();
-        self.offsets.push(start as u32);
-        self.bytes.extend_from_slice(block);
-        self.bytes.len() - start
-    }
-
-    pub(super) fn into_stream(self) -> SharedPositionStream {
-        SharedPositionStream::new(
-            PositionStreamCodec::PackedDelta,
-            self.offsets,
-            bytes::Bytes::from(self.bytes),
-        )
     }
 }

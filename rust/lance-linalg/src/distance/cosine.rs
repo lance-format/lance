@@ -13,14 +13,8 @@ use std::arch::x86_64::{
 };
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, FixedSizeListArray, Float32Array,
-    cast::AsArray,
-    types::{Float16Type, Float32Type, Float64Type, Int8Type},
-};
-use arrow_schema::DataType;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
@@ -28,8 +22,9 @@ use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use super::HalfBackend;
 use super::{
     Dot, HALF_KERNELS_COMPILED, HalfType, Normalize, assert_equal_lengths, dot::dot, half_backend,
-    int8_query_to_f32, norm_l2::norm_l2, x86_half_features,
+    norm_l2::norm_l2, x86_half_features,
 };
+use crate::Result;
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchKind;
 #[allow(unused_imports)]
@@ -37,7 +32,6 @@ use crate::simd::{
     FloatSimd, SIMD,
     f32::{f32x8, f32x16},
 };
-use crate::{Error, Result};
 
 /// Cosine Distance
 pub trait Cosine: Dot + Normalize {
@@ -1348,72 +1342,15 @@ pub fn cosine_distance_batch<'a, T: Cosine>(
     T::cosine_batch(from, batch, dimension)
 }
 
-fn do_cosine_distance_arrow_batch<T: ArrowFloatType>(
-    from: &T::ArrayType,
-    to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>>
-where
-    T::Native: Cosine,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values =
-        to.values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::InvalidArgumentError(format!(
-                "`to` values have data type {}, expected {} to match `from`",
-                to.values().data_type(),
-                from.data_type()
-            )))?;
-    let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
-
-    Ok(Arc::new(Float32Array::new(
-        dists.collect(),
-        to.nulls().cloned(),
-    )))
-}
-
-/// Compute Cosine distance between a vector and a batch of vectors.
+/// Compute cosine distances, propagating the null buffer of `to`.
 ///
-/// Null buffer of `to` is propagated to the returned array.
-///
-/// Parameters
-///
-/// - `from`: the vector to compute distance from.
-/// - `to`: a list of vectors to compute distance to.
-///
-/// # Errors
-///
-/// Returns an error if `from` is an `Int8` array containing nulls, since a null
-/// query element has no distance to compute. The unsupported-type and downcast
-/// paths return errors of their own; this list is not exhaustive.
-///
-/// # Panics
-///
-/// With debug assertions on, panics if the length of `from` is not equal to the
-/// dimension (value length) of `to`. Without them the mismatch is not reliably
-/// caught, since cosine has no always-on layout assert of its own, unlike the l2
-/// and dot equivalents.
+/// See [`super::DistanceType::batch`] for supported types and input validation.
+#[deprecated(note = "Use DistanceType::Cosine.batch")]
 pub fn cosine_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    match *from.data_type() {
-        DataType::Float16 => do_cosine_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
-        DataType::Float32 => do_cosine_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
-        DataType::Float64 => do_cosine_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_cosine_distance_arrow_batch::<Float32Type>(
-            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
-            &to.convert_to_floating_point()?,
-        ),
-        _ => Err(Error::InvalidArgumentError(format!(
-            "`from` has unsupported data type {}",
-            from.data_type()
-        ))),
-    }
+    super::DistanceType::Cosine.batch(from, to).map(Arc::new)
 }
 
 /// Portable scalar reference cosine over f64 inputs. Used by parity tests
@@ -1848,6 +1785,8 @@ mod tests {
         /// the masked-load (mask 0x00FF) AVX-512 implementation produces
         /// the same result as the scalar reference. Early-returns on hosts
         /// without AVX-512F.
+        /// Direct kernels need the same absolute tolerance as scalar/SIMD
+        /// parity: different reduction orders lose relative precision near zero.
         #[cfg(target_arch = "x86_64")]
         #[test]
         fn test_cosine_once_8_scalar_vs_avx512_parity(
@@ -1862,7 +1801,7 @@ mod tests {
             let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
             let avx512 =
                 unsafe { super::f32::cosine_once_x86::cosine_once_8_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX-512-direct parity for the 16-lane cosine_once kernel. Verifies
@@ -1883,7 +1822,7 @@ mod tests {
             let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
             let avx512 =
                 unsafe { super::f32::cosine_once_x86::cosine_once_16_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX + FMA-direct parity for the 8-lane cosine_once kernel.
@@ -1903,7 +1842,7 @@ mod tests {
             let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
             let avx_fma =
                 unsafe { super::f32::cosine_once_x86::cosine_once_8_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX + FMA-direct parity for the 16-lane cosine_once kernel.
@@ -1923,7 +1862,7 @@ mod tests {
             let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
             let avx_fma =
                 unsafe { super::f32::cosine_once_x86::cosine_once_16_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX-only-direct parity for the 8-lane cosine_once kernel.
@@ -1942,7 +1881,7 @@ mod tests {
             let x_norm = norm_l2(&x);
             let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
             let avx = unsafe { super::f32::cosine_once_x86::cosine_once_8_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX-only-direct parity for the 16-lane cosine_once kernel.
@@ -1961,7 +1900,7 @@ mod tests {
             let x_norm = norm_l2(&x);
             let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
             let avx = unsafe { super::f32::cosine_once_x86::cosine_once_16_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5, epsilon = 1e-6));
         }
     }
 

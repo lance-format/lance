@@ -11,8 +11,8 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::Result;
 use lance_core::cache::{LanceCache, WeakLanceCache};
@@ -257,7 +257,7 @@ pub(super) async fn element_document_index(
     let mut postings: Vec<PostingListBuilder> = vocab
         .iter()
         .map(|token| {
-            builder.tokens.add((*token).to_owned());
+            builder.tokens.get_or_add(token);
             PostingListBuilder::new_with_posting_tail_codec_and_block_size(
                 false,
                 posting_tail_codec,

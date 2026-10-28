@@ -156,6 +156,7 @@ pub(super) fn document_matches_flat_query(
     }
     Ok(phrase_matches_positions(
         query_tokens,
+        &query_position_groups(query_tokens),
         &document_positions,
         slop,
     ))
@@ -165,29 +166,45 @@ pub(super) const FLAT_ALL_TOKENS_COL: &str = "all_tokens";
 pub(super) const FLAT_QUERY_TOKEN_COUNTS_COL: &str = "query_token_counts";
 pub(super) const FLAT_PHRASE_MATCH_COL: &str = "phrase_match";
 
+static FLAT_ALL_TOKENS_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false)));
+static FLAT_QUERY_TOKEN_COUNTS_ITEM_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new("item", DataType::UInt64, true)));
+static FLAT_PHRASE_MATCH_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new(FLAT_PHRASE_MATCH_COL, DataType::Boolean, false)));
+
 pub(super) fn phrase_matches_positions(
     query_tokens: &Tokens,
+    query_groups: &[Vec<usize>],
     document_positions: &[Vec<u32>],
     slop: u32,
 ) -> bool {
-    let Some(first_positions) = document_positions.first() else {
+    debug_assert_eq!(query_tokens.len(), document_positions.len());
+    let Some(first_group) = query_groups.first() else {
         return false;
     };
-    if first_positions.is_empty() {
+    // Same-position tokens are alternatives, just like the indexed posting unions.
+    let mut candidates = first_group
+        .iter()
+        .flat_map(|index| &document_positions[*index])
+        .copied()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
         return false;
     }
 
-    let mut candidates = first_positions.clone();
-    debug_assert_eq!(query_tokens.len(), document_positions.len());
-    for (query_index, positions) in document_positions.iter().enumerate().skip(1) {
+    for groups in query_groups.windows(2) {
         let Some(query_delta) = query_tokens
-            .position(query_index)
-            .checked_sub(query_tokens.position(query_index - 1))
+            .position(groups[1][0])
+            .checked_sub(query_tokens.position(groups[0][0]))
         else {
             return false;
         };
         let mut next_candidates = Vec::new();
-        for &position in positions {
+        for &position in groups[1]
+            .iter()
+            .flat_map(|index| &document_positions[*index])
+        {
             let position = u64::from(position);
             if candidates.iter().any(|candidate| {
                 let least = u64::from(*candidate) + u64::from(query_delta);
@@ -229,28 +246,32 @@ pub(super) async fn tokenize_and_count(
     coordinate_rank: usize,
     phrase_slop: Option<u32>,
 ) -> DataFusionResult<RecordBatch> {
-    let mut output_fields = vec![ROW_ID_FIELD.clone()];
-    output_fields.extend(
-        (0..coordinate_rank)
-            .map(|rank| Field::new(doc_index_storage_column(rank), DataType::UInt32, false)),
-    );
+    let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
+    output_fields.extend((0..coordinate_rank).map(|rank| {
+        Arc::new(Field::new(
+            doc_index_storage_column(rank),
+            DataType::UInt32,
+            false,
+        ))
+    }));
     output_fields.extend([
-        Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false),
-        Field::new(
+        FLAT_ALL_TOKENS_FIELD.clone(),
+        Arc::new(Field::new(
             FLAT_QUERY_TOKEN_COUNTS_COL,
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt64, true)),
+                FLAT_QUERY_TOKEN_COUNTS_ITEM_FIELD.clone(),
                 query_tokens.len() as i32,
             ),
             false,
-        ),
+        )),
     ]);
     if phrase_slop.is_some() {
-        output_fields.push(Field::new(FLAT_PHRASE_MATCH_COL, DataType::Boolean, false));
+        output_fields.push(FLAT_PHRASE_MATCH_FIELD.clone());
     }
     let output_schema = Arc::new(Schema::new(output_fields));
     let output_schema_clone = output_schema.clone();
     let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+    let query_groups = Arc::new(query_position_groups(query_tokens.as_ref()));
     let bytes_accumulated = Arc::new(AtomicU64::new(0));
     let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
 
@@ -260,6 +281,7 @@ pub(super) async fn tokenize_and_count(
             let output_schema = output_schema.clone();
             let query_tokens = query_tokens.clone();
             let query_token_indices = query_token_indices.clone();
+            let query_groups = query_groups.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
@@ -328,6 +350,7 @@ pub(super) async fn tokenize_and_count(
                     let matches = phrase_slop.is_none_or(|slop| {
                         phrase_matches_positions(
                             query_tokens.as_ref(),
+                            &query_groups,
                             &temp_query_positions,
                             slop,
                         )
@@ -1002,7 +1025,7 @@ pub async fn flat_bm25_search_stream_with_metrics(
 ///
 /// ```no_run
 /// # async fn example(
-/// #     input: datafusion::execution::SendableRecordBatchStream,
+/// #     input: datafusion_execution::SendableRecordBatchStream,
 /// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// use lance_index::scalar::inverted::{
 ///     flat_bm25_search_stream_with_metrics_and_operator, query::Operator, InvertedIndexParams,

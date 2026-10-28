@@ -8,6 +8,8 @@ use std::sync::{
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use datafusion::common::Result as DFResult;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
@@ -228,6 +230,13 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

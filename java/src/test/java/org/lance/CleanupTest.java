@@ -49,6 +49,13 @@ public class CleanupTest {
       testDataset.write(2, 10).close();
 
       try (Dataset dataset = testDataset.write(3, 10)) {
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset
+                    .cleanup(CleanupPolicy.builder().build())
+                    .withDeleteConcurrency(-1L)
+                    .execute());
         RemovalStats stats =
             dataset.cleanupWithPolicy(CleanupPolicy.builder().withBeforeVersion(3L).build());
         assertEquals(2L, stats.getOldVersions());
@@ -99,7 +106,8 @@ public class CleanupTest {
 
       try (Dataset dataset = testDataset.write(3, 10)) {
         CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
-        CleanupOperation cleanup = dataset.cleanup(policy);
+        CleanupOperation cleanup =
+            dataset.cleanup(policy).withDeleteConcurrency(0L).withDeleteRateLimit(0L);
         CleanupExplanation explanation = cleanup.explain();
 
         assertEquals(2L, explanation.getStats().getOldVersions());
@@ -112,7 +120,7 @@ public class CleanupTest {
         List<Version> versions = dataset.listVersions();
         assertEquals(4, versions.size());
 
-        RemovalStats stats = cleanup.execute();
+        RemovalStats stats = cleanup.withDeleteConcurrency(2L).withDeleteRateLimit(100L).execute();
         assertEquals(explanation.getStats().getOldVersions(), stats.getOldVersions());
       }
     }
@@ -233,11 +241,15 @@ public class CleanupTest {
             versions.get(versions.size() - 1).getDataTime().toInstant().toEpochMilli() + 1;
         long start = System.nanoTime();
         RemovalStats stats =
-            dataset.cleanupWithPolicy(
-                CleanupPolicy.builder()
-                    .withBeforeTimestampMillis(beforeTimestampMillis)
-                    .withDeleteRateLimit(1L)
-                    .build());
+            dataset
+                .cleanup(
+                    CleanupPolicy.builder()
+                        .withBeforeTimestampMillis(beforeTimestampMillis)
+                        .withDeleteRateLimit(100L)
+                        .build())
+                .withDeleteConcurrency(2L)
+                .withDeleteRateLimit(1L)
+                .execute();
         long elapsed = System.nanoTime() - start;
 
         assertEquals(3L, stats.getOldVersions());

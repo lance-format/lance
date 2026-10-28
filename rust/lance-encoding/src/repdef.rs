@@ -1902,6 +1902,21 @@ impl RepDefUnraveler {
         let current_def_cmp = self.current_def_cmp;
         self.current_def_cmp += 1;
 
+        // If every level present is visible at this layer (always the case without lists) then
+        // each level yields one validity bit and we can build them in bulk.  Slicing up to the
+        // max def level keeps the out-of-range panic of the per-level lookup below.
+        let max_def = def_levels.iter().copied().max().unwrap_or(0);
+        let current_rep_cmp = self.current_rep_cmp;
+        if self.levels_to_rep[..=max_def as usize]
+            .iter()
+            .all(|&rep| rep <= current_rep_cmp)
+        {
+            validity.append_buffer(&BooleanBuffer::collect_bool(def_levels.len(), |i| {
+                def_levels[i] <= current_def_cmp
+            }));
+            return Ok(());
+        }
+
         for is_valid in def_levels.iter().filter_map(|&level| {
             if self.levels_to_rep[level as usize] <= self.current_rep_cmp {
                 Some(level <= current_def_cmp)
@@ -1945,7 +1960,9 @@ impl RepDefUnraveler {
             //  def: 1 1 1 0 1 1 0
             //
             // Maybe there's some special logic for empty/null lists?  I'll save the headache for future me.
-            todo!("Not yet supported FSL<...List<...>>");
+            return Err(Error::not_supported(
+                "Reading a column that combines a fixed-size-list with a list-like layer is not yet supported: the fixed-size-list layer cannot decimate repetition levels",
+            ));
         }
         let Some(def_levels) = self.def_levels.as_mut() else {
             return Ok(());
@@ -2845,7 +2862,7 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 
     use crate::encodings::logical::primitive::sparse::{
-        SparsePositionSet, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
+        SparsePositionPlan, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
         SparseValiditySet,
     };
     use crate::repdef::{
@@ -2908,13 +2925,12 @@ mod tests {
                         positions,
                     },
                 }],
-                num_items: 2,
                 num_visible_items: 2,
             })
         };
-        let mut repdef = CompositeRepDefUnraveler::new(vec![sparse(SparsePositionSet::Empty)]);
+        let mut repdef = CompositeRepDefUnraveler::new(vec![sparse(SparsePositionPlan::Empty)]);
         repdef.add_compatibility_check(CompositeRepDefUnraveler::new(vec![sparse(
-            SparsePositionSet::Explicit(vec![0]),
+            SparsePositionPlan::Explicit(vec![0]),
         )]));
 
         let err = repdef.unravel_validity(2).unwrap_err();
@@ -3142,6 +3158,48 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl_over_list_is_not_supported() {
+        // A fixed-size-list whose child contains a list serializes repetition levels, and
+        // decimating those through the fixed-size dimension is not implemented.  The write
+        // side accepts such a column, so the read side has to report it instead of hitting
+        // the todo!() this used to end in (which panicked inside a decode task).
+        //
+        // Layers as the writer emits them for FSL<Struct<List<Int32>>>: the fixed-size-list
+        // layer, then the struct layer, then the list offsets, then the leaf validity.
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, true])), 2, 2);
+        builder.add_no_null(4);
+        builder.add_offsets(offsets_32(&[0, 2, 2, 3, 5]), None);
+        builder.add_validity_bitmap(validity(&[true, true, true, true, true]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(rep.as_ref().to_vec()),
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+            5,
+        )]);
+
+        // Consume the inner layers in the order the decoder does, so the fixed-size-list
+        // layer is the one that fails
+        unraveler.unravel_validity(5).unwrap();
+        unraveler.unravel_offsets::<i32>().unwrap();
+        unraveler.unravel_validity(4).unwrap();
+
+        let err = unraveler.unravel_fsl_validity(2, 2).unwrap_err();
+        assert!(matches!(err, lance_core::Error::NotSupported { .. }));
+        assert!(
+            err.to_string()
+                .contains("cannot decimate repetition levels"),
             "unexpected error: {}",
             err
         );
@@ -4050,6 +4108,65 @@ mod tests {
             (
                 offsets_32(&[0, 2, 2, 2, 4]),
                 Some(validity(&[true, true, false, true]))
+            )
+        );
+    }
+
+    #[test]
+    fn test_unravel_validity_unaligned_pages() {
+        // Pages whose lengths are not multiples of 64 append at unaligned bit offsets
+        let def1: Vec<u16> = (0..70).map(|i| (i % 3 == 0) as u16).collect();
+        let def2: Vec<u16> = (0..130).map(|i| (i % 5 == 0) as u16).collect();
+        let expected = def1
+            .iter()
+            .chain(def2.iter())
+            .map(|&level| level == 0)
+            .collect::<Vec<_>>();
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![
+            RepDefUnraveler::new(
+                None,
+                Some(def1),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                70,
+            ),
+            RepDefUnraveler::new(
+                None,
+                Some(def2),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                130,
+            ),
+        ]);
+
+        assert_eq!(
+            unraveler.unravel_validity(200).unwrap(),
+            Some(validity(&expected))
+        );
+    }
+
+    #[test]
+    fn test_unravel_validity_list_page_without_null_lists() {
+        // No null or empty lists, so every level is visible at the item layer
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(vec![1, 0, 1, 1, 0]),
+            Some(vec![0, 1, 0, 1, 0]),
+            vec![
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::NullableList,
+            ]
+            .into(),
+            5,
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(5).unwrap(),
+            Some(validity(&[true, false, true, false, true]))
+        );
+        assert_eq!(
+            unraveler.unravel_offsets::<i32>().unwrap(),
+            (
+                offsets_32(&[0, 2, 3, 5]),
+                Some(validity(&[true, true, true]))
             )
         );
     }
