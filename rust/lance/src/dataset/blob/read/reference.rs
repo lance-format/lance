@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     task::{Context, Poll},
 };
 
@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::plan::{BlobReadBatch, plan_blob_read_batches_with_limits};
 use super::{BlobEntry, BlobReadRange, ReadBlobsExecution, execute_blob_read_plan};
 use crate::Dataset;
-use crate::blob::reference::{BlobRef, BlobSourceContext, pb};
+use crate::blob::reference::{BlobRef, BlobRefMetrics, BlobSourceContext, ReaderMetrics, pb};
 use crate::dataset::blob::file::{BlobFile, BlobSource};
 use crate::dataset::blob::materialize::{
     BlobMaterializationContext, BlobMaterializationReservation,
@@ -225,6 +225,7 @@ struct ReaderInner {
     materialization_limit: u64,
     parallelism: usize,
     objects: Mutex<HashMap<ObjectKey, Arc<OnceCell<CachedObject>>>>,
+    metrics: ReaderMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -264,6 +265,17 @@ struct PreparedRequest {
 }
 
 impl BlobRefReader {
+    /// Snapshot cumulative session I/O/demand counters and shared reservation peaks.
+    /// See [`BlobRefMetrics`] for counter scope and cancellation semantics.
+    pub fn metrics(&self) -> Result<BlobRefMetrics> {
+        let mut metrics = self.inner.metrics.snapshot();
+        metrics.reserved_bytes = self.inner.context.reserved_bytes()?;
+        metrics.io_reserved_bytes = self.inner.context.io_reserved_bytes()?;
+        (metrics.peak_reserved_bytes, metrics.peak_io_reserved_bytes) =
+            self.inner.context.reservation_peaks()?;
+        Ok(metrics)
+    }
+
     /// Create a reader sharing the supplied finite budgets and schedulers.
     /// Bindings must be unique and follow the transported context table's order.
     pub fn try_new(
@@ -305,6 +317,7 @@ impl BlobRefReader {
                 materialization_limit,
                 parallelism,
                 objects: Mutex::new(HashMap::new()),
+                metrics: ReaderMetrics::default(),
             }),
         })
     }
@@ -525,6 +538,12 @@ impl ReadState {
                         cached
                             .size
                             .get_or_try_init(|| async {
+                                state
+                                    .reader
+                                    .inner
+                                    .metrics
+                                    .metadata_requests
+                                    .fetch_add(1, Ordering::Relaxed);
                                 cached.source.object_store.size(&cached.source.path).await
                             })
                             .await
@@ -541,6 +560,9 @@ impl ReadState {
                 .try_collect::<HashMap<_, _>>()
                 .await?;
         let mut entries = Vec::with_capacity(pending.len());
+        let mut logical_bytes = 0_u64;
+        let mut duplicates = 0_u64;
+        let mut demands = HashSet::new();
         for (index, locator) in pending {
             let request = &self.requests[index];
             let cell = objects
@@ -578,6 +600,16 @@ impl ReadState {
                     )));
                 }
             }
+            let (offset, length) = match request.demand {
+                BlobRefDemand::Whole => (locator.object.offset, size),
+                BlobRefDemand::Range(range) => (locator.object.offset + range.offset, range.length),
+            };
+            logical_bytes = logical_bytes.checked_add(length).ok_or_else(|| {
+                Error::invalid_input("Blob reference logical demand bytes overflow u64")
+            })?;
+            if length > 0 && !demands.insert((locator.key(), offset, length)) {
+                duplicates += 1;
+            }
             let kind = if locator.object.origin == pb::object_locator::Origin::Lance as i32 {
                 BlobKind::Managed
             } else {
@@ -613,6 +645,16 @@ impl ReadState {
             })?
             .into(),
         );
+        self.reader
+            .inner
+            .metrics
+            .requested_logical_bytes
+            .fetch_add(logical_bytes, Ordering::Relaxed);
+        self.reader
+            .inner
+            .metrics
+            .duplicate_demands
+            .fetch_add(duplicates, Ordering::Relaxed);
         Ok(())
     }
 
@@ -628,6 +670,10 @@ impl ReadState {
                         self.label(index)
                     )));
                 }
+                self.reader.inner.metrics.returned_logical_bytes.fetch_add(
+                    data.as_ref().map_or(0, |data| data.len() as u64),
+                    Ordering::Relaxed,
+                );
                 return Ok(Some((
                     ReadBlobRef {
                         request_index: self.requests[index].request_index,
@@ -670,7 +716,13 @@ impl ReadState {
                     _materialization: reservation.clone(),
                     _io: io_reservation,
                 })),
+                io_stats: Some(self.reader.inner.metrics.payload.clone()),
             });
+            self.reader
+                .inner
+                .metrics
+                .coalesced_bytes
+                .fetch_add(batch.physical_bytes, Ordering::Relaxed);
             let incomplete = self.outstanding.len();
             let blobs = stream::iter(batch.plans.into_iter().map(|plan| {
                 let label = plan

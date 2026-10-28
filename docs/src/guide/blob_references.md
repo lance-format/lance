@@ -331,6 +331,9 @@ compact context does not carry a base registry.
 
 ## Combining batches
 
+For nested capture, worker reconstruction, conformance inputs, and measured I/O
+qualification, see [Engine blob integration](blob_reference_integration.md).
+
 Two independently produced batches can both use slot zero for unrelated sources.
 Intern contexts by their full source fingerprint, then call
 `BlobRefBatch::remap_contexts` with the shared context table. The method updates
@@ -491,4 +494,6 @@ Python accepts integers in `0..=2**64-1`. Neither binding truncates high bits.
 | Source snapshot lifetime | Application-managed | Application-managed | Application-managed |
 | Automatic expiration/renewal | No | No | No |
 | Foreign dataset owner retention | Separate agreement | Separate agreement | Separate agreement |
-| Nested reference capture | No | No | No |
+| Struct/List/LargeList reference capture | Yes | Yes | Yes |
+| FixedSizeList/Map/union reference capture | No | No | No |
+| Reader I/O, demand, and reservation metrics | Yes | Yes | Yes |

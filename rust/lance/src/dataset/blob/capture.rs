@@ -3,18 +3,20 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, StructArray};
+use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::Field;
 use lance_arrow::FieldExt;
-use lance_core::datatypes::BlobV2Layout;
+use lance_core::datatypes::{BlobV2Layout, Field as LanceField};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 
 use super::locate::{BlobLocator, StoredBlob};
 use crate::Dataset;
-use crate::blob::reference::{BlobRefBatch, BlobSourceContext};
+use crate::blob::reference::{BlobRefBatch, BlobSourceContext, NestedBlobRefBatch};
 
-/// Capture portable references from a top-level Blob V2 descriptor scan.
+mod nested;
+
+/// Capture portable references from a Blob V2 descriptor scan.
 ///
 /// Create one session per source snapshot and field. It caches fragment, object
 /// store, and registered-base resolution across batches. Capture neither reads
@@ -46,10 +48,11 @@ pub struct BlobRefCapture {
     context: BlobSourceContext,
     field_id: i32,
     resolver: BlobLocator,
+    field_path: Vec<i32>,
 }
 
 impl BlobRefCapture {
-    /// Bind capture to the exact snapshot and top-level field that produced the scan.
+    /// Bind capture to the exact snapshot and Blob V2 leaf that produced the scan.
     ///
     /// `field_id` is the Lance field ID from `dataset.schema()`, not its positional
     /// column index. The source context must identify this exact loaded manifest.
@@ -59,16 +62,14 @@ impl BlobRefCapture {
         field_id: i32,
     ) -> Result<Self> {
         context.validate_dataset(&dataset)?;
-        let field = dataset
-            .schema()
-            .fields
-            .iter()
-            .find(|field| field.id == field_id)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "Blob capture field_id {field_id} is not a top-level field in this snapshot",
-                ))
-            })?;
+        let field_path = find_field_path(&dataset.schema().fields, field_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob capture field_id {field_id} is not a field in this snapshot",
+            ))
+        })?;
+        let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
+            Error::internal(format!("Blob capture field_id {field_id} disappeared"))
+        })?;
         if !field.is_blob_v2() {
             return Err(Error::invalid_input(format!(
                 "Blob capture field '{}' (field_id {field_id}) is not Blob V2",
@@ -81,6 +82,7 @@ impl BlobRefCapture {
             context,
             field_id,
             resolver,
+            field_path,
         })
     }
 
@@ -93,8 +95,71 @@ impl BlobRefCapture {
     ///
     /// `row_addresses` contains physical `_rowaddr` values from the same scan, not
     /// logical `_rowid` values. It must have one entry per descriptor, including nulls.
-    /// Nested containers need their own row-to-parent mapping and are not accepted.
+    /// Nested leaves require [`Self::capture_nested`] to preserve element identity.
     pub async fn capture(
+        &mut self,
+        scan_source: &BlobSourceContext,
+        field: &Field,
+        row_addresses: &[RowAddress],
+        descriptors: &StructArray,
+    ) -> Result<BlobRefBatch> {
+        if self.field_path.len() != 1 {
+            return Err(Error::invalid_input(
+                "Use capture_nested for a Blob V2 leaf below a container",
+            ));
+        }
+        self.capture_descriptors(scan_source, field, row_addresses, descriptors)
+            .await
+    }
+
+    /// Capture a selected Blob V2 leaf below structs and List/LargeList containers.
+    /// Pass the original top-level scan field/array and one physical address per
+    /// root row. The result maps each element to a flat reference without reading
+    /// siblings or losing parent nulls, list ordinals, or empty lists. Other nested
+    /// layouts are rejected. Field IDs avoid ambiguity in quoted field names.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::ArrayRef;
+    /// # use arrow_schema::Field;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::blob::reference::{BlobRefCapture, BlobSourceContext};
+    /// # use lance_core::utils::address::RowAddress;
+    /// # async fn example(dataset: Arc<Dataset>, source: BlobSourceContext,
+    /// #     leaf_id: i32, field: &Field, addresses: &[RowAddress], array: &ArrayRef) -> Result<()> {
+    /// let mut capture = BlobRefCapture::try_new(dataset, source.clone(), leaf_id)?;
+    /// let nested = capture.capture_nested(&source, field, addresses, array).await?;
+    /// assert_eq!(nested.indices().num_rows(), addresses.len());
+    /// // Carry nested.references() and nested.indices() through the engine's Arrow transport.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn capture_nested(
+        &mut self,
+        scan_source: &BlobSourceContext,
+        field: &Field,
+        row_addresses: &[RowAddress],
+        descriptors: &ArrayRef,
+    ) -> Result<NestedBlobRefBatch> {
+        let prepared = nested::prepare(
+            &self.dataset,
+            &self.field_path,
+            field,
+            row_addresses,
+            descriptors,
+        )?;
+        let references = self
+            .capture_descriptors(
+                scan_source,
+                &prepared.field,
+                &prepared.addresses,
+                &prepared.descriptors,
+            )
+            .await?;
+        NestedBlobRefBatch::try_new(references, prepared.indices)
+    }
+
+    async fn capture_descriptors(
         &mut self,
         scan_source: &BlobSourceContext,
         field: &Field,
@@ -171,4 +236,19 @@ impl BlobRefCapture {
         }
         BlobRefBatch::try_new(vec![self.context.clone()], references)
     }
+}
+
+fn find_field_path(fields: &[LanceField], field_id: i32) -> Option<Vec<i32>> {
+    for field in fields {
+        if field.id == field_id {
+            return Some(vec![field.id]);
+        }
+        if !field.is_blob_v2()
+            && let Some(mut path) = find_field_path(&field.children, field_id)
+        {
+            path.insert(0, field.id);
+            return Some(path);
+        }
+    }
+    None
 }
