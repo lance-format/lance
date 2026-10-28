@@ -5047,6 +5047,8 @@ mod tests {
             physical_rows: Some(0),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
@@ -5128,6 +5130,8 @@ mod tests {
             physical_rows: Some(0),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         let target_bases = vec![

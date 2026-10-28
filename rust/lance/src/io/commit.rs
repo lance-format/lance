@@ -1330,6 +1330,13 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    // Definitions are allocated against the version chain: a detached
+    // manifest's ids and field-identity activation would be invisible to it.
+    if write_config.has_clustering_definitions() {
+        return Err(Error::invalid_input(
+            "a clustering definitions list cannot be committed detached",
+        ));
+    }
     let mut transaction = transaction.clone();
     canonicalize_non_reusable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
     let transaction = &transaction;
@@ -1814,6 +1821,15 @@ pub(crate) async fn commit_transaction(
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
 
+    // An allocating clustering submission from a reusable-id snapshot: judge
+    // every transaction in its window for field-identity changes; see
+    // `refuse_field_identity_change`. Decided from the version the transaction
+    // read, not from the handle it was submitted through, which may already
+    // be at a later, activated version.
+    let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
+        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+    .then(|| read_version_dataset.schema().clone());
+
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
         // we need to check for. We could be optimistic here and blindly
@@ -1853,8 +1869,28 @@ pub(crate) async fn commit_transaction(
                     .into(),
                 ));
             }
+            // A cleaned-up version may have replaced a key field; an identity
+            // window with a hole cannot be judged, so it is refused.
+            if identity_fence.is_some() && !missing.is_empty() {
+                return Err(Error::commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "versions {missing:?} between this submission's read version and the \
+                         latest were cleaned up, so the field identity of its clustering keys \
+                         cannot be checked; reload the table and rebuild the list"
+                    )
+                    .into(),
+                ));
+            }
 
             for (other_version, other_transaction) in other_transactions.iter() {
+                if let Some(read_schema) = &identity_fence {
+                    conflict_resolver::refuse_field_identity_change(
+                        read_schema,
+                        other_transaction,
+                        *other_version,
+                    )?;
+                }
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
@@ -3112,6 +3148,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -3125,6 +3163,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -3163,6 +3203,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -3176,6 +3218,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
@@ -3221,6 +3265,8 @@ mod tests {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         let mut manifest = Manifest::new(
@@ -3783,6 +3829,8 @@ mod tests {
             physical_rows: Some(100),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         Manifest::new(
             schema,
@@ -3819,6 +3867,8 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         Manifest::new(
             Schema::default(),
@@ -4067,6 +4117,8 @@ mod tests {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let fragments = vec![
             make_fragment(0, vec![shared_a.clone(), shared_b.clone()]),
@@ -4392,6 +4444,8 @@ mod tests {
             physical_rows: Some(100),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let manifest = Manifest::new(
             schema,
@@ -4478,6 +4532,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -4524,6 +4580,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let transaction = Transaction::new(
             42,

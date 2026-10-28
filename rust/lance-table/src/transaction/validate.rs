@@ -2512,6 +2512,8 @@ mod tests {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let manifest = Manifest::new(
             prior_schema,
@@ -2574,6 +2576,8 @@ mod tests {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let manifest = Manifest::new(
             prior_schema,
@@ -2650,6 +2654,8 @@ mod tests {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let operation = Operation::Overwrite {

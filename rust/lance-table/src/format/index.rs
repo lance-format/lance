@@ -105,6 +105,17 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// The clustering definition this segment was built under, by
+    /// `Manifest::clustering` id. Changes to the same segment keep it; a
+    /// segment built from this one does not inherit it.
+    pub clustering_id: Option<u32>,
+
+    /// Arbitrary metadata attached to this segment, like
+    /// `Manifest::table_metadata`. Changes to the same segment preserve every
+    /// entry, including keys this build does not understand; new segments
+    /// carry only what their creator sets.
+    pub metadata: HashMap<String, String>,
 }
 
 impl IndexMetadata {
@@ -371,6 +382,7 @@ impl DeepSizeOf for IndexMetadata {
                     }
                 })
                 .unwrap_or(0)
+            + self.metadata.deep_size_of_children(context)
     }
 }
 
@@ -419,6 +431,8 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
+            clustering_id: proto.clustering_id,
+            metadata: proto.metadata,
         };
 
         // This is the single boundary between manifest bytes and
@@ -481,8 +495,8 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
                 .as_ref()
                 .map(|details| details.as_ref().clone()),
             index_version: Some(idx.index_version),
-            clustering_id: None,
-            metadata: Default::default(),
+            clustering_id: idx.clustering_id,
+            metadata: idx.metadata.clone(),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
@@ -570,6 +584,28 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashMap;
 
+    /// Provider metadata is heap-allocated and feeds bounded caches, so it has
+    /// to be in the deep size. Compares two entries rather than asserting
+    /// allocator byte counts, which would be brittle.
+    #[test]
+    fn provider_metadata_counts_towards_the_deep_size() {
+        use lance_core::deepsize::DeepSizeOf;
+
+        let bare = crate::transaction::test_support::sample_index_metadata("idx");
+        let mut carrying = bare.clone();
+        carrying.metadata = HashMap::from([(
+            "org.example.cluster.bucket".to_string(),
+            "a reasonably long provider value".to_string(),
+        )]);
+
+        assert!(
+            carrying.deep_size_of() > bare.deep_size_of(),
+            "metadata must contribute: bare={} carrying={}",
+            bare.deep_size_of(),
+            carrying.deep_size_of()
+        );
+    }
+
     #[test]
     fn test_fragment_bitmap_serialized_run_optimized() {
         let bitmap = RoaringBitmap::from_sorted_iter(0..1_000_000).unwrap();
@@ -587,6 +623,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&metadata);
@@ -628,6 +666,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let with = |details: Arc<prost_types::Any>| IndexMetadata {
             index_details: Some(details),
@@ -675,6 +715,8 @@ mod tests {
                     size_bytes: 1024,
                     file_metadata_size_bytes: NonZero::new(256),
                 }]),
+                clustering_id: None,
+                metadata: Default::default(),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -688,6 +730,8 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -741,6 +785,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&original);
@@ -812,6 +858,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 

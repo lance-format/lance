@@ -122,8 +122,9 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 /// Writer-only protection for clustering definitions, ID allocation, references,
 /// and generic fragment/index segment metadata maintenance.
-/// Reserved and unsupported until writers implement its maintenance rules.
-/// Ordinary readers can ignore this metadata; all covered features share this one bit.
+/// Set whenever a manifest carries any of them; a writer that does not preserve
+/// them must refuse the dataset. Ordinary readers can ignore this metadata; all
+/// covered features share this one bit.
 pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 18;
@@ -171,6 +172,9 @@ pub fn apply_feature_flags(
     // write.
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
+    // Same carry for the index section's clustering references and generic
+    // metadata, which `build_manifest` derives from the index list.
+    let object_metadata = manifest.writer_feature_flags & FLAG_OBJECT_METADATA;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
     let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
     if non_reusable_field_ids {
@@ -248,12 +252,48 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
     }
 
+    // Clustering definitions, the allocation high-water mark, and object
+    // references or generic metadata on fragments all need a writer that
+    // preserves them. Readers may ignore them, so this is a writer-only bit.
+    let has_object_metadata = manifest.max_clustering_id != 0
+        || !manifest.clustering.is_empty()
+        || manifest
+            .fragments
+            .iter()
+            .any(|frag| frag.clustering_id.is_some() || !frag.metadata.is_empty());
+    if has_object_metadata {
+        manifest.writer_feature_flags |= FLAG_OBJECT_METADATA;
+    }
+    manifest.writer_feature_flags |= object_metadata;
+
     manifest.reader_feature_flags |= covered_index_metadata;
     manifest.writer_feature_flags |= covered_index_metadata;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 
     Ok(())
+}
+
+/// Set the writer-only object-metadata bit for an index section that carries a
+/// clustering reference or generic metadata on any segment.
+///
+/// `apply_feature_flags` derives the bit from what the manifest itself holds
+/// (definitions, the allocation high-water mark, fragment references and maps),
+/// but a `Manifest` only points at its index section. Every path that publishes
+/// a manifest together with its indices calls this after `apply_feature_flags`:
+/// `build_manifest` for ordinary commits, and `write_manifest_file` for the
+/// clone and restore paths that bypass it. Readers may ignore the metadata, so
+/// the reader word is untouched.
+pub fn apply_index_object_metadata_flag(
+    manifest: &mut Manifest,
+    indices: &[crate::format::IndexMetadata],
+) {
+    if indices
+        .iter()
+        .any(|index| index.clustering_id.is_some() || !index.metadata.is_empty())
+    {
+        manifest.writer_feature_flags |= FLAG_OBJECT_METADATA;
+    }
 }
 
 /// Carry sticky capabilities from the manifest a new one is derived from.
@@ -343,7 +383,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
-    mark_supported(&mut supported, FLAG_OBJECT_METADATA, false);
+    mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
     supported
 }
 
@@ -535,22 +575,57 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
-    fn test_object_metadata_flag_fences_writes_without_blocking_reads() {
-        let mut manifest = empty_manifest();
-        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
-        ensure_can_read_manifest(&manifest).unwrap();
-        let error = ensure_can_write_manifest(&manifest).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("cannot be written"));
-        assert!(!can_read_dataset(FLAG_OBJECT_METADATA));
-        assert!(!can_write_dataset(FLAG_OBJECT_METADATA));
+    fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
-        // The zone seed bit below it is supported; bits above remain unknown.
-        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_read_dataset(FLAG_OBJECT_METADATA));
+        assert!(can_write_dataset(FLAG_OBJECT_METADATA));
         assert_eq!(FLAG_UNKNOWN, 1 << 18);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
+
+        // Nothing clustering-related: no bit, and a stale bit is cleared.
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = 0;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // Allocation alone (ids handed out, definitions since removed).
+        let mut manifest = empty_manifest();
+        manifest.max_clustering_id = 3;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // A definition.
+        let mut manifest = empty_manifest();
+        manifest.clustering = vec![crate::format::ClusteringDefinition {
+            id: 1,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        }];
+        manifest.max_clustering_id = 1;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // Generic metadata on a fragment with no clustering reference at all.
+        let mut manifest = empty_manifest();
+        let mut fragment = crate::format::Fragment::new(0);
+        fragment
+            .metadata
+            .insert("org.example.unknown".into(), "opaque".into());
+        manifest.fragments = std::sync::Arc::new(vec![fragment]);
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // The bit `build_manifest` derives from the index section is carried
+        // across the reset, like the covering bit.
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
     }
 
     #[test]

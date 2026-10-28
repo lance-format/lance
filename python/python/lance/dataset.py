@@ -6356,6 +6356,11 @@ class Index:
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
     covering_fields: List[int] = dataclasses.field(default_factory=list)
+    clustering_id: Optional[int] = None
+    """The clustering definition this segment was built under, if any."""
+    metadata: Dict[str, str] = dataclasses.field(default_factory=dict)
+    """Generic metadata attached to this segment. Preserved verbatim, including
+    keys this library does not understand."""
 
 
 class IndexInformation(TypedDict):

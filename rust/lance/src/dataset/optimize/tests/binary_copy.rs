@@ -307,7 +307,10 @@ async fn do_test_binary_copy_packed_struct_column_mapping(version: LanceFileVers
 #[tokio::test]
 async fn test_binary_copy_skipped_after_metadata_only_add_column() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_skipped_after_metadata_only_add_column(version).await;
+        Box::pin(do_test_binary_copy_skipped_after_metadata_only_add_column(
+            version,
+        ))
+        .await;
     }
 }
 

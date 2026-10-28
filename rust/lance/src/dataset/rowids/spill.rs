@@ -2975,10 +2975,10 @@ mod tests {
         let mut spilled_anything = false;
         for (index, step) in steps.into_iter().enumerate() {
             let label = format!("step {index} ({step:?})");
-            if let Err(error) = inline.apply(step).await {
+            if let Err(error) = Box::pin(inline.apply(step)).await {
                 panic!("{label} failed on the inline table: {error}");
             }
-            if let Err(error) = spilled.apply(step).await {
+            if let Err(error) = Box::pin(spilled.apply(step)).await {
                 panic!("{label} failed on the spilled table: {error}");
             }
             spilled_anything |= assert_twins_agree(&spilled.dataset, &inline.dataset, &label).await;

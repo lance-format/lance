@@ -1949,6 +1949,8 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     persist_fixture(&mut dataset, indices).await;
 
@@ -3399,6 +3401,8 @@ async fn install_history(
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     indices.push(fri.clone());
     Arc::make_mut(&mut dataset.manifest).fragments = live.into();

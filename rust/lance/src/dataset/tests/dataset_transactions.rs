@@ -2044,6 +2044,8 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
 
     let transaction = Transaction::new(
@@ -2105,6 +2107,8 @@ async fn test_shallow_clone_preserves_the_covering_fence() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     dataset
         .apply_commit(
@@ -2201,6 +2205,8 @@ async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let uuid = index.uuid;
 
