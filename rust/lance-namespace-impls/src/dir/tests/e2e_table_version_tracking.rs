@@ -1041,11 +1041,12 @@ async fn test_query_table_vector_search() {
     let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
+    assert!(batches[0].column_by_name("query_index").is_none());
 }
 
 #[tokio::test]
 async fn test_query_table_multi_vector_batch_search() {
-    use arrow::array::AsArray;
+    use arrow::array::{Array, AsArray};
     use arrow::datatypes::Int32Type;
 
     let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
@@ -1069,7 +1070,8 @@ async fn test_query_table_multi_vector_batch_search() {
     let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
 
     assert_eq!(batch.num_rows(), 6);
-    let query_index_field = batch.schema().field(0);
+    let schema = batch.schema();
+    let query_index_field = schema.field(0);
     assert_eq!(query_index_field.name(), "query_index");
     assert!(!query_index_field.is_nullable());
     let query_index = batch["query_index"].as_primitive::<Int32Type>();
@@ -1080,6 +1082,56 @@ async fn test_query_table_multi_vector_batch_search() {
     assert_eq!(ids.value(0), 1);
     assert_eq!(ids.value(2), 3);
     assert_eq!(ids.value(4), 2);
+}
+
+#[tokio::test]
+async fn test_query_table_multi_vector_offset_boundary() {
+    let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+    let vector = || {
+        Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![
+                vec![1.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0],
+            ]),
+        })
+    };
+
+    let request = QueryTableRequest {
+        id: Some(table_id.clone()),
+        k: 2,
+        vector: vector(),
+        offset: Some(0),
+        ..Default::default()
+    };
+    let bytes = namespace.query_table(request).await.unwrap();
+    let reader = FileReader::try_new(Cursor::new(bytes.to_vec()), None).unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
+    assert_eq!(batch.num_rows(), 6);
+
+    let request = QueryTableRequest {
+        id: Some(table_id),
+        k: 2,
+        vector: vector(),
+        offset: Some(1),
+        ..Default::default()
+    };
+    let err = namespace.query_table(request).await.unwrap_err();
+    let lance_core::Error::Namespace { source, .. } = &err else {
+        panic!("expected a Namespace error, got: {}", err);
+    };
+    let ns_err = source
+        .downcast_ref::<NamespaceError>()
+        .expect("expected a NamespaceError source");
+    assert_eq!(ns_err.code(), ErrorCode::InvalidInput);
+    assert!(
+        err.to_string()
+            .contains("multi_vector batch search does not support offset > 0"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[tokio::test]
@@ -1133,7 +1185,8 @@ async fn test_query_table_multi_vector_empty_result_keeps_query_index_schema() {
     let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
 
     assert_eq!(batch.num_rows(), 0);
-    let query_index_field = batch.schema().field(0);
+    let schema = batch.schema();
+    let query_index_field = schema.field(0);
     assert_eq!(query_index_field.name(), "query_index");
     assert!(!query_index_field.is_nullable());
 }
@@ -1270,6 +1323,28 @@ async fn test_explain_table_query_plan_multi_vector() {
 
     let plan = namespace.explain_table_query_plan(request).await.unwrap();
     assert!(plan.contains("query_index"), "unexpected plan: {}", plan);
+
+    let query = QueryTableRequest {
+        k: 2,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]]),
+        }),
+        offset: Some(1),
+        ..Default::default()
+    };
+    let mut request = ExplainTableQueryPlanRequest::new(query);
+    request.id = Some(vec!["vector_table".to_string()]);
+    let err = namespace
+        .explain_table_query_plan(request)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("multi_vector batch search does not support offset > 0"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[tokio::test]

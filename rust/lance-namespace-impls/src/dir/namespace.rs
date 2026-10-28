@@ -2122,11 +2122,12 @@ impl LanceNamespace for DirectoryNamespace {
         // Build scanner
         let mut scanner = dataset.scan();
 
-        let query_array = Self::query_vector_array(&request.vector).map_err(|e| {
-            NamespaceError::InvalidInput {
-                message: format!("Invalid vector search: {}", e),
-            }
-        })?;
+        let query_array =
+            Self::query_vector_array(&request.vector, request.offset).map_err(|e| {
+                NamespaceError::InvalidInput {
+                    message: format!("Invalid vector search for query_table: {}", e),
+                }
+            })?;
         let has_vector_query = query_array.is_some();
 
         // Apply prefilter setting (must be set before nearest)

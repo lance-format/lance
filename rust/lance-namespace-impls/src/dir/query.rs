@@ -54,8 +54,11 @@ impl DirectoryNamespace {
     /// `FixedSizeListArray` with one row per vector, which the scanner runs as a
     /// batch search against a fixed-size-list column. For a multivector column,
     /// the rows form one multivector query while retaining the same encoding.
+    /// Positive offsets are rejected because the scanner applies an offset to the
+    /// combined batch result rather than once per query.
     pub(super) fn query_vector_array(
         vector: &QueryTableRequestVector,
+        offset: Option<i32>,
     ) -> std::result::Result<Option<ArrayRef>, String> {
         let single = vector.single_vector.as_ref().filter(|v| !v.is_empty());
         let multi = vector.multi_vector.as_ref().filter(|mv| !mv.is_empty());
@@ -67,6 +70,12 @@ impl DirectoryNamespace {
             (None, Some(rows)) => rows,
             (None, None) => return Ok(None),
         };
+        if let Some(offset) = offset.filter(|&offset| offset > 0) {
+            return Err(format!(
+                "multi_vector batch search does not support offset > 0: offset={offset}; \
+                 offset is applied to the combined result instead of once per query"
+            ));
+        }
         if let Some(i) = rows.iter().position(|r| r.is_empty()) {
             return Err(format!("multi_vector row {} is empty", i));
         }
@@ -161,7 +170,7 @@ impl DirectoryNamespace {
             }
         }
 
-        let query = Self::query_vector_array(vector).map_err(|e| {
+        let query = Self::query_vector_array(vector, offset).map_err(|e| {
             Error::invalid_input_source(
                 format!("Invalid vector query for {}: {}", operation, e).into(),
             )
