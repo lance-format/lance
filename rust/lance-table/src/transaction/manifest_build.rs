@@ -1470,10 +1470,6 @@ impl Transaction {
                 unreachable!()
             }
             Operation::DataReplacement { replacements } => {
-                log::warn!(
-                    "Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution."
-                );
-
                 let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
                     .iter()
                     .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
@@ -2331,6 +2327,7 @@ mod tests {
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
     use rstest::rstest;
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -5686,6 +5683,27 @@ mod tests {
 
     #[test]
     fn test_data_replacement_tombstones_overlaid_fields() {
+        // Capture only this thread's warnings so parallel tests cannot affect the assertion.
+        thread_local! {
+            static WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        struct WarningLogger;
+        impl log::Log for WarningLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    WARNINGS.with_borrow_mut(|warnings| warnings.push(record.args().to_string()));
+                }
+            }
+
+            fn flush(&self) {}
+        }
+        log::set_logger(&WarningLogger).unwrap();
+        log::set_max_level(log::LevelFilter::Warn);
+
         // A DataReplacement writing new base values for field 5 must stop any
         // overlay already shadowing those cells: field 5 is tombstoned in place
         // (preserving the overlay's field 3), and an overlay covering only field
@@ -5734,6 +5752,8 @@ mod tests {
         let (result, _) = txn
             .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
+
+        WARNINGS.with_borrow(|warnings| assert!(warnings.is_empty(), "{warnings:?}"));
 
         let frag = &result.fragments[0];
         // The base data file for field 5 was swapped in.
