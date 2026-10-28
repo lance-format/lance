@@ -4,28 +4,34 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use std::collections::BTreeSet;
-use std::{ops::Bound, sync::Arc};
+use std::{
+    ops::Bound,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use arrow_array::Array;
 use arrow_array::{
-    ArrayRef, BooleanArray, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type,
+    ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array, cast::AsArray, types::UInt64Type,
 };
+use arrow_ord::{ord::make_comparator, sort::sort_to_indices};
+use arrow_schema::SortOptions;
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
-use lance_core::Result;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::{Error, Result};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
 use datafusion_common::ScalarValue;
 
+use super::lookup::U64Lookup;
 use crate::metrics::MetricsCollector;
 use crate::scalar::btree::{BTREE_VALUES_COLUMN, OrderableScalarValue};
 use crate::scalar::{AnyQuery, SargableQuery};
@@ -96,18 +102,39 @@ fn empty_ids() -> UInt64Array {
 /// Evaluating a query requires O(N) time where N is the # of rows
 #[derive(Debug)]
 pub struct FlatIndex {
-    /// Sorted by row id. Nothing else is materialized at load time: every
-    /// answer is a filtered view of the id column computed on demand, so a
-    /// cached page costs exactly its Arrow buffers.
+    /// Sorted by row id, so filtered id columns remain sorted for bitmap assembly.
     data: Arc<RecordBatch>,
+    /// Reuse the address-sort permutation until lookup needs value order.
+    /// Ordinary filters never pay for constructing a second ordering.
+    lookup_order: Mutex<LookupOrder>,
+    lookup_u64: OnceLock<Option<Arc<U64Lookup>>>,
     df_schema: DFSchema,
+}
+
+#[derive(Debug)]
+enum LookupOrder {
+    /// Maps address-sorted positions to positions in the original input page.
+    Source(UInt32Array),
+    /// Cached IPC only contains address-sorted data, without its input order.
+    Unsorted,
+    /// Positions of non-null values in ascending value order.
+    Values(UInt32Array),
 }
 
 impl DeepSizeOf for FlatIndex {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // `df_schema` is a two-field schema derived from `data`; its footprint
         // is a few hundred bytes and not worth a separate accounting.
+        // Charge for the eventual lookup permutation even before it exists,
+        // so lazy initialization cannot grow an already-accounted cache entry.
+        let lookup_extra = if self.values().as_primitive_opt::<UInt64Type>().is_some() {
+            U64Lookup::extra_size(self.data.num_rows())
+        } else {
+            0
+        };
         self.data.get_array_memory_size()
+            + self.data.num_rows() * std::mem::size_of::<u32>()
+            + lookup_extra
     }
 }
 
@@ -116,11 +143,14 @@ impl FlatIndex {
     pub fn try_new(data: RecordBatch) -> Result<Self> {
         // Sort by row id so every filtered view of the id column is itself
         // sorted, which is what makes bitmap construction cheap downstream.
-        let data = data.sort_by_column(IDS_COL_IDX, None)?;
+        let row_order = sort_to_indices(data.column(IDS_COL_IDX), None, None)?;
+        let data = data.take(&row_order)?;
         let df_schema = DFSchema::try_from(data.schema())?;
 
         Ok(Self {
             data: Arc::new(data),
+            lookup_order: Mutex::new(LookupOrder::Source(row_order)),
+            lookup_u64: OnceLock::new(),
             df_schema,
         })
     }
@@ -131,6 +161,55 @@ impl FlatIndex {
 
     pub(crate) fn values(&self) -> &ArrayRef {
         self.data.column(VALUES_COL_IDX)
+    }
+
+    pub(crate) fn value_order(&self) -> Result<UInt32Array> {
+        let mut order = self
+            .lookup_order
+            .lock()
+            .map_err(|_| Error::internal("BTree lookup order lock poisoned"))?;
+        if let LookupOrder::Values(order) = &*order {
+            return Ok(order.clone());
+        }
+        let values = self.values();
+        let value_order = if values.len() == values.logical_null_count() {
+            UInt32Array::from(Vec::<u32>::new())
+        } else if let LookupOrder::Source(row_order) = &*order {
+            let mut positions = vec![0; row_order.len()];
+            for (position, &source) in row_order.values().iter().enumerate() {
+                positions[source as usize] = position as u32;
+            }
+            positions.retain(|&position| values.is_valid(position as usize));
+            let compare = make_comparator(values, values, SortOptions::default())?;
+            // Current writers persist value order. Remapped or older pages
+            // may not, so validate it before using the inverse permutation.
+            if !positions
+                .windows(2)
+                .all(|pair| !compare(pair[0] as usize, pair[1] as usize).is_gt())
+            {
+                positions.sort_unstable_by(|&a, &b| compare(a as usize, b as usize));
+            }
+            UInt32Array::from(positions)
+        } else {
+            let order = sort_to_indices(values, None, None)?;
+            order.slice(values.null_count(), values.len() - values.null_count())
+        };
+        *order = LookupOrder::Values(value_order.clone());
+        Ok(value_order)
+    }
+
+    pub(super) fn lookup_u64(&self) -> Result<Option<&Arc<U64Lookup>>> {
+        let Some(values) = self.values().as_primitive_opt::<UInt64Type>() else {
+            return Ok(None);
+        };
+        if let Some(lookup) = self.lookup_u64.get() {
+            return Ok(lookup.as_ref());
+        }
+        let order = self.value_order()?;
+        Ok(self
+            .lookup_u64
+            .get_or_init(|| U64Lookup::try_new(values, self.ids(), order).map(Arc::new))
+            .as_ref())
     }
 
     fn has_nulls(&self) -> bool {
@@ -432,11 +511,13 @@ impl CacheCodecImpl for FlatIndex {
         Self: Sized,
     {
         let batch = r.read_ipc()?;
-
+        // Cached data is already address-sorted. Keep its IPC buffers shared
+        // and defer rebuilding the lookup permutation until it is requested.
         let df_schema = DFSchema::try_from(batch.schema())?;
-
         Ok(Self {
             data: Arc::new(batch),
+            lookup_order: Mutex::new(LookupOrder::Unsorted),
+            lookup_u64: OnceLock::new(),
             df_schema,
         })
     }
@@ -450,7 +531,7 @@ mod tests {
     };
 
     use super::*;
-    use arrow_array::{record_batch, types::Int32Type};
+    use arrow_array::{NullArray, record_batch, types::Int32Type};
     use datafusion_common::ScalarValue;
     use lance_core::utils::row_addr_remap::GroupInput;
     use lance_datagen::{RowCount, array, gen_batch};
@@ -490,6 +571,17 @@ mod tests {
 
         assert_eq!(restored.data, index.data);
         assert_eq!(restored.all().unwrap(), index.all().unwrap());
+        let ordered_values = |index: &FlatIndex| {
+            let charged_size = index.deep_size_of();
+            let order = index.value_order().unwrap();
+            assert_eq!(index.deep_size_of(), charged_size);
+            assert_eq!(index.value_order().unwrap(), order);
+            arrow_select::take::take(index.values(), &order, None).unwrap()
+        };
+        assert_eq!(
+            ordered_values(&restored).to_data(),
+            ordered_values(index).to_data()
+        );
     }
 
     /// The per-page primitives hand back sorted, filtered views of the id
@@ -570,9 +662,98 @@ mod tests {
         .unwrap();
         assert_roundtrips(&FlatIndex::try_new(batch).unwrap());
 
+        let nulls = RecordBatch::try_from_iter_with_nullable([
+            (
+                BTREE_VALUES_COLUMN,
+                Arc::new(NullArray::new(3)) as ArrayRef,
+                true,
+            ),
+            (
+                BTREE_IDS_COLUMN,
+                Arc::new(UInt64Array::from(vec![2, 0, 1])) as ArrayRef,
+                false,
+            ),
+        ])
+        .unwrap();
+        assert_roundtrips(&FlatIndex::try_new(nulls).unwrap());
+
         // Empty index
         let empty = RecordBatch::new_empty(example_index().data.schema());
         assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
+    }
+
+    #[rstest]
+    #[case::range(vec![Some(103), Some(100), Some(102), Some(101)], Some(vec![73, 70, 72, 71]), true)]
+    #[case::dense(vec![Some(103), Some(100), Some(102), Some(101)], Some(vec![15, 0, 8, 20]), true)]
+    #[case::sparse_word_boundaries((0..130).filter(|key| key % 3 != 1).map(Some).collect(), None, true)]
+    #[case::nullable(vec![Some(102), None, Some(100), Some(101)], None, true)]
+    #[case::high_keys((u64::MAX-7..=u64::MAX).rev().map(Some).collect(), None, true)]
+    #[case::duplicate_and_hole(vec![Some(10), Some(11), Some(11), Some(13)], None, false)]
+    #[case::huge_span(vec![Some(0), Some(u64::MAX)], None, false)]
+    #[case::all_null(vec![None, None], None, false)]
+    #[case::empty(vec![], None, false)]
+    fn test_u64_mapping_preserves_pairs_and_cache(
+        #[case] values: Vec<Option<u64>>,
+        #[case] addresses: Option<Vec<u64>>,
+        #[case] specialized: bool,
+    ) {
+        let addresses =
+            addresses.unwrap_or_else(|| (0..values.len()).rev().map(|i| (i * 2) as u64).collect());
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, UInt64, values.clone()),
+            (BTREE_IDS_COLUMN, UInt64, addresses.clone())
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+        let mut bytes = Vec::new();
+        index
+            .serialize(&mut CacheEntryWriter::new(&mut bytes))
+            .unwrap();
+        let bytes = bytes::Bytes::from(bytes);
+        let restored = FlatIndex::deserialize(&mut CacheEntryReader::new(
+            &bytes,
+            0,
+            FlatIndex::CURRENT_VERSION,
+        ))
+        .unwrap();
+        let mut queries = values.clone();
+        queries.extend([
+            Some(0),
+            Some(12),
+            Some(63),
+            Some(64),
+            Some(65),
+            Some(127),
+            Some(128),
+            Some(u64::MAX),
+            None,
+        ]);
+        let mut expected = Vec::new();
+        for (key_index, key) in queries.iter().enumerate() {
+            if let Some(key) = key {
+                for (value, address) in values.iter().zip(&addresses) {
+                    if value == &Some(*key) {
+                        expected.push((key_index as u32, *address));
+                    }
+                }
+            }
+        }
+        expected.sort_unstable();
+        for page in [&index, &restored] {
+            let charged = page.deep_size_of();
+            assert_eq!(page.lookup_u64().unwrap().is_some(), specialized);
+            let keys = crate::scalar::btree::LookupKeys::try_new(Arc::new(UInt64Array::from(
+                queries.clone(),
+            )))
+            .unwrap();
+            let mut actual = keys
+                .match_page(page, None, &NoOpMetricsCollector)
+                .unwrap()
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+            assert_eq!(page.deep_size_of(), charged);
+        }
     }
 
     /// The data batch must decode zero-copy through the full envelope-bearing
