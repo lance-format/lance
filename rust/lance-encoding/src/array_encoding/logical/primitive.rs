@@ -9,6 +9,7 @@ use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use log::trace;
 
+use crate::data::dictionary_batch_limit;
 use crate::decoder::{ColumnBuffers, PageBuffers};
 use crate::decoder::{
     DrainLimit, FieldScheduler, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder, SchedulingJob,
@@ -331,6 +332,11 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 }
 
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        let dictionary_len = self.physical_decoder.as_ref()?.dictionary_len()?;
+        dictionary_batch_limit(&self.data_type, dictionary_len)
+    }
+
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {

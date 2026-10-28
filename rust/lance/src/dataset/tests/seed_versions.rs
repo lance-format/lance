@@ -364,6 +364,69 @@ async fn test_binary_copy_carries_shifted_null_offsets() {
     assert_eq!(seed.total_rows(), values.len() as u64);
 }
 
+/// A version 0 seed whose statistics cannot satisfy the version 1 contract
+/// (here a null count above the zone length) is left unused: the update
+/// scans the fragment, publishes a version 1 segment covering it, and the
+/// indexed answers equal a scan.
+#[tokio::test]
+async fn test_index_update_scans_invalid_version_0_seed() {
+    use arrow_array::{UInt32Array, UInt64Array};
+
+    let dir = TempStrDir::default();
+    let dataset = seeded_dataset(dir.as_str(), &["val"]).await;
+    let crafted = rows(TRAINING_ROWS, ROWS_PER_FILE);
+    // One version 0 record over the whole file with more nulls than rows.
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("min", DataType::Int64, true),
+        ArrowField::new("max", DataType::Int64, true),
+        ArrowField::new("null_count", DataType::UInt32, false),
+        ArrowField::new("nan_count", DataType::UInt32, false),
+        ArrowField::new("zone_length", DataType::UInt64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(TRAINING_ROWS)])),
+            Arc::new(Int64Array::from(vec![Some(
+                TRAINING_ROWS + ROWS_PER_FILE - 1,
+            )])),
+            Arc::new(UInt32Array::from(vec![ROWS_PER_FILE as u32 + 1])),
+            Arc::new(UInt32Array::from(vec![0u32])),
+            Arc::new(UInt64Array::from(vec![ROWS_PER_FILE as u64])),
+        ],
+    )
+    .unwrap();
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut writer = IpcWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+    let seeds = vec![("val", Bytes::from(buf.into_inner()))];
+    let mut dataset = commit_crafted_fragment(dataset, crafted, &seeds).await;
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    let indices = reopened.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1, "{indices:?}");
+    assert_eq!(indices[0].index_version, 1);
+    assert_eq!(
+        indices[0].fragment_bitmap.as_ref().unwrap(),
+        reopened.fragment_bitmap.as_ref(),
+        "the scanned fragment is covered"
+    );
+    for filter in ["val > 20", "val = 70", "val < 100 AND val > 30"] {
+        assert_eq!(
+            count(&reopened, filter, true).await,
+            count(&reopened, filter, false).await,
+            "{filter}"
+        );
+    }
+}
+
 /// An index update that harvests a future-version seed fails before
 /// publishing anything; it never covers the fragment with statistics it
 /// could not read.

@@ -23,6 +23,7 @@ use crate::dataset::{
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
+use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
@@ -3189,6 +3190,68 @@ async fn write_rejects_dictionary_null_index_outside_declared_key_range(
         error
             .to_string()
             .contains("dictionary indices use 32 bits but the declared Int8 key type uses 8 bits")
+    );
+}
+
+#[rstest]
+#[case::appended_null("v10.0.0/wide_dictionary/appended_null.lance", 128, 2, 2)]
+#[case::merged_chunks("v13.0.0/wide_dictionary/merged_chunks.lance", 100, 2, 2)]
+#[case::compacted("v13.0.0/wide_dictionary/compacted.lance", 100, 1, 1)]
+#[tokio::test]
+async fn read_historical_widened_dictionary(
+    #[case] fixture: &str,
+    #[case] values_per_chunk: usize,
+    #[case] repetitions: usize,
+    #[case] fragments: usize,
+    #[values(64, 1024)] batch_size: usize,
+) {
+    let directory = copy_test_data_to_tmp(fixture).unwrap();
+    let dataset = Dataset::open(&directory.path_str()).await.unwrap();
+    assert_eq!(dataset.count_fragments(), fragments);
+    let chunks = if values_per_chunk == 128 { 1 } else { 2 };
+    let expected = (0..repetitions)
+        .flat_map(|_| {
+            (0..chunks).flat_map(|chunk| {
+                (chunk * values_per_chunk..(chunk + 1) * values_per_chunk)
+                    .map(|i| Some(format!("v{i}")))
+                    .chain([None])
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut stream = dataset
+        .scan()
+        .batch_size(batch_size)
+        .try_into_stream()
+        .await
+        .unwrap();
+    let mut actual = Vec::with_capacity(expected.len());
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        assert!(batch.num_rows() <= batch_size.min(128));
+        assert_eq!(
+            batch["d"].data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+        );
+        let values = arrow::compute::cast(&batch["d"], &DataType::Utf8).unwrap();
+        actual.extend(
+            as_string_array(&values)
+                .iter()
+                .map(|value| value.map(str::to_owned)),
+        );
+    }
+    assert_eq!(actual, expected);
+
+    // Sparse reads must remap the stored keys even when only high positions in
+    // the page dictionary are selected, and must preserve the in-band null.
+    let indices = [expected.len() as u64 - 2, expected.len() as u64 - 1, 0];
+    let batch = dataset
+        .take(&indices, Arc::new(dataset.schema().clone()))
+        .await
+        .unwrap();
+    let values = arrow::compute::cast(&batch["d"], &DataType::Utf8).unwrap();
+    let expected = indices.map(|i| expected[i as usize].as_deref());
+    assert_eq!(
+        as_string_array(&values),
+        &StringArray::from(Vec::from(expected))
     );
 }
 

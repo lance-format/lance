@@ -23,6 +23,7 @@ use lance_index::{
         lance_format::LanceIndexStore,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
+        zonemap::ZoneMapIndexVersion,
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -913,6 +914,14 @@ async fn merge_scalar_indices<'a>(
             .iter()
             .any(|segment| !segment.results_are_row_addrs());
 
+    // An older ZoneMap file version lacks statistics the current version
+    // stores (the NaN sign split, the maximum hidden by the NaN marker);
+    // only a scan recovers them, so such a segment is rebuilt, not merged.
+    let zonemap_requires_rebuild = index_type == IndexType::ZoneMap
+        && selected_old_indices
+            .iter()
+            .any(|segment| segment.index_version < ZoneMapIndexVersion::CURRENT as i32);
+
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
     //   - `effective_old_frags`: the selected segments' coverage intersected
@@ -928,6 +937,7 @@ async fn merge_scalar_indices<'a>(
         && !update_criteria.requires_old_data
         && !ngram_requires_rebuild
         && !legacy_domain_mismatch
+        && !zonemap_requires_rebuild
         && (has_segment_merge_primitive || selected_old_indices.len() == 1);
 
     // The bitmap the merged segment commits, decided by how its content is
@@ -5702,7 +5712,16 @@ mod tests {
                 &["vector"],
                 IndexType::Vector,
                 None,
-                &VectorIndexParams::ivf_flat(num_partitions, MetricType::L2),
+                // Pin the type default target: the join case needs its partitions
+                // under a quarter of it, and a build from a partition count would
+                // record its own.
+                &VectorIndexParams::with_ivf_flat_params(
+                    MetricType::L2,
+                    IvfBuildParams {
+                        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                        ..IvfBuildParams::new(num_partitions)
+                    },
+                ),
                 true,
             )
             .await

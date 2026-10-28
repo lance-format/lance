@@ -1785,6 +1785,8 @@ mod tests {
         /// the masked-load (mask 0x00FF) AVX-512 implementation produces
         /// the same result as the scalar reference. Early-returns on hosts
         /// without AVX-512F.
+        /// Direct kernels need the same absolute tolerance as scalar/SIMD
+        /// parity: different reduction orders lose relative precision near zero.
         #[cfg(target_arch = "x86_64")]
         #[test]
         fn test_cosine_once_8_scalar_vs_avx512_parity(
@@ -1799,7 +1801,7 @@ mod tests {
             let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
             let avx512 =
                 unsafe { super::f32::cosine_once_x86::cosine_once_8_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX-512-direct parity for the 16-lane cosine_once kernel. Verifies
@@ -1820,7 +1822,7 @@ mod tests {
             let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
             let avx512 =
                 unsafe { super::f32::cosine_once_x86::cosine_once_16_avx512(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx512, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX + FMA-direct parity for the 8-lane cosine_once kernel.
@@ -1840,7 +1842,7 @@ mod tests {
             let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
             let avx_fma =
                 unsafe { super::f32::cosine_once_x86::cosine_once_8_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX + FMA-direct parity for the 16-lane cosine_once kernel.
@@ -1860,7 +1862,7 @@ mod tests {
             let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
             let avx_fma =
                 unsafe { super::f32::cosine_once_x86::cosine_once_16_avx_fma(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx_fma, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX-only-direct parity for the 8-lane cosine_once kernel.
@@ -1879,7 +1881,7 @@ mod tests {
             let x_norm = norm_l2(&x);
             let scalar = super::f32::cosine_once_8_scalar(&x, x_norm, &y);
             let avx = unsafe { super::f32::cosine_once_x86::cosine_once_8_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5, epsilon = 1e-6));
         }
 
         /// AVX-only-direct parity for the 16-lane cosine_once kernel.
@@ -1898,7 +1900,7 @@ mod tests {
             let x_norm = norm_l2(&x);
             let scalar = super::f32::cosine_once_16_scalar(&x, x_norm, &y);
             let avx = unsafe { super::f32::cosine_once_x86::cosine_once_16_avx(&x, x_norm, &y) };
-            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
+            prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5, epsilon = 1e-6));
         }
     }
 

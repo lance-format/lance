@@ -747,7 +747,7 @@ async fn plan_split_rebuild(
     }
     let uuid = Uuid::new_v4();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let files = build_vector_model_segment(
+    let built = build_vector_model_segment(
         dataset,
         field_path,
         name,
@@ -764,11 +764,14 @@ async fn plan_split_rebuild(
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
-        index_details: Some(Arc::new(vector_index_details(&params))),
+        index_details: Some(Arc::new(vector_index_details(
+            &params,
+            built.target_partition_size,
+        ))),
         index_version: params.index_type().version(),
         created_at: Some(Utc::now()),
         base_id: None,
-        files: Some(files),
+        files: Some(built.files),
     };
     Ok(Some(SplitInputs {
         reference,

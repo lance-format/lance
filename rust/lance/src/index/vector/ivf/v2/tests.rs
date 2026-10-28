@@ -35,6 +35,7 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::vector::details::target_partition_size_from_details;
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
@@ -5414,7 +5415,12 @@ async fn test_spfresh_join_split() {
     .await
     .unwrap();
 
-    let ivf_params = IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap();
+    // Pin the type default target so the limits above are the ones this test
+    // reasons about; a build from a partition count would record its own.
+    let ivf_params = IvfBuildParams {
+        target_partition_size: Some(IndexType::IvfPq.target_partition_size()),
+        ..IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap()
+    };
     let params = VectorIndexParams::with_ivf_pq_params(
         DistanceType::L2,
         ivf_params,
@@ -5486,6 +5492,32 @@ async fn test_spfresh_join_split() {
         true,
     )
     .await;
+}
+
+/// A multivector index built from a partition count records no target
+/// partition size: a retrain divides the table's rows by the target, so a
+/// target in vectors would train a fraction of the partitions.
+#[tokio::test]
+async fn test_multivec_build_from_partition_count_records_no_target() {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, _) =
+        generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::Cosine,
+        IvfBuildParams::new(1),
+        lightweight_pq_params(),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let details = indices[0]
+        .index_details
+        .as_ref()
+        .expect("a vector index records its details");
+    assert_eq!(target_partition_size_from_details(details), None);
 }
 
 #[tokio::test]
@@ -5599,7 +5631,12 @@ async fn test_split_multiple_partitions_in_one_optimize() {
     .unwrap();
 
     let centroids = build_centroids_for_offsets(&offsets);
-    let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+    // Pin the type default target so the threshold above is the one this test
+    // reasons about; a build from a partition count would record its own.
+    let ivf_params = IvfBuildParams {
+        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+        ..IvfBuildParams::try_with_centroids(2, centroids).unwrap()
+    };
     let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
     dataset
         .create_index(
@@ -5912,7 +5949,16 @@ async fn optimize_after_delete(
     .await
     .unwrap();
 
-    let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
+    // Pin the type default target: both callers size their partitions against
+    // its split and join thresholds, and a build from a partition count would
+    // record its own.
+    let params = VectorIndexParams::with_ivf_flat_params(
+        DistanceType::L2,
+        IvfBuildParams {
+            target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+            ..IvfBuildParams::new(nlist)
+        },
+    );
     dataset
         .create_index(
             &["vector"],

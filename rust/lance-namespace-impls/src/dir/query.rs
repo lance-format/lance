@@ -74,7 +74,6 @@ impl DirectoryNamespace {
         upper_bound: Option<f32>,
         operation: &str,
     ) -> Result<()> {
-        // prefilter must be set before nearest() so the fragment-scan guard sees it.
         if let Some(pf) = prefilter {
             scanner.prefilter(pf);
         }

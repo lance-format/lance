@@ -6496,10 +6496,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_rejects_zero_target_partition_size() {
+        assert_zero_target_rejected(IvfBuildParams::with_target_partition_size(0)).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_with_num_partitions() {
+        assert_zero_target_rejected(IvfBuildParams {
+            target_partition_size: Some(0),
+            ..IvfBuildParams::new(20)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_with_centroids() {
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![0.0; 2 * DIM]),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        assert_zero_target_rejected(IvfBuildParams {
+            target_partition_size: Some(0),
+            centroids: Some(centroids),
+            ..Default::default()
+        })
+        .await;
+    }
+
+    async fn assert_zero_target_rejected(ivf_params: IvfBuildParams) {
         let test_dir = TempStrDir::default();
         let (mut dataset, _) = generate_test_dataset(test_dir.as_str(), 0.0..1.0).await;
-
-        let ivf_params = IvfBuildParams::with_target_partition_size(0);
         let params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
         let err = dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)

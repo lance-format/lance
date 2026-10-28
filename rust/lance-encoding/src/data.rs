@@ -1232,6 +1232,21 @@ impl DictionaryDataBlock {
     }
 }
 
+/// Limits recovery batches only when a stored dictionary exceeds its declared key capacity.
+pub(crate) fn dictionary_batch_limit(data_type: &DataType, dictionary_len: u64) -> Option<u64> {
+    let DataType::Dictionary(key_type, _) = data_type else {
+        return None;
+    };
+    let capacity = match key_type.as_ref() {
+        DataType::Int8 => i8::MAX as u64 + 1,
+        DataType::UInt8 => u8::MAX as u64 + 1,
+        DataType::Int16 => i16::MAX as u64 + 1,
+        DataType::UInt16 => u16::MAX as u64 + 1,
+        _ => return None,
+    };
+    (dictionary_len > capacity).then_some(capacity)
+}
+
 /// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
 ///
 /// The output of each decoder is a DataBlock.  Decoders can be chained together to transform
@@ -3377,6 +3392,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dictionary_rejects_unsupported_index_width_mismatch() {
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u16]),
+                bits_per_value: 16,
+                num_values: 1,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec!["value"]))),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let error = block.into_arrow(data_type, false).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("dictionary indices use 16 bits"));
+    }
+
     fn widened_int8_dictionary(indices: Vec<u32>, values: Vec<Option<String>>) -> ArrayRef {
         let num_values = indices.len() as u64;
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
@@ -3509,6 +3541,113 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    #[rstest]
+    #[case::fits_int8(DataType::Int8, 128, None)]
+    #[case::overflow_int8(DataType::Int8, 129, Some(128))]
+    #[case::fits_uint8(DataType::UInt8, 256, None)]
+    #[case::overflow_uint8(DataType::UInt8, 257, Some(256))]
+    #[case::fits_int16(DataType::Int16, 32768, None)]
+    #[case::overflow_int16(DataType::Int16, 32769, Some(32768))]
+    #[case::fits_uint16(DataType::UInt16, 65536, None)]
+    #[case::overflow_uint16(DataType::UInt16, 65537, Some(65536))]
+    fn dictionary_recovery_batch_limit(
+        #[case] key_type: DataType,
+        #[case] dictionary_len: u64,
+        #[case] expected: Option<u64>,
+    ) {
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        assert_eq!(
+            super::dictionary_batch_limit(&data_type, dictionary_len),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::int8(DataType::Int8)]
+    #[case::uint8(DataType::UInt8)]
+    #[case::int16(DataType::Int16)]
+    #[case::uint16(DataType::UInt16)]
+    fn dictionary_recovers_widened_indices(#[case] key_type: DataType) {
+        // Duplicate values and a null beyond the declared key's range are both
+        // emitted by historical writers. Only the selected values need to fit.
+        let high_index = super::max_index_val(&key_type) as usize + 1;
+        let mut values = vec![Some("duplicate"); high_index + 2];
+        values[high_index] = Some("high");
+        values[high_index + 1] = None;
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![
+                    high_index as u32,
+                    0,
+                    high_index as u32 + 1,
+                    1,
+                ]),
+                bits_per_value: 32,
+                num_values: 4,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(values))),
+        });
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        for validate in [false, true] {
+            let array = make_array(
+                block
+                    .clone()
+                    .into_arrow(data_type.clone(), validate)
+                    .unwrap(),
+            );
+            assert_eq!(array.data_type(), &data_type);
+            let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+            assert_eq!(
+                decoded.as_ref(),
+                &StringArray::from(vec![
+                    Some("high"),
+                    Some("duplicate"),
+                    None,
+                    Some("duplicate")
+                ])
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::all_null(vec![None, None])]
+    fn dictionary_recovers_widened_nulls(#[case] values: Vec<Option<&str>>) {
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u32; values.len()]),
+                bits_per_value: 32,
+                num_values: values.len() as u64,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec![None::<&str>]))),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let array = make_array(block.into_arrow(data_type, false).unwrap());
+        let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+        assert_eq!(decoded.as_ref(), &StringArray::from(values));
+    }
+
+    #[test]
+    fn dictionary_recovers_widened_duplicate_entries() {
+        let values =
+            StringArray::from((0..180).map(|i| format!("v{}", i % 90)).collect::<Vec<_>>());
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec((0_u32..180).collect()),
+                bits_per_value: 32,
+                num_values: 180,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(values.clone())),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let array = make_array(block.into_arrow(data_type, false).unwrap());
+        let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+        assert_eq!(decoded.as_ref(), &values);
     }
 
     #[rstest]
