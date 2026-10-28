@@ -3,7 +3,6 @@
 
 //! Ordered, deletion-aware lookup of unique keys through ordinary scalar indices.
 
-mod capture;
 mod uint64;
 
 use std::collections::{BTreeMap, HashMap};

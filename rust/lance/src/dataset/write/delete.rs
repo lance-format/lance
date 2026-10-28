@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
@@ -324,7 +325,8 @@ impl RetryExecutor for DeleteJob {
                     let removed_row_ids = row_id_rx.try_recv().map_err(|err| {
                         Error::internal(format!("Failed to receive row ids: {}", err))
                     })?;
-                    let removed_row_addrs = removed_row_ids.row_addrs(&self.dataset).await?;
+                    let row_id_index = get_row_id_index(&self.dataset).await?;
+                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
 
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;
