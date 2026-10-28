@@ -137,6 +137,10 @@ pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataTyp
     Ok(())
 }
 
+/// Field IDs of a new table must be below this (2^30), leaving room for about a
+/// billion fields added later.
+pub const NEW_TABLE_FIELD_ID_LIMIT: i32 = 1 << 30;
+
 impl Schema {
     /// The unenforced primary key fields in the schema, ordered by position.
     ///
@@ -348,8 +352,8 @@ impl Schema {
         self.do_project(columns, true, true)
     }
 
-    /// Check that the top level fields don't contain `.` in their names
-    /// to distinguish from nested fields.
+    /// Check field ids, sibling names, fixed-size-list dimensions, and top-level
+    /// names (which cannot contain `.` to distinguish them from nested paths).
     // TODO: pub(crate)
     pub fn validate(&self) -> Result<()> {
         let mut seen_names = HashSet::new();
@@ -367,6 +371,20 @@ impl Schema {
                     "Duplicate field name \"{}\" in schema:\n {:#?}",
                     field.name, self
                 )));
+            }
+        }
+
+        // Each child collection has its own namespace. Checking only the root
+        // makes a later sibling with the same name unreachable by field path.
+        for parent in self.fields_pre_order() {
+            let mut seen_children = HashSet::with_capacity(parent.children.len());
+            for child in &parent.children {
+                if !seen_children.insert(child.name.as_str()) {
+                    return Err(Error::schema(format!(
+                        "Duplicate field name \"{}\" under field \"{}\" in schema:\n {:#?}",
+                        child.name, parent.name, self
+                    )));
+                }
             }
         }
 
@@ -402,6 +420,50 @@ impl Schema {
             validate_fixed_size_list_dimensions(&field.name, &field.data_type())?;
         }
 
+        Ok(())
+    }
+
+    /// Validate a schema before storing it in a dataset manifest.
+    ///
+    /// System columns are virtual on reads, so [`Self::validate`] permits their
+    /// names in projection schemas. Stored top-level fields must have nonempty
+    /// names and may not use system-column names. Nested fields may use system
+    /// names because virtual columns are added only at the schema root.
+    ///
+    /// ```
+    /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// use lance_core::datatypes::Schema;
+    ///
+    /// let arrow = ArrowSchema::new(vec![Field::new("_rowid", DataType::UInt64, false)]);
+    /// let schema = Schema::try_from(&arrow)?;
+    /// assert!(schema.validate_writable().is_err());
+    /// let empty = ArrowSchema::new(vec![Field::new("", DataType::UInt64, false)]);
+    /// assert!(Schema::try_from(&empty)?.validate_writable().is_err());
+    ///
+    /// let nested = ArrowSchema::new(vec![Field::new(
+    ///     "outer",
+    ///     DataType::Struct(vec![Field::new("_rowid", DataType::UInt64, false)].into()),
+    ///     false,
+    /// )]);
+    /// Schema::try_from(&nested)?.validate_writable()?;
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn validate_writable(&self) -> Result<()> {
+        self.validate()?;
+        for (index, field) in self.fields.iter().enumerate() {
+            if field.name.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "The top-level column at index {index} has an empty name and cannot be stored in a Lance dataset"
+                )));
+            }
+            if crate::is_system_column(&field.name) {
+                return Err(Error::invalid_input(format!(
+                    "The column '{}' at path '{}' is a reserved name and cannot be stored in a Lance dataset",
+                    field.name,
+                    self.field_path_minimal(field.id)?
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -740,6 +802,35 @@ impl Schema {
             field.try_set_id(-1, &mut current_id)?;
         }
         Ok(())
+    }
+
+    /// Assign field IDs for a new table: keep the IDs the fields carry and give
+    /// each field without one an ID above the largest.
+    ///
+    /// Fails when two fields share an ID, or when an ID is not below
+    /// [`NEW_TABLE_FIELD_ID_LIMIT`], so the table has room for fields added later.
+    pub fn try_assign_new_table_field_ids(&mut self) -> Result<()> {
+        self.try_keep_field_ids()?;
+        if let Some(max_id) = self.max_field_id()
+            && max_id >= NEW_TABLE_FIELD_ID_LIMIT
+        {
+            return Err(Error::invalid_input(format!(
+                "field ID {max_id} is too large for a new table: field IDs must be below \
+                 {NEW_TABLE_FIELD_ID_LIMIT} to leave room for fields added later"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Keep the IDs the fields carry and give each field without one an ID
+    /// above the largest. Unlike [`Self::try_assign_new_table_field_ids`] there
+    /// is no upper limit, for IDs an existing table already uses, which may be
+    /// past [`NEW_TABLE_FIELD_ID_LIMIT`].
+    ///
+    /// Fails when two fields share an ID.
+    pub fn try_keep_field_ids(&mut self) -> Result<()> {
+        self.try_set_field_id(None)?;
+        self.validate()
     }
 
     /// Replace every field ID with a fresh checked allocation.
@@ -1836,6 +1927,7 @@ mod tests {
     use crate::datatypes::field::LANCE_FIELD_ID_KEY;
     use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
+    use rstest::rstest;
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
@@ -2099,6 +2191,96 @@ mod tests {
         let error = schema.validate().unwrap_err();
         assert!(matches!(&error, Error::Schema { .. }));
         assert!(error.to_string().contains("Duplicate field id 0"));
+    }
+
+    #[rstest]
+    #[case::direct(false)]
+    #[case::deeply_nested(true)]
+    fn test_validate_rejects_duplicate_sibling_names(#[case] is_nested: bool) {
+        let duplicate_children = DataType::Struct(ArrowFields::from(vec![
+            ArrowField::new("x", DataType::Int32, false),
+            ArrowField::new("x", DataType::Int64, false),
+        ]));
+        let data_type = if is_nested {
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "inner",
+                duplicate_children,
+                false,
+            )]))
+        } else {
+            duplicate_children
+        };
+        let arrow = ArrowSchema::new(vec![ArrowField::new("outer", data_type, false)]);
+        let error = Schema::try_from(&arrow).unwrap_err();
+        assert!(matches!(&error, Error::Schema { .. }));
+        assert!(error.to_string().contains("Duplicate field name \"x\""));
+
+        let valid = ArrowSchema::new(vec![
+            ArrowField::new(
+                "left",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int32,
+                    false,
+                )])),
+                false,
+            ),
+            ArrowField::new(
+                "right",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int64,
+                    false,
+                )])),
+                false,
+            ),
+        ]);
+        assert!(Schema::try_from(&valid).is_ok());
+    }
+
+    #[rstest]
+    #[case::row_id(ROW_ID)]
+    #[case::row_address(ROW_ADDR)]
+    #[case::row_offset(ROW_OFFSET)]
+    #[case::last_updated(ROW_LAST_UPDATED_AT_VERSION)]
+    #[case::created(ROW_CREATED_AT_VERSION)]
+    fn test_validate_writable_rejects_system_names_only_at_root(
+        #[case] name: &str,
+        #[values(false, true)] is_nested: bool,
+    ) {
+        let field = ArrowField::new(name, DataType::UInt64, false);
+        let arrow = if is_nested {
+            ArrowSchema::new(vec![ArrowField::new(
+                "outer",
+                DataType::Struct(ArrowFields::from(vec![field])),
+                false,
+            )])
+        } else {
+            ArrowSchema::new(vec![field])
+        };
+        let schema = Schema::try_from(&arrow).unwrap();
+        schema.validate().unwrap();
+        if is_nested {
+            schema.validate_writable().unwrap();
+            return;
+        }
+        let error = schema.validate_writable().unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(&format!("path '{name}'")));
+        assert!(error.to_string().contains("reserved name"));
+    }
+
+    #[test]
+    fn test_validate_writable_rejects_empty_top_level_name() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("", DataType::Int32, false),
+        ]);
+        let schema = Schema::try_from(&arrow).unwrap();
+        let error = schema.validate_writable().unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("index 1"), "{error}");
+        assert!(error.to_string().contains("empty name"), "{error}");
     }
 
     #[test]
@@ -2601,6 +2783,38 @@ mod tests {
             .intersection_ignore_types(&schema_with_list_struct)
             .unwrap();
         assert_eq!(intersection, with_missing_field);
+
+        // LargeList must narrow its item children the same way List does.
+        let schema_with_large_list_struct = ArrowSchema::new(vec![ArrowField::new(
+            "struct_list",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+        let schema_with_large_list_struct =
+            Schema::try_from(&schema_with_large_list_struct).unwrap();
+
+        let with_missing_field = schema_with_large_list_struct.project_by_ids(&[1, 3], false);
+        let intersection = schema_with_large_list_struct
+            .intersection_ignore_types(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        let intersection = with_missing_field
+            .intersection_ignore_types(&schema_with_large_list_struct)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        // Strict mode must narrow as well: item child types are shared here,
+        // so the recursion is not gated behind ignore_types.
+        let intersection = schema_with_large_list_struct
+            .intersection(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
     }
 
     #[test]
@@ -2675,6 +2889,56 @@ mod tests {
                 ("right_only".to_string(), "right".to_string()),
             ])
         );
+    }
+
+    fn with_field_id(field: ArrowField, id: i32) -> ArrowField {
+        field.with_metadata(HashMap::from([(
+            LANCE_FIELD_ID_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    #[test]
+    fn test_new_table_keeps_supplied_field_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            with_field_id(ArrowField::new("a", DataType::Int32, false), 0),
+            with_field_id(
+                ArrowField::new(
+                    "s",
+                    DataType::Struct(ArrowFields::from(vec![
+                        with_field_id(ArrowField::new("x", DataType::Utf8, true), 7),
+                        ArrowField::new("y", DataType::Utf8, true),
+                    ])),
+                    true,
+                ),
+                3,
+            ),
+            ArrowField::new("b", DataType::Int64, true),
+        ]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.try_assign_new_table_field_ids().unwrap();
+
+        let ids: Vec<(&str, i32)> = schema
+            .fields_pre_order()
+            .map(|field| (field.name.as_str(), field.id))
+            .collect();
+        assert_eq!(ids, vec![("a", 0), ("s", 3), ("x", 7), ("y", 8), ("b", 9)]);
+    }
+
+    #[rstest::rstest]
+    #[case::at_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT])]
+    #[case::filled_up_to_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT - 1, -1])]
+    #[case::largest_possible(vec![i32::MAX])]
+    #[case::shared(vec![1, 1])]
+    fn test_new_table_rejects_unusable_field_ids(#[case] ids: Vec<i32>) {
+        let fields: Vec<ArrowField> = (0..ids.len())
+            .map(|i| ArrowField::new(format!("f{i}"), DataType::Int32, true))
+            .collect();
+        let mut schema = Schema::try_from(&ArrowSchema::new(fields)).unwrap();
+        for (field, id) in schema.fields.iter_mut().zip(ids) {
+            field.id = id;
+        }
+        assert!(schema.try_assign_new_table_field_ids().is_err());
     }
 
     #[test]

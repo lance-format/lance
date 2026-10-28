@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    data::concat_decoded_arrays,
     decoder::{
         DecodeArrayTask, DrainLimit, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
@@ -535,6 +536,14 @@ impl SimpleStructDecoder {
 }
 
 impl LogicalPageDecoder for SimpleStructDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        self.children
+            .iter()
+            .flat_map(|child| child.scheduled.iter())
+            .filter_map(|decoder| decoder.max_dictionary_rows())
+            .min()
+    }
+
     fn accept_child(&mut self, mut child: DecoderReady) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();
@@ -635,7 +644,7 @@ impl CompositeDecodeTask {
         //
         // This optimization is probably most important for super fast storage like NVME
         // where the page size can be smaller.
-        Ok(arrow_select::concat::concat(&array_refs)?)
+        concat_decoded_arrays(&array_refs)
     }
 }
 

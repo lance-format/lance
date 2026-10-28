@@ -13,8 +13,8 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use ivf::storage::IvfModel;
 use lance_core::deepsize::DeepSizeOf;
@@ -189,6 +189,8 @@ pub struct Query {
 
     /// The number of candidates to reserve while searching.
     /// this is an optional parameter for HNSW related index types.
+    /// Unset defaults to `1.5 * k * refine_factor`, floored at
+    /// [`crate::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub ef: Option<usize>,
 
     /// If presented, apply a refine step.

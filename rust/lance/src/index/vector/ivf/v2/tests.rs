@@ -35,6 +35,7 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::vector::details::target_partition_size_from_details;
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
@@ -83,7 +84,7 @@ use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
-use lance_linalg::distance::{DistanceType, multivec_distance};
+use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
@@ -1203,6 +1204,61 @@ async fn load_vector_index_context(
     }
 }
 
+/// An empty HNSW partition must carry the segment's build parameters so that
+/// `statistics()` never reports the sub-index defaults for a partition without
+/// rows (regression: append-optimize segments with a leading empty partition
+/// surfaced `{max_level: 7, m: 20, ef_construction: 150}` instead of the
+/// reference segment's parameters).
+#[tokio::test]
+async fn test_empty_partition_metadata_preserves_hnsw_build_params() {
+    const INDEX_NAME: &str = "test_index";
+
+    let test_dir = TempStrDir::default();
+    let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS);
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+        .await
+        .unwrap();
+
+    // A centroid at 100000.0 puts every row closer to the zero centroid, so
+    // partition 0 is deterministically empty without retraining.
+    let mut centroid_values = vec![0.0_f32; DIM * 2];
+    for value in centroid_values.iter_mut().take(DIM) {
+        *value = 100000.0;
+    }
+    let centroids = Arc::new(
+        FixedSizeListArray::try_new_from_values(Float32Array::from(centroid_values), DIM as i32)
+            .unwrap(),
+    );
+    let mut ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+    ivf_params.max_iters = 2;
+    ivf_params.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+
+    let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+        DistanceType::L2,
+        ivf_params,
+        lightweight_hnsw_params(),
+        lightweight_pq_params(),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some(INDEX_NAME.to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+
+    let stats_json = dataset.index_statistics(INDEX_NAME).await.unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+    let hnsw_params = &stats["indices"][0]["sub_index"]["params"];
+    assert_eq!(hnsw_params["max_level"], 2, "stats: {stats_json}");
+    assert_eq!(hnsw_params["m"], 4, "stats: {stats_json}");
+    assert_eq!(hnsw_params["ef_construction"], 16, "stats: {stats_json}");
+}
+
 async fn shrink_smallest_partition(
     dataset: &mut Dataset,
     index_name: &str,
@@ -1572,7 +1628,8 @@ fn multivec_ground_truth(
     } else {
         query.as_fixed_size_list().values().clone()
     };
-    multivec_distance(&query, vectors, distance_type)
+    distance_type
+        .multivec(&query, vectors)
         .unwrap()
         .into_iter()
         .enumerate()
@@ -3408,7 +3465,22 @@ async fn test_ivf_pq_f64_smoke(#[case] version: IndexFileVersion) {
 
 #[tokio::test]
 async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
-    let params = pq_matrix_params(1, DistanceType::Cosine, IndexFileVersion::Legacy);
+    let mut ivf_params = IvfBuildParams::new(1);
+    ivf_params.max_iters = 2;
+    ivf_params.sample_rate = PQ_MATRIX_NUM_ROWS;
+    // Multi-vector scoring compounds quantization error. Four-dimensional
+    // sub-vectors keep recall clear of the threshold with this small codebook
+    // training sample; the single-vector matrix's eight-dimensional ones do not.
+    let pq_params = PQBuildParams {
+        num_sub_vectors: 8,
+        num_bits: 8,
+        max_iters: 2,
+        sample_rate: 1,
+        ..Default::default()
+    };
+    let mut params =
+        VectorIndexParams::with_ivf_pq_params(DistanceType::Cosine, ivf_params, pq_params);
+    params.version(IndexFileVersion::Legacy);
     test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
 }
 
@@ -5343,7 +5415,12 @@ async fn test_spfresh_join_split() {
     .await
     .unwrap();
 
-    let ivf_params = IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap();
+    // Pin the type default target so the limits above are the ones this test
+    // reasons about; a build from a partition count would record its own.
+    let ivf_params = IvfBuildParams {
+        target_partition_size: Some(IndexType::IvfPq.target_partition_size()),
+        ..IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap()
+    };
     let params = VectorIndexParams::with_ivf_pq_params(
         DistanceType::L2,
         ivf_params,
@@ -5415,6 +5492,32 @@ async fn test_spfresh_join_split() {
         true,
     )
     .await;
+}
+
+/// A multivector index built from a partition count records no target
+/// partition size: a retrain divides the table's rows by the target, so a
+/// target in vectors would train a fraction of the partitions.
+#[tokio::test]
+async fn test_multivec_build_from_partition_count_records_no_target() {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, _) =
+        generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::Cosine,
+        IvfBuildParams::new(1),
+        lightweight_pq_params(),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let details = indices[0]
+        .index_details
+        .as_ref()
+        .expect("a vector index records its details");
+    assert_eq!(target_partition_size_from_details(details), None);
 }
 
 #[tokio::test]
@@ -5528,7 +5631,12 @@ async fn test_split_multiple_partitions_in_one_optimize() {
     .unwrap();
 
     let centroids = build_centroids_for_offsets(&offsets);
-    let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+    // Pin the type default target so the threshold above is the one this test
+    // reasons about; a build from a partition count would record its own.
+    let ivf_params = IvfBuildParams {
+        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+        ..IvfBuildParams::try_with_centroids(2, centroids).unwrap()
+    };
     let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
     dataset
         .create_index(
@@ -5841,7 +5949,16 @@ async fn optimize_after_delete(
     .await
     .unwrap();
 
-    let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
+    // Pin the type default target: both callers size their partitions against
+    // its split and join thresholds, and a build from a partition count would
+    // record its own.
+    let params = VectorIndexParams::with_ivf_flat_params(
+        DistanceType::L2,
+        IvfBuildParams {
+            target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+            ..IvfBuildParams::new(nlist)
+        },
+    );
     dataset
         .create_index(
             &["vector"],

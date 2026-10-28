@@ -10,14 +10,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, Weak};
 
-use arrow_array::{Array, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array,
+    cast::AsArray,
+    make_array,
+    types::{UInt32Type, UInt64Type},
+};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::DataType;
 use futures::TryStreamExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::{ScalarIndex, registry::VALUE_COLUMN_NAME};
+use lance_index::scalar::{LOOKUP_KEY_INDEX, ScalarIndex, registry::VALUE_COLUMN_NAME};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::overlay::staleness::overlay_affects_index;
 use lance_table::format::{Fragment, IndexMetadata, Manifest, ROW_ID_FIELD_ID, RowIdMeta};
@@ -234,6 +239,7 @@ impl PreparedLookup {
         dataset
             .assign_lookup_matches(&mut addresses, self.lookup_ranges(keys), column)
             .await?;
+        let lookup_keys = make_array(keys.to_data());
         for segment in &self.segments {
             let index = segment
                 .index
@@ -241,22 +247,41 @@ impl PreparedLookup {
                     open_scalar_index(dataset, column, &segment.metadata, &NoOpMetricsCollector)
                 })
                 .await?;
-            let matches = index.lookup(keys, &NoOpMetricsCollector).await?;
-            let mut live = Vec::with_capacity(matches.key_indices.len());
-            for (key, address) in matches.key_indices.iter().zip(matches.row_ids.iter()) {
-                let (Some(key), Some(address)) = (key, address) else {
-                    return Err(Error::index(
-                        "Scalar lookup returned a null key position or address",
-                    ));
-                };
-                let address = RowAddress::from(address);
-                if segment.coverage.contains(address.fragment_id()) {
-                    live.push((key as usize, address));
+            let mut matches = index.lookup(lookup_keys.clone(), &NoOpMetricsCollector)?;
+            // A legacy segment on a dataset without stable IDs reports _rowid,
+            // whose values are physical addresses on that dataset.
+            let row_column = if index.results_are_row_addresses() {
+                ROW_ADDR
+            } else {
+                ROW_ID
+            };
+            while let Some(batch) = matches.try_next().await? {
+                let key_indices = batch
+                    .column_by_name(LOOKUP_KEY_INDEX)
+                    .and_then(|column| column.as_primitive_opt::<UInt32Type>())
+                    .ok_or_else(|| Error::index("Scalar lookup must return UInt32 key_index"))?;
+                let row_addresses = batch
+                    .column_by_name(row_column)
+                    .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+                    .ok_or_else(|| {
+                        Error::index(format!("Scalar lookup must return UInt64 {row_column}"))
+                    })?;
+                let mut live = Vec::with_capacity(batch.num_rows());
+                for (key, address) in key_indices.iter().zip(row_addresses.iter()) {
+                    let (Some(key), Some(address)) = (key, address) else {
+                        return Err(Error::index(
+                            "Scalar lookup returned a null key position or address",
+                        ));
+                    };
+                    let address = RowAddress::from(address);
+                    if segment.coverage.contains(address.fragment_id()) {
+                        live.push((key as usize, address));
+                    }
                 }
+                dataset
+                    .assign_lookup_matches(&mut addresses, live, column)
+                    .await?;
             }
-            dataset
-                .assign_lookup_matches(&mut addresses, live, column)
-                .await?;
         }
         Ok(addresses)
     }

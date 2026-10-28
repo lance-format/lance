@@ -489,6 +489,35 @@ message ByteStreamSplit {
   CompressiveEncoding values = 1;
 }
 
+/* ALP: Adaptive Lossless floating-Point encoding
+ *
+ * Unstable 2.3 mirror of the stable 2.1/2.2 ALP compression message. Each
+ * mini-block chunk is self-describing (mode, exponents, bit width, base
+ * values), so only the input width is declared here.
+ */
+message Alp {
+  // 32 for f32 and 64 for f64
+  uint32 bits_per_value = 1;
+}
+
+/* Length-preserving modular integer differences within each fixed-size tensor.
+ * The child is one or more fixed-size-list layers ending in plain 8/16/32/64-bit
+ * elements, without child validity. For each tensor, divide its elements into
+ * spans of axis_length * inner_stride. Copy the first inner_stride elements of
+ * each span. For every later element i, store input[i] - input[i-inner_stride]
+ * modulo 2^element_bits. Decode by adding the already reconstructed predecessor.
+ * Preserve little-endian representation and original element order. Each tensor
+ * is independent. This transform is valid only in per-value encoding positions.
+ */
+message AxisDelta {
+  // Required untransformed fixed-size-list encoding, retaining the tensor shape.
+  CompressiveEncoding values = 1;
+  // Positive number of positions along the predicted physical axis.
+  uint64 axis_length = 2;
+  // Positive number of elements between adjacent positions along that axis.
+  uint64 inner_stride = 3;
+}
+
 // An encoding that compresses a data block into buffers
 message CompressiveEncoding {
     oneof compression {
@@ -507,5 +536,7 @@ message CompressiveEncoding {
         VariablePackedStruct variable_packed_struct = 13;
         Range range = 14;
         Delta delta = 15;
+        AxisDelta axis_delta = 16;
+        Alp alp = 17;
     }
 }

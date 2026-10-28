@@ -6,41 +6,12 @@
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array, cast::AsArray, types::UInt64Type};
 use lance_core::utils::address::RowAddress;
 
-use crate::scalar::LookupMatches;
-
 /// One page's positions in the shared, value-sorted input permutation.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LookupPage {
     pub(super) page_id: u32,
     /// `None` keeps the general path for overlapping or irregular ranges.
     pub(super) key_range: Option<(usize, usize)>,
-}
-
-/// Accumulate a query's candidates before constructing its two Arrow arrays.
-pub(super) struct LookupBuffers {
-    key_indices: Vec<u32>,
-    row_ids: Vec<u64>,
-}
-
-impl LookupBuffers {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self {
-            key_indices: Vec::with_capacity(capacity),
-            row_ids: Vec::with_capacity(capacity),
-        }
-    }
-
-    pub(super) fn push(&mut self, key: u32, address: u64) {
-        self.key_indices.push(key);
-        self.row_ids.push(address);
-    }
-
-    pub(super) fn finish(self) -> LookupMatches {
-        LookupMatches {
-            key_indices: self.key_indices.into(),
-            row_ids: self.row_ids.into(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -206,8 +177,12 @@ impl U64Lookup {
     /// Charge the maximum bitmap/rank allocation before lazy initialization.
     /// The position array shares the existing value-order buffer.
     pub(super) fn extra_size(rows: usize) -> usize {
-        rows.saturating_mul(2).div_ceil(64)
-            * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>())
+        // The mapping is shared with an in-flight lookup after its page handle
+        // is released, so include the allocation and Arc reference counters.
+        std::mem::size_of::<Self>()
+            + 2 * std::mem::size_of::<usize>()
+            + rows.saturating_mul(2).div_ceil(64)
+                * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>())
     }
 
     pub(super) fn try_new(

@@ -11,8 +11,8 @@ use std::{
 
 use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
 use lance_core::deepsize::DeepSizeOf;

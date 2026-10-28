@@ -24,9 +24,10 @@ use std::{
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use std::hint::black_box;
 
-use arrow_array::{ArrayRef, Int64Array, StringArray};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
+use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
@@ -814,11 +815,15 @@ fn bench_lookup(c: &mut Criterion) {
                             let index = index.clone();
                             let keys = keys.clone();
                             async move {
-                                let matches = index
-                                    .lookup(keys.as_ref(), &NoOpMetricsCollector)
+                                let matches: Vec<RecordBatch> = index
+                                    .lookup(keys, &NoOpMetricsCollector)
+                                    .unwrap()
+                                    .try_collect()
                                     .await
                                     .unwrap();
-                                assert_eq!(matches.len(), num_keys);
+                                let num_matches: usize =
+                                    matches.iter().map(RecordBatch::num_rows).sum();
+                                assert_eq!(num_matches, num_keys);
                                 black_box(matches);
                             }
                         })

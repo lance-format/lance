@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::{
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, TaskContext, context::SessionContext},
     physical_plan::{
         DisplayAs, ExecutionPlan, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
@@ -20,10 +22,12 @@ use datafusion::{
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
 use lance_core::{ROW_ADDR, ROW_ID};
+use lance_datafusion::exec::LanceExecutionOptions;
 
 use crate::Dataset;
 use crate::dataset::transaction::UpdateMode::RewriteColumns;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::write::WriteParams;
 use crate::dataset::write::merge_insert::assign_action::Action;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertJob, MergeInsertParams, MergeStats,
@@ -53,7 +57,6 @@ use super::MergeInsertMetrics;
 /// already sorts by row address, groups by fragment, and fills the rows a
 /// fragment did not have an update for. Reusing it keeps a single in-place
 /// column-write implementation rather than adding a second one.
-#[derive(Debug)]
 pub struct InPlaceMergeInsertExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
@@ -62,11 +65,33 @@ pub struct InPlaceMergeInsertExec {
     /// mode. Counted there rather than here, so it has to be folded into the
     /// stats this node reports.
     source_skipped_duplicates: Arc<AtomicU64>,
+    spill_session_context: SessionContext,
+    spill_execution_options: LanceExecutionOptions,
+    /// The caller's write parameters, for the new fragments `update_fragments`
+    /// would write. Eligibility forbids inserts here, so none are expected.
+    write_params: Arc<WriteParams>,
     update_if_deferred: bool,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
+}
+
+impl std::fmt::Debug for InPlaceMergeInsertExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InPlaceMergeInsertExec")
+            .field("input", &self.input)
+            .field("dataset", &self.dataset)
+            .field("params", &self.params)
+            .field("source_skipped_duplicates", &self.source_skipped_duplicates)
+            .field("spill_execution_options", &self.spill_execution_options)
+            .field("update_if_deferred", &self.update_if_deferred)
+            .field("properties", &self.properties)
+            .field("metrics", &self.metrics)
+            .field("merge_stats", &self.merge_stats)
+            .field("transaction", &self.transaction)
+            .finish_non_exhaustive()
+    }
 }
 
 impl InPlaceMergeInsertExec {
@@ -75,6 +100,9 @@ impl InPlaceMergeInsertExec {
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
+        spill_session_context: SessionContext,
+        spill_execution_options: LanceExecutionOptions,
+        write_params: Arc<WriteParams>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -89,6 +117,9 @@ impl InPlaceMergeInsertExec {
             dataset,
             params,
             source_skipped_duplicates,
+            spill_session_context,
+            spill_execution_options,
+            write_params,
             update_if_deferred: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -379,6 +410,13 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -393,6 +431,9 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
+            spill_session_context: self.spill_session_context.clone(),
+            spill_execution_options: self.spill_execution_options.clone(),
+            write_params: self.write_params.clone(),
             update_if_deferred: self.update_if_deferred,
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
@@ -438,6 +479,9 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         let transaction_holder = self.transaction.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
+        let spill_session_context = self.spill_session_context.clone();
+        let spill_execution_options = self.spill_execution_options.clone();
+        let write_params = self.write_params.clone();
 
         let result_stream = stream::once(async move {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
@@ -453,10 +497,12 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
             } = MergeInsertJob::update_fragments(
                 dataset.clone(),
                 patch_stream,
-                current_version,
                 target_bases_info,
-                params.write_version(&dataset),
+                &spill_session_context,
+                &spill_execution_options,
+                (current_version, params.write_version(&dataset)),
                 &params.on,
+                write_params,
             )
             .await?;
 

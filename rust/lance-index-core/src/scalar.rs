@@ -4,19 +4,20 @@
 //! Abstract scalar index traits and types for Lance index plugins
 
 use crate::remapping::{RowAddrTranslator, materialize_remap};
-use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Schema};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
+use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::Expr;
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -24,6 +25,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
+use std::sync::LazyLock;
 use std::{any::Any, sync::Arc};
 
 use crate::metrics::MetricsCollector;
@@ -293,6 +295,17 @@ pub trait IndexReader: Send + Sync {
             })
             .buffered(batch_readahead.max(1) as usize);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+    /// Whether the decoder behind this reader splits batches before their i32
+    /// offsets overflow.
+    ///
+    /// Callers streaming rows of unbounded size (e.g. large posting lists) may
+    /// request multi-row batches only when this returns `true`: a decoder that
+    /// splits by row count alone can overflow its i32 offsets within a single
+    /// batch. When it returns `false`, such callers should request one row per
+    /// batch instead, which still reads the file in one sequential pass.
+    fn guarantees_byte_splitting(&self) -> bool {
+        false
     }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
@@ -671,62 +684,49 @@ impl SearchOptions {
     }
 }
 
-/// The `(key, row id)` pairs produced by [`ScalarIndex::lookup`].
-///
-/// Pair `i` says that the key at position `key_indices[i]` of the looked-up
-/// keys equals the indexed value of row `row_ids[i]`. A key matching several
-/// rows yields one pair per row, and a key matching nothing yields none.
-/// Pairs come in no particular order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LookupMatches {
-    pub key_indices: UInt32Array,
-    pub row_ids: UInt64Array,
+/// Column of a [`ScalarIndex::lookup`] batch holding, for each match, the
+/// position in the looked-up keys of the key that matched.
+pub const LOOKUP_KEY_INDEX: &str = "key_index";
+
+static LOOKUP_ROW_ID_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| lookup_schema_with_row_column(ROW_ID));
+static LOOKUP_ROW_ADDR_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| lookup_schema_with_row_column(ROW_ADDR));
+
+fn lookup_schema_with_row_column(row_column: &str) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(LOOKUP_KEY_INDEX, DataType::UInt32, false),
+        Field::new(row_column, DataType::UInt64, false),
+    ]))
 }
 
-impl LookupMatches {
-    pub fn new(key_indices: UInt32Array, row_ids: UInt64Array) -> Result<Self> {
-        if key_indices.len() != row_ids.len() {
-            return Err(Error::internal(format!(
-                "lookup matches have {} key indices but {} row ids",
-                key_indices.len(),
-                row_ids.len()
-            )));
-        }
-        Ok(Self {
-            key_indices,
-            row_ids,
-        })
+/// The schema of the batches [`ScalarIndex::lookup`] streams.
+///
+/// The second column is the matched row, named [`ROW_ADDR`] when the index
+/// reports row addresses (see [`ScalarIndex::results_are_row_addresses`]) and
+/// [`ROW_ID`] otherwise.
+pub fn lookup_schema(results_are_row_addresses: bool) -> SchemaRef {
+    if results_are_row_addresses {
+        LOOKUP_ROW_ADDR_SCHEMA.clone()
+    } else {
+        LOOKUP_ROW_ID_SCHEMA.clone()
     }
+}
 
-    pub fn empty() -> Self {
-        Self {
-            key_indices: UInt32Array::from(Vec::<u32>::new()),
-            row_ids: UInt64Array::from(Vec::<u64>::new()),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.row_ids.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.row_ids.is_empty()
-    }
-
-    /// Concatenate matches produced against the same keys, e.g. by several
-    /// segments of one index.
-    pub fn concat(parts: impl IntoIterator<Item = Self>) -> Self {
-        let mut key_indices = Vec::new();
-        let mut row_ids = Vec::new();
-        for part in parts {
-            key_indices.extend_from_slice(part.key_indices.values());
-            row_ids.extend_from_slice(part.row_ids.values());
-        }
-        Self {
-            key_indices: UInt32Array::from(key_indices),
-            row_ids: UInt64Array::from(row_ids),
-        }
-    }
+/// Build one [`ScalarIndex::lookup`] batch: match `i` pairs the key at
+/// position `key_indices[i]` with row `rows[i]`.
+pub fn lookup_batch(
+    results_are_row_addresses: bool,
+    key_indices: Vec<u32>,
+    rows: Vec<u64>,
+) -> Result<RecordBatch> {
+    Ok(RecordBatch::try_new(
+        lookup_schema(results_are_row_addresses),
+        vec![
+            Arc::new(UInt32Array::from(key_indices)),
+            Arc::new(UInt64Array::from(rows)),
+        ],
+    )?)
 }
 
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
@@ -757,21 +757,25 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
 
     /// Find the rows whose indexed value equals each of `keys`.
     ///
-    /// Returns one `(key index, row id)` pair per match, where the key index is
-    /// the key's position in `keys`. Matching is exact equality: a null key
-    /// never matches, not even a null indexed value. `keys` must have the
-    /// index's value type.
+    /// Streams one row per match in batches with [`lookup_schema`]: the
+    /// key's position in `keys` and the matched row. A key matching several
+    /// rows yields one match per row, a key matching nothing yields none, and
+    /// matches come in no particular order. A key matches exactly the rows
+    /// `search` returns for an equality query on it, so for floats `-0.0`
+    /// and `0.0` compare equal and NaN matches NaN. A null key never matches,
+    /// not even a null indexed value. `keys` must have the index's value type.
     ///
-    /// Like [`Self::search`], the row ids are not filtered by deletions, and any
-    /// fragment-reuse remapping the index was loaded with is already applied.
+    /// Like [`Self::search`], the rows may include deleted rows, so callers
+    /// must filter them, and any fragment-reuse remapping the index was loaded
+    /// with is already applied.
     ///
     /// Indices that cannot answer exact-equality lookups return
     /// [`Error::NotSupported`], which is the default.
-    async fn lookup(
-        &self,
-        _keys: &dyn Array,
-        _metrics: &dyn MetricsCollector,
-    ) -> Result<LookupMatches> {
+    fn lookup<'a>(
+        &'a self,
+        _keys: ArrayRef,
+        _metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
         Err(Error::not_supported(format!(
             "{} index does not support key lookup",
             self.index_type()

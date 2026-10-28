@@ -83,7 +83,7 @@ use lance_index::vector::pq::storage::{
 };
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
-use lance_index::vector::v3::shuffler::create_ivf_shuffler;
+use lance_index::vector::v3::shuffler::create_owned_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
@@ -585,12 +585,73 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
     None
 }
 
+fn vector_segments_share_merge_model(
+    left: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+    right: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+) -> bool {
+    if left.0.index_version != right.0.index_version {
+        return false;
+    }
+
+    let indices = [left.1.clone(), right.1.clone()];
+    validate_vector_query_compatibility(&indices, "merging vector index segments").is_ok()
+        && vector_model_mismatch(&indices).is_none()
+}
+
+/// Partition a logical vector index into groups that remain acceptable to the
+/// distributed merger after compaction remaps their row addresses.
+pub(crate) fn compaction_vector_segment_merge_groups(
+    logical_index: &LogicalIvfView<'_>,
+) -> Vec<Vec<Uuid>> {
+    let can_merge_after_remap = |index: &dyn VectorIndex| {
+        // Legacy readers have no v2 model inspection. HNSW remapping preserves
+        // graphs, whereas merging would rebuild them. PQ/RQ remaps write query
+        // layouts that the row-major distributed merger cannot consume.
+        !index.as_any().is::<IVFIndex>()
+            && matches!(
+                index.sub_index_type(),
+                (
+                    SubIndexType::Flat,
+                    QuantizationType::Flat | QuantizationType::Scalar
+                )
+            )
+    };
+    let segments = logical_index.segments().collect::<Vec<_>>();
+    let mut groups = Vec::<Vec<usize>>::new();
+
+    for segment_idx in 0..segments.len() {
+        if !can_merge_after_remap(segments[segment_idx].1.as_ref()) {
+            groups.push(vec![segment_idx]);
+            continue;
+        }
+        if let Some(group) = groups.iter_mut().find(|group| {
+            can_merge_after_remap(segments[group[0]].1.as_ref())
+                && vector_segments_share_merge_model(segments[group[0]], segments[segment_idx])
+        }) {
+            group.push(segment_idx);
+        } else {
+            groups.push(vec![segment_idx]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|segment_idx| segments[segment_idx].0.uuid)
+                .collect()
+        })
+        .collect()
+}
+
 pub(crate) fn vector_segment_compatibility(
     logical_index: &LogicalIvfView<'_>,
     operation: &str,
 ) -> Result<VectorSegmentCompatibility> {
     let indices = logical_index.indices().cloned().collect::<Vec<_>>();
     validate_vector_query_compatibility(&indices, operation)?;
+
     Ok(if vector_model_mismatch(&indices).is_none() {
         VectorSegmentCompatibility::SharedModel
     } else {
@@ -805,9 +866,7 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let format_version = dataset_format_version(dataset);
 
-    let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
-    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
+    let shuffler = create_owned_ivf_shuffler(num_partitions, format_version, None)?;
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let summary = match index_type {
@@ -1117,6 +1176,7 @@ async fn optimize_ivf_pq_indices(
         IndexFile {
             path: INDEX_FILE_NAME.to_string(),
             size_bytes,
+            file_metadata_size_bytes: None,
         },
     ))
 }
@@ -1276,10 +1336,12 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_size,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: aux_size,
+                file_metadata_size_bytes: None,
             },
         ],
     ))
@@ -2161,13 +2223,13 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &RowAddrTranslator,
+        mapping: Arc<RowAddrTranslator>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap_streaming(mapping).await?;
+        page.remap_streaming(&mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -2212,7 +2274,7 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
 /// thread, and in CI (dev-profile wheel, opt-level 0) it overflowed the
 /// Windows main-thread stack. `remap_index_file_v3` dispatches over an 11-arm
 /// match whose arms each await a different monomorphization of
-/// `IvfIndexBuilder::remap_streaming`; without the box the outer future embeds
+/// `IvfIndexBuilder::remap_with`; without the box the outer future embeds
 /// every specialized builder future, and at opt-level 0 each arm's future is
 /// also materialized as a separate stack temporary while it is polled. Boxing
 /// per arm, in the concrete `Pin<Box<impl Future>>` form (a `dyn Future`
@@ -2220,11 +2282,12 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
 /// `DatasetIndexRemapper::remap_indices`), leaves one pointer per arm
 /// on the caller's stack. The builder moves into the heap future too, so the
 /// dispatching future does not hold a builder across the await either.
-fn remap_boxed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+fn remap_boxed<'a, S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     mut builder: IvfIndexBuilder<S, Q>,
-    mapping: &RowAddrTranslator,
-) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + '_>> {
-    Box::pin(async move { builder.remap_streaming(mapping).await })
+    mapping: &'a RowAddrTranslator,
+    owned_fragments: Option<&'a RoaringBitmap>,
+) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + 'a>> {
+    Box::pin(async move { builder.remap_with(mapping.clone(), owned_fragments).await })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2234,6 +2297,7 @@ pub(crate) async fn remap_index_file_v3(
     index: Arc<dyn VectorIndex>,
     mapping: &RowAddrTranslator,
     column: String,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().join(new_uuid.to_string());
@@ -2246,6 +2310,7 @@ pub(crate) async fn remap_index_file_v3(
                         dataset, column, index_dir, index,
                     )?,
                     mapping,
+                    owned_fragments,
                 )
                 .await
             }
@@ -2255,6 +2320,7 @@ pub(crate) async fn remap_index_file_v3(
                         dataset, column, index_dir, index,
                     )?,
                     mapping,
+                    owned_fragments,
                 )
                 .await
             }
@@ -2269,6 +2335,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2278,6 +2345,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2287,6 +2355,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2296,6 +2365,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2305,6 +2375,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2314,6 +2385,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2323,6 +2395,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2333,6 +2406,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2342,6 +2416,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2382,9 +2457,10 @@ pub(crate) async fn remap_index_file(
     let mut writer = object_store.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
+    let mapping = Arc::new(mapping.clone());
 
     let mut task_stream = stream::iter(tasks)
-        .map(|task| task.load_and_remap(reader.clone(), index, mapping))
+        .map(|task| task.load_and_remap(reader.clone(), index, mapping.clone()))
         .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
@@ -2425,6 +2501,7 @@ pub(crate) async fn remap_index_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -2493,6 +2570,7 @@ async fn write_ivf_pq_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -2684,11 +2762,27 @@ pub(crate) async fn merge_segments(
             })?,
         );
     }
-    merge_segments_with_row_filters(
+    merge_segments_inner(
         dataset.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
-        row_filters,
+        Some(row_filters),
+        lance_index::progress::noop_progress(),
+    )
+    .await
+}
+
+/// Merge staging segments whose remap already removed rows not owned by each
+/// source segment.
+pub(crate) async fn merge_remapped_segments(
+    dataset: &Dataset,
+    segments: Vec<TableIndexMetadata>,
+) -> Result<TableIndexMetadata> {
+    merge_segments_inner(
+        dataset.object_store.as_ref(),
+        &dataset.indices_dir(),
+        segments,
+        None,
         lance_index::progress::noop_progress(),
     )
     .await
@@ -2718,15 +2812,21 @@ pub(crate) async fn merge_segments_with_progress(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    merge_segments_with_row_filters(object_store, indices_dir, segments, row_filters, progress)
-        .await
+    merge_segments_inner(
+        object_store,
+        indices_dir,
+        segments,
+        Some(row_filters),
+        progress,
+    )
+    .await
 }
 
-async fn merge_segments_with_row_filters(
+async fn merge_segments_inner(
     object_store: &ObjectStore,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
-    row_filters: Vec<lance_index::scalar::OldIndexDataFilter>,
+    row_filters: Option<Vec<lance_index::scalar::OldIndexDataFilter>>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
@@ -2766,7 +2866,7 @@ async fn merge_segments_with_row_filters(
         indices_dir,
         &final_dir,
         &segments,
-        &row_filters,
+        row_filters.as_deref(),
         None,
         progress,
     )
@@ -2794,7 +2894,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
-    row_filters: &[lance_index::scalar::OldIndexDataFilter],
+    row_filters: Option<&[lance_index::scalar::OldIndexDataFilter]>,
     _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
@@ -2823,14 +2923,24 @@ async fn merge_segments_to_dir(
                 .join(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
-    let auxiliary_file = lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
-        object_store,
-        &aux_paths,
-        final_dir,
-        row_filters,
-        progress.clone(),
-    )
-    .await?;
+    let auxiliary_file = if let Some(row_filters) = row_filters {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
+            object_store,
+            &aux_paths,
+            final_dir,
+            row_filters,
+            progress.clone(),
+        )
+        .await?
+    } else {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
+            object_store,
+            &aux_paths,
+            final_dir,
+            progress.clone(),
+        )
+        .await?
+    };
     let index_file = write_root_vector_index_from_auxiliary(
         object_store,
         final_dir,
@@ -3042,6 +3152,7 @@ async fn write_root_vector_index_from_auxiliary(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -4989,6 +5100,85 @@ fn weighted_subset<T: StreamingKMeansArrowType>(
     ))
 }
 
+/// Splits `cluster` in two by L2 around the row farthest from its centroid and
+/// the row farthest from that one, or returns `None` when all its rows are
+/// identical. Each seed row is nearest to itself, so both halves are non-empty
+/// whenever the rows differ.
+fn bisect_weighted_cluster<T: StreamingKMeansArrowType>(
+    cluster: &WeightedCluster<T>,
+    data_values: &[T::Native],
+    weights: &[f64],
+    losses: &[f64],
+    dimension: usize,
+    metric_policy: &dyn StreamingFloatKMeansMetricPolicy<T>,
+    next_cluster_id: &mut usize,
+) -> Result<Option<[WeightedCluster<T>; 2]>> {
+    let row = |idx: usize| &data_values[idx * dimension..(idx + 1) * dimension];
+    let farthest_from = |anchor: &[T::Native]| {
+        cluster
+            .indices
+            .iter()
+            .copied()
+            .max_by(|&a, &b| squared_l2(row(a), anchor).total_cmp(&squared_l2(row(b), anchor)))
+    };
+    let Some(first) = farthest_from(&cluster.centroid) else {
+        return Ok(None);
+    };
+    let Some(second) = farthest_from(row(first)) else {
+        return Ok(None);
+    };
+    if squared_l2(row(first), row(second)) == 0.0 {
+        return Ok(None);
+    }
+    let (near_first, near_second): (Vec<usize>, Vec<usize>) = cluster
+        .indices
+        .iter()
+        .partition(|&&idx| squared_l2(row(idx), row(first)) <= squared_l2(row(idx), row(second)));
+    let mut make_half = |indices: Vec<usize>| -> Result<WeightedCluster<T>> {
+        let weight = indices.iter().map(|&idx| weights[idx]).sum::<f64>();
+        let mut centroid = vec![T::Native::default(); dimension];
+        for &idx in &indices {
+            let row_weight = cast_weight::<T>(weights[idx], format_args!("bisected row {idx}"))?;
+            for (sum, value) in centroid.iter_mut().zip(row(idx)) {
+                *sum += *value * row_weight;
+            }
+        }
+        if weight > 0.0 {
+            let weight = cast_weight::<T>(weight, "bisected cluster")?;
+            centroid
+                .iter_mut()
+                .for_each(|value| *value = *value / weight);
+        } else {
+            centroid.copy_from_slice(row(indices[0]));
+        }
+        let loss = indices
+            .iter()
+            .map(|&idx| losses[idx] + weights[idx] * squared_l2(row(idx), &centroid))
+            .sum();
+        let split_priority = metric_policy.split_priority(
+            data_values,
+            weights,
+            &indices,
+            &centroid,
+            dimension,
+            loss,
+        );
+        let id = *next_cluster_id;
+        *next_cluster_id += 1;
+        Ok(WeightedCluster {
+            id,
+            indices,
+            centroid,
+            weight,
+            split_priority,
+            finalized: true,
+        })
+    };
+    let first = make_half(near_first)?;
+    let second = make_half(near_second)?;
+    Ok(Some([first, second]))
+}
+
 fn train_weighted_hierarchical_kmeans<T: StreamingKMeansArrowType>(
     data: &FixedSizeListArray,
     weights: &[f64],
@@ -5059,10 +5249,16 @@ fn train_weighted_hierarchical_kmeans<T: StreamingKMeansArrowType>(
         let mut cluster = heap
             .pop()
             .ok_or_else(|| Error::index("No weighted cluster can be further split"))?;
-        if cluster.finalized || cluster.indices.len() <= 1 {
-            cluster.finalized = true;
+        if cluster.finalized {
             heap.push(cluster);
             break;
+        }
+        if cluster.indices.len() <= 1 {
+            // A singleton can retain a large coreset loss while other clusters
+            // still have multiple summaries to split.
+            cluster.finalized = true;
+            heap.push(cluster);
+            continue;
         }
 
         let remaining_k = target_k - heap.len();
@@ -5129,25 +5325,70 @@ fn train_weighted_hierarchical_kmeans<T: StreamingKMeansArrowType>(
         }
     }
 
+    // The split loop can stop with multi-row clusters left: a k-means split can
+    // leave every row on one side even when the rows differ, which happens
+    // under Dot, and a singleton at the top of the heap ends the loop. Bisect
+    // the remaining multi-row clusters by L2 until `target_k` is reached, so
+    // the count falls short only when the coreset holds fewer distinct rows.
     let mut clusters = heap.into_vec();
-    clusters.sort_by_key(|cluster| cluster.id);
-    while clusters.len() < target_k {
-        let duplicate = clusters
-            .iter()
-            .max_by(|left, right| {
-                left.weight
-                    .partial_cmp(&right.weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .cloned()
-            .ok_or_else(|| Error::index("No weighted clusters were trained"))?;
-        clusters.push(WeightedCluster {
-            id: next_cluster_id,
-            ..duplicate
-        });
-        next_cluster_id += 1;
+    let mut unsplittable = Vec::new();
+    while clusters.len() + unsplittable.len() < target_k {
+        let Some(position) = (0..clusters.len())
+            .filter(|&position| clusters[position].indices.len() > 1)
+            .max_by(|&a, &b| clusters[a].cmp(&clusters[b]))
+        else {
+            break;
+        };
+        let cluster = clusters.swap_remove(position);
+        match bisect_weighted_cluster(
+            &cluster,
+            data_values,
+            weights,
+            losses,
+            dimension,
+            metric_policy,
+            &mut next_cluster_id,
+        )? {
+            Some(halves) => clusters.extend(halves),
+            None => unsplittable.push(cluster),
+        }
     }
-    clusters.truncate(target_k);
+    clusters.append(&mut unsplittable);
+    clusters.sort_by_key(|cluster| cluster.id);
+    if clusters.len() < target_k {
+        // Padding the count with clones of the heaviest cluster left partitions
+        // whose centroid ties exactly with the original, which assignment keeps,
+        // so they started empty. Reject instead, like the flat hierarchical
+        // trainer: after the bisection above, the coreset has fewer distinct
+        // rows than `target_k`.
+        if data.len() < target_k {
+            // Not the data's fault: the coreset summarizing the training sample
+            // is smaller than the partition count, as Dot's can be when its only
+            // chunk samples exactly `num_partitions` rows.
+            return Err(Error::invalid_input(format!(
+                "Cannot create {target_k} IVF partitions from {} weighted coreset rows: the \
+                 coreset summarizing the training sample is smaller than the partition \
+                 count. Increase sample_rate or reduce num_partitions.",
+                data.len()
+            )));
+        }
+        return Err(Error::invalid_input(format!(
+            "Cannot create {target_k} IVF partitions: weighted k-means could only form {} \
+             non-empty clusters from {} weighted coreset rows, and the rest could not be \
+             split further. Reduce num_partitions to <= {} or provide more diverse data.",
+            clusters.len(),
+            data.len(),
+            clusters.len()
+        )));
+    }
+    // The split loop stops at `target_k`, and every `cluster_k` it takes is
+    // bounded by what is left, so the count lands exactly on `target_k`.
+    debug_assert_eq!(
+        clusters.len(),
+        target_k,
+        "weighted kmeans formed {} clusters for target_k {target_k}",
+        clusters.len()
+    );
 
     let mut values = Vec::with_capacity(target_k * dimension);
     for cluster in clusters {
@@ -5420,6 +5661,13 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
                         )
                         .await?
                 };
+        }
+
+        // Float16 samples are widened for coreset training, but residuals and
+        // query preprocessing require centroids in the vector column's type.
+        if get_vector_type(dataset.schema(), column)?.1 == DataType::Float16 {
+            let values = arrow::compute::cast(centroids.values(), &DataType::Float16)?;
+            centroids = FixedSizeListArray::try_new_from_values(values, dimension as i32)?;
         }
 
         Ok((IvfModel::new(centroids, None), coreset_len))
@@ -6244,6 +6492,53 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
         (dataset, array)
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_partition_size() {
+        assert_zero_target_rejected(IvfBuildParams::with_target_partition_size(0)).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_with_num_partitions() {
+        assert_zero_target_rejected(IvfBuildParams {
+            target_partition_size: Some(0),
+            ..IvfBuildParams::new(20)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_with_centroids() {
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![0.0; 2 * DIM]),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        assert_zero_target_rejected(IvfBuildParams {
+            target_partition_size: Some(0),
+            centroids: Some(centroids),
+            ..Default::default()
+        })
+        .await;
+    }
+
+    async fn assert_zero_target_rejected(ivf_params: IvfBuildParams) {
+        let test_dir = TempStrDir::default();
+        let (mut dataset, _) = generate_test_dataset(test_dir.as_str(), 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("target_partition_size must be greater than zero"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -7367,6 +7662,105 @@ mod tests {
         );
     }
 
+    /// Padding the partition count with clones of the heaviest cluster left
+    /// partitions that started empty; reject like the flat hierarchical
+    /// trainer. A coreset smaller than the partition count and a coreset whose
+    /// rows are identical both reach the shortfall, and each gets its own
+    /// advice.
+    #[rstest::rstest]
+    #[case::fewer_rows_than_partitions(6, 16, "Increase sample_rate")]
+    #[case::enough_rows_all_identical(32, 16, "provide more diverse data")]
+    #[test]
+    fn test_weighted_hierarchical_rejects_padding_with_duplicates(
+        #[case] num_points: usize,
+        #[case] target_k: usize,
+        #[case] advice: &str,
+    ) {
+        let dimension = 8;
+        // Every row identical in the second case, a ramp in the first: either
+        // way the trainer cannot reach `target_k` non-empty clusters.
+        let values: Vec<f32> = if num_points < target_k {
+            (0..num_points * dimension)
+                .map(|i| i as f32 * 0.01)
+                .collect()
+        } else {
+            vec![0.5; num_points * dimension]
+        };
+        let data = streaming_kmeans_fsl_from_values::<Float32Type>(values, dimension).unwrap();
+        let params = WeightedHierarchicalKMeansParams {
+            dimension,
+            target_k,
+            metric_policy: &L2_METRIC_POLICY,
+            max_iters: 2,
+            on_progress: Arc::new(|_, _| {}),
+        };
+        let err = train_weighted_hierarchical_kmeans::<Float32Type>(
+            &data,
+            &vec![1.0; num_points],
+            &vec![0.1; num_points],
+            &params,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("Cannot create {target_k} IVF partitions")),
+            "got: {msg}"
+        );
+        // The row count belongs in the message: it is the coreset size, not
+        // the dataset's, so a reader can tell the two shortfalls apart.
+        assert!(
+            msg.contains(&format!("{num_points} weighted coreset rows")),
+            "got: {msg}"
+        );
+        assert!(msg.contains(advice), "got: {msg}");
+    }
+
+    /// Under Dot, positive 1-D rows all go to the largest centroid, so every
+    /// k-means split leaves its rows on one side. The rows are distinct, so the
+    /// trainer must still reach `target_k` distinct centroids rather than
+    /// reject the request, for f32 and f64 centroids alike.
+    fn bisects_clusters_kmeans_cannot_split<T: StreamingKMeansArrowType>() {
+        let num_points = 8;
+        let target_k = 4;
+        let values = (1..=num_points)
+            .map(|i| T::Native::from_f64(i as f64).unwrap())
+            .collect::<Vec<_>>();
+        let data = streaming_kmeans_fsl_from_values::<T>(values, 1).unwrap();
+        let params = WeightedHierarchicalKMeansParams {
+            dimension: 1,
+            target_k,
+            metric_policy: &DOT_METRIC_POLICY,
+            max_iters: 5,
+            on_progress: Arc::new(|_, _| {}),
+        };
+
+        let centroids = train_weighted_hierarchical_kmeans::<T>(
+            &data,
+            &vec![1.0; num_points],
+            &vec![0.0; num_points],
+            &params,
+        )
+        .unwrap();
+        let mut values = centroids
+            .values()
+            .as_primitive::<T>()
+            .values()
+            .iter()
+            .map(|value| value.as_())
+            .collect::<Vec<f64>>();
+        values.sort_by(f64::total_cmp);
+        values.dedup();
+        assert_eq!(values.len(), target_k, "centroids: {values:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::f32(bisects_clusters_kmeans_cannot_split::<Float32Type> as fn())]
+    #[case::f64(bisects_clusters_kmeans_cannot_split::<Float64Type> as fn())]
+    fn test_weighted_hierarchical_bisects_clusters_kmeans_cannot_split(#[case] check: fn()) {
+        check();
+    }
+
     #[tokio::test]
     async fn test_build_ivf_model_streaming_dot_coreset_training() {
         const DIMENSION: usize = 4;
@@ -7546,11 +7940,7 @@ mod tests {
     ) {
         let test_dir = TempStrDir::default();
         let uri = format!("{}/ds", test_dir.as_str());
-        let expected_type = if values.data_type() == &DataType::Float64 {
-            DataType::Float64
-        } else {
-            DataType::Float32
-        };
+        let expected_type = values.data_type().clone();
         let fsl = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "vector",
@@ -7954,6 +8344,123 @@ mod tests {
         assert!(recall >= 0.5, "recall: {recall}, row ids: {ids:?}");
     }
 
+    #[rstest]
+    #[case::float16_streaming_fixed(DataType::Float16, false, Some(1), 1)]
+    #[case::float16_streaming_nullable(DataType::Float16, true, Some(1), 1)]
+    #[case::float16_streaming_without_refinement(DataType::Float16, false, Some(1), 0)]
+    #[case::float32_streaming(DataType::Float32, false, Some(1), 1)]
+    #[case::float16_in_memory(DataType::Float16, false, None, 0)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ivf_rq_build_and_search_float_types(
+        #[case] value_type: DataType,
+        #[case] is_nullable: bool,
+        #[case] streaming_sample_rate: Option<usize>,
+        #[case] refine_passes: usize,
+    ) {
+        const NUM_ROWS: usize = 600;
+        const NUM_PARTITIONS: usize = 257;
+        const DIMENSION: usize = 32;
+        const EXPECTED_ROW: usize = 17;
+        const K: usize = 5;
+
+        let test_dir = TempStrDir::default();
+        let batch = gen_batch()
+            .with_seed(42.into())
+            .col("id", array::step::<UInt64Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>((DIMENSION as u32).into()),
+            )
+            .into_batch_rows((NUM_ROWS as u64).into())
+            .unwrap();
+        let vectors = batch["vector"].as_fixed_size_list();
+        let values = arrow::compute::cast(vectors.values(), &value_type).unwrap();
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap();
+        let query = vectors.value(EXPECTED_ROW);
+        let batch = batch
+            .replace_column_schema_by_name("vector", vectors.data_type().clone(), Arc::new(vectors))
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            batch.schema().field(0).clone(),
+            batch.schema().field(1).clone().with_nullable(is_nullable),
+        ]));
+        let batch = RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap();
+        let mut dataset = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                max_rows_per_file: NUM_ROWS / 2,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut ivf_params = IvfBuildParams::new(NUM_PARTITIONS);
+        ivf_params.sample_rate = 2;
+        ivf_params.streaming_sample_rate = streaming_sample_rate;
+        // Resampled chunks can overlap, so retain enough summaries to split 257 clusters.
+        ivf_params.streaming_coreset_rate = is_nullable.then_some(2);
+        ivf_params.streaming_refine_passes = refine_passes;
+        ivf_params.max_iters = 1;
+        let params = VectorIndexParams::with_ivf_rq_params(
+            MetricType::Cosine,
+            ivf_params,
+            RQBuildParams::new(1),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        drop(dataset);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let model = index.ivf_model();
+        assert_eq!(model.num_partitions(), NUM_PARTITIONS);
+        assert_eq!(model.centroids_array().unwrap().value_type(), value_type);
+
+        let mut scanner = dataset.scan();
+        // Probe and rerank the full fixture to isolate type correctness from
+        // partition training and random one-bit quantization quality.
+        scanner
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(MetricType::Cosine)
+            .minimum_nprobes(NUM_PARTITIONS)
+            .refine(NUM_ROWS.div_ceil(K) as u32);
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfPartition"), "{plan}");
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), K);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(ids[0], EXPECTED_ROW as u64);
+        assert!(
+            result["_distance"]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+
+        let ground_truth = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(MetricType::Cosine)
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let expected_ids = ground_truth["id"].as_primitive::<UInt64Type>().values();
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count() as f32 / K as f32;
+        assert!(recall >= 0.5, "recall: {recall}, row ids: {ids:?}");
+    }
+
     #[test]
     fn test_fixed_training_ranges_are_sorted_and_bounded() {
         let ranges = generate_fixed_training_ranges(10_000, 1_234, 1_024, 16);
@@ -8270,16 +8777,26 @@ mod tests {
         assert!(error.to_string().contains("input lengths do not match"));
     }
 
-    #[test]
-    fn test_weighted_hierarchical_splits_until_target_k() {
+    #[rstest]
+    #[case::zero_loss(17, 0.0)]
+    #[case::lossy_coreset(32, 1_000.0)]
+    #[case::exhausted_splits(33, 1_000.0)]
+    fn test_weighted_hierarchical_splits_until_target_k(
+        #[case] target_k: usize,
+        #[case] base_loss: f64,
+    ) {
         let values = (0..16)
             .flat_map(|value| [value as f32, value as f32 + 0.1])
             .collect::<Vec<_>>();
         let data = streaming_kmeans_fsl_from_values::<Float32Type>(values, 1).unwrap();
+        // A singleton summary can retain a large loss from the raw vectors it
+        // represents, even though that summary cannot be split any further.
+        let mut losses = vec![0.0; data.len()];
+        losses[0] = base_loss;
         let progress = Arc::new(|_: u32, _: u32| {});
         let params = WeightedHierarchicalKMeansParams {
             dimension: 1,
-            target_k: 17,
+            target_k,
             metric_policy: &L2_METRIC_POLICY,
             max_iters: 3,
             on_progress: progress,
@@ -8287,21 +8804,34 @@ mod tests {
         let result = train_weighted_hierarchical_kmeans::<Float32Type>(
             &data,
             &vec![1.0; 32],
-            &vec![0.0; 32],
+            &losses,
             &params,
-        )
-        .unwrap();
-        assert_eq!(result.len(), 17);
+        );
+        if target_k > data.len() {
+            let Err(error) = result else {
+                panic!(
+                    "a coreset of {} rows cannot serve {target_k} partitions",
+                    data.len()
+                );
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("smaller than the partition count"),
+                "unexpected error: {error}"
+            );
+            return;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.len(), target_k);
         let values = result.values().as_primitive::<Float32Type>().values();
         let mut sorted = values.to_vec();
         sorted.sort_by(|left, right| left.total_cmp(right));
-        assert!(
-            sorted
-                .windows(2)
-                .filter(|pair| (pair[0] - pair[1]).abs() > 0.001)
-                .count()
-                >= 16
-        );
+        let distinct_centroids = 1 + sorted
+            .windows(2)
+            .filter(|pair| (pair[0] - pair[1]).abs() > 0.001)
+            .count();
+        assert_eq!(distinct_centroids, target_k.min(data.len()));
     }
 
     #[test]
@@ -8755,7 +9285,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::f16("f16", DataType::Float32)]
+    #[case::f16("f16", DataType::Float16)]
     #[case::f32("f32", DataType::Float32)]
     #[case::f64("f64", DataType::Float64)]
     #[case::int8("int8", DataType::Float32)]
@@ -9178,7 +9708,7 @@ mod tests {
             .chunks(dim)
             .enumerate()
             .map(|(i, vec)| {
-                let dist = distance_type.func()(query, vec);
+                let dist = distance_type.try_func().unwrap()(query, vec);
                 (dist, i as u32)
             })
             .collect_vec();

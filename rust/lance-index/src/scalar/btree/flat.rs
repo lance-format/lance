@@ -18,6 +18,7 @@ use arrow_schema::SortOptions;
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
@@ -106,7 +107,7 @@ pub struct FlatIndex {
     /// Reuse the address-sort permutation until lookup needs value order.
     /// Ordinary filters never pay for constructing a second ordering.
     lookup_order: Mutex<LookupOrder>,
-    lookup_u64: OnceLock<Option<U64Lookup>>,
+    lookup_u64: OnceLock<Option<Arc<U64Lookup>>>,
     df_schema: DFSchema,
 }
 
@@ -197,7 +198,7 @@ impl FlatIndex {
         Ok(value_order)
     }
 
-    pub(super) fn lookup_u64(&self) -> Result<Option<&U64Lookup>> {
+    pub(super) fn lookup_u64(&self) -> Result<Option<&Arc<U64Lookup>>> {
         let Some(values) = self.values().as_primitive_opt::<UInt64Type>() else {
             return Ok(None);
         };
@@ -207,7 +208,7 @@ impl FlatIndex {
         let order = self.value_order()?;
         Ok(self
             .lookup_u64
-            .get_or_init(|| U64Lookup::try_new(values, self.ids(), order))
+            .get_or_init(|| U64Lookup::try_new(values, self.ids(), order).map(Arc::new))
             .as_ref())
     }
 
@@ -260,7 +261,12 @@ impl FlatIndex {
         }
         let query = SargableQuery::IsIn(needles.iter().map(|v| v.0.clone()).collect());
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let expr = create_physical_expr(
+            &expr,
+            &self.df_schema,
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )?;
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
@@ -407,7 +413,12 @@ impl FlatIndex {
 
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let expr = create_physical_expr(
+            &expr,
+            &self.df_schema,
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )?;
         self.eval_expr(&expr, track_nulls)
     }
 
@@ -731,21 +742,13 @@ mod tests {
         for page in [&index, &restored] {
             let charged = page.deep_size_of();
             assert_eq!(page.lookup_u64().unwrap().is_some(), specialized);
-            let keys = crate::scalar::btree::LookupKeys::try_new(
-                Arc::new(UInt64Array::from(queries.clone())),
-                true,
-            )
+            let keys = crate::scalar::btree::LookupKeys::try_new(Arc::new(UInt64Array::from(
+                queries.clone(),
+            )))
             .unwrap();
-            let mut matches = crate::scalar::btree::LookupBuffers::new(queries.len());
-            keys.match_page(page, None, &mut matches, &NoOpMetricsCollector)
-                .unwrap();
-            let matches = matches.finish();
-            let mut actual = matches
-                .key_indices
-                .values()
-                .iter()
-                .copied()
-                .zip(matches.row_ids.values().iter().copied())
+            let mut actual = keys
+                .match_page(page, None, &NoOpMetricsCollector)
+                .unwrap()
                 .collect::<Vec<_>>();
             actual.sort_unstable();
             assert_eq!(actual, expected);

@@ -133,6 +133,22 @@ message RangeToFile {
   string path = 4;
 }
 
+/* Header for a serialized `BitmapIndexState` cache entry, followed by a
+ * `RAW_BLOB` (the null-row bitmap) then a single Arrow IPC section holding
+ * the keys/offsets lookup batch.
+ */
+message BitmapIndexHeader {
+  /* Whether `BitmapIndex::load_bitmap` results are physical row addresses
+   * rather than row ids directly.
+   *
+   * Absent (default false) on a cache entry rebuilt from a segment persisted
+   * before address-domain support (these indexes always used row ids).
+   *
+   * This should be set (and true) on all bitmap indexes with version > 0.
+   */
+  bool results_are_row_addresses = 1;
+}
+
 /* ---------------------------------------------------------------------------
  * Vector indices (IVF partitions)
  * ---------------------------------------------------------------------------

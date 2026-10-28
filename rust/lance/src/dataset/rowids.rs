@@ -558,9 +558,10 @@ mod test {
         DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount, copy_test_data_to_tmp,
     };
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
+    use arrow_array::types::{Float32Type, Int32Type, UInt32Type, UInt64Type};
     use arrow_array::{
-        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array, record_batch,
+        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array,
+        record_batch,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
@@ -640,15 +641,25 @@ mod test {
             let index = open_scalar_index(dataset, ROW_ID, &segment, &NoOpMetricsCollector)
                 .await
                 .unwrap();
-            let matches = index.lookup(&keys, &NoOpMetricsCollector).await.unwrap();
-            actual.extend(
-                matches
-                    .key_indices
-                    .values()
-                    .iter()
-                    .map(|position| u64::from(*position))
-                    .zip(matches.row_ids.values().iter().copied()),
-            );
+            let mut matches = index
+                .lookup(Arc::new(keys.clone()), &NoOpMetricsCollector)
+                .unwrap();
+            while let Some(batch) = matches.try_next().await.unwrap() {
+                actual.extend(
+                    batch["key_index"]
+                        .as_primitive::<UInt32Type>()
+                        .values()
+                        .iter()
+                        .map(|position| u64::from(*position))
+                        .zip(
+                            batch[ROW_ADDR]
+                                .as_primitive::<UInt64Type>()
+                                .values()
+                                .iter()
+                                .copied(),
+                        ),
+                );
+            }
         }
         let scan = dataset
             .scan()
@@ -1119,7 +1130,10 @@ mod test {
     #[case::signed("i")]
     #[case::unsigned("u")]
     #[tokio::test]
-    async fn test_row_id_btree_unique_key_lookup(#[case] column: &str) {
+    async fn test_row_id_btree_unique_key_lookup(
+        #[case] column: &str,
+        #[values(1, 8193)] repeats: usize,
+    ) {
         let mut dataset = lance_datagen::gen_batch()
             .col(
                 "i",
@@ -1156,6 +1170,9 @@ mod test {
             "u" => Arc::new(UInt64Array::from(vec![8])),
             _ => unreachable!(),
         };
+        let key_positions =
+            UInt32Array::from_iter_values((0..repeats).flat_map(|_| 0..keys.len() as u32));
+        let keys = arrow_select::take::take(&keys, &key_positions, None).unwrap();
         for indexed_fragments in 0..=2 {
             if indexed_fragments == 1 {
                 let params = ScalarIndexParams::default();
@@ -1194,13 +1211,14 @@ mod test {
             .unwrap();
         assert_eq!(
             resolved,
-            vec![
+            [
                 Some(RowAddress::new_from_parts(1, 0)),
                 None,
                 Some(RowAddress::new_from_parts(1, 1)),
                 Some(RowAddress::new_from_parts(1, 0)),
                 None,
             ]
+            .repeat(repeats)
         );
         let error = dataset
             .lookup_row_addresses("i", &UInt64Array::from(vec![7]))

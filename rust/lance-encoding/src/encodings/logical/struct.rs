@@ -338,6 +338,13 @@ impl StructuralStructDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        self.children
+            .iter()
+            .filter_map(|child| child.max_dictionary_rows())
+            .min()
+    }
+
     fn accept_page(&mut self, mut child: LoadedPageShard) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();
@@ -1140,8 +1147,8 @@ mod tests {
         let list_array = Arc::new(list_builder.finish());
         let int_array = Arc::new(Int32Array::from_iter_values(0..10000));
         let fields = vec![
-            Field::new("", list_array.data_type().clone(), true),
-            Field::new("", int_array.data_type().clone(), true),
+            Field::new("list", list_array.data_type().clone(), true),
+            Field::new("scalar", int_array.data_type().clone(), true),
         ];
         let struct_array = Arc::new(StructArray::new(
             Fields::from(fields),

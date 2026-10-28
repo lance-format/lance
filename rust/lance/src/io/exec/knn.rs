@@ -18,7 +18,11 @@ use arrow_array::{
     cast::AsArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
 use datafusion::physical_plan::PlanProperties;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
@@ -49,7 +53,9 @@ use lance_datafusion::utils::{
 };
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
+use lance_index::scalar::minhash_lsh::{MinHashHit, TopHits};
 use lance_index::vector::DIST_Q_C_COLUMN;
+use lance_index::vector::graph::OrderedFloat;
 use lance_index::vector::{
     DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query, VectorIndex,
     flat::compute_distance,
@@ -960,6 +966,13 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1066,8 +1079,16 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        let inner_stats = self.input.partition_statistics(partition)?;
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let inner_stats = &input_stats[0];
         let input_schema = self.input.schema();
         let input_stats_by_name = inner_stats
             .column_statistics
@@ -1420,6 +1441,13 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2248,6 +2276,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -2468,20 +2503,22 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         )))
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        let mut requests = vec![ChildStats::Skip; self.children().len()];
+        requests[0] = ChildStats::At(partition);
+        requests
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> DataFusionResult<Arc<datafusion::physical_plan::Statistics>> {
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
         Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
-                    * self
-                        .input
-                        .partition_statistics(partition)?
-                        .num_rows
-                        .get_value()
-                        .unwrap_or(&1),
+                    * input_stats[0].num_rows.get_value().unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
@@ -2673,6 +2710,13 @@ impl ExecutionPlan for ANNIvfBatchExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -2734,8 +2778,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
         let result_schema = schema.clone();
         let fut = async move {
             let dim = query.key.len() / query_count;
-            // Per-query candidate (distance, row_id) pairs accumulated across deltas.
-            let mut candidates: Vec<Vec<(f32, u64)>> = vec![Vec::new(); query_count];
+            // Each max-heap retains only the best k candidates across deltas.
+            let mut candidates = (0..query_count)
+                .map(|_| TopHits::new(query.k))
+                .collect::<Vec<_>>();
 
             for index_meta in &indices {
                 let index = {
@@ -2836,13 +2882,17 @@ impl ExecutionPlan for ANNIvfBatchExec {
                             ))
                         })?
                         .as_primitive::<UInt64Type>();
-                    candidates[query_index].extend(
-                        dists
-                            .values()
-                            .iter()
-                            .copied()
-                            .zip(row_ids.values().iter().copied()),
-                    );
+                    for (distance, row_id) in dists
+                        .values()
+                        .iter()
+                        .copied()
+                        .zip(row_ids.values().iter().copied())
+                    {
+                        candidates[query_index].push(MinHashHit {
+                            distance: OrderedFloat(distance),
+                            row_id,
+                        });
+                    }
                 }
             }
 
@@ -2850,13 +2900,11 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut query_index_builder = Int32Builder::new();
             let mut distance_builder = Float32Builder::new();
             let mut row_id_builder = UInt64Builder::new();
-            for (query_index, cands) in candidates.iter_mut().enumerate() {
-                cands.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                cands.truncate(query.k);
-                for (distance, row_id) in cands.iter() {
+            for (query_index, hits) in candidates.into_iter().enumerate() {
+                for MinHashHit { distance, row_id } in hits.into_sorted() {
                     query_index_builder.append_value(query_index as i32);
-                    distance_builder.append_value(*distance);
-                    row_id_builder.append_value(*row_id);
+                    distance_builder.append_value(distance.0);
+                    row_id_builder.append_value(row_id);
                 }
             }
             let batch = RecordBatch::try_new(
@@ -2948,6 +2996,13 @@ impl ExecutionPlan for MultivectorScoringExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -3080,6 +3135,8 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::adaptive_probe::AutoProbeConfig;
     use super::*;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
 
     use std::any::Any;
 
@@ -3136,6 +3193,44 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+        }
+    }
+
+    #[rstest]
+    #[case::single_segment(3, vec![vec![(3.0, 3), (1.0, 1), (2.0, 2)]])]
+    #[case::multiple_segments(2, vec![vec![(4.0, 4), (1.0, 3)], vec![(2.0, 2), (0.0, 1)]])]
+    #[case::empty_segment(2, vec![vec![], vec![(2.0, 2)], vec![]])]
+    #[case::fewer_than_k(4, vec![vec![(2.0, 2)], vec![(1.0, 1)]])]
+    #[case::zero_k(0, vec![vec![(1.0, 1)]])]
+    #[case::ties_and_duplicates(3, vec![vec![(1.0, 7), (1.0, 3)], vec![(1.0, 3), (1.0, 5)]])]
+    #[case::worse_after_full(1, vec![vec![(1.0, 1)], vec![(2.0, 2)]])]
+    #[case::float_total_order(3, vec![vec![(f32::NAN, 1), (-0.0, 3)], vec![(0.0, 2), (f32::NEG_INFINITY, 4)]])]
+    #[case::signed_zero_at_capacity(1, vec![vec![(0.0, 2)], vec![(-0.0, 3)]])]
+    fn test_ann_batch_candidate_merge_matches_sort(
+        #[case] k: usize,
+        #[case] segments: Vec<Vec<(f32, u64)>>,
+    ) {
+        let mut expected = segments.iter().flatten().copied().collect::<Vec<_>>();
+        expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        expected.truncate(k);
+
+        let mut hits = TopHits::new(k);
+        let mut candidates_seen = 0;
+        for segment in segments {
+            for (distance, row_id) in segment {
+                hits.push(MinHashHit {
+                    distance: OrderedFloat(distance),
+                    row_id,
+                });
+                candidates_seen += 1;
+                assert_eq!(hits.missing(), k.saturating_sub(candidates_seen));
+            }
+        }
+        let actual = hits.into_sorted();
+        assert_eq!(actual.len(), expected.len());
+        for (candidate, (distance, row_id)) in actual.iter().zip(expected) {
+            assert_eq!(candidate.distance.0.to_bits(), distance.to_bits());
+            assert_eq!(candidate.row_id, row_id);
         }
     }
 
@@ -4670,7 +4765,9 @@ mod tests {
             },
         )
         .unwrap();
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(
             stats.column_statistics.len(),
             plan.schema().fields().len(),

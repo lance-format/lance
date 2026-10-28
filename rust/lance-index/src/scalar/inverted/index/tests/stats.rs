@@ -2,6 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_core::cache::{
+    CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, QuickCacheBackend,
+};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// IO accounting for the IO-counting stats test below: tracks bytes
 /// pulled from the posting file so we can assert that the stats path is
@@ -918,6 +922,224 @@ async fn test_cache_aware_exact_reuses_prewarmed_read_ahead_group() {
     assert_eq!(metrics.index_cache_hits(), 1);
     assert_eq!(metrics.index_cache_misses(), 0);
     assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+}
+
+#[rstest::rstest]
+#[case::v2(false, false)]
+#[case::v3(true, false)]
+#[case::v2_backpressure(false, true)]
+#[case::v3_backpressure(true, true)]
+#[tokio::test]
+async fn test_cache_aware_exact_reuses_nonresident_group(
+    #[case] v3: bool,
+    #[case] backpressure: bool,
+) {
+    #[derive(Debug)]
+    struct LayeredBackend {
+        inner: QuickCacheBackend,
+        resident: AtomicBool,
+        lower_tier_reads: AtomicUsize,
+        backpressure: bool,
+        source_group: std::sync::Mutex<Option<std::sync::Weak<dyn std::any::Any + Send + Sync>>>,
+        insert_ready: tokio::sync::Notify,
+        resume_insert: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl CacheBackend for LayeredBackend {
+        async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+            if self.resident.load(Ordering::Relaxed) {
+                self.inner.get_resident(key).await
+            } else {
+                None
+            }
+        }
+
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            let entry = self.inner.get(key, codec).await;
+            if !self.resident.load(Ordering::Relaxed)
+                && entry.as_ref().is_some_and(|entry| {
+                    entry
+                        .downcast_ref::<PostingListGroup>()
+                        .is_some_and(|group| group.len() > 1)
+                })
+            {
+                self.lower_tier_reads.fetch_add(1, Ordering::Relaxed);
+                if self.backpressure {
+                    *self.source_group.lock().unwrap() =
+                        Some(Arc::downgrade(entry.as_ref().unwrap()));
+                    // Model a lower-tier read whose promoted group has been
+                    // evicted before the singleton can finish spilling.
+                    self.inner.clear().await;
+                }
+            }
+            entry
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            size_bytes: usize,
+            codec: Option<CacheCodec>,
+        ) {
+            let block = self.backpressure
+                && entry
+                    .downcast_ref::<PostingListGroup>()
+                    .is_some_and(|group| group.len() == 1);
+            self.inner.insert(key, entry, size_bytes, codec).await;
+            if block {
+                self.insert_ready.notify_one();
+                self.resume_insert.notified().await;
+            }
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: std::pin::Pin<
+                Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
+            >,
+            codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            self.inner.get_or_insert(key, loader, codec).await
+        }
+
+        async fn clear(&self) {
+            self.inner.clear().await;
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.inner.num_entries().await
+        }
+
+        async fn size_bytes(&self) -> usize {
+            self.inner.size_bytes().await
+        }
+    }
+
+    let backend = Arc::new(LayeredBackend {
+        inner: QuickCacheBackend::with_capacity(1024 * 1024),
+        resident: AtomicBool::new(true),
+        lower_tier_reads: AtomicUsize::new(0),
+        backpressure,
+        source_group: std::sync::Mutex::new(None),
+        insert_ready: tokio::sync::Notify::new(),
+        resume_insert: tokio::sync::Notify::new(),
+    });
+    let cache = LanceCache::with_backend(backend.clone());
+    let (mut index, counter, _tmpdir) = if v3 {
+        load_counted_v3_index(cache.clone()).await
+    } else {
+        load_counted_v2_index(8, cache.clone()).await
+    };
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+    inverted_list.prewarm_posting_lists(false, 1).await.unwrap();
+    let calls_before = counter.read_range_calls();
+    let rows_before = counter.rows_read();
+    backend.resident.store(false, Ordering::Relaxed);
+
+    let request = tokio::spawn({
+        let inverted_list = inverted_list.clone();
+        async move {
+            inverted_list
+                .posting_list_with_policy(
+                    0,
+                    false,
+                    &NoOpMetricsCollector,
+                    PostingReadPolicy::CacheAwareExact,
+                )
+                .await
+        }
+    });
+    if backpressure {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend.insert_ready.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            backend
+                .source_group
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .is_none(),
+            "the large source group must be released before insertion waits"
+        );
+        backend.resume_insert.notify_one();
+    }
+    let posting = request.await.unwrap().unwrap();
+
+    assert_eq!(posting.len(), 1);
+    assert_eq!(backend.lower_tier_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(counter.read_range_calls(), calls_before);
+    assert_eq!(counter.rows_read(), rows_before);
+
+    // A second request must reuse the compact singleton rather than fetching
+    // and decoding the larger persistent group again, even with cold RAM.
+    let repeated = inverted_list
+        .posting_list_with_policy(
+            0,
+            false,
+            &NoOpMetricsCollector,
+            PostingReadPolicy::CacheAwareExact,
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.len(), posting.len());
+    assert_eq!(backend.lower_tier_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(counter.read_range_calls(), calls_before);
+    assert_eq!(counter.rows_read(), rows_before);
+
+    let singleton = inverted_list
+        .index_cache
+        .get_with_key(&posting_list_group_cache_key(
+            0,
+            1,
+            inverted_list.has_impacts,
+        ))
+        .await
+        .unwrap();
+    let PostingListGroupStorage::Packed(singleton) = &singleton.storage else {
+        panic!("modern singleton cache must preserve packed storage");
+    };
+    assert_eq!(singleton.batch.num_rows(), 1);
+    if backpressure {
+        return;
+    }
+    let full = inverted_list
+        .index_cache
+        .get_with_key(&posting_list_group_cache_key(
+            0,
+            4,
+            inverted_list.has_impacts,
+        ))
+        .await
+        .unwrap();
+    let PostingListGroupStorage::Packed(full) = &full.storage else {
+        panic!("modern prewarm must use packed storage");
+    };
+    // Keeping a slice would pin all unrelated postings after group eviction.
+    let blocks = |batch: &RecordBatch| {
+        batch
+            .column_by_name(POSTING_COL)
+            .unwrap()
+            .as_list::<i32>()
+            .values()
+            .as_binary::<i64>()
+            .values()
+            .data_ptr()
+    };
+    assert_ne!(blocks(&singleton.batch), blocks(&full.batch));
 }
 
 #[tokio::test]
