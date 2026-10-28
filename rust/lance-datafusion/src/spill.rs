@@ -1076,11 +1076,18 @@ mod tests {
         let (first_result, second_result) = tokio::join!(collect(first), collect(second));
         assert!(first_result.is_err());
         assert!(second_result.is_err());
-        tokio::task::yield_now().await;
-        assert_eq!(
-            disk_manager.used_disk_space(),
-            0,
-            "concurrent replay quota failures must release their disk reservations"
+        // A drain task publishes its error before it returns, and the spill file's last
+        // reference drops with the task on a worker thread, so the release can trail it.
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while disk_manager.used_disk_space() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "concurrent replay quota failures must release their disk reservations, {} bytes still reserved",
+            disk_manager.used_disk_space()
         );
     }
 
