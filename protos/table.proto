@@ -647,6 +647,21 @@ message ShardManifest {
    * (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
    */
   ShardStatus status = 15;
+
+  /* The operation holding the seal, set with status SEALED and cleared on
+   * unseal. Lets whoever finds the seal identify its holder and tell when it
+   * expires.
+   */
+  optional SealedBy sealed_by = 16;
+}
+
+// The holder of a shard's seal.
+message SealedBy {
+  // Caller-chosen id of the operation that sealed the shard.
+  string txn = 1;
+
+  // When the seal was taken (Unix timestamp in milliseconds).
+  int64 sealed_at_millis = 2;
 }
 
 // A shard field value stored as raw Arrow scalar bytes.
@@ -817,6 +832,17 @@ message MemWalIndexDetails {
    * (which is not persisted).
    */
   map<string, string> writer_config_defaults = 11;
+
+  /* Names this MemWAL's storage directory, `_{dir_id}_mem_wal/` under the
+   * table's base path. Minted when the MemWAL is initialized and carried
+   * unchanged through every rewrite of this index, so a MemWAL initialized
+   * again after removal shares no storage with an earlier one. Empty means
+   * the legacy `_mem_wal/` directory.
+   *
+   * Commits that change MemWAL state name the dir_id they were built for and
+   * are rejected when the index they build on carries another one, or none.
+   */
+  string dir_id = 13;
 }
 
 // Sharding spec definition.

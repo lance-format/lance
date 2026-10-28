@@ -13240,6 +13240,7 @@ mod test {
                 updated_fragments: vec![updated.fragment],
                 new_fragments: vec![],
                 fields_modified: updated.fields_modified,
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),

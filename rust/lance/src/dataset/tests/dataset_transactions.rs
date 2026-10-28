@@ -1551,6 +1551,7 @@ async fn test_build_manifest_partial_last_updated_rewrite_columns_stable_row_ids
         updated_fragments: vec![u.fragment],
         new_fragments: vec![],
         fields_modified: u.fields_modified,
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: Some(UpdateMode::RewriteColumns),

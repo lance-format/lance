@@ -625,6 +625,7 @@ impl MergeInsertBuilder {
     pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
         sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
+        dir_id: String,
     ) -> PyResult<PyRefMut<'a, Self>> {
         use lance_index::mem_wal::CompactedSsTable;
 
@@ -632,7 +633,8 @@ impl MergeInsertBuilder {
             .iter()
             .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;
-        slf.builder.mark_sstables_as_compacted(compacted_sstables);
+        slf.builder
+            .mark_sstables_as_compacted(dir_id, compacted_sstables);
         Ok(slf)
     }
 }

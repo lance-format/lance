@@ -81,7 +81,9 @@ fn inner_merge_insert<'local>(
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
             .write_mode(write_mode)
-            .mark_sstables_as_compacted(compacted_sstables)
+            // The Java API has no MemWAL `dir_id` yet; empty names the legacy
+            // `_mem_wal` directory.
+            .mark_sstables_as_compacted("", compacted_sstables)
             .try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;

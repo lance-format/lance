@@ -190,6 +190,10 @@ pub enum Operation {
         fields_modified: Vec<u32>,
         /// MemWAL SSTables to mark as compacted after this transaction.
         compacted_sstables: Vec<CompactedSsTable>,
+        /// The `dir_id` of the MemWAL `compacted_sstables` belongs to. Required
+        /// when `compacted_sstables` is non-empty; see
+        /// [`Self::UpdateMemWalState`].
+        mem_wal_dir_id: Option<String>,
         /// The fields that used to judge whether to preserve the new frag's id into
         /// the frag bitmap of the specified indices.
         fields_for_preserving_frag_bitmap: Vec<u32>,
@@ -232,6 +236,11 @@ pub enum Operation {
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
         compacted_sstables: Vec<CompactedSsTable>,
+        /// The `dir_id` of the MemWAL this update was built for. Rejected with
+        /// [`lance_core::Error::StaleMemWal`] unless the manifest it builds on
+        /// carries that MemWAL, so a late writer from a disabled or replaced
+        /// MemWAL cannot record progress into the current one.
+        dir_id: String,
     },
 
     /// Clone a dataset.

@@ -980,6 +980,7 @@ fn convert_to_java_operation_inner<'local>(
             update_mode,
             inserted_rows_filter,
             updated_fragment_offsets,
+            ..
         } => {
             let removed_fragment_ids_obj =
                 export_unsigned_longs(env, &removed_fragment_ids, "update.removedFragmentIds")?;
@@ -1187,7 +1188,9 @@ fn convert_to_java_operation_inner<'local>(
                 num_fragments,
             )?)],
         )?),
-        Operation::UpdateMemWalState { compacted_sstables } => {
+        Operation::UpdateMemWalState {
+            compacted_sstables, ..
+        } => {
             let compacted_sstables = export_compacted_sstables(env, &compacted_sstables)?;
             Ok(env.new_object(
                 "org/lance/operation/UpdateMemWalState",
@@ -2064,12 +2067,16 @@ fn convert_to_rust_operation(
                 }
             };
 
+            // The Java API has no MemWAL `dir_id` yet; empty names the legacy
+            // `_mem_wal` directory.
+            let mem_wal_dir_id = (!compacted_sstables.is_empty()).then(String::new);
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
                 fields_modified,
                 compacted_sstables,
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
@@ -2166,7 +2173,11 @@ fn convert_to_rust_operation(
                 "getCompactedSstables",
                 |env, sstable| compacted_sstable_from_java(env, &sstable),
             )?;
-            Operation::UpdateMemWalState { compacted_sstables }
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                // See the `Update` import above.
+                dir_id: String::new(),
+            }
         }
         "Clone" => Operation::Clone {
             is_shallow: env.get_boolean_from_method(java_operation, "isShallow")?,

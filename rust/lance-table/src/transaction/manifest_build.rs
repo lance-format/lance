@@ -44,8 +44,8 @@ use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
 use crate::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
-    CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
-    new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
+    CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, check_mem_wal_dir_id,
+    load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
 };
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::prepare::{FragReuseUpdate, PreparedIndices};
@@ -279,6 +279,36 @@ impl Transaction {
             segments.sort_unstable_by_key(|segment| segment.uuid);
         }
         by_name
+    }
+
+    /// Checks a `CreateIndex` that writes the MemWAL index against the manifest
+    /// it builds on. A rewrite (it removes the old MemWAL index) must find the
+    /// same `dir_id`; an initialization must find no MemWAL index, so two
+    /// concurrent initializations cannot both commit.
+    fn check_mem_wal_create_index(
+        indices: &[IndexMetadata],
+        new_indices: &[IndexMetadata],
+        removed_indices: &[IndexMetadata],
+    ) -> Result<()> {
+        let Some(new_mem_wal) = new_indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        else {
+            return Ok(());
+        };
+        if removed_indices
+            .iter()
+            .any(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        {
+            let dir_id = load_mem_wal_index_details(new_mem_wal.clone())?.dir_id;
+            return check_mem_wal_dir_id(indices, &dir_id);
+        }
+        if indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+            return Err(Error::invalid_input(
+                "MemWAL is already initialized on this dataset.",
+            ));
+        }
+        Ok(())
     }
 
     /// Apply MemWAL index-coverage rules once the final index list is known.
@@ -901,6 +931,7 @@ impl Transaction {
                 new_fragments,
                 fields_modified,
                 compacted_sstables,
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 updated_fragment_offsets,
@@ -1114,7 +1145,19 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
+                // Checked whenever named, not only with progress: a compaction
+                // commits in chunks and only the last records progress, so an
+                // earlier chunk from a replaced MemWAL must be refused too.
+                if let Some(dir_id) = mem_wal_dir_id {
+                    check_mem_wal_dir_id(&final_indices, dir_id)?;
+                }
                 if !compacted_sstables.is_empty() {
+                    if mem_wal_dir_id.is_none() {
+                        return Err(Error::invalid_input(
+                            "an Update recording MemWAL compaction progress must name \
+                             the MemWAL it belongs to (mem_wal_dir_id)",
+                        ));
+                    }
                     update_mem_wal_index_compacted_sstables(
                         &mut final_indices,
                         new_version,
@@ -1301,6 +1344,7 @@ impl Transaction {
                 removed_indices,
                 ..
             } => {
+                Self::check_mem_wal_create_index(&final_indices, new_indices, removed_indices)?;
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let removed_uuids = removed_indices
                     .iter()
@@ -1770,8 +1814,12 @@ impl Transaction {
                 }
             }
             Operation::UpdateMemWalState {
-                compacted_sstables, ..
+                compacted_sstables,
+                dir_id,
             } => {
+                // Checked even when empty: an empty update is the fence that
+                // proves the MemWAL is still present.
+                check_mem_wal_dir_id(&final_indices, dir_id)?;
                 // Updates the MemWAL index only; the fragments are unchanged.
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 update_mem_wal_index_compacted_sstables(
@@ -3024,6 +3072,7 @@ mod tests {
         let transaction = Transaction::new(
             manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
             },
             None,
@@ -4015,6 +4064,7 @@ mod tests {
                 updated_fragments: vec![updated2, updated4, Fragment::new(99)],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -4140,6 +4190,7 @@ mod tests {
                 updated_fragments: vec![updated],
                 new_fragments: vec![inserted],
                 fields_modified: vec![1],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode,
@@ -4418,6 +4469,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4478,6 +4530,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4537,6 +4590,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4596,6 +4650,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4649,6 +4704,7 @@ mod tests {
             updated_fragments: vec![frag_a],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: vec![],
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -4676,6 +4732,7 @@ mod tests {
                 updated_fragments: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4726,6 +4783,7 @@ mod tests {
                     updated_fragments: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: 1,
@@ -4775,6 +4833,7 @@ mod tests {
                     updated_fragments: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: 1,
@@ -6811,6 +6870,7 @@ mod tests {
                 updated_fragments: vec![staged],
                 new_fragments: vec![],
                 fields_modified: vec![0],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),

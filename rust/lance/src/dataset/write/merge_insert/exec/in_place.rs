@@ -532,6 +532,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                mem_wal_dir_id: None,
                 compacted_sstables,
                 // In-place patches leave every row where it was, so no index's
                 // fragment bitmap needs extending.

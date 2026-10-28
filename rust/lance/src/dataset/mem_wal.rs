@@ -31,6 +31,21 @@
 //!
 //! Each shard has exactly one active writer at any time, enforced via
 //! monotonically increasing writer epochs in the shard manifest.
+//!
+//! ## MemWAL Directory
+//!
+//! Each initialization mints a `dir_id` into the MemWAL index, and all of that
+//! MemWAL's storage lives under `{base}/_{dir_id}_mem_wal/` (the legacy
+//! `_mem_wal/` when it is empty). A MemWAL initialized again after removal
+//! never shares paths or epochs with an earlier one.
+//!
+//! Every commit that changes MemWAL state names the `dir_id` it was built for:
+//! `UpdateMemWalState`, an `Update` recording `compacted_sstables`, and a
+//! `CreateIndex` rewriting the MemWAL index. Building the manifest rejects it
+//! with [`lance_core::Error::StaleMemWal`] when the manifest it builds on has no
+//! MemWAL index or one with another `dir_id`, whether or not the commit rebased.
+//! A writer that outlives the removal or replacement of its MemWAL therefore
+//! cannot record its progress into another one.
 
 mod api;
 mod hnsw;
@@ -103,8 +118,8 @@ impl MemTableDataTarget {
         }
     }
 
-    pub fn generation_path(&self, base_path: &Path, shard_id: &Uuid) -> Path {
-        shard_base_path(base_path, shard_id).join(self.generation_dir.as_str())
+    pub fn generation_path(&self, base_path: &Path, dir_id: &str, shard_id: &Uuid) -> Path {
+        shard_base_path(base_path, dir_id, shard_id).join(self.generation_dir.as_str())
     }
 
     pub fn data_file_key(&self) -> &str {
@@ -333,7 +348,9 @@ pub use sharding::{
     evaluate_sharding_spec, evaluate_sharding_spec_with_embedded_columns,
     evaluate_sharding_spec_with_source_columns,
 };
-pub use wal::{BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer};
+pub use wal::{
+    BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer, fence_shard,
+};
 pub use write::FreezeFence;
 pub use write::ShardWriter;
 pub use write::ShardWriterConfig;
