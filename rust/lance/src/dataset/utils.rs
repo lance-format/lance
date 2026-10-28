@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::Result;
+use crate::{Dataset, Result};
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -16,8 +16,8 @@ use lance_arrow::json::{
 };
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
 use lance_table::format::{RowDatasetVersionRun, RowDatasetVersionSequence};
+use lance_table::rowids::RowIdSequence;
 use lance_table::rowids::segment::U64Segment;
-use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -188,26 +188,16 @@ impl CapturedRowIds {
         }
     }
 
-    pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Result<Cow<'_, RoaringTreemap>> {
+    /// Resolve captured IDs as a set of live addresses. Positional lookups use
+    /// bounded batches, and uncovered fragments are scanned once for the set.
+    pub async fn row_addrs(&self, dataset: &Dataset) -> Result<Cow<'_, RoaringTreemap>> {
         match self {
             Self::AddressStyle(addrs) => Ok(Cow::Borrowed(addrs)),
             Self::SequenceStyle {
                 row_ids: sequence, ..
-            } => {
-                let mut treemap = RoaringTreemap::new();
-                let Some(index) = index else {
-                    panic!("RowIdIndex required for sequence style row ids")
-                };
-                for row_id in sequence.iter() {
-                    treemap.insert(
-                        index
-                            .get(row_id)?
-                            .expect("row id missing from index")
-                            .into(),
-                    );
-                }
-                Ok(Cow::Owned(treemap))
-            }
+            } => Ok(Cow::Owned(
+                dataset.resolve_captured_row_ids(sequence).await?,
+            )),
         }
     }
 }
@@ -396,6 +386,22 @@ impl SchemaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::WriteParams;
+    use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::rowids::{
+        INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+    };
+    use crate::index::DatasetIndexExt;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, UInt64Type};
+    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{Error, ROW_ADDR};
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_table::format::RowIdMeta;
+    use lance_table::rowids::write_row_ids;
 
     #[test]
     fn capture_created_at_extends_a_run_across_batches() {
@@ -417,5 +423,216 @@ mod tests {
         let mut not_carried = CapturedRowIds::new(true);
         not_carried.capture_created_at(&[1, 2]);
         assert_eq!(not_carried.created_at_sequence(), None);
+    }
+
+    #[rstest::rstest]
+    #[case::unindexed(0)]
+    #[case::partial(1)]
+    #[case::full(2)]
+    #[tokio::test]
+    async fn captured_row_ids_scan_uncovered_fragments_once(#[case] indexed_fragments: usize) {
+        let directory = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                &directory,
+                FragmentCount::from(4),
+                FragmentRowCount::from(5000),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 5000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+            ])
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10000,
+                defer_index_remap: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|f| f.row_id_meta == Some(RowIdMeta::Column))
+        );
+        if indexed_fragments != 0 {
+            let fragments = dataset.fragments()[..indexed_fragments]
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect();
+            dataset
+                .create_index_builder(&[ROW_ID], IndexType::BTree, &ScalarIndexParams::default())
+                .fragments(fragments)
+                .await
+                .unwrap();
+        }
+        dataset.delete("i = 7 OR i = 10007").await.unwrap();
+        let oracle = dataset
+            .scan()
+            .project::<&str>(&[])
+            .unwrap()
+            .with_row_id()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = oracle[ROW_ID].as_primitive::<UInt64Type>();
+        let addresses = oracle[ROW_ADDR].as_primitive::<UInt64Type>();
+        let expected: RoaringTreemap = addresses.values().iter().copied().collect();
+        let single_id = ids.value(ids.len() - 1);
+        let single_address = addresses.value(addresses.len() - 1);
+        let mut all_ids: Vec<_> = ids.values().iter().rev().copied().collect();
+        all_ids.extend([single_id, single_id]);
+        let mut data_reads = Vec::new();
+        for requested in [vec![single_id], all_ids] {
+            // Fresh sessions make metadata caching independent of request size.
+            let reader = DatasetBuilder::from_uri(&directory).load().await.unwrap();
+            reader.object_store.io_stats_incremental();
+            let is_single = requested.len() == 1;
+            let captured = CapturedRowIds::SequenceStyle {
+                row_ids: RowIdSequence::from(requested.as_slice()),
+                created_at: None,
+            };
+            let actual = captured.row_addrs(&reader).await.unwrap().into_owned();
+            assert_eq!(
+                actual,
+                if is_single {
+                    RoaringTreemap::from_iter([single_address])
+                } else {
+                    expected.clone()
+                }
+            );
+            let mut reads = reader
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .into_iter()
+                .filter(|request| request.path.as_ref().contains("/data/"))
+                .map(|request| {
+                    (
+                        request.path.to_string(),
+                        request.range.map(|r| (r.start, r.end)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            reads.sort_unstable();
+            data_reads.push(reads);
+        }
+        assert_eq!(
+            data_reads[0], data_reads[1],
+            "larger captures must not rescan uncovered data"
+        );
+        assert_eq!(data_reads[0].is_empty(), indexed_fragments == 2);
+        for missing_id in [7, 20000] {
+            let captured = CapturedRowIds::SequenceStyle {
+                row_ids: RowIdSequence::from(&[missing_id][..]),
+                created_at: None,
+            };
+            let error = captured.row_addrs(&dataset).await.unwrap_err();
+            assert!(matches!(error, Error::Internal { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("Captured row ID {missing_id} has no live address"))
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::ambiguous(false)]
+    #[case::deleted_original(true)]
+    #[tokio::test]
+    async fn captured_row_ids_detect_duplicates_across_coverage(
+        #[case] has_deleted_original: bool,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        if has_deleted_original {
+            dataset.delete("i = 2").await.unwrap();
+        }
+        // The first fragment has an inline range; the nonmonotonic last
+        // fragment requires a scan. Row ID 2 crosses the two resolution paths.
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        Arc::make_mut(&mut manifest.fragments)[2].row_id_meta = Some(RowIdMeta::Inline(
+            write_row_ids(&RowIdSequence::from(&[2, 9, 8, 11][..])).into(),
+        ));
+        let captured = CapturedRowIds::SequenceStyle {
+            row_ids: RowIdSequence::from(&[2, 8, 2, 11][..]),
+            created_at: None,
+        };
+        let result = captured.row_addrs(&dataset).await;
+        if has_deleted_original {
+            assert_eq!(
+                result.unwrap().into_owned(),
+                RoaringTreemap::from_iter(
+                    [0, 2, 3].map(|offset| u64::from(RowAddress::new_from_parts(2, offset)))
+                )
+            );
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("not unique"));
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_row_ids_empty_and_address_domain() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(1),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 1,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset.delete("true").await.unwrap();
+        let mut captured = CapturedRowIds::new(true);
+        assert!(captured.row_addrs(&dataset).await.unwrap().is_empty());
+        captured.capture(&[0]).unwrap();
+        let error = captured.row_addrs(&dataset).await.unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Captured row ID 0 has no live address")
+        );
+
+        let physical = CapturedRowIds::AddressStyle(RoaringTreemap::from_iter([7, 9]));
+        assert!(matches!(
+            physical.row_addrs(&dataset).await.unwrap(),
+            Cow::Borrowed(_)
+        ));
     }
 }

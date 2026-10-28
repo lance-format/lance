@@ -3517,7 +3517,7 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            captured_ids.row_addrs(None)?.into_owned()
+            captured_ids.row_addrs(dataset.as_ref()).await?.into_owned()
         } else if records_from_fragment_metadata {
             live_row_addrs(dataset.as_ref(), &fragments, &new_fragments).await?
         } else {

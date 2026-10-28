@@ -8,9 +8,7 @@ use std::time::Duration;
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
-use crate::dataset::rowids::{
-    get_row_id_index, inline_row_lineage_max_bytes, place_carried_row_lineage,
-};
+use crate::dataset::rowids::{inline_row_lineage_max_bytes, place_carried_row_lineage};
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
@@ -595,8 +593,7 @@ impl UpdateJob {
         }
 
         // Apply deletions
-        let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
+        let row_addrs = removed_row_ids.row_addrs(&self.dataset).await?;
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,
