@@ -136,14 +136,25 @@ async fn tagged_remapping_translates_pairwise_staged_ids(#[case] options: Duplic
 }
 
 #[rstest::rstest]
-#[case::default_search("default")]
-#[case::all_segments("all")]
-#[case::partial_selection("partial")]
-#[case::reconverged("reconverged")]
+#[case::default_search("default", false, true, false, false)]
+#[case::default_prefilter("default", true, true, false, false)]
+#[case::all_segments("all", false, true, false, false)]
+#[case::all_prefilter("all", true, true, false, false)]
+#[case::partial_selection("partial", false, true, false, false)]
+#[case::partial_prefilter("partial", true, true, false, false)]
+#[case::reconverged("reconverged", false, true, false, false)]
+#[case::reconverged_prefilter("reconverged", true, true, false, false)]
+#[case::all_postfilter("all", true, false, false, false)]
+#[case::partial_postfilter("partial", true, false, false, false)]
+#[case::partial_fast("partial", false, false, true, false)]
+#[case::segment_only("partial", false, false, false, true)]
 #[tokio::test]
 async fn vector_fragment_search_requires_every_contributor(
     #[case] selection: &str,
-    #[values(false, true)] filtered_destination: bool,
+    #[case] filtered_destination: bool,
+    #[case] prefilter: bool,
+    #[case] is_fast: bool,
+    #[case] segment_only: bool,
 ) {
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -276,17 +287,29 @@ async fn vector_fragment_search_requires_every_contributor(
     }
 
     let mut scan = dataset.scan();
-    let expected_rows = if selection == "reconverged" && !filtered_destination {
+    let is_postfilter = filtered_destination && !prefilter;
+    let expected_rows = if segment_only {
+        4
+    } else if is_fast {
+        0
+    } else if is_postfilter {
+        2
+    } else if selection == "reconverged" && !filtered_destination {
         8
     } else {
         1
     };
-    scan.nearest("vector", query, expected_rows).unwrap();
+    let k = if is_postfilter {
+        3
+    } else {
+        expected_rows.max(1)
+    };
     if filtered_destination {
         scan.with_fragments(vec![dataset.fragments()[0].clone()]);
-        scan.filter("i = 6").unwrap();
-        scan.prefilter(true);
-    } else {
+        scan.filter(if prefilter { "i = 6" } else { "i != 6" })
+            .unwrap();
+        scan.prefilter(prefilter);
+    } else if !segment_only {
         scan.with_fragments(dataset.fragments().iter().cloned().collect());
     }
     match selection {
@@ -299,14 +322,89 @@ async fn vector_fragment_search_requires_every_contributor(
         "default" | "reconverged" => {}
         _ => unreachable!(),
     }
+    scan.nearest("vector", query, k).unwrap().nprobes(1);
+    if is_fast {
+        scan.fast_search();
+    }
     let plan = scan.explain_plan(false).await.unwrap();
-    assert_eq!(plan.contains("ANN"), selection != "partial", "{plan}");
-    if selection == "partial" {
+    assert_eq!(
+        plan.contains("ANN"),
+        selection != "partial" || segment_only,
+        "{plan}"
+    );
+    if selection == "partial" && !is_fast && !segment_only {
         // The query names no metric, so the flat fallback ranks by the index's.
         assert!(plan.contains("KNNVectorDistance: metric=cosine"), "{plan}");
     }
     let result = scan.try_into_batch().await.unwrap();
     assert_eq!(result.num_rows(), expected_rows);
+    if is_fast {
+        return;
+    }
+    // Ordinary reads define current values and scope; no FRI coverage helper or KNN kernel
+    // participates in the distance oracle.
+    let mut oracle = dataset.scan();
+    if filtered_destination {
+        oracle.with_fragments(vec![dataset.fragments()[0].clone()]);
+    }
+    let source = oracle.try_into_batch().await.unwrap();
+    let norm = |vector: &[f32]| {
+        vector
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let query_norm = norm(query.values());
+    let mut expected = Vec::new();
+    for row in 0..source.num_rows() {
+        let id = source["i"].as_primitive::<Int32Type>().value(row);
+        if segment_only && id >= 4 {
+            continue;
+        }
+        if filtered_destination && prefilter && id != 6 {
+            continue;
+        }
+        let vector = source["vector"].as_fixed_size_list().value(row);
+        let vector = vector.as_primitive::<arrow_array::types::Float32Type>();
+        let dot = vector
+            .values()
+            .iter()
+            .zip(query.values())
+            .map(|(value, q)| f64::from(*value) * f64::from(*q))
+            .sum::<f64>();
+        let distance = 1.0 - dot / (norm(vector.values()) * query_norm);
+        expected.push((id, distance));
+    }
+    expected.sort_by(|left, right| left.1.total_cmp(&right.1));
+    expected.truncate(k);
+    if is_postfilter {
+        expected.retain(|(id, _)| *id != 6);
+    }
+    let actual = result["i"].as_primitive::<Int32Type>().values();
+    assert_eq!(
+        actual.as_ref(),
+        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        "{plan}"
+    );
+    let unique: RoaringBitmap = actual.iter().map(|id| *id as u32).collect();
+    assert_eq!(unique.len() as usize, result.num_rows());
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|(id, _)| unique.contains(*id as u32))
+            .count() as f64
+            / expected.len() as f64,
+        1.0
+    );
+    for (row, (_, distance)) in expected.iter().enumerate() {
+        let actual = f64::from(
+            result["_distance"]
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .value(row),
+        );
+        assert!(actual.is_finite() && (actual - distance).abs() <= 1e-5 + 1e-6 * distance.abs());
+    }
     if expected_rows == 8 {
         let mut values = result["i"].as_primitive::<Int32Type>().values().to_vec();
         values.sort_unstable();
@@ -314,11 +412,13 @@ async fn vector_fragment_search_requires_every_contributor(
     }
     // IVF_FLAT with one partition is exact: the nearest row must come from Y,
     // including when explicit selection of X requires a flat fallback.
-    assert_eq!(
-        result["i"].as_primitive::<Int32Type>().value(0),
-        6,
-        "{plan}"
-    );
+    if !is_postfilter && !segment_only {
+        assert_eq!(
+            result["i"].as_primitive::<Int32Type>().value(0),
+            6,
+            "{plan}"
+        );
+    }
 }
 
 #[rstest::rstest]
@@ -722,6 +822,93 @@ async fn text_indices_translate_through_the_shared_remapper(#[case] index_type: 
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(actual, std::collections::BTreeSet::from([0, 2, 6]));
+    }
+}
+
+#[rstest::rstest]
+#[case::lazy(false)]
+#[case::prewarmed(true)]
+#[tokio::test]
+async fn translated_fts_preserves_cached_state_after_request_end(#[case] prewarm: bool) {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col("text", lance_datagen::array::fill_utf8("hit".to_string()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &lance_index::scalar::InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let metadata = dataset
+        .load_index_by_name("text_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    if prewarm {
+        dataset.prewarm_index("text_idx").await.unwrap();
+    } else {
+        dataset
+            .open_scalar_index("text", &metadata.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+    }
+    let before = crate::index::scalar::cached_scalar_index_container(&dataset, &metadata.uuid)
+        .await
+        .unwrap();
+    let before = before
+        .as_any()
+        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+        .unwrap();
+    for _ in 0..2 {
+        let metrics = lance_index::metrics::LocalMetricsCollector::default();
+        let index = dataset
+            .open_scalar_index("text", &metadata.uuid, &metrics)
+            .await
+            .unwrap();
+        let after = index
+            .as_any()
+            .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+            .unwrap();
+        assert_eq!(
+            (
+                metrics
+                    .index_loads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before.shares_prewarm_state(after),
+            ),
+            (0, true),
+            "translated FTS must preserve cached state after its request ends"
+        );
+        let live = Arc::downgrade(&index);
+        drop(index);
+        assert!(live.upgrade().is_none());
+        let mut scan = dataset.scan();
+        scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+            .unwrap();
+        let result = scan.try_into_batch().await.unwrap();
+        let mut values = result["i"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (0..8).collect::<Vec<_>>());
     }
 }
 
@@ -1759,6 +1946,8 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     persist_fixture(&mut dataset, indices).await;
 
@@ -3209,6 +3398,8 @@ async fn install_history(
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     indices.push(fri.clone());
     Arc::make_mut(&mut dataset.manifest).fragments = live.into();

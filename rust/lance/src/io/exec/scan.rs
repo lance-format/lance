@@ -9,7 +9,9 @@ use std::task::{Context, Poll};
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -773,6 +775,13 @@ impl ExecutionPlan for LanceScanExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -894,6 +903,8 @@ impl ExecutionPlan for LanceScanExec {
 mod tests {
     use arrow_array::types::Int32Type;
     use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use datafusion::prelude::SessionConfig;
     use futures::TryStreamExt;
     use lance_datagen::{array, gen_batch};
@@ -984,7 +995,9 @@ mod tests {
             LanceScanConfig::default(),
         );
 
-        let stats = scan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&scan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
         // Nullable int32 plus a four-float vector, including estimated validity.
         assert_eq!(
@@ -1015,7 +1028,9 @@ mod tests {
             LanceScanConfig::default(),
         );
 
-        let stats = scan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&scan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(TOTAL_ROWS));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8300));
         assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
@@ -1053,7 +1068,13 @@ mod tests {
             },
         );
 
-        assert_eq!(scan.partition_statistics(None).unwrap().num_rows, expected);
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(&scan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
+            expected
+        );
         if range.is_none() {
             assert_eq!(scanned_rows(&scan).await, TOTAL_ROWS);
         }
@@ -1154,7 +1175,13 @@ mod tests {
             .indent(true)
             .to_string();
         assert!(description.contains(scan_node), "{description}");
-        assert_eq!(plan.partition_statistics(None).unwrap().num_rows, expected);
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
+            expected
+        );
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), 8);
         assert_eq!(batch["_rowid"].null_count(), usize::from(deleted));
@@ -1203,7 +1230,9 @@ mod tests {
             },
         );
 
-        let stats = exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
+            .unwrap();
         let emitted = scanned_rows(&exec).await;
 
         assert_eq!(

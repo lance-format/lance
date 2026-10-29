@@ -552,7 +552,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let files = if train {
+                let (files, built_target) = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
                         if vector_params_have_precomputed_ivf(vec_params) {
@@ -570,9 +570,9 @@ impl<'a> CreateIndexBuilder<'a> {
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
-                            files
+                            (files, None)
                         } else {
-                            Box::pin(build_filtered_vector_index(
+                            let built = Box::pin(build_filtered_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
@@ -582,11 +582,12 @@ impl<'a> CreateIndexBuilder<'a> {
                                 fragments,
                                 self.progress.clone(),
                             ))
-                            .await?
+                            .await?;
+                            (built.files, built.target_partition_size)
                         }
                     } else {
                         // Standard full dataset indexing
-                        Box::pin(build_vector_index(
+                        let built = Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -595,21 +596,23 @@ impl<'a> CreateIndexBuilder<'a> {
                             fri,
                             self.progress.clone(),
                         ))
-                        .await?
+                        .await?;
+                        (built.files, built.target_partition_size)
                     }
                 } else {
                     // Create empty vector index
-                    build_empty_vector_index(
+                    let files = build_empty_vector_index(
                         self.dataset,
                         column,
                         &index_name,
                         index_id,
                         vec_params,
                     )
-                    .await?
+                    .await?;
+                    (files, None)
                 };
                 CreatedIndex {
-                    index_details: vector_index_details(vec_params),
+                    index_details: vector_index_details(vec_params, built_target),
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -685,6 +688,8 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(index_files_to_table(created_index.files)),
+            clustering_id: None,
+            metadata: Default::default(),
         };
         // A generic scalar request only resolves to an implementation here.
         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
@@ -854,6 +859,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                clustering_id: None,
+                metadata: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &metadata)?;
             let segments = vec![metadata.into_index_segment()?];
@@ -925,6 +932,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                clustering_id: None,
+                metadata: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
             segment_metadatas.push(segment);
@@ -4803,7 +4812,7 @@ mod tests {
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
                     vec![],
@@ -4829,7 +4838,7 @@ mod tests {
                     Uuid::new_v4(),
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
                     vec![],

@@ -37,7 +37,7 @@ from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
-from lance.util import validate_vector_index
+from lance.util import sanitize_ts, validate_vector_index
 
 BaseModel = pytest.importorskip("pydantic").BaseModel
 
@@ -56,6 +56,11 @@ input_data = [
     (None, pa.record_batch([[1.0, 2.0], [20, 30]], names=["a", "b"])),
     (None, pd.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
     (None, pl.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
+    (None, pa.dataset.dataset(pa.table({"a": [1.0, 2.0], "b": [20, 30]}))),
+    (
+        None,
+        pa.dataset.dataset(pa.table({"a": [1.0, 2.0], "b": [20, 30]})).scanner(),
+    ),
     (
         input_schema,
         [pa.record_batch([pa.array([1.0, 2.0]), pa.array([20, 30])], names=["a", "b"])],
@@ -74,6 +79,8 @@ input_data = [
     ),
     # Pydantic model instances are auto-converted
     (None, [_InputModel(a=1.0, b=20), _InputModel(a=2.0, b=30)]),
+    (None, {"a": [1.0, 2.0], "b": [20, 30]}),
+    (None, [{"a": 1.0, "b": 20}, {"a": 2.0, "b": 30}]),
 ]
 
 
@@ -565,12 +572,12 @@ def test_asof_checkout(tmp_path: Path):
     ts_3 = datetime.now()
 
     # check that only the first batch is present
-    ds = lance.dataset(base_dir, asof=ts_1)
+    ds = lance.dataset(base_dir, asof=pd.Timestamp(ts_1))
     assert ds.version == 1
     assert len(ds.to_table()) == 3
 
     # check that the first and second batch are present
-    ds = lance.dataset(base_dir, asof=ts_2)
+    ds = lance.dataset(base_dir, asof=ts_2.isoformat())
     assert ds.version == 2
     assert len(ds.to_table()) == 6
 
@@ -578,6 +585,34 @@ def test_asof_checkout(tmp_path: Path):
     ds = lance.dataset(base_dir, asof=ts_3)
     assert ds.version == 3
     assert len(ds.to_table()) == 9
+
+    with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
+        lance.dataset(base_dir, asof=pd.NaT)
+
+    # An explicit version takes precedence over the timestamp cutoff.
+    assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
+
+
+@pytest.mark.parametrize(
+    "ts", ["2026-01-01", pd.Timestamp("2026-01-01"), datetime(2026, 1, 1)]
+)
+def test_sanitize_ts(ts):
+    assert sanitize_ts(ts) == datetime(2026, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "ts,error", [(pd.NaT, ValueError), (object(), TypeError)], ids=["nat", "object"]
+)
+def test_sanitize_ts_rejects(ts, error):
+    with pytest.raises(error):
+        sanitize_ts(ts)
+
+
+def test_sanitize_ts_without_pandas(monkeypatch):
+    monkeypatch.setattr("lance.util._PANDAS_AVAILABLE", False)
+    assert sanitize_ts("2026-01-01 00:00:00") == datetime(2026, 1, 1)
+    with pytest.raises(ValueError, match="Try installing Pandas"):
+        sanitize_ts("2026-01-01")
 
 
 def test_enable_stable_row_ids(tmp_path: Path):
@@ -2071,6 +2106,80 @@ def test_strict_overwrite(tmp_path: Path):
         )
     # CommitConflict means commit-step retries were exhausted; it is safe to retry.
     assert exc_info.value.retryable is True
+
+
+def test_fragment_object_metadata_round_trips_through_append(tmp_path: Path):
+    """A fragment's generic metadata map crosses Python -> Rust -> Python intact."""
+    import dataclasses
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "fragment_metadata"
+    dataset = lance.write_dataset(table, base_dir)
+
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: 東京  ",
+        "org.example.empty": "",
+    }
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    assert fragment.clustering_id is None
+    assert fragment.metadata == {}
+    stamped = dataclasses.replace(fragment, metadata=metadata)
+
+    dataset = lance.LanceDataset.commit(
+        dataset, lance.LanceOperation.Append([stamped]), read_version=dataset.version
+    )
+    committed = [f.metadata for f in dataset.get_fragments()]
+    assert committed[0].metadata == {}
+    assert committed[1].metadata == metadata
+    assert committed[1].clustering_id is None
+
+    # Operations on the same fragment keep the map.
+    dataset.delete("a = 3")
+    kept = dataset.get_fragments()[1].metadata
+    assert kept.metadata == metadata
+    assert kept.deletion_file is not None
+
+
+def test_nonzero_clustering_reference_reaches_rust_validation(tmp_path: Path):
+    """A nonzero clustering_id crosses Python -> Rust on fragments and indices.
+
+    No definition can exist in a table created from Python yet, so the manifest
+    validation error is the evidence that the reference arrived in Rust.
+    """
+    import dataclasses
+
+    from lance.dataset import Index
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "clustering_reference"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = dataclasses.replace(
+        lance.fragment.LanceFragment.create(base_dir, table), clustering_id=7
+    )
+    with pytest.raises(OSError, match="references clustering definition 7"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.Append([fragment]),
+            read_version=dataset.version,
+        )
+
+    index = Index(
+        uuid="00000000-0000-0000-0000-000000000001",
+        name="a_idx",
+        fields=[0],
+        dataset_version=dataset.version,
+        fragment_ids=set(f.fragment_id for f in dataset.get_fragments()),
+        index_version=0,
+        clustering_id=9,
+    )
+    with pytest.raises(OSError, match="references clustering definition 9"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+            read_version=dataset.version,
+        )
 
 
 def test_commit_timeout(tmp_path: Path):

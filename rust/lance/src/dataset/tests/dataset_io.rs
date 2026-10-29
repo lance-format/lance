@@ -23,6 +23,7 @@ use crate::dataset::{
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
+use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
@@ -1428,6 +1429,7 @@ async fn test_write_manifest(
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1601,6 +1603,8 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
         physical_rows: Some(second.num_rows()),
         last_updated_at_version_meta: None,
         created_at_version_meta: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -2142,6 +2146,7 @@ async fn append_dataset(
 async fn test_deep_clone(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
+    #[values(false, true)] local_fsync: bool,
 ) {
     // Setup source and target dirs
     let test_dir = TempStdDir::default();
@@ -2161,7 +2166,7 @@ async fn test_deep_clone(
         data_reader,
         test_uri,
         Some(WriteParams {
-            max_rows_per_file: 64,
+            max_rows_per_file: 32,
             max_rows_per_group: 16,
             data_storage_version: Some(data_storage_version),
             ..Default::default()
@@ -2197,8 +2202,17 @@ async fn test_deep_clone(
         .await
         .unwrap();
 
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([("local_fsync".to_owned(), local_fsync.to_string())]),
+        ))),
+        ..Default::default()
+    };
     // Perform deep clone
-    let cloned_dataset = branch.deep_clone(cloned_uri, "tag", None).await.unwrap();
+    let cloned_dataset = branch
+        .deep_clone(cloned_uri, "tag", Some(store_params.clone()))
+        .await
+        .unwrap();
 
     // Validate target dataset rows
     let batches = cloned_dataset
@@ -2264,7 +2278,11 @@ async fn test_deep_clone(
     let clone_dir = test_dir.join("clone_ds_old_ver");
     let cloned_ds = clone_dir.to_str().unwrap();
     let cloned_dataset = branch
-        .deep_clone(cloned_ds, ("branch", original_version - 1), None)
+        .deep_clone(
+            cloned_ds,
+            ("branch", original_version - 1),
+            Some(store_params),
+        )
         .await
         .unwrap();
     let store = branch.object_store.as_ref();
@@ -2284,6 +2302,13 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+
+    std::fs::remove_dir_all(base_dir).unwrap();
+    for (uri, expected_rows) in [(cloned_uri, 54), (cloned_ds, 64)] {
+        let reopened = Dataset::open(uri).await.unwrap();
+        let batch = reopened.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+    }
 }
 
 #[tokio::test]
@@ -3192,6 +3217,68 @@ async fn write_rejects_dictionary_null_index_outside_declared_key_range(
     );
 }
 
+#[rstest]
+#[case::appended_null("v10.0.0/wide_dictionary/appended_null.lance", 128, 2, 2)]
+#[case::merged_chunks("v13.0.0/wide_dictionary/merged_chunks.lance", 100, 2, 2)]
+#[case::compacted("v13.0.0/wide_dictionary/compacted.lance", 100, 1, 1)]
+#[tokio::test]
+async fn read_historical_widened_dictionary(
+    #[case] fixture: &str,
+    #[case] values_per_chunk: usize,
+    #[case] repetitions: usize,
+    #[case] fragments: usize,
+    #[values(64, 1024)] batch_size: usize,
+) {
+    let directory = copy_test_data_to_tmp(fixture).unwrap();
+    let dataset = Dataset::open(&directory.path_str()).await.unwrap();
+    assert_eq!(dataset.count_fragments(), fragments);
+    let chunks = if values_per_chunk == 128 { 1 } else { 2 };
+    let expected = (0..repetitions)
+        .flat_map(|_| {
+            (0..chunks).flat_map(|chunk| {
+                (chunk * values_per_chunk..(chunk + 1) * values_per_chunk)
+                    .map(|i| Some(format!("v{i}")))
+                    .chain([None])
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut stream = dataset
+        .scan()
+        .batch_size(batch_size)
+        .try_into_stream()
+        .await
+        .unwrap();
+    let mut actual = Vec::with_capacity(expected.len());
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        assert!(batch.num_rows() <= batch_size.min(128));
+        assert_eq!(
+            batch["d"].data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+        );
+        let values = arrow::compute::cast(&batch["d"], &DataType::Utf8).unwrap();
+        actual.extend(
+            as_string_array(&values)
+                .iter()
+                .map(|value| value.map(str::to_owned)),
+        );
+    }
+    assert_eq!(actual, expected);
+
+    // Sparse reads must remap the stored keys even when only high positions in
+    // the page dictionary are selected, and must preserve the in-band null.
+    let indices = [expected.len() as u64 - 2, expected.len() as u64 - 1, 0];
+    let batch = dataset
+        .take(&indices, Arc::new(dataset.schema().clone()))
+        .await
+        .unwrap();
+    let values = arrow::compute::cast(&batch["d"], &DataType::Utf8).unwrap();
+    let expected = indices.map(|i| expected[i as usize].as_deref());
+    assert_eq!(
+        as_string_array(&values),
+        &StringArray::from(Vec::from(expected))
+    );
+}
+
 /// Each batch carries the same 127-value Int8 dictionary, about 12.7 MB of values,
 /// so the writer flushes it as its own page (a column is flushed once it buffers
 /// `cache_bytes_per_column`, 8 MiB by default).  A scan batch over both pages then
@@ -4019,6 +4106,48 @@ async fn write_tiny_dataset(uri: &str) -> Dataset {
         .unwrap()
 }
 
+#[tokio::test]
+async fn test_open_empty_latest_manifest_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    let mut dataset = write_tiny_dataset(uri).await;
+    dataset.truncate_table().await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+
+    let manifest_path = dataset.manifest_location.path.clone();
+    std::fs::write(lance_io::local::to_local_path(&manifest_path), b"").unwrap();
+
+    let error = Dataset::open(uri).await.unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains(manifest_path.as_ref()),
+        "{error}"
+    );
+    assert!(error.to_string().contains("0 bytes"), "{error}");
+}
+
+#[tokio::test]
+async fn test_read_empty_data_file_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    write_tiny_dataset(uri).await;
+
+    let data_path = std::fs::read_dir(test_dir.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(&data_path, b"").unwrap();
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    let error = dataset.scan().try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    let object_path = Path::from_absolute_path(&data_path).unwrap();
+    assert!(error.to_string().contains(object_path.as_ref()), "{error}");
+    assert!(error.to_string().contains("size 0 bytes"), "{error}");
+}
+
 /// `drop` deletes whatever path it is handed, so the guard must accept a real dataset
 /// even when the user keeps unmanaged files beside it.
 #[rstest]
@@ -4247,6 +4376,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,

@@ -19,6 +19,8 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, type
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     execution::memory_pool::{MemoryConsumer, MemoryReservation},
     physical_plan::{
@@ -34,6 +36,7 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::{Error, ROW_ID_FIELD, Result, deepsize::DeepSizeOf, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
+    signed_zero::zero_encodings,
     utils::{
         ExecutionPlanMetricsSetExt, SCALAR_INDEX_MAX_ALLOWED_METRIC,
         SCALAR_INDEX_MAX_BLOCKED_METRIC, SCALAR_INDEX_MIN_ALLOWED_METRIC,
@@ -353,6 +356,13 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -720,18 +730,28 @@ impl MapIndexExec {
     ///
     /// One NULL survives dedupe on purpose: an index reads a NULL in the list
     /// as "also match null rows", which is a flag rather than a count.
+    ///
+    /// A float zero is looked up under both encodings. The index compares keys
+    /// by encoding, but the hash join downstream matches `-0.0` and `+0.0` per
+    /// IEEE 754, so probing one encoding would miss rows the join would match.
     fn key_values(column: &ArrayRef, dedupe: bool) -> datafusion::error::Result<Vec<ScalarValue>> {
         let mut values = Vec::with_capacity(column.len());
         let mut seen = HashSet::with_capacity(if dedupe { column.len() } else { 0 });
         for row in 0..column.len() {
             let value = ScalarValue::try_from_array(column, row)?;
-            if dedupe {
-                if seen.contains(&value) {
-                    continue;
+            let encodings = match zero_encodings(&value) {
+                Some((negative, positive)) => vec![negative, positive],
+                None => vec![value],
+            };
+            for value in encodings {
+                if dedupe {
+                    if seen.contains(&value) {
+                        continue;
+                    }
+                    seen.insert(value.clone());
                 }
-                seen.insert(value.clone());
+                values.push(value);
             }
-            values.push(value);
         }
         Ok(values)
     }
@@ -868,6 +888,13 @@ impl ExecutionPlan for MapIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -1190,6 +1217,13 @@ impl ExecutionPlan for MaterializeIndexExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1249,6 +1283,8 @@ impl ExecutionPlan for MaterializeIndexExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use std::{ops::Bound, sync::Arc};
 
     use crate::index::DatasetIndexExt;
@@ -1331,6 +1367,45 @@ mod tests {
             dataset: Arc::new(dataset),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    #[test]
+    fn key_values_probes_both_zero_encodings() {
+        fn float_bits(values: &[ScalarValue]) -> Vec<u64> {
+            values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::Float64(Some(v)) => v.to_bits(),
+                    other => panic!("unexpected key value {other:?}"),
+                })
+                .collect()
+        }
+        fn bits(values: &[f64]) -> Vec<u64> {
+            values.iter().map(|v| v.to_bits()).collect()
+        }
+
+        let floats: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![
+            1.0,
+            0.0,
+            1.0,
+            f64::NAN,
+        ]));
+
+        // A zero row yields both encodings, so without dedupe there are more
+        // values than rows. The values only build an `IsIn` set, so nothing
+        // depends on them lining up with input rows.
+        let values = MapIndexExec::key_values(&floats, false).unwrap();
+        assert_eq!(float_bits(&values), bits(&[1.0, -0.0, 0.0, 1.0, f64::NAN]));
+
+        let deduped = MapIndexExec::key_values(&floats, true).unwrap();
+        assert_eq!(float_bits(&deduped), bits(&[1.0, -0.0, 0.0, f64::NAN]));
+
+        // Integer zero has a single encoding and is not expanded.
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        assert_eq!(
+            MapIndexExec::key_values(&ints, false).unwrap(),
+            vec![ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(1))]
+        );
     }
 
     #[test]
@@ -1504,7 +1579,8 @@ mod tests {
         let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
             assert_eq!(plan.schema(), schema);
             assert_eq!(
-                plan.partition_statistics(None)
+                StatisticsContext::new()
+                    .compute(&plan, &StatisticsArgs::new())
                     .unwrap()
                     .column_statistics
                     .len(),

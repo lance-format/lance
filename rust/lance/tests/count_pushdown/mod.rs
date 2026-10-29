@@ -25,10 +25,12 @@ use datafusion::config::ConfigOptions;
 use datafusion::datasource::TableType;
 use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder, TaskContext};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, displayable,
 };
@@ -116,6 +118,13 @@ impl ExecutionPlan for PassThroughExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -350,9 +359,10 @@ async fn count_star_over_a_limited_coalesce() {
                 return Ok(Transformed::no(node));
             }
             let input = CoalescePartitionsExec::new(agg.input().clone()).with_fetch(Some(5));
-            Ok(Transformed::yes(
-                node.clone().with_new_children(vec![Arc::new(input)])?,
-            ))
+            Ok(Transformed::yes(replace_children_if_necessary(
+                node.clone(),
+                vec![Arc::new(input)],
+            )?))
         })
         .unwrap()
         .data;

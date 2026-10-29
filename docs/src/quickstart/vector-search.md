@@ -25,7 +25,6 @@ import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import duckdb
 ```
 
 ## Prepare Your Vector Embeddings
@@ -75,9 +74,7 @@ You'll perform vector search without an index to see the baseline performance, t
 First, let's sample some query vectors:
 
 ```python
-import duckdb
-# Make sure DuckDB v0.7+ is installed
-samples = duckdb.query("SELECT vector FROM sift1m USING SAMPLE 100").to_df().vector
+samples = sift1m.sample(100, columns=["vector"]).to_pandas().vector
 ```
 
 ```
@@ -118,7 +115,7 @@ Time(sec): 0.10735273361206055
 ...
 ```
 
-Without the index, the search will scan throughout the whole dataset to compute the distance between each data point. For practical real-time performance with, you will get much better performance with an ANN index.
+Without the index, the search will scan throughout the whole dataset to compute the distance between each data point. For practical real-time performance on large datasets, you will get much better performance with an ANN index.
 
 ## Build the Search Index
 

@@ -16,7 +16,7 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_arrow::json::JsonEncoding;
@@ -3143,7 +3143,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream::{self, BoxStream};
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
@@ -5760,7 +5760,7 @@ mod tests {
             let first_callback_started = first_callback_started.clone();
             async move {
                 first_callback_started.notified().await;
-                Err(datafusion::error::DataFusionError::Execution(
+                Err(datafusion_common::DataFusionError::Execution(
                     "injected stream failure".to_owned(),
                 ))
             }

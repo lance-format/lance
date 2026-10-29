@@ -78,7 +78,7 @@ ds.create_scalar_index(
 The index creation process builds an efficient lookup structure that maps words to the documents containing them. This enables high-performance keyword-based search, even on large datasets.
 
 !!! warning "Index Creation Time"
-Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits at query time are substantial.
+    Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits at query time are substantial.
 
 ## Advanced Index Configuration
 

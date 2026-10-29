@@ -2556,20 +2556,49 @@ def test_index_cast_centroids(tmp_path):
     )
 
 
-def test_fragment_scan_disallowed_on_ann(dataset):
-    q = np.random.randn(128)
-    with pytest.raises(
-        ValueError, match="This operation is not supported for fragment scan"
-    ):
-        scanner = dataset.scanner(
-            columns=["id"],
-            nearest={
-                "column": "vector",
-                "q": q,
-            },
-            fragments=[LanceFragment(dataset, 0)],
-        )
-        scanner.explain_plan(True)
+@pytest.fixture
+def fragment_vector_dataset(tmp_path):
+    table = pa.table(
+        {
+            "id": range(12),
+            "vector": pa.array(
+                [[float(i), 0.0, 0.0, 0.0] for i in range(12)],
+                type=pa.list_(pa.float32(), 4),
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table.slice(0, 8), tmp_path, max_rows_per_file=4)
+    dataset = dataset.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+    )
+    segment = str(dataset.describe_indices()[0].segments[0].uuid)
+    dataset = lance.write_dataset(table.slice(8), dataset.uri, mode="append")
+    return dataset, segment
+
+
+@pytest.mark.parametrize("as_string", [False, True], ids=["uuid", "string"])
+def test_fragment_scan_default_postfilter(fragment_vector_dataset, as_string):
+    dataset, segment = fragment_vector_dataset
+    # The binding sets fragments before nearest; both filtering flags use defaults.
+    scanner = dataset.scanner(
+        columns=["id", "_distance"],
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[segment if as_string else uuid.UUID(segment)],
+        nearest={"column": "vector", "q": np.zeros(4, dtype=np.float32), "k": 6},
+        filter="id % 2 = 1",
+    )
+    plan = scanner.explain_plan()
+    assert "ANNSubIndex" in plan and "KNNVectorDistance" in plan, plan
+    assert "UnionExec" in plan, plan
+    result = scanner.to_table()
+    ids = result["id"].to_pylist()
+    expected_ids = [5, 7, 9]
+    assert len(set(ids) & set(expected_ids)) / len(expected_ids) == 1.0, plan
+    assert ids == expected_ids, plan
+    assert result["_distance"].to_pylist() == [25.0, 49.0, 81.0]
 
 
 def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
@@ -2866,6 +2895,9 @@ def test_retrain_indices(tmp_path, retrain):
         index_type="IVF_FLAT",
         num_partitions=1,
         ivf_centroids=old_centroid,
+        # A retrain sizes partitions from the target the index records. Pin it
+        # at the 128 rows the table ends with so the retrain keeps one partition.
+        target_partition_size=128,
         index_file_version=IndexFileVersion.V3,
     )
     indexed_dataset = lance.write_dataset(
@@ -3504,6 +3536,37 @@ def test_scanner_rejects_unknown_index_segments(tmp_path):
                 "k": 10,
             },
             index_segments=[uuid.uuid4()],
+        ).to_table()
+
+
+def test_scanner_rejects_invalid_index_segment_uuid(fragment_vector_dataset):
+    dataset, _ = fragment_vector_dataset
+    with pytest.raises(ValueError, match="invalid index segment uuid 'not-a-uuid'"):
+        dataset.scanner(
+            nearest={"column": "vector", "q": np.zeros(4), "k": 5},
+            fragments=dataset.get_fragments()[1:],
+            index_segments=["not-a-uuid"],
+        ).to_table()
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        pytest.param(str(uuid.UUID(int=0)), id="single-string"),
+        pytest.param(uuid.UUID(int=0), id="single-uuid"),
+        pytest.param([123], id="integer-element"),
+        pytest.param([None], id="none-element"),
+    ],
+)
+def test_scanner_rejects_index_segment_types(fragment_vector_dataset, segments):
+    dataset, _ = fragment_vector_dataset
+    with pytest.raises(
+        TypeError, match="index_segments must be an iterable of str or uuid.UUID"
+    ):
+        dataset.scanner(
+            nearest={"column": "vector", "q": np.zeros(4), "k": 5},
+            fragments=dataset.get_fragments()[1:],
+            index_segments=segments,
         ).to_table()
 
 
