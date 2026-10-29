@@ -616,7 +616,7 @@ same id, name, or path.
     stabilization vote does not pass. Discussion:
     [#5960](https://github.com/lance-format/lance/discussions/5960).
 
-!!! note "Readers before v14.0.0 cannot decode a `CompositeOperation`"
+!!! note "Readers before v14.0.0 fail on a `CompositeOperation`"
 
     Any reader can open and scan a table version committed as a
     `CompositeOperation`: the inline transaction lives in manifest field 23,
@@ -656,10 +656,18 @@ into concrete identifiers. Both properties, true deltas and local placeholders,
 are what let a composite operation be replayed against a newer version, or onto
 a different branch, without rewriting it.
 
-A committed identifier, by contrast, must already exist at the operation's
-read version. Apply rejects a committed fragment, field, or base id above the
-read version's high-water mark for that id space, since a concurrent commit may
-have minted it for an unrelated object in the meantime.
+A committed identifier, by contrast, must have been allocated by the
+operation's read version: it is at or below the read version's high-water mark
+for that id space, either naming an existing object or, for a fragment, an id
+an earlier commit reserved. Apply rejects a committed fragment, field, or base
+id above the mark, since a concurrent commit may have minted it for an
+unrelated object in the meantime.
+
+Every fragment must store data for each required field, one that is
+non-nullable and has only non-nullable ancestors; a fragment without it would
+read the field back as nulls. Apply checks each fragment whose data files the
+operation sets. When the operation makes a field required, by adding it as
+non-nullable or by making it non-nullable, apply checks every fragment.
 
 The full action vocabulary and the reasoning behind its shape are defined in
 `protos/transaction/actions.proto`.
@@ -682,7 +690,7 @@ this has no other visible effect within the operation, and a fragment can claim
 a reserved id only from an earlier commit's reservation. `ResetTable` discards
 objects but never rewinds the id counters.
 
-`data_change` is per action. `false` asserts the action changes no row's
+`data_change` is per action, and absent means true. `false` asserts the action changes no row's
 values: the rows it adds, removes, or rebinds are the same logical rows with
 the same values before and after, as when compaction moves rows or a column
 file is re-encoded. Change-data-capture readers emit rows only from
@@ -699,9 +707,11 @@ value a reader sees changes, so overlays keep shadowing the base, index
 coverage is kept, and no row's last-updated-at version moves. Nor does it count
 as writing values against a concurrent overlay of those fields, a concurrent
 index build over them, or a concurrent change that makes one of them required.
-Apply rejects a `false`
-tombstone whose fields are not all re-bound that way, and an `AddDataFile`
-whose `data_change` differs from that of the tombstone it re-binds.
+It does count as a write against `AssertCellsUnchanged` and `AssertUniqueKeys`:
+apply cannot verify that the values are unchanged, and those assertions guard
+correctness. Apply rejects a `false` tombstone whose fields are not all
+re-bound that way, and an `AddDataFile` whose `data_change` differs from that
+of the tombstone it re-binds.
 
 ### Fragment Reuse History
 
@@ -709,7 +719,8 @@ The [fragment reuse history](../index/system/frag_reuse.md) is not an index in
 a `CompositeOperation`. Apply rejects `AddIndexSegment`, `RemoveIndexSegment`,
 `AdjustIndexCoverage`, and `DropIndex` when they name `__lance_frag_reuse`.
 The history changes only through two actions, and neither refers to the
-history's index entry, its UUID, or its `index_version`.
+history's index entry, its UUID, or its `index_version`. A `ResetTable`
+discards the history along with the indices.
 
 `AppendFragReuseTransition` records that a compaction in the same operation
 moved rows from its `sources` to its `destinations`, with one ordered
@@ -734,7 +745,9 @@ Apply validates the transition without reading any file, and rejects it unless:
   operation;
 - every index on the table returns row addresses. The history translates row
   addresses, so it would mistranslate an index that returns stable row ids,
-  which only a table with stable row ids can have;
+  which only a table with stable row ids can have. For the same reason, an
+  `AddIndexSegment` for an index that returns stable row ids must not be
+  committed while the history is tagged (`index_version` 1 or higher);
 - a stable partition has between 1 and 65,536 destinations.
 
 Apply then creates the history if the table has none, converts a version 0
@@ -788,8 +801,12 @@ and it only ever loses coverage; it is never a conflict.
 
 ### Isolation
 
-Two `CompositeOperation`s conflict when they write overlapping parts of the
-manifest, or when one breaks a precondition the other asserts. Without
+Two `CompositeOperation`s conflict when they change the same part of the
+manifest in ways that cannot both apply, or when one breaks a precondition the
+other asserts. Some changes to the same part do both apply: two overlays of the
+same cells both land and the newer wins, an overlay and a re-encode of its
+column both land, and fragment reuse transitions with disjoint sources both
+append to the history. Without
 assertions this is snapshot isolation: concurrent writers that each read a
 value the other overwrites can both commit. A writer whose values depend on
 what it read must declare the read with `AssertCellsUnchanged`. For example,

@@ -684,7 +684,8 @@ message TrimFragReuse {}
  * written by later actions in the same operation (the decomposition of a full
  * Overwrite / CREATE OR REPLACE).
  *
- * Drops the entire schema, schema metadata, all fragments, and all indices;
+ * Drops the entire schema, schema metadata, all fragments, and all indices,
+ * including the fragment reuse history;
  * preserves table config, table metadata, and base paths (change those via
  * ConfigUpdate / AddBase in the same operation). Its write footprint spans the
  * whole schema, all fragments, and all indices, so it conflicts with any
@@ -762,9 +763,10 @@ message AssertUniqueKeys {
  * on what it read (an update computing `a = b`) must declare the read here.
  *
  * "Unchanged" follows the cell preconditions proposed for the legacy
- * transaction (#9121): a cell counts as changed if its field was dropped or changed type or
- * nullability, its fragment was removed, the data file carrying its field was
- * replaced, or an overlay touching it was added. A change to the deletion
+ * transaction (#9121): a cell counts as changed if its field was dropped or its
+ * definition altered, its fragment was removed, the data file carrying its
+ * field was replaced (a re-encode included), or an overlay touching it was
+ * added. A change to the deletion
  * vector does not count. Implementations may over-reject (e.g. at fragment
  * granularity) but must never under-reject.
  */
