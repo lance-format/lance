@@ -126,6 +126,7 @@ mod tests {
     };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::sync::Arc;
 
     fn assertion(key_fields: Vec<FieldRef>, hashes: &[u64]) -> Action {
@@ -324,8 +325,12 @@ mod tests {
     /// A key does not have to arrive in a new row. Rewriting a key column in
     /// place -- a column rewrite, an overlay -- can put any value in it, and the
     /// writer asserts nothing about which, so the assertion cannot be checked.
-    #[test]
-    fn test_an_assertion_conflicts_with_an_in_place_write_to_its_key_column() {
+    /// That holds for a write that claims not to change the data too: nothing
+    /// verifies the claim.
+    #[rstest]
+    fn test_an_assertion_conflicts_with_an_in_place_write_to_its_key_column(
+        #[values(true, false)] data_change: bool,
+    ) {
         let ours = footprint(vec![
             append(0),
             assertion(vec![FieldRef::Committed(0)], &[1]),
@@ -334,12 +339,11 @@ mod tests {
             footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
                 field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
+                data_change,
             })])
         };
 
         assert!(ours.conflicts_with(&rewrite(0)));
-        assert!(rewrite(0).conflicts_with(&ours));
         assert!(!ours.conflicts_with(&rewrite(1)));
     }
 
@@ -371,9 +375,7 @@ mod tests {
         };
 
         assert!(ours.conflicts_with(&overlay(0)));
-        assert!(overlay(0).conflicts_with(&ours));
         assert!(!ours.conflicts_with(&overlay(1)));
-        assert!(!overlay(1).conflicts_with(&ours));
     }
 
     /// Bloom filters built for different sizes or error rates cannot be
@@ -401,16 +403,27 @@ mod tests {
         assert!(theirs.conflicts_with(&ours));
     }
 
+    /// The assertion is a precondition on the commit carrying it, as legacy
+    /// merge insert's inserted-key filter is: it holds against what landed
+    /// before it, and says nothing about a write that lands after it. That
+    /// write is no different from one planned after the assertion landed,
+    /// which nothing stops from writing a duplicate key either.
     #[test]
-    fn test_an_assertion_conflicts_with_an_unqualified_insert() {
+    fn test_an_assertion_conflicts_with_an_unqualified_insert_landing_before_it() {
         let ours = footprint(vec![
             append(0),
             assertion(vec![FieldRef::Committed(0)], &[1]),
         ]);
         let plain_append = footprint(vec![append(0)]);
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(0),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change: true,
+        })]);
 
         assert!(ours.conflicts_with(&plain_append));
-        assert!(plain_append.conflicts_with(&ours));
+        assert!(!plain_append.conflicts_with(&ours));
+        assert!(!rewrite.conflicts_with(&ours));
     }
 
     #[test]

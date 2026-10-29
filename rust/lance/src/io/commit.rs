@@ -59,8 +59,8 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
-    write_manifest_file,
+    ManifestWriteConfig, NewTransaction, NewTransactionResult, TRANSACTIONS_DIR,
+    load_new_transactions, write_manifest_file,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::{
     ReadSnapshot, validate_frag_reuse_history,
@@ -1712,14 +1712,14 @@ async fn prepare_attempt(
 
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
-) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
+) -> Result<(Dataset, Vec<NewTransaction>)> {
     let NewTransactionResult {
         dataset: new_ds,
         new_transactions,
     } = load_new_transactions(dataset);
     let new_transactions = new_transactions.try_collect::<Vec<_>>();
     let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
-    txns.sort_by_key(|(version, _)| *version);
+    txns.sort_by_key(|(version, _, _)| *version);
     Ok((new_ds, txns))
 }
 
@@ -1887,7 +1887,7 @@ pub(crate) async fn commit_transaction(
                 ));
             }
         } else if !strict_overwrite {
-            let checked_since = dataset.manifest.version;
+            let checked_since = dataset.manifest.clone();
             let (loaded_dataset, other_transactions) =
                 load_and_sort_new_transactions(&dataset).await?;
             dataset = loaded_dataset;
@@ -1902,11 +1902,18 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
             rebase.load_current_lineage(&dataset).await?;
+            rebase.record_manifests(
+                std::iter::once(checked_since.clone()).chain(
+                    other_transactions
+                        .iter()
+                        .map(|(_, _, manifest)| manifest.clone()),
+                ),
+            );
             let seen = other_transactions
                 .iter()
-                .map(|(version, _)| *version)
+                .map(|(version, _, _)| *version)
                 .collect::<HashSet<_>>();
-            let missing = (checked_since + 1..=dataset.manifest.version)
+            let missing = (checked_since.version + 1..=dataset.manifest.version)
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
             rebase.check_missing_versions(&missing, dataset.manifest.version)?;
@@ -1924,7 +1931,7 @@ pub(crate) async fn commit_transaction(
                 ));
             }
 
-            for (other_version, other_transaction) in other_transactions.iter() {
+            for (other_version, other_transaction, _) in other_transactions.iter() {
                 if let Some(read_schema) = &identity_fence {
                     conflict_resolver::refuse_field_identity_change(
                         read_schema,
@@ -3164,7 +3171,7 @@ mod tests {
         let (_, transactions) = load_and_sort_new_transactions(&dataset_v1).await.unwrap();
 
         // Verify transactions are sorted by version
-        let versions: Vec<u64> = transactions.iter().map(|(v, _)| *v).collect();
+        let versions: Vec<u64> = transactions.iter().map(|(v, _, _)| *v).collect();
         for i in 1..versions.len() {
             assert!(
                 versions[i] > versions[i - 1],

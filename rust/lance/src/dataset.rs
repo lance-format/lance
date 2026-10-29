@@ -4011,9 +4011,13 @@ impl Dataset {
     }
 }
 
+/// A transaction committed since a dataset version: the version it committed,
+/// the transaction, and the manifest it committed.
+pub(crate) type NewTransaction = (u64, Arc<Transaction>, Arc<Manifest>);
+
 pub(crate) struct NewTransactionResult<'a> {
     pub dataset: BoxFuture<'a, Result<Dataset>>,
-    pub new_transactions: BoxStream<'a, Result<(u64, Arc<Transaction>)>>,
+    pub new_transactions: BoxStream<'a, Result<NewTransaction>>,
 }
 
 pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'_> {
@@ -4089,7 +4093,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         .await;
                     loaded
                 };
-            Ok((manifest.version, transaction))
+            Ok((manifest.version, transaction, manifest))
         })
         .try_buffer_unordered(stage_parallelism);
 
