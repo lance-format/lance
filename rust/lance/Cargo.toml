@@ -118,6 +118,8 @@ criterion = { workspace = true }
 approx.workspace = true
 all_asserts.workspace = true
 mock_instant.workspace = true
+metrics.workspace = true
+metrics-util.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
 lance-index = { workspace = true, features = ["test-oracle"] }
@@ -152,6 +154,10 @@ reqwest = { workspace = true, features = ["rustls"] }
 name = "arrow_ordering"
 test = false
 
+[[test]]
+name = "memory_metrics"
+required-features = ["metrics"]
+
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 backtrace = ["lance-core/backtrace"]
@@ -176,8 +182,8 @@ tencent = ["lance-io/tencent"]
 goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
-# Publish object store metrics via the `metrics` crate.
-metrics = ["lance-io/metrics"]
+# Publish object store and memory metrics via the `metrics` crate.
+metrics = ["lance-core/metrics", "lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []

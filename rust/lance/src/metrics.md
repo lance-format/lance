@@ -45,3 +45,22 @@ objects is one request, matching how backends batch them.
 cloud stores (S3, GCS, Azure); Opendal-backed stores bypass the HTTP client
 where the counters are installed, so they report the other object store metrics
 but not throttle/retryable counts.
+
+## Memory metrics
+
+These report the memory of the Lance process. They are off by default: set `LANCE_MEMORY_OBSERVE` to `1`, `true`, `on` or `yes` to turn them on. Unset, empty, `0`, `false`, `off` or `no` keeps them off, and any other value makes the observed operations fail with an invalid-input error. Lance reads the variable once, the first time it needs it, so set it before the process starts. Readings come from `/proc/self/status` and the process's cgroup, so they are available on Linux only; elsewhere, and in builds without the `metrics` feature, setting the variable logs a warning and reports nothing.
+
+The gauges are read when the recorder collects. The Python and Java OpenTelemetry bridges refresh them before every snapshot. A Rust application using another recorder can use `lance::memory::histogram_bounds()` while configuring it, call `lance::memory::describe_metrics()` after installing it, and call `lance::memory::refresh_metrics()` from its collection loop. A gauge whose source is unavailable, such as the limit of a cgroup that has none, is not reported, and a gauge keeps its last value if its source disappears later.
+
+The peak histograms cover index builds started through `create_index` (or `CreateIndexBuilder`) and the inverted index branch of `merge_index_metadata`. While a build runs, a background thread samples the resident set size (RSS) every 100 ms, and every stage of the build, as well as the build as a whole, reports the largest value seen. The readings taken when a stage starts and ends count for every stage open at the time, so a build's peak is never below the peaks of its stages. A spike between two readings is only caught when it raises the peak RSS the kernel keeps for the process (`VmHWM`), so the values are lower bounds. Index builds that run as part of `optimize_indices` or of a MemWAL flush are not reported yet.
+
+Peaks describe the whole process, so work running at the same time, including other index builds, counts towards them. For most scalar indices the `load_data` stage only prepares the scan: reading, sorting and training happen after it and show up in the operation peak. `operation` is `create_index` or `merge_index_metadata`, and `index_type` is the lowercase type name (`btree`, `inverted`, `ivf_pq`, ...). The `index_type` and `stage` labels each keep at most 64 distinct values per process; later values are reported as `other`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lance_memory_rss_bytes` | gauge | none | Resident set size of the process, in bytes. |
+| `lance_memory_rss_peak_bytes` | gauge | none | Largest resident set size of the process since it started, in bytes. |
+| `lance_memory_cgroup_bytes` | gauge | none | Memory charged to the cgroup that sets the tightest limit on the process, or to its own cgroup when no group sets one (`memory.current`, or `memory.usage_in_bytes` on cgroup v1), in bytes. Unlike RSS it includes page cache and files written to tmpfs, such as spill files under a tmpfs `/tmp`. |
+| `lance_memory_cgroup_limit_bytes` | gauge | none | Tightest memory limit over the process's cgroup and its ancestors, in bytes. |
+| `lance_memory_stage_peak_bytes` | histogram | `operation`, `index_type`, `stage` | Peak RSS during each stage of an index build, in bytes. |
+| `lance_memory_operation_peak_bytes` | histogram | `operation`, `index_type` | Peak RSS during each index build, in bytes. |

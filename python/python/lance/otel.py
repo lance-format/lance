@@ -4,7 +4,8 @@
 """Bridge Lance's internal metrics into OpenTelemetry.
 
 Lance core publishes metrics (currently object store request counts, bytes,
-latency, errors, and throttles) through the Rust ``metrics`` facade. This module
+latency, errors, and throttles, plus process memory when ``LANCE_MEMORY_OBSERVE``
+is set) through the Rust ``metrics`` facade. This module
 installs a process-global recorder that aggregates them and registers
 OpenTelemetry observable instruments that report the aggregated values into the
 user's ``MeterProvider``.

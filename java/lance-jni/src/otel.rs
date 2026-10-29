@@ -203,10 +203,14 @@ fn register_bounds() {
     for (name, values) in lance_io::object_store::metrics::histogram_bounds() {
         bounds.insert((*name).to_string(), Arc::from(*values));
     }
+    for (name, values) in lance_core::memory::histogram_bounds() {
+        bounds.insert((*name).to_string(), Arc::from(*values));
+    }
 }
 
 fn describe_all() {
     lance_io::object_store::metrics::describe_metrics();
+    lance_core::memory::describe_metrics();
 }
 
 enum MetricValue {
@@ -428,6 +432,7 @@ fn lance_metrics_catalog_native<'local>(env: &mut JNIEnv<'local>) -> Result<JObj
 fn snapshot_lance_metrics_native<'local>(env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
     let list = object_list(env)?;
     if let Some(registry) = REGISTRY.get() {
+        lance_core::memory::refresh_metrics();
         for point in collect_points(registry) {
             env.with_local_frame(64, |env| {
                 let item = metric_point_to_java(env, point)?;
@@ -537,5 +542,15 @@ mod tests {
 
         assert!(matches!(counter.value, MetricValue::Scalar(value) if value == 5.0));
         assert!(matches!(gauge.value, MetricValue::Scalar(value) if (value - 2.25).abs() < 1e-9));
+    }
+
+    #[test]
+    fn test_register_bounds_covers_memory_peaks() {
+        use lance_core::memory;
+
+        register_bounds();
+        for name in [memory::METRIC_STAGE_PEAK, memory::METRIC_OPERATION_PEAK] {
+            assert_eq!(&*bounds_for(name), memory::PEAK_BOUNDS, "{name}");
+        }
     }
 }
