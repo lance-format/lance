@@ -57,6 +57,7 @@ fn inner_merge_insert<'local>(
     let use_index = extract_use_index(env, &jparam)?;
     let write_mode = extract_write_mode(env, &jparam)?;
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
+    let mem_wal_dir_id = env.get_optional_string_from_method(&jparam, "getMemWalDirId")?;
     let data_storage_version = extract_data_storage_version(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
@@ -72,7 +73,7 @@ fn inner_merge_insert<'local>(
         if let Some(version) = data_storage_version {
             builder.data_storage_version(LanceFileVersion::from_str(&version)?);
         }
-        let merge_insert_job = builder
+        builder
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
             .when_not_matched_by_source(when_not_matched_by_source)
@@ -80,11 +81,11 @@ fn inner_merge_insert<'local>(
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
-            .write_mode(write_mode)
-            // The Java API has no MemWAL `dir_id` yet; empty names the legacy
-            // `_mem_wal` directory.
-            .mark_sstables_as_compacted("", compacted_sstables)
-            .try_build()?;
+            .write_mode(write_mode);
+        if let Some(dir_id) = mem_wal_dir_id {
+            builder.mark_sstables_as_compacted(dir_id, compacted_sstables);
+        }
+        let merge_insert_job = builder.try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;

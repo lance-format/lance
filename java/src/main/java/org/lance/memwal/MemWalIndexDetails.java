@@ -26,13 +26,15 @@ public class MemWalIndexDetails {
   private final boolean maintainAllIndexes;
   private final Map<String, String> writerConfigDefaults;
   private final List<ShardingSpec> shardingSpecs;
+  private final String dirId;
 
   public MemWalIndexDetails(
       long numShards,
       List<String> maintainedIndexes,
       boolean maintainAllIndexes,
       Map<String, String> writerConfigDefaults,
-      List<ShardingSpec> shardingSpecs) {
+      List<ShardingSpec> shardingSpecs,
+      String dirId) {
     this.numShards = numShards;
     this.maintainedIndexes =
         maintainedIndexes == null ? Collections.emptyList() : maintainedIndexes;
@@ -40,6 +42,7 @@ public class MemWalIndexDetails {
     this.writerConfigDefaults =
         writerConfigDefaults == null ? Collections.emptyMap() : writerConfigDefaults;
     this.shardingSpecs = shardingSpecs == null ? Collections.emptyList() : shardingSpecs;
+    this.dirId = dirId == null ? "" : dirId;
   }
 
   /** Number of shards tracked by the MemWAL index. */
@@ -75,6 +78,14 @@ public class MemWalIndexDetails {
     return shardingSpecs;
   }
 
+  /**
+   * Identifies this MemWAL incarnation and names its storage directory; empty for a MemWAL
+   * initialized without one. Commits that record MemWAL compaction progress must name it.
+   */
+  public String dirId() {
+    return dirId;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -83,6 +94,7 @@ public class MemWalIndexDetails {
         .add("maintainAllIndexes", maintainAllIndexes)
         .add("writerConfigDefaults", writerConfigDefaults)
         .add("shardingSpecs", shardingSpecs)
+        .add("dirId", dirId)
         .toString();
   }
 }

@@ -14,6 +14,7 @@
 package org.lance.operation;
 
 import org.lance.memwal.CompactedSsTable;
+import org.lance.memwal.MemWalIndexDetails;
 
 import com.google.common.base.MoreObjects;
 
@@ -24,13 +25,20 @@ import java.util.Objects;
 /** Update SSTable compaction progress in the MemWAL index. */
 public final class UpdateMemWalState implements Operation {
   private final List<CompactedSsTable> compactedSstables;
+  private final String dirId;
 
-  private UpdateMemWalState(List<CompactedSsTable> compactedSstables) {
+  private UpdateMemWalState(List<CompactedSsTable> compactedSstables, String dirId) {
     this.compactedSstables = Objects.requireNonNull(compactedSstables);
+    this.dirId = Objects.requireNonNull(dirId);
   }
 
   public List<CompactedSsTable> getCompactedSstables() {
     return compactedSstables;
+  }
+
+  /** The {@code dirId} of the MemWAL this update was built for. */
+  public String getDirId() {
+    return dirId;
   }
 
   @Override
@@ -40,7 +48,10 @@ public final class UpdateMemWalState implements Operation {
 
   @Override
   public String toString() {
-    return MoreObjects.toStringHelper(this).add("compactedSstables", compactedSstables).toString();
+    return MoreObjects.toStringHelper(this)
+        .add("compactedSstables", compactedSstables)
+        .add("dirId", dirId)
+        .toString();
   }
 
   @Override
@@ -48,6 +59,7 @@ public final class UpdateMemWalState implements Operation {
     if (this == o) return true;
     if (o == null || getClass() != o.getClass()) return false;
     UpdateMemWalState that = (UpdateMemWalState) o;
+    if (!dirId.equals(that.dirId)) return false;
     if (compactedSstables.size() != that.compactedSstables.size()) return false;
     for (int i = 0; i < compactedSstables.size(); i++) {
       CompactedSsTable left = compactedSstables.get(i);
@@ -62,7 +74,7 @@ public final class UpdateMemWalState implements Operation {
 
   @Override
   public int hashCode() {
-    int result = 1;
+    int result = dirId.hashCode();
     for (CompactedSsTable sstable : compactedSstables) {
       result = 31 * result + Objects.hash(sstable.getShardId(), sstable.getGeneration());
     }
@@ -75,14 +87,25 @@ public final class UpdateMemWalState implements Operation {
 
   public static final class Builder {
     private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+    private String dirId = "";
 
     public Builder compactedSstables(List<CompactedSsTable> compactedSstables) {
       this.compactedSstables = compactedSstables;
       return this;
     }
 
+    /**
+     * Set the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL this update was built for;
+     * defaults to empty, a MemWAL without one. The commit fails unless the table still carries that
+     * MemWAL, even when no SSTables are recorded.
+     */
+    public Builder dirId(String dirId) {
+      this.dirId = dirId;
+      return this;
+    }
+
     public UpdateMemWalState build() {
-      return new UpdateMemWalState(compactedSstables);
+      return new UpdateMemWalState(compactedSstables, dirId);
     }
   }
 }

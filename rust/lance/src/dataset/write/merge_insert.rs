@@ -1111,7 +1111,7 @@ impl MergeInsertBuilder {
     /// would claim rows were copied in that never were.
     ///
     /// `dir_id` names the MemWAL the SSTables belong to. The commit fails with
-    /// [`Error::StaleMemWal`](lance_core::Error::StaleMemWal) if the table's
+    /// [`Error::StaleMemWal`] if the table's
     /// MemWAL has since been disabled or replaced. Pass an empty `sstables` on
     /// the passes that record no progress, so they are checked too.
     pub fn mark_sstables_as_compacted(

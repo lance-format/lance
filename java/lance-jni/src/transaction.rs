@@ -976,11 +976,11 @@ fn convert_to_java_operation_inner<'local>(
             new_fragments,
             fields_modified,
             compacted_sstables,
+            mem_wal_dir_id,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter,
             updated_fragment_offsets,
-            ..
         } => {
             let removed_fragment_ids_obj =
                 export_unsigned_longs(env, &removed_fragment_ids, "update.removedFragmentIds")?;
@@ -1002,6 +1002,10 @@ fn convert_to_java_operation_inner<'local>(
                 )?
                 .l()?;
             let compacted_sstables = export_compacted_sstables(env, &compacted_sstables)?;
+            let mem_wal_dir_id = match mem_wal_dir_id {
+                Some(dir_id) => JObject::from(env.new_string(dir_id)?),
+                None => JObject::null(),
+            };
             let inserted_rows_filter = match inserted_rows_filter {
                 Some(filter) => key_existence_filter_into_java(env, &filter)?,
                 None => JObject::null(),
@@ -1050,7 +1054,7 @@ fn convert_to_java_operation_inner<'local>(
             };
             Ok(env.new_object(
                 "org/lance/operation/Update",
-                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;Ljava/util/List;Lorg/lance/operation/KeyExistenceFilter;)V",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;[J[JLjava/util/Optional;Ljava/util/Map;Ljava/util/List;Ljava/lang/String;Lorg/lance/operation/KeyExistenceFilter;)V",
                 &[
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
@@ -1060,6 +1064,7 @@ fn convert_to_java_operation_inner<'local>(
                     JValue::Object(&update_mode_optional),
                     JValue::Object(&java_offsets_map),
                     JValue::Object(&compacted_sstables),
+                    JValue::Object(&mem_wal_dir_id),
                     JValue::Object(&inserted_rows_filter),
                 ],
             )?)
@@ -1189,13 +1194,15 @@ fn convert_to_java_operation_inner<'local>(
             )?)],
         )?),
         Operation::UpdateMemWalState {
-            compacted_sstables, ..
+            compacted_sstables,
+            dir_id,
         } => {
             let compacted_sstables = export_compacted_sstables(env, &compacted_sstables)?;
+            let dir_id = env.new_string(dir_id)?;
             Ok(env.new_object(
                 "org/lance/operation/UpdateMemWalState",
-                "(Ljava/util/List;)V",
-                &[JValue::Object(&compacted_sstables)],
+                "(Ljava/util/List;Ljava/lang/String;)V",
+                &[JValue::Object(&compacted_sstables), JValue::Object(&dir_id)],
             )?)
         }
         Operation::Clone {
@@ -2067,9 +2074,8 @@ fn convert_to_rust_operation(
                 }
             };
 
-            // The Java API has no MemWAL `dir_id` yet; empty names the legacy
-            // `_mem_wal` directory.
-            let mem_wal_dir_id = (!compacted_sstables.is_empty()).then(String::new);
+            let mem_wal_dir_id =
+                env.get_optional_string_from_method(java_operation, "getMemWalDirId")?;
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
@@ -2175,8 +2181,7 @@ fn convert_to_rust_operation(
             )?;
             Operation::UpdateMemWalState {
                 compacted_sstables,
-                // See the `Update` import above.
-                dir_id: String::new(),
+                dir_id: env.get_string_from_method(java_operation, "getDirId")?,
             }
         }
         "Clone" => Operation::Clone {

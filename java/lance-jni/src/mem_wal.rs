@@ -303,7 +303,7 @@ fn inner_writer_lsm_scanner<'local>(
 ) -> Result<JObject<'local>> {
     let mut snapshots = read_shard_snapshots(env, &shard_snapshots)?;
 
-    let (in_memory_memtables, writer_snapshot, dataset, shard_id, pk_columns) = {
+    let (in_memory_memtables, writer_snapshot, dataset, shard_id, pk_columns, dir_id) = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
         let pk_columns = get_pk_columns(&guard.dataset)?;
@@ -320,6 +320,7 @@ fn inner_writer_lsm_scanner<'local>(
             guard.dataset.clone(),
             guard.shard_id,
             pk_columns,
+            guard.writer.config().dir_id.clone(),
         )
     };
 
@@ -327,6 +328,7 @@ fn inner_writer_lsm_scanner<'local>(
     snapshots.push(writer_snapshot);
 
     let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
+        .with_mem_wal_dir_id(dir_id)
         .with_in_memory_memtables(shard_id, in_memory_memtables);
     attach_lsm_scanner(env, scanner)
 }
@@ -375,8 +377,16 @@ fn inner_lsm_scanner_from_snapshots<'local>(
         Arc::new(guard.inner.clone())
     };
     let pk_columns = get_pk_columns(&dataset)?;
-    let scanner = LsmScanner::new(dataset, snapshots, pk_columns);
+    let dir_id = mem_wal_dir_id(&dataset)?;
+    let scanner = LsmScanner::new(dataset, snapshots, pk_columns).with_mem_wal_dir_id(dir_id);
     attach_lsm_scanner(env, scanner)
+}
+
+/// The `dir_id` of the dataset's MemWAL, which its SSTables live under; empty
+/// when the dataset has no MemWAL.
+fn mem_wal_dir_id(dataset: &LanceDataset) -> Result<String> {
+    let details = block_on(dataset.mem_wal_index_details())?;
+    Ok(details.map(|details| details.dir_id).unwrap_or_default())
 }
 
 fn attach_lsm_scanner<'local>(
@@ -778,7 +788,8 @@ fn inner_create_lookup_planner(
     // resolves its columns by id; `base_schema` carries none. Built before the
     // collector takes the dataset.
     let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));
-    let collector = LsmDataSourceCollector::new(dataset, snapshots);
+    let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots)
+        .with_mem_wal_dir_id(mem_wal_dir_id(&dataset)?);
     let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone())?
         .with_identity_schema(identity_schema);
 
@@ -906,7 +917,8 @@ fn inner_create_vector_planner(
         .map(|filter| parse_lsm_filter_expr(base_schema.as_ref(), filter).map_err(Error::from))
         .transpose()?;
 
-    let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots);
+    let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots)
+        .with_mem_wal_dir_id(mem_wal_dir_id(&dataset)?);
     let mut planner = LsmVectorSearchPlanner::new(
         collector,
         pk_columns,
@@ -1428,15 +1440,17 @@ fn index_details_to_java<'a>(
         )?;
     }
 
+    let dir_id = env.new_string(&details.dir_id)?;
     Ok(env.new_object(
         "org/lance/memwal/MemWalIndexDetails",
-        "(JLjava/util/List;ZLjava/util/Map;Ljava/util/List;)V",
+        "(JLjava/util/List;ZLjava/util/Map;Ljava/util/List;Ljava/lang/String;)V",
         &[
             JValueGen::Long(details.num_shards as i64),
             JValueGen::Object(&maintained_indexes),
             JValueGen::Bool(u8::from(details.maintain_all_indexes)),
             JValueGen::Object(&writer_config_defaults),
             JValueGen::Object(&sharding_specs),
+            JValueGen::Object(&dir_id),
         ],
     )?)
 }

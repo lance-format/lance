@@ -3977,7 +3977,8 @@ impl Dataset {
     /// has not been initialized.
     ///
     /// The returned dict has `num_shards`, `maintained_indexes`,
-    /// `maintain_all_indexes`, `writer_config_defaults`, and `sharding_specs`.
+    /// `maintain_all_indexes`, `writer_config_defaults`, `sharding_specs`, and
+    /// `dir_id`.
     ///
     /// `maintain_all_indexes` is what distinguishes maintaining every index
     /// the table has from maintaining none: both leave `maintained_indexes`
@@ -3998,6 +3999,7 @@ impl Dataset {
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
         dict.set_item("maintain_all_indexes", details.maintain_all_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
+        dict.set_item("dir_id", details.dir_id)?;
 
         let specs = PyList::empty(py);
         for spec in &details.sharding_specs {
