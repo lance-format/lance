@@ -56,7 +56,9 @@ tests = [
     "pandas",
     "polars[pyarrow,pandas]",
     "psutil",
-    "pytest",
+    # pytest-xdist 3.8 loadgroup breaks on pytest 9.2:
+    # https://github.com/pytest-dev/pytest-xdist/issues/1386
+    "pytest<9.2",
     "pytest-xdist",
     "tqdm",
     "datafusion>=54,<55",

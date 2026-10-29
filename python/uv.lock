@@ -2483,7 +2483,7 @@ requires-dist = [
     { name = "psutil", marker = "extra == 'tests'" },
     { name = "pyarrow", specifier = ">=14" },
     { name = "pyright", marker = "extra == 'dev'" },
-    { name = "pytest", marker = "extra == 'tests'" },
+    { name = "pytest", marker = "extra == 'tests'", specifier = "<9.2" },
     { name = "pytest-benchmark", marker = "extra == 'benchmarks'" },
     { name = "pytest-xdist", marker = "extra == 'tests'" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.11.2" },
