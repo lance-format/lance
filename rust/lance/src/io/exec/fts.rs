@@ -57,6 +57,7 @@ use crate::index::scalar::inverted::{
     ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
     load_segments, transform_fts_document_stream,
 };
+use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::ScoredDoc;
@@ -281,13 +282,13 @@ impl ExecutionPlan for FtsDocumentExec {
 
 /// Open one FTS segment as an [`InvertedIndex`].
 ///
-/// With `restrict_rows` the segment may only report live rows currently stored in the
-/// fragments it covers (see [`open_fts_segments`]).
+/// With `coverage` the segment may only report live rows currently stored in the fragments
+/// it covers (see [`open_fts_segments`]).
 async fn open_fts_segment(
     dataset: &Dataset,
     column: &str,
     segment: &IndexMetadata,
-    restrict_rows: bool,
+    coverage: Option<(&SegmentCoverage, usize)>,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
     let open = async {
@@ -306,15 +307,8 @@ async fn open_fts_segment(
             })
     };
     let allowed_rows = async {
-        let coverage = if restrict_rows {
-            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
-        } else {
-            None
-        };
-        match coverage.and_then(|coverage| {
-            DatasetPreFilter::create_restricted_deletion_mask(Arc::new(dataset.clone()), coverage)
-        }) {
-            Some(mask) => Ok(Some(mask.await?)),
+        match coverage {
+            Some((coverage, index)) => Ok(Some(coverage.live_rows(index).await?)),
             None => Ok(None),
         }
     };
@@ -340,12 +334,13 @@ async fn open_fts_segments(
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
-    let restrict_rows = dataset.manifest.uses_stable_row_ids() && segments.len() > 1;
-    try_join_all(
-        segments
-            .iter()
-            .map(|segment| open_fts_segment(dataset, column, segment, restrict_rows, metrics)),
-    )
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let coverage =
+        SegmentCoverage::resolve(dataset, &segment_refs, SegmentRowDomain::RowId).await?;
+    try_join_all(segments.iter().enumerate().map(|(index, segment)| {
+        let coverage = coverage.as_ref().map(|coverage| (coverage, index));
+        open_fts_segment(dataset, column, segment, coverage, metrics)
+    }))
     .await
 }
 
@@ -4207,11 +4202,9 @@ impl FlatMatchFilterExec {
                     column
                 ))
             })?;
-            return Ok(
-                open_fts_segment(dataset, column, index_meta, false, metrics)
-                    .await?
-                    .tokenizer(),
-            );
+            return Ok(open_fts_segment(dataset, column, index_meta, None, metrics)
+                .await?
+                .tokenizer());
         }
         Ok(default_text_tokenizer())
     }
@@ -4225,11 +4218,9 @@ impl FlatMatchFilterExec {
         let index_meta = segments.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(
-            open_fts_segment(dataset, column, index_meta, false, metrics)
-                .await?
-                .tokenizer(),
-        )
+        Ok(open_fts_segment(dataset, column, index_meta, None, metrics)
+            .await?
+            .tokenizer())
     }
 
     pub fn new(
@@ -9647,6 +9638,15 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let engines = MatchQuery::new("engines".into()).with_column(Some("text".into()));
+        assert_eq!(
+            fts_hits(&dataset, engines.into())
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ["a1", "a4"]
+        );
 
         let update = record_batch!(
             ("id", Utf8, ["a1"]),
