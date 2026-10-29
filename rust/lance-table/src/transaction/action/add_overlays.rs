@@ -381,20 +381,26 @@ mod tests {
     /// A full rewrite of the overlaid column replaces every cell from a
     /// snapshot that never saw the overlay, and tombstones the overlay as it
     /// applies; the overlay's values would be gone without a trace. Either
-    /// order loses, so the pair is symmetric.
-    #[test]
-    fn test_an_overlay_and_a_rewrite_of_the_same_column_conflict() {
+    /// order loses, so the pair is symmetric. A re-encode (`data_change`
+    /// false) keeps the overlay and every row's offset, so the overlay still
+    /// wins its cells whichever lands first.
+    #[rstest::rstest]
+    #[case::rewrite(true)]
+    #[case::reencode(false)]
+    fn test_an_overlay_conflicts_with_a_rewrite_of_its_column_but_not_a_reencode(
+        #[case] data_change: bool,
+    ) {
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
         let rewrite = |field: i32| {
             footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
                 field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
+                data_change,
             })])
         };
 
-        assert!(overlaid.conflicts_with(&rewrite(0)));
-        assert!(rewrite(0).conflicts_with(&overlaid));
+        assert_eq!(overlaid.conflicts_with(&rewrite(0)), data_change);
+        assert_eq!(rewrite(0).conflicts_with(&overlaid), data_change);
         // Another column of the same fragment is not touched by the overlay.
         assert!(!overlaid.conflicts_with(&rewrite(1)));
         assert!(!rewrite(1).conflicts_with(&overlaid));

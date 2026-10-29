@@ -4730,6 +4730,52 @@ mod composite {
         .await;
     }
 
+    /// A re-encode keeps every row where it was and leaves the overlays alone,
+    /// so whichever lands first, the overlay still wins its cells.
+    #[rstest::rstest]
+    #[case::overlay_first(true)]
+    #[case::reencode_first(false)]
+    #[tokio::test]
+    async fn test_an_overlay_and_a_reencode_of_its_column_both_land(#[case] overlay_first: bool) {
+        let original = test_dataset(false).await;
+        let fragment = original.fragments()[0].id;
+        let read_version = original.version().version;
+        let overlay = vec![overlay_action(&original, fragment)];
+        let reencode = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment),
+                file: existing_data_file(&original, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+                base: None,
+            }),
+        ];
+        let (first, second) = if overlay_first {
+            (overlay, reencode)
+        } else {
+            (reencode, overlay)
+        };
+
+        let committed = commit(original, first).await;
+        let landed = CommitBuilder::new(Arc::new(committed))
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, second))
+            .await
+            .unwrap();
+
+        assert_eq!(landed.fragments()[0].overlays.len(), 1);
+        let values = landed.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            values.column(0).as_ref(),
+            &Int32Array::from_iter_values((5..10).chain(5..10)) as &dyn arrow_array::Array
+        );
+    }
+
     /// A stale append that carries an overlay for a column a concurrent set
     /// dropped would leave values for a field the schema no longer has.
     #[tokio::test]
