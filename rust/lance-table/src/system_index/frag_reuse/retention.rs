@@ -198,7 +198,7 @@ fn is_transition_needed(
 /// digests and the stored index metadata alone (zero payload IO).
 ///
 /// Legacy versions keep the exact v0 caught-up predicate; transitions use
-/// [`is_transition_needed`]; then transitive chain retention closes the set
+/// `is_transition_needed`; then transitive chain retention closes the set
 /// forward: a retained record's translation path walks through every
 /// downstream consumer of its destinations, so those records must survive
 /// too. Legacy versions retain at whole-version granularity (their groups
