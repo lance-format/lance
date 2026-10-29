@@ -1043,7 +1043,7 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
+            .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
             .collect::<Result<Vec<_>>>()?;
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),

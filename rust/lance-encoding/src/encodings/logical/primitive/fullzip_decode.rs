@@ -196,6 +196,37 @@ impl FullZipScheduler {
             })
             .transpose()?;
 
+        let bits_rep = u8::try_from(layout.bits_rep).map_err(|_| {
+            Error::corrupt_file_named(
+                "full_zip_layout",
+                format!("Full-zip bits_rep {} does not fit in a u8", layout.bits_rep),
+            )
+        })?;
+        let bits_def = u8::try_from(layout.bits_def).map_err(|_| {
+            Error::corrupt_file_named(
+                "full_zip_layout",
+                format!("Full-zip bits_def {} does not fit in a u8", layout.bits_def),
+            )
+        })?;
+        // Levels are u16 values, and the parser supports at most a 32-bit word.
+        if bits_rep > 16 || bits_def > 16 {
+            return Err(Error::corrupt_file_named(
+                "full_zip_layout",
+                format!(
+                    "Full-zip control word uses {bits_rep} repetition and {bits_def} definition bits, but each side supports at most 16 bits (32 bits total)"
+                ),
+            ));
+        }
+        let ctrl_word_parser = ControlWordParser::new(bits_rep, bits_def);
+        let def_meaning = layout
+            .layers
+            .iter()
+            .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+            .collect::<Result<Vec<_>>>()?;
+
+        let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
+        let max_visible_def = max_visible_level(&def_meaning);
+
         let value_compression = layout.value_compression.as_ref().ok_or_else(|| {
             Error::corrupt_file_named(
                 "full_zip_layout",
@@ -220,27 +251,6 @@ impl FullZipScheduler {
                 ));
             }
         };
-        let bits_rep = u8::try_from(layout.bits_rep).map_err(|_| {
-            Error::corrupt_file_named(
-                "full_zip_layout",
-                format!("Full-zip bits_rep {} does not fit in a u8", layout.bits_rep),
-            )
-        })?;
-        let bits_def = u8::try_from(layout.bits_def).map_err(|_| {
-            Error::corrupt_file_named(
-                "full_zip_layout",
-                format!("Full-zip bits_def {} does not fit in a u8", layout.bits_def),
-            )
-        })?;
-        let ctrl_word_parser = ControlWordParser::new(bits_rep, bits_def);
-        let def_meaning = layout
-            .layers
-            .iter()
-            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-            .collect::<Result<Vec<_>>>()?;
-
-        let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
-        let max_visible_def = max_visible_level(&def_meaning);
 
         let bits_per_offset = match layout.details {
             Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => 32,
@@ -2337,6 +2347,24 @@ mod tests {
                 .expect_err("a page without a data buffer must fail");
         assert!(
             error.to_string().contains("no data buffer"),
+            "unexpected error: {error}"
+        );
+
+        let layout = metadata::FullZipLayout {
+            bits_rep: 200,
+            bits_def: 100,
+            ..Default::default()
+        };
+        let error = FullZipScheduler::try_new(
+            &[(0, 100)],
+            0,
+            2,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .expect_err("a control word wider than 32 bits must fail");
+        assert!(
+            error.to_string().contains("at most 16 bits"),
             "unexpected error: {error}"
         );
     }

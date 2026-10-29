@@ -2318,7 +2318,11 @@ impl NilaryControlWordIterator {
 
 /// Helper function to get a bit mask of the given width
 fn get_mask(width: u16) -> u16 {
-    (1 << width) - 1
+    if width >= u16::BITS as u16 {
+        u16::MAX
+    } else {
+        (1 << width) - 1
+    }
 }
 
 // We're really going out of our way to avoid boxing here but this will be called on a per-value basis
@@ -2866,8 +2870,8 @@ mod tests {
         SparseValiditySet,
     };
     use crate::repdef::{
-        CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler, SerializedRepDefs,
-        max_visible_level,
+        CompositeRepDefUnraveler, ControlWordParser, DefinitionInterpretation, RepDefUnraveler,
+        SerializedRepDefs, max_visible_level,
     };
 
     use super::RepDefBuilder;
@@ -2900,6 +2904,16 @@ mod tests {
         #[case] expected: u16,
     ) {
         assert_eq!(max_visible_level(def_meaning), expected);
+    }
+
+    #[test]
+    fn control_word_parser_handles_16_bit_levels() {
+        let parser = ControlWordParser::new(16, 16);
+        let mut rep = Vec::new();
+        let mut def = Vec::new();
+        parser.parse(&[0xff; 4], &mut rep, &mut def);
+        assert_eq!(rep, vec![u16::MAX]);
+        assert_eq!(def, vec![u16::MAX]);
     }
 
     fn validity(values: &[bool]) -> NullBuffer {

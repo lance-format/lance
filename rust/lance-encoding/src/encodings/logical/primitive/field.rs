@@ -377,7 +377,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = constant_layout
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
                     .collect::<Result<Vec<_>>>()?;
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
@@ -426,7 +426,7 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = blob
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
                     .collect::<Result<Vec<_>>>()?;
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
