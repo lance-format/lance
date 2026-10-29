@@ -55,7 +55,7 @@ For detailed conflict detection and resolution mechanisms, see the [Conflict Res
 
 ## Transaction Types
 
-The authoritative specification for transaction types is defined in [`protos/transaction.proto`](https://github.com/lancedb/lance/blob/main/protos/transaction.proto).
+The authoritative specification for transaction types is defined in [`protos/transaction/`](https://github.com/lancedb/lance/tree/main/protos/transaction).
 
 Each transaction contains a `read_version` field indicating the table version from which the transaction was built,
 a `uuid` field uniquely identifying the transaction, and an `operation` field specifying one of the following transaction types:
@@ -604,6 +604,236 @@ Adds new base paths to the table, enabling reference to data files in additional
 An UpdateBases operation only modifies the base paths. As a result, it only conflicts with other
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
+
+## Action-Based Transactions (Transaction V2)
+
+!!! warning "Experimental"
+
+    Transaction V2 is an experimental format feature under the process in
+    [Voting](../../community/voting.md). Its protobuf field numbers are not a
+    stable contract, breaking changes may be made without a separate vote, and
+    the feature is removed from the specification and the codebase if its
+    stabilization vote does not pass. Discussion:
+    [#5960](https://github.com/lance-format/lance/discussions/5960).
+
+!!! note "Readers before v14.0.0 fail on a `CompositeOperation`"
+
+    Any reader can open and scan a table version committed as a
+    `CompositeOperation`: the inline transaction lives in manifest field 23,
+    which older readers ignore
+    ([#9482](https://github.com/lance-format/lance/pull/9482), v14.0.0). A
+    reader before v14.0.0 that decodes the transaction itself, to read the
+    transaction history or to check a concurrent commit for conflicts, fails
+    on the unrecognized operation. For conflict checking that failure aborts
+    the older writer's commit, which is the safe outcome.
+
+Every operation above is a single named verb. A transaction may instead carry a
+`CompositeOperation`: an ordered list of granular *actions* that apply
+atomically as one manifest change. This lets one commit express a change no
+single named operation covers, such as appending a fragment and updating table
+config together, and makes the transaction a true diff of the manifest rather
+than a description of intent.
+
+<details>
+<summary>CompositeOperation protobuf message</summary>
+
+```protobuf
+%%% proto.message.CompositeOperation %%%
+```
+
+</details>
+
+A `CompositeOperation` holds `UserStep`s, each a human-recognizable step with
+a description, which in turn hold the granular `Action`s applied to the
+manifest. The two levels support multi-statement transactions: each statement
+becomes one step, so the transaction history still shows what each statement
+did, while all of the steps' actions apply as one atomic change.
+
+Actions are deltas rather than post-images, and an action that allocates a new
+identifier (a field, fragment, or base id) names it with a local placeholder.
+When building the manifest before commit, the local placeholders are translated
+into concrete identifiers. Both properties, true deltas and local placeholders,
+are what let a composite operation be replayed against a newer version, or onto
+a different branch, without rewriting it.
+
+A committed identifier, by contrast, must have been allocated by the
+operation's read version: it is at or below the read version's high-water mark
+for that id space, either naming an existing object or, for a fragment, an id
+an earlier commit reserved. Apply rejects a committed fragment, field, or base
+id above the mark, since a concurrent commit may have minted it for an
+unrelated object in the meantime.
+
+Every fragment must store data for each required field, one that is
+non-nullable and has only non-nullable ancestors; a fragment without it would
+read the field back as nulls. Apply checks each fragment whose data files the
+operation sets. When the operation makes a field required, by adding it as
+non-nullable or by making it non-nullable, apply checks every fragment.
+
+The full action vocabulary and the reasoning behind its shape are defined in
+`protos/transaction/actions.proto`.
+
+One vocabulary detail is a format contract rather than an implementation
+choice. `AddIndexSegment.fields` names only the columns the segment is keyed
+on, and `covering_fields` is an independent declaration of the columns whose
+values it carries, so the segment's dependency set is the union of the two.
+This is the contract an index action targets, not the legacy one where
+`IndexMetadata.fields` means keyed columns followed by carried columns. A
+declaration whose two lists overlap can only be represented by a manifest
+declaring `FLAG_INDEPENDENT_COVERING_FIELDS`; until a release implements that
+flag, apply rejects the overlapping form and lowers a disjoint one to the
+legacy subset representation.
+
+Actions apply in order, with one exception: `ReserveFragmentIds` and
+`ReserveRowIds` are summed and taken after the operation's own mints, wherever
+they appear. A reservation creates nothing another action can reference, so
+this has no other visible effect within the operation, and a fragment can claim
+a reserved id only from an earlier commit's reservation. `ResetTable` discards
+objects but never rewinds the id counters.
+
+`data_change` is per action, and absent means true. `false` asserts the action changes no row's
+values: the rows it adds, removes, or rebinds are the same logical rows with
+the same values before and after, as when compaction moves rows or a column
+file is re-encoded. Change-data-capture readers emit rows only from
+`data_change = true` actions, and one operation may mix both.
+
+On a `TombstoneFieldData`, the flag means what `DataReplacement.data_change`
+means. A tombstone that changes data tombstones the fields' entries in the
+fragment's overlays, since new base values supersede them, and withdraws every
+index on those fields from the fragment. A tombstone with `data_change` false
+is one half of a re-encode: the same operation re-binds every tombstoned field
+in that fragment with an `AddDataFile` that also has `data_change` false and
+holds the same base values (overlays not applied) for every physical row. No
+value a reader sees changes, so overlays keep shadowing the base, index
+coverage is kept, and no row's last-updated-at version moves. Nor does it count
+as writing values against a concurrent overlay of those fields, a concurrent
+index build over them, or a concurrent change that makes one of them required.
+It does count as a write against `AssertCellsUnchanged` and `AssertUniqueKeys`:
+apply cannot verify that the values are unchanged, and those assertions guard
+correctness. Apply rejects a `false` tombstone whose fields are not all
+re-bound that way, and an `AddDataFile` whose `data_change` differs from that
+of the tombstone it re-binds.
+
+### Fragment Reuse History
+
+The [fragment reuse history](../index/system/frag_reuse.md) is not an index in
+a `CompositeOperation`. Apply rejects `AddIndexSegment`, `RemoveIndexSegment`,
+`AdjustIndexCoverage`, and `DropIndex` when they name `__lance_frag_reuse`.
+The history changes only through two actions, and neither refers to the
+history's index entry, its UUID, or its `index_version`. A `ResetTable`
+discards the history along with the indices.
+
+`AppendFragReuseTransition` records that a compaction in the same operation
+moved rows from its `sources` to its `destinations`, with one ordered
+compaction or stable partition mapping. It is a delta: on every commit attempt,
+apply appends the transition to the history as it stands on the version being
+committed on top of, never to a copy the writer read. Transitions with disjoint
+sources therefore commute. The transition carries no fragment digests. Apply
+derives each source digest from the fragment as it stands (its physical rows
+and deleted rows) and each destination digest from its `AddFragment` (its
+physical rows and no deleted rows).
+
+Apply validates the transition without reading any file, and rejects it unless:
+
+- every source is removed in the same operation by a `RemoveFragment` with
+  `data_change` false;
+- every destination is added in the same operation by an `AddFragment`, under a
+  local or a reserved committed id, and has no deletion file;
+- each source's surviving-row count in the mapping equals its physical rows
+  minus its deleted rows, and the sources' surviving rows total the
+  destinations' physical rows;
+- no source is consumed by any other transition, in the history or in the same
+  operation;
+- every index on the table returns row addresses. The history translates row
+  addresses, so it would mistranslate an index that returns stable row ids,
+  which only a table with stable row ids can have. For the same reason, an
+  `AddIndexSegment` for an index that returns stable row ids must not be
+  committed while the history is tagged (`index_version` 1 or higher);
+- a stable partition has between 1 and 65,536 destinations.
+
+Apply then creates the history if the table has none, converts a version 0
+history to version 1 (keeping its `legacy_versions`), sets
+`FLAG_FRAGMENT_REUSE_INDEX`, and, on a table with stable row ids, also sets
+`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`. A history over the inline size limit is
+written to an external details file.
+
+Recording a transition is never required. A compaction that moves covered rows
+without one is legal: the indices lose coverage of those rows, which are then
+scanned, and since fragment ids are never reused nothing is served wrongly.
+Recording a transition on every compaction is a writer default, not a rule
+apply enforces. The writer is responsible only for the mapping payload being
+correct.
+
+`TrimFragReuse` is declarative. On every commit attempt, apply drops every
+transition that no index on the version being committed on top of still needs.
+It names no transition, so it never conflicts; an implementation may keep a
+transition it cannot prove unneeded.
+
+Neither action adds a conflict claim of its own. A transition's sources are
+removed by `RemoveFragment`s in the same operation, which already make two
+compactions of the same fragment, or a compaction and a concurrent deletion
+from one of its sources, conflict.
+
+### Index Builds and Removed Fragments
+
+An `AddIndexSegment` requires the data it covers, and so does an
+`AdjustIndexCoverage` for the fragments it adds: a concurrent commit that
+replaces those fields' values in place (an `AddDataFile` or a
+`TombstoneFieldData` with `data_change` true, or an `AlterField` of one of the
+fields) conflicts with it, because a reader cannot tell from the metadata that
+the indexed values changed. Removing a whole fragment does not conflict with
+that requirement. Like a deletion or an overlay, a removal is visible in the
+metadata: a segment naming a removed fragment either reaches its rows through
+the fragment reuse history or loses that coverage. So neither a removal nor a
+compaction conflicts with building an index, whether or not the compaction
+records a transition, and this does not depend on what else the removing
+operation contains. A data file written into a committed fragment still
+conflicts with that fragment's removal, which destroys the written cells, and
+an `AdjustIndexCoverage` still requires each committed fragment it adds to
+exist.
+
+After such a race, an index can hold two segments whose coverage overlaps once
+the history is applied: one built late over a compacted source, and one built
+over the destination. A reader must serve a fragment from a segment that
+covers it directly rather than translating another segment's coverage through
+the history, so the overlap never returns a row twice. Apply does not prune the
+overlap; dropping the superseded segment is the index maintenance's concern,
+and it only ever loses coverage; it is never a conflict.
+
+### Isolation
+
+Two `CompositeOperation`s conflict when they change the same part of the
+manifest in ways that cannot both apply, or when one breaks a precondition the
+other asserts. Some changes to the same part do both apply: two overlays of the
+same cells both land and the newer wins, an overlay and a re-encode of its
+column both land, and fragment reuse transitions with disjoint sources both
+append to the history. Without
+assertions this is snapshot isolation: concurrent writers that each read a
+value the other overwrites can both commit. A writer whose values depend on
+what it read must declare the read with `AssertCellsUnchanged`. For example,
+`UPDATE t SET a = b` and `UPDATE t SET b = a` from the same snapshot write
+disjoint columns, so without assertions both commit and the columns end up
+swapped, which neither serial order produces (either leaves them equal); each
+declaring the column it read makes the second commit conflict.
+
+### Compatibility
+
+A `CompositeOperation` produces an ordinary manifest, so a reader that scans a
+table whose latest version was written this way needs no knowledge of the
+feature. Readers are affected in two places:
+
+- A reader that decodes the transaction itself — reading the transaction
+  history, or checking a concurrent commit for conflicts — sees an operation it
+  does not recognize. Implementations must reject it rather than treat it as a
+  no-op, so that a concurrent V2 commit aborts an in-flight commit instead of
+  being silently skipped.
+- Transactions are usually inlined into the manifest. Opening a table never
+  requires decoding them (see
+  [Inline Transaction Sections](#inline-transaction-sections)), so an
+  undecodable inline `CompositeOperation` does not prevent reading data.
+
+Conflict resolution between two `CompositeOperation`s is computed from the
+actions themselves. Between a `CompositeOperation` and any named operation it
+fails closed: the commit is rejected as a conflict rather than compared.
 
 ## Conflict Resolution
 
