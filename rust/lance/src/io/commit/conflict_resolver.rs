@@ -86,7 +86,7 @@ pub struct TransactionRebase<'a> {
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
     /// Field tree at `transaction.read_version`.
-    read_version_schema: Schema,
+    read_version_schema: Arc<Schema>,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -347,7 +347,7 @@ impl<'a> TransactionRebase<'a> {
             transaction.read_version,
             dataset.manifest.version
         );
-        let read_version_schema = dataset.schema().clone();
+        let read_version_schema = Arc::new(dataset.schema().clone());
 
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
@@ -3840,7 +3840,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: schema.clone(),
+            read_version_schema: Arc::new(schema.clone()),
         };
         rebase.check_txn(&Transaction::new(0, other.clone(), None), 1)
     }
@@ -5056,7 +5056,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
 
             let result = rebase.check_txn(&unknown, 1);
@@ -5300,7 +5300,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5368,7 +5368,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5518,7 +5518,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5569,7 +5569,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -5593,7 +5593,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -5682,7 +5682,7 @@ mod tests {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
-                        read_version_schema: lance_core::datatypes::Schema::default(),
+                        read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -5883,7 +5883,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
         let update = Transaction::new(
             1,
@@ -6102,7 +6102,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let same_name = Transaction::new(
@@ -6168,7 +6168,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -6424,7 +6424,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -7427,7 +7427,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
-                read_version_schema: lance_core::datatypes::Schema::default(),
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -7499,7 +7499,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7546,7 +7546,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7594,7 +7594,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7642,7 +7642,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7701,7 +7701,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7735,7 +7735,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -7790,7 +7790,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
-            read_version_schema: lance_core::datatypes::Schema::default(),
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
