@@ -926,8 +926,8 @@ impl ShardMemory {
     /// figure, not another term to add. `0` in WAL-only mode, which has none.
     ///
     /// Broken out because it does not behave like row data and is usually what
-    /// explains a shard near its ceiling with few rows in it: an HNSW graph
-    /// allocates a fixed part sized by `max_memtable_rows` on the first insert.
+    /// explains a shard near its ceiling with few rows in it: an HNSW index
+    /// allocates slabs sized by `max_memtable_rows` on the first insert.
     pub fn index_bytes(&self) -> usize {
         match &self.source {
             ShardMemorySource::MemTables(t) => t
