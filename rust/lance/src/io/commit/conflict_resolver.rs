@@ -307,6 +307,21 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
+/// Resolve the snapshot field lineage must use. Some rebased operations keep
+/// their original read version while the commit loop has already loaded a newer
+/// dataset, so callers cannot assume the two versions match.
+async fn dataset_at_read_version<'d>(
+    dataset: &'d Dataset,
+    transaction: &Transaction,
+) -> Result<Cow<'d, Dataset>> {
+    if transaction.read_version == 0 || dataset.manifest.version == transaction.read_version {
+        return Ok(Cow::Borrowed(dataset));
+    }
+    Ok(Cow::Owned(
+        dataset.checkout_version(transaction.read_version).await?,
+    ))
+}
+
 fn update_map_changes_metadata(update: &UpdateMap) -> bool {
     update.replace || !update.update_entries.is_empty()
 }
@@ -338,15 +353,8 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
-        // Commit and staged-index replay resolve the transaction's read version
-        // before constructing the rebase. Keep that invariant local to field
-        // lineage instead of consulting whichever dataset value the caller had.
-        debug_assert!(
-            transaction.read_version == 0 || dataset.manifest.version == transaction.read_version,
-            "transaction read version {} does not match dataset version {}",
-            transaction.read_version,
-            dataset.manifest.version
-        );
+        let dataset = dataset_at_read_version(dataset, &transaction).await?;
+        let dataset = dataset.as_ref();
         let read_version_schema = Arc::new(dataset.schema().clone());
 
         match &transaction.operation {
