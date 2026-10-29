@@ -14,12 +14,18 @@
 //! the rule can be tightened in a later release without a format change.
 //!
 //! Which coordinates an action writes is decided by that action, in its own
-//! module. This module holds the coordinate space and the comparison.
+//! module. This module holds the coordinate space and the comparison; the
+//! footprints of the named operations, which have no actions to ask, are in
+//! `legacy`.
+
+mod legacy;
 
 use super::query_contract::QueryContract;
 use super::{Action, CompositeOperation, FieldRef, Ref};
+use crate::format::Manifest;
 use crate::format::key_existence::KeyExistenceFilter;
-use crate::transaction::UpdateMap;
+use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
+use crate::transaction::{Transaction, UpdateMap};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -325,11 +331,31 @@ pub struct Footprint {
     /// the same id collide. The exact set rather than a range, so two
     /// compactions whose rows interleave in id order do not.
     supplied_row_ids: RoaringTreemap,
-    /// Whether this set rewrites the table wholesale. Such a set collides with
-    /// every concurrent set, including one that records no claim at all -- an
-    /// append's rows would vanish or survive the reset depending on which
-    /// commit landed first -- so it is a flag rather than a region.
-    exclusive: bool,
+    /// Whether this set rewrites the table wholesale. The rule is asymmetric,
+    /// and it is a flag rather than a region because neither side of it can
+    /// be stated as coordinates:
+    ///
+    /// - A reset that landed first conflicts with every set that read before
+    ///   it, including one that records no claim at all: whatever that set
+    ///   read is gone, and an append's rows would land in a table they were
+    ///   never prepared against.
+    /// - A reset landing second wins over what landed in between. Discarding
+    ///   a concurrent append is what an overwrite means, and it is what the
+    ///   legacy `Overwrite` and `Restore` do. Only the claims the resetting set
+    ///   states besides the reset -- the config it sets, the bases it adds --
+    ///   are compared.
+    resets_table: bool,
+    /// Whether this footprint cannot say what its set touches: a named
+    /// operation whose post-image no coordinates describe yet. Collides with
+    /// every concurrent set, in either order.
+    opaque: bool,
+    /// Committed fragments whose rows this set moves while carrying the
+    /// indices over them along, through a remap it computed at its read
+    /// version. An index segment over one of them committed since would be
+    /// left describing rows that are no longer there. Checked one way: an index
+    /// built after the move landed requires the moved data, and so collides
+    /// through its own claims.
+    remaps_indices_over: HashSet<u64>,
     /// Whether this set brings rows into the dataset that were not there
     /// before. Coordinates cannot answer what the key assertions ask: two
     /// writers inserting the same key write it into fragments of their own, so
@@ -457,7 +483,59 @@ impl IndexClaim {
     }
 }
 
+/// What it takes for a pending set to land on top of a committed one.
+#[derive(Debug)]
+pub enum Verdict {
+    /// The two sets touch nothing in common; the pending one lands as it is.
+    Compatible,
+    /// The sets overlap, but only in ways the pending set can be rewritten
+    /// around. Each [`Overlap`] names one, and
+    /// [`CompositeOperation::rebase`] rewrites the pending set past it.
+    Rebase(Vec<Overlap>),
+    /// The sets collide; the pending one has to be planned again.
+    Conflict,
+}
+
+/// One way two sets overlap that the pending set can be rewritten around.
+///
+/// Named after what overlaps, not after the pair of operations that produced
+/// it, so that each overlap is handled once however many pairs reach it. There
+/// are none yet: every overlap is a [`Verdict::Conflict`].
+#[derive(Debug)]
+pub enum Overlap {}
+
 impl Footprint {
+    /// The footprint of `transaction`, which has not committed yet and read
+    /// `read`.
+    ///
+    /// An action set's footprint comes from its actions. A named operation's
+    /// comes straight from the operation, with post-image semantics: whatever
+    /// part of the manifest it restates it is taken to replace.
+    pub fn pending(transaction: &Transaction, read: &Manifest) -> Self {
+        Self::of_operation(&transaction.operation, &read.schema)
+    }
+
+    /// The footprint of `transaction`, which committed `after` on top of
+    /// `before`.
+    ///
+    /// Both forms are read from the transaction, as in [`Self::pending`]; the
+    /// manifests are what a named operation's footprint will be diffed from,
+    /// so that it claims what the commit changed rather than everything it
+    /// restated.
+    pub fn committed(transaction: &Transaction, before: &Manifest, _after: &Manifest) -> Self {
+        Self::of_operation(&transaction.operation, &before.schema)
+    }
+
+    /// What it takes for this set to land on top of `committed`, a set that
+    /// landed after this one read.
+    pub fn compare(&self, committed: &Self) -> Verdict {
+        if self.conflicts_with(committed) {
+            Verdict::Conflict
+        } else {
+            Verdict::Compatible
+        }
+    }
+
     /// Whether this set can still commit on top of `committed`, a set that
     /// landed after this one read.
     ///
@@ -471,13 +549,12 @@ impl Footprint {
     /// `Precondition`s, which are tested against the facts `committed`
     /// recorded, and are likewise one-way.
     ///
-    /// The value predicates -- key assertions, index claims -- are not
-    /// coordinates and are compared on their own terms, symmetrically.
-    pub fn conflicts_with(&self, committed: &Self) -> bool {
-        // A wholesale rewrite leaves nothing for a concurrent set to land on --
-        // not even an append, whose rows the reset would discard or resurrect
-        // depending on which commit won.
-        if self.exclusive || committed.exclusive {
+    /// Key assertions are preconditions too, and likewise one-way. Index
+    /// claims are compared symmetrically.
+    ///
+    /// A reset is the other asymmetry; see [`Self::resets_table`].
+    pub(crate) fn conflicts_with(&self, committed: &Self) -> bool {
+        if self.opaque || committed.opaque || committed.resets_table {
             return true;
         }
         if self.claims_conflict_with(committed) || self.preconditions_violated_by(committed) {
@@ -503,16 +580,15 @@ impl Footprint {
         {
             return true;
         }
-        // Symmetric, unlike the coordinate requirements above. Dropping the
-        // second direction would let a plain append land a duplicate of a key
-        // a committed merge-insert asserted was absent -- correct if the
-        // assertion is a precondition on that commit, wrong if it is an
-        // invariant on the table.
-        //
-        // TODO(https://github.com/lance-format/lance/issues/10189): decide which
-        // reading holds as part of conflict parity with the legacy resolver;
-        // until then, keep the stricter one.
-        if self.key_assertion_violated_by(committed) || committed.key_assertion_violated_by(self) {
+        // One-way, as legacy merge insert's inserted-key filter is: a
+        // uniqueness assertion is a precondition on the commit that carries
+        // it, not an invariant on the table. A plain append landing after a
+        // merge insert is no different from one planned after it, which
+        // nothing stops from writing a duplicate key either.
+        if self.key_assertion_violated_by(committed) {
+            return true;
+        }
+        if self.index_moved_under(committed) {
             return true;
         }
         self.index_claims.iter().any(|ours| {
@@ -521,6 +597,20 @@ impl Footprint {
                 .iter()
                 .any(|theirs| ours.conflicts_with(theirs))
         })
+    }
+
+    /// Whether `committed` put an index segment over rows this set moves.
+    fn index_moved_under(&self, committed: &Self) -> bool {
+        if self.remaps_indices_over.is_empty() {
+            return false;
+        }
+        committed
+            .index_claims
+            .iter()
+            .any(|claim| match &claim.coverage {
+                Some(covered) => !covered.is_disjoint(&self.remaps_indices_over),
+                None => true,
+            })
     }
 
     /// Whether any coordinate touched by both sets, directly or through a
@@ -940,6 +1030,12 @@ impl Footprint {
     /// with it every coordinate inside it.
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
         self.write(Coordinate::FragmentExistence(fragment));
+        self.replace_fragment(fragment);
+    }
+
+    /// Record that this set restates `fragment` as a whole, writing every
+    /// coordinate inside it.
+    fn replace_fragment(&mut self, fragment: u64) {
         self.regions
             .insert(Region::Fragment(fragment), Mode::Writes);
     }
@@ -948,7 +1044,7 @@ impl Footprint {
     /// or the whole map when it replaces rather than merges.
     pub(super) fn write_map_update(&mut self, map: ConfigMap, update: &UpdateMap) {
         if update.replace {
-            self.regions.insert(Region::Map(map), Mode::Writes);
+            self.write_map(map);
             return;
         }
         for entry in &update.update_entries {
@@ -959,10 +1055,26 @@ impl Footprint {
         }
     }
 
-    /// Mark this set as rewriting the whole table, conflicting with any
-    /// concurrent set whatsoever.
-    pub(super) fn take_exclusive(&mut self) {
-        self.exclusive = true;
+    /// Record that this set replaces one of the manifest's string maps whole.
+    fn write_map(&mut self, map: ConfigMap) {
+        self.regions.insert(Region::Map(map), Mode::Writes);
+    }
+
+    /// Mark this set as one whose footprint cannot be stated. See
+    /// [`Self::opaque`].
+    pub(super) fn mark_opaque(&mut self) {
+        self.opaque = true;
+    }
+
+    /// Mark this set as rewriting the whole table. See
+    /// [`Self::resets_table`].
+    ///
+    /// The MemWAL index is claimed as well. A reset drops every index, which
+    /// for an ordinary index loses nothing a rebuild cannot recover, but the
+    /// MemWAL index records compaction progress that exists nowhere else.
+    pub(super) fn reset_table(&mut self) {
+        self.resets_table = true;
+        self.rewrite_index(MEM_WAL_INDEX_NAME.to_string());
     }
 }
 
