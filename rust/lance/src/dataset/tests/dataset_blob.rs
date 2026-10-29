@@ -3375,31 +3375,37 @@ async fn test_blob_v2_append_rejects_threshold_mismatch_with_non_blob_input_exte
     assert!(message.contains(BLOB_INLINE_SIZE_THRESHOLD_META_KEY));
 }
 
-/// Write `batch` as a V2.2 dataset at `uri`, with `bases` registered.
-async fn write_blob_dataset(uri: &str, batch: RecordBatch, bases: Vec<BasePath>) -> Arc<Dataset> {
+/// Write `batch` as a V2.2 dataset at `uri`, two rows per fragment, with `bases`
+/// registered.
+async fn write_blob_dataset(uri: &str, batch: RecordBatch, bases: Vec<BasePath>) -> Dataset {
     let schema = batch.schema();
-    Arc::new(
-        Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            uri,
-            Some(WriteParams {
-                data_storage_version: Some(LanceFileVersion::V2_2),
-                allow_external_blob_outside_bases: true,
-                initial_bases: (!bases.is_empty()).then_some(bases),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap(),
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            max_rows_per_file: 2,
+            allow_external_blob_outside_bases: true,
+            initial_bases: (!bases.is_empty()).then_some(bases),
+            ..Default::default()
+        }),
     )
+    .await
+    .unwrap()
 }
 
-/// Every row of `source`, with its blobs as values another dataset is written from.
-async fn scan_as_logical(source: &Arc<Dataset>) -> RecordBatch {
+/// `source` copied to `target_uri` through `scan_blobs_as_logical`, then
+/// reopened with the source's directory removed, so every value it reads is
+/// its own.
+async fn copy_without_source(source: Arc<Dataset>, target_uri: &str) -> Arc<Dataset> {
     let stream = source.scan_blobs_as_logical().await.unwrap();
     let schema = stream.schema();
     let batches: Vec<_> = stream.try_collect().await.unwrap();
-    arrow_select::concat::concat_batches(&schema, &batches).unwrap()
+    let logical = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
+    assert!(logical.column_by_name(lance_core::ROW_ADDR).is_none());
+    write_blob_dataset(target_uri, logical, vec![]).await;
+    std::fs::remove_dir_all(source.uri()).unwrap();
+    Arc::new(Dataset::open(target_uri).await.unwrap())
 }
 
 /// Every blob of `dataset`'s column picked by `column`, read as bytes.
@@ -3416,9 +3422,11 @@ async fn read_blob_bytes(
         .collect()
 }
 
-/// Rows scanned from one dataset become values another dataset is written from:
-/// each stored blob as its bytes and an External blob as its link, at the top
-/// level, inside a struct and as a list element.
+/// Rows scanned from one dataset become another dataset's own data: each stored
+/// blob as its bytes and an External blob as a link to the same object, at the
+/// top level, in a struct, as a list element and in a column added later,
+/// across fragments and without the source's deleted rows. The External
+/// object sits under a registered base.
 #[tokio::test]
 async fn scan_blobs_as_logical_writes_another_dataset() {
     use crate::blob::{BlobFieldOptions, blob_field_with_options};
@@ -3439,9 +3447,9 @@ async fn scan_blobs_as_logical_writes_another_dataset() {
         None,
         Some(b"the writer's".to_vec()),
     ];
-    let blob = || {
+    let blob = |name: &str| {
         blob_field_with_options(
-            "blob",
+            name,
             true,
             BlobFieldOptions {
                 inline_size_threshold: Some(4),
@@ -3463,16 +3471,18 @@ async fn scan_blobs_as_logical_writes_another_dataset() {
         }
         builder.finish().unwrap()
     };
-    let struct_fields: arrow_schema::Fields = vec![blob()].into();
-    let item = Arc::new(blob());
+    let struct_fields: arrow_schema::Fields = vec![blob("blob")].into();
+    let item = Arc::new(blob("blob"));
     let schema = Arc::new(Schema::new(vec![
-        blob(),
+        Field::new("id", DataType::Int32, false),
+        blob("blob"),
         Field::new("meta", DataType::Struct(struct_fields.clone()), true),
         Field::new("items", DataType::List(item.clone()), true),
     ]));
     let batch = RecordBatch::try_new(
         schema,
         vec![
+            Arc::new(Int32Array::from_iter_values(0..values.len() as i32)),
             column(),
             Arc::new(StructArray::new(struct_fields, vec![column()], None)),
             Arc::new(arrow_array::ListArray::new(
@@ -3484,19 +3494,44 @@ async fn scan_blobs_as_logical_writes_another_dataset() {
         ],
     )
     .unwrap();
-    let source = write_blob_dataset(&source_dir, batch, vec![]).await;
-
-    let logical = scan_as_logical(&source).await;
-    assert!(logical.column_by_name(lance_core::ROW_ADDR).is_none());
-    let target = write_blob_dataset(&target_dir, logical, vec![]).await;
-
-    assert_eq!(
-        read_blob_bytes(&target, |rows| rows["blob"].clone()).await,
-        values
+    let base = BasePath::new(
+        1,
+        external.std_path().to_str().unwrap().to_string(),
+        None,
+        false,
     );
+    let mut source = write_blob_dataset(&source_dir, batch, vec![base]).await;
+    // A column added later is written to data files of its own.
+    let later = Arc::new(Schema::new(vec![blob("later")]));
+    let later = RecordBatch::try_new(later.clone(), vec![column()]).unwrap();
+    let later_schema = later.schema();
+    source
+        .add_columns(
+            crate::dataset::NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(later)],
+                later_schema,
+            ))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    source.delete("id = 3").await.unwrap();
+
+    let target = copy_without_source(Arc::new(source), &target_dir).await;
+
+    let mut expected = values.clone();
+    expected.remove(3);
+    for column in ["blob", "later"] {
+        assert_eq!(
+            read_blob_bytes(&target, |rows| rows[column].clone()).await,
+            expected,
+            "{column}"
+        );
+    }
     assert_eq!(
         read_blob_bytes(&target, |rows| rows["meta"].as_struct()["blob"].clone()).await,
-        values
+        expected
     );
     assert_eq!(
         read_blob_bytes(&target, |rows| rows["items"]
@@ -3504,16 +3539,78 @@ async fn scan_blobs_as_logical_writes_another_dataset() {
             .values()
             .clone())
         .await,
-        values
+        expected
     );
     let external = target
-        .take_blobs_by_indices(&[values.len() as u64 - 1], "blob")
+        .take_blobs_by_indices(&[expected.len() as u64 - 1], "blob")
         .await
         .unwrap();
     assert_eq!(
         external[0].as_ref().unwrap().kind(),
         BlobKind::External,
         "an External blob stays a link"
+    );
+}
+
+/// Managed blobs, in the table's own area and under a registered base, copy as
+/// their bytes.
+#[tokio::test]
+async fn scan_blobs_as_logical_copies_managed_blobs() {
+    let source_dir = TempStrDir::default();
+    let target_dir = TempStrDir::default();
+    let objects = TempDir::default();
+    std::fs::create_dir_all(objects.std_path().join("_blobs")).unwrap();
+    std::fs::write(objects.std_path().join("_blobs/adopted.blob"), b"payload").unwrap();
+    let owned = vec![7; 100 * 1024];
+    let mut bytes = BlobArrayBuilder::new(1);
+    bytes.push_bytes(&owned).unwrap();
+    let mut adopted = BlobDescriptorArrayBuilder::new("adopted");
+    adopted
+        .push(BlobDescriptor::Managed {
+            base_id: Some(7),
+            uri: "_blobs/adopted.blob".to_string(),
+            offset: 1,
+            size: 3,
+        })
+        .unwrap();
+    let (adopted_field, adopted) = adopted.finish().unwrap().into_parts();
+    let schema = Arc::new(managed_blob_schema(vec![
+        blob_field("owned", true),
+        adopted_field,
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![bytes.finish().unwrap(), adopted]).unwrap();
+    let source = Arc::new(
+        write_blob_dataset(
+            &source_dir,
+            batch,
+            vec![BasePath::new(
+                7,
+                objects.std_path().to_str().unwrap().to_string(),
+                None,
+                false,
+            )],
+        )
+        .await,
+    );
+    let descriptors = source.scan().try_into_batch().await.unwrap();
+    for (column, kind) in [
+        ("owned", BlobKind::Managed),
+        ("adopted", BlobKind::ManagedWithBase),
+    ] {
+        let kinds = descriptors[column].as_struct()["kind"].as_primitive::<UInt8Type>();
+        assert_eq!(kinds.value(0), kind as u8, "{column}");
+    }
+
+    let target = copy_without_source(source, &target_dir).await;
+    std::fs::remove_dir_all(objects.std_path()).unwrap();
+
+    assert_eq!(
+        read_blob_bytes(&target, |rows| rows["owned"].clone()).await,
+        vec![Some(owned)]
+    );
+    assert_eq!(
+        read_blob_bytes(&target, |rows| rows["adopted"].clone()).await,
+        vec![Some(b"ayl".to_vec())]
     );
 }
 
@@ -3559,8 +3656,7 @@ async fn scan_blobs_as_logical_keeps_escaped_external_names() {
     )
     .await;
 
-    let logical = scan_as_logical(&source).await;
-    let target = write_blob_dataset(&target_dir, logical, vec![]).await;
+    let target = copy_without_source(Arc::new(source), &target_dir).await;
 
     let expected: Vec<_> = objects
         .iter()
