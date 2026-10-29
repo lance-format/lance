@@ -184,6 +184,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::dataset::UpdateBuilder;
     use crate::dataset::WriteParams;
     use arrow_array::{
         ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, types::Int32Type,
@@ -465,6 +466,10 @@ mod tests {
     }
 
     async fn test_dataset_nested() -> Dataset {
+        test_dataset_nested_at("memory://test").await
+    }
+
+    async fn test_dataset_nested_at(uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new_with_metadata(
             vec![
                 ArrowField::new("id", DataType::Int32, false),
@@ -502,7 +507,7 @@ mod tests {
 
         Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            "memory://test",
+            uri,
             None,
         )
         .await
@@ -1036,5 +1041,68 @@ mod tests {
             .await
             .expect("the repairing delete must not be blocked");
         assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn field_metadata_write_conflict_does_not_retry_a_stale_metadata_plan() {
+        let metadata_first_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let dataset = test_dataset_nested_at(metadata_first_dir.as_str()).await;
+        let base_version = dataset.manifest.version;
+
+        // Metadata commits first: the stale write can safely replan and retry.
+        let mut metadata_first = dataset.clone();
+        metadata_first
+            .update_field_metadata()
+            .update("name", [("definition", "metadata-first")])
+            .unwrap()
+            .await
+            .unwrap();
+        let write_after_metadata = dataset.clone();
+        let write_result = UpdateBuilder::new(Arc::new(write_after_metadata.clone()))
+            .conflict_retries(0)
+            .set("name", "'written'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await;
+        // The public update retry loop reports the resolver's retryable
+        // conflict as exhausted contention. The resolver test asserts the
+        // underlying RetryableCommitConflict variant directly.
+        assert!(
+            matches!(&write_result, Err(Error::TooMuchWriteContention { .. })),
+            "{write_result:?}"
+        );
+        assert_eq!(write_after_metadata.manifest.version, base_version);
+
+        // A write commits first: the stale metadata transaction must not retry
+        // itself because its update values were planned against the old field
+        // definition.
+        let write_first_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let dataset = test_dataset_nested_at(write_first_dir.as_str()).await;
+        let base_version = dataset.manifest.version;
+        let write_result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .conflict_retries(0)
+            .set("name", "'written'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let write_version = write_result.new_dataset.manifest.version;
+        assert!(write_version > base_version);
+
+        let mut metadata_after_write = dataset;
+        let metadata_result = metadata_after_write
+            .update_field_metadata()
+            .update("name", [("definition", "stale")])
+            .unwrap()
+            .await;
+        assert!(
+            matches!(&metadata_result, Err(Error::IncompatibleTransaction { .. })),
+            "{metadata_result:?}"
+        );
+        assert_eq!(metadata_after_write.manifest.version, base_version);
     }
 }

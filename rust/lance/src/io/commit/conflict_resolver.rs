@@ -194,9 +194,10 @@ fn same_logical_index(a: &IndexMetadata, b: &IndexMetadata) -> bool {
 
 /// `id` plus its ancestors and descendants.
 ///
-/// A packed struct or a blob records the parent's id in the data file where a
-/// normal struct records its leaves (`collect_columns` in dataset.rs), so a
-/// write and a metadata change can name either end. Containment runs both ways.
+/// A packed struct or blob is one physical data-file column and records the
+/// container's id, while an ordinary struct records its descendant leaf ids.
+/// A write and a metadata change can therefore name either end, so containment
+/// runs both ways.
 fn field_lineage(schema: &Schema, id: i32) -> HashSet<i32> {
     let mut lineage = HashSet::from([id]);
 
@@ -306,18 +307,8 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
-/// The dataset at `transaction.read_version`; callers may submit through a
-/// handle at any version. A no-op when the caller already resolved it.
-async fn dataset_at_read_version<'d>(
-    dataset: &'d Dataset,
-    transaction: &Transaction,
-) -> Result<Cow<'d, Dataset>> {
-    if transaction.read_version == 0 || dataset.manifest.version == transaction.read_version {
-        return Ok(Cow::Borrowed(dataset));
-    }
-    Ok(Cow::Owned(
-        dataset.checkout_version(transaction.read_version).await?,
-    ))
+fn update_map_changes_metadata(update: &UpdateMap) -> bool {
+    update.replace || !update.update_entries.is_empty()
 }
 
 /// Whether an operation changes schema-level or per-field metadata. A merge
@@ -335,10 +326,10 @@ fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
 
     schema_metadata_updates
         .as_ref()
-        .is_some_and(|update| update.replace || !update.update_entries.is_empty())
+        .is_some_and(update_map_changes_metadata)
         || field_metadata_updates
             .values()
-            .any(|update| update.replace || !update.update_entries.is_empty())
+            .any(update_map_changes_metadata)
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -347,8 +338,15 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
-        let dataset = dataset_at_read_version(dataset, &transaction).await?;
-        let dataset = dataset.as_ref();
+        // Commit and staged-index replay resolve the transaction's read version
+        // before constructing the rebase. Keep that invariant local to field
+        // lineage instead of consulting whichever dataset value the caller had.
+        debug_assert!(
+            transaction.read_version == 0 || dataset.manifest.version == transaction.read_version,
+            "transaction read version {} does not match dataset version {}",
+            transaction.read_version,
+            dataset.manifest.version
+        );
         let read_version_schema = dataset.schema().clone();
 
         match &transaction.operation {
@@ -571,8 +569,7 @@ impl<'a> TransactionRebase<'a> {
     }
 
     /// A field's metadata is part of its definition, so a write and a metadata
-    /// change to a field it produced values for are not independent. Called
-    /// from both sides: commit order decides only which one rebases.
+    /// change to a field it produced values for are not independent.
     fn check_field_metadata(
         &self,
         write: &Operation,
@@ -581,11 +578,28 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         let written = value_producing_fields(write);
-        let redefined = field_metadata_updates.keys().any(|id| {
+        let redefined = field_metadata_updates.iter().find_map(|(id, update)| {
+            if !update_map_changes_metadata(update) {
+                return None;
+            }
             let lineage = field_lineage(&self.read_version_schema, *id);
-            written.iter().any(|field| lineage.contains(field))
+            written
+                .iter()
+                .any(|field| lineage.contains(field))
+                .then_some(*id)
         });
-        if redefined {
+        if let Some(field_id) = redefined {
+            if matches!(self.transaction.operation, Operation::UpdateConfig { .. }) {
+                return Err(Error::incompatible_transaction_source(
+                    format!(
+                        "Field metadata update for field {field_id} was planned before concurrent \
+                         transaction {} at version {other_version} rewrote that field. Re-read \
+                         the field and replan the metadata update.",
+                        other_transaction.operation
+                    )
+                    .into(),
+                ));
+            }
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
         Ok(())
@@ -3446,12 +3460,12 @@ async fn rewrite_reuse_state(
 fn initial_fragments_for_rebase(
     dataset: &Dataset,
     modified_fragment_ids: &HashSet<u64>,
-) -> Result<HashMap<u64, (Fragment, bool)>> {
+) -> HashMap<u64, (Fragment, bool)> {
     if modified_fragment_ids.is_empty() {
-        return Ok(HashMap::new());
+        return HashMap::new();
     }
 
-    Ok(dataset
+    dataset
         .fragments()
         .iter()
         .filter(|fragment| {
@@ -3459,7 +3473,7 @@ fn initial_fragments_for_rebase(
             modified_fragment_ids.contains(&fragment.id)
         })
         .map(|fragment| (fragment.id, (fragment.clone(), false)))
-        .collect())
+        .collect()
 }
 
 /// Read a fragment's deletion vector as a bitmap of physical offsets, or an
@@ -3655,7 +3669,7 @@ mod tests {
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
-    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup, UpdateMap};
+    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
     use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
     use crate::{
@@ -3805,25 +3819,30 @@ mod tests {
         }
     }
 
-    /// Whether `ours` retryably conflicts with `other` under `schema`.
-    fn conflicts(
+    /// The conflict returned when `ours` rebases against `other`.
+    fn conflict_result(
         ours: &Operation,
         other: &Operation,
         schema: &lance_core::datatypes::Schema,
-    ) -> bool {
+    ) -> Result<()> {
         let mut rebase = TransactionRebase {
             transaction: Transaction::new(0, ours.clone(), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(ours).collect::<HashSet<_>>(),
             affected_rows: None,
-            conflicting_frag_reuse_indices: Vec::new(),
+            frag_reuse_base: None,
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            current_lineage: None,
+            current_live: None,
+            untagged_reuse: None,
+            current_schema: None,
+            read_fragments: None,
+            read_schema: None,
+            reuse: Default::default(),
+            staged_replay: false,
             read_version_schema: schema.clone(),
         };
-        matches!(
-            rebase.check_txn(&Transaction::new(0, other.clone(), None), 1),
-            Err(Error::RetryableCommitConflict { .. })
-        )
+        rebase.check_txn(&Transaction::new(0, other.clone(), None), 1)
     }
 
     async fn test_dataset(num_rows: usize, num_fragments: usize) -> Dataset {
@@ -5722,6 +5741,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -5932,6 +5952,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Default::default(),
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5996,6 +6017,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Default::default(),
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -6025,6 +6047,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -6214,6 +6237,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -6265,6 +6289,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -6317,6 +6342,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -6487,6 +6513,7 @@ mod tests {
                 reuse: Default::default(),
 
                 staged_replay: false,
+                read_version_schema: Default::default(),
             };
             // Disjoint from the rewritten fragment, so this only exercises the
             // stable-row-ids check and not the group-straddling check below it.
@@ -6902,8 +6929,20 @@ mod tests {
         metadata: &Operation,
         schema: &lance_core::datatypes::Schema,
     ) {
-        assert!(conflicts(write, metadata, schema), "{write}, {metadata}");
-        assert!(conflicts(metadata, write, schema), "{metadata}, {write}");
+        assert!(
+            matches!(
+                conflict_result(write, metadata, schema),
+                Err(Error::RetryableCommitConflict { .. })
+            ),
+            "{write}, {metadata}"
+        );
+        assert!(
+            matches!(
+                conflict_result(metadata, write, schema),
+                Err(Error::IncompatibleTransaction { .. })
+            ),
+            "{metadata}, {write}"
+        );
     }
 
     /// Asserts the pair is independent in both commit orders.
@@ -6912,8 +6951,14 @@ mod tests {
         metadata: &Operation,
         schema: &lance_core::datatypes::Schema,
     ) {
-        assert!(!conflicts(write, metadata, schema), "{write}, {metadata}");
-        assert!(!conflicts(metadata, write, schema), "{metadata}, {write}");
+        assert!(
+            conflict_result(write, metadata, schema).is_ok(),
+            "{write}, {metadata}"
+        );
+        assert!(
+            conflict_result(metadata, write, schema).is_ok(),
+            "{metadata}, {write}"
+        );
     }
 
     /// Every shape of write that produces values for `fields`.
@@ -6948,6 +6993,49 @@ mod tests {
         for write in writes_of(&[a_st]) {
             assert_conflicts_both_ways(&write, &metadata_on(a_leaves[0]), &schema);
         }
+
+        // Blob children have field ids, but the file records the blob's parent
+        // id as its physical column. Metadata on a child must still conflict.
+        let blob_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]))
+        .unwrap();
+        let blob = field_id(&blob_schema, "blob");
+        let blob_child = blob_schema.field("blob").unwrap().children[0].id;
+        for write in writes_of(&[blob]) {
+            assert_conflicts_both_ways(&write, &metadata_on(blob_child), &blob_schema);
+        }
+
+        // A merge UpdateMap with no entries is a no-op. Replacing metadata with
+        // an empty map is still an effective clear and must conflict.
+        let no_op_merge = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                scalar,
+                UpdateMap {
+                    update_entries: vec![],
+                    replace: false,
+                },
+            )]),
+        };
+        assert_rebases_past(&update_rewriting(&[scalar]), &no_op_merge, &schema);
+
+        let clear = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                scalar,
+                UpdateMap {
+                    update_entries: vec![],
+                    replace: true,
+                },
+            )]),
+        };
+        assert_conflicts_both_ways(&update_rewriting(&[scalar]), &clear, &schema);
     }
 
     /// `commit_transaction` resolves the transaction's read version before
