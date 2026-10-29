@@ -133,6 +133,8 @@ impl AddIndexSegment {
             created_at: self.created_at,
             base_id,
             files: (!self.files.is_empty()).then(|| self.files.clone()),
+            clustering_id: None,
+            metadata: Default::default(),
         };
         // Belt and braces: `lower_covering` builds the legacy form by
         // construction, so a failure here means the two have drifted apart.
