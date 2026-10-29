@@ -36,6 +36,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
     )
 }
 
+/// Run the merge insert `jparam` describes, reading the source from the Arrow
+/// stream at `batch_address`.
 #[allow(clippy::too_many_arguments)]
 fn inner_merge_insert<'local>(
     env: &mut JNIEnv<'local>,

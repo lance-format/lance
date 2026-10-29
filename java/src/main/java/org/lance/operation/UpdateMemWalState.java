@@ -27,6 +27,7 @@ public final class UpdateMemWalState implements Operation {
   private final List<CompactedSsTable> compactedSstables;
   private final String dirId;
 
+  /** Throws {@link NullPointerException} if either argument is null. */
   private UpdateMemWalState(List<CompactedSsTable> compactedSstables, String dirId) {
     this.compactedSstables = Objects.requireNonNull(compactedSstables);
     this.dirId = Objects.requireNonNull(dirId);
@@ -95,15 +96,16 @@ public final class UpdateMemWalState implements Operation {
     }
 
     /**
-     * Set the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL this update was built for;
-     * defaults to empty, a MemWAL without one. The commit fails unless the table still carries that
-     * MemWAL, even when no SSTables are recorded.
+     * Set the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL this update was built for
+     * (default empty). The commit fails unless the table still carries that MemWAL, even with no
+     * SSTables.
      */
     public Builder dirId(String dirId) {
       this.dirId = dirId;
       return this;
     }
 
+    /** Build the {@link UpdateMemWalState}. */
     public UpdateMemWalState build() {
       return new UpdateMemWalState(compactedSstables, dirId);
     }

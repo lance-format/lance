@@ -146,8 +146,7 @@ impl LsmDataSourceCollector {
     }
 
     /// Set the MemWAL `dir_id` the snapshots' SSTables live under. Defaults to
-    /// empty, the legacy `_mem_wal`; a MemWAL with a `dir_id` must set it, or
-    /// its SSTables resolve to a directory that holds none of them.
+    /// empty (legacy `_mem_wal`); without it a `dir_id` MemWAL's SSTables won't resolve.
     pub fn with_mem_wal_dir_id(mut self, dir_id: impl Into<String>) -> Self {
         self.dir_id = dir_id.into();
         self

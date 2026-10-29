@@ -888,6 +888,7 @@ pub(crate) fn convert_to_java_operation<'local>(
     Ok(operation)
 }
 
+/// Convert a Rust [`Operation`] to its `org.lance.operation` Java object.
 fn convert_to_java_operation_inner<'local>(
     env: &mut JNIEnv<'local>,
     operation: Operation,
@@ -1758,6 +1759,7 @@ impl FieldExt for Field {
     }
 }
 
+/// Convert an `org.lance.operation` Java object to a Rust [`Operation`].
 fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,

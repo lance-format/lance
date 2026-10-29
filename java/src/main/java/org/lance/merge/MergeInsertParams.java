@@ -327,6 +327,7 @@ public class MergeInsertParams {
     return compactedSstables;
   }
 
+  /** The {@code dirId} passed to {@link #markSstablesAsCompacted(String, List)}, if any. */
   public Optional<String> getMemWalDirId() {
     return memWalDirId;
   }

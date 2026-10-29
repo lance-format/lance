@@ -122,6 +122,7 @@ public class Update implements Operation {
     return memWalDirId;
   }
 
+  /** Same as {@link #memWalDirId()}; the getter the JNI layer reads. */
   public Optional<String> getMemWalDirId() {
     return memWalDirId;
   }
@@ -293,8 +294,8 @@ public class Update implements Operation {
 
     /**
      * Set the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL the {@link
-     * #compactedSstables(List) compacted SSTables} belong to. Required when they are non-empty; the
-     * commit fails if the table's MemWAL has since been disabled or replaced.
+     * #compactedSstables(List) compacted SSTables} belong to; required when they are non-empty. The
+     * commit fails if that MemWAL has since been disabled or replaced.
      */
     public Builder memWalDirId(String memWalDirId) {
       this.memWalDirId = memWalDirId;
@@ -306,6 +307,7 @@ public class Update implements Operation {
       return this;
     }
 
+    /** Build the {@link Update}. */
     public Update build() {
       return new Update(
           removedFragmentIds,

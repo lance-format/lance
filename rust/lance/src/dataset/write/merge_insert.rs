@@ -1110,10 +1110,9 @@ impl MergeInsertBuilder {
     /// process then died before the matching upsert, the recorded generation
     /// would claim rows were copied in that never were.
     ///
-    /// `dir_id` names the MemWAL the SSTables belong to. The commit fails with
-    /// [`Error::StaleMemWal`] if the table's
-    /// MemWAL has since been disabled or replaced. Pass an empty `sstables` on
-    /// the passes that record no progress, so they are checked too.
+    /// `dir_id` names the MemWAL the SSTables belong to; the commit fails with
+    /// [`Error::StaleMemWal`] if it was since disabled or replaced. Pass an
+    /// empty `sstables` on passes that record no progress so they are checked too.
     pub fn mark_sstables_as_compacted(
         &mut self,
         dir_id: impl Into<String>,
@@ -3578,6 +3577,8 @@ impl MergeInsertJob {
             ))
     }
 
+    /// Build the uncommitted merge-insert transaction, using the v2 plan when
+    /// it supports the source and the legacy path otherwise.
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,

@@ -699,6 +699,7 @@ impl UpdateJob {
         Ok(())
     }
 
+    /// Commit `update_data` against `dataset` as an `Update` transaction.
     async fn commit_impl(
         &self,
         dataset: Arc<Dataset>,

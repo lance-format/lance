@@ -281,10 +281,8 @@ impl Transaction {
         by_name
     }
 
-    /// Checks a `CreateIndex` that writes the MemWAL index against the manifest
-    /// it builds on. A rewrite (it removes the old MemWAL index) must find the
-    /// same `dir_id`; an initialization must find no MemWAL index, so two
-    /// concurrent initializations cannot both commit.
+    /// Checks a `CreateIndex` writing the MemWAL index: a rewrite must keep the
+    /// current `dir_id`; an initialization must find no MemWAL index.
     fn check_mem_wal_create_index(
         indices: &[IndexMetadata],
         new_indices: &[IndexMetadata],
@@ -1145,9 +1143,8 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
-                // Checked whenever named, not only with progress: a compaction
-                // commits in chunks and only the last records progress, so an
-                // earlier chunk from a replaced MemWAL must be refused too.
+                // Checked even without progress: only a compaction's last chunk
+                // records any, and earlier chunks must be refused too.
                 if let Some(dir_id) = mem_wal_dir_id {
                     check_mem_wal_dir_id(&final_indices, dir_id)?;
                 }

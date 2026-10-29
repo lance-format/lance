@@ -73,9 +73,8 @@ pub struct ShardWriterConfig {
     /// Unique identifier for this shard (UUID v4).
     pub shard_id: Uuid,
 
-    /// The MemWAL's `dir_id`, read from the MemWAL index: every WAL entry,
-    /// shard manifest and generation this writer touches lives under its
-    /// directory. Empty for the legacy `_mem_wal`.
+    /// The MemWAL's `dir_id`; this writer's WAL, manifests, and generations live
+    /// under its directory. Empty for the legacy `_mem_wal`.
     pub dir_id: String,
 
     /// Shard spec ID this shard was created with.
@@ -2263,6 +2262,9 @@ impl SharedWriterState {
         }
     }
 
+    /// Write the batches' blob payloads into the memtable's generation; batches
+    /// pass through untouched when it has no data target. The flag is true when
+    /// the payloads sit in the generation's shared pack, which the WAL flush finishes.
     async fn prepare_batches(
         &self,
         memtable: &MemTable,
@@ -2802,6 +2804,7 @@ impl ShardWriter {
         .await
     }
 
+    /// Body of [`Self::open`].
     async fn open_inner(
         object_store: Arc<ObjectStore>,
         base_path: Path,

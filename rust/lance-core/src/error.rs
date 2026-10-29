@@ -423,10 +423,8 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
-    /// A MemWAL commit was built for a MemWAL that is no longer current: the
-    /// manifest it builds on has no MemWAL index, or one with another
-    /// `dir_id`. Never retryable; the MemWAL it belongs to was disabled or
-    /// replaced. Match via [`Error::is_stale_mem_wal`].
+    /// A MemWAL commit names a `dir_id` the manifest it builds on no longer
+    /// carries. Never retryable. Match via [`Error::is_stale_mem_wal`].
     #[snafu(display("Stale MemWAL: {message}, {location}"))]
     StaleMemWal {
         message: String,

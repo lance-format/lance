@@ -1433,12 +1433,12 @@ impl WalAppender {
         }
     }
 
+    /// Find the next free WAL position: probe forward from the manifest's
+    /// hint, falling back to a full listing.
     async fn discover_next_position(&self) -> Result<u64> {
         if let Ok(Some(manifest)) = self.manifest_store.latest().await {
-            // `last_seen` is a best-effort hint that can lag `replay_after`, and
-            // entries below `replay_after` may already be GC'd. Probing from a
-            // hole there would put a fence sentinel below the real tip, where it
-            // fences no one; entries from `replay_after` up are never deleted.
+            // `last_seen` can lag `replay_after`, below which entries may be
+            // GC'd; probing from such a hole would fence below the real tip.
             let hint = manifest
                 .wal_entry_position_last_seen
                 .max(manifest.replay_after_wal_entry_position);
@@ -1457,14 +1457,11 @@ impl WalAppender {
     }
 }
 
-/// Fence the writer holding `shard_id` below `writer_epoch`, without opening a
-/// writer. Writes a fence sentinel at the WAL tip, so that writer's next append
-/// collides on PUT-IF-NOT-EXISTS and fails as fenced. If a live append takes
-/// the tip first, the sentinel lands one past it. Returns the sentinel's
-/// position.
+/// Fence the writer holding `shard_id` below `writer_epoch` without opening a
+/// writer: writes a sentinel at the WAL tip (past it if a live append wins), so
+/// that writer's next PUT-IF-NOT-EXISTS fails. Returns the sentinel's position.
 ///
-/// The caller must already have raised the shard manifest's epoch to
-/// `writer_epoch` (by a claim or a seal), so the fenced writer cannot reclaim.
+/// The caller must already have raised the manifest epoch to `writer_epoch`.
 pub async fn fence_shard(
     object_store: Arc<ObjectStore>,
     base_path: &Path,

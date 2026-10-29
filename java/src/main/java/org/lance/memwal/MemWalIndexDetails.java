@@ -28,6 +28,7 @@ public class MemWalIndexDetails {
   private final List<ShardingSpec> shardingSpecs;
   private final String dirId;
 
+  /** Null collections and a null {@code dirId} are stored as empty. */
   public MemWalIndexDetails(
       long numShards,
       List<String> maintainedIndexes,
@@ -79,8 +80,8 @@ public class MemWalIndexDetails {
   }
 
   /**
-   * Identifies this MemWAL incarnation and names its storage directory; empty for a MemWAL
-   * initialized without one. Commits that record MemWAL compaction progress must name it.
+   * Names this MemWAL incarnation's storage directory; empty for a legacy MemWAL. Commits recording
+   * compaction progress must name it.
    */
   public String dirId() {
     return dirId;

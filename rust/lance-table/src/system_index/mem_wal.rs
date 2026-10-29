@@ -425,10 +425,9 @@ pub struct MemWalIndexDetails {
     /// an individual writer may still override any value at runtime in its
     /// own (non-persisted) `ShardWriterConfig`.
     pub writer_config_defaults: HashMap<String, String>,
-    /// Names this MemWAL's storage directory (`_{dir_id}_mem_wal/`); empty is
-    /// the legacy `_mem_wal/`. Minted once per initialization and never
-    /// reused, so it identifies one MemWAL incarnation. The index UUID does
-    /// not: every rewrite of this index mints a new one.
+    /// Names this MemWAL's storage directory (`_{dir_id}_mem_wal/`; empty is
+    /// the legacy `_mem_wal/`). Minted once per initialization, so unlike the
+    /// index UUID, which every rewrite re-mints, it identifies one incarnation.
     pub dir_id: String,
 }
 
@@ -541,13 +540,8 @@ pub fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex>> {
     )?)))
 }
 
-/// Rejects a MemWAL commit built for the MemWAL `dir_id` unless `indices`, the
-/// manifest it builds on, carries that MemWAL.
-///
-/// Runs in manifest build rather than only in the conflict resolver, so a
-/// commit built directly on a HEAD that no longer has the MemWAL is rejected
-/// as surely as one rebased over its removal. A late writer from a disabled
-/// or replaced MemWAL therefore cannot record its progress into another one.
+/// Rejects with [`Error::StaleMemWal`] unless `indices` carries the MemWAL
+/// `dir_id`. Runs at manifest build, so it also catches commits that never rebase.
 pub fn check_mem_wal_dir_id(indices: &[IndexMetadata], dir_id: &str) -> Result<()> {
     let Some(index) = indices.iter().find(|idx| idx.name == MEM_WAL_INDEX_NAME) else {
         return Err(Error::stale_mem_wal(format!(

@@ -164,8 +164,7 @@ pub fn mem_wal_dir_name(dir_id: &str) -> String {
     }
 }
 
-/// Mint a `dir_id` for a new MemWAL: 8 hex characters, hashed the way the
-/// directory namespace names table locations. Callers re-mint on collision.
+/// Mint a random 8-hex-character `dir_id`; callers re-mint on collision.
 pub(crate) fn generate_mem_wal_dir_id(base_uri: &str) -> String {
     use std::hash::{DefaultHasher, Hash, Hasher};
 

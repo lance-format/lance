@@ -129,6 +129,7 @@ impl FlushedSize {
 const TRAINING_BATCH_SIZE: usize = 8192;
 
 impl MemTableFlusher {
+    /// Create a flusher writing `shard_id`'s generations under the MemWAL `dir_id`.
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_path: Path,
@@ -233,6 +234,8 @@ impl MemTableFlusher {
         }
     }
 
+    /// The generation's folder name, path, and reserved data file name (`None`
+    /// when no target was reserved). Errors if the target is for another generation.
     fn generation_target(&self, memtable: &MemTable) -> Result<(String, Path, Option<String>)> {
         let generation = memtable.generation();
         if let Some(target) = memtable.target() {

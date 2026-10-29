@@ -648,9 +648,8 @@ message ShardManifest {
    */
   ShardStatus status = 15;
 
-  /* The operation holding the seal, set with status SEALED and cleared on
-   * unseal. Lets whoever finds the seal identify its holder and tell when it
-   * expires.
+  /* The operation holding the seal; set with status SEALED, cleared on
+   * unseal. Identifies the holder and when it sealed.
    */
   optional SealedBy sealed_by = 16;
 }
@@ -834,13 +833,12 @@ message MemWalIndexDetails {
   map<string, string> writer_config_defaults = 11;
 
   /* Names this MemWAL's storage directory, `_{dir_id}_mem_wal/` under the
-   * table's base path. Minted when the MemWAL is initialized and carried
-   * unchanged through every rewrite of this index, so a MemWAL initialized
-   * again after removal shares no storage with an earlier one. Empty means
-   * the legacy `_mem_wal/` directory.
+   * table's base path; empty means the legacy `_mem_wal/`. Minted at
+   * initialization and kept across rewrites of this index, so a
+   * re-initialized MemWAL shares no storage with an earlier one.
    *
-   * Commits that change MemWAL state name the dir_id they were built for and
-   * are rejected when the index they build on carries another one, or none.
+   * Commits that change MemWAL state name their dir_id and are rejected when
+   * the index they build on carries another one, or none.
    */
   string dir_id = 13;
 }

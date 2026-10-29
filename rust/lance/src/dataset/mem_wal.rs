@@ -34,18 +34,14 @@
 //!
 //! ## MemWAL Directory
 //!
-//! Each initialization mints a `dir_id` into the MemWAL index, and all of that
-//! MemWAL's storage lives under `{base}/_{dir_id}_mem_wal/` (the legacy
-//! `_mem_wal/` when it is empty). A MemWAL initialized again after removal
-//! never shares paths or epochs with an earlier one.
+//! Each initialization mints a `dir_id`, and that MemWAL's storage lives under
+//! `{base}/_{dir_id}_mem_wal/` (legacy `_mem_wal/` when empty), so a
+//! re-initialized MemWAL never shares paths or epochs with an earlier one.
 //!
-//! Every commit that changes MemWAL state names the `dir_id` it was built for:
-//! `UpdateMemWalState`, an `Update` recording `compacted_sstables`, and a
-//! `CreateIndex` rewriting the MemWAL index. Building the manifest rejects it
-//! with [`lance_core::Error::StaleMemWal`] when the manifest it builds on has no
-//! MemWAL index or one with another `dir_id`, whether or not the commit rebased.
-//! A writer that outlives the removal or replacement of its MemWAL therefore
-//! cannot record its progress into another one.
+//! Commits that change MemWAL state (`UpdateMemWalState`, an `Update` with
+//! `compacted_sstables`, a `CreateIndex` rewriting the MemWAL index) name their
+//! `dir_id`; manifest build rejects them with [`lance_core::Error::StaleMemWal`]
+//! when the manifest carries no MemWAL or another one.
 
 mod api;
 mod hnsw;
@@ -118,6 +114,7 @@ impl MemTableDataTarget {
         }
     }
 
+    /// Directory of this target's generation in the MemWAL `dir_id`.
     pub fn generation_path(&self, base_path: &Path, dir_id: &str, shard_id: &Uuid) -> Path {
         shard_base_path(base_path, dir_id, shard_id).join(self.generation_dir.as_str())
     }

@@ -296,6 +296,8 @@ pub extern "system" fn Java_org_lance_memwal_ShardWriter_nativeLsmScanner<'local
     )
 }
 
+/// Build an LSM scanner over `shard_snapshots` plus this writer's own snapshot
+/// and in-memory memtables.
 fn inner_writer_lsm_scanner<'local>(
     env: &mut JNIEnv<'local>,
     this: JObject<'local>,
@@ -365,6 +367,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmScanner_createFromSnapshots<'loc
     )
 }
 
+/// Build an LSM scanner over `dataset` and `shard_snapshots`.
 fn inner_lsm_scanner_from_snapshots<'local>(
     env: &mut JNIEnv<'local>,
     dataset: JObject<'local>,
@@ -382,8 +385,7 @@ fn inner_lsm_scanner_from_snapshots<'local>(
     attach_lsm_scanner(env, scanner)
 }
 
-/// The `dir_id` of the dataset's MemWAL, which its SSTables live under; empty
-/// when the dataset has no MemWAL.
+/// The dataset's MemWAL `dir_id`; empty when it has no MemWAL.
 fn mem_wal_dir_id(dataset: &LanceDataset) -> Result<String> {
     let details = block_on(dataset.mem_wal_index_details())?;
     Ok(details.map(|details| details.dir_id).unwrap_or_default())
@@ -765,6 +767,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmPointLookupPlanner_nativeCreate(
     );
 }
 
+/// Build a point-lookup planner over `shard_snapshots` and attach it to `this`.
 fn inner_create_lookup_planner(
     env: &mut JNIEnv,
     this: JObject,
@@ -882,6 +885,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmVectorSearchPlanner_nativeCreate
     );
 }
 
+/// Build a vector-search planner over `shard_snapshots` and attach it to `this`.
 #[allow(clippy::too_many_arguments)]
 fn inner_create_vector_planner(
     env: &mut JNIEnv,
@@ -1422,6 +1426,7 @@ fn box_u64_opt<'a>(env: &mut JNIEnv<'a>, value: Option<usize>) -> Result<JObject
     }
 }
 
+/// Convert `details` to a Java `MemWalIndexDetails`.
 fn index_details_to_java<'a>(
     env: &mut JNIEnv<'a>,
     details: &MemWalIndexDetails,

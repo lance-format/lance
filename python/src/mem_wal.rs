@@ -935,8 +935,7 @@ impl PyLsmVectorSearchPlanner {
     }
 }
 
-/// The `dir_id` of the dataset's MemWAL, which its SSTables live under; empty
-/// when the dataset has no MemWAL.
+/// The dataset's MemWAL `dir_id`; empty when it has no MemWAL.
 fn mem_wal_dir_id(ds: &Arc<LanceDataset>) -> PyResult<String> {
     let ds = ds.clone();
     let details = rt()
