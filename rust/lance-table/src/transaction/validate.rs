@@ -9,6 +9,7 @@
 
 use crate::format::{Fragment, Manifest};
 use crate::io::deletion::relative_deletion_file_path;
+use crate::transaction::action::Action;
 use crate::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
@@ -621,6 +622,20 @@ pub fn validate_detached_non_reusable_field_ids(
         | Operation::Restore { .. } => Err(Error::invalid_input(
             "Detached commits cannot change schema after non-reusable field IDs are activated",
         )),
+        // Only AddField allocates an id. A detached manifest advances its own
+        // watermark, which cannot keep ids unique against the main line.
+        // TODO: reserve field ids on main, as ReserveFragmentIds does for
+        // fragments, so a detached AddField can be supported.
+        Operation::CompositeOperation(composite)
+            if composite
+                .iter_actions()
+                .any(|action| matches!(action, Action::AddField(_))) =>
+        {
+            Err(Error::invalid_input(
+                "Detached commits cannot AddField after non-reusable field IDs are activated; \
+                 reserving field ids on the main line is the planned path",
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -644,7 +659,7 @@ fn overwrite_fragments_valid(fragments: &[Fragment]) -> Result<()> {
     Ok(())
 }
 
-fn schema_fragments_valid(
+pub fn schema_fragments_valid(
     manifest: Option<&Manifest>,
     schema: &Schema,
     fragments: &[Fragment],
@@ -1118,6 +1133,9 @@ mod tests {
     use super::*;
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{DataFile, DataStorageFormat};
+    use crate::transaction::action::{
+        AddField, AlterField, CompositeOperation, DropField, FieldRef, SetDeletionFile, UserStep,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use roaring::RoaringBitmap;
@@ -2100,6 +2118,58 @@ mod tests {
                 .contains("Detached commits cannot change schema"),
             "{err}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::add_field(
+        Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: LanceCoreField::try_from(ArrowField::new("detached", DataType::Int32, true))
+                .unwrap(),
+        }),
+        false
+    )]
+    #[case::rename(
+        Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: Some("renamed".into()),
+            nullable: None,
+        }),
+        true
+    )]
+    #[case::drop_field(Action::DropField(DropField { field: FieldRef::Committed(0) }), true)]
+    #[case::data_only(
+        Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: None,
+            data_change: true,
+            base: None,
+        }),
+        true
+    )]
+    #[test]
+    fn detached_composite_may_not_allocate_field_ids_once_non_reusable(
+        #[case] action: Action,
+        #[case] allowed: bool,
+    ) {
+        let manifest = activated_manifest();
+        let operation =
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step",
+                vec![action],
+            )]));
+
+        let result = validate_detached_non_reusable_field_ids(&manifest, &operation);
+
+        if allowed {
+            result.unwrap();
+        } else {
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("AddField"), "{err}");
+            assert!(err.to_string().contains("Detached"), "{err}");
+            assert!(err.to_string().contains("reserving field ids"), "{err}");
+        }
     }
 
     #[rstest::rstest]
