@@ -720,6 +720,11 @@ def test_tag(tmp_path: Path):
 
     assert len(ds.tags.list()) == 0
 
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag1 does not exist"
+    ):
+        ds.tags.get("tag1")
+
     with pytest.raises(ValueError):
         ds.tags.create("tag1", 3)
 
@@ -728,7 +733,11 @@ def test_tag(tmp_path: Path):
 
     ds.tags.create("tag1", 1)
     ds.tags.replace_metadata("tag1", {"description": "first tag"})
-    tag1_meta = ds.tags.list()["tag1"]
+    tag1_meta = ds.tags.get("tag1")
+    assert tag1_meta == ds.tags.list()["tag1"]
+    assert tag1_meta["version"] == 1
+    assert tag1_meta["branch"] is None
+    assert tag1_meta["manifest_size"] > 0
     assert tag1_meta["created_at"] is not None
     assert isinstance(tag1_meta["created_at"], datetime)
     assert tag1_meta["updated_at"] is not None
@@ -746,6 +755,7 @@ def test_tag(tmp_path: Path):
     ds.tags.create("tag2", 1)
 
     assert len(ds.tags.list()) == 2
+    assert ds.tags.get("tag1")["metadata"] == {}
 
     with pytest.raises(OSError):
         ds.checkout_version("tag3")
@@ -769,7 +779,7 @@ def test_tag(tmp_path: Path):
     ):
         ds.tags.update("tag3", 1)
 
-    tag1_meta = ds.tags.list()["tag1"]
+    tag1_meta = ds.tags.get("tag1")
     tag1_created_at = tag1_meta["created_at"]
     tag1_updated_at = tag1_meta["updated_at"]
     assert tag1_created_at is not None
@@ -777,17 +787,19 @@ def test_tag(tmp_path: Path):
     ds.tags.replace_metadata("tag1", {"description": "updated tag"})
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
-    replaced_tag1_meta = ds.tags.list()["tag1"]
+    replaced_tag1_meta = ds.tags.get("tag1")
     assert replaced_tag1_meta["metadata"] == {"description": "updated tag"}
     assert replaced_tag1_meta["updated_at"] == tag1_updated_at
 
     ds.tags.replace_metadata("tag1", {"owner": "ml-team"})
-    replaced_again_tag1_meta = ds.tags.list()["tag1"]
+    replaced_again_tag1_meta = ds.tags.get("tag1")
     assert replaced_again_tag1_meta["metadata"] == {"owner": "ml-team"}
     assert replaced_again_tag1_meta["updated_at"] == tag1_updated_at
 
     ds.tags.update("tag1", 2)
-    updated_tag1_meta = ds.tags.list()["tag1"]
+    updated_tag1_meta = ds.tags.get("tag1")
+    assert updated_tag1_meta["version"] == 2
+    assert updated_tag1_meta["branch"] is None
     assert updated_tag1_meta["created_at"] == tag1_created_at
     assert updated_tag1_meta["updated_at"] is not None
     assert updated_tag1_meta["updated_at"] >= tag1_updated_at
@@ -810,7 +822,9 @@ def test_tag(tmp_path: Path):
 
     ds.create_branch("branch", "tag1")
     ds.tags.create("tag3", ("branch", None))
-    target_tag = ds.tags.list().get("tag3")
+    target_tag = ds.tags.get("tag3")
+    assert target_tag == ds.tags.list()["tag3"]
+    assert ds.checkout_version(("branch", 1)).tags.get("tag3") == target_tag
     assert ds.tags.get_version("tag3") == 1
     assert len(ds.tags.list()) == 3
     assert target_tag is not None
@@ -818,7 +832,7 @@ def test_tag(tmp_path: Path):
     assert target_tag["branch"] == "branch"
 
     ds.tags.update("tag3", (None, 2))
-    target_tag = ds.tags.list()["tag3"]
+    target_tag = ds.tags.get("tag3")
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
     assert target_tag["version"] == 2
@@ -826,7 +840,7 @@ def test_tag(tmp_path: Path):
 
     ds.create_branch("branch2", 2)
     ds.tags.update("tag3", ("branch2", 2))
-    target_tag = ds.tags.list()["tag3"]
+    target_tag = ds.tags.get("tag3")
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
     assert target_tag["version"] == 2
@@ -834,6 +848,19 @@ def test_tag(tmp_path: Path):
 
     ds.tags.delete("tag3")
     assert len(ds.tags.list()) == 2
+
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag3 does not exist"
+    ):
+        ds.tags.get("tag3")
+
+
+@pytest.mark.parametrize("tag", ["", "invalid/tag", ".invalid"])
+def test_tag_get_invalid_name(tmp_path: Path, tag: str):
+    ds = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
+
+    with pytest.raises(ValueError, match="Ref is invalid"):
+        ds.tags.get(tag)
 
 
 def test_tag_order(tmp_path: Path):
