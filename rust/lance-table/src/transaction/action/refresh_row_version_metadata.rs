@@ -104,7 +104,9 @@ mod tests {
     use super::*;
     use crate::format::{DataFile, Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
-    use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
+    use crate::transaction::action::test_support::{
+        apply, backed_manifest, footprint, one_column_file,
+    };
     use crate::transaction::action::{
         Action, AddDataFile, AddFragment, FieldRef, Ref, RemoveFragment, TombstoneFieldData,
     };
@@ -258,7 +260,7 @@ mod tests {
         }
         actions.push(Action::AddDataFile(AddDataFile {
             fragment,
-            file: DataFile::new_unstarted("data/rewritten.lance", ConcreteFileVersion::V2_0),
+            file: one_column_file("data/rewritten.lance"),
             field_ids: vec![FieldRef::Committed(0)],
             data_change,
             base: None,
