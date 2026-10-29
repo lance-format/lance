@@ -73,6 +73,10 @@ pub struct ShardWriterConfig {
     /// Unique identifier for this shard (UUID v4).
     pub shard_id: Uuid,
 
+    /// The MemWAL's `dir_id`; this writer's WAL, manifests, and generations live
+    /// under its directory. Empty for the legacy `_mem_wal`.
+    pub dir_id: String,
+
     /// Shard spec ID this shard was created with.
     /// A value of 0 indicates a manually-created shard not governed by any spec.
     pub shard_spec_id: u32,
@@ -278,6 +282,7 @@ impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
             shard_id: Uuid::new_v4(),
+            dir_id: String::new(),
             shard_spec_id: 0,
             durable_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
@@ -1475,6 +1480,7 @@ struct ReplayResult {
 async fn replay_memtable_from_wal(
     object_store: Arc<ObjectStore>,
     base_path: Path,
+    dir_id: &str,
     shard_id: Uuid,
     our_epoch: u64,
     manifest: &ShardManifest,
@@ -1500,7 +1506,7 @@ async fn replay_memtable_from_wal(
     // contents into the base table.
     let start_position = manifest.replay_after_wal_entry_position.saturating_add(1);
 
-    let tailer = WalTailer::new(object_store, base_path, shard_id);
+    let tailer = WalTailer::new(object_store, base_path, dir_id, shard_id);
     let mut position = start_position;
 
     let mut active = make_memtable(base_generation, 0, None)?;
@@ -2256,6 +2262,9 @@ impl SharedWriterState {
         }
     }
 
+    /// Write the batches' blob payloads into the memtable's generation; batches
+    /// pass through untouched when it has no data target. The flag is true when
+    /// the payloads sit in the generation's shared pack, which the WAL flush finishes.
     async fn prepare_batches(
         &self,
         memtable: &MemTable,
@@ -2267,7 +2276,7 @@ impl SharedWriterState {
         };
         let logical_schema = Schema::try_from(schema.storage.as_ref())?;
         let data_dir = target
-            .generation_path(&self.base_path, &self.shard_id)
+            .generation_path(&self.base_path, &self.config.dir_id, &self.shard_id)
             .join(DATA_DIR);
         let source_store_registry = self
             .config
@@ -2795,6 +2804,7 @@ impl ShardWriter {
         .await
     }
 
+    /// Body of [`Self::open`].
     async fn open_inner(
         object_store: Arc<ObjectStore>,
         base_path: Path,
@@ -2829,6 +2839,7 @@ impl ShardWriter {
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
             &base_path,
+            &config.dir_id,
             shard_id,
             config.manifest_scan_batch_size,
         ));
@@ -2928,6 +2939,7 @@ impl ShardWriter {
         let wal_appender = Arc::new(WalAppender::with_claimed_epoch(
             object_store.clone(),
             base_path.clone(),
+            &config.dir_id,
             shard_id,
             manifest_store.clone(),
             epoch,
@@ -3047,6 +3059,7 @@ impl ShardWriter {
                 object_store.clone(),
                 base_path.clone(),
                 base_uri.clone(),
+                config.dir_id.clone(),
                 shard_id,
                 manifest_store.clone(),
             )
@@ -3068,6 +3081,7 @@ impl ShardWriter {
         } = replay_memtable_from_wal(
             object_store.clone(),
             base_path.clone(),
+            &config.dir_id,
             shard_id,
             epoch,
             manifest,
@@ -3163,6 +3177,7 @@ impl ShardWriter {
                 object_store.clone(),
                 base_path.clone(),
                 base_uri,
+                config.dir_id.clone(),
                 shard_id,
                 manifest_store,
             )
@@ -5622,13 +5637,15 @@ mod tests {
         second_watcher.wait().await.unwrap();
         fence.wait().await.unwrap();
 
-        let tailer = WalTailer::new(store.clone(), base_path.clone(), shard_id);
+        let tailer = WalTailer::new(store.clone(), base_path.clone(), "", shard_id);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.batches.len(), 2);
         assert!(tailer.read_entry(2).await.unwrap().is_none());
 
         let target = entry.target.unwrap();
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
         assert_eq!(sidecars.len(), 1, "both puts must share one packed object");
         let payload = store
@@ -5684,7 +5701,7 @@ mod tests {
 
         let mut watcher = watcher.unwrap();
         assert!(watcher.wait().await.is_err());
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert!(tailer.read_entry(1).await.unwrap().is_none());
     }
 
@@ -5730,7 +5747,7 @@ mod tests {
 
         assert!(writer.wal_flusher.flush(&source, 1).await.is_err());
         assert!(
-            WalTailer::new(store.clone(), base_path.clone(), shard_id)
+            WalTailer::new(store.clone(), base_path.clone(), "", shard_id)
                 .read_entry(1)
                 .await
                 .unwrap()
@@ -5739,7 +5756,7 @@ mod tests {
         let data_dir = batch_store
             .target()
             .unwrap()
-            .generation_path(&base_path, &shard_id)
+            .generation_path(&base_path, "", &shard_id)
             .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
     }
@@ -5819,7 +5836,7 @@ mod tests {
         assert!(error.to_string().contains("terminally failed Blob v2 pack"));
         assert!(first_watcher.unwrap().wait().await.is_err());
         assert!(
-            WalTailer::new(store.clone(), base_path.clone(), shard_id)
+            WalTailer::new(store.clone(), base_path.clone(), "", shard_id)
                 .read_entry(1)
                 .await
                 .unwrap()
@@ -5828,7 +5845,7 @@ mod tests {
         let data_dir = batch_store
             .target()
             .unwrap()
-            .generation_path(&base_path, &shard_id)
+            .generation_path(&base_path, "", &shard_id)
             .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
     }
@@ -5883,7 +5900,7 @@ mod tests {
         }
         writer.close().await.unwrap();
 
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, config.shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", config.shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -5972,7 +5989,7 @@ mod tests {
                 "the 1 MiB payload must not remain resident: {row_bytes} bytes"
             );
 
-            let tailer = WalTailer::new(store.clone(), base_path.clone(), config.shard_id);
+            let tailer = WalTailer::new(store.clone(), base_path.clone(), "", config.shard_id);
             for position in [1, 2] {
                 let entry = tailer.read_entry(position).await.unwrap().unwrap();
                 assert_eq!(entry.target.as_ref(), Some(&target));
@@ -6037,7 +6054,9 @@ mod tests {
                 Some(BlobV2Layout::Descriptor)
             );
 
-            let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+            let data_dir = target
+                .generation_path(&base_path, "", &shard_id)
+                .join(DATA_DIR);
             let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
             assert_eq!(sidecars.len(), 3, "two packed puts plus one dedicated blob");
             (target, sidecars)
@@ -6080,7 +6099,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         let sidecars_after_successor = blob_sidecars(store.as_ref(), &data_dir).await;
         assert_eq!(sidecars_after_successor.len(), sidecars_before.len() + 1);
         assert!(
@@ -6091,7 +6112,7 @@ mod tests {
         );
 
         writer.close().await.unwrap();
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 10)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 10)
             .latest()
             .await
             .unwrap()
@@ -6148,7 +6169,9 @@ mod tests {
             }
             WriterMode::WalOnly { .. } => unreachable!(),
         };
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
 
         let scanned = writer.scan().await.unwrap().try_into_batch().await.unwrap();
@@ -6209,7 +6232,9 @@ mod tests {
             }
             WriterMode::WalOnly { .. } => unreachable!(),
         };
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
 
         writer
@@ -7204,6 +7229,7 @@ mod tests {
                 store,
                 base_path,
                 base_uri,
+                "",
                 writer.config.shard_id,
                 writer.manifest_store.clone(),
             )),
@@ -9583,7 +9609,7 @@ mod tests {
 
         // Read back via WalTailer. WAL positions are 1-based, so two
         // entries from a fresh shard land at 1 and 2.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert_eq!(tailer.first_position().await.unwrap(), 1);
         assert_eq!(tailer.next_position().await.unwrap(), 3);
 
@@ -9634,7 +9660,7 @@ mod tests {
 
         // `put` returned, so the batch must already be durable — read the WAL
         // directly, without closing the writer.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert_eq!(tailer.next_position().await.unwrap(), 2);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.batches.len(), 1);
@@ -9757,7 +9783,7 @@ mod tests {
 
         // All three puts should be in a single WAL entry at position 1
         // (WAL positions are 1-based).
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert_eq!(tailer.next_position().await.unwrap(), 2);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.batches.len(), 3);
@@ -10354,7 +10380,7 @@ mod tests {
         .close()
         .await
         .unwrap();
-        ShardManifestStore::new(store.clone(), base_path, shard_id, 2)
+        ShardManifestStore::new(store.clone(), base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10395,7 +10421,7 @@ mod tests {
             .unwrap();
         let second = writer.force_freeze_active().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10411,7 +10437,7 @@ mod tests {
         // Crash: drop without close.
         drop(writer);
 
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10511,7 +10537,7 @@ mod tests {
         assert!(writer.close().await.is_err());
 
         controls.clear_write_failures();
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10629,7 +10655,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let first = tailer.first_position().await.unwrap();
         let next = tailer.next_position().await.unwrap();
         let mut wal_rows = 0;
@@ -10779,7 +10805,7 @@ mod tests {
 
         // And the WAL really holds every row we acked (3 puts x 5 rows).
         writer.close().await.unwrap();
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let first = tailer.first_position().await.unwrap();
         let next = tailer.next_position().await.unwrap();
         let mut wal_rows = 0;
@@ -11004,7 +11030,7 @@ mod tests {
         writer.close().await.unwrap();
 
         // Walk the WAL in entry order and collect the ids as replay would see them.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let first = tailer.first_position().await.unwrap();
         let next = tailer.next_position().await.unwrap();
         let mut ids: Vec<i32> = Vec::new();
@@ -11134,7 +11160,7 @@ mod tests {
         // Simulate an external compactor compacting the SSTable.
         // into the base table: drain `sstables` to empty via a
         // direct manifest commit. The cursor stays where the flush put it.
-        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         let pre = manifest_store.latest().await.unwrap().unwrap();
         assert!(
             !pre.sstables.is_empty(),
@@ -11329,12 +11355,14 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
         let appender = WalAppender::with_claimed_epoch(
             store.clone(),
             base_path.clone(),
+            "",
             shard_id,
             manifest_store,
             epoch,
@@ -11401,12 +11429,14 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
         let high_epoch_appender = WalAppender::with_claimed_epoch(
             store.clone(),
             base_path.clone(),
+            "",
             shard_id,
             manifest_store,
             100,
@@ -11559,7 +11589,7 @@ mod tests {
         // Each put should have produced its own WAL entry — three crossings,
         // three entries. Without the regression fix, all three batches end
         // up in a single entry written by `close()`.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let next = tailer.next_position().await.unwrap();
         assert!(
             next >= 3,
@@ -13539,8 +13569,15 @@ mod shard_writer_tests {
         let (store, base_path) = lance_io::object_store::ObjectStore::from_uri(&uri)
             .await
             .expect("Failed to open store");
-        let manifest_store =
-            super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let dir_id = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+        let manifest_store = super::super::manifest::ShardManifestStore::new(
+            store, &base_path, &dir_id, shard_id, 2,
+        );
         let manifest = manifest_store
             .latest()
             .await
@@ -13549,7 +13586,8 @@ mod shard_writer_tests {
         assert_eq!(manifest.sstables.len(), 1);
 
         let sstable = &manifest.sstables[0];
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
+        let gen_uri =
+            crate::dataset::mem_wal::util::sstable_uri(&uri, &dir_id, &shard_id, &sstable.path);
         let sstable = Dataset::open(&gen_uri)
             .await
             .expect("Failed to open SSTable");
@@ -14171,10 +14209,14 @@ mod shard_writer_tests {
         }
 
         // Close writer to ensure final flush
+        let dir_id = writer.config().dir_id.clone();
         writer.close().await.expect("Failed to close");
 
         // === VERIFY FILE SYSTEM LAYOUT ===
-        let mem_wal_dir = temp_dir.path().join("_mem_wal").join(shard_id.to_string());
+        let mem_wal_dir = temp_dir
+            .path()
+            .join(crate::dataset::mem_wal::util::mem_wal_dir_name(&dir_id))
+            .join(shard_id.to_string());
         assert!(mem_wal_dir.exists(), "MemWAL directory should exist");
 
         // Check WAL directory
@@ -14205,8 +14247,15 @@ mod shard_writer_tests {
         let (store, base_path) = lance_io::object_store::ObjectStore::from_uri(&uri)
             .await
             .expect("Failed to open store");
-        let manifest_store =
-            super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let dir_id = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+        let manifest_store = super::super::manifest::ShardManifestStore::new(
+            store, &base_path, &dir_id, shard_id, 2,
+        );
         let manifest = manifest_store
             .latest()
             .await
@@ -14220,10 +14269,10 @@ mod shard_writer_tests {
         );
         for sstable in &manifest.sstables {
             // The path stored in manifest is relative to the shard directory
-            // Construct full path: temp_dir/_mem_wal/shard_id/generation_folder
+            // Construct full path: temp_dir/{mem_wal_dir}/shard_id/generation_folder
             let gen_path = temp_dir
                 .path()
-                .join("_mem_wal")
+                .join(crate::dataset::mem_wal::util::mem_wal_dir_name(&dir_id))
                 .join(shard_id.to_string())
                 .join(&sstable.path);
 
@@ -14354,8 +14403,13 @@ mod shard_writer_tests {
         assert_eq!(manifest.sstables.len(), 1);
         let sstable = manifest.sstables[0].clone();
 
-        // The generation landed under `_mem_wal/`, and the base table is untouched.
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
+        // The generation landed under the MemWAL directory, and the base table is untouched.
+        let gen_uri = crate::dataset::mem_wal::util::sstable_uri(
+            &uri,
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
+        );
         let generation = Dataset::open(&gen_uri)
             .await
             .expect("generation must exist at its own path");
@@ -14372,7 +14426,8 @@ mod shard_writer_tests {
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
             .with_sstable(sstable.generation, sstable.path.clone());
-        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
+        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()])
+            .with_mem_wal_dir_id(writer.config().dir_id.clone());
         let rows: usize = scanner
             .try_into_stream()
             .await
@@ -14468,7 +14523,8 @@ mod shard_writer_tests {
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
             .with_sstable(sstable.generation, sstable.path.clone());
-        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
+        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()])
+            .with_mem_wal_dir_id(writer.config().dir_id.clone());
         let rows: usize = scanner
             .try_into_stream()
             .await
@@ -14559,6 +14615,7 @@ mod shard_writer_tests {
             vec![snapshot],
             vec!["id".to_string()],
         )
+        .with_mem_wal_dir_id(writer.config().dir_id.clone())
         .with_session(dataset.session())
         .with_store_params(store_params)
         .try_into_stream()
