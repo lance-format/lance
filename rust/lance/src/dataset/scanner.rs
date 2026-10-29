@@ -3482,6 +3482,25 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if let Some(ordering) = &self.ordering {
+            for column in ordering {
+                let mut fields = self
+                    .dataset
+                    .schema()
+                    .field(&column.column_name)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                while let Some(field) = fields.pop() {
+                    if field.is_blob_v2() && self.blob_handling.returns_description(field) {
+                        return Err(Error::invalid_input(format!(
+                            "Ordering by Blob V2 contents in '{}' requires binary blob handling; order by an explicit descriptor subfield for metadata ordering",
+                            column.column_name
+                        )));
+                    }
+                    fields.extend(&field.children);
+                }
+            }
+        }
         if let Some(query) = &self.nearest {
             query.validate_search_effort()?;
         }
@@ -3923,7 +3942,10 @@ impl Scanner {
         };
 
         // Load columns needed for filter and ordering
-        let mut pre_filter_projection = self.dataset.empty_projection();
+        let mut pre_filter_projection = self
+            .dataset
+            .empty_projection()
+            .with_blob_handling(self.blob_handling.clone());
 
         // We may need to take filter columns if we are going to refine
         // an indexed scan.
@@ -3978,15 +4000,8 @@ impl Scanner {
             return Ok(plan);
         }
 
-        // Sort
+        // Ordering columns were loaded with the filter projection above.
         if let Some(ordering) = &self.ordering {
-            let ordering_columns = ordering.iter().map(|col| &col.column_name);
-            let projection_with_ordering = self
-                .dataset
-                .empty_projection()
-                .union_columns(ordering_columns, OnMissing::Error)?;
-            // We haven't loaded the sort column yet so take it now
-            plan = self.take(plan, projection_with_ordering)?;
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
@@ -4031,6 +4046,12 @@ impl Scanner {
             .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
+
+        // Preserve the validated output schema without letting limit pushdown
+        // construct a zero-capacity Top-K sorter or read any payloads.
+        if self.limit == Some(0) {
+            return Ok(Arc::new(EmptyExec::new(plan.schema())));
+        }
 
         // If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
@@ -4164,7 +4185,7 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
+                projection.with_row_addr || self.projection_plan.physical_projection.with_row_addr,
                 self.projection_plan
                     .physical_projection
                     .with_row_last_updated_at_version,
@@ -4578,6 +4599,17 @@ impl Scanner {
             // If the user is not requesting any columns then we will scan the row address which
             // is cheap
             projection.with_row_addr = true;
+        }
+
+        if let Some(ordering) = &self.ordering {
+            let projected = projection.to_schema();
+            let sort_column_missing = ordering
+                .iter()
+                .any(|column| projected.field(&column.column_name).is_none());
+            if sort_column_missing && !projection.with_row_id && !projection.with_row_addr {
+                // Fetching an unselected sort column later needs a physical row identity.
+                projection.with_row_addr = true;
+            }
         }
 
         // An external mask is applied as the row source inside new_filtered_read, so
@@ -7227,6 +7259,7 @@ impl Scanner {
             let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
+                .with_blob_handling(self.blob_handling.clone())
                 .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
 
@@ -11416,6 +11449,20 @@ mod test {
             let actual = scan.limit(Some(0), None)?.try_into_batch().await?;
             assert_eq!(actual.num_rows(), 0);
         }
+        for offset in [None, Some(0), Some(1)] {
+            let mut scan = dataset.scan();
+            scan.project(&["i"])?;
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first("i".into())]))?;
+            let expected_schema = scan.schema().await?;
+            let before = dataset.object_store.io_stats_snapshot();
+            let actual = scan.limit(Some(0), offset)?.try_into_batch().await?;
+            assert_eq!(actual.num_rows(), 0);
+            assert_eq!(actual.schema(), expected_schema);
+            assert_eq!(
+                dataset.object_store.io_stats_snapshot().requests.len(),
+                before.requests.len()
+            );
+        }
         Ok(())
     }
 
@@ -15059,6 +15106,19 @@ mod test {
             .unwrap();
 
         assert_eq!(batches_by_str[0], sorted_by_str);
+
+        let unprojected_sort = dataset
+            .scan()
+            .project(&["int"])
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "str".to_string(),
+            )]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(unprojected_sort, sorted_by_str.project(&[0]).unwrap());
 
         // Ensure an empty sort vec does not break anything (sorting is disabled)
         dataset

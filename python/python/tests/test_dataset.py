@@ -1696,6 +1696,81 @@ def test_pickle_fragment(tmp_path: Path):
     assert fragment.to_table() == unpickled.to_table()
 
 
+def test_snapshot_retention_protects_ordinary_data(tmp_path):
+    from lance.retention import SnapshotIdentity, SnapshotRetention
+
+    original = pa.table({"value": pa.array([1, None], type=pa.int32())})
+    dataset = lance.write_dataset(original, tmp_path / "retained", max_rows_per_file=1)
+    dataset.update_config({"lance.snapshot_retention.lock_expiration_hours": "6"})
+    assert len(dataset.get_fragments()) == 2
+    snapshot = SnapshotIdentity.from_dataset(dataset, "catalog/ordinary")
+    snapshot = SnapshotIdentity.decode(snapshot.encode())
+    assert snapshot.version == dataset.version
+    assert snapshot.table_identity == "catalog/ordinary"
+    assert snapshot.branch is None
+    assert len(snapshot.snapshot_id) == 32
+    token = SnapshotRetention.acquire(dataset, snapshot, str(uuid.uuid4()))
+    token = SnapshotRetention.decode(token.encode())
+    assert token.snapshot.encode() == snapshot.encode()
+    assert token.tag_name in dataset.tags.list()
+    latest = lance.write_dataset(
+        pa.table({"value": pa.array([3, 4], type=pa.int32())}),
+        dataset.uri,
+        mode="overwrite",
+    )
+    try:
+        latest.cleanup_old_versions(older_than=timedelta(hours=-1))
+        assert dataset.to_table().equals(original)
+        assert snapshot.version in [item["version"] for item in latest.versions()]
+    finally:
+        token.release(latest)
+    token.release(latest)
+    stats = latest.cleanup_old_versions(older_than=timedelta(hours=-1))
+    assert stats.data_files_removed == 2
+    assert snapshot.version not in [item["version"] for item in latest.versions()]
+    with pytest.raises((ValueError, OSError)):
+        SnapshotRetention.acquire(dataset, snapshot, str(uuid.uuid4()))
+
+
+@pytest.mark.parametrize("operation", ["acquire", "release", "cleanup"])
+def test_snapshot_retention_conflicts_have_distinct_exception(tmp_path, operation):
+    from lance.retention import RefConflictError, SnapshotIdentity, SnapshotRetention
+
+    assert RefConflictError is lance.RefConflictError
+    dataset_path = tmp_path / "retained"
+    dataset = lance.write_dataset(pa.table({"value": [1, 2]}), dataset_path)
+    snapshot = SnapshotIdentity.from_dataset(dataset, "catalog/conflict")
+    token = SnapshotRetention.acquire(dataset, snapshot, "query")
+    owner = dataset_path / "_refs/retention-v1/maintenance" / str(uuid.uuid4())
+    owner.parent.mkdir(parents=True, exist_ok=True)
+    owner.write_text(
+        '{"ticket":1,"expires_at":"2100-01-01T00:00:00Z","mode":"exclusive"}'
+    )
+    try:
+        with pytest.raises(RefConflictError, match="maintenance lock"):
+            if operation == "acquire":
+                SnapshotRetention.acquire(dataset, snapshot, "other-query")
+            elif operation == "release":
+                token.release(dataset)
+            else:
+                dataset.cleanup_old_versions()
+    finally:
+        owner.unlink()
+        token.release(dataset)
+    assert not dataset.tags.list()
+
+
+@pytest.mark.parametrize("hours", ["0", "-1", "1.5", "", "18446744073709551615"])
+def test_snapshot_retention_rejects_invalid_lock_expiration(tmp_path, hours):
+    dataset = lance.write_dataset(pa.table({"value": [1, 2]}), tmp_path / "retained")
+    dataset.update_config({"lance.snapshot_retention.lock_expiration_hours": hours})
+    snapshot = lance.SnapshotIdentity.from_dataset(dataset, "catalog/ordinary")
+    with pytest.raises(ValueError, match="lock_expiration_hours"):
+        lance.SnapshotRetention.acquire(dataset, snapshot, str(uuid.uuid4()))
+    with pytest.raises(OSError, match="lock_expiration_hours"):
+        dataset.cleanup_old_versions()
+
+
 def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

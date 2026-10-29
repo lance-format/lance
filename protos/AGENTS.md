@@ -6,7 +6,7 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
 - Changes to protobuf schemas that define a persisted Lance format require a PMC vote on the pull request, enforced by the `format-spec-vote` CI gate. See [Lance Format Specification Changes](../docs/src/community/voting.md#lance-format-specification-changes).
 - Keep a persisted-format proto change in its own PR, together with the matching `docs/src/format/` change and only the library edits needed to compile. Put the implementation in a follow-up PR — voters need to read the contract, not its implementation.
-- Execution-plan schemas (`ann.proto`, `filtered_read.proto`, and `table_identifier.proto`) are wire contracts, not persisted Lance formats. Changes to them belong with their implementation and do not require a format vote or a `docs/src/format/` change.
+- Execution wire schemas (`ann.proto`, `blob_reference.proto`, `filtered_read.proto`, and `table_identifier.proto`) are not persisted Lance formats. Changes to them belong with their implementation and do not require a format vote or a `docs/src/format/` change.
 
 ## Compatibility
 

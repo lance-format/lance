@@ -106,6 +106,7 @@ pub use blob::{
     blob_field, blob_field_with_options,
 };
 pub use dataset::Dataset;
+pub use dataset::{retention::SnapshotRetention, snapshot::SnapshotIdentity};
 use lance_index::vector::DIST_COL;
 
 /// Creates and loads a [`Dataset`] from the given path.

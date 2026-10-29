@@ -63,6 +63,7 @@ use std::ptr::NonNull;
 pub(crate) mod arrow;
 pub(crate) mod bitmap;
 pub(crate) mod blob;
+mod blob_reference;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -82,6 +83,7 @@ pub(crate) mod rowids;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
+mod snapshot_retention;
 pub(crate) mod storage_options;
 pub(crate) mod tracing;
 pub(crate) mod transaction;
@@ -281,6 +283,18 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPackedBlobWriter>()?;
     m.add_class::<PyManagedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
+    m.add_class::<blob_reference::PyBlobSourceContext>()?;
+    m.add_class::<blob_reference::PyBlobRefBatch>()?;
+    m.add_class::<blob_reference::PyNestedBlobRefBatch>()?;
+    m.add_class::<blob_reference::PyBlobRefCapture>()?;
+    m.add_class::<blob_reference::PyBlobRefReader>()?;
+    m.add_class::<blob_reference::PyBlobRefReadStream>()?;
+    m.add_class::<snapshot_retention::PySnapshotIdentity>()?;
+    m.add_class::<snapshot_retention::PySnapshotRetention>()?;
+    m.add(
+        "RefConflictError",
+        m.py().get_type::<error::RefConflictError>(),
+    )?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileWriteSummary>()?;

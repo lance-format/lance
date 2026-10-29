@@ -60,6 +60,8 @@ pub struct ProxyObjectStorePolicy {
     /// an error then the target method will not be invoked and the error will
     /// be returned instead.
     before_policies: HashMap<String, PolicyFn>,
+    /// Policies invoked after a successful put, to simulate a lost write response.
+    after_put_policies: HashMap<String, PolicyFn>,
     /// Policies which run after calls that return ObjectMeta.  The policy can
     /// transform the returned ObjectMeta to mock out file listing results.
     object_meta_policies: HashMap<String, ObjectMetaPolicyFn>,
@@ -79,6 +81,15 @@ impl ProxyObjectStorePolicy {
 
     pub fn clear_before_policy(&mut self, name: &str) {
         self.before_policies.remove(name);
+    }
+
+    /// Inject a response failure after the object has already been written.
+    pub fn set_after_put_policy(&mut self, name: &str, policy: PolicyFn) {
+        self.after_put_policies.insert(name.to_string(), policy);
+    }
+
+    pub fn clear_after_put_policy(&mut self, name: &str) {
+        self.after_put_policies.remove(name);
     }
 
     pub fn set_obj_meta_policy(&mut self, name: &str, policy: ObjectMetaPolicyFn) {
@@ -171,7 +182,11 @@ impl ObjectStore for ProxyObjectStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.before_method("put", location)?;
-        self.target.put_opts(location, bytes, opts).await
+        let result = self.target.put_opts(location, bytes, opts).await?;
+        for policy in self.policy.lock().unwrap().after_put_policies.values() {
+            policy("put", location).map_err(OSError::from)?;
+        }
+        Ok(result)
     }
 
     async fn put_multipart_opts(

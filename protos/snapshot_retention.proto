@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.dataset.retention;
+
+// Execution-only snapshot identity and retention transport, not a persisted Lance format.
+message SnapshotIdentity {
+  uint32 protocol_version = 1;
+  // Caller-supplied table incarnation and catalog/storage authority.
+  string table_identity = 2;
+  // Canonical absolute table root, without a branch suffix or credentials.
+  string table_uri = 3;
+  // Absent identifies the main branch.
+  optional string branch = 4;
+  uint64 version = 5;
+  string manifest_path = 6;
+  // Original manifest protobuf bytes, forwarded without re-encoding.
+  bytes manifest = 7;
+  // Absent means the original manifest bytes supply the commit identity.
+  optional string manifest_identity = 8;
+}
+
+// An explicit-release snapshot GC root. Decoding does not acquire protection.
+message SnapshotRetention {
+  uint32 protocol_version = 1;
+  bytes snapshot = 2;
+  string tag_name = 3;
+}

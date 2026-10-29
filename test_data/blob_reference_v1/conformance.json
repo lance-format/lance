@@ -1,0 +1,19 @@
+{
+  "protocol_version": 1,
+  "payloads": ["abc", "abcde", "abcdefghij", null, "", "uv"],
+  "requests": [
+    {"reference_index": 2, "request_index": "18446744073709551615", "range": null, "expected": "abcdefghij"},
+    {"reference_index": 0, "request_index": "0", "range": null, "expected": "abc"},
+    {"reference_index": 1, "request_index": "1", "range": [1, 3], "expected": "bcd"},
+    {"reference_index": 3, "request_index": "2", "range": null, "expected": null},
+    {"reference_index": 4, "request_index": "3", "range": null, "expected": ""},
+    {"reference_index": 2, "request_index": "4", "range": [2, 4], "expected": "cdef"},
+    {"reference_index": 2, "request_index": "5", "range": [2, 4], "expected": "cdef"},
+    {"reference_index": 2, "request_index": "6", "range": [10, 0], "expected": ""}
+  ],
+  "invalid_ranges": [
+    {"offset": "18446744073709551615", "length": "1"},
+    {"offset": "10", "length": "1"},
+    {"offset": "0", "length": "18446744073709551615"}
+  ]
+}

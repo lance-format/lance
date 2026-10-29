@@ -15,6 +15,21 @@ from .lance import (
     BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
 )
 from .lance import (
+    BlobRefBatch as BlobRefBatch,
+)
+from .lance import (
+    BlobRefCapture as BlobRefCapture,
+)
+from .lance import (
+    BlobRefReader as BlobRefReader,
+)
+from .lance import (
+    BlobRefReadStream as BlobRefReadStream,
+)
+from .lance import (
+    BlobSourceContext as BlobSourceContext,
+)
+from .lance import (
     DedicatedBlobWriter as DedicatedBlobWriter,
 )
 from .lance import (
@@ -22,6 +37,9 @@ from .lance import (
 )
 from .lance import (
     ManagedBlobWriter as ManagedBlobWriter,
+)
+from .lance import (
+    NestedBlobRefBatch as NestedBlobRefBatch,
 )
 from .lance import (
     PackedBlobWriter as PackedBlobWriter,
