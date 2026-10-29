@@ -27,8 +27,20 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
+    use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use crate::index::frag_reuse_reader::tests::{install, persist_fixture, prepare_partition};
+    use crate::session::Session;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::Int32Type;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_index::IndexType;
+    use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use prost::Message;
 
     async fn test_dataset() -> crate::Dataset {
         let write_params = WriteParams {
@@ -413,8 +425,7 @@ mod tests {
     }
 
     async fn catch_up_generation(dataset: &crate::Dataset, index: &str) -> Option<u64> {
-        let meta = dataset
-            .load_indices()
+        let meta = crate::index::load_all_indices(dataset)
             .await
             .unwrap()
             .iter()
@@ -667,6 +678,155 @@ mod tests {
             err.to_string().contains("incompatible"),
             "expected an incompatible-transaction error, got {err}"
         );
+    }
+
+    /// A MemWAL table with generation 5 compacted, and `i_idx` built over
+    /// fragments 0 and 1 before a deferred compaction moved them into 10 and
+    /// 11. The tagged history is stored outside the manifest.
+    async fn tagged_compacted_dataset(uri: &str, shard: Uuid) -> crate::Dataset {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(uri, FragmentCount::from(2), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::ReserveFragments { num_fragments: 20 },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let (transition, destinations) = prepare_partition(&dataset, &[0, 1], 10).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        install(&mut dataset, content, destinations, true).await;
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        persist_fixture(&mut dataset, indices).await;
+        let dataset = fresh_session(uri).await;
+
+        let mem_wal_index =
+            new_mem_wal_index_meta(dataset.manifest.version, MemWalIndexDetails::default())
+                .unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![mem_wal_index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap()
+    }
+
+    async fn fresh_session(uri: &str) -> crate::Dataset {
+        DatasetBuilder::from_uri(uri)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap()
+    }
+
+    /// After a deferred compaction under a tagged history, an index's stored
+    /// bitmap still names the retired sources. It covers the table through
+    /// the history, and the commit path reads that history even when it is
+    /// stored outside the manifest.
+    #[tokio::test]
+    #[serial_test::serial(frag_reuse_maintenance)]
+    async fn an_index_covering_the_table_through_a_tagged_history_earns_catch_up() {
+        let dir = TempStrDir::default();
+        let mut dataset = tagged_compacted_dataset(dir.as_str(), Uuid::new_v4()).await;
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .find(|idx| idx.name == "i_idx")
+                .and_then(|idx| idx.fragment_bitmap.clone()),
+            Some(roaring::RoaringBitmap::from_iter([0u32, 1])),
+            "the stored bitmap is the retired sources"
+        );
+
+        // Nothing to rebuild: the commit that records the position is the
+        // one the optimize makes only because the dry run says it advances.
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(vec!["i_idx".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(catch_up_generation(&dataset, "i_idx").await, Some(5));
+    }
+
+    /// A history that cannot be read proves no coverage, but an append never
+    /// walks it and still commits.
+    #[tokio::test]
+    #[serial_test::serial(frag_reuse_maintenance)]
+    async fn an_unreadable_tagged_history_does_not_block_an_append() {
+        let dir = TempStrDir::default();
+        let mut dataset = tagged_compacted_dataset(dir.as_str(), Uuid::new_v4()).await;
+        let mut indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let entry = indices
+            .iter_mut()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        entry.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: vec![0x0a, 0x03, 0xff, 0xff],
+        }));
+        persist_fixture(&mut dataset, indices).await;
+        let dataset = fresh_session(dir.as_str()).await;
+
+        let batch = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+            .into_batch_rows(lance_datagen::RowCount::from(4))
+            .unwrap();
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: crate::dataset::WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 12);
+        assert_eq!(catch_up_generation(&dataset, "i_idx").await, None);
     }
 
     /// One `__lance_mem_wal` entry carrying `details`, as a real table has.

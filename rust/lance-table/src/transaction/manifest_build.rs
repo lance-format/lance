@@ -40,6 +40,7 @@ use crate::io::{
 };
 use crate::rowids::version::build_version_meta;
 use crate::rowids::{read_row_ids, write_row_ids};
+use crate::system_index::frag_reuse::lineage::TaggedLineage;
 use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
 use crate::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
 use crate::system_index::is_system_index;
@@ -377,6 +378,28 @@ impl Transaction {
                 .map(|fragment| fragment.id as u32)
                 .collect()
         });
+        // Under a tagged history a segment's bitmap is provenance: it keeps
+        // the retired sources of a deferred compaction and never gains their
+        // destinations, so coverage is what the history maps it to.
+        let lineage = read_version_state.and_then(|state| {
+            let entry = state.indices.iter().find(|index| is_tagged(index))?;
+            match TaggedLineage::from_indices_with_ledger(
+                state.indices,
+                state.frag_reuse_ledger.cloned(),
+            ) {
+                Ok(lineage) => lineage,
+                // Commits that never walk the history, such as appends, still
+                // succeed when it cannot be read; they just prove no coverage.
+                Err(err) => {
+                    log::warn!(
+                        "MemWAL index catch-up cannot read the fragment reuse history of {}; \
+                         no index coverage is proven at version {new_version}: {err}",
+                        entry.uuid
+                    );
+                    Some(TaggedLineage::new(entry, None))
+                }
+            }
+        });
 
         let covers_read_version = |segments: &[CoverageIdentity]| -> bool {
             let Some(required) = read_fragments.as_ref() else {
@@ -401,7 +424,14 @@ impl Transaction {
                     None => return false,
                 }
             }
-            required.is_subset(&covered)
+            match lineage.as_ref() {
+                None => required.is_subset(&covered),
+                // A history this build cannot walk serves no segment at query
+                // time, so it proves nothing either.
+                Some(lineage) => lineage
+                    .coverage_of(&covered)
+                    .is_some_and(|covered| required.is_subset(&covered)),
+            }
         };
 
         let mut rebuilt: Vec<IndexCatchupProgress> = Vec::new();
@@ -6210,6 +6240,7 @@ mod tests {
                 Some(ReadVersionState {
                     manifest: &manifest,
                     indices: read_indices,
+                    frag_reuse_ledger: None,
                 }),
                 2,
             )
@@ -6271,6 +6302,7 @@ mod tests {
                     Some(ReadVersionState {
                         manifest: &manifest,
                         indices: &read,
+                        frag_reuse_ledger: None,
                     }),
                 )
                 .unwrap();
@@ -6306,6 +6338,108 @@ mod tests {
             let read = table(&[0], Uuid::new_v4(), progress(shard, 5));
             let mut after = table(&[0], Uuid::new_v4(), progress(shard, 5));
             apply(&mut after, &read, &[0, 1], &read).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
+        /// Under a tagged history a segment's stored bitmap is provenance: it
+        /// keeps the retired source ids and never gains the destinations.
+        /// Coverage is what the history maps the index's segments to, and a
+        /// destination counts only when the index holds every one of its
+        /// sources.
+        #[rstest]
+        #[case::compacted(vec![(vec![5], vec![0])], vec![vec![5]], &[0], true)]
+        #[case::compacted_twice(
+            vec![(vec![5], vec![0]), (vec![0], vec![1])],
+            vec![vec![5]],
+            &[1],
+            true
+        )]
+        #[case::sources_split_across_segments(
+            vec![(vec![5, 6], vec![0])],
+            vec![vec![5], vec![6]],
+            &[0],
+            true
+        )]
+        #[case::beside_an_untouched_fragment(
+            vec![(vec![5], vec![0])],
+            vec![vec![5, 2]],
+            &[0, 2],
+            true
+        )]
+        #[case::a_source_never_indexed(vec![(vec![5, 6], vec![0])], vec![vec![5]], &[0], false)]
+        #[case::an_untouched_fragment_never_indexed(
+            vec![(vec![5], vec![0])],
+            vec![vec![5]],
+            &[0, 2],
+            false
+        )]
+        fn coverage_is_mapped_through_a_tagged_history(
+            #[case] transitions: Vec<(Vec<u64>, Vec<u64>)>,
+            #[case] segments: Vec<Vec<u32>>,
+            #[case] read_frags: &[u32],
+            #[case] is_credited: bool,
+        ) {
+            let shard = Uuid::new_v4();
+            let mut manifest = manifest_with(read_frags);
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            let mut read: Vec<IndexMetadata> = segments
+                .iter()
+                .map(|frags| user_index("idx", Uuid::new_v4(), frags))
+                .collect();
+            read.push(mem_wal_index(progress(shard, 5)));
+            let transitions: Vec<(&[u64], &[u64])> = transitions
+                .iter()
+                .map(|(sources, destinations)| (sources.as_slice(), destinations.as_slice()))
+                .collect();
+            read.push(tagged_entry(&transitions));
+            let segments_before = Transaction::logical_index_segments(&read);
+            let mut after = read.clone();
+            Transaction::apply_mem_wal_index_coverage(
+                &mut after,
+                &segments_before,
+                Some(ReadVersionState {
+                    manifest: &manifest,
+                    indices: &read,
+                    frag_reuse_ledger: None,
+                }),
+                2,
+            )
+            .unwrap();
+            assert_eq!(
+                coverage_for(&after, "idx"),
+                is_credited.then(|| compacted(shard, 5))
+            );
+        }
+
+        /// A history that cannot be read proves nothing, but the commit still
+        /// goes through: appends never walk it and must not be blocked by it.
+        #[test]
+        fn an_unreadable_tagged_history_proves_nothing_without_failing() {
+            let shard = Uuid::new_v4();
+            let mut manifest = manifest_with(&[0]);
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            let mut entry = tagged_entry(&[(&[5], &[0])]);
+            entry.index_details = Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                value: vec![0x0a, 0x03, 0xff, 0xff],
+            }));
+            let mut read = table(&[5], Uuid::new_v4(), progress(shard, 5));
+            read.push(entry);
+            let segments_before = Transaction::logical_index_segments(&read);
+            let mut after = read.clone();
+            Transaction::apply_mem_wal_index_coverage(
+                &mut after,
+                &segments_before,
+                Some(ReadVersionState {
+                    manifest: &manifest,
+                    indices: &read,
+                    frag_reuse_ledger: None,
+                }),
+                2,
+            )
+            .unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 

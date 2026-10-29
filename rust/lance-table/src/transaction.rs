@@ -61,6 +61,7 @@ pub use validate::{
 use crate::format::{IndexMetadata, Manifest};
 use roaring::RoaringBitmap;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Non-system logical index name -> its physical segments, ordered by UUID.
@@ -103,4 +104,9 @@ pub struct CoverageIdentity {
 pub struct ReadVersionState<'a> {
     pub manifest: &'a Manifest,
     pub indices: &'a [IndexMetadata],
+    /// The decoded history of the tagged fragment reuse entry in `indices`.
+    /// Required when that history is stored externally; an inline one is
+    /// decoded from the entry when this is `None`.
+    pub frag_reuse_ledger:
+        Option<&'a Arc<crate::system_index::frag_reuse::ledger::FragReuseLedger>>,
 }

@@ -2487,10 +2487,11 @@ impl Dataset {
     /// index list it would commit is the one already loaded, and the version it
     /// would read is the current one -- which makes the speculative answer the
     /// same one the commit reaches.
-    fn mem_wal_catch_up_would_advance(&self, indices: &[IndexMetadata]) -> Result<bool> {
+    async fn mem_wal_catch_up_would_advance(&self, indices: &[IndexMetadata]) -> Result<bool> {
         if !indices.iter().any(|index| index.name == MEM_WAL_INDEX_NAME) {
             return Ok(false);
         }
+        let frag_reuse_ledger = self.mem_wal_catch_up_ledger(indices).await;
         let catchup_of = |indices: &[IndexMetadata]| -> Result<Option<Vec<_>>> {
             indices
                 .iter()
@@ -2510,10 +2511,40 @@ impl Dataset {
             Some(ReadVersionState {
                 manifest: &self.manifest,
                 indices,
+                frag_reuse_ledger: frag_reuse_ledger.as_ref(),
             }),
             self.manifest.version + 1,
         )?;
         Ok(catchup_of(&speculative)? != catchup_of(indices)?)
+    }
+
+    /// The tagged fragment reuse history MemWAL catch-up maps index coverage
+    /// through, for `indices` as listed at this version. Read only on a table
+    /// that maintains catch-up, so no other commit opens the history.
+    ///
+    /// `None` when there is no such history or it cannot be read. An
+    /// unreadable history proves no coverage, but must not fail commits such
+    /// as appends that never walk it.
+    pub(crate) async fn mem_wal_catch_up_ledger(
+        &self,
+        indices: &[IndexMetadata],
+    ) -> Option<Arc<lance_table::system_index::frag_reuse::ledger::FragReuseLedger>> {
+        if !indices.iter().any(|index| index.name == MEM_WAL_INDEX_NAME) {
+            return None;
+        }
+        let entry = indices
+            .iter()
+            .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))?;
+        match frag_reuse_reader::open_ledger(self, entry).await {
+            Ok(ledger) => Some(ledger),
+            Err(err) => {
+                log::warn!(
+                    "MemWAL index catch-up cannot read the fragment reuse history of {}: {err}",
+                    entry.uuid
+                );
+                None
+            }
+        }
     }
 }
 

@@ -1192,7 +1192,7 @@ pub async fn commit_optimize_indices(
 ) -> Result<()> {
     if results.is_empty() {
         let indices = load_all_indices(dataset).await?;
-        if !dataset.mem_wal_catch_up_would_advance(&indices)?
+        if !dataset.mem_wal_catch_up_would_advance(&indices).await?
             || has_unsupported_frag_reuse_history(dataset, &indices).await?
         {
             return Ok(());

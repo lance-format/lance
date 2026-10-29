@@ -51,10 +51,7 @@ impl CacheKey for LedgerKey {
     }
 }
 
-pub(super) async fn open_ledger(
-    dataset: &Dataset,
-    index: &IndexMetadata,
-) -> Result<Arc<FragReuseLedger>> {
+pub async fn open_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<Arc<FragReuseLedger>> {
     let store = dataset.object_store_for_index(index).await?;
     let key = LedgerKey {
         uuid: index.uuid,

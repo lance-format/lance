@@ -1756,9 +1756,13 @@ pub(crate) async fn commit_transaction(
     // cached data, so the common case is a cache hit rather than a read.
     let read_version_dataset = dataset.clone();
     let read_version_indices = load_all_indices(&read_version_dataset).await?;
+    let read_version_ledger = read_version_dataset
+        .mem_wal_catch_up_ledger(&read_version_indices)
+        .await;
     let read_version_state = Some(crate::dataset::transaction::ReadVersionState {
         manifest: read_version_dataset.manifest.as_ref(),
         indices: read_version_indices.as_slice(),
+        frag_reuse_ledger: read_version_ledger.as_ref(),
     });
 
     let mut transaction = transaction.clone();

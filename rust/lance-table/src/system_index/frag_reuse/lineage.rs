@@ -115,6 +115,29 @@ impl TaggedLineage {
             .collect()
     }
 
+    /// The fragments whose rows an index built over `provenance` holds: the
+    /// provenance itself plus every destination of a transition whose
+    /// sources it holds entirely, transitively. A destination that also took
+    /// rows from an uncovered source is partly unindexed, so it is left out,
+    /// as the reader leaves it out. `None` when the history cannot be walked.
+    pub fn coverage_of(&self, provenance: &RoaringBitmap) -> Option<RoaringBitmap> {
+        let ledger = self.ledger.as_ref()?;
+        let mut covered = provenance.clone();
+        // Producers precede their consumers, so one pass reaches every hop.
+        for transition in ledger.transitions() {
+            let complete = transition
+                .sources()
+                .iter()
+                .all(|source| u32::try_from(source.id).is_ok_and(|id| covered.contains(id)));
+            if complete {
+                for destination in transition.destinations() {
+                    covered.insert(u32::try_from(destination.id).ok()?);
+                }
+            }
+        }
+        Some(covered)
+    }
+
     /// Every fragment the rows of `source` were moved into, following the
     /// transitions transitively (retired intermediates included, in walk
     /// order). `None` when the history cannot be walked.
