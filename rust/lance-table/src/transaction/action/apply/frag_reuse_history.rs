@@ -217,6 +217,8 @@ impl ApplyState<'_> {
             // A stable partition's row map lives in its own directory, named by
             // the transition, not under this entry's uuid.
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         if is_tagged(&entry) && !rebound_fields.is_empty() {
             self.withdraw_along_lineage(&entry, ledger, rebound_fields);
