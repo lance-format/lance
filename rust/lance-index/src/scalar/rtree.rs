@@ -356,20 +356,7 @@ impl RTreeIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
-        let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
-        validate_stored_page_size(metadata.page_size, metadata.num_items)?;
-        let nulls_reader = store.open_index_file(RTREE_NULLS_NAME).await?;
-
-        Ok(Arc::new(Self {
-            metadata: Arc::new(metadata),
-            store,
-            frag_reuse_index,
-            batch_remapper: None,
-            index_cache: WeakLanceCache::from(index_cache),
-            pages_reader,
-            nulls_reader,
-        }))
+        Self::load_inner(store, frag_reuse_index, None, index_cache).await
     }
 
     /// Additive sibling of [`Self::load`] for mappings that require
@@ -380,6 +367,19 @@ impl RTreeIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
+        Self::load_inner(store, None, remapping, index_cache).await
+    }
+
+    async fn load_inner(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        debug_assert!(
+            frag_reuse_index.is_none() || batch_remapper.is_none(),
+            "RTree legacy and batch remappers are mutually exclusive"
+        );
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
         validate_stored_page_size(metadata.page_size, metadata.num_items)?;
@@ -388,8 +388,8 @@ impl RTreeIndex {
         Ok(Arc::new(Self {
             metadata: Arc::new(metadata),
             store,
-            frag_reuse_index: None,
-            batch_remapper: remapping,
+            frag_reuse_index,
+            batch_remapper,
             index_cache: WeakLanceCache::from(index_cache),
             pages_reader,
             nulls_reader,
@@ -496,18 +496,24 @@ impl RTreeIndex {
         Ok(null_map)
     }
 
+    async fn remap_row_addrs(&self, row_addrs: RowAddrTreeMap) -> Result<RowAddrTreeMap> {
+        if let Some(remapper) = &self.frag_reuse_index {
+            Ok(remapper.remap_row_addrs_tree_map(&row_addrs))
+        } else if let Some(remapper) = &self.batch_remapper {
+            remap_row_addrs_tree_map_async(remapper.as_ref(), &row_addrs).await
+        } else {
+            Ok(row_addrs)
+        }
+    }
+
     /// Prepare old entries in the current row-ID domain before filtering either
     /// representation. New input must bypass this helper, even when it reuses old IDs.
     async fn retained_data(
         &self,
         old_data_filter: Option<&OldIndexDataFilter>,
     ) -> Result<(SendableRecordBatchStream, RowAddrTreeMap)> {
-        let mut null_map = self.search_null(&NoOpMetricsCollector).await?;
-        if let Some(remapper) = &self.frag_reuse_index {
-            null_map = remapper.remap_row_addrs_tree_map(&null_map);
-        } else if let Some(remapper) = &self.batch_remapper {
-            null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-        }
+        let null_map = self.search_null(&NoOpMetricsCollector).await?;
+        let mut null_map = self.remap_row_addrs(null_map).await?;
         if let Some(filter) = old_data_filter {
             filter.retain_old_rows(&mut null_map);
         }
@@ -782,32 +788,17 @@ impl ScalarIndex for RTreeIndex {
                 let geo_array =
                     extract_bounding_boxes(query.value.to_array()?.as_ref(), &query.field)?;
                 let bbox = total_bounds(&geo_array)?;
-                let mut rowids = self.search_bbox(bbox, metrics).await?;
-                let mut null_map = self.search_null(metrics).await?;
-
-                if let Some(fri) = &self.frag_reuse_index {
-                    // Legacy synchronous remapping path.
-                    rowids = fri.remap_row_addrs_tree_map(&rowids);
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
-                } else if let Some(remapper) = &self.batch_remapper {
-                    // Tagged asynchronous path.
-                    rowids = remap_row_addrs_tree_map_async(remapper.as_ref(), &rowids).await?;
-                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-                }
+                let rowids = self.search_bbox(bbox, metrics).await?;
+                let null_map = self.search_null(metrics).await?;
+                let rowids = self.remap_row_addrs(rowids).await?;
+                let null_map = self.remap_row_addrs(null_map).await?;
                 Ok(SearchResult::AtMost(NullableRowAddrSet::new(
                     rowids, null_map,
                 )))
             }
             GeoQuery::IsNull => {
-                let mut null_map = self.search_null(metrics).await?;
-
-                if let Some(fri) = &self.frag_reuse_index {
-                    // Legacy synchronous remapping path.
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
-                } else if let Some(remapper) = &self.batch_remapper {
-                    // Tagged asynchronous path.
-                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-                }
+                let null_map = self.search_null(metrics).await?;
+                let null_map = self.remap_row_addrs(null_map).await?;
                 Ok(SearchResult::Exact(NullableRowAddrSet::new(
                     null_map,
                     RowAddrTreeMap::default(),
