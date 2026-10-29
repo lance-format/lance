@@ -2433,9 +2433,10 @@ mod composite {
     use uuid::Uuid;
 
     /// A two-fragment dataset, so its two data files can stand in for the files an
-    /// action set would otherwise have had to write.
+    /// action set would otherwise have had to write. Its column is nullable, so
+    /// a test may mint a fragment without writing data for it.
     async fn test_dataset(enable_stable_row_ids: bool) -> Dataset {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let data =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(0..10))])
                 .unwrap();

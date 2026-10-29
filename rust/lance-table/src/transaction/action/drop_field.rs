@@ -209,7 +209,7 @@ mod tests {
     /// backing the whole struct.
     fn manifest_with_struct() -> Manifest {
         let arrow = ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("id", DataType::Int32, true),
             ArrowField::new(
                 "s",
                 DataType::Struct(Fields::from(vec![

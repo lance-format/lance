@@ -26,13 +26,16 @@
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::inherit_sticky_feature_flags;
 use crate::format::overlay::staleness::field_affects_index;
-use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
+use crate::format::{
+    BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
+};
 use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
+use crate::transaction::validate::schema_fragments_valid;
 use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
@@ -284,6 +287,7 @@ impl<'a> ApplyState<'a> {
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
         Transaction::normalize_fragments(&mut fragments)?;
+        check_required_fields_are_stored(current_manifest, &schema, &fragments)?;
 
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one action
@@ -921,6 +925,48 @@ impl<'a> ApplyState<'a> {
     }
 }
 
+/// Reject a fragment that stores no data for a non-nullable field: it would
+/// read back as nulls, which the schema forbids.
+///
+/// Like the legacy path, only fragments whose data files this operation set
+/// are checked, so a fragment committed before the check existed does not
+/// block an unrelated commit. Making a field required is a claim about every
+/// row, so then every fragment is checked.
+fn check_required_fields_are_stored(
+    current_manifest: &Manifest,
+    schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
+    if !required_field_ids(schema).is_subset(&required_field_ids(&current_manifest.schema)) {
+        return schema_fragments_valid(Some(current_manifest), schema, fragments);
+    }
+    let files_before: HashMap<u64, &[DataFile]> = current_manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment.files.as_slice()))
+        .collect();
+    let written: Vec<Fragment> = fragments
+        .iter()
+        .filter(|fragment| files_before.get(&fragment.id) != Some(&fragment.files.as_slice()))
+        .cloned()
+        .collect();
+    schema_fragments_valid(Some(current_manifest), schema, &written)
+}
+
+/// The ids of the fields that can never be null: non-nullable, under
+/// non-nullable ancestors only.
+fn required_field_ids(schema: &Schema) -> HashSet<i32> {
+    fn collect(fields: &[Field], ids: &mut HashSet<i32>) {
+        for field in fields.iter().filter(|field| !field.nullable) {
+            ids.insert(field.id);
+            collect(&field.children, ids);
+        }
+    }
+    let mut ids = HashSet::new();
+    collect(&schema.fields, &mut ids);
+    ids
+}
+
 /// Drop the fragments whose data no longer matches what an index recorded.
 ///
 /// An index built over a field describes the values that were in that field
@@ -1024,6 +1070,7 @@ mod tests {
     };
     use crate::transaction::action::test_support::{
         added_field, apply, apply_with_indices, backed_manifest, manifest_with_base, mint_base,
+        one_column_file,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
@@ -1171,7 +1218,7 @@ mod tests {
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                file: one_column_file("data/new.lance"),
                 field_ids: vec![FieldRef::Local(0)],
                 data_change: true,
                 base: None,
@@ -1240,9 +1287,9 @@ mod tests {
             DataType::Struct(Fields::from(vec![ArrowField::new(
                 "x",
                 DataType::Int32,
-                false,
+                true,
             )])),
-            false,
+            true,
         )]);
         let mut manifest = backed_manifest();
         manifest.schema = lance_core::datatypes::Schema::try_from(&arrow).unwrap();
@@ -1374,7 +1421,7 @@ mod tests {
     fn write_data(fragment: Ref, field: FieldRef) -> Action {
         Action::AddDataFile(AddDataFile {
             fragment,
-            file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+            file: one_column_file("data/new.lance"),
             field_ids: vec![field],
             data_change: true,
             base: None,
@@ -1802,7 +1849,7 @@ mod tests {
     fn data_file_under_base(fragment: Ref, base: Ref) -> Action {
         Action::AddDataFile(AddDataFile {
             fragment,
-            file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+            file: one_column_file("data/new.lance"),
             field_ids: vec![FieldRef::Committed(0)],
             data_change: true,
             base: Some(base),
@@ -1973,11 +2020,14 @@ mod tests {
         assert!(error.to_string().contains("read version"), "{error}");
     }
 
-    /// `backed_manifest` plus a nullable field 1 that fragment 0 stores no
-    /// data for, which is allowed while the field is nullable.
+    /// `backed_manifest` with its stored field 0 required, plus a nullable
+    /// field 1 that fragment 0 stores no data for, which is allowed while the
+    /// field is nullable.
     fn manifest_with_an_unstored_nullable_field() -> Manifest {
+        let mut manifest = backed_manifest();
+        manifest.schema.field_by_id_mut(0).unwrap().nullable = false;
         apply(
-            &backed_manifest(),
+            &manifest,
             vec![Action::AddField(AddField {
                 local: 0,
                 parent: None,

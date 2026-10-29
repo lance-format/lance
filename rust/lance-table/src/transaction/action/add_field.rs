@@ -123,16 +123,15 @@ impl TryFrom<pb_actions::AddField> for AddField {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::DataFile;
-    use crate::transaction::action::test_support::{added_field, apply};
+    use crate::transaction::action::test_support::{
+        added_field, apply, one_column_file, unbacked_manifest,
+    };
     use crate::transaction::action::{Action, AddDataFile, Ref};
-    use crate::transaction::test_support::sample_manifest;
     use arrow_schema::{DataType, Field as ArrowField};
-    use lance_file::version::ConcreteFileVersion;
 
     #[test]
     fn test_two_add_fields_mint_distinct_ids() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let next = apply(
             &manifest,
             vec![
@@ -163,7 +162,7 @@ mod tests {
     fn test_add_field_then_add_its_data_file() {
         // The add-column shape: mint the field, then write the file that backs
         // it, naming the field by the token the mint has not resolved yet.
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let next = apply(
             &manifest,
             vec![
@@ -174,7 +173,7 @@ mod tests {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(0),
-                    file: DataFile::new_unstarted("data/added.lance", ConcreteFileVersion::V2_0),
+                    file: one_column_file("data/added.lance"),
                     field_ids: vec![FieldRef::Local(7)],
                     data_change: true,
                     base: None,
@@ -191,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_add_field_under_a_parent() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let next = apply(
             &manifest,
             vec![
@@ -222,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_add_field_rejects_a_missing_parent() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
             vec![Action::AddField(AddField {
@@ -241,7 +240,7 @@ mod tests {
     #[test]
     fn test_add_field_rejects_a_name_a_sibling_already_has() {
         // `sample_manifest` already has a top-level field called "id".
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
             vec![Action::AddField(AddField {
@@ -313,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_local_token_is_rejected() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
             vec![

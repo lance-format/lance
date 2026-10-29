@@ -99,7 +99,10 @@ mod tests {
         let mut fragment = Fragment::new(1);
         fragment.physical_rows = Some(10);
         fragment.row_id_meta = Some(row_id_meta(0..10));
-        make_stable_row_id_manifest(vec![fragment])
+        let mut manifest = make_stable_row_id_manifest(vec![fragment]);
+        // These tests add fragments without data, which a required column forbids.
+        manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
+        manifest
     }
 
     #[test]

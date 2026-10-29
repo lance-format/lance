@@ -213,22 +213,23 @@ mod tests {
     use crate::format::RowIdMeta;
     use crate::rowids::write_row_ids;
     use crate::transaction::action::test_support::{
-        added_field, apply, backed_manifest, manifest_with_base, mint_base,
+        added_field, apply, backed_manifest, manifest_with_base, mint_base, one_column_file,
+        unbacked_manifest,
     };
     use crate::transaction::action::{Action, AddField, AddFragment, TombstoneFieldData};
-    use crate::transaction::test_support::{make_stable_row_id_manifest, sample_manifest};
+    use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
     #[test]
     fn test_add_data_file_rejects_an_unbound_local_token() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(3),
-                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                file: one_column_file("data/x.lance"),
                 field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
                 base: None,
@@ -245,12 +246,12 @@ mod tests {
     /// embedded file could only disagree with it.
     #[test]
     fn test_add_data_file_rejects_a_file_carrying_its_own_field_ids() {
-        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
+        let mut file = one_column_file("data/x.lance");
         file.fields = vec![0].into();
         file.column_indices = vec![0].into();
 
         let error = apply(
-            &sample_manifest(),
+            &unbacked_manifest(),
             vec![
                 Action::AddFragment(AddFragment {
                     id: Ref::Local(0),
@@ -309,7 +310,7 @@ mod tests {
         #[case] mint_base_first: bool,
         #[case] expected: std::result::Result<Option<u32>, &str>,
     ) {
-        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
+        let mut file = one_column_file("data/x.lance");
         file.base_id = embedded_base_id;
         let mut actions = Vec::new();
         if mint_base_first {
@@ -360,7 +361,10 @@ mod tests {
     fn file_binding(fragment: Ref, field_ids: &[i32]) -> Action {
         Action::AddDataFile(AddDataFile {
             fragment,
-            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+            file: DataFile {
+                column_indices: (0..).take(field_ids.len()).collect(),
+                ..DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0)
+            },
             field_ids: field_ids.iter().copied().map(FieldRef::Committed).collect(),
             data_change: true,
             base: None,
@@ -475,7 +479,7 @@ mod tests {
                 arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true),
             ]))
             .unwrap();
-        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
+        let mut file = one_column_file("data/x.lance");
         file.column_indices = column_indices.into();
 
         let result = apply(
@@ -509,8 +513,8 @@ mod tests {
 
     #[test]
     fn test_add_data_file_rejects_a_column_count_mismatch() {
-        let manifest = sample_manifest();
-        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
+        let manifest = unbacked_manifest();
+        let mut file = one_column_file("data/x.lance");
         file.column_indices = vec![0, 1].into();
 
         let error = apply(
@@ -534,12 +538,12 @@ mod tests {
 
     #[test]
     fn test_add_data_file_rejects_a_missing_fragment() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(7),
-                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                file: one_column_file("data/x.lance"),
                 field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
                 base: None,
@@ -554,7 +558,7 @@ mod tests {
     fn add_file_for_field_zero() -> Action {
         Action::AddDataFile(AddDataFile {
             fragment: Ref::Committed(0),
-            file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+            file: one_column_file("data/new.lance"),
             field_ids: vec![FieldRef::Committed(0)],
             data_change: true,
             base: None,

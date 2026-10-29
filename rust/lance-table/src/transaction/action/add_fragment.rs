@@ -232,16 +232,14 @@ impl TryFrom<pb_actions::AddFragment> for AddFragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::DataFile;
     use crate::format::IndexMetadata;
     use crate::rowids::version::RowDatasetVersionSequence;
     use crate::rowids::write_row_ids;
-    use crate::transaction::action::test_support::{apply, apply_with_indices};
-    use crate::transaction::action::{Action, AddDataFile, FieldRef, ReserveFragmentIds};
-    use crate::transaction::test_support::{
-        make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
+    use crate::transaction::action::test_support::{
+        apply, apply_with_indices, one_column_file, unbacked_manifest,
     };
-    use lance_file::version::ConcreteFileVersion;
+    use crate::transaction::action::{Action, AddDataFile, FieldRef, ReserveFragmentIds};
+    use crate::transaction::test_support::{make_stable_row_id_manifest, sample_index_metadata};
     use roaring::RoaringBitmap;
     use rstest::rstest;
 
@@ -258,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_add_fragment_and_data_file_mint_ids() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let next = apply(
             &manifest,
             vec![
@@ -272,7 +270,7 @@ mod tests {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
-                    file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    file: one_column_file("data/new.lance"),
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                     base: None,
@@ -299,7 +297,7 @@ mod tests {
         // What a writer that needs the id up front does: reserve in one commit,
         // read the high-water mark back, then name the id in the next.
         let reserved = apply(
-            &sample_manifest(),
+            &unbacked_manifest(),
             vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
         )
         .unwrap();
@@ -320,7 +318,7 @@ mod tests {
     fn test_an_unreserved_id_is_rejected() {
         // sample_manifest holds fragment 0 and nothing is reserved, so 1 is the
         // next id a mint would hand out -- claiming it would collide.
-        let error = apply(&sample_manifest(), vec![add_fragment(Ref::Committed(1))]).unwrap_err();
+        let error = apply(&unbacked_manifest(), vec![add_fragment(Ref::Committed(1))]).unwrap_err();
 
         assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
         assert!(
@@ -341,7 +339,7 @@ mod tests {
         Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 }),
     ])]
     fn test_an_id_reserved_in_the_same_operation_cannot_be_claimed(#[case] actions: Vec<Action>) {
-        let error = apply(&sample_manifest(), actions).unwrap_err();
+        let error = apply(&unbacked_manifest(), actions).unwrap_err();
 
         assert!(
             error.to_string().contains("no commit has reserved"),
@@ -361,7 +359,7 @@ mod tests {
         #[case] expected_error: Option<&str>,
     ) {
         let reserved = apply(
-            &sample_manifest(),
+            &unbacked_manifest(),
             vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
         )
         .unwrap();
@@ -394,7 +392,7 @@ mod tests {
     #[test]
     fn test_an_id_already_in_use_is_rejected() {
         let reserved = apply(
-            &sample_manifest(),
+            &unbacked_manifest(),
             vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
         )
         .unwrap();
@@ -415,7 +413,7 @@ mod tests {
     #[test]
     fn test_a_reserved_id_can_back_a_data_file_in_the_same_operation() {
         let reserved = apply(
-            &sample_manifest(),
+            &unbacked_manifest(),
             vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
         )
         .unwrap();
@@ -428,7 +426,7 @@ mod tests {
                     // The same reference the AddFragment carried, so a writer
                     // does not need a local token alongside the reserved id.
                     fragment: Ref::Committed(1),
-                    file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    file: one_column_file("data/new.lance"),
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                     base: None,
@@ -494,9 +492,12 @@ mod tests {
         #[case] missing: Option<&str>,
     ) {
         let manifest = if stable_row_ids {
-            make_stable_row_id_manifest(vec![])
+            let mut manifest = make_stable_row_id_manifest(vec![]);
+            // The moved fragment carries no data, which a required column forbids.
+            manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
+            manifest
         } else {
-            sample_manifest()
+            unbacked_manifest()
         };
 
         let result = apply(&manifest, vec![action]);

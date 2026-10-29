@@ -45,10 +45,19 @@ pub(super) fn added_field(name: &str) -> Field {
     Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap()
 }
 
-/// `sample_manifest` with fragment 0 actually backed by a data file, so the
+/// A one-column table whose fragment 0 has no data files. The column is
+/// nullable, so a fragment may be added without data for it, which lets tests
+/// about ids and reservations skip writing any.
+pub(super) fn unbacked_manifest() -> Manifest {
+    let mut manifest = sample_manifest();
+    manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
+    manifest
+}
+
+/// `unbacked_manifest` with fragment 0 actually backed by a data file, so the
 /// reference-stable actions have something committed to point at.
 pub(super) fn backed_manifest() -> Manifest {
-    let mut manifest = sample_manifest();
+    let mut manifest = unbacked_manifest();
     let mut fragment = Fragment::new(0);
     fragment.physical_rows = Some(10);
     fragment.files.push(DataFile::new(
@@ -81,4 +90,14 @@ pub(super) fn mint_base() -> Action {
         local: 0,
         base: BasePath::new(0, "s3://bucket/minted".into(), None, false),
     })
+}
+
+/// A v2 data file with one top-level column, as a writer hands it to
+/// `AddDataFile`. A v2 file with no column indices stores nothing a reader can
+/// find, so it would not back the field it names.
+pub(super) fn one_column_file(path: &str) -> DataFile {
+    DataFile {
+        column_indices: Arc::from([0]),
+        ..DataFile::new_unstarted(path, ConcreteFileVersion::V2_0)
+    }
 }
