@@ -58,12 +58,13 @@ mod tests {
     use crate::transaction::action::test_support::frag_reuse::{
         compaction, history, ordered, read_history, recorded, survivors, table,
     };
-    use crate::transaction::action::test_support::{apply_with_indices, footprint};
+    use crate::transaction::action::test_support::{
+        apply_with_indices, footprint, one_column_file,
+    };
     use crate::transaction::action::{
         Action, AddDataFile, AddOverlays, FieldRef, Ref, TombstoneFieldData,
     };
     use crate::transaction::test_support::sample_index_metadata;
-    use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
     fn trim() -> Action {
@@ -163,7 +164,7 @@ mod tests {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(0),
-                    file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    file: one_column_file("data/new.lance"),
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                     base: None,
