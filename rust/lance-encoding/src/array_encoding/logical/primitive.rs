@@ -511,11 +511,10 @@ impl PrimitiveFieldEncoder {
         field: Field,
     ) -> Result<Self> {
         Ok(Self {
-            accumulation_queue: AccumulationQueue::new_with_shared_slice_retention(
+            accumulation_queue: AccumulationQueue::new(
                 options.cache_bytes_per_column,
                 column_index,
                 options.keep_original_array,
-                true,
             ),
             column_index,
             max_page_bytes: options.max_page_bytes,
@@ -608,11 +607,8 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        if let Some(page) = self
-            .accumulation_queue
-            .insert_with_page_info(array, row_number, num_rows)
-        {
-            Ok(self.do_flush(page.arrays)?)
+        if let Some(arrays) = self.accumulation_queue.insert(array, row_number, num_rows) {
+            Ok(self.do_flush(arrays.0)?)
         } else {
             Ok(vec![])
         }
