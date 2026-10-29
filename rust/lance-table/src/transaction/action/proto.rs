@@ -30,6 +30,17 @@ pub(super) fn required<T>(value: Option<T>, what: &str) -> Result<T> {
     value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
 }
 
+/// A required string field. Protobuf gives an unset string the empty value, so
+/// the two cases cannot be told apart and neither is usable.
+pub(super) fn non_empty(value: String, what: &str) -> Result<String> {
+    if value.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "{what} is required but was empty"
+        )));
+    }
+    Ok(value)
+}
+
 impl From<Ref> for pb_actions::Ref {
     fn from(value: Ref) -> Self {
         let kind = match value {
@@ -166,18 +177,22 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, RowIdMeta};
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
-        FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        SetDeletionFile, TombstoneFieldData,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
+    use chrono::DateTime;
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn sample_data_file() -> DataFile {
         DataFile::new_unstarted("data/1.lance", ConcreteFileVersion::V2_0)
@@ -239,6 +254,43 @@ mod tests {
             }),
             Action::DropField(DropField {
                 field: FieldRef::Committed(3),
+            }),
+            Action::AddIndexSegment(AddIndexSegment {
+                uuid: Uuid::from_u128(7),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                covering_fields: vec![FieldRef::Local(3)],
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
+                    value: vec![1, 2, 3],
+                })),
+                index_version: 2,
+                covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
+                files: vec![IndexFile {
+                    path: "index.idx".into(),
+                    size_bytes: 512,
+                    file_metadata_size_bytes: std::num::NonZero::new(128),
+                }],
+                base: Some(Ref::Local(1)),
+                created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
+                dataset_version: Some(3),
+                data_change: false,
+            }),
+            Action::RemoveIndexSegment(RemoveIndexSegment {
+                uuid: Uuid::from_u128(8),
+                name: "by_a".into(),
+                data_change: true,
+            }),
+            Action::DropIndex(DropIndex {
+                name: "by_c".into(),
+            }),
+            Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid: Uuid::from_u128(9),
+                name: "by_b".into(),
+                add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
+                remove_fragments: vec![2, 3],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: vec![FieldRef::Committed(1)],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
@@ -314,6 +366,46 @@ mod tests {
         let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
         assert!(
             error.to_string().contains("was empty"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::addition(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AddIndexSegment(pb_actions::AddIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            ..Default::default()
+        })),
+    }, "AddIndexSegment.name")]
+    #[case::removal(pb_actions::Action {
+        action: Some(pb_actions::action::Action::RemoveIndexSegment(pb_actions::RemoveIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            data_change: None,
+        })),
+    }, "RemoveIndexSegment.name")]
+    #[case::coverage(pb_actions::Action {
+        action: Some(pb_actions::action::Action::AdjustIndexCoverage(pb_actions::AdjustIndexCoverage {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            add_fragments: Vec::new(),
+            remove_fragments: Vec::new(),
+            fields: Vec::new(),
+            covering_fields: Vec::new(),
+        })),
+    }, "AdjustIndexCoverage.name")]
+    fn test_an_index_action_without_a_name_is_rejected(
+        #[case] message: pb_actions::Action,
+        #[case] expected: &str,
+    ) {
+        // Protobuf cannot tell an unset string from an empty one, and an index
+        // action that does not say which index it edits cannot be checked for
+        // conflicts.
+        let error = Action::try_from(message).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(expected),
             "unexpected message: {error}"
         );
     }
