@@ -28,12 +28,11 @@ dataset.create_scalar_index("id", "BTREE")
 # A BM25 full-text index on a text column
 dataset.create_scalar_index("text", "INVERTED", with_position=True)
 
-# An IVF_PQ vector index on a fixed-size vector column
+# An IVF_RQ vector index on a fixed-size vector column
 dataset.create_index(
     "vector",
-    index_type="IVF_PQ",
+    index_type="IVF_RQ",
     num_partitions=256,
-    num_sub_vectors=16,
 )
 ```
 

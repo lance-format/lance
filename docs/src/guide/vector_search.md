@@ -48,13 +48,26 @@ All `IVF_*` indexes first partition vectors with an inverted-file (IVF) coarse q
 | `IVF_HNSW_SQ` | Scalar-quantized vectors plus HNSW graph | Graph search with compressed candidate storage | More build parameters and graph overhead |
 | `IVF_HNSW_PQ` | Product-quantized vectors plus HNSW graph | Graph search with small candidate storage | Quantization and graph tuning both affect recall |
 
-Start with `IVF_PQ` for a compact general-purpose ANN index, `IVF_RQ` when RaBitQ's recall/storage profile fits the workload, or `IVF_HNSW_SQ` when graph search is useful. Validate the choice against measured recall and latency on representative data rather than selecting by index size alone.
+**Start with `IVF_RQ` for most vector-search workloads.** It provides compact storage and multi-bit distance estimates without requiring PQ sub-vector configuration. Use `IVF_PQ` when its smaller index footprint or GPU-accelerated training is important, and `IVF_HNSW_*` when graph-based search fits your latency and recall requirements. Validate the choice against measured recall and latency on representative data rather than selecting by index size alone.
 
 See [Performance Guide](performance.md#vector-index) for index-size formulas and training memory estimates.
 
 ## Create a Vector Index
 
-Create an `IVF_PQ` index:
+Create an `IVF_RQ` index with the default 5-bit RaBitQ configuration:
+
+```python
+dataset.create_index(
+    "vector",
+    index_type="IVF_RQ",
+    metric="l2",
+    num_partitions=256,
+)
+```
+
+The default `num_bits=5` is a good starting point for recall. Use `num_bits=1` when minimizing index size and build I/O is more important, then measure recall because searches cannot use the multi-bit distance estimate.
+
+Create an `IVF_PQ` or `IVF_HNSW_SQ` index when those alternatives better fit your workload:
 
 ```python
 dataset.create_index(
@@ -63,18 +76,6 @@ dataset.create_index(
     metric="l2",
     num_partitions=256,
     num_sub_vectors=16,
-)
-```
-
-Create an `IVF_RQ` or `IVF_HNSW_SQ` index:
-
-```python
-dataset.create_index(
-    "vector",
-    index_type="IVF_RQ",
-    metric="l2",
-    num_partitions=256,
-    num_bits=5,
 )
 
 dataset.create_index(
