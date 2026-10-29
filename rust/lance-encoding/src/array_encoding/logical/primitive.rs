@@ -607,11 +607,14 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        if let Some(arrays) = self.accumulation_queue.insert(array, row_number, num_rows) {
-            Ok(self.do_flush(arrays.0)?)
-        } else {
-            Ok(vec![])
+        let mut tasks = Vec::new();
+        for page in self
+            .accumulation_queue
+            .insert_with_pages(array, row_number, num_rows)
+        {
+            tasks.extend(self.do_flush(page.arrays)?);
         }
+        Ok(tasks)
     }
 
     // If there is any data left in the buffer then create an encode task from it

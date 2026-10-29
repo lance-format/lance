@@ -11,8 +11,6 @@ use arrow_schema::DataType;
 use lance_arrow::deepcopy::{deep_copy_array, deep_copy_array_sliced};
 use log::{debug, trace};
 
-const MAX_DETACHED_SLICE_PAGE_BYTES: u64 = 1024 * 1024;
-
 // Value buffers are rounded to 64 bytes; compact validity buffers use exact byte lengths.
 // Inspect lengths without building ArrayData, so the copy decision requires no allocations.
 fn flat_copy_sizes(array: &dyn Array) -> Option<(usize, usize)> {
@@ -70,9 +68,16 @@ fn byte_copy_sizes<T: ByteArrayType>(array: &GenericByteArray<T>) -> (usize, usi
 }
 
 #[derive(Debug)]
+pub(crate) struct AccumulatedPage {
+    pub(crate) arrays: Vec<ArrayRef>,
+    pub(crate) row_number: u64,
+    pub(crate) num_rows: u64,
+    pub(crate) includes_inserted_array: bool,
+}
+
+#[derive(Debug)]
 pub struct AccumulationQueue {
     cache_bytes: u64,
-    page_limit: u64,
     keep_original_array: bool,
     buffered_arrays: Vec<ArrayRef>,
     current_bytes: u64,
@@ -88,7 +93,6 @@ impl AccumulationQueue {
     pub fn new(cache_bytes: u64, column_index: u32, keep_original_array: bool) -> Self {
         Self {
             cache_bytes,
-            page_limit: cache_bytes,
             buffered_arrays: Vec::new(),
             current_bytes: 0,
             column_index,
@@ -110,14 +114,7 @@ impl AccumulationQueue {
         if !self.keep_original_array {
             match flat_copy_sizes(array.as_ref()) {
                 Some((copied_bytes, compacted_bytes)) => {
-                    if array.get_array_memory_size() > compacted_bytes {
-                        // The source array, its detached page copy, and the
-                        // encoder output can all be live at the same time.
-                        // Keep copied-slice pages bounded instead of letting
-                        // all three use the full per-column cache budget.
-                        self.page_limit = self.page_limit.min(MAX_DETACHED_SLICE_PAGE_BYTES);
-                    }
-                    let remaining_bytes = self.page_limit.saturating_sub(self.current_bytes);
+                    let remaining_bytes = self.remaining_bytes();
                     if copied_bytes <= compacted_bytes && copied_bytes as u64 <= remaining_bytes {
                         array = deep_copy_array(array.as_ref());
                     } else if compacted_bytes as u64 <= remaining_bytes {
@@ -128,9 +125,7 @@ impl AccumulationQueue {
                     }
                 }
                 // Nested and view arrays retain their existing copy policy.
-                None if array.get_array_memory_size() as u64
-                    <= self.page_limit.saturating_sub(self.current_bytes) =>
-                {
+                None if array.get_array_memory_size() as u64 <= self.remaining_bytes() => {
                     array = deep_copy_array(array.as_ref());
                 }
                 None => {}
@@ -142,13 +137,12 @@ impl AccumulationQueue {
         self.num_rows += num_rows;
         self.current_bytes += array.get_array_memory_size() as u64;
         self.buffered_arrays.push(array);
-        if is_full || self.current_bytes > self.page_limit {
+        if is_full || self.current_bytes > self.cache_bytes {
             debug!(
                 "Flushing column {} page of size {} bytes (unencoded)",
                 self.column_index, self.current_bytes
             );
             self.current_bytes = 0;
-            self.page_limit = self.cache_bytes;
             let row_number = self.row_number;
             self.row_number = u64::MAX;
             let num_rows = self.num_rows;
@@ -167,6 +161,64 @@ impl AccumulationQueue {
         }
     }
 
+    pub(crate) fn insert_with_pages(
+        &mut self,
+        mut array: ArrayRef,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Vec<AccumulatedPage> {
+        let mut pages = Vec::with_capacity(2);
+        if !self.keep_original_array && !self.buffered_arrays.is_empty() {
+            let required_bytes = match flat_copy_sizes(array.as_ref()) {
+                Some((_, compacted_bytes)) => compacted_bytes as u64,
+                None => array.get_array_memory_size() as u64,
+            };
+            if required_bytes > self.remaining_bytes()
+                && let Some(page) = self.take_page(false)
+            {
+                // Do not join a borrowed input that cannot fit to a page whose
+                // buffered values are already detached copies.  Encoding that
+                // mixed page keeps the foreign source allocation alive while
+                // both the copied input and the encoded output are resident.
+                pages.push(page);
+            }
+        }
+
+        let mut is_full = false;
+        if !self.keep_original_array {
+            match flat_copy_sizes(array.as_ref()) {
+                Some((copied_bytes, compacted_bytes)) => {
+                    let remaining_bytes = self.remaining_bytes();
+                    if copied_bytes <= compacted_bytes && copied_bytes as u64 <= remaining_bytes {
+                        array = deep_copy_array(array.as_ref());
+                    } else if compacted_bytes as u64 <= remaining_bytes {
+                        array = deep_copy_array_sliced(array.as_ref());
+                    } else {
+                        // Copy alignment can exceed the budget even when the original fits.
+                        is_full = true;
+                    }
+                }
+                // Nested and view arrays retain their existing copy policy.
+                None if array.get_array_memory_size() as u64 <= self.remaining_bytes() => {
+                    array = deep_copy_array(array.as_ref());
+                }
+                None => {}
+            }
+        }
+        if self.row_number == u64::MAX {
+            self.row_number = row_number;
+        }
+        self.num_rows += num_rows;
+        self.current_bytes += array.get_array_memory_size() as u64;
+        self.buffered_arrays.push(array);
+        if (is_full || self.current_bytes > self.cache_bytes)
+            && let Some(page) = self.take_page(true)
+        {
+            pages.push(page);
+        }
+        pages
+    }
+
     pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.buffered_arrays.is_empty() {
             trace!(
@@ -180,7 +232,6 @@ impl AccumulationQueue {
                 self.column_index, self.current_bytes
             );
             self.current_bytes = 0;
-            self.page_limit = self.cache_bytes;
             let row_number = self.row_number;
             self.row_number = u64::MAX;
             let num_rows = self.num_rows;
@@ -191,6 +242,28 @@ impl AccumulationQueue {
                 num_rows,
             ))
         }
+    }
+
+    fn remaining_bytes(&self) -> u64 {
+        self.cache_bytes.saturating_sub(self.current_bytes)
+    }
+
+    fn take_page(&mut self, includes_inserted_array: bool) -> Option<AccumulatedPage> {
+        if self.buffered_arrays.is_empty() {
+            self.current_bytes = 0;
+            return None;
+        }
+        self.current_bytes = 0;
+        let row_number = self.row_number;
+        self.row_number = u64::MAX;
+        let num_rows = self.num_rows;
+        self.num_rows = 0;
+        Some(AccumulatedPage {
+            arrays: std::mem::take(&mut self.buffered_arrays),
+            row_number,
+            num_rows,
+            includes_inserted_array,
+        })
     }
 }
 
@@ -270,23 +343,47 @@ mod tests {
     }
 
     #[test]
-    fn test_detached_slice_pages_use_bounded_buffer() {
-        let parent: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..262_144));
-        let slice = parent.slice(0, 32_768);
-        let mut queue = AccumulationQueue::new(8 * 1024 * 1024, 0, false);
-        let mut pages = 0;
+    fn test_preflush_keeps_detached_copies_out_of_borrowed_page() {
+        let parent: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..4096));
+        let slice = parent.slice(17, 32);
+        let copied_bytes = deep_copy_array_sliced(slice.as_ref()).get_array_memory_size() as u64;
+        let mut queue = AccumulationQueue::new(copied_bytes * 3 / 2, 0, false);
 
-        for index in 0..16 {
-            if queue
-                .insert(slice.clone(), index * 32_768, 32_768)
-                .is_some()
-            {
-                pages += 1;
-            }
-        }
-        pages += usize::from(queue.flush().is_some());
+        assert!(queue.insert_with_pages(slice.clone(), 17, 32).is_empty());
+        let pages = queue.insert_with_pages(slice.clone(), 49, 32);
+        assert_eq!(pages.len(), 1);
+        assert!(!pages[0].includes_inserted_array);
+        assert_ne!(
+            pages[0].arrays[0].to_data().buffers()[0].data_ptr(),
+            slice.to_data().buffers()[0].data_ptr()
+        );
 
-        assert_eq!(pages, 4);
+        let (arrays, row_number, num_rows) = queue.flush().unwrap();
+        assert_eq!((row_number, num_rows), (49, 32));
+        assert_eq!(arrays[0].as_ref(), slice.as_ref());
+        assert_ne!(
+            arrays[0].to_data().buffers()[0].data_ptr(),
+            slice.to_data().buffers()[0].data_ptr()
+        );
+    }
+
+    #[test]
+    fn test_preflush_can_return_previous_and_current_pages() {
+        let parent: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..4096));
+        let slice = parent.slice(0, 32);
+        let copied_bytes = deep_copy_array_sliced(slice.as_ref()).get_array_memory_size() as u64;
+        let mut queue = AccumulationQueue::new(copied_bytes, 0, false);
+
+        assert!(queue.insert_with_pages(slice.clone(), 0, 32).is_empty());
+        let pages = queue.insert_with_pages(parent.clone(), 32, 4096);
+        assert_eq!(pages.len(), 2);
+        assert!(!pages[0].includes_inserted_array);
+        assert!(pages[1].includes_inserted_array);
+        assert_ne!(
+            pages[0].arrays[0].to_data().buffers()[0].data_ptr(),
+            slice.to_data().buffers()[0].data_ptr()
+        );
+        assert!(Arc::ptr_eq(&pages[1].arrays[0], &parent));
     }
 
     #[rstest]
