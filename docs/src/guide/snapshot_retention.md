@@ -64,10 +64,12 @@ to the same `SnapshotRetention` API used by ordinary scans.
 
 ## Maintenance lock expiration
 
-Acquisition, release, and cleanup coordinate through a table-root maintenance
-lock across branches and processes. Acquisition and release hold shared locks,
-so independent queries do not exclude each other. Cleanup holds an exclusive lock
-for its entire run and excludes both operations. Workers reading retained files
+Acquisition, release, cleanup, and ordinary branch deletion coordinate through a
+table-root maintenance lock across branches and processes. Acquisition and release
+hold shared locks, so independent queries do not exclude each other. Cleanup and
+ordinary branch deletion hold exclusive locks for their entire runs. Branch
+deletion keeps its lock through the tag check and physical deletion, so it cannot
+invalidate a successfully retained branch snapshot. Workers reading retained files
 do not hold the maintenance lock.
 
 Maintenance owners have a **fixed lifetime of 120 hours** by default. Set the
@@ -153,10 +155,11 @@ A retirement marker prevents later acquisition when partial cleanup has deleted
 payloads but left their manifest on storage. Markers are cleared only after the
 corresponding manifest has been deleted.
 
-Every cleanup client must participate in the current protocol, including automatic
-and branch cleanup. Stop or exclude older clients and already-open older handles
-before enabling this guarantee. A capability check cannot revoke an older client's
-permission to delete files. Forced table/branch deletion, manual tag modification,
+Every client that performs cleanup or ordinary branch deletion must participate
+in the current protocol. This includes automatic and branch cleanup. Stop or
+exclude older clients and already-open older handles before enabling this
+guarantee. A capability check cannot revoke an older client's permission to delete
+files. Forced table/branch deletion, manual tag modification,
 and deletion outside Lance are excluded.
 
 Storage must provide atomic conditional creation and consistent reads/listing.
@@ -171,8 +174,8 @@ immutability/lifetime contracts.
 
 `SnapshotMaintenanceLock` is available as a Rust hook for maintenance coordinators.
 Call `check_valid()` before protected work and bound all submitted operations.
-Do not call acquisition, release, or cleanup while already holding the hook: those
-operations acquire the same lock themselves.
+Do not call acquisition, release, cleanup, or ordinary branch deletion while
+already holding the hook: those operations acquire the same lock themselves.
 
 ## Recovery after interruption
 

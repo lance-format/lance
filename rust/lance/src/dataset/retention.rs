@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Explicit-release snapshot retention coordinated with dataset cleanup.
+//! Explicit-release snapshot retention coordinated with cleanup and branch deletion.
 //!
-//! All cleanup clients must use this coordination protocol. Older maintenance
-//! clients, forced branch/table deletion, and deletion outside Lance are excluded.
+//! All cleanup and ordinary branch deletion clients must use this protocol.
+//! Older clients, forced branch/table deletion, and deletion outside Lance are excluded.
 //! See the [deployment contract](https://lance.org/guide/snapshot_retention/).
 
 use std::collections::HashMap;
@@ -15,6 +15,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
+use lance_table::io::manifest::read_manifest;
 use object_store::{Error as StoreError, ObjectStoreExt, path::Path};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ use tracing::warn;
 use crate::Dataset;
 use crate::dataset::snapshot::{SnapshotIdentity, canonical_uri, pb};
 
-use crate::dataset::refs::{TagContents, tag_path};
+use crate::dataset::refs::{Refs, TagContents, tag_path};
 use crate::utils::temporal::utc_now;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -63,8 +64,8 @@ pub(crate) struct MaintenanceDeadline {
 }
 
 impl MaintenanceDeadline {
-    fn from_dataset(dataset: &Dataset) -> Result<Self> {
-        let hours = dataset.manifest().config.get(LOCK_EXPIRATION_HOURS_KEY)
+    fn from_config(config: &HashMap<String, String>) -> Result<Self> {
+        let hours = config.get(LOCK_EXPIRATION_HOURS_KEY)
             .map(|value| value.parse::<u64>().map_err(|error| Error::invalid_input(format!("{LOCK_EXPIRATION_HOURS_KEY} must be a positive integer in hours, got {value:?}: {error}"))))
             .transpose()?.unwrap_or(DEFAULT_LOCK_EXPIRATION_HOURS);
         let lifetime = i64::try_from(hours).ok().filter(|hours| *hours > 0)
@@ -103,17 +104,17 @@ impl MaintenanceDeadline {
 pub(crate) type MaintenanceDelete =
     dyn Fn(Arc<ObjectStore>, Path) -> BoxFuture<'static, Result<()>> + Send + Sync;
 
-fn retention_dir(dataset: &Dataset) -> Result<Path> {
-    Ok(dataset.refs.root()?.path.join("_refs").join("retention-v1"))
+fn retention_dir(refs: &Refs) -> Result<Path> {
+    Ok(refs.root()?.path.join("_refs").join("retention-v1"))
 }
 
 fn retirement_path(dataset: &Dataset, manifest: &Path) -> Result<Path> {
-    Ok(retention_dir(dataset)?
+    Ok(retention_dir(&dataset.refs)?
         .join("retiring")
         .join(blake3::hash(manifest.as_ref().as_bytes()).to_hex().as_str()))
 }
 
-/// A storage-backed fence between snapshot retention operations and cleanup.
+/// A storage-backed fence between snapshot retention, cleanup, and ordinary branch deletion.
 /// Public acquisition is exclusive; query acquisition and release share the fence.
 ///
 /// Contention returns [`Error::RefConflict`]; callers may retry the whole operation.
@@ -128,8 +129,9 @@ fn retirement_path(dataset: &Dataset, manifest: &Path) -> Result<Path> {
 /// expired owner must stop work; expiry cannot cancel an already submitted delete.
 ///
 /// This hook also lets a maintenance coordinator serialize its own operations with
-/// Lance. While holding it, do not call cleanup or retention acquisition, which
-/// acquire the same lock. It does not protect files from uncoordinated deletion.
+/// Lance. While holding it, do not call cleanup, ordinary branch deletion, or
+/// retention acquisition, which acquire the same lock. It does not protect files
+/// from uncoordinated deletion.
 ///
 /// ```
 /// # use lance::{Dataset, Result};
@@ -158,7 +160,30 @@ impl SnapshotMaintenanceLock {
         if dataset.object_store.scheme() == "cos" {
             return Ok(None);
         }
-        Self::acquire_inner(dataset, Some(delete), MaintenanceMode::Exclusive)
+        Self::acquire_inner(
+            &dataset.refs,
+            &dataset.manifest().config,
+            Some(delete),
+            MaintenanceMode::Exclusive,
+        )
+        .await
+        .map(Some)
+    }
+
+    pub(crate) async fn for_branch_deletion(refs: &Refs) -> Result<Option<Self>> {
+        // COS cannot acquire retention, so preserve ordinary branch management there.
+        if refs.object_store.scheme() == "cos" {
+            return Ok(None);
+        }
+        // Reference handles have no loaded manifest. Use their authenticated store
+        // and commit handler to read the latest table-root maintenance configuration.
+        let root = refs.root()?;
+        let location = refs
+            .commit_handler
+            .resolve_latest_location(&root.path, &refs.object_store)
+            .await?;
+        let manifest = read_manifest(&refs.object_store, &location.path, location.size).await?;
+        Self::acquire_inner(refs, &manifest.config, None, MaintenanceMode::Exclusive)
             .await
             .map(Some)
     }
@@ -166,22 +191,35 @@ impl SnapshotMaintenanceLock {
     /// Acquire the exclusive table-root fence across all branches and worker processes.
     /// Storage must implement atomic conditional creation and consistent reads/listing.
     pub async fn acquire(dataset: &Dataset) -> Result<Self> {
-        Self::acquire_inner(dataset, None, MaintenanceMode::Exclusive).await
+        Self::acquire_inner(
+            &dataset.refs,
+            &dataset.manifest().config,
+            None,
+            MaintenanceMode::Exclusive,
+        )
+        .await
     }
 
     async fn for_retention(dataset: &Dataset) -> Result<Self> {
-        Self::acquire_inner(dataset, None, MaintenanceMode::Shared).await
+        Self::acquire_inner(
+            &dataset.refs,
+            &dataset.manifest().config,
+            None,
+            MaintenanceMode::Shared,
+        )
+        .await
     }
 
     async fn acquire_inner(
-        dataset: &Dataset,
+        refs: &Refs,
+        config: &HashMap<String, String>,
         delete: Option<Arc<MaintenanceDelete>>,
         mode: MaintenanceMode,
     ) -> Result<Self> {
-        let directory = retention_dir(dataset)?.join("maintenance");
+        let directory = retention_dir(refs)?.join("maintenance");
         let owner = uuid::Uuid::new_v4().to_string();
         let path = directory.clone().join(owner.as_str());
-        let deadline = MaintenanceDeadline::from_dataset(dataset)?;
+        let deadline = MaintenanceDeadline::from_config(config)?;
         let mut record = MaintenanceOwner {
             ticket: 0,
             expires_at: deadline.expires_at,
@@ -190,7 +228,7 @@ impl SnapshotMaintenanceLock {
         // Zero announces that this owner is choosing a ticket. Every attempt has
         // its own key: a retried DELETE must never remove a subsequent owner's lock.
         let fence = Self {
-            store: dataset.object_store.clone(),
+            store: refs.object_store.clone(),
             path,
             delete,
             deadline,
@@ -380,6 +418,11 @@ impl SnapshotRetention {
         fence: &SnapshotMaintenanceLock,
     ) -> Result<()> {
         fence.check_valid()?;
+        if let Some(branch) = self.snapshot.branch() {
+            // Failed branch deletion can leave manifests after removing its registration.
+            // Do not acquire a new GC root for that abandoned version chain.
+            dataset.branches().get(branch).await?;
+        }
         let manifest_path = dataset.manifest_location().path.clone();
         let location = dataset
             .commit_handler
@@ -558,22 +601,31 @@ pub(crate) async fn clear_retiring(
 mod tests {
     use super::*;
 
-    use std::{sync::Mutex, time::Duration};
+    use std::{
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
 
     use arrow_array::{RecordBatchIterator, record_batch};
     use futures::TryStreamExt;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
+    use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore, uri_to_url};
     use mock_instant::thread_local::MockClock;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use rstest::rstest;
+    use tokio::sync::Notify;
 
     use crate::dataset::{WriteMode, WriteParams, cleanup::CleanupPolicyBuilder};
 
     #[derive(Debug)]
     struct MaintenanceTestStore {
         policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+        is_throttled: bool,
     }
 
     impl WrappingObjectStore for MaintenanceTestStore {
@@ -582,14 +634,19 @@ mod tests {
             _prefix: &str,
             store: Arc<dyn object_store::ObjectStore>,
         ) -> Arc<dyn object_store::ObjectStore> {
-            Arc::new(ThrottledStore::new(
-                Arc::new(ProxyObjectStore::new(store, self.policy.clone())),
-                ThrottleConfig {
-                    wait_put_per_call: Duration::from_millis(1),
-                    wait_get_per_call: Duration::from_millis(1),
-                    ..Default::default()
-                },
-            ))
+            let store = Arc::new(ProxyObjectStore::new(store, self.policy.clone()));
+            if self.is_throttled {
+                Arc::new(ThrottledStore::new(
+                    store,
+                    ThrottleConfig {
+                        wait_put_per_call: Duration::from_millis(1),
+                        wait_get_per_call: Duration::from_millis(1),
+                        ..Default::default()
+                    },
+                ))
+            } else {
+                store
+            }
         }
 
         fn wrap_paginated(
@@ -622,6 +679,7 @@ mod tests {
                 store_params: Some(ObjectStoreParams {
                     object_store_wrapper: Some(Arc::new(MaintenanceTestStore {
                         policy: policy.clone(),
+                        is_throttled: true,
                     })),
                     ..Default::default()
                 }),
@@ -649,6 +707,313 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg_attr(coverage, coverage(off))]
+    async fn branch_retention_dataset() -> (
+        tempfile::TempDir,
+        Dataset,
+        Dataset,
+        Arc<Mutex<ProxyObjectStorePolicy>>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        // Keep local read/list/delete shortcuts from bypassing the injected policies.
+        let uri = uri_to_url(directory.path().to_str().unwrap())
+            .unwrap()
+            .as_str()
+            .trim_end_matches('/')
+            .replacen("file:", "file-object-store:", 1);
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        let batch = record_batch!(("value", Int32, [1, 2])).unwrap();
+        let mut root = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            uri.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(MaintenanceTestStore {
+                        policy: policy.clone(),
+                        is_throttled: false,
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let branch = root.create_branch("dev", 1, None).await.unwrap();
+        // Overwrite the shallow clone so its retained files belong to this branch.
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            Arc::new(branch),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // This independently opened worker does not share the deletion hook's mutex.
+        let branch = Dataset::open(uri.as_str())
+            .await
+            .unwrap()
+            .checkout_branch("dev")
+            .await
+            .unwrap();
+        assert_eq!(branch.get_fragments().len(), 2);
+        (directory, root, branch, policy)
+    }
+
+    #[rstest]
+    #[case::dataset_from_main(true, false)]
+    #[case::refs_from_main(false, false)]
+    #[case::dataset_from_branch(true, true)]
+    #[case::refs_from_branch(false, true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn branch_deletion_excludes_retention_after_tag_check(
+        #[case] use_dataset_api: bool,
+        #[case] use_branch_handle: bool,
+    ) {
+        let (_directory, mut root, branch, policy) = branch_retention_dataset().await;
+        if use_branch_handle {
+            root = root.checkout_branch("dev").await.unwrap();
+        }
+        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
+            .await
+            .unwrap();
+        let manifest = branch.manifest_location().path.clone();
+        let reached = Arc::new(Notify::new());
+        let reached_hook = reached.clone();
+        let (resume, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        policy.lock().unwrap().set_before_policy(
+            "pause_branch_delete",
+            Arc::new(move |method, path| {
+                if method == "delete" && path.as_ref().ends_with("_refs/branches/dev.json") {
+                    reached_hook.notify_one();
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                }
+                Ok(())
+            }),
+        );
+        let deletion = tokio::spawn(async move {
+            if use_dataset_api {
+                root.delete_branch("dev").await
+            } else {
+                root.branches().delete("dev", false).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), reached.notified())
+            .await
+            .unwrap();
+        let retention = SnapshotRetention::acquire(&branch, snapshot, "during-delete").await;
+        resume.send(()).unwrap();
+        deletion.await.unwrap().unwrap();
+        assert!(
+            retention.is_err() || branch.object_store.exists(&manifest).await.unwrap(),
+            "Ordinary branch deletion invalidated a successfully retained snapshot"
+        );
+        let error = retention.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        assert!(error.to_string().contains("maintenance lock"), "{error}");
+        assert!(branch.tags().list().await.unwrap().is_empty());
+        assert!(!branch.object_store.exists(&manifest).await.unwrap());
+    }
+
+    #[rstest]
+    #[case::dataset_from_main(true, false)]
+    #[case::refs_from_main(false, false)]
+    #[case::dataset_from_branch(true, true)]
+    #[case::refs_from_branch(false, true)]
+    #[tokio::test]
+    async fn branch_deletion_preserves_retained_snapshots(
+        #[case] use_dataset_api: bool,
+        #[case] use_branch_handle: bool,
+    ) {
+        let (_directory, mut root, branch, _) = branch_retention_dataset().await;
+        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
+            .await
+            .unwrap();
+        let retained = SnapshotRetention::acquire(&branch, snapshot, "before-delete")
+            .await
+            .unwrap();
+        if use_branch_handle {
+            root = root.checkout_branch("dev").await.unwrap();
+        }
+        let result = if use_dataset_api {
+            root.delete_branch("dev").await
+        } else {
+            root.branches().delete("dev", false).await
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        assert!(error.to_string().contains(retained.tag_name()), "{error}");
+        assert!(
+            branch
+                .object_store
+                .exists(&branch.manifest_location().path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            branch.scan().try_into_batch().await.unwrap(),
+            record_batch!(("value", Int32, [1, 2])).unwrap()
+        );
+        // A tag-check failure must release the maintenance owner.
+        SnapshotMaintenanceLock::acquire(&root)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        retained.release(&branch).await.unwrap();
+        if use_dataset_api {
+            root.delete_branch("dev").await.unwrap();
+        } else {
+            root.branches().delete("dev", false).await.unwrap();
+        }
+        assert!(branch.branches().list().await.unwrap().is_empty());
+        assert!(branch.tags().list().await.unwrap().is_empty());
+        assert!(
+            !branch
+                .object_store
+                .exists(&branch.manifest_location().path)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_deletion_stops_at_root_configured_deadline() {
+        MockClock::set_system_time(Duration::from_secs(3600));
+        let (_directory, mut root, branch, policy) = branch_retention_dataset().await;
+        root.update_config([(LOCK_EXPIRATION_HOURS_KEY, "1")])
+            .await
+            .unwrap();
+        let deleting = root.checkout_branch("dev").await.unwrap();
+        assert!(
+            !deleting
+                .manifest()
+                .config
+                .contains_key(LOCK_EXPIRATION_HOURS_KEY)
+        );
+        let reads = AtomicUsize::new(0);
+        policy.lock().unwrap().set_before_policy(
+            "expire_before_branch_delete",
+            Arc::new(move |method, path| {
+                if method == "get_opts"
+                    && path.as_ref().ends_with("_refs/branches/dev.json")
+                    && reads.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    MockClock::advance_system_time(Duration::from_secs(2 * 3600));
+                }
+                Ok(())
+            }),
+        );
+        let error = deleting.branches().delete("dev", false).await.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }));
+        assert!(error.to_string().contains("expired"), "{error}");
+        assert!(branch.branches().get("dev").await.is_ok());
+        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
+            .await
+            .unwrap();
+        SnapshotRetention::acquire(&branch, snapshot, "after-expiration")
+            .await
+            .unwrap()
+            .release(&branch)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn branch_deletion_rejects_invalid_root_lock_expiration() {
+        let (_directory, mut root, branch, _) = branch_retention_dataset().await;
+        root.update_config([(LOCK_EXPIRATION_HOURS_KEY, "0")])
+            .await
+            .unwrap();
+        let error = root.branches().delete("dev", false).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(LOCK_EXPIRATION_HOURS_KEY),
+            "{error}"
+        );
+        assert!(branch.branches().get("dev").await.is_ok());
+        assert!(
+            root.object_store
+                .read_dir(retention_dir(&root.refs).unwrap().join("maintenance"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Forced deletion retains its existing uncoordinated recovery behavior.
+        root.force_delete_branch("dev").await.unwrap();
+        assert!(
+            !branch
+                .object_store
+                .exists(&branch.manifest_location().path)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_deletion_failure_does_not_allow_retention_of_leftover_manifest() {
+        let (directory, mut root, branch, policy) = branch_retention_dataset().await;
+        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
+            .await
+            .unwrap();
+        let branch_file = directory
+            .path()
+            .join("_refs")
+            .join("branches")
+            .join("dev.json");
+        policy.lock().unwrap().set_before_policy(
+            "lose_branch_delete_response",
+            Arc::new(move |method, path| {
+                if method == "delete" && path.as_ref().ends_with("_refs/branches/dev.json") {
+                    // Storage applied the metadata delete, but its response was lost.
+                    std::fs::remove_file(&branch_file)?;
+                    return Err(Error::io("injected lost branch deletion response"));
+                }
+                Ok(())
+            }),
+        );
+        let error = root.delete_branch("dev").await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected lost branch deletion response"),
+            "{error}"
+        );
+        assert!(
+            branch
+                .object_store
+                .exists(&branch.manifest_location().path)
+                .await
+                .unwrap()
+        );
+        let error = SnapshotRetention::acquire(&branch, snapshot, "after-failed-delete")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RefNotFound { .. }));
+        assert!(
+            error.to_string().contains("branch dev does not exist"),
+            "{error}"
+        );
+        assert!(branch.tags().list().await.unwrap().is_empty());
+        SnapshotMaintenanceLock::acquire(&root)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        root.force_delete_branch("dev").await.unwrap();
+    }
+
     #[rstest]
     #[case::exclusive(MaintenanceMode::Exclusive, MaintenanceMode::Exclusive)]
     #[case::reader_writer(MaintenanceMode::Shared, MaintenanceMode::Exclusive)]
@@ -661,8 +1026,18 @@ mod tests {
     ) {
         let (dataset, _) = maintenance_dataset().await;
         let (first, second) = tokio::join!(
-            SnapshotMaintenanceLock::acquire_inner(&dataset, None, first_mode),
-            SnapshotMaintenanceLock::acquire_inner(&dataset, None, second_mode)
+            SnapshotMaintenanceLock::acquire_inner(
+                &dataset.refs,
+                &dataset.manifest().config,
+                None,
+                first_mode
+            ),
+            SnapshotMaintenanceLock::acquire_inner(
+                &dataset.refs,
+                &dataset.manifest().config,
+                None,
+                second_mode
+            )
         );
         if first_mode == MaintenanceMode::Shared && second_mode == MaintenanceMode::Shared {
             assert!(first.is_ok() && second.is_ok());
@@ -768,7 +1143,7 @@ mod tests {
             .clear_after_put_policy("lost_owner_response");
         let owners = dataset
             .object_store
-            .read_dir(retention_dir(&dataset).unwrap().join("maintenance"))
+            .read_dir(retention_dir(&dataset.refs).unwrap().join("maintenance"))
             .await
             .unwrap();
         assert_eq!(owners, vec![active.path.filename().unwrap().to_string()]);
@@ -817,7 +1192,7 @@ mod tests {
             .lock()
             .unwrap()
             .clear_after_put_policy("lost_owner_response");
-        let directory = retention_dir(&dataset).unwrap().join("maintenance");
+        let directory = retention_dir(&dataset.refs).unwrap().join("maintenance");
         let owners = dataset
             .object_store
             .read_dir(directory.clone())
@@ -906,7 +1281,7 @@ mod tests {
         assert!(matches!(error, Error::RefConflict { .. }));
         assert!(error.to_string().contains("maintenance lock"));
         second.release().await.unwrap();
-        let choosing = retention_dir(&dataset)
+        let choosing = retention_dir(&dataset.refs)
             .unwrap()
             .join("maintenance")
             .join(uuid::Uuid::new_v4().to_string());
@@ -1192,7 +1567,7 @@ mod tests {
         let retention = SnapshotRetention::acquire(&dataset, snapshot, "query")
             .await
             .unwrap();
-        let path = retention_dir(&dataset)
+        let path = retention_dir(&dataset.refs)
             .unwrap()
             .join("maintenance")
             .join(uuid::Uuid::new_v4().to_string());
@@ -1243,7 +1618,7 @@ mod tests {
         assert!(
             dataset
                 .object_store
-                .read_dir(retention_dir(&dataset).unwrap().join("maintenance"))
+                .read_dir(retention_dir(&dataset.refs).unwrap().join("maintenance"))
                 .await
                 .unwrap()
                 .is_empty()
