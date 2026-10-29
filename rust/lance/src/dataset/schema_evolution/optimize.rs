@@ -14,7 +14,7 @@ use crate::Result;
 use super::NewColumnTransform;
 
 /// Optimizes a `NewColumnTransform` into
-pub(super) trait NewColumnTransformOptimizer: Send + Sync {
+pub trait NewColumnTransformOptimizer: Send + Sync {
     /// Optimize the passed `NewColumnTransform` to a more efficient form.
     fn optimize(
         &self,
@@ -24,16 +24,16 @@ pub(super) trait NewColumnTransformOptimizer: Send + Sync {
 }
 
 /// A `NewColumnTransformOptimizer` that chains multiple `NewColumnTransformOptimizer`s together.
-pub(super) struct ChainedNewColumnTransformOptimizer {
+pub struct ChainedNewColumnTransformOptimizer {
     optimizers: Vec<Box<dyn NewColumnTransformOptimizer>>,
 }
 
 impl ChainedNewColumnTransformOptimizer {
-    pub(super) fn new(optimizers: Vec<Box<dyn NewColumnTransformOptimizer>>) -> Self {
+    pub fn new(optimizers: Vec<Box<dyn NewColumnTransformOptimizer>>) -> Self {
         Self { optimizers }
     }
 
-    pub(super) fn add_optimizer(&mut self, optimizer: Box<dyn NewColumnTransformOptimizer>) {
+    pub fn add_optimizer(&mut self, optimizer: Box<dyn NewColumnTransformOptimizer>) {
         self.optimizers.push(optimizer);
     }
 }
@@ -59,10 +59,10 @@ impl NewColumnTransformOptimizer for ChainedNewColumnTransformOptimizer {
 /// would be optimized to
 /// `NewColumnTransform::AllNulls(Schema::new(vec![Field::new("new_col", DataType::Int)]))`.
 ///
-pub(super) struct SqlToAllNullsOptimizer;
+pub struct SqlToAllNullsOptimizer;
 
 impl SqlToAllNullsOptimizer {
-    pub(super) fn new() -> Self {
+    pub fn new() -> Self {
         Self
     }
 

@@ -12,6 +12,39 @@ ${system data directory}/lance/language_models
 It also supports configuring user dictionaries,
 which makes it convenient for users to expand their own dictionaries without retraining the language models.
 
+## Inspect Query Tokenization
+
+Use `lance.tokenize` to inspect the tokens that a full-text query will produce
+without creating a dataset or index:
+
+```python
+import lance
+
+tokens = lance.tokenize("the Cats and Dogs")
+[(token.text, token.position) for token in tokens]
+# [("cat", 0), ("dog", 2)]
+```
+
+Positions start at the first retained query token and preserve gaps left by stop
+word removal and other filters. This is the same representation used for phrase
+matching. The function accepts the tokenizer-related options supported by
+`LanceDataset.create_scalar_index`, including custom stop words, n-grams, and the
+code analyzer:
+
+```python
+tokens = lance.tokenize(
+    "getUserName::value42",
+    analyzer="code",
+    split_identifiers=True,
+    index_operators=True,
+)
+```
+
+Options set to `None` use the selected analyzer profile's default. For example,
+the code analyzer disables stemming and stop-word removal unless explicitly
+overridden. The exception is `max_token_length`: omitting it keeps the default
+length limit of 40, while `max_token_length=None` disables the limit.
+
 ## ICU Tokenizer
 
 ICU uses Unicode word boundary rules and bundled dictionary data for complex scripts. It is useful for mixed-language text and does not require downloading a language model.
@@ -25,6 +58,60 @@ Use `icu/split` when mixed-language text also contains punctuation-delimited ide
 ```python
 ds.create_scalar_index("text", "INVERTED", base_tokenizer="icu/split")
 ```
+
+## Code Analyzer
+
+The code analyzer tokenizes code-like text so identifiers and operators can be
+searched. Enable it with `analyzer="code"`; `base_tokenizer="code"` is
+equivalent and infers the same profile:
+
+```python
+ds.create_scalar_index("source", "INVERTED", analyzer="code")
+```
+
+Indexes built with the code analyzer require FTS format v3.
+
+Identifiers are Unicode alphanumeric characters plus `_`. Everything else is a
+lexical boundary, and punctuation that is not an indexed operator (for example
+`.` `@` `#` `$`) is dropped.
+
+The code profile changes the defaults and adds four flags:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `split_identifiers` | `False` | Split identifiers such as `getUserName` into subwords (`get`, `User`, `Name`). |
+| `split_on_numerics` | `True` | Split subwords at letter/number boundaries (for example `value42` into `value` and `42`). |
+| `preserve_original` | `True` | Index the complete identifier in addition to its subwords. |
+| `index_operators` | `False` | Index operators such as `::`, `->`, and `!=`. |
+
+`split_on_numerics` and `preserve_original` only take effect when
+`split_identifiers=True`. The code profile also disables stemming and stop-word
+removal, and keeps the default `max_token_length` of 40.
+
+Because `split_identifiers` defaults to `False`, `getUserName` is not found by
+`user`; enable splitting to match subwords:
+
+```python
+tokens = lance.tokenize("getUserName::value42", analyzer="code")
+[(token.text, token.position) for token in tokens]
+# [("getusername", 0), ("value42", 1)]
+
+tokens = lance.tokenize(
+    "getUserName::value42",
+    analyzer="code",
+    split_identifiers=True,
+    index_operators=True,
+)
+[(token.text, token.position) for token in tokens]
+# [("getusername", 0), ("get", 0), ("user", 1), ("name", 2),
+#  ("::", 3), ("value42", 4), ("value", 4), ("42", 5)]
+```
+
+When identifiers are split, subwords are assigned consecutive positions starting
+at the identifier's position, and the preserved original identifier is stored at
+the first position with a length covering all subwords. With
+`with_position=True`, phrase queries can match subword sequences inside a single
+identifier, such as `'user name'` within `getUserName`.
 
 ## Language Models of Jieba
 
@@ -54,7 +141,7 @@ Create a file named config.json in the root directory of the current model.
 ```
 
 - The "main" field is optional. If not filled, the default is "dict.txt".
-- "users" is the path of the user dictionary. For the format of the user dictionary, please refer to https://github.com/messense/jieba-rs/blob/main/src/data/dict.txt.
+- "users" is the path of the user dictionary. For the format of the user dictionary, please refer to https://github.com/messense/jieba-rs/blob/main/jieba/src/data/dict.txt.
 
 ## Language Models of Lindera
 

@@ -7,21 +7,23 @@
 //! allowing it to be accessed via HTTP. The server implements the Lance REST Namespace
 //! specification.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
     Json, Router, ServiceExt,
     body::Bytes,
-    extract::{FromRequest, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    extract::{FromRequest, Path, Query, RawQuery, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::watch;
 use tower::Layer;
 use tower_http::normalize_path::NormalizePathLayer;
 use tower_http::trace::TraceLayer;
+use url::form_urlencoded;
 
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
@@ -86,7 +88,12 @@ impl RestAdapter {
                 "/v1/table/:id/version/delete",
                 post(batch_delete_table_versions),
             )
-            .route("/v1/table/:id/stats", get(get_table_stats))
+            .route(
+                "/v1/table/version/batch-create",
+                post(batch_create_table_versions),
+            )
+            .route("/v1/table/batch-commit", post(batch_commit_tables))
+            .route("/v1/table/:id/stats", post(get_table_stats))
             // Table data operations
             .route("/v1/table/:id/create", post(create_table))
             .route("/v1/table/:id/declare", post(declare_table))
@@ -95,7 +102,7 @@ impl RestAdapter {
             .route("/v1/table/:id/update", post(update_table))
             .route("/v1/table/:id/delete", post(delete_from_table))
             .route("/v1/table/:id/query", post(query_table))
-            .route("/v1/table/:id/count_rows", get(count_table_rows))
+            .route("/v1/table/:id/count_rows", post(count_table_rows))
             // Index operations
             .route("/v1/table/:id/create_index", post(create_table_index))
             .route(
@@ -105,7 +112,7 @@ impl RestAdapter {
             .route("/v1/table/:id/index/list", post(list_table_indices))
             .route(
                 "/v1/table/:id/index/:index_name/stats",
-                get(describe_table_index_stats),
+                post(describe_table_index_stats),
             )
             .route(
                 "/v1/table/:id/index/:index_name/drop",
@@ -135,8 +142,12 @@ impl RestAdapter {
                 "/v1/table/:id/schema_metadata/update",
                 post(update_table_schema_metadata),
             )
+            .route(
+                "/v1/table/:id/update_field_metadata",
+                post(update_field_metadata),
+            )
             // Tag operations
-            .route("/v1/table/:id/tags/list", get(list_table_tags))
+            .route("/v1/table/:id/tags/list", post(list_table_tags))
             .route("/v1/table/:id/tags/version", post(get_table_tag_version))
             .route("/v1/table/:id/tags/create", post(create_table_tag))
             .route("/v1/table/:id/tags/delete", post(delete_table_tag))
@@ -153,6 +164,7 @@ impl RestAdapter {
             .route("/v1/transaction/:id/alter", post(alter_transaction))
             // Global table operations
             .route("/v1/table", get(list_all_tables))
+            .layer(axum::middleware::map_response(rejection_to_error_response))
             .layer(TraceLayer::new_for_http())
             .with_state(self.backend.clone())
     }
@@ -310,6 +322,12 @@ struct PaginationQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct BranchQuery {
+    delimiter: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DescribeTableQuery {
     delimiter: Option<String>,
     with_table_uri: Option<bool>,
@@ -381,6 +399,62 @@ fn error_to_response(err: Error) -> Response {
     }
 }
 
+/// The headers the REST spec maps from a response's context: each
+/// `header.<name>` entry becomes a `<name>` header.
+fn context_headers(context: &serde_json::Value) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (key, value) in context.as_object().into_iter().flatten() {
+        if let (Some(name), Some(value)) = (key.strip_prefix("header."), value.as_str())
+            && let (Ok(name), Ok(value)) =
+                (HeaderName::try_from(name), HeaderValue::try_from(value))
+        {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+/// Answers with `response` as JSON, and its context as headers.
+fn json_response<T: Serialize>(status: StatusCode, response: T) -> Response {
+    match serde_json::to_value(response) {
+        Ok(response) => (
+            status,
+            context_headers(&response["context"]),
+            Json(response),
+        )
+            .into_response(),
+        Err(e) => error_to_response(
+            NamespaceError::Internal {
+                message: format!("Failed to serialize response: {}", e),
+            }
+            .into(),
+        ),
+    }
+}
+
+/// Answers axum's plain-text rejection of a malformed request (bad JSON, a
+/// missing content type, an unparsable query) with the spec's 400 error model.
+async fn rejection_to_error_response(response: Response) -> Response {
+    let rejected = matches!(
+        response.status(),
+        StatusCode::BAD_REQUEST
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            | StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let is_json = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .is_some_and(|ct| ct.as_bytes().starts_with(b"application/json"));
+    if !rejected || is_json {
+        return response;
+    }
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let message = String::from_utf8_lossy(&body).into_owned();
+    error_to_response(NamespaceError::InvalidInput { message }.into())
+}
+
 // ============================================================================
 // Namespace Operation Handlers
 // ============================================================================
@@ -392,11 +466,13 @@ async fn create_namespace(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateNamespaceRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.create_namespace(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -416,7 +492,7 @@ async fn list_namespaces(
     };
 
     match backend.list_namespaces(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -428,11 +504,13 @@ async fn describe_namespace(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DescribeNamespaceRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.describe_namespace(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -444,11 +522,13 @@ async fn drop_namespace(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DropNamespaceRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.drop_namespace(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -460,11 +540,13 @@ async fn namespace_exists(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<NamespaceExistsRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.namespace_exists(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => StatusCode::OK.into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -489,7 +571,7 @@ async fn list_tables(
     };
 
     match backend.list_tables(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -501,11 +583,13 @@ async fn register_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<RegisterTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.register_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -517,7 +601,9 @@ async fn describe_table(
     Query(params): Query<DescribeTableQuery>,
     Json(mut request): Json<DescribeTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
     if params.with_table_uri.is_some() {
         request.with_table_uri = params.with_table_uri;
@@ -530,7 +616,7 @@ async fn describe_table(
     }
 
     match backend.describe_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -542,11 +628,13 @@ async fn table_exists(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<TableExistsRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.table_exists(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => StatusCode::OK.into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -564,7 +652,7 @@ async fn drop_table(
     };
 
     match backend.drop_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -576,11 +664,13 @@ async fn deregister_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeregisterTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.deregister_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -604,19 +694,13 @@ fn parse_json_query_param<T: serde::de::DeserializeOwned>(
 ) -> std::result::Result<Option<T>, Box<Response>> {
     match raw {
         Some(raw) => serde_json::from_str(raw).map(Some).map_err(|e| {
-            let response = (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!(
-                            "Failed to parse {} {} query parameter as JSON: {}",
-                            operation, param_name, e
-                        )
-                    }
-                })),
-            )
-                .into_response();
-            Box::new(response)
+            let message = format!(
+                "Failed to parse {} {} query parameter as JSON: {}",
+                operation, param_name, e
+            );
+            Box::new(error_to_response(
+                NamespaceError::InvalidInput { message }.into(),
+            ))
         }),
         None => Ok(None),
     }
@@ -652,7 +736,7 @@ async fn create_table(
     };
 
     match backend.create_table(request, body).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -664,11 +748,13 @@ async fn declare_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeclareTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.declare_table(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -676,6 +762,7 @@ async fn declare_table(
 #[derive(Debug, Deserialize)]
 struct InsertQuery {
     delimiter: Option<String>,
+    branch: Option<String>,
     mode: Option<String>,
 }
 
@@ -688,21 +775,25 @@ async fn insert_into_table(
 ) -> Response {
     let request = InsertIntoTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
-        mode: params.mode.clone(),
+        branch: params.branch,
+        mode: params.mode,
         identity: extract_identity(&headers),
         ..Default::default()
     };
 
     match backend.insert_into_table(request, body).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
 
+/// `on` is absent here on purpose: it repeats once per column of a composite match key,
+/// and `serde_urlencoded` (what axum's `Query` is built on) cannot deserialize a sequence.
+/// It is collected from the raw query string by [`merge_insert_on_params`] instead.
 #[derive(Debug, Deserialize)]
 struct MergeInsertQuery {
     delimiter: Option<String>,
-    on: Option<String>,
+    branch: Option<String>,
     when_matched_update_all: Option<bool>,
     when_matched_update_all_filt: Option<String>,
     when_not_matched_insert_all: Option<bool>,
@@ -712,16 +803,26 @@ struct MergeInsertQuery {
     use_index: Option<bool>,
 }
 
+fn merge_insert_on_params(raw_query: Option<&str>) -> Option<Vec<String>> {
+    let on: Vec<String> = form_urlencoded::parse(raw_query?.as_bytes())
+        .filter(|(key, _)| key == "on")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    (!on.is_empty()).then_some(on)
+}
+
 async fn merge_insert_into_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<MergeInsertQuery>,
+    RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Response {
     let request = MergeInsertIntoTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
-        on: params.on,
+        branch: params.branch,
+        on: merge_insert_on_params(raw_query.as_deref()),
         when_matched_update_all: params.when_matched_update_all,
         when_matched_update_all_filt: params.when_matched_update_all_filt,
         when_not_matched_insert_all: params.when_not_matched_insert_all,
@@ -734,7 +835,7 @@ async fn merge_insert_into_table(
     };
 
     match backend.merge_insert_into_table(request, body).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -746,11 +847,13 @@ async fn update_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<UpdateTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.update_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -762,11 +865,13 @@ async fn delete_from_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeleteFromTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.delete_from_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -778,11 +883,18 @@ async fn query_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<QueryTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.query_table(request).await {
-        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/vnd.apache.arrow.file")],
+            bytes,
+        )
+            .into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -792,17 +904,15 @@ async fn count_table_rows(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CountTableRowsRequest>,
 ) -> Response {
-    let request = CountTableRowsRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        version: None,
-        predicate: None,
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
 
     match backend.count_table_rows(request).await {
-        Ok(count) => (StatusCode::OK, Json(serde_json::json!({ "count": count }))).into_response(),
+        Ok(count) => (StatusCode::OK, Json(count)).into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -818,11 +928,13 @@ async fn rename_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<RenameTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.rename_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -834,11 +946,13 @@ async fn restore_table(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<RestoreTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.restore_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -860,7 +974,7 @@ async fn list_table_versions(
     };
 
     match backend.list_table_versions(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -870,22 +984,15 @@ async fn create_table_version(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
-    Json(body): Json<CreateTableVersionRequest>,
+    Json(mut request): Json<CreateTableVersionRequest>,
 ) -> Response {
-    let request = CreateTableVersionRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        identity: extract_identity(&headers),
-        version: body.version,
-        manifest_path: body.manifest_path,
-        manifest_size: body.manifest_size,
-        e_tag: body.e_tag,
-        metadata: body.metadata,
-        branch: body.branch,
-        ..Default::default()
-    };
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
 
     match backend.create_table_version(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -894,19 +1001,16 @@ async fn describe_table_version(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<DelimiterQuery>,
-    Json(body): Json<DescribeTableVersionRequest>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<DescribeTableVersionRequest>,
 ) -> Response {
-    let request = DescribeTableVersionRequest {
-        id: Some(parse_id(&id, query.delimiter.as_deref())),
-        version: body.version,
-        branch: body.branch,
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
 
     match backend.describe_table_version(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -916,18 +1020,41 @@ async fn batch_delete_table_versions(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
-    Json(body): Json<BatchDeleteTableVersionsRequest>,
+    Json(mut request): Json<BatchDeleteTableVersionsRequest>,
 ) -> Response {
-    let request = BatchDeleteTableVersionsRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        identity: extract_identity(&headers),
-        ranges: body.ranges,
-        branch: body.branch,
-        ..Default::default()
-    };
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
 
     match backend.batch_delete_table_versions(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn batch_create_table_versions(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Json(mut request): Json<BatchCreateTableVersionsRequest>,
+) -> Response {
+    request.identity = extract_identity(&headers);
+
+    match backend.batch_create_table_versions(request).await {
+        Ok(response) => json_response(StatusCode::OK, response),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn batch_commit_tables(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Json(mut request): Json<BatchCommitTablesRequest>,
+) -> Response {
+    request.identity = extract_identity(&headers);
+
+    match backend.batch_commit_tables(request).await {
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -937,15 +1064,15 @@ async fn get_table_stats(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<GetTableStatsRequest>,
 ) -> Response {
-    let request = GetTableStatsRequest {
-        id: Some(parse_id(&id, params.delimiter.as_deref())),
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
 
     match backend.get_table_stats(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -965,7 +1092,7 @@ async fn list_all_tables(
     };
 
     match backend.list_all_tables(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -981,11 +1108,13 @@ async fn create_table_index(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateTableIndexRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.create_table_index(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -997,11 +1126,13 @@ async fn create_table_scalar_index(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateTableIndexRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.create_table_scalar_index(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1014,11 +1145,13 @@ async fn list_table_indices(
     MaybeJson(body): MaybeJson<ListTableIndicesRequest>,
 ) -> Response {
     let mut request = body.unwrap_or_default();
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.list_table_indices(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1034,17 +1167,18 @@ async fn describe_table_index_stats(
     headers: HeaderMap,
     Path(params): Path<IndexPathParams>,
     Query(query): Query<DelimiterQuery>,
+    Json(mut request): Json<DescribeTableIndexStatsRequest>,
 ) -> Response {
-    let request = DescribeTableIndexStatsRequest {
-        id: Some(parse_id(&params.id, query.delimiter.as_deref())),
-        version: None,
-        index_name: Some(params.index_name),
-        identity: extract_identity(&headers),
-        ..Default::default()
-    };
+    let route_id = parse_id(&params.id, query.delimiter.as_deref());
+    if let Err(response) = from_route(&mut request.id, route_id)
+        .and_then(|()| from_route(&mut request.index_name, params.index_name))
+    {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
 
     match backend.describe_table_index_stats(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1053,17 +1187,18 @@ async fn drop_table_index(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(params): Path<IndexPathParams>,
-    Query(query): Query<DelimiterQuery>,
+    Query(query): Query<BranchQuery>,
 ) -> Response {
     let request = DropTableIndexRequest {
         id: Some(parse_id(&params.id, query.delimiter.as_deref())),
+        branch: query.branch,
         index_name: Some(params.index_name),
         identity: extract_identity(&headers),
         ..Default::default()
     };
 
     match backend.drop_table_index(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1079,11 +1214,13 @@ async fn alter_table_add_columns(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableAddColumnsRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.alter_table_add_columns(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1095,11 +1232,13 @@ async fn alter_table_alter_columns(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableAlterColumnsRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.alter_table_alter_columns(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1111,11 +1250,13 @@ async fn alter_table_backfill_columns(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableBackfillColumnsRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.alter_table_backfill_columns(request).await {
-        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::ACCEPTED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1125,13 +1266,16 @@ async fn refresh_materialized_view(
     headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
-    Json(mut request): Json<RefreshMaterializedViewRequest>,
+    MaybeJson(body): MaybeJson<RefreshMaterializedViewRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    let mut request = body.unwrap_or_default();
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.refresh_materialized_view(request).await {
-        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::ACCEPTED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1143,11 +1287,13 @@ async fn create_materialized_view(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateMaterializedViewRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.create_materialized_view(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1159,11 +1305,13 @@ async fn alter_table_drop_columns(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTableDropColumnsRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.alter_table_drop_columns(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1172,14 +1320,43 @@ async fn update_table_schema_metadata(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<DelimiterQuery>,
-    Json(mut request): Json<UpdateTableSchemaMetadataRequest>,
+    Query(params): Query<BranchQuery>,
+    Json(metadata): Json<HashMap<String, String>>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
-    request.identity = extract_identity(&headers);
+    // The spec sends and returns the metadata map itself, not the models.
+    let request = UpdateTableSchemaMetadataRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        branch: params.branch,
+        metadata: Some(metadata),
+        identity: extract_identity(&headers),
+        ..Default::default()
+    };
 
     match backend.update_table_schema_metadata(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => (
+            StatusCode::OK,
+            context_headers(&serde_json::json!(response.context)),
+            Json(response.metadata.unwrap_or_default()),
+        )
+            .into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn update_field_metadata(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<UpdateFieldMetadataRequest>,
+) -> Response {
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
+    request.identity = extract_identity(&headers);
+
+    match backend.update_field_metadata(request).await {
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1203,7 +1380,7 @@ async fn list_table_tags(
     };
 
     match backend.list_table_tags(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1215,11 +1392,13 @@ async fn get_table_tag_version(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<GetTableTagVersionRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.get_table_tag_version(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1231,11 +1410,13 @@ async fn create_table_tag(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateTableTagRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.create_table_tag(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1247,11 +1428,13 @@ async fn delete_table_tag(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeleteTableTagRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.delete_table_tag(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1263,11 +1446,13 @@ async fn update_table_tag(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<UpdateTableTagRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.update_table_tag(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1283,11 +1468,13 @@ async fn create_table_branch(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<CreateTableBranchRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.create_table_branch(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1307,7 +1494,7 @@ async fn list_table_branches(
     };
 
     match backend.list_table_branches(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1319,11 +1506,13 @@ async fn delete_table_branch(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DeleteTableBranchRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.delete_table_branch(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1339,11 +1528,13 @@ async fn explain_table_query_plan(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<ExplainTableQueryPlanRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.explain_table_query_plan(request).await {
-        Ok(plan) => (StatusCode::OK, plan).into_response(),
+        Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -1355,11 +1546,13 @@ async fn analyze_table_query_plan(
     Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AnalyzeTableQueryPlanRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
+    }
     request.identity = extract_identity(&headers);
 
     match backend.analyze_table_query_plan(request).await {
-        Ok(plan) => (StatusCode::OK, plan).into_response(),
+        Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -1372,22 +1565,16 @@ async fn describe_transaction(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(_params): Query<DelimiterQuery>,
+    Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<DescribeTransactionRequest>,
 ) -> Response {
-    // The path id is the transaction identifier
-    // The request.id in body is the table ID (namespace path)
-    // For the trait, we set request.id to include both table ID and transaction ID
-    // by appending the transaction ID to the table ID path
-    if let Some(ref mut table_id) = request.id {
-        table_id.push(id);
-    } else {
-        request.id = Some(vec![id]);
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
     }
     request.identity = extract_identity(&headers);
 
     match backend.describe_transaction(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1396,20 +1583,16 @@ async fn alter_transaction(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(_params): Query<DelimiterQuery>,
+    Query(params): Query<DelimiterQuery>,
     Json(mut request): Json<AlterTransactionRequest>,
 ) -> Response {
-    // The path id is the transaction identifier
-    // Append it to the table ID path in the request
-    if let Some(ref mut table_id) = request.id {
-        table_id.push(id);
-    } else {
-        request.id = Some(vec![id]);
+    if let Err(response) = from_route(&mut request.id, parse_id(&id, params.delimiter.as_deref())) {
+        return *response;
     }
     request.identity = extract_identity(&headers);
 
     match backend.alter_transaction(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1417,6 +1600,26 @@ async fn alter_transaction(
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Sets a request field to the value the route names. The REST spec answers
+/// 400 when the body already names a different value.
+fn from_route<T: PartialEq + std::fmt::Debug>(
+    field: &mut Option<T>,
+    route: T,
+) -> std::result::Result<(), Box<Response>> {
+    match field {
+        Some(body) if *body != route => Err(Box::new(error_to_response(
+            NamespaceError::InvalidInput {
+                message: format!("request body names {:?}, the route names {:?}", body, route),
+            }
+            .into(),
+        ))),
+        _ => {
+            *field = Some(route);
+            Ok(())
+        }
+    }
+}
 
 /// Parse object ID from path string using delimiter
 fn parse_id(id_str: &str, delimiter: Option<&str>) -> Vec<String> {
@@ -1468,6 +1671,9 @@ fn extract_identity(headers: &HeaderMap) -> Option<Box<Identity>> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "rest")]
+    mod conformance;
+
     #[test]
     fn test_parse_id_default_delimiter() {
         let id = parse_id("ns1$ns2$table", None);
@@ -1503,6 +1709,25 @@ mod tests {
         assert_eq!(id, vec!["table"]);
     }
 
+    #[test]
+    fn test_merge_insert_on_params() {
+        assert_eq!(merge_insert_on_params(None), None);
+        assert_eq!(merge_insert_on_params(Some("delimiter=%24")), None);
+        assert_eq!(
+            merge_insert_on_params(Some("on=id&use_index=true")),
+            Some(vec!["id".to_string()])
+        );
+        assert_eq!(
+            merge_insert_on_params(Some("on=region&use_index=true&on=id")),
+            Some(vec!["region".to_string(), "id".to_string()])
+        );
+        // A backtick-quoted field path arrives percent-encoded.
+        assert_eq!(
+            merge_insert_on_params(Some("on=%60a.b%60&on=nested.leaf")),
+            Some(vec!["`a.b`".to_string(), "nested.leaf".to_string()])
+        );
+    }
+
     // ============================================================================
     // Integration Tests
     // ============================================================================
@@ -1518,6 +1743,7 @@ mod tests {
         struct RestServerFixture {
             _temp_dir: TempDir,
             namespace: crate::RestNamespace,
+            backend: Arc<RecordingNamespace>,
             server_handle: RestAdapterHandle,
         }
 
@@ -1541,8 +1767,10 @@ mod tests {
                 if managed_versioning {
                     builder = builder.table_version_tracking_enabled(true);
                 }
-                let backend = builder.build().await.unwrap();
-                let backend = Arc::new(backend);
+                let backend = Arc::new(RecordingNamespace {
+                    inner: Some(builder.build().await.unwrap()),
+                    ..Default::default()
+                });
 
                 // Start REST server with port 0 (OS assigns available port)
                 let config = RestAdapterConfig {
@@ -1553,21 +1781,163 @@ mod tests {
                 let server = RestAdapter::new(backend.clone(), config);
                 let server_handle = server.start().await.unwrap();
 
-                // Get the actual port assigned by OS
-                let actual_port = server_handle.port();
-
                 // Create RestNamespace client
-                let server_url = format!("http://127.0.0.1:{}", actual_port);
-                let namespace = RestNamespaceBuilder::new(&server_url)
+                let namespace = RestNamespaceBuilder::new(url(&server_handle))
                     .delimiter("$")
                     .build();
 
                 Self {
                     _temp_dir: temp_dir,
                     namespace,
+                    backend,
                     server_handle,
                 }
             }
+        }
+
+        fn url(server_handle: &RestAdapterHandle) -> String {
+            format!("http://127.0.0.1:{}", server_handle.port())
+        }
+
+        /// One request an operation received: the operation, the request as
+        /// JSON, and its Arrow data.
+        type Received = (&'static str, serde_json::Value, Option<Bytes>);
+
+        /// Keeps every request each operation receives, and forwards it to
+        /// `inner`. An operation listed with an answer gets that answer
+        /// instead. Without `inner`, every other operation answers its default
+        /// response, with a context entry that the adapter must send as an
+        /// x-served-by header.
+        #[derive(Debug, Default)]
+        pub(super) struct RecordingNamespace {
+            inner: Option<crate::DirectoryNamespace>,
+            received: std::sync::Mutex<Vec<Received>>,
+        }
+
+        impl RecordingNamespace {
+            /// The last request `operation` received, as JSON.
+            fn received(&self, operation: &str) -> serde_json::Value {
+                let received = self.received.lock().unwrap();
+                let mut requests = received.iter().rev();
+                let last =
+                    requests.find_map(|(op, request, _)| (*op == operation).then_some(request));
+                last.cloned().unwrap_or_default()
+            }
+
+            /// Takes every request received so far.
+            pub(super) fn take(&self) -> Vec<Received> {
+                std::mem::take(&mut self.received.lock().unwrap())
+            }
+        }
+
+        /// Adds the x-served-by context entry to a model response.
+        fn with_context<T: serde::Serialize + serde::de::DeserializeOwned>(response: T) -> T {
+            let mut response = serde_json::to_value(response).unwrap();
+            if response.is_object() {
+                response["context"] = serde_json::json!({"header.x-served-by": "recorder"});
+            }
+            serde_json::from_value(response).unwrap()
+        }
+
+        macro_rules! forward {
+            ($($method:ident($request:ty $(, $data:ident)?) -> $response:ty $(= $answer:expr)?;)*) => {
+                #[async_trait::async_trait]
+                impl LanceNamespace for RecordingNamespace {
+                    $(
+                        async fn $method(
+                            &self,
+                            request: $request
+                            $(, $data: Bytes)?
+                        ) -> Result<$response> {
+                            let json = serde_json::to_value(&request).unwrap();
+                            let data: Option<Bytes> = None $(.or(Some($data.clone())))?;
+                            self.received.lock().unwrap().push((stringify!($method), json, data));
+                            forward!(@answer self, $method(request $(, $data)?) $(, $answer)?)
+                        }
+                    )*
+
+                    fn namespace_id(&self) -> String {
+                        self.inner.as_ref().map_or("recorder".to_string(), |inner| inner.namespace_id())
+                    }
+                }
+            };
+            (@answer $self:ident, $method:ident($($arg:expr),*)) => {
+                match &$self.inner {
+                    Some(inner) => inner.$method($($arg),*).await,
+                    None => Ok(with_context(Default::default())),
+                }
+            };
+            (@answer $self:ident, $method:ident($($arg:expr),*), $answer:expr) => { Ok($answer) };
+        }
+
+        forward! {
+            list_namespaces(ListNamespacesRequest) -> ListNamespacesResponse;
+            describe_namespace(DescribeNamespaceRequest) -> DescribeNamespaceResponse;
+            create_namespace(CreateNamespaceRequest) -> CreateNamespaceResponse;
+            drop_namespace(DropNamespaceRequest) -> DropNamespaceResponse;
+            namespace_exists(NamespaceExistsRequest) -> ();
+            list_tables(ListTablesRequest) -> ListTablesResponse;
+            describe_table(DescribeTableRequest) -> DescribeTableResponse;
+            register_table(RegisterTableRequest) -> RegisterTableResponse;
+            table_exists(TableExistsRequest) -> ();
+            drop_table(DropTableRequest) -> DropTableResponse;
+            deregister_table(DeregisterTableRequest) -> DeregisterTableResponse;
+            count_table_rows(CountTableRowsRequest) -> i64;
+            create_table(CreateTableRequest, data) -> CreateTableResponse;
+            declare_table(DeclareTableRequest) -> DeclareTableResponse;
+            insert_into_table(InsertIntoTableRequest, data) -> InsertIntoTableResponse;
+            merge_insert_into_table(MergeInsertIntoTableRequest, data)
+                -> MergeInsertIntoTableResponse;
+            update_table(UpdateTableRequest) -> UpdateTableResponse;
+            delete_from_table(DeleteFromTableRequest) -> DeleteFromTableResponse;
+            // Bytes has no serde form to add a context to, so we always answer
+            // this rather than forward.
+            query_table(QueryTableRequest) -> Bytes = Bytes::from_static(b"arrow ipc file");
+            create_table_index(CreateTableIndexRequest) -> CreateTableIndexResponse;
+            list_table_indices(ListTableIndicesRequest) -> ListTableIndicesResponse;
+            describe_table_index_stats(DescribeTableIndexStatsRequest)
+                -> DescribeTableIndexStatsResponse;
+            describe_transaction(DescribeTransactionRequest) -> DescribeTransactionResponse;
+            alter_transaction(AlterTransactionRequest) -> AlterTransactionResponse;
+            create_table_scalar_index(CreateTableIndexRequest) -> CreateTableScalarIndexResponse;
+            drop_table_index(DropTableIndexRequest) -> DropTableIndexResponse;
+            list_all_tables(ListTablesRequest) -> ListTablesResponse;
+            restore_table(RestoreTableRequest) -> RestoreTableResponse;
+            rename_table(RenameTableRequest) -> RenameTableResponse;
+            list_table_versions(ListTableVersionsRequest) -> ListTableVersionsResponse;
+            create_table_version(CreateTableVersionRequest) -> CreateTableVersionResponse;
+            describe_table_version(DescribeTableVersionRequest) -> DescribeTableVersionResponse;
+            batch_delete_table_versions(BatchDeleteTableVersionsRequest)
+                -> BatchDeleteTableVersionsResponse;
+            batch_create_table_versions(BatchCreateTableVersionsRequest)
+                -> BatchCreateTableVersionsResponse;
+            batch_commit_tables(BatchCommitTablesRequest) -> BatchCommitTablesResponse;
+            update_table_schema_metadata(UpdateTableSchemaMetadataRequest)
+                -> UpdateTableSchemaMetadataResponse;
+            // DirectoryNamespace does not implement this.
+            update_field_metadata(UpdateFieldMetadataRequest) -> UpdateFieldMetadataResponse
+                = with_context(UpdateFieldMetadataResponse::new(7));
+            get_table_stats(GetTableStatsRequest) -> GetTableStatsResponse;
+            explain_table_query_plan(ExplainTableQueryPlanRequest) -> String;
+            analyze_table_query_plan(AnalyzeTableQueryPlanRequest) -> String;
+            alter_table_add_columns(AlterTableAddColumnsRequest) -> AlterTableAddColumnsResponse;
+            alter_table_alter_columns(AlterTableAlterColumnsRequest)
+                -> AlterTableAlterColumnsResponse;
+            alter_table_drop_columns(AlterTableDropColumnsRequest) -> AlterTableDropColumnsResponse;
+            alter_table_backfill_columns(AlterTableBackfillColumnsRequest)
+                -> AlterTableBackfillColumnsResponse;
+            refresh_materialized_view(RefreshMaterializedViewRequest)
+                -> RefreshMaterializedViewResponse;
+            create_materialized_view(CreateMaterializedViewRequest)
+                -> CreateMaterializedViewResponse;
+            list_table_tags(ListTableTagsRequest) -> ListTableTagsResponse;
+            get_table_tag_version(GetTableTagVersionRequest) -> GetTableTagVersionResponse;
+            create_table_tag(CreateTableTagRequest) -> CreateTableTagResponse;
+            delete_table_tag(DeleteTableTagRequest) -> DeleteTableTagResponse;
+            update_table_tag(UpdateTableTagRequest) -> UpdateTableTagResponse;
+            create_table_branch(CreateTableBranchRequest) -> CreateTableBranchResponse;
+            list_table_branches(ListTableBranchesRequest) -> ListTableBranchesResponse;
+            delete_table_branch(DeleteTableBranchRequest) -> DeleteTableBranchResponse;
         }
 
         impl Drop for RestServerFixture {
@@ -1690,8 +2060,8 @@ mod tests {
 
             assert_eq!(
                 response.status(),
-                204,
-                "POST request with trailing slash should succeed with 204 No Content"
+                200,
+                "POST request with trailing slash should succeed with 200"
             );
 
             // Test GET endpoint with trailing slash
@@ -2964,12 +3334,18 @@ mod tests {
             use arrow::record_batch::{RecordBatch, RecordBatchIterator};
             use lance::dataset::{Dataset, WriteMode, WriteParams};
             use lance_namespace::LanceNamespace;
+            use lance_namespace::models::CreateNamespaceRequest;
 
             let fixture = RestServerFixture::new().await;
             let namespace = Arc::new(fixture.namespace.clone()) as Arc<dyn LanceNamespace>;
 
             // Use child namespace instead of root
             let table_id = vec!["test_ns".to_string(), "test_table".to_string()];
+
+            // Writing into a namespace that does not exist is rejected, so create it first.
+            let mut create_ns_req = CreateNamespaceRequest::new();
+            create_ns_req.id = Some(vec!["test_ns".to_string()]);
+            namespace.create_namespace(create_ns_req).await.unwrap();
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("a", DataType::Int32, false),
                 ArrowField::new("b", DataType::Int32, false),
@@ -3061,6 +3437,151 @@ mod tests {
             assert_eq!(a_col.values(), &[100, 200]);
         }
 
+        /// `(region, id, value)` rows, for merge inserts keyed on `region` + `id`.
+        fn create_composite_key_arrow_data(rows: &[(&str, i32, &str)]) -> Bytes {
+            use arrow::array::{Int32Array, StringArray};
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::ipc::writer::StreamWriter;
+            use arrow::record_batch::RecordBatch;
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|(region, _, _)| *region),
+                    )),
+                    Arc::new(Int32Array::from_iter_values(
+                        rows.iter().map(|(_, id, _)| *id),
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|(_, _, value)| *value),
+                    )),
+                ],
+            )
+            .unwrap();
+
+            let mut buffer = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+            Bytes::from(buffer)
+        }
+
+        /// A composite match key survives the round trip through the REST client and the
+        /// adapter's query string, which repeats `on` once per column.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_merge_insert_composite_key_round_trip() {
+            use lance_namespace::LanceNamespace;
+
+            let fixture = RestServerFixture::new().await;
+            let table_id = vec!["merge_ns".to_string(), "merge_table".to_string()];
+            let on = vec!["region".to_string(), "id".to_string()];
+
+            let mut create_ns = CreateNamespaceRequest::new();
+            create_ns.id = Some(vec!["merge_ns".to_string()]);
+            fixture.namespace.create_namespace(create_ns).await.unwrap();
+
+            let create_table_req = CreateTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(
+                    create_table_req,
+                    create_composite_key_arrow_data(&[
+                        ("us", 1, "a"),
+                        ("us", 2, "b"),
+                        ("eu", 1, "c"),
+                    ]),
+                )
+                .await
+                .unwrap();
+
+            let mut merge_req = MergeInsertIntoTableRequest::new();
+            merge_req.id = Some(table_id);
+            merge_req.on = Some(on);
+            merge_req.when_matched_update_all = Some(true);
+            let response = fixture
+                .namespace
+                .merge_insert_into_table(
+                    merge_req,
+                    create_composite_key_arrow_data(&[("us", 1, "updated"), ("eu", 2, "inserted")]),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.num_updated_rows, Some(1));
+            assert_eq!(response.num_inserted_rows, Some(1));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_insert_into_table_returns_row_count_and_version() {
+            use lance_namespace::LanceNamespace;
+
+            let fixture = RestServerFixture::new().await;
+            let table_id = vec!["insert_ns".to_string(), "insert_table".to_string()];
+
+            let mut create_ns = CreateNamespaceRequest::new();
+            create_ns.id = Some(vec!["insert_ns".to_string()]);
+            fixture.namespace.create_namespace(create_ns).await.unwrap();
+
+            let create_table_req = CreateTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("Create".to_string()),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .create_table(create_table_req, create_test_arrow_data())
+                .await
+                .unwrap();
+
+            let request = InsertIntoTableRequest {
+                id: Some(table_id.clone()),
+                mode: Some("append".to_string()),
+                ..Default::default()
+            };
+            let response = fixture
+                .namespace
+                .insert_into_table(request, create_test_arrow_data())
+                .await
+                .unwrap();
+
+            assert_eq!(response.num_inserted_rows, Some(3));
+            assert_eq!(response.version, Some(2));
+
+            // The table now holds ids 1, 2, 3, 1, 2, 3.
+            let count = fixture
+                .namespace
+                .count_table_rows(CountTableRowsRequest {
+                    id: Some(table_id.clone()),
+                    predicate: Some("id > 1".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 4);
+
+            let stats = fixture
+                .namespace
+                .get_table_stats(GetTableStatsRequest {
+                    id: Some(table_id),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(stats.num_rows, 6);
+        }
+
         // ============================================================================
         // DynamicContextProvider Integration Test
         // ============================================================================
@@ -3082,26 +3603,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_rest_namespace_with_context_provider() {
-            let temp_dir = TempDir::new().unwrap();
-            let temp_path = temp_dir.path().to_str().unwrap().to_string();
-
-            // Create DirectoryNamespace backend with manifest enabled
-            let backend = DirectoryNamespaceBuilder::new(&temp_path)
-                .manifest_enabled(true)
-                .build()
-                .await
-                .unwrap();
-            let backend = Arc::new(backend);
-
-            // Start REST server
-            let config = RestAdapterConfig {
-                port: 0,
-                ..Default::default()
-            };
-
-            let server = RestAdapter::new(backend.clone(), config);
-            let server_handle = server.start().await.unwrap();
-            let actual_port = server_handle.port();
+            let fixture = RestServerFixture::new().await;
 
             // Create context provider that adds custom headers
             let mut context_headers = HashMap::new();
@@ -3119,8 +3621,7 @@ mod tests {
             });
 
             // Create RestNamespace client with context provider and base headers
-            let server_url = format!("http://127.0.0.1:{}", actual_port);
-            let namespace = RestNamespaceBuilder::new(&server_url)
+            let namespace = RestNamespaceBuilder::new(url(&fixture.server_handle))
                 .delimiter("$")
                 .header("X-Base-Header", "base-value")
                 .context_provider(provider)
@@ -3131,11 +3632,19 @@ mod tests {
                 id: Some(vec!["context_test_ns".to_string()]),
                 properties: None,
                 mode: None,
-                identity: None,
+                identity: Some(Box::new(Identity {
+                    api_key: Some("key".to_string()),
+                    auth_token: Some("token".to_string()),
+                })),
                 context: None,
             };
             let result = namespace.create_namespace(create_req).await;
             assert!(result.is_ok(), "Failed to create namespace: {:?}", result);
+            // The identity travels as the x-api-key and Authorization headers.
+            assert_eq!(
+                fixture.backend.received("create_namespace")["identity"],
+                serde_json::json!({"api_key": "key", "auth_token": "token"})
+            );
 
             // List namespaces - should also work
             let list_req = ListNamespacesRequest {
@@ -3161,10 +3670,20 @@ mod tests {
                     "test_table".to_string(),
                 ]),
                 mode: Some("create".to_string()),
+                context: Some(HashMap::from([(
+                    "header.x-api-key".to_string(),
+                    "from-context".to_string(),
+                )])),
                 ..Default::default()
             };
             let result = namespace.create_table(create_table_req, table_data).await;
             assert!(result.is_ok(), "Failed to create table: {:?}", result);
+            // A header.<name> context entry travels as that header, which is
+            // the only way context crosses with an Arrow body.
+            assert_eq!(
+                fixture.backend.received("create_table")["identity"]["api_key"],
+                "from-context"
+            );
 
             // Describe the table - should work with context provider
             let describe_req = DescribeTableRequest {
@@ -3176,9 +3695,9 @@ mod tests {
             };
             let result = namespace.describe_table(describe_req).await;
             assert!(result.is_ok(), "Failed to describe table: {:?}", result);
-
-            // Cleanup
-            server_handle.shutdown();
+            // Response headers come back as header.<name> context entries.
+            let context = result.unwrap().context.unwrap_or_default();
+            assert_eq!(context["header.content-type"], "application/json");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3336,6 +3855,91 @@ mod tests {
                 "branch must be forwarded in the request body and honored by the backend"
             );
 
+            // The directory backend ignores branch on these, or lacks the
+            // operation, so we check the request it received.
+            let branch = Some("dev".to_string());
+            fixture
+                .namespace
+                .create_table_branch(CreateTableBranchRequest {
+                    id: Some(id.clone()),
+                    name: "dev".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let insert = InsertIntoTableRequest {
+                id: Some(id.clone()),
+                branch: branch.clone(),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .insert_into_table(insert, create_test_arrow_data())
+                .await
+                .unwrap();
+            let merge_insert = MergeInsertIntoTableRequest {
+                id: Some(id.clone()),
+                branch: branch.clone(),
+                on: Some(vec!["id".to_string()]),
+                when_matched_update_all: Some(true),
+                ..Default::default()
+            };
+            fixture
+                .namespace
+                .merge_insert_into_table(merge_insert, create_test_arrow_data())
+                .await
+                .unwrap();
+            let mut create_index = CreateTableIndexRequest::new("id".into(), "BTREE".into());
+            create_index.id = Some(id.clone());
+            create_index.name = Some("id_idx".to_string());
+            fixture
+                .namespace
+                .create_table_index(create_index)
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .drop_table_index(DropTableIndexRequest {
+                    id: Some(id.clone()),
+                    branch: branch.clone(),
+                    index_name: Some("id_idx".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            // The metadata reaches the backend, and its answer parses.
+            let updated = fixture
+                .namespace
+                .update_table_schema_metadata(UpdateTableSchemaMetadataRequest {
+                    id: Some(id.clone()),
+                    branch,
+                    metadata: Some(HashMap::from([("k".to_string(), "v".to_string())])),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(updated.metadata.unwrap_or_default()["k"], "v");
+            let field_metadata = HashMap::from([("k".to_string(), "v".to_string())]);
+            let field_update = UpdateFieldMetadataEntry::new("id".to_string(), field_metadata);
+            let mut update_fields = UpdateFieldMetadataRequest::new(vec![field_update]);
+            update_fields.id = Some(id.clone());
+            update_fields.branch = Some("dev".to_string());
+            let updated = fixture
+                .namespace
+                .update_field_metadata(update_fields)
+                .await
+                .unwrap();
+            assert_eq!(updated.version, 7);
+            let operations = [
+                "insert_into_table",
+                "merge_insert_into_table",
+                "drop_table_index",
+                "update_table_schema_metadata",
+                "update_field_metadata",
+            ];
+            let branches = operations.map(|op| fixture.backend.received(op)["branch"].clone());
+            assert_eq!(branches, ["dev"; 5], "{:?}", operations);
+
             fixture.server_handle.shutdown();
         }
 
@@ -3417,6 +4021,32 @@ mod tests {
                 "duplicate branch create should map to 409, got {}",
                 resp.status()
             );
+
+            // A malformed body, or a body id that differs from the route,
+            // gets the 400 ErrorResponse.
+            let bodies = [
+                "{",
+                r#"{"name": 1}"#,
+                r#"{"id": ["other"], "name": "other"}"#,
+            ];
+            let mut errors = Vec::new();
+            for body in bodies {
+                let resp = client
+                    .post(format!(
+                        "http://127.0.0.1:{}/v1/table/{}/branches/create",
+                        port, table_path
+                    ))
+                    .query(&[("delimiter", "$")])
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = resp.status().as_u16();
+                let error = resp.json::<ErrorResponse>().await.ok();
+                errors.push((status, error.map(|e| e.code)));
+            }
+            assert_eq!(errors, [(400, Some(13)); 3], "{:?}", bodies);
 
             // delete -> list no longer shows it
             fixture
@@ -3565,6 +4195,8 @@ mod tests {
                 .len()
             };
             assert_eq!(main_chain_len(namespace.clone(), table_id.clone()).await, 2);
+            let created = fixture.backend.received("create_table_version");
+            assert_eq!(created["naming_scheme"], "V2");
 
             // Branch via the REST client, then open and commit on it.
             namespace
@@ -3634,6 +4266,14 @@ mod tests {
                 .create("exp-tag", ("exp", Some(overlap_version)))
                 .await
                 .unwrap();
+            let tags = namespace
+                .list_table_tags(ListTableTagsRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(tags.tags["exp-tag"].branch.as_deref(), Some("exp"));
             let tag_open = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
                 .await
                 .unwrap()
@@ -3712,6 +4352,19 @@ mod tests {
                 body.branches
             );
 
+            // The refresh body is optional too.
+            let refresh = "v1/materialized_view/list_post_ns%24list_post_table/refresh";
+            client
+                .post(format!("http://127.0.0.1:{}/{}", port, refresh))
+                .query(&[("delimiter", "$")])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.backend.received("refresh_materialized_view")["id"],
+                serde_json::json!(["list_post_ns", "list_post_table"])
+            );
+
             fixture.server_handle.shutdown();
         }
 
@@ -3784,6 +4437,33 @@ mod tests {
                 version_info.version.version, 1,
                 "Latest version should be 1"
             );
+
+            // The route names the table and the transaction, here by version.
+            let transaction_id = Some(vec![
+                "describe_version_ns".to_string(),
+                "describe_version_table".to_string(),
+                "1".to_string(),
+            ]);
+            let mut set_owner = AlterTransactionAction::new();
+            set_owner.set_property_action = Some(Box::new(AlterTransactionSetProperty {
+                key: Some("owner".to_string()),
+                value: Some("alice".to_string()),
+                mode: None,
+            }));
+            let mut alter = AlterTransactionRequest::new(vec![set_owner]);
+            alter.id = transaction_id.clone();
+            fixture.namespace.alter_transaction(alter).await.unwrap();
+            let transaction = fixture
+                .namespace
+                .describe_transaction(DescribeTransactionRequest {
+                    id: transaction_id,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let properties = transaction.properties.unwrap_or_default();
+            assert_eq!(properties["version"], "1");
+            assert_eq!(properties["owner"], "alice");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3852,6 +4532,43 @@ mod tests {
                 vec!["id"],
                 "Index column should be 'id'"
             );
+
+            let stats = fixture
+                .namespace
+                .describe_table_index_stats(DescribeTableIndexStatsRequest {
+                    id: Some(vec![
+                        "index_test_ns".to_string(),
+                        "index_test_table".to_string(),
+                    ]),
+                    index_name: Some("id_idx".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(stats.num_indexed_rows, Some(3));
+
+            let table_id = Some(vec![
+                "index_test_ns".to_string(),
+                "index_test_table".to_string(),
+            ]);
+            let mut query = QueryTableRequest::new(1, QueryTableRequestVector::new());
+            query.filter = Some("id > 1".to_string());
+            let mut explain = ExplainTableQueryPlanRequest::new(query);
+            explain.id = table_id.clone();
+            let plan = fixture
+                .namespace
+                .explain_table_query_plan(explain)
+                .await
+                .unwrap();
+            assert!(plan.contains("LanceRead"), "{}", plan);
+            let mut analyze = AnalyzeTableQueryPlanRequest::new(1, QueryTableRequestVector::new());
+            analyze.id = table_id;
+            let analysis = fixture
+                .namespace
+                .analyze_table_query_plan(analyze)
+                .await
+                .unwrap();
+            assert!(analysis.contains("AnalyzeExec"), "{}", analysis);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -7,16 +7,17 @@ use std::vec;
 
 use crate::index::vector::VectorIndexParams;
 use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, json_field};
-use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
+use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, RecordBatchExt};
 
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, FixedSizeListArray, ListArray, StructArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, StructArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_array::{Int64Array, UInt64Array};
+use arrow_array::{Int64Array, UInt32Array, UInt64Array, record_batch};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
+use arrow_select::take::take_record_batch;
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
@@ -25,7 +26,9 @@ use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
-    SCORE_FIELD, query::PhraseQuery, tokenizer::InvertedIndexParams,
+    SCORE_FIELD,
+    query::{FtsQuery, MatchQuery, Operator, PhraseQuery},
+    tokenizer::InvertedIndexParams,
 };
 use lance_index::{IndexType, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -33,15 +36,77 @@ use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
-use crate::Dataset;
 use crate::dataset::NewColumnTransform;
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
-use lance_index::scalar::inverted::query::FtsQuery;
+use crate::{Dataset, Error};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
+use rstest::rstest;
+
+#[rstest]
+#[case::struct_null_check(false, "c IS NOT NULL", vec![0, 1, 2])]
+#[case::struct_value(false, "c.t > 0", vec![1, 2])]
+#[case::struct_null(false, "c IS NULL", vec![3])]
+#[case::list_null_check(true, "c IS NOT NULL", vec![0, 1, 2])]
+#[case::list_null(true, "c IS NULL", vec![3])]
+#[tokio::test]
+async fn test_partial_projection_with_filter_on_same_column(
+    #[case] is_list: bool,
+    #[case] filter: &str,
+    #[case] expected_indices: Vec<u32>,
+) {
+    let children = record_batch!(
+        ("t", Int32, [-1, 2, 3, 4]),
+        ("b", Utf8, [Some("x"), Some("y"), None, Some("z")])
+    )
+    .unwrap();
+    let item = StructArray::new(
+        children.schema().fields().clone(),
+        children.columns().to_vec(),
+        Some(NullBuffer::from(vec![true, true, true, false])),
+    );
+    let c: ArrayRef = if is_list {
+        Arc::new(ListArray::new(
+            Arc::new(ArrowField::new("item", item.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([1, 0, 2, 1]),
+            Arc::new(item),
+            Some(NullBuffer::from(vec![true, true, true, false])),
+        ))
+    } else {
+        Arc::new(item)
+    };
+    let batch = record_batch!(("k", Int32, [0, 1, 2, 3]))
+        .unwrap()
+        .try_with_column(ArrowField::new("c", c.data_type().clone(), true), c)
+        .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let leaf = if is_list { "c.item.b" } else { "c.b" };
+    let projection = dataset.schema().project(&["k", leaf]).unwrap();
+    let expected_schema = ArrowSchema::from(&projection);
+    let expected = batch.project_by_schema(&expected_schema).unwrap();
+    let expected = take_record_batch(&expected, &UInt32Array::from(expected_indices)).unwrap();
+
+    let mut scan = dataset.scan();
+    scan.project_with_schema(&projection).unwrap();
+    scan.filter(filter).unwrap();
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.schema().as_ref(), &expected_schema, "{filter}");
+    assert_eq!(result, expected, "{filter}");
+}
 
 /// A null struct must not read back as a valid struct with null children.
 ///
@@ -273,6 +338,7 @@ async fn test_vector_filter_fts_search() {
         upper_bound: None,
         minimum_nprobes: 20,
         maximum_nprobes: None,
+        search_effort: 0.5,
         ef: None,
         refine_factor: None,
         metric_type: Some(MetricType::L2),
@@ -410,12 +476,15 @@ async fn test_fts_filter_vector_search() {
     let dataset = prepare_query_filter_dataset().await;
     let schema: ArrowSchema = dataset.schema().into();
 
+    // Assert filtering and exact distance order without depending on PQ's
+    // approximate distances, which can tie for adjacent vectors.
     // Case 1: search with prefilter=true, query_filter=match("text")
     let query_vector = Float32Array::from(vec![300f32, 300f32, 300f32, 300f32]);
     let mut scanner = dataset.scan();
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(true)
         .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
             "text".to_string(),
@@ -439,6 +508,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(true)
         .filter("category='geography'")
         .unwrap()
@@ -464,6 +534,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(false)
         .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
             "text".to_string(),
@@ -487,6 +558,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(false)
         .filter("category='geography'")
         .unwrap()
@@ -540,6 +612,212 @@ async fn test_fts_filter_vector_search() {
         .try_into_stream()
         .await;
     assert!(stream.is_err());
+}
+
+#[rstest]
+#[case::list(false)]
+#[case::large_list(true)]
+#[tokio::test]
+async fn test_fts_list_postfilter_vector_search(#[case] is_large_list: bool) {
+    async fn indexed_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut ids = result["id"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn postfilter_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
+        let query_vector = Float32Array::from(vec![0.0, 0.0]);
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .prefilter(false)
+            .filter_query(QueryFilter::Fts(query))
+            .unwrap();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        let post_filter_position = plan
+            .find("FlatMatchFilter: column=docs")
+            .expect("expected FTS to run as a flat match filter");
+        let vector_search_position = plan
+            .find("ANNSubIndex")
+            .expect("expected the query to use the vector index");
+        assert!(
+            post_filter_position < vector_search_position,
+            "expected FTS to wrap the vector search as a post-filter, got:\n{plan}"
+        );
+        let result = scanner.try_into_batch().await.unwrap();
+        let mut ids = result["id"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn match_query(terms: &str, operator: Operator) -> FullTextSearchQuery {
+        FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new(terms.to_owned())
+                .with_column(Some("docs".to_owned()))
+                .with_operator(operator),
+        ))
+    }
+
+    let item_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
+    let values = Arc::new(StringArray::from(vec![
+        Some("target"),
+        Some("alpha"),
+        Some("beta"),
+        Some(""),
+        None,
+        Some("target"),
+    ])) as ArrayRef;
+    let validity = Some(NullBuffer::from(vec![true, true, true, true, false]));
+    let docs: ArrayRef = if is_large_list {
+        Arc::new(LargeListArray::new(
+            item_field.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 2, 3, 3, 6, 6])),
+            values,
+            validity,
+        ))
+    } else {
+        Arc::new(ListArray::new(
+            item_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 3, 3, 6, 6])),
+            values,
+            validity,
+        ))
+    };
+    let vectors = FixedSizeListArray::try_new_from_values(
+        Float32Array::from(vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]),
+        2,
+    )
+    .unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("vector", vectors.data_type().clone(), false),
+        ArrowField::new("docs", docs.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..5)),
+            Arc::new(vectors),
+            docs,
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    dataset
+        .create_index(
+            &["docs"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = match_query("target", Operator::Or);
+    assert_eq!(indexed_ids(&dataset, query.clone()).await, [0, 3]);
+    assert_eq!(postfilter_ids(&dataset, query).await, [0, 3]);
+
+    let query = match_query("target alpha", Operator::And);
+    assert_eq!(indexed_ids(&dataset, query.clone()).await, [0]);
+    assert_eq!(postfilter_ids(&dataset, query).await, [0]);
+
+    let query = match_query("target missing", Operator::And);
+    assert!(indexed_ids(&dataset, query.clone()).await.is_empty());
+    assert!(postfilter_ids(&dataset, query).await.is_empty());
+
+    dataset
+        .create_index(
+            &["docs"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().base_tokenizer("raw".to_owned()),
+            true,
+        )
+        .await
+        .unwrap();
+    let query = match_query("target", Operator::Or);
+    assert_eq!(indexed_ids(&dataset, query.clone()).await, [3]);
+    assert_eq!(postfilter_ids(&dataset, query).await, [3]);
+
+    dataset
+        .create_index(
+            &["docs"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::code()
+                .split_identifiers(true)
+                .preserve_original(true),
+            true,
+        )
+        .await
+        .unwrap();
+    let query = match_query("targetAlpha", Operator::And);
+    assert_eq!(indexed_ids(&dataset, query.clone()).await, [0]);
+    assert_eq!(postfilter_ids(&dataset, query).await, [0]);
+
+    let fuzzy_query = FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new("targets".to_owned())
+            .with_column(Some("docs".to_owned()))
+            .with_fuzziness(Some(1)),
+    ));
+    let query_vector = Float32Array::from(vec![0.0, 0.0]);
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .prefilter(false)
+        .filter_query(QueryFilter::Fts(fuzzy_query))
+        .unwrap();
+    let error = scanner.try_into_batch().await.unwrap_err();
+    assert!(matches!(&error, Error::NotSupported { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("Fuzzy MatchQuery is not supported when FTS is used as a post-filter"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]

@@ -13,7 +13,9 @@ use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
-    Error, Result, datatypes::BLOB_V2_DESC_FIELDS, datatypes::Field, error::LanceOptionExt,
+    Error, Result,
+    datatypes::{BLOB_V2_DESC_FIELDS, BlobV2Layout, Field},
+    error::LanceOptionExt,
 };
 
 use crate::{
@@ -21,7 +23,7 @@ use crate::{
     constants::PACKED_STRUCT_META_KEY,
     decoder::PageEncoding,
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
-    format::ProtobufUtils21,
+    format::EncodingUtils,
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
 use lance_core::datatypes::BlobKind;
@@ -85,7 +87,7 @@ impl BlobStructuralEncoder {
                         ));
                     };
 
-                    let wrapped = ProtobufUtils21::blob_layout(inner_layout, &def_meaning);
+                    let wrapped = EncodingUtils::blob_layout(inner_layout, &def_meaning);
                     Ok(EncodedPage {
                         column_idx: encoded_page.column_idx,
                         data: encoded_page.data,
@@ -259,7 +261,27 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        let struct_arr = array.as_struct();
+        let struct_arr = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "Blob v2 encoder expected StructArray, got {}",
+                        array.data_type()
+                    )
+                    .into(),
+                )
+            })?;
+        if BlobV2Layout::classify(struct_arr.fields()) != Some(BlobV2Layout::Prepared) {
+            let actual = BlobV2Layout::classify(struct_arr.fields())
+                .map(|layout| layout.to_string())
+                .unwrap_or_else(|| format!("unrecognized ({:?})", struct_arr.fields()));
+            return Err(Error::invalid_input_source(
+                format!("Blob v2 encoder expected prepared array layout, got {actual} layout")
+                    .into(),
+            ));
+        }
 
         let kind_col = struct_arr
             .column_by_name("kind")
@@ -307,67 +329,95 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let mut uri_builder = StringBuilder::with_capacity(row_count, row_count * 16);
 
         for i in 0..row_count {
-            let (kind_value, position_value, size_value, blob_id_value, uri_value) =
-                if struct_arr.is_null(i) || kind_col.is_null(i) {
-                    (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
-                } else {
-                    let kind_val = BlobKind::try_from(kind_col.value(i))?;
-                    match kind_val {
-                        BlobKind::Dedicated => (
-                            BlobKind::Dedicated as u8,
-                            0,
-                            blob_size_col.value(i),
-                            blob_id_col.value(i),
-                            "".to_string(),
-                        ),
-                        BlobKind::External => {
-                            let uri = uri_col.value(i).to_string();
-                            let position = if packed_position_col.is_null(i) {
-                                0
-                            } else {
-                                packed_position_col.value(i)
-                            };
-                            let size = if blob_size_col.is_null(i) {
-                                0
-                            } else {
-                                blob_size_col.value(i)
-                            };
-                            let external_base_id = if blob_id_col.is_null(i) {
-                                0
-                            } else {
+            let (kind_value, position_value, size_value, blob_id_value, uri_value) = if struct_arr
+                .is_null(i)
+                || kind_col.is_null(i)
+            {
+                (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
+            } else {
+                let kind_val = BlobKind::try_from(kind_col.value(i))?;
+                match kind_val {
+                    BlobKind::Managed | BlobKind::ManagedWithBase => {
+                        if uri_col.is_null(i)
+                            || ((kind_val == BlobKind::ManagedWithBase) != blob_id_col.is_valid(i))
+                            || packed_position_col.is_null(i)
+                            || blob_size_col.is_null(i)
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "Managed blob row {i} requires URI, position, and size, plus a base ID for an explicit base"
+                            )));
+                        }
+                        let uri = uri_col.value(i);
+                        let position = packed_position_col.value(i);
+                        let size = blob_size_col.value(i);
+                        lance_core::utils::blob::validate_managed_reference(uri, position, size)?;
+                        (
+                            kind_val as u8,
+                            position,
+                            size,
+                            if kind_val == BlobKind::ManagedWithBase {
                                 blob_id_col.value(i)
-                            };
-                            (
-                                BlobKind::External as u8,
-                                position,
-                                size,
-                                external_base_id,
-                                uri,
-                            )
-                        }
-                        BlobKind::Packed => (
-                            BlobKind::Packed as u8,
-                            packed_position_col.value(i),
-                            blob_size_col.value(i),
-                            blob_id_col.value(i),
-                            "".to_string(),
-                        ),
-                        BlobKind::Inline => {
-                            let data_val = data_col.value(i);
-                            let blob_len = data_val.len() as u64;
-                            let position = external_buffers
-                                .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
-
-                            (
-                                BlobKind::Inline as u8,
-                                position,
-                                blob_len,
-                                0,
-                                "".to_string(),
-                            )
-                        }
+                            } else {
+                                0
+                            },
+                            uri.to_string(),
+                        )
                     }
-                };
+                    BlobKind::Dedicated => (
+                        BlobKind::Dedicated as u8,
+                        0,
+                        blob_size_col.value(i),
+                        blob_id_col.value(i),
+                        "".to_string(),
+                    ),
+                    BlobKind::External => {
+                        let uri = uri_col.value(i).to_string();
+                        let position = if packed_position_col.is_null(i) {
+                            0
+                        } else {
+                            packed_position_col.value(i)
+                        };
+                        let size = if blob_size_col.is_null(i) {
+                            0
+                        } else {
+                            blob_size_col.value(i)
+                        };
+                        let external_base_id = if blob_id_col.is_null(i) {
+                            0
+                        } else {
+                            blob_id_col.value(i)
+                        };
+                        (
+                            BlobKind::External as u8,
+                            position,
+                            size,
+                            external_base_id,
+                            uri,
+                        )
+                    }
+                    BlobKind::Packed => (
+                        BlobKind::Packed as u8,
+                        packed_position_col.value(i),
+                        blob_size_col.value(i),
+                        blob_id_col.value(i),
+                        "".to_string(),
+                    ),
+                    BlobKind::Inline => {
+                        let data_val = data_col.value(i);
+                        let blob_len = data_val.len() as u64;
+                        let position =
+                            external_buffers.add_buffer(LanceBuffer::from(Buffer::from(data_val)));
+
+                        (
+                            BlobKind::Inline as u8,
+                            position,
+                            blob_len,
+                            0,
+                            "".to_string(),
+                        )
+                    }
+                }
+            };
 
             kind_builder.append_value(kind_value);
             position_builder.append_value(position_value);
@@ -429,6 +479,7 @@ mod tests {
         ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_core::datatypes::BLOB_V2_LOGICAL_MINIMAL_FIELDS;
 
     #[test]
     fn test_blob_encoder_creation() {
@@ -446,6 +497,51 @@ mod tests {
             create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options);
 
         assert!(encoder.is_ok());
+    }
+
+    #[test]
+    fn test_blob_v2_encoder_rejects_logical_array_layout() {
+        let field = Field::try_from(
+            ArrowField::new(
+                "blob_field",
+                DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+            )])),
+        )
+        .unwrap();
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions::default();
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU32);
+        let mut encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
+        let array = Arc::new(
+            StructArray::try_new(
+                BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone(),
+                vec![
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"payload".as_ref())])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                ],
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let mut external_buffers = OutOfLineBuffers::new(0, 8);
+        let Err(error) =
+            encoder.maybe_encode(array, &mut external_buffers, RepDefBuilder::default(), 0, 1)
+        else {
+            panic!("logical array layout unexpectedly reached the descriptor encoder");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("expected prepared array layout, got logical layout")
+        );
     }
 
     #[tokio::test]
@@ -544,7 +640,16 @@ mod tests {
             Some(empty),
         ]));
 
-        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default().with_encodings([
+                TestEncoding::Array,
+                TestEncoding::StructuralU16,
+                TestEncoding::StructuralU32,
+            ]),
+            blob_metadata,
+        )
+        .await;
     }
 
     #[tokio::test]

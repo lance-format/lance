@@ -89,6 +89,12 @@ impl FailingProxyStore {
             }),
         );
     }
+
+    /// Stop failing calls configured by [`Self::fail_when`].
+    pub fn clear_fail_when(&self, method: &str, path_substr: &str) {
+        let mut policy = self.policy.lock().unwrap();
+        policy.clear_before_policy(&format!("fail_{}_{}", method, path_substr));
+    }
 }
 
 impl WrappingObjectStore for FailingProxyStore {
@@ -98,5 +104,14 @@ impl WrappingObjectStore for FailingProxyStore {
         original: Arc<dyn object_store::ObjectStore>,
     ) -> Arc<dyn object_store::ObjectStore> {
         Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
+    }
+
+    // Injects behaviour into every request, so a listing must not go around it.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
     }
 }

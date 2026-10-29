@@ -1,13 +1,13 @@
 ---
 title: Vector Search
-description: High-performance vector search with ANN indexes, including IVF_PQ, IVF_HNSW_PQ, and IVF_HNSW_SQ
+description: High-performance vector search with ANN indices, including IVF_PQ, IVF_HNSW_PQ, and IVF_HNSW_SQ
 ---
 
 # Vector Indexing and Vector Search With Lance
 
-Lance provides high-performance vector search capabilities with ANN (Approximate Nearest Neighbor) indexes.
+Lance provides high-performance vector search capabilities with ANN (Approximate Nearest Neighbor) indices.
 
-By the end of this tutorial, you'll be able to build and use ANN indexes to dramatically speed up vector search operations while maintaining high accuracy. You'll also learn how to tune search parameters for optimal performance and combine vector search with metadata queries in a single operation.
+By the end of this tutorial, you'll be able to build and use ANN indices to dramatically speed up vector search operations while maintaining high accuracy. You'll also learn how to tune search parameters for optimal performance and combine vector search with metadata queries in a single operation.
 
 ## Install the Python SDK
 
@@ -25,7 +25,6 @@ import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import duckdb
 ```
 
 ## Prepare Your Vector Embeddings
@@ -49,14 +48,13 @@ Then, convert the raw vector data into Lance format for efficient storage and qu
 
 ```python
 from lance.vector import vec_to_table
-import struct
 
 uri = "vec_data.lance"
 
-with open("sift/sift_base.fvecs", mode="rb") as fobj:
-    buf = fobj.read()
-    data = np.array(struct.unpack("<128000000f", buf[4 : 4 + 4 * 1000000 * 128])).reshape((1000000, 128))
-    dd = dict(zip(range(1000000), data))
+# Each .fvecs record is an int32 dimension followed by that many float32 values
+raw = np.fromfile("sift/sift_base.fvecs", dtype="<f4").reshape(-1, 129)
+data = raw[:, 1:]
+dd = dict(zip(range(len(data)), data))
 
 table = vec_to_table(dd)
 lance.write_dataset(table, uri, max_rows_per_group=8192, max_rows_per_file=1024*1024)
@@ -76,9 +74,7 @@ You'll perform vector search without an index to see the baseline performance, t
 First, let's sample some query vectors:
 
 ```python
-import duckdb
-# Make sure DuckDB v0.7+ is installed
-samples = duckdb.query("SELECT vector FROM sift1m USING SAMPLE 100").to_df().vector
+samples = sift1m.sample(100, columns=["vector"]).to_pandas().vector
 ```
 
 ```
@@ -119,7 +115,7 @@ Time(sec): 0.10735273361206055
 ...
 ```
 
-Without the index, the search will scan throughout the whole dataset to compute the distance between each data point. For practical real-time performance with, you will get much better performance with an ANN index.
+Without the index, the search will scan throughout the whole dataset to compute the distance between each data point. For practical real-time performance on large datasets, you will get much better performance with an ANN index.
 
 ## Build the Search Index
 
@@ -210,8 +206,6 @@ The latency vs recall is tunable via:
 - **refine_factor**: determines how many vectors are retrieved during re-ranking
 
 ```python
-%%time
-
 sift1m.to_table(
     nearest={
         "column": "vector",

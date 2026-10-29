@@ -38,6 +38,14 @@ These files serve two purposes:
 1. Enable manifest reconstruction during commit retries when concurrent transactions have been committed
 2. Support conflict detection by describing the operation performed
 
+### Inline Transaction Sections
+
+Small transactions may also be embedded in the manifest file. The manifest stores the byte position of the length-prefixed Transaction message in `transaction_section` (field 23). Readers that do not recognize this manifest field ignore it, so adding a Transaction operation cannot prevent those readers from opening the dataset.
+
+Decoding an inline transaction while opening a manifest is an optional cache optimization. An undecodable or unsupported Transaction message must not make the manifest unreadable. A Transaction whose `operation` holds a field number in the reserved range 100-199 that the reader does not recognize is an operation from a newer writer. Readers must treat it as an unknown operation that conflicts with every concurrent transaction, and must not re-encode or commit it.
+
+`transaction_section_deprecated` (field 21) is the legacy inline position. New writers must leave it absent. Readers may use it to retrieve a transaction from an old manifest when field 23 is absent.
+
 ### Commit Algorithm
 
 The commit process attempts to atomically write a new manifest file using the storage primitives described above.
@@ -185,7 +193,7 @@ row ids feature is enable, then the rewrite operation is compatible with index c
 that are retryable conflicts with index creation:
 
 - Rewrite (only if overlapping fragments, no stable row ids, and no fragment reuse index)
-- DataReplacement (only if overlapping fragments and the column being replaced is being indexed)
+- DataReplacement (only if the column being replaced is being indexed and `data_change` is not false)
 
 Some indices are special singleton indices. For example, the fragment reuse index and the mem wal index. If a conflict occurs
 between two operations that are modifying the same singleton index, then we must rebase the operation and merge the indexes.
@@ -199,6 +207,10 @@ Reorganizes data without semantic modification.
 This includes operations such as compaction, defragmentation, and re-ordering.
 Rewrite operations change row addresses, requiring index updates.
 New fragment IDs must be reserved via `ReserveFragments` before executing a `Rewrite` transaction.
+
+A rewrite that defers index remapping publishes its address mapping in the
+same commit by replacing the [Fragment Reuse Index](../index/system/frag_reuse.md)
+entry in the manifest's index section.
 
 <details>
 <summary>Rewrite protobuf message</summary>
@@ -330,6 +342,7 @@ The Restore operation reverts the table to a previous version. It's generally as
 other operation. Here are the operations that conflict with Restore:
 
 - UpdateMemWalState
+- UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
 
 ### ReserveFragments
 
@@ -427,11 +440,41 @@ An UpdateConfig operation only modifies table config and tends to be compatible 
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
+- Restore (only if the UpdateConfig updates schema or field metadata)
 - UpdateConfig (only if the two operations modify the same config)
 
 ### DataReplacement
 
-Replaces data in specific column regions with new data files.
+Replaces the data files backing some fields of existing fragments with new data files, without moving rows. Each
+`DataReplacementGroup` names a target fragment and one new data file for it. A fragment can be the target of several
+groups, one per new file, and different groups can carry different fields.
+
+The groups apply in order, each to the target fragment as it stands when the transaction commits (and as the previous
+groups left it), not to the fragment as the writer read it:
+
+- If one of the fragment's data files lists the same field ids as the new file, in the same order and file version, the
+  new file's path, size and base replace that data file's.
+- If none of the fragment's data files holds any of the new file's fields (for example, a column added as all nulls),
+  the new file is appended.
+- If the fragment's data files hold all of the new file's fields, those fields are replaced with the tombstone id (`-2`)
+  in the files that hold them, and the new file is appended. A data file left with no field of the schema and none of
+  the fragment's spilled row lineage is removed from the fragment. A legacy (V1) data file can't tombstone single
+  fields, so a field a V1 file holds can only be replaced by an exact match.
+- Any other replacement is rejected.
+
+`data_change` says whether the new files change any value. When it is absent, as in every transaction written before
+the field existed, it means true. A replacement that changes data:
+
+- withdraws, from every index on a replaced field, its coverage of the target fragments;
+- tombstones the replaced fields in the target fragments' overlays committed at or before its read version, since the
+  new base values supersede them (see [DataOverlay](#dataoverlay));
+- with stable row IDs, sets the last-updated-at version of every row in the target fragments to the new version.
+
+With `data_change` false, the writer asserts that the new files hold, for every physical row, the same base values the
+fragment's files held for those fields (overlays not applied), only laid out in different files. No value a reader sees
+changes, so none of the above happens: index coverage is kept, overlays keep shadowing the base, and no row's
+last-updated-at version moves. Nor does it count as writing values against a concurrent Project or Merge that may change
+a field's nullability. A compaction that repacks a fragment's columns into fewer files is such a replacement.
 
 <details>
 <summary>DataReplacement protobuf message</summary>
@@ -444,21 +487,26 @@ Replaces data in specific column regions with new data files.
 
 #### DataReplacement Compatibility
 
-A DataReplacement operation only replaces a single column's worth of data. As a result, it can be safer and simpler than Merge
-or Update operations. It rewrites a column file positionally against the fragments it targets, so a concurrent operation only
-conflicts when it removes one of those fragments or invalidates the rows the column file covers. Here are the operations that
-conflict with DataReplacement (non-retryable):
+A DataReplacement operation only replaces the data of the fields its new files carry. As a result, it can be safer and
+simpler than Merge or Update operations. It rewrites column files positionally against the fragments it targets, so a
+concurrent operation conflicts when it removes one of those fragments or one of the replaced fields, moves or rewrites
+the rows the column files cover, or depends on the replaced values. Here are the operations that conflict with
+DataReplacement (non-retryable):
 
 - Overwrite
 - Restore
 - UpdateMemWalState
 - Delete (only if it removes a target fragment outright)
 - Update (only if it removes a target fragment outright)
+- Project (only if it drops a field being replaced)
+
+The last three are retryable instead when `data_change` is false: a replacement that only moves values can be planned
+again against the new version, while one that changes data would need new values from its caller.
 
 The following operations are retryable conflicts with DataReplacement:
 
 - DataReplacement (only if same field and overlapping fragments)
-- CreateIndex (only if the field being replaced is being indexed)
+- CreateIndex (only if the field being replaced is being indexed, and `data_change` is not false)
 - Rewrite (only if overlapping fragments)
 - Update (only if it rewrites rows out of a target fragment, or rewrites one of the replaced fields in place)
 - Merge (always)
@@ -522,7 +570,8 @@ field, it supersedes any older overlay on that field: the writer tombstones the
 overlay's entry for the rewritten field — replacing the field id with the obsolete
 sentinel, as with obsolete base columns — so the fresh base values are not silently
 shadowed. Overlay entries for other fields are preserved, and an overlay left with
-no live fields is dropped.
+no live fields is dropped. A DataReplacement with `data_change` false writes no new
+values, so it tombstones nothing.
 
 ### UpdateMemWalState
 
@@ -685,7 +734,9 @@ In this scenario:
 If the backing object store does not support atomic operations (rename-if-not-exists or put-if-not-exists), an external manifest store can be used to enable concurrent writers.
 
 An external manifest store is a key-value store that supports put-if-not-exists operations.
-The external manifest store supplements but does not replace the manifests in object storage.
+It is the concurrency coordinator and fast version index: its conditional write selects one
+immutable staging manifest for each version. The canonical manifest bytes in object storage
+remain authoritative, so the external store supplements but does not replace them.
 A reader unaware of the external manifest store can still read the table, but may observe a version up to one commit behind the true latest version.
 
 ### Commit Process with External Store
@@ -698,24 +749,41 @@ The commit process follows a four-step protocol:
    - Write the new manifest to object storage under a unique path determined by a new UUID
    - This staged manifest is not yet visible to readers
 
-2. **Commit to external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}`
-   - Atomically commit the path of the staged manifest to the external store using put-if-not-exists
-   - The commit is effectively complete after this step
-   - If this operation fails due to conflict, another writer has committed this version
+2. **Reserve version in external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest-{uuid}`
+   - Atomically reserve the version for this staged manifest using put-if-not-exists
+   - The reservation selects one immutable staging object; it is not yet the canonical commit
+   - If this operation fails due to conflict, another writer reserved this version
 
 3. **Finalize in object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
    - Copy the staged manifest to the final path
+   - Successful materialization at this deterministic path is the commit point
    - This makes the manifest discoverable by readers unaware of the external store
 
 4. **Update external store pointer**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
    - Update the external store to point to the finalized manifest path
+   - After copying, read the canonical object's current metadata. Return its ETag to the caller as
+     an opaque physical-generation observation so runtime caches do not collapse a newly committed
+     Dataset into an older cached Dataset at the same URI and version
+   - Do not persist that ETag in the external store. Concurrent finalizers can copy the same selected
+     immutable bytes into different physical generations, and COPY plus external-store publication
+     is not atomic. Every helper therefore publishes the same stable path-and-size tuple
    - Completes the synchronization between external store and object storage
 
 **Fault Tolerance:**
 
-If the writer fails after step 2 but before step 4, the external store and object store are temporarily out of sync.
-Readers detect this condition and attempt to complete the synchronization.
-If synchronization fails, the reader refuses to load to ensure dataset portability.
+If the writer fails after step 2 but before step 3, the external store contains a pending
+reservation. Readers that use the external store detect this state and retry materialization.
+If step 3 succeeds but step 4 fails, the canonical object remains committed; readers use it and
+may repair the external index. Staging deletion is garbage collection and does not affect the
+commit outcome.
+
+**Rolling Upgrade:**
+
+Roll this behavior out normally across the fleet. New readers ignore legacy stored
+ETags, and legacy readers already accept finalized rows without an ETag, so mixed-version rows
+remain compatible. While both legacy finalizers and legacy readers remain, the pre-existing race
+can still republish a stale ETag that a legacy reader rejects. Full protection takes effect when
+the rolling upgrade converges; no row migration or quiesced cutover is required.
 
 ### Reader Process with External Store
 
@@ -725,7 +793,9 @@ The reader follows a validation and synchronization protocol:
 
 1. **Query external store**: `GET_EXTERNAL_STORE base_uri, version` → `path`
    - Retrieve the manifest path for the requested version
-   - If the path does not end with a UUID, return it directly (synchronization complete)
+   - If the path does not end with a UUID, validate the canonical object's size. Ignore any legacy
+     stored ETag because it is neither content identity nor dataset-incarnation identity; the
+     validation HEAD still returns the current canonical ETag to the caller
    - If the path ends with a UUID, synchronization is required
 
 2. **Synchronize to object store**: `COPY_OBJECT_STORE {dataset}/_versions/{version}.manifest-{uuid} → {dataset}/_versions/{version}.manifest`
@@ -733,11 +803,12 @@ The reader follows a validation and synchronization protocol:
    - This operation is idempotent
 
 3. **Update external store**: `PUT_EXTERNAL_STORE base_uri, version, {dataset}/_versions/{version}.manifest`
-   - Update the external store to reflect the finalized path
-   - Future readers will see the synchronized state
+   - Best-effort record the finalized path and size without an ETag while returning the observed
+     destination ETag to the current caller
+   - If this index repair fails, retain staging so a future reader can retry it
 
 4. **Return finalized path**: Return `{dataset}/_versions/{version}.manifest`
-   - Always return the finalized path
-   - If synchronization fails, return an error to prevent reading inconsistent state
+   - Return once canonical materialization succeeds, even if index repair or staging cleanup fails
+   - If canonical materialization cannot be established, or an observed size differs, return an error
 
 This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.

@@ -15,7 +15,14 @@ on:
       - rust-toolchain.toml
       - Cargo.toml
       - Cargo.lock
+      - python/Cargo.lock
+      - java/lance-jni/Cargo.lock
+      - .cargo/config.toml
+      - clippy.toml
       - deny.toml
+      - ci/check_dependency_age.py
+      - ci/check_advisory_ignores.py
+      - ci/arrow_upgrade.py
 
 permissions:
   contents: read
@@ -52,24 +59,21 @@ jobs:
       # Catches manifest problems that only surface at publish time (missing
       # readme/license files, path dependencies without a version, excluded
       # files a crate needs). `--no-verify` skips building each packaged crate,
-      # which the other jobs already cover. Keep the excludes in sync with
-      # .github/workflows/cargo-publish.yml.
+      # which the other jobs already cover. Package the Arrow-versioned helper
+      # crates too even though releases publish them separately.
       - name: Package crates
         run: |
-          cargo package --workspace --no-verify \
-            --exclude lance-arrow-stats \
-            --exclude lance-arrow-scalar \
-            --all-features
+          cargo package --workspace --no-verify --all-features
 
   rustdoc:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
@@ -81,16 +85,22 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Get features
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | sort | uniq | paste -s -d "," -`
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Clippy
         run: cargo clippy --profile ci --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
+      # The Arrow ordering fixtures in `lance` are `test = false`, which
+      # `--all-targets` skips (and a named `--test` is ignored next to
+      # `--tests`), so lint them in their own invocation. `--workspace` keeps
+      # feature unification identical to the step above.
+      - name: Clippy (Arrow ordering fixtures)
+        run: cargo clippy --profile ci --locked --workspace --features ${{ env.ALL_FEATURES }} --test arrow_ordering -- -D warnings
 
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
@@ -101,8 +111,145 @@ jobs:
         with:
           log-level: warn
           command: check
+      # Runs after cargo-deny so it can reuse the index cargo-deny already
+      # fetched. The script falls back to the network when that misses.
+      - name: Check dependency age
+        run: python3 ci/check_dependency_age.py
+      # Fails if an ignore in deny.toml has no `expires` or `no fix` marker, or
+      # its expires date has passed. It runs even if a step above failed, so
+      # one CI run reports every problem.
+      - name: Check advisory ignores
+        if: ${{ !cancelled() }}
+        run: python3 ci/check_advisory_ignores.py
 
-  linux-coverage-build:
+  arrow-ordering-detect:
+    # Lance inherits its comparison semantics from Arrow, DataFusion and `half`.
+    # The ordering fixtures are excluded from the default test run (`test =
+    # false` in rust/lance/Cargo.toml) and run only from the
+    # `arrow-ordering-compat` job below, which this small job gates: it fires
+    # when a PR changes one of those versions in Cargo.lock, or touches the
+    # fixtures, these jobs, the detector, or the Lance crates the fixtures
+    # exercise, so edits to the check itself are verified too.
+    name: Detect Arrow ordering-relevant changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+      base_sha: ${{ steps.detect.outputs.base_sha }}
+    env:
+      FIXTURE: rust/lance/tests/arrow_ordering.rs
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Depth 2 keeps both parents of the PR's merge commit; a depth-1
+          # checkout hides them, so `HEAD^1` cannot resolve.
+          fetch-depth: 2
+      - name: Detect dependency or fixture changes
+        id: detect
+        run: |
+          # The checkout is the PR's merge commit, whose first parent is the base
+          # branch as merged. The event payload's base SHA goes stale on a re-run
+          # after the base branch moved, so the parent is the reference used.
+          # `--verify -q` prints nothing on failure, so the fallback value is
+          # never mixed with an unresolved expression.
+          if git rev-parse --verify -q HEAD^2 >/dev/null; then
+            base_sha=$(git rev-parse --verify -q HEAD^1)
+          else
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          fi
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --depth=1 origin "$base_sha"
+          git show "$base_sha:Cargo.lock" > "$RUNNER_TEMP/base.Cargo.lock"
+          python3 ci/arrow_upgrade.py "$RUNNER_TEMP/base.Cargo.lock" Cargo.lock
+          # Changes to the check itself, or to the Lance crates it exercises,
+          # also run the fixtures so the check is never merged untested.
+          self_changed=$(git diff --name-only "$base_sha" HEAD -- \
+            rust/lance/tests/arrow_ordering.rs rust/lance/Cargo.toml ci/arrow_upgrade.py .github/workflows/rust.yml \
+            rust/arrow-scalar rust/arrow-stats)
+          if [ -n "$self_changed" ]; then
+            echo "fixtures or the paths they exercise changed:"
+            echo "$self_changed"
+          fi
+          if [ -n "$self_changed" ] || grep -q '^changed=true$' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  arrow-ordering-compat:
+    # The fixtures *from the base branch* run first, so an upgrade cannot pass
+    # by refreshing the expectations in the same PR; a reviewed change is
+    # admitted with the `arrow-ordering-reviewed` label, read live so a re-run
+    # after labelling sees it. The PR's own copy runs after.
+    name: Arrow ordering compatibility
+    needs: arrow-ordering-detect
+    if: needs.arrow-ordering-detect.outputs.run == 'true'
+    runs-on: "ubuntu-24.04-8x"
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      CC: clang
+      CXX: clang++
+      # No `-D warnings` here: this job builds with default features, under
+      # which feature-gated code warns as dead, and a dependency bump may
+      # deprecate an API the base fixtures use. The clippy job enforces
+      # warnings; this job's only question is whether the ordering changed.
+      BASE_SHA: ${{ needs.arrow-ordering-detect.outputs.base_sha }}
+      FIXTURE: rust/lance/tests/arrow_ordering.rs
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Run base-branch fixtures against the upgraded dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          # The base branch's expectations are the contract under test.
+          if ! git cat-file -e "$BASE_SHA:$FIXTURE" 2>/dev/null; then
+            echo "::notice::No ordering fixtures on the base branch; only the PR's copy is checked."
+            exit 0
+          fi
+          git show "$BASE_SHA:$FIXTURE" > "$FIXTURE"
+          # Labels are read live rather than from the event payload so that a
+          # re-run after labelling admits the change.
+          reviewed=false
+          if gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name' | grep -qx 'arrow-ordering-reviewed'; then
+            reviewed=true
+          fi
+          # A compile failure means the upgrade renamed an API the fixtures use;
+          # that is a port, not an ordering finding, and is reported as such.
+          if ! cargo test --profile ci --locked -p lance --test arrow_ordering --no-run; then
+            if [ "$reviewed" = "true" ]; then
+              echo "::warning::Base-branch fixtures do not compile against the upgraded dependencies; admitted by the arrow-ordering-reviewed label. Only the PR's copy is checked."
+              exit 0
+            fi
+            echo "::error::Base-branch fixtures do not compile against the upgraded dependencies, so the ordering contract could not be checked. Port the fixture file without changing expectations, review the release notes in the job summary, then apply the arrow-ordering-reviewed label."
+            exit 1
+          fi
+          if cargo test --profile ci --locked -p lance --test arrow_ordering; then
+            exit 0
+          fi
+          if [ "$reviewed" = "true" ]; then
+            echo "::warning::Arrow ordering changed; admitted by the arrow-ordering-reviewed label."
+            exit 0
+          fi
+          echo "::error::Arrow ordering changed against the base-branch fixtures. Review the release notes in the job summary, record the affected Lance paths and any persisted-structure handling in the PR, then apply the arrow-ordering-reviewed label."
+          exit 1
+      - name: Run the PR's fixtures against the upgraded dependencies
+        run: |
+          git checkout -- "$FIXTURE"
+          cargo test --profile ci --locked -p lance --test arrow_ordering
+
+  linux-build:
     runs-on: "ubuntu-24.04-8x"
     timeout-minutes: 75
     env:
@@ -115,163 +262,37 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Setup rust toolchain
         run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
-          rustup default nightly-2026-07-13
+          rustup toolchain install stable
+          rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
         with:
-          key: llvm-cov-ci
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
+          tool: protoc
       - name: Install cargo-nextest
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
         with:
           tool: nextest
-      - name: Build coverage tests
+      - name: Build tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo +nightly-2026-07-13 llvm-cov nextest-archive \
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
             --cargo-profile ci \
             --locked \
             --workspace \
-            --features ${ALL_FEATURES} \
-            --archive-file rust-coverage-tests.tar.zst
-      - name: Upload coverage tests
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rust-coverage-tests
-          path: rust-coverage-tests.tar.zst
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-
-  linux-coverage-test:
-    needs: linux-coverage-build
-    runs-on: "ubuntu-24.04-8x"
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
-          rustup default nightly-2026-07-13
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y libssl-dev
+            --features "${ALL_FEATURES}" \
+            --no-run
       - name: Start DynamoDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
-        with:
-          tool: nextest
-      - name: Download coverage tests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rust-coverage-tests
-          path: coverage-artifacts
-      - name: Run coverage tests
+      - name: Run tests
         run: |
-          cargo +nightly-2026-07-13 llvm-cov nextest \
-            --no-report \
-            --archive-file coverage-artifacts/rust-coverage-tests.tar.zst \
-            --partition slice:${{ matrix.shard }}/3
-      - name: Merge shard coverage
-        run: |
-          TOOLCHAIN_ROOT=`rustc +nightly-2026-07-13 --print sysroot`
-          HOST_TRIPLE=`rustc +nightly-2026-07-13 -vV | awk '/^host:/ {print $2}'`
-          LLVM_PROFDATA="${TOOLCHAIN_ROOT}/lib/rustlib/${HOST_TRIPLE}/bin/llvm-profdata"
-          find target/llvm-cov-target -maxdepth 1 -name '*.profraw' -print > coverage-artifacts/profraw-files
-          "${LLVM_PROFDATA}" merge \
-            -sparse \
-            -f coverage-artifacts/profraw-files \
-            -o coverage-artifacts/coverage-shard-${{ matrix.shard }}.profdata
-      - name: Upload shard coverage
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rust-coverage-profile-${{ matrix.shard }}
-          path: coverage-artifacts/coverage-shard-${{ matrix.shard }}.profdata
-          retention-days: 1
-          if-no-files-found: error
-
-  linux-build:
-    needs: [linux-coverage-build, linux-coverage-test]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
-          rustup default nightly-2026-07-13
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
-        with:
-          tool: nextest
-      - name: Download coverage tests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rust-coverage-tests
-          path: coverage-artifacts
-      - name: Download shard coverage
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: rust-coverage-profile-*
-          path: coverage-artifacts/profiles
-          merge-multiple: true
-      - name: Merge coverage
-        run: |
-          mkdir -p target/llvm-cov-target
-          cargo +nightly-2026-07-13 nextest list \
-            --archive-file coverage-artifacts/rust-coverage-tests.tar.zst \
-            --extract-to target/llvm-cov-target > /dev/null
-          TOOLCHAIN_ROOT=`rustc +nightly-2026-07-13 --print sysroot`
-          HOST_TRIPLE=`rustc +nightly-2026-07-13 -vV | awk '/^host:/ {print $2}'`
-          LLVM_PROFDATA="${TOOLCHAIN_ROOT}/lib/rustlib/${HOST_TRIPLE}/bin/llvm-profdata"
-          "${LLVM_PROFDATA}" merge \
-            -sparse \
-            coverage-artifacts/profiles/*.profdata \
-            -o target/llvm-cov-target/lance.profdata
-          cargo +nightly-2026-07-13 llvm-cov report \
-            --nextest-archive-file coverage-artifacts/rust-coverage-tests.tar.zst \
-            --codecov \
-            --output-path coverage.codecov
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rust-coverage-codecov
-          path: coverage.codecov
-          retention-days: 1
-          if-no-files-found: error
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          codecov_yml_path: codecov.yml
-          files: coverage.codecov
-          flags: unittests
-          fail_ci_if_error: false
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}"
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x
@@ -284,47 +305,20 @@ jobs:
           rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
-  query-integration-tests:
-    runs-on: ubuntu-24.04-4x
-    timeout-minutes: 75
-    env:
-      # We use opt-level 1 which makes some tests 5x faster to run.
-      RUSTFLAGS: "-C debuginfo=1 -C opt-level=1"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Build query integration tests
-        run: |
-          cargo build --locked -p lance --no-default-features --features fp16kernels,slow_tests --tests --test integration_tests
-      - name: Run query integration tests
-        run: |
-          cargo test --locked -p lance --no-default-features --features fp16kernels,slow_tests --test integration_tests
   build-no-lock:
     runs-on: ubuntu-24.04-8x
     timeout-minutes: 30
@@ -342,13 +336,13 @@ jobs:
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build all
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
     runs-on: warp-macos-14-arm64-6x
@@ -373,15 +367,21 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # macOS runner capacity is the scarcest in CI, so this job is kept as short
+      # as it can be. nextest runs each test in its own process and schedules
+      # across all cores, rather than one test binary at a time. Benchmarks are
+      # only compile-checked here, which build-no-lock already does on Linux;
+      # nothing about bench compilation is macOS-specific.
       - name: Build tests
         run: |
-          cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+          cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --profile ci --features fp16kernels,cli,dynamodb,substrait
-      - name: Check benchmarks
-        run: |
-          cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
+          cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
   windows-build:
     runs-on: windows-latest-4x
     defaults:
@@ -399,24 +399,39 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # Same reasoning as mac-build: nextest schedules across all cores instead
+      # of running one test binary at a time, and build-no-lock already
+      # compile-checks the benchmarks on Linux.
       - name: Build tests
-        run: cargo test --profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked --no-run
       - name: Run tests
-        run: cargo test --profile ci
-      - name: Check benchmarks
-        run: cargo check --profile ci --benches
+        run: cargo nextest run --cargo-profile ci
 
   qemu-pre-haswell:
-    # Verifies that lance-linalg's runtime SIMD dispatch still works
-    # correctly when the binary is built with the lower x86-64-v2 baseline
-    # (the legacy build path documented in CONTRIBUTING.md). Emulates a
-    # Nehalem CPU under qemu-user; catches any accidental AVX2/FMA
-    # instructions that leak past the runtime dispatch.
+    # Builds lance-linalg's lib tests once in release mode and runs them twice: on
+    # the runner's own CPU, and under qemu emulating a Nehalem.
     #
-    # The published-wheel default baseline (`target-cpu=haswell`) is set in
-    # `.cargo/config.toml`; this job overrides RUSTFLAGS for one job to
-    # exercise the legacy path without affecting any other build.
-    name: pre-Haswell SIGILL check (qemu Nehalem)
+    # Release mode, not the `ci` profile the other test jobs use: `ci` inherits
+    # `dev`, so the Rust there compiles at opt-level 0.
+    #
+    # The qemu run is the pre-Haswell check: it verifies that runtime SIMD
+    # dispatch still works when the binary is built with the lower x86-64-v2
+    # baseline (the legacy build path documented in CONTRIBUTING.md), and catches
+    # any accidental AVX2/FMA instructions that leak past the dispatch. A Nehalem
+    # fails every feature gate, so that run takes the fallback arms; the native
+    # run is there to reach the SIMD arms a Nehalem cannot.
+    #
+    # `test_x86_runtime_feature_report` writes the features each run detected to
+    # stderr. Both runs use default features, so `fp16kernels` is off.
+    #
+    # The x86_64-linux baseline (`target-cpu=haswell`) comes from
+    # `.cargo/config.toml`; this job overrides RUSTFLAGS to exercise the legacy
+    # path, which affects only this job.
+    name: lance-linalg release tests (native + qemu Nehalem)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -437,13 +452,26 @@ jobs:
         with:
           path: ${{ runner.temp }}/lance-qemu/8.2.10/qemu-x86_64
           key: qemu-user-8.2.10-x86_64-linux-user-${{ runner.os }}-${{ runner.arch }}-v1
-      - name: Install dependencies
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      # Ordered before the QEMU build so a failure there cannot skip the native
+      # run: a step runs only if the ones before it succeeded.
+      - name: Build lance-linalg lib tests in release mode
         run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+          cargo test --release -p lance-linalg --lib --no-run
+      # `env` is a no-op runner: it overrides the job-level qemu runner for this
+      # step, so the binary built above runs on the runner's own CPU.
+      - name: Run lance-linalg lib tests on the runner's own CPU
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: env
+        run: |
+          cargo test --release -p lance-linalg --lib
       - name: Install QEMU build dependencies
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
+          sudo apt update
           sudo apt install -y \
             ninja-build \
             pkg-config \
@@ -489,9 +517,6 @@ jobs:
             echo "Expected QEMU 8.2.10, got: ${QEMU_VERSION_OUTPUT}" >&2
             exit 1
           fi
-      - name: Build lance-linalg lib tests in release mode
-        run: |
-          cargo test --release -p lance-linalg --lib --no-run
       - name: Run lance-linalg lib tests under qemu Nehalem
         run: |
           cargo test --release -p lance-linalg --lib
@@ -502,7 +527,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        msrv: ["1.91.0"] # This should match up with rust-version in Cargo.toml
+        msrv: ["1.95.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
       CC: clang
@@ -512,10 +537,10 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install ${{ matrix.msrv }}
         run: |
           rustup toolchain install ${{ matrix.msrv }}
@@ -523,5 +548,5 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.msrv }}
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo check --profile ci --workspace --tests --benches --features ${ALL_FEATURES}

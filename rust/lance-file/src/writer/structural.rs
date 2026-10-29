@@ -4,8 +4,8 @@
 use core::panic;
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_data::ArrayData;
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
+use arrow_buffer::BooleanBuffer;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{StreamExt, stream::FuturesOrdered};
 use lance_core::{
@@ -14,7 +14,6 @@ use lance_core::{
     utils::bit::pad_bytes,
 };
 use lance_encoding::{
-    decoder::PageEncoding,
     encoder::{
         BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
         OutOfLineBuffers,
@@ -32,7 +31,10 @@ use tracing::instrument;
 use crate::{
     datatypes::FieldsWithMeta,
     format::{pb, pbfile},
-    writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriterOptions, PAGE_BUFFER_ALIGNMENT},
+    writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, ExpectedTypes, FileWriterOptions,
+        PAGE_BUFFER_ALIGNMENT,
+    },
 };
 
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -209,10 +211,7 @@ impl StructuralFileSink {
             buffer_sizes.push(buffer.len() as u64);
             self.write_aligned_buffer(&buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = crate::writer::encode_page_encoding(&encoded_page.description)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -249,6 +248,9 @@ impl StructuralFileSink {
         while let Some(encoding_task) = encoding_tasks.next().await {
             self.write_page(encoding_task?).await?;
         }
+        // Reaps any upload that has already failed so the error is attributed to
+        // this batch. This does not wait for in-flight uploads; see
+        // `ObjectWriter::poll_flush`.
         self.writer.flush().await?;
         Ok(())
     }
@@ -378,6 +380,7 @@ impl StructuralFileSink {
 /// a schema is initialized. This component only executes that decision.
 pub struct EncodingPipeline {
     schema: Option<Schema>,
+    expected_types: Option<ExpectedTypes>,
     field_encoders: Vec<Box<dyn FieldEncoder>>,
     field_id_to_column_indices: Vec<(u32, u32)>,
     rows_written: u64,
@@ -390,6 +393,7 @@ impl EncodingPipeline {
     pub fn new(options: FileWriterOptions) -> Self {
         Self {
             schema: None,
+            expected_types: None,
             field_encoders: Vec::new(),
             field_id_to_column_indices: Vec::new(),
             rows_written: 0,
@@ -397,6 +401,10 @@ impl EncodingPipeline {
             schema_metadata: HashMap::new(),
             options,
         }
+    }
+
+    pub(crate) fn validate_options(&self) -> Result<()> {
+        self.options.validate()
     }
 
     pub fn encoding_options(&self, schema: &Schema) -> EncodingOptions {
@@ -446,26 +454,117 @@ impl EncodingPipeline {
         self.schema.is_some()
     }
 
-    fn verify_field_nullability(array: &ArrayData, field: &Field) -> Result<()> {
-        if !field.nullable && array.null_count() > 0 {
+    fn verify_field_nullability(array: &dyn Array, field: &Field) -> Result<()> {
+        Self::verify_field_nullability_where_reachable(array, field, None)
+    }
+
+    /// `reachable` marks the slots a valid parent can actually see, or `None`
+    /// at the top level where every slot is reachable.
+    ///
+    /// A null struct slot leaves its children undefined, so a child null there
+    /// says nothing about whether the child is nullable. Arrow draws the line
+    /// the same way -- `StructArray::try_new` rejects only nulls in a
+    /// non-nullable child that the parent's null mask does not cover -- and a
+    /// reader is free to hand back nulls under a null parent for a column this
+    /// writer produced with values there. Judging those would make a column
+    /// unwritable after a round trip.
+    ///
+    /// Nulls are read through `logical_nulls`, which is what Arrow validates
+    /// against. A dictionary key pointing at a null value is a null the
+    /// physical validity buffer does not carry, and masking physical validity
+    /// alone would let one through into a file Arrow refuses on readback.
+    fn verify_field_nullability_where_reachable(
+        array: &dyn Array,
+        field: &Field,
+        reachable: Option<&BooleanBuffer>,
+    ) -> Result<()> {
+        let nulls = array.logical_nulls();
+        let offending = match (nulls.as_ref(), reachable) {
+            (None, _) => 0,
+            (Some(nulls), None) => nulls.null_count(),
+            (Some(nulls), Some(reachable)) => (&!nulls.inner() & reachable).count_set_bits(),
+        };
+        if !field.nullable && offending > 0 {
             return Err(Error::invalid_input(format!(
                 "The field `{}` contained null values even though the field is marked non-null in the schema",
                 field.name
             )));
         }
-        for (child_field, child_array) in field.children.iter().zip(array.child_data()) {
-            Self::verify_field_nullability(child_array, child_field)?;
+        if field.children.is_empty() {
+            return Ok(());
+        }
+        // Only a struct's children sit one slot per parent slot. List-like
+        // children are addressed through offsets, so the parent's validity
+        // does not map onto them and they are checked as before.
+        let Some(parent) = array.as_any().downcast_ref::<StructArray>() else {
+            for (child_field, child_array) in
+                field.children.iter().zip(array.to_data().child_data())
+            {
+                Self::verify_field_nullability_where_reachable(
+                    make_array(child_array.clone()).as_ref(),
+                    child_field,
+                    None,
+                )?;
+            }
+            return Ok(());
+        };
+        let own = nulls
+            .as_ref()
+            .map(|nulls| nulls.inner().clone())
+            .unwrap_or_else(|| BooleanBuffer::new_set(array.len()));
+        let child_reachable = match reachable {
+            Some(reachable) => &own & reachable,
+            None => own,
+        };
+        // `StructArray::columns` are already cut to the parent's window, so
+        // they line up with a mask built from the parent's slots.
+        for (child_field, child_array) in field.children.iter().zip(parent.columns()) {
+            Self::verify_field_nullability_where_reachable(
+                child_array.as_ref(),
+                child_field,
+                Some(&child_reachable),
+            )?;
         }
         Ok(())
     }
 
-    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (column, field) in batch
-            .columns()
+    /// Select, by name, the array that will be encoded for each schema field.
+    ///
+    /// A batch may order its columns differently from the schema or carry extra
+    /// ones, so each field's array is pulled by name rather than by position. A
+    /// column the schema names but the batch lacks is an error. Selecting once
+    /// here lets the nullability check and the encoder share the result, so each
+    /// field is resolved by name a single time per batch rather than once for the
+    /// check and again for the encoder, as the v2.0 writer already does.
+    fn field_arrays(&self, batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
+        self.schema
+            .as_ref()
+            .unwrap()
+            .fields
             .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(&column.to_data(), field)?;
+            .enumerate()
+            .map(|(field_index, field)| {
+                let array = batch.column_by_name(&field.name).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Cannot write batch.  The batch was missing the column `{}`",
+                            field.name
+                        )
+                        .into(),
+                    )
+                })?;
+                Ok((field_index, array.clone()))
+            })
+            .collect()
+    }
+
+    /// Verify each selected array against its field's nullability, on the same
+    /// `(field_index, array)` pairs the encoder writes, so the check and the
+    /// encoder never disagree about which array belongs to a field.
+    fn verify_nullability(&self, field_arrays: &[(usize, ArrayRef)]) -> Result<()> {
+        let fields = &self.schema.as_ref().unwrap().fields;
+        for (field_index, array) in field_arrays {
+            Self::verify_field_nullability(array.as_ref(), &fields[*field_index])?;
         }
         Ok(())
     }
@@ -494,34 +593,6 @@ impl EncodingPipeline {
             .collect()
     }
 
-    fn encode_batch(
-        &mut self,
-        batch: &RecordBatch,
-        external_buffers: &mut OutOfLineBuffers,
-    ) -> Result<Vec<Vec<EncodeTask>>> {
-        let field_arrays = self
-            .schema
-            .as_ref()
-            .unwrap()
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(field_index, field)| {
-                let array = batch.column_by_name(&field.name).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!(
-                            "Cannot write batch.  The batch was missing the column `{}`",
-                            field.name
-                        )
-                        .into(),
-                    )
-                })?;
-                Ok((field_index, array.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.encode_columns(&field_arrays, external_buffers)
-    }
-
     #[instrument(skip_all, level = "debug")]
     pub async fn write_batch(
         &mut self,
@@ -534,7 +605,13 @@ impl EncodingPipeline {
             batch.num_columns(),
             batch.get_array_memory_size()
         );
-        self.verify_nullability_constraints(batch)?;
+        let schema = self
+            .schema
+            .as_ref()
+            .expect("the pipeline is initialized before writing");
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_batch(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -545,9 +622,15 @@ impl EncodingPipeline {
             ));
         }
 
+        // Resolve each field's array by name once, then both check nullability
+        // and encode from the same arrays: a batch may reorder or duplicate
+        // columns, so the check must see exactly what the encoder writes.
+        let field_arrays = self.field_arrays(batch)?;
+        self.verify_nullability(&field_arrays)?;
+
         let mut external_buffers =
             OutOfLineBuffers::new(sink.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
-        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         for external_buffer in external_buffers.take_buffers() {
             sink.write_aligned_buffer(&external_buffer).await?;
         }
@@ -595,7 +678,10 @@ impl EncodingPipeline {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
-        Self::verify_field_nullability(&array.to_data(), field)?;
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_column(column_index, &array)?;
+        Self::verify_field_nullability(array.as_ref(), field)?;
         if array.is_empty() {
             return Ok(());
         }
@@ -697,7 +783,9 @@ impl EncodingPipeline {
         self.schema_metadata.insert(key.into(), value.into());
     }
 
-    pub fn initialize_with_external_metadata(&mut self, schema: Schema, rows_written: u64) {
+    pub fn initialize_with_external_metadata(&mut self, mut schema: Schema, rows_written: u64) {
+        self.schema_metadata
+            .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
         self.rows_written = rows_written;
     }
@@ -771,14 +859,7 @@ pub fn encode_batch_body(batch: &EncodedBatch, write_schema: bool) -> Result<Enc
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = crate::writer::encode_page_encoding(&page_info.encoding)?;
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
                     page_info.buffer_offsets_and_sizes.iter().copied().unzip();
                 Ok(pbfile::column_metadata::Page {
@@ -834,4 +915,107 @@ pub fn encode_batch_body(batch: &EncodedBatch, write_schema: bool) -> Result<Enc
         num_global_buffers,
         num_columns: batch.page_table.len() as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, BooleanArray, StructArray};
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
+
+    use super::EncodingPipeline;
+
+    /// `analysis: struct<changed: bool>` where the child is declared
+    /// non-nullable, built with a nullable child so the array can carry the
+    /// nulls a reader hands back.
+    fn analysis(parent_valid: Vec<bool>, changed: Vec<Option<bool>>) -> (ArrayRef, Schema) {
+        let child = Arc::new(BooleanArray::from(changed)) as ArrayRef;
+        let array = Arc::new(StructArray::new(
+            Fields::from(vec![ArrowField::new("changed", DataType::Boolean, true)]),
+            vec![child],
+            Some(NullBuffer::from(parent_valid)),
+        )) as ArrayRef;
+        let declared = ArrowSchema::new(vec![ArrowField::new(
+            "analysis",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "changed",
+                DataType::Boolean,
+                false,
+            )])),
+            true,
+        )]);
+        (array, Schema::try_from(&declared).unwrap())
+    }
+
+    #[test]
+    fn child_nulls_under_a_null_parent_are_writable() {
+        // A null struct slot leaves its child undefined, and a reader returns
+        // null there for a column this writer stored a value in. Rejecting it
+        // would make the column unwritable after a round trip.
+        let (array, schema) = analysis(
+            vec![true, false, true, false],
+            vec![Some(true), None, Some(false), None],
+        );
+        EncodingPipeline::verify_field_nullability(array.as_ref(), &schema.fields[0]).unwrap();
+    }
+
+    #[test]
+    fn child_nulls_under_a_valid_parent_are_still_rejected() {
+        let (array, schema) = analysis(
+            vec![true, true, true, false],
+            vec![Some(true), None, Some(false), None],
+        );
+        let error = EncodingPipeline::verify_field_nullability(array.as_ref(), &schema.fields[0])
+            .expect_err("a null the parent does not mask violates the schema");
+        assert!(
+            error.to_string().contains("`changed`"),
+            "should name the offending child: {error}"
+        );
+    }
+
+    /// A dictionary key can point at a null value, which the physical
+    /// validity buffer does not record. Masking physical validity alone would
+    /// admit that null and produce a file Arrow rejects on readback.
+    #[test]
+    fn a_logical_null_in_a_dictionary_child_is_rejected() {
+        use arrow_array::{DictionaryArray, Int32Array};
+
+        let values = Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef;
+        let keys = Int32Array::from(vec![Some(0), Some(1), None]);
+        let child = Arc::new(DictionaryArray::new(keys, values)) as ArrayRef;
+        let child_type = child.data_type().clone();
+        // Row 2's key is physically null but the parent masks it; row 1 is a
+        // logical null the parent does not mask.
+        let array = Arc::new(StructArray::new(
+            Fields::from(vec![ArrowField::new("code", child_type.clone(), true)]),
+            vec![child],
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+        let declared = ArrowSchema::new(vec![ArrowField::new(
+            "wrapper",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "code", child_type, false,
+            )])),
+            true,
+        )]);
+        let schema = Schema::try_from(&declared).unwrap();
+
+        let error = EncodingPipeline::verify_field_nullability(array.as_ref(), &schema.fields[0])
+            .expect_err("the visible logical null at row 1 must be rejected");
+        assert!(error.to_string().contains("`code`"), "{error}");
+    }
+
+    #[test]
+    fn a_sliced_parent_lines_up_with_its_children() {
+        let (array, schema) = analysis(
+            vec![true, false, true, true],
+            vec![Some(true), None, Some(false), Some(true)],
+        );
+        // Dropping the first row leaves the null parent at slot 0.
+        let sliced = array.slice(1, 3);
+        EncodingPipeline::verify_field_nullability(sliced.as_ref(), &schema.fields[0]).unwrap();
+    }
 }

@@ -5,7 +5,7 @@ use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc, sync::Lazy
 
 use arrow::{
     array::{ArrayData, AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
-    buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
+    buffer::{BooleanBuffer, Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
         ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
         IntervalMonthDayNano, UInt32Type,
@@ -569,7 +569,19 @@ where
         };
         self.leftover_count = ((self.leftover_count as u64 + length.0) % self.repeat as u64) as u32;
         self.leftover = values.last().copied().unwrap_or(T::default());
-        Ok(Arc::new(ArrayType::from(values)))
+        let array = ArrayType::from(values);
+        // `ArrayType::from` uses the primitive type's default metadata. For
+        // timezone-aware timestamps this drops the timezone, so restore the
+        // generator's declared type when it differs.
+        if array.data_type() == &self.data_type {
+            return Ok(Arc::new(array));
+        }
+        let data = array
+            .into_data()
+            .into_builder()
+            .data_type(self.data_type.clone())
+            .build()?;
+        Ok(make_array(data))
     }
 
     fn data_type(&self) -> &DataType {
@@ -814,9 +826,9 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
         let num_bytes = length.0 * Self::byte_width()?;
-        let mut bytes = vec![0; num_bytes as usize];
-        rng.fill_bytes(&mut bytes);
-        let bytes = ScalarBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
+        let mut bytes = MutableBuffer::from_len_zeroed(num_bytes as usize);
+        rng.fill_bytes(bytes.as_slice_mut());
+        let bytes = ScalarBuffer::new(bytes.into(), 0, length.0 as usize);
         Ok(Arc::new(
             PrimitiveArray::<T>::new(bytes, None).with_data_type(self.data_type.clone()),
         ))
@@ -3239,8 +3251,48 @@ mod tests {
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt32Array,
     };
+    use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::float16(DataType::Float16)]
+    #[case::decimal128(DataType::Decimal128(38, 10))]
+    #[case::decimal256(DataType::Decimal256(76, 10))]
+    fn test_random_bytes_generator_alignment(#[case] data_type: DataType) {
+        for length in [0, 3] {
+            let generated = array::rand_type(&data_type)
+                .generate_default(RowCount::from(length))
+                .unwrap();
+            assert_eq!(generated.data_type(), &data_type);
+            assert_eq!(generated.len(), length as usize);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_timezone_is_preserved() {
+        let data_type = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let mut generator = array::rand_type(&data_type);
+        let generated = generator.generate_default(RowCount::from(2)).unwrap();
+        assert_eq!(generated.data_type(), &data_type);
+
+        let fields = Fields::from(vec![Field::new("timestamp", data_type, true)]);
+        let mut generator = array::rand_struct(fields.clone());
+        let generated = generator.generate_default(RowCount::from(2)).unwrap();
+        assert_eq!(generated.data_type(), &DataType::Struct(fields));
+    }
+
+    #[test]
+    fn test_fn_gen_propagates_array_data_build_error() {
+        // FnGen constructors are internal. Use an incompatible declared type to
+        // verify that ArrayDataBuilder validation failures are propagated.
+        let mut generator = FnGen::<i32, Int32Array, _>::new_unknown_size(DataType::Utf8, |_| 0, 1);
+
+        assert!(matches!(
+            generator.generate_default(RowCount::from(1)),
+            Err(ArrowError::InvalidArgumentError(_))
+        ));
+    }
 
     #[test]
     fn test_step() {

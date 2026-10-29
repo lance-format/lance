@@ -60,13 +60,4 @@ impl GraphBuilderNode {
             self.bottom_neighbors = self.level_neighbors[0].clone();
         }
     }
-
-    pub(crate) fn cutoff(&self, level: u16, max_size: usize) -> OrderedFloat {
-        let neighbors = &self.level_neighbors_ranked[level as usize];
-        if neighbors.len() < max_size {
-            OrderedFloat(f32::INFINITY)
-        } else {
-            neighbors.last().unwrap().dist
-        }
-    }
 }

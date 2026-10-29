@@ -111,6 +111,11 @@ public class TestUtils {
     }
 
     public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      return createNewFragment(
+          rowCount, new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+    }
+
+    public List<FragmentMetadata> createNewFragment(int rowCount, WriteParams writeParams) {
       List<FragmentMetadata> fragmentMetas;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
         root.allocateNew();
@@ -124,12 +129,7 @@ public class TestUtils {
         }
         root.setRowCount(rowCount);
 
-        fragmentMetas =
-            Fragment.create(
-                datasetPath,
-                allocator,
-                root,
-                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
+        fragmentMetas = Fragment.create(datasetPath, allocator, root, writeParams);
       }
       return fragmentMetas;
     }
@@ -684,6 +684,7 @@ public class TestUtils {
           new WriteParams.Builder()
               // Enable stable row ids to simplify test assertions across fragments
               .withEnableStableRowIds(true)
+              .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_1)
               .withMode(WriteParams.WriteMode.CREATE)
               .build();
       Dataset ds = Dataset.create(allocator, datasetPath, getSchema(), params);
@@ -734,6 +735,7 @@ public class TestUtils {
                 .withMaxRowsPerFile(maxRowsPerFile)
                 .withMode(WriteParams.WriteMode.APPEND)
                 .withEnableStableRowIds(true)
+                .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_1)
                 .build();
 
         List<FragmentMetadata> metas = Fragment.create(datasetPath, allocator, root, params);

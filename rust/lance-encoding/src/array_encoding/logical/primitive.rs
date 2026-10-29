@@ -9,14 +9,19 @@ use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use log::trace;
 
+use crate::data::dictionary_batch_limit;
 use crate::decoder::{ColumnBuffers, PageBuffers};
-use crate::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
+use crate::decoder::{
+    DrainLimit, FieldScheduler, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder, SchedulingJob,
+    has_i32_offsets,
+};
 use crate::encoder::ArrayEncodingStrategy;
 use crate::utils::accumulation::AccumulationQueue;
 use crate::{array_encoding::physical::decoder_from_array_encoding, data::DataBlock};
 use lance_core::{Error, Result, datatypes::Field};
 
 use crate::{
+    EncodingsIo,
     decoder::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PageEncoding, PageInfo,
         PageScheduler, PrimitivePageDecoder, PriorityRange, ScheduledScanLine, SchedulerContext,
@@ -180,9 +185,13 @@ impl SchedulingJob for PrimitiveFieldSchedulingJob<'_> {
         self.global_row_offset += cur_page.num_rows;
         self.page_idx += 1;
 
+        // A page that queues a read once its first reads arrive (a string
+        // page's bytes) keeps this I/O until then, which holds back the late
+        // reads of its scheduling step.
+        let page_io: Arc<dyn EncodingsIo> = Arc::new(context.late_read_guard());
         let physical_decoder = cur_page.scheduler.schedule_ranges(
             &ranges_in_page,
-            context.io(),
+            &page_io,
             priority.current_priority(),
         );
 
@@ -323,6 +332,11 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 }
 
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
+    fn max_dictionary_rows(&self) -> Option<u64> {
+        let dictionary_len = self.physical_decoder.as_ref()?.dictionary_len()?;
+        dictionary_batch_limit(&self.data_type, dictionary_len)
+    }
+
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {
@@ -366,6 +380,58 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
             task,
             num_rows: rows_to_take,
         })
+    }
+
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        if num_rows == 0 || !has_i32_offsets(&self.data_type) {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+            });
+        }
+        let Some(physical_decoder) = self.physical_decoder.as_ref() else {
+            return Err(lance_core::Error::internal(format!(
+                "max_rows_to_drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited",
+                self.data_type, self.column_index
+            )));
+        };
+        match physical_decoder.variable_width_bytes(self.rows_drained, num_rows)? {
+            Some(bytes) if bytes <= byte_budget => Ok(DrainLimit {
+                rows: num_rows,
+                bytes,
+            }),
+            Some(_) => {
+                // Largest prefix of the request that still fits the budget.
+                // `variable_width_bytes` is monotonically non-decreasing in the row
+                // count; zero rows always fit.
+                let mut fits = 0u64;
+                let mut too_big = num_rows;
+                while fits + 1 < too_big {
+                    let mid = fits + (too_big - fits) / 2;
+                    let mid_bytes = physical_decoder
+                        .variable_width_bytes(self.rows_drained, mid)?
+                        .unwrap_or(0);
+                    if mid_bytes <= byte_budget {
+                        fits = mid;
+                    } else {
+                        too_big = mid;
+                    }
+                }
+                let bytes = physical_decoder
+                    .variable_width_bytes(self.rows_drained, fits)?
+                    .unwrap_or(0);
+                Ok(DrainLimit { rows: fits, bytes })
+            }
+            // The encoding cannot report sizes.  Only accept this page's rows when
+            // the batch has accumulated no variable-width bytes yet (the budget is
+            // still whole), and charge the entire budget so nothing stacks after
+            // them; otherwise contribute nothing so the batch ends before them.
+            None if byte_budget >= I32_OFFSET_BYTE_BUDGET => Ok(DrainLimit {
+                rows: num_rows,
+                bytes: byte_budget,
+            }),
+            None => Ok(DrainLimit { rows: 0, bytes: 0 }),
+        }
     }
 
     fn rows_loaded(&self) -> u64 {
@@ -455,6 +521,7 @@ impl PrimitiveFieldEncoder {
 
     // Creates an encode task, consuming all buffered data
     fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<Vec<EncodeTask>> {
+        DataBlock::validate_arrays(&arrays, &self.field.name)?;
         if arrays.len() == 1 {
             let array = arrays.into_iter().next().unwrap();
             let size_bytes = array.get_buffer_memory_size();

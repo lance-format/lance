@@ -36,10 +36,14 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class UpdateTest extends OperationTestBase {
@@ -105,6 +109,88 @@ public class UpdateTest extends OperationTestBase {
   }
 
   @Test
+  void testUpdatedFragmentOffsetsRoundTrip(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testUpdatedFragmentOffsetsRoundTrip").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Append an initial fragment so we have a real fragment id.
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(10);
+      try (Transaction appendTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build()) {
+        new CommitBuilder(dataset).execute(appendTxn).close();
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+      Fragment existingFragment = dataset.getFragments().get(0);
+      long fragmentId = existingFragment.getId();
+      // Use the committed fragment's own metadata as the updatedFragment so that
+      // the updatedFragmentOffsets key is valid (must match a fragment in updatedFragments).
+      FragmentMetadata existingFragmentMeta = existingFragment.metadata();
+
+      // Build Update with non-empty updatedFragmentOffsets. Values are portable RoaringBitmap
+      // bytes encoding {1, 3, 5}: cookie(4) + containerCount(4) + key(2) + card-1(2) +
+      // offset(4) + elems(6). Offset = 16 (start of container data from beginning of stream).
+      Map<Long, byte[]> offsets = new HashMap<>();
+      offsets.put(
+          fragmentId,
+          new byte[] {
+            (byte) 0x3A,
+            (byte) 0x30,
+            (byte) 0x00,
+            (byte) 0x00, // cookie = 12346
+            (byte) 0x01,
+            (byte) 0x00,
+            (byte) 0x00,
+            (byte) 0x00, // 1 container
+            (byte) 0x00,
+            (byte) 0x00, // container key 0
+            (byte) 0x02,
+            (byte) 0x00, // cardinality - 1 = 2
+            (byte) 0x10,
+            (byte) 0x00,
+            (byte) 0x00,
+            (byte) 0x00, // offset = 16
+            (byte) 0x01,
+            (byte) 0x00, // element 1
+            (byte) 0x03,
+            (byte) 0x00, // element 3
+            (byte) 0x05,
+            (byte) 0x00 // element 5
+          });
+
+      try (Transaction updateTxn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(
+                  Update.builder()
+                      .updatedFragments(Collections.singletonList(existingFragmentMeta))
+                      .updateMode(Optional.of(UpdateMode.RewriteColumns))
+                      .updatedFragmentOffsets(offsets)
+                      .build())
+              .build()) {
+        try (Dataset committed = new CommitBuilder(dataset).execute(updateTxn)) {
+          // Read the committed transaction back (exercises the IntoJava JNI path).
+          try (Transaction readTx = committed.readTransaction().orElseThrow()) {
+            assertInstanceOf(Update.class, readTx.operation());
+            Update readOp = (Update) readTx.operation();
+
+            Map<Long, byte[]> readOffsets = readOp.updatedFragmentOffsets();
+            assertEquals(1, readOffsets.size());
+            assertArrayEquals(offsets.get(fragmentId), readOffsets.get(fragmentId));
+          }
+        }
+      }
+    }
+  }
+
+  @Test
   void testUpdateColumns(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testUpdateColumns").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -154,6 +240,7 @@ public class UpdateTest extends OperationTestBase {
                       .updatedFragments(
                           Collections.singletonList(updateResult.getUpdatedFragment()))
                       .fieldsModified(updateResult.getFieldsModified())
+                      .updateMode(Optional.of(UpdateMode.RewriteColumns))
                       .build())
               .build()) {
         try (Dataset dataset = new CommitBuilder(this.dataset).execute(updateTxn)) {

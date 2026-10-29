@@ -22,6 +22,14 @@ lto = "thin"
 codegen-units = 16
 
 [target.x86_64-unknown-linux-gnu]
+# The default target is haswell.  This is an old enough target
+# that portability is high but a new enough target that we gain
+# some of the most common SIMD optimizations.
+#
+# On certain paths we use explicit SIMD and runtime dispatch to
+# opt-in to even higher CPU targets.  The target specified here
+# is for all code that is NOT using explicit SIMD (still the large
+# majority of code).
 rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c"]
 
 [target.aarch64-apple-darwin]

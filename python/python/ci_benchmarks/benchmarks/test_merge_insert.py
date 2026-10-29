@@ -13,10 +13,14 @@ so every benchmark here is parametrized on it:
       ``can_use_create_plan``, so the DataFusion path
       (``LanceRead + HashJoin``) runs instead.
 
-For a partial-schema source the same knob also selects the write sink: v1
-patches columns in place (``UpdateMode::RewriteColumns``) while v2 rewrites
-whole rows (``RewriteRows``).  That makes ``write_bytes`` the interesting
-metric for the ``test_update_*`` benchmarks.
+For a partial-schema source the write sink is a second, independent choice, made
+with ``write_mode``.  Under the default ``"auto"`` v1 patches columns in place
+(``UpdateMode::RewriteColumns``) while v2 rewrites whole rows
+(``RewriteRows``); the ``v2_rewrite_columns`` variants of
+``test_update_subset_*`` ask v2 for the patching sink instead.  That makes
+``write_bytes`` the interesting metric for the ``test_update_*`` benchmarks:
+which sink writes less depends on how wide the omitted columns are and how many
+rows are matched, so these sweeps are where the crossover shows up.
 
 Targets are mutated, so each measured run is preceded by an untimed restore to
 the ``merge_insert_base`` tag written by ``datagen/merge_insert.py``.
@@ -54,11 +58,28 @@ if TYPE_CHECKING:
 
 PLANS = ["v1_indexed", "v2_hash"]
 
+# Partial-column updates have a third shape: v2 asked for the column-patching
+# sink, which is the only v2 sink that does not rewrite whole rows.
+WRITE_PLANS = ["v1_indexed", "v2_hash", "v2_rewrite_columns"]
+
 # Brackets the cold-random break-even, which the design analysis puts at
 # roughly target_rows / 4096 -- about 2.4K rows for the 10M-row narrow target.
 SOURCE_SIZES = [1_000, 10_000, 100_000]
 
 NARROW_KEYS = ["id_int", "id_uuid7", "id_uuid4"]
+
+# DataFusion accounts each 8,192-row slice of the 1.32 GiB full-schema source
+# for its shared backing buffers. Budget the resulting ~159 GiB of reservations
+# without changing the source layout measured by this benchmark.
+_MEM_POOL_SIZE = 160 * 1024**3
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _merge_insert_mem_pool() -> Iterable[None]:
+    """Use a bounded pool large enough for every merge_insert benchmark."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("LANCE_MEM_POOL_SIZE", str(_MEM_POOL_SIZE))
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +301,10 @@ def uses_index(plan: str) -> bool:
     return plan == "v1_indexed"
 
 
+def write_mode_for(plan: str) -> str:
+    return "rewrite_columns" if plan == "v2_rewrite_columns" else "auto"
+
+
 # ---------------------------------------------------------------------------
 # A. Cost model core -- merge_insert_narrow, 10M rows
 # ---------------------------------------------------------------------------
@@ -384,7 +409,7 @@ def _wide_rounds(fraction: float) -> int:
 
 
 def update_subset(
-    source: pa.Table, *, use_index: bool
+    source: pa.Table, *, use_index: bool, write_mode: str = "auto"
 ) -> Callable[[lance.LanceDataset], ExecuteResult]:
     """Partial-schema update. No insert clause: matched rows only."""
 
@@ -393,13 +418,14 @@ def update_subset(
             dataset.merge_insert("id_int")
             .when_matched_update_all()
             .use_index(use_index)
+            .write_mode(write_mode)
             .execute(source)
         )
 
     return job
 
 
-@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("plan", WRITE_PLANS)
 @pytest.mark.parametrize("fraction", ROW_FRACTIONS, ids=FRACTION_IDS)
 def test_update_subset_row_fraction(
     benchmark, wide: Target, fraction: float, plan: str
@@ -413,14 +439,18 @@ def test_update_subset_row_fraction(
     run(
         benchmark,
         wide,
-        update_subset(source, use_index=uses_index(plan)),
+        update_subset(
+            source,
+            use_index=uses_index(plan),
+            write_mode=write_mode_for(plan),
+        ),
         rounds=_wide_rounds(fraction),
         warmup=fraction != 1.0,
         expected_rows=WIDE_NUM_ROWS,
     )
 
 
-@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("plan", WRITE_PLANS)
 @pytest.mark.parametrize("fraction", [0.01, 1.0], ids=["1pct", "100pct"])
 @pytest.mark.parametrize("projection", list(PROJECTIONS), ids=list(PROJECTIONS))
 def test_update_subset_projection(
@@ -431,7 +461,11 @@ def test_update_subset_projection(
     run(
         benchmark,
         wide,
-        update_subset(source, use_index=uses_index(plan)),
+        update_subset(
+            source,
+            use_index=uses_index(plan),
+            write_mode=write_mode_for(plan),
+        ),
         rounds=_wide_rounds(fraction),
         warmup=fraction != 1.0,
         expected_rows=WIDE_NUM_ROWS,
@@ -714,13 +748,15 @@ def test_io_mem_upsert_ratio(
 
 
 @pytest.mark.io_memory_benchmark()
-@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("plan", WRITE_PLANS)
 @pytest.mark.parametrize("fraction", ROW_FRACTIONS, ids=FRACTION_IDS)
 def test_io_mem_update_subset_row_fraction(
     io_mem_benchmark, wide: Target, fraction: float, plan: str
 ) -> None:
     source = wide_source(wide_row_indices(fraction), PROJECTIONS["one_scalar"])
-    job = update_subset(source, use_index=uses_index(plan))
+    job = update_subset(
+        source, use_index=uses_index(plan), write_mode=write_mode_for(plan)
+    )
     io_mem_benchmark(
         job,
         wide.dataset,
@@ -730,13 +766,15 @@ def test_io_mem_update_subset_row_fraction(
 
 
 @pytest.mark.io_memory_benchmark()
-@pytest.mark.parametrize("plan", PLANS)
+@pytest.mark.parametrize("plan", WRITE_PLANS)
 @pytest.mark.parametrize("projection", list(PROJECTIONS), ids=list(PROJECTIONS))
 def test_io_mem_update_subset_projection(
     io_mem_benchmark, wide: Target, projection: str, plan: str
 ) -> None:
     source = wide_source(wide_row_indices(0.01), PROJECTIONS[projection])
-    job = update_subset(source, use_index=uses_index(plan))
+    job = update_subset(
+        source, use_index=uses_index(plan), write_mode=write_mode_for(plan)
+    )
     io_mem_benchmark(job, wide.dataset, setup=lambda: wide.reset())
 
 

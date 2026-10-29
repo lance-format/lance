@@ -53,6 +53,77 @@ The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
+`index_version` also tracks the row domain of the auxiliary file's `_rowid`
+or `_rowaddr` column. From version 3 onward, a segment stores the physical row
+address (`fragment_id << 32 | offset`) of each vector in `_rowaddr` instead of the
+dataset's logical row id in `_rowid`. A segment persisted below version 3 stores
+row ids throughout, and merging never combines segments of differing domain.
+
+## PCA Pre-transform
+
+!!! warning "Experimental"
+
+    PCA as a vector pre-transform is an experimental format feature. The
+    stored model may change incompatibly without a separate vote; after
+    such a change the index must be rebuilt, and the data itself is never
+    rewritten. The feature is removed if its stabilization vote does not pass.
+    Indices that do not use a pre-transform are unaffected.
+
+An `IVF_RQ` index may store one PCA pre-transform. The index metric must be
+L2. Cosine and dot are not defined for this pre-transform. Both indexed vectors
+and query vectors are projected by the stored model before IVF and quantization.
+An index that uses the pre-transform records index metadata version 4 so readers
+that do not support PCA skip it. Version 4 retains the row-address domain
+introduced by version 3. IVF_RQ indices without PCA keep their existing index
+metadata version and index vectors in their original dimension. The IVF_RQ
+quantization format itself is unchanged. The source dataset is not rewritten;
+dropping the feature only requires rebuilding the index.
+
+### Model file
+
+The trained model is one global buffer in the index file `index.idx`, not in
+`auxiliary.idx`. The Arrow schema metadata key is `lance:pca`. Its value is
+the decimal text of the one-based global buffer index returned when that
+buffer was written, the same numbering as `lance:ivf`. The index is not fixed.
+The file container must be legacy container `(0, 3)` or file version 2.x,
+because those containers can store schema metadata and global buffers.
+
+The buffer is a protobuf `PcaModel`:
+
+```protobuf
+%%% proto.message.PcaModel %%%
+```
+
+`model_version` must be 1. Both tensors are required, `data_type` must be
+`FLOAT32`, and `data` is little-endian IEEE-754. `transform_matrix` has rank 2
+and shape `[output_dimension, input_dimension]`, stored row-major.
+`mean` has rank 1 and shape `[input_dimension]`. No dimension may be zero.
+`data` length must equal the product of the shape times 4. Every value must
+be finite. `mean` length must equal the matrix column count.
+`input_dimension` must equal the indexed vector column's dimension.
+`output_dimension` must be strictly less than `input_dimension` and must equal
+the IVF centroid dimension and the input dimension of the RQ quantizer.
+
+### Projection
+
+For an input vector `x` and the stored mean, both of length `input_dimension`,
+the projected vector `y` has length `output_dimension`:
+
+```text
+y = A (x - mean)
+```
+
+`A` is `transform_matrix`. Element `r` of `y` is the dot product of matrix row
+`r` with `(x - mean)`. The same formula is used for vectors written into the
+index and for query vectors. The file stores that matrix directly and does not
+store a separate rotation matrix. Rows of `A` are not rescaled, so this
+version does not whiten the projection.
+
+Index metadata version 4 requires the `lance:pca` metadata key and the model
+buffer, and the physical index type must be `IVF_RQ`. Any other index metadata
+version must not contain `lance:pca` or the model buffer. A mismatch is a corrupt
+index.
+
 ## Storage Layout (V3)
 
 Each vector index is stored as 2 regular Lance files - index file and auxiliary file.
@@ -68,7 +139,7 @@ The index file stores the search structure with graph or flat organization.
 The Arrow schema of the Lance file varies depending on the sub-index type used.
 
 !!! note
-All partitions are stored in the same file, and partitions must be written in order.
+    All partitions are stored in the same file, and partitions must be written in order.
 
 ##### FLAT
 
@@ -84,12 +155,12 @@ HNSW (Hierarchical Navigable Small World) indices provide fast approximate searc
 
 | Column        | Type          | Nullable | Description            |
 | ------------- | ------------- | -------- | ---------------------- |
-| `__vector_id` | uint64        | false    | Vector identifier      |
-| `__neighbors` | list<uint32>  | false    | Neighbor node IDs      |
-| `_distance`   | list<float32> | false    | Distances to neighbors |
+| `__vector_id` | uint32        | true     | Vector identifier      |
+| `__neighbors` | list<uint32>  | true     | Neighbor node IDs      |
+| `_distance`   | list<float32> | true     | Distances to neighbors |
 
 !!! note
-HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
+    HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
 
 #### Arrow Schema Metadata
 
@@ -111,8 +182,8 @@ References the IVF metadata stored in the Lance file global buffer.
 This value records the global buffer index, currently this is always "1".
 
 !!! note
-Global buffer indices in Lance files are 1-based,
-so you need to subtract 1 when accessing them through code.
+    Global buffer indices in Lance files are 1-based,
+    so you need to subtract 1 when accessing them through code.
 
 ##### "lance:flat"
 
@@ -159,25 +230,40 @@ Since the auxiliary file stores the actual (quantized) vectors,
 the Arrow schema of the Lance file varies depending on the quantization method used.
 
 !!! note
-All partitions are stored in the same file, and partitions must be written in order.
+    All partitions are stored in the same file, and partitions must be written in order.
+
+Every quantization format below lists only its internal columns. When a V3 IVF
+writer materializes carried values, it appends one trailing column per carried
+field after them, named and typed exactly as in the dataset schema. This physical
+payload may be a subset of the manifest's `covering_fields` declaration (see
+[Index Metadata](../index.md)). A reader returns only columns whose physical
+schema and dataset field ids it verifies across every selected segment; all other
+projected columns come from a base-table take.
+
+A reader discovers carried columns by exclusion, not by position: any column in the
+auxiliary file's schema that is not one of the quantizer's internal columns is a
+carried column. Writers append them in trailing order, but a reader must not depend
+on that ordering to identify them.
 
 ##### FLAT
 
 No quantization applied - stores original vectors in their full precision:
 
-| Column   | Type                     | Nullable | Description                                           |
-| -------- | ------------------------ | -------- | ----------------------------------------------------- |
-| `_rowid` | uint64                   | false    | Row identifier                                        |
-| `flat`   | list<float32>[dimension] | false    | Original vector values (list_size = vector dimension) |
+| Column     | Type                     | Nullable | Description                                           |
+| ---------- | ------------------------ | -------- | ----------------------------------------------------- |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
+| `flat`     | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
 
 ##### PQ
 
 Compresses vectors using product quantization for significant memory savings:
 
-| Column      | Type           | Nullable | Description                                 |
-| ----------- | -------------- | -------- | ------------------------------------------- |
-| `_rowid`    | uint64         | false    | Row identifier                              |
-| `__pq_code` | list<uint8>[m] | false    | PQ codes (list_size = number of subvectors) |
+| Column      | Type                                            | Nullable | Description                                   |
+| ----------- | ----------------------------------------------- | -------- | --------------------------------------------- |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
+| `__pq_code` | list<uint8>[num_sub_vectors * num_bits / 8]     | true     | PQ codes, packed to `num_bits` per subvector  |
 
 ##### SQ
 
@@ -185,23 +271,29 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 | Column      | Type                   | Nullable | Description                             |
 | ----------- | ---------------------- | -------- | --------------------------------------- |
-| `_rowid`    | uint64                 | false    | Row identifier                          |
-| `__sq_code` | list<uint8>[dimension] | false    | SQ codes (list_size = vector dimension) |
+| `_rowid`    | uint64                 | true     | Row identifier (present when version <= 2) |
+| `_rowaddr`  | uint64                 | true     | Row address (present when version >= 3) |
+| `__sq_code` | list<uint8>[dimension] | true     | SQ codes (list_size = vector dimension) |
 
 ##### RQ
 
 Compresses vectors using RabitQ with random rotation and binary quantization for extreme compression:
 
-| Column               | Type                                             | Nullable                 | Description                                                     |
-| -------------------- | ------------------------------------------------ | ------------------------ | --------------------------------------------------------------- |
-| `_rowid`             | uint64                                           | false                    | Row identifier                                                  |
-| `_rabit_codes`       | list<uint8>[dimension / 8]                       | false                    | Binary quantized codes (1 bit per dimension, packed into bytes) |
-| `__add_factors`      | float32                                          | false                    | Additive correction factors for distance computation            |
-| `__scale_factors`    | float32                                          | false                    | Scale correction factors for distance computation               |
-| `__error_factors`    | float32                                          | false for `raw_query`    | Error factors for raw-query lower-bound pruning                 |
-| `__ex_codes`         | list<uint8>[ceil(dimension * (num_bits - 1) / 8)] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ                         |
-| `__add_factors_ex`   | float32                                          | false for `num_bits > 1` | Additive correction factors for ex-code distance computation    |
-| `__scale_factors_ex` | float32                                          | false for `num_bits > 1` | Scale correction factors for ex-code distance computation       |
+| Column               | Type                                             | Nullable | Present when                | Description                                                     |
+| -------------------- | ------------------------------------------------ | -------- | --------------------------- | --------------------------------------------------------------- |
+| `_rowid`             | uint64                                           | true     | always                      | Row identifier (a physical row address from 3 onward; a row id in a segment persisted at version <= 2) |
+| `_rabit_codes`       | list<uint8>[ceil(code_dim / 8)]                  | true     | always                      | Binary quantized codes (1 bit per dimension, packed into bytes) |
+| `__add_factors`      | float32                                          | true     | always                      | Additive correction factors for distance computation            |
+| `__scale_factors`    | float32                                          | true     | always                      | Scale correction factors for distance computation               |
+| `__error_factors`    | float32                                          | true     | `raw_query` estimator       | Error factors for raw-query lower-bound pruning                 |
+| `__blocked_ex_codes` | list<uint8>[next_multiple_of(code_dim, 64) * (num_bits - 1) / 8] | true | `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ, in the blocked layout  |
+| `__add_factors_ex`   | float32                                          | true     | `num_bits > 1`              | Additive correction factors for ex-code distance computation    |
+| `__scale_factors_ex` | float32                                          | true     | `num_bits > 1`              | Scale correction factors for ex-code distance computation       |
+
+!!! note
+    Indexes written before the blocked ex-code layout store the same bits in
+    `__ex_codes`, sized `ceil(dimension * (num_bits - 1) / 8)`. Readers still
+    accept that column and repack it at load time; writers no longer emit it.
 
 #### Arrow Schema Metadata
 
@@ -223,6 +315,17 @@ It's only used for tracking each partition's offset and length in the auxiliary 
 Contains RabitQ-specific metadata in JSON format (only present for RQ quantization).
 This includes the rotation matrix position, number of bits, and packing information.
 See the RQ metadata specification in the "storage_metadata" section below.
+
+##### "covering_field_ids"
+
+The dataset field ids of the storage file's physical carried columns,
+comma separated in physical schema order (only present when the storage carries
+values). Arrow fields carry no Lance field id, so names and types alone cannot
+prove which logical column a payload came from. Readers use these ids to bind
+physical values to the segment's `covering_fields` declaration, and treat missing,
+malformed, ambiguous, or mismatched metadata as no servable carried capability.
+A merge must not combine shards whose carried columns disagree on these ids, even
+when those columns match by name and type.
 
 ##### "storage_metadata"
 
@@ -280,7 +383,7 @@ to rotate vectors before binary quantization:
 
 The rotation matrix has shape `[code_dim, code_dim]` where `code_dim` is the rotated vector
 dimension. IVF_RQ always stores the 1-bit binary sign code in `_rabit_codes`; for `num_bits > 1`,
-the remaining `num_bits - 1` ex-code bits are stored in `__ex_codes` instead of widening the
+the remaining `num_bits - 1` ex-code bits are stored in `__blocked_ex_codes` instead of widening the
 binary code path. New IVF_RQ indexes store raw-query estimator factors. `num_bits=1` indexes only
 store the binary-code factor columns; multi-bit indexes also store separate ex-code additive and
 scale factors.
@@ -319,7 +422,7 @@ PQ uses 16 num_sub_vectors (m=16) with 8 num_bits per subvector, and distance ty
 ```python
 pa.schema([
     pa.field("_rowid", pa.uint64()),
-    pa.field("__pq_code", pa.list(pa.uint8(), list_size=16)), # m subvector codes
+    pa.field("__pq_code", pa.list_(pa.uint8(), list_size=16)), # num_sub_vectors * num_bits / 8 = 16 * 8 / 8
 ])
 ```
 
@@ -327,7 +430,7 @@ pa.schema([
 
 This example shows how an `IVF_RQ` index is physically laid out. Assume vectors have dimension 128,
 RQ uses 1 bit per dimension (`num_bits=1`), and distance type is "l2". For `num_bits > 1`, the
-auxiliary schema also includes `__ex_codes`, `__add_factors_ex`, and `__scale_factors_ex`.
+auxiliary schema also includes `__blocked_ex_codes`, `__add_factors_ex`, and `__scale_factors_ex`.
 
 #### Index File
 
@@ -356,7 +459,7 @@ auxiliary schema also includes `__ex_codes`, `__add_factors_ex`, and `__scale_fa
 ```python
 pa.schema([
     pa.field("_rowid", pa.uint64()),
-    pa.field("_rabit_codes", pa.list(pa.uint8(), list_size=16)), # dimension/8 = 128/8 = 16 bytes
+    pa.field("_rabit_codes", pa.list_(pa.uint8(), list_size=16)), # ceil(code_dim / 8) = ceil(128 / 8)
     pa.field("__add_factors", pa.float32()),
     pa.field("__scale_factors", pa.float32()),
     pa.field("__error_factors", pa.float32()),

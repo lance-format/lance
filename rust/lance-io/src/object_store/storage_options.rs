@@ -138,6 +138,8 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
     async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
         let request = DescribeTableRequest {
             id: Some(self.table_id.clone()),
+            // Some server implementations may not return credentials unless explicitly requested
+            vend_credentials: Some(true),
             ..Default::default()
         };
 

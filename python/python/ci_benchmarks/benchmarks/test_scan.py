@@ -30,4 +30,9 @@ def test_scan_slice(benchmark, dataset):
         ds = lance.dataset(dataset_uri)
         ds.to_table(offset=num_rows - 100, limit=50)
 
-    benchmark.pedantic(bench, rounds=1, iterations=1)
+    # A single unwarmed round measures whatever page-cache state the preceding
+    # benchmarks left behind (test_full_scan alone cycles the dataset plus a
+    # full in-memory table through RAM), not the scan itself.  Warm up once and
+    # take several rounds so the recorded value tracks the code path
+    # deterministically (see issue #8289).
+    benchmark.pedantic(bench, rounds=5, iterations=1, warmup_rounds=1)
