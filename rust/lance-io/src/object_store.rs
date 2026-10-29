@@ -353,6 +353,13 @@ pub struct ObjectStoreParams {
     #[cfg(feature = "aws")]
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// The connector that native S3, GCS and Azure stores open their HTTP clients with.
+    ///
+    /// Lance's own HTTP layers (the AIMD throttle and the metrics) wrap it, so it sees every
+    /// attempt object_store's retry loop makes, and the [`ClientOptions`] lance resolved from
+    /// the storage options. `None` is object_store's `ReqwestConnector`.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    pub http_connector: Option<Arc<dyn object_store::client::HttpConnector>>,
     /// Unified storage options accessor with caching and automatic refresh
     ///
     /// Provides storage options and optionally a dynamic provider for automatic
@@ -377,6 +384,8 @@ impl Default for ObjectStoreParams {
             #[cfg(feature = "aws")]
             aws_credentials: None,
             object_store_wrapper: None,
+            #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+            http_connector: None,
             storage_options_accessor: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
@@ -457,6 +466,10 @@ impl std::hash::Hash for ObjectStoreParams {
         if let Some(wrapper) = &self.object_store_wrapper {
             wrapper_allocation_ptr(wrapper).hash(state);
         }
+        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+        if let Some(connector) = &self.http_connector {
+            Arc::as_ptr(connector).cast::<()>().hash(state);
+        }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
         }
@@ -472,6 +485,18 @@ impl PartialEq for ObjectStoreParams {
     fn eq(&self, other: &Self) -> bool {
         #[cfg(feature = "aws")]
         if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
+            return false;
+        }
+        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+        if self
+            .http_connector
+            .as_ref()
+            .map(|c| Arc::as_ptr(c).cast::<()>())
+            != other
+                .http_connector
+                .as_ref()
+                .map(|c| Arc::as_ptr(c).cast::<()>())
+        {
             return false;
         }
 

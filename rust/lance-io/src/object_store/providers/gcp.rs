@@ -25,7 +25,9 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
+    throttle::{
+        AimdThrottleState, Transport, cloud_http_connector, shared_throttle_state, with_throttling,
+    },
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
@@ -238,6 +240,7 @@ impl GcsStoreProvider {
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
         throttle_state: Option<&AimdThrottleState>,
+        transport: Transport,
         // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
         // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
     ) -> Result<Arc<GoogleCloudStorage>> {
@@ -283,6 +286,7 @@ impl GcsStoreProvider {
         builder = builder.with_http_connector(cloud_http_connector(
             throttle_state,
             crate::object_store::metrics_base(&store_prefix, base_path),
+            transport,
         ));
 
         Ok(Arc::new(builder.build()?))
@@ -327,6 +331,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
                     &storage_options,
                     accessor,
                     throttle_state.as_ref(),
+                    Transport::new(params.http_connector.as_ref()),
                 )
                 .await?;
             (

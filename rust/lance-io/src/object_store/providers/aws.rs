@@ -35,7 +35,9 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
-    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
+    throttle::{
+        AimdThrottleState, Transport, cloud_http_connector, shared_throttle_state, with_throttling,
+    },
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
@@ -155,7 +157,11 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, metrics_base));
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            metrics_base,
+            Transport::new(params.http_connector.as_ref()),
+        ));
 
         let use_multipart_copy = builder
             .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
@@ -1205,6 +1211,77 @@ mod tests {
 
         assert!(!store.list_is_lexically_ordered);
         assert_eq!(store.paginated_lister.is_some(), paginated);
+    }
+
+    /// Answers every request with 404 and records what reached it.
+    #[derive(Debug, Default)]
+    struct RecordingConnector {
+        connects: AtomicUsize,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[derive(Debug)]
+    struct NotFound(Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl object_store::client::HttpService for NotFound {
+        async fn call(
+            &self,
+            req: object_store::client::HttpRequest,
+        ) -> std::result::Result<object_store::client::HttpResponse, object_store::client::HttpError>
+        {
+            self.0.lock().unwrap().push(req.uri().to_string());
+            let mut response = object_store::client::HttpResponse::new(
+                object_store::client::HttpResponseBody::from(String::new()),
+            );
+            *response.status_mut() = http::StatusCode::NOT_FOUND;
+            Ok(response)
+        }
+    }
+
+    impl object_store::client::HttpConnector for RecordingConnector {
+        fn connect(
+            &self,
+            _options: &ClientOptions,
+        ) -> object_store::Result<object_store::client::HttpClient> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(object_store::client::HttpClient::new(NotFound(
+                self.requests.clone(),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_store_opens_its_clients_with_the_given_http_connector() {
+        let connector = Arc::new(RecordingConnector::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("region".to_string(), "us-east-1".to_string()),
+                    ("aws_access_key_id".to_string(), "key".to_string()),
+                    ("aws_secret_access_key".to_string(), "secret".to_string()),
+                    ("aws_endpoint".to_string(), "http://127.0.0.1:1".to_string()),
+                    ("allow_http".to_string(), "true".to_string()),
+                ]),
+            ))),
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+        assert_ne!(params, ObjectStoreParams::default());
+
+        let url = Url::parse("s3://bucket/path").unwrap();
+        let store = AwsStoreProvider.new_store(url, &params).await.unwrap();
+        let found =
+            object_store::ObjectStoreExt::get(store.inner.as_ref(), &Path::from("path/file")).await;
+
+        assert!(
+            matches!(found, Err(object_store::Error::NotFound { .. })),
+            "{found:?}"
+        );
+        assert!(connector.connects.load(Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/bucket/path/file"), "{requests:?}");
     }
 
     #[derive(Debug)]

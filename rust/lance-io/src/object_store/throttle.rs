@@ -661,6 +661,29 @@ impl<C> AimdHttpConnector<C> {
     }
 }
 
+/// The caller's connector from [`ObjectStoreParams::http_connector`], or object_store's default.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+#[derive(Debug, Clone)]
+pub(crate) struct Transport(Arc<dyn HttpConnector>);
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl Transport {
+    pub(crate) fn new(connector: Option<&Arc<dyn HttpConnector>>) -> Self {
+        Self(
+            connector
+                .cloned()
+                .unwrap_or_else(|| Arc::new(object_store::client::ReqwestConnector::default())),
+        )
+    }
+}
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl HttpConnector for Transport {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        self.0.connect(options)
+    }
+}
+
 #[cfg(all(
     any(feature = "aws", feature = "azure", feature = "gcp"),
     feature = "metrics"
@@ -668,9 +691,13 @@ impl<C> AimdHttpConnector<C> {
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     metrics_base: String,
+    transport: Transport,
 ) -> AimdHttpConnector<crate::object_store::metrics::MeteringHttpConnector> {
     AimdHttpConnector::new(
-        crate::object_store::metrics::MeteringHttpConnector::new(metrics_base),
+        crate::object_store::metrics::MeteringHttpConnector::with_transport(
+            metrics_base,
+            transport,
+        ),
         state,
     )
 }
@@ -682,8 +709,9 @@ pub(crate) fn cloud_http_connector(
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     _metrics_base: String,
-) -> AimdHttpConnector<object_store::client::ReqwestConnector> {
-    AimdHttpConnector::new(object_store::client::ReqwestConnector::default(), state)
+    transport: Transport,
+) -> AimdHttpConnector<Transport> {
+    AimdHttpConnector::new(transport, state)
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
