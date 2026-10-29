@@ -276,7 +276,7 @@ impl Footprint {
     /// `committed` serialized first and nothing arriving later can break what
     /// it required. A set whose validity depends on what it read rather than on
     /// a coordinate -- a tightened nullability, a replaced field -- adds
-    /// [`Precondition`]s, which are tested against the facts `committed`
+    /// `Precondition`s, which are tested against the facts `committed`
     /// recorded, and are likewise one-way.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
