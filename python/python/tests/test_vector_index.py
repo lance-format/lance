@@ -3521,6 +3521,42 @@ def test_prewarm_index(tmp_path):
     run(dataset, q=np.array(q), assert_func=func)
 
 
+def test_vector_search_filter_uses_the_index_metric(tmp_path):
+    # With no metric given, a VectorSearchQuery filter used to search with L2
+    # and skip a cosine index. Rows 0-3 point the query's way but are far away;
+    # rows 4-7 are near it in L2 and point elsewhere, so the two metrics pick
+    # disjoint top 4s.
+    vectors = [[10.0, 1.0]] * 4 + [[0.0, 1.0]] * 4
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(8), pa.int64()),
+                "vector": pa.array(vectors, pa.list_(pa.float32(), 2)),
+                "text": ["match"] * 8,
+            }
+        ),
+        tmp_path / "ds",
+    )
+    ds = ds.create_index(
+        "vector",
+        "IVF_FLAT",
+        metric="cosine",
+        num_partitions=1,
+        ivf_centroids=np.array([[1.0, 0.0]], dtype=np.float32),
+    )
+    ds.create_scalar_index("text", "INVERTED")
+    q = np.array([1.0, 0.0], dtype=np.float32)
+
+    scanner = ds.scanner(
+        columns=["id"],
+        filter=VectorSearchQuery("vector", q, k=4),
+        full_text_query=MatchQuery("match", column="text"),
+        prefilter=True,
+    )
+    assert "ANNSubIndex" in scanner.explain_plan()
+    assert sorted(scanner.to_table()["id"].to_pylist()) == [0, 1, 2, 3]
+
+
 def test_scanner_rejects_unknown_index_segments(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)

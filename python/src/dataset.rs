@@ -5960,7 +5960,9 @@ impl PySearchFilter {
             search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
 
-        let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
+        // Leave an unset metric to the core, which takes it from the index the
+        // search picks, as the `nearest` path does.
+        let metric_type = metric_type_opt;
 
         let vector_query = VectorQuery {
             column,
