@@ -2309,7 +2309,7 @@ mod tests {
     #[test]
     fn test_full_zip_scheduler_rejects_bad_rep_index() {
         use crate::compression::DefaultDecompressionStrategy;
-        use crate::format::metadata;
+        use crate::format::{EncodingUtils, metadata};
 
         let layout = metadata::FullZipLayout::default();
         // Two buffers: data + repetition index.  With 3 rows the index must be a
@@ -2353,6 +2353,8 @@ mod tests {
         let layout = metadata::FullZipLayout {
             bits_rep: 200,
             bits_def: 100,
+            details: Some(metadata::full_zip_layout::Details::BitsPerValue(32)),
+            value_compression: Some(EncodingUtils::flat(32, None)),
             ..Default::default()
         };
         let error = FullZipScheduler::try_new(
