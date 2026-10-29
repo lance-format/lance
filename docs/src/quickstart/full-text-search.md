@@ -503,4 +503,4 @@ For advanced usage instructions with different tokenizers and more technical det
 
 ## Next Steps
 
-Check out the **[User Guide](../guide/read_and_write.md)** and explore the Lance API in more detail.
+Continue with the **[Full-Text Search User Guide](../guide/full_text_search.md)** for index configuration, query types, and index maintenance.
