@@ -1552,7 +1552,7 @@ mod tests {
                 .ef_construction(16),
         )
         .unwrap();
-        let existing = (1..=8)
+        let existing: Vec<_> = (1..=8)
             .map(|id| ScoredPoint::new(id, vectors.distance_between(0, id)))
             .collect();
         graph.set_node_neighbors(0, 0, &existing).unwrap();
