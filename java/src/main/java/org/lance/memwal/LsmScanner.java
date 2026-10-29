@@ -61,9 +61,11 @@ public class LsmScanner implements Closeable {
   public static LsmScanner fromSnapshots(Dataset dataset, List<ShardSnapshot> shardSnapshots) {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
-    LsmScanner scanner = createFromSnapshots(dataset, shardSnapshots);
-    scanner.allocator = dataset.allocator();
-    return scanner;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      LsmScanner scanner = createFromSnapshots(dataset, shardSnapshots);
+      scanner.allocator = dataset.allocator();
+      return scanner;
+    }
   }
 
   static native LsmScanner createFromSnapshots(Dataset dataset, List<ShardSnapshot> shardSnapshots);

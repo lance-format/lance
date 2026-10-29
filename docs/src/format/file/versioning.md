@@ -25,3 +25,32 @@ The following values are supported:
 | legacy         | N/A                   | N/A                   | Alias for 0.1 |
 | stable         | N/A                   | N/A                   | Alias for the default version for new datasets in the Lance release you are running. |
 | next           | N/A                   | N/A                   | Alias for the latest unstable version in the Lance release you are running.|
+
+## Compatibility Caveats
+
+Stable formats carry a compatibility guarantee, but certain data patterns exposed encoder bugs
+that required encoding changes to fix.  Files containing those patterns written by the fixed
+encoder are not readable by readers predating the fix.  The affected scenarios are listed here
+so operators running mixed-version deployments know the minimum reader version required.
+
+### FixedSizeList with all-null inner values (Lance 11.1.0)
+
+**Affected format**: 2.1 and later.
+
+**Scenario**: A `FixedSizeList` column where every inner value (not the outer list item itself)
+is null — for example, `FixedSizeList<nullable Float32, dim=4>` where all eight Float32 values
+across two outer rows are null.
+
+**Buggy writer (Lance < 11.1.0)**: The encoder wrote `bits_per_value=0` into the FullZip page
+layout.  Readers of any version rejected these pages with an error, so the data was unreadable
+regardless of reader version.
+
+**Fixed writer (Lance ≥ 11.1.0)**: The encoder stores per-row validity bytes for the null inner
+values, producing `bits_per_value > 0`.  The fixed reader (Lance ≥ 11.1.0) can also decode the
+old buggy pages, so old files written before 11.1.0 become readable after upgrading.
+
+**Forward compatibility**: Files containing this pattern written by Lance ≥ 11.1.0 are **not
+readable by Lance < 11.1.0**.  Old readers encounter the `Compression::Constant` inner encoding
+in the FSL descriptor and panic rather than returning an error.
+
+**Minimum reader version for new files**: Lance 11.1.0.

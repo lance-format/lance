@@ -915,8 +915,8 @@ mod tests {
     /// IVF_HNSW_* builds.
     ///
     /// The OS temp dir is process-global, so an in-process check can't attribute a
-    /// leak to our own build. Instead we run the build in a child process with
-    /// `TMPDIR` pointed at an isolated dir we own, then assert nothing survives.
+    /// leak to our own build. Instead we run the build in a child process with its
+    /// temp dir pointed at an isolated dir we own, then assert nothing survives.
     #[test]
     fn test_hnsw_pq_scratch_dir_is_not_leaked() {
         // Isolated temp root for the child. Owned here so it -- and anything the
@@ -926,7 +926,13 @@ mod tests {
         let child_test = "index::vector::ivf::io::tests::build_legacy_hnsw_pq_in_child_process";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([child_test, "--exact", "--ignored", "--nocapture"])
+            // `std::env::temp_dir()` reads `TMPDIR` on POSIX and `TMP`/`TEMP` on
+            // Windows. Set all three, and let the child confirm the redirect took
+            // effect: a child staging into the real temp dir would leave the scan
+            // below looking at an empty directory and passing for the wrong reason.
             .env("TMPDIR", isolated_root.as_ref())
+            .env("TMP", isolated_root.as_ref())
+            .env("TEMP", isolated_root.as_ref())
             .env("LANCE_HNSW_LEAK_TEST_ROOT", isolated_root.as_ref())
             .output()
             .expect("failed to spawn child test process");
@@ -937,8 +943,18 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        // Each build stages its partitions in one `.tmp*` dir directly under TMPDIR.
-        // Every guard removes its dir when it drops, so none should survive.
+        // A filter that matches nothing also exits 0, so confirm the child did the
+        // work instead of reporting a clean scan of an untouched directory.
+        assert!(
+            isolated_root.join("dataset").is_dir(),
+            "the child process did not run the build; filter was {child_test:?}\n\
+             --- child stdout ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+
+        // Each build stages its partitions in one `.tmp*` dir directly under the
+        // child's temp dir. Every guard removes its dir when it drops, so none
+        // should survive.
         let leaked: Vec<PathBuf> = std::fs::read_dir(&isolated_root)
             .expect("read isolated temp root")
             .flatten()
@@ -955,7 +971,9 @@ mod tests {
         assert!(
             leaked.is_empty(),
             "legacy IVF_HNSW_PQ build leaked {} scratch director{} under the temp dir; \
-             the TempStdDir guard should remove each one when it drops: {:?}",
+             the TempStdDir guard should remove each one when it drops: {:?}. `.tmp` is \
+             tempfile's default prefix, so one of these may belong to another tempfile \
+             user rather than to that guard.",
             leaked.len(),
             if leaked.len() == 1 { "y" } else { "ies" },
             leaked,
@@ -963,9 +981,9 @@ mod tests {
     }
 
     /// Child half of [`test_hnsw_pq_scratch_dir_is_not_leaked`]. Ignored so it only
-    /// runs when the parent spawns it with `TMPDIR` and `LANCE_HNSW_LEAK_TEST_ROOT`
-    /// pointed at an isolated dir. Builds a few legacy IVF_HNSW_PQ indices; the
-    /// parent does the leak detection.
+    /// runs when the parent spawns it with the temp-dir env vars and
+    /// `LANCE_HNSW_LEAK_TEST_ROOT` pointed at an isolated dir. Builds a few legacy
+    /// IVF_HNSW_PQ indices; the parent does the leak detection.
     #[tokio::test]
     #[ignore = "spawned as a child process by test_hnsw_pq_scratch_dir_is_not_leaked"]
     async fn build_legacy_hnsw_pq_in_child_process() {
@@ -975,10 +993,28 @@ mod tests {
             return;
         };
 
-        const DIM: usize = 32;
-        const ROWS: usize = 1024;
-        const NLIST: usize = 4;
-        const NUM_BUILDS: usize = 3;
+        // The parent can only scan the directory it owns, so if its temp-dir env
+        // vars did not take effect the scan is vacuous and passes no matter what
+        // the build does. Fail here instead of reporting a clean run.
+        let temp_dir = std::env::temp_dir();
+        let canonical = |path: &std::path::Path| {
+            path.canonicalize()
+                .unwrap_or_else(|e| panic!("cannot canonicalize {path:?}: {e}"))
+        };
+        assert_eq!(
+            canonical(&temp_dir),
+            canonical(std::path::Path::new(&root)),
+            "the temp dir was not redirected to the isolated root; temp_dir() is \
+             {temp_dir:?}, root is {root:?}. On Windows 11 and Server 2022 and newer, \
+             `std::env::temp_dir` goes through `GetTempPath2`, which ignores TMP and \
+             TEMP for a process running as SYSTEM; older Windows falls back to \
+             `GetTempPathW`, which honors them.",
+        );
+
+        const DIM: usize = 8;
+        const ROWS: usize = 256;
+        const NLIST: usize = 2;
+        const NUM_BUILDS: usize = 2;
 
         // Keep the dataset out of the temp dir's `.tmp*` namespace so the parent
         // never confuses it with a leaked scratch directory.
@@ -996,6 +1032,24 @@ mod tests {
             .await
             .unwrap();
 
+        let ivf_params = IvfBuildParams {
+            num_partitions: Some(NLIST),
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        };
+        let hnsw_params = HnswBuildParams::default()
+            .max_level(2)
+            .num_edges(4)
+            .ef_construction(16);
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 2,
+            num_bits: 8,
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        };
+
         for _ in 0..NUM_BUILDS {
             crate::index::vector::ivf::build_ivf_hnsw_pq_index(
                 &ds,
@@ -1003,9 +1057,9 @@ mod tests {
                 "idx",
                 uuid::Uuid::new_v4(),
                 MetricType::L2,
-                &IvfBuildParams::new(NLIST),
-                &HnswBuildParams::default(),
-                &PQBuildParams::new(4, 8),
+                &ivf_params,
+                &hnsw_params,
+                &pq_params,
             )
             .await
             .unwrap();

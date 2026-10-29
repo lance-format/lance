@@ -7,13 +7,17 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use arrow::array::AsArray;
-use arrow::compute::{TakeOptions, concat_batches};
+use arrow::compute::TakeOptions;
 use arrow::datatypes::UInt64Type;
 use arrow_array::{Array, BooleanArray, UInt32Array};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
@@ -22,6 +26,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::projection::ProjectionMapping;
 use futures::FutureExt;
 use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -38,8 +43,11 @@ use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
 use crate::dataset::rowids::get_row_id_index;
 use crate::datatypes::Schema;
+use crate::index::prefilter::DatasetPreFilter;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
+
+mod batch;
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
@@ -74,6 +82,12 @@ struct TakeStream {
     /// must be materialized after take.
     read_fields: Arc<Schema>,
     materialize_blob_v2_binary: bool,
+    /// Scanner-level byte budget for output batches. Applied after blob v2
+    /// payloads are materialized so that the final batch size is capped.
+    batch_size_bytes: Option<u64>,
+    /// Safety limit applied before concatenation and duplicate expansion. Kept
+    /// separate from the scanner's output budget so tests can lower it.
+    max_batch_bytes: usize,
     /// The output schema, needed for us to merge the new columns
     /// into the input data in the correct order
     output_schema: SchemaRef,
@@ -95,6 +109,7 @@ impl TakeStream {
         scan_scheduler: Arc<ScanScheduler>,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
+        batch_size_bytes: Option<u64>,
     ) -> Self {
         let materialize_blob_v2_binary =
             crate::dataset::blob::schema_has_blob_v2_binary_view(fields_to_take.as_ref());
@@ -110,6 +125,8 @@ impl TakeStream {
             fields_to_take,
             read_fields,
             materialize_blob_v2_binary,
+            batch_size_bytes,
+            max_batch_bytes: i32::MAX as usize,
             output_schema,
             readers_cache: Arc::new(Mutex::new(HashMap::new())),
             scan_scheduler,
@@ -173,11 +190,12 @@ impl TakeStream {
     }
 
     /// Returns the row addresses for the given batch, plus an optional validity
-    /// mask. When stable row IDs are used, some row IDs from stale index results
-    /// (e.g. FTS matches for deleted rows) may no longer exist in the row ID
-    /// index. These are excluded from the returned addresses, and the mask
-    /// indicates which input rows are still valid so the caller can filter the
-    /// batch to match.
+    /// mask. Some row IDs from stale index results (e.g. FTS matches for deleted
+    /// rows) may no longer be valid. For stable row IDs, the row ID index detects
+    /// these entries. For physical row IDs, the dataset deletion mask detects
+    /// deleted rows and removed fragments. Invalid entries are excluded from the
+    /// returned addresses, and the mask indicates which input rows are still
+    /// valid so the caller can filter the batch to match.
     async fn get_row_addrs(
         &self,
         batch: &RecordBatch,
@@ -189,41 +207,61 @@ impl TakeStream {
 
             if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                let mut addresses = Vec::with_capacity(row_id_array.len());
-                let mut valid = Vec::with_capacity(row_id_array.len());
-
-                for id in row_id_array.values().iter() {
-                    if let Some(address) = row_id_index.get(*id) {
-                        addresses.push(u64::from(address));
-                        valid.push(true);
-                    } else {
-                        valid.push(false);
-                    }
-                }
-
-                let mask = if addresses.len() < row_id_array.len() {
-                    Some(BooleanArray::from(valid))
-                } else {
-                    None
-                };
-                Ok((Arc::new(UInt64Array::from(addresses)), mask))
+                Self::resolve_row_addrs(row_id_array, |id| Ok(row_id_index.get(id)?.map(u64::from)))
             } else {
-                Ok((row_id_array.clone(), None))
+                let row_id_array = row_id_array.as_primitive::<UInt64Type>();
+                let fragments = row_id_array
+                    .values()
+                    .iter()
+                    .map(|id| RowAddress::from(*id).fragment_id())
+                    .collect();
+                if let Some(mask) =
+                    DatasetPreFilter::create_deletion_mask(self.dataset.clone(), fragments)
+                {
+                    let mask = mask.await?;
+                    Self::resolve_row_addrs(row_id_array, |id| Ok(mask.selected(id).then_some(id)))
+                } else {
+                    Ok((Arc::new(row_id_array.clone()), None))
+                }
             }
         }
+    }
+
+    fn resolve_row_addrs(
+        row_ids: &UInt64Array,
+        mut resolve: impl FnMut(u64) -> Result<Option<u64>>,
+    ) -> Result<(Arc<dyn Array>, Option<BooleanArray>)> {
+        let mut addresses = Vec::with_capacity(row_ids.len());
+        let mut valid = Vec::with_capacity(row_ids.len());
+
+        for id in row_ids.values().iter() {
+            if let Some(address) = resolve(*id)? {
+                addresses.push(address);
+                valid.push(true);
+            } else {
+                valid.push(false);
+            }
+        }
+
+        let mask = if addresses.len() < row_ids.len() {
+            Some(BooleanArray::from(valid))
+        } else {
+            None
+        };
+        Ok((Arc::new(UInt64Array::from(addresses)), mask))
     }
 
     async fn map_batch(
         self: Arc<Self>,
         batch: RecordBatch,
         batch_number: u32,
-    ) -> DataFusionResult<RecordBatch> {
+    ) -> DataFusionResult<Vec<RecordBatch>> {
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
         let (row_addrs_arr, validity_mask) = self.get_row_addrs(&batch).await?;
 
-        // Filter out rows whose row IDs no longer exist (e.g. stale FTS/vector
-        // index entries pointing to deleted rows). Without this, the downstream
-        // merge would fail with a row-count mismatch.
+        // Filter stale index entries before reading so the input batch and taken
+        // columns remain aligned. Otherwise, the downstream merge would fail with
+        // a row-count mismatch.
         let batch = if let Some(mask) = validity_mask {
             arrow::compute::filter_record_batch(&batch, &mask)?
         } else {
@@ -303,8 +341,15 @@ impl TakeStream {
                     let reader = self.open_reader(fragment_id).await?;
                     let offsets = std::mem::take(&mut current_offsets);
                     futures.push_back(
-                        async move { reader.take_as_batch(&offsets, Some(batch_number)).await }
-                            .boxed(),
+                        async move {
+                            reader
+                                .take(&offsets, u32::MAX, Some(batch_number))
+                                .await?
+                                .buffered(get_num_compute_intensive_cpus())
+                                .try_collect::<Vec<_>>()
+                                .await
+                        }
+                        .boxed(),
                     );
                 }
                 current_fragment_id = Some(addr.fragment_id());
@@ -319,7 +364,10 @@ impl TakeStream {
             futures.push_back(
                 async move {
                     reader
-                        .take_as_batch(&current_offsets, Some(batch_number))
+                        .take(&current_offsets, u32::MAX, Some(batch_number))
+                        .await?
+                        .buffered(get_num_compute_intensive_cpus())
+                        .try_collect::<Vec<_>>()
                         .await
                 }
                 .boxed(),
@@ -329,55 +377,78 @@ impl TakeStream {
         // Stop the compute timer, don't count I/O time
         drop(compute_timer);
 
-        let batches = futures.try_collect::<Vec<_>>().await?;
+        // Keep decoder batches separate: even a single fragment can return
+        // more variable-width data than one Arrow array can represent.
+        let batches = futures
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+            return Ok(vec![RecordBatch::new_empty(self.output_schema.clone())]);
         }
 
         let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
-        let schema = batches.first().expect_ok()?.schema();
-        let mut new_data = concat_batches(&schema, batches.iter())?;
-
         // Expand deduplicated rows and restore original order.
         // When both are needed, combine into a single take to avoid two passes.
-        match (sorted_to_unique, permutation) {
+        let indices = match (sorted_to_unique, permutation) {
             (Some(expand_map), Some(inv_perm)) => {
                 // Compose: for each original position, look up its sorted position
                 // via the inverse permutation, then map through the dedup expand.
-                let combined = UInt32Array::from(
+                Some(UInt32Array::from(
                     inv_perm
                         .values()
                         .iter()
                         .map(|&p| expand_map[p as usize] as u32)
                         .collect::<Vec<_>>(),
-                );
-                new_data = arrow_select::take::take_record_batch(&new_data, &combined).unwrap();
+                ))
             }
-            (None, Some(inv_perm)) => {
-                new_data = arrow_select::take::take_record_batch(&new_data, &inv_perm).unwrap();
-            }
+            (None, Some(inv_perm)) => Some(inv_perm),
             (Some(expand_map), None) => {
                 // Sorted and unique was false but no permutation — shouldn't happen,
                 // but handle defensively.
-                let expand_indices =
-                    UInt32Array::from(expand_map.iter().map(|&i| i as u32).collect::<Vec<_>>());
-                new_data =
-                    arrow_select::take::take_record_batch(&new_data, &expand_indices).unwrap();
+                Some(UInt32Array::from(
+                    expand_map.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                ))
             }
-            (None, None) => {}
-        }
+            (None, None) => None,
+        };
 
-        if self.materialize_blob_v2_binary {
-            new_data = crate::dataset::blob::materialize_blob_v2_binary_batch(
-                &self.dataset,
-                self.fields_to_take.as_ref(),
-                new_data,
-            )
-            .await?;
+        let taken = batch::take_batches(&batches, indices.as_ref(), self.max_batch_bytes)?;
+        let taken_rows = taken.iter().map(RecordBatch::num_rows).sum::<usize>();
+        if taken_rows != batch.num_rows() {
+            return Err(DataFusionError::Execution(format!(
+                "Take returned {taken_rows} rows for an input batch with {} rows",
+                batch.num_rows()
+            )));
         }
+        let mut output = Vec::with_capacity(taken.len());
+        let mut offset = 0;
+        for mut new_data in taken {
+            if self.materialize_blob_v2_binary {
+                new_data = crate::dataset::blob::materialize_blob_v2_binary_batch(
+                    &self.dataset,
+                    self.fields_to_take.as_ref(),
+                    new_data,
+                )
+                .await?;
+            }
 
-        Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+            let input = batch.slice(offset, new_data.num_rows());
+            offset += new_data.num_rows();
+            let merged = input.merge_with_schema(&new_data, self.output_schema.as_ref())?;
+            if let Some(budget) = self.batch_size_bytes {
+                output.extend(crate::dataset::blob::split_batch_by_bytes(
+                    merged,
+                    (budget * 2) as usize,
+                )?);
+            } else {
+                output.push(merged);
+            }
+        }
+        Ok(output)
     }
 
     fn apply<S: Stream<Item = Result<RecordBatch>> + Send + 'static>(
@@ -401,6 +472,8 @@ impl TakeStream {
             .boxed();
         batches
             .try_buffered(get_num_compute_intensive_cpus())
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
             .map(move |result| {
                 if result.is_ok() {
                     result_metrics.batches_processed.add(1);
@@ -434,9 +507,17 @@ pub struct TakeExec {
     schema_to_take: Arc<Schema>,
     // The schema of the output
     output_schema: SchemaRef,
+    /// Cached from the output schema and dataset blob metadata at construction.
+    bytes_per_row: Option<f64>,
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    /// Scanner-level byte budget for output batches.
+    batch_size_bytes: Option<u64>,
+    /// Whether the input columns lead the output unchanged. A take that adds
+    /// fields to an input struct changes that column, so orderings on it do
+    /// not carry across.
+    has_unchanged_input: bool,
 }
 
 impl DisplayAs for TakeExec {
@@ -485,6 +566,16 @@ impl TakeExec {
         input: Arc<dyn ExecutionPlan>,
         projection: Projection,
     ) -> Result<Option<Self>> {
+        Self::try_new_with_batch_size(dataset, input, projection, None)
+    }
+
+    /// Create a [`TakeExec`] node with an explicit byte budget for output batches.
+    pub fn try_new_with_batch_size(
+        dataset: Arc<Dataset>,
+        input: Arc<dyn ExecutionPlan>,
+        projection: Projection,
+        batch_size_bytes: Option<u64>,
+    ) -> Result<Option<Self>> {
         let original_projection = projection.clone();
         let projection =
             projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
@@ -515,23 +606,55 @@ impl TakeExec {
             &output_schema,
         ));
         let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
+        let has_unchanged_input = input
+            .schema()
+            .fields()
+            .iter()
+            .zip(output_arrow.fields())
+            .all(|(input_field, output_field)| input_field == output_field);
+        let eq_properties = if has_unchanged_input {
+            Self::output_equivalences(&input, &output_arrow)?
+        } else {
+            EquivalenceProperties::new(output_arrow.clone())
+        };
         let properties = Arc::new(
             input
                 .properties()
                 .as_ref()
                 .clone()
-                .with_eq_properties(EquivalenceProperties::new(output_arrow.clone())),
+                .with_eq_properties(eq_properties),
         );
+
+        let schema_to_take = projection.into_schema_ref();
+        let bytes_per_row = estimated_bytes_per_row(output_arrow.as_ref(), dataset.schema());
 
         Ok(Some(Self {
             dataset,
             output_projection: original_projection,
-            schema_to_take: projection.into_schema_ref(),
+            schema_to_take,
             input,
             output_schema: output_arrow,
+            bytes_per_row,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            batch_size_bytes,
+            has_unchanged_input,
         }))
+    }
+
+    /// The input's orderings and equivalences on `output`, whose leading
+    /// columns are the input's. Rows keep their input order.
+    fn output_equivalences(
+        input: &Arc<dyn ExecutionPlan>,
+        output: &SchemaRef,
+    ) -> Result<EquivalenceProperties> {
+        let input_schema = input.schema();
+        let indices = (0..input_schema.fields().len()).collect::<Vec<_>>();
+        let mapping = ProjectionMapping::from_indices(&indices, &input_schema)?;
+        Ok(input
+            .properties()
+            .eq_properties
+            .project(&mapping, output.clone()))
     }
 
     /// The output of a take operation will be all columns from the input schema followed
@@ -606,12 +729,25 @@ impl ExecutionPlan for TakeExec {
         vec![&self.input]
     }
 
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Rows keep their order, but a changed input column must not let a
+        // sort above be pushed below the take.
+        vec![self.has_unchanged_input]
+    }
+
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         // This is an I/O bound operation and wouldn't really benefit from partitioning
         //
         // Plus, if we did that, we would be creating multiple schedulers which could use
         // a lot of RAM.
         vec![false]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     /// This preserves the output schema.
@@ -627,7 +763,12 @@ impl ExecutionPlan for TakeExec {
 
         let projection = self.output_projection.clone();
 
-        let plan = Self::try_new(self.dataset.clone(), children[0].clone(), projection)?;
+        let plan = Self::try_new_with_batch_size(
+            self.dataset.clone(),
+            children[0].clone(),
+            projection,
+            self.batch_size_bytes,
+        )?;
 
         if let Some(plan) = plan {
             Ok(Arc::new(plan))
@@ -647,6 +788,7 @@ impl ExecutionPlan for TakeExec {
         let schema_to_take = self.schema_to_take.clone();
         let output_schema = self.output_schema.clone();
         let metrics = self.metrics.clone();
+        let batch_size_bytes = self.batch_size_bytes;
 
         // ScanScheduler::new launches the I/O scheduler in the background.
         // We aren't allowed to do work in `execute` and so we defer creation of the
@@ -664,6 +806,7 @@ impl ExecutionPlan for TakeExec {
                 scan_scheduler,
                 &metrics,
                 partition,
+                batch_size_bytes,
             ));
             take_stream.apply(input_stream)
         });
@@ -678,12 +821,21 @@ impl ExecutionPlan for TakeExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        // Include fetched columns as well as carried columns when costing the
+        // output of a late-materialized plan.
+        let num_rows = input_stats[0].num_rows;
         Ok(Arc::new(Statistics {
-            num_rows: self.input.partition_statistics(partition)?.num_rows,
+            num_rows,
+            total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
     }
@@ -700,23 +852,34 @@ impl ExecutionPlan for TakeExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
+    use lance_core::datatypes::BlobHandling;
 
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray, StructArray,
+        record_batch,
     };
     use arrow_schema::{DataType, Field, Fields};
+    use arrow_select::concat::concat_batches;
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, datatypes::OnMissing};
     use lance_datafusion::{datagen::DatafusionDatagenExt, exec::OneShotExec, utils::MetricsExt};
     use lance_datagen::{BatchCount, RowCount};
+    use lance_file::version::LanceFileVersion;
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use rstest::rstest;
 
     use crate::{
-        dataset::WriteParams,
+        dataset::{UpdateBuilder, WriteParams},
+        index::DatasetIndexExt,
         io::exec::{LanceScanConfig, LanceScanExec},
-        utils::test::NoContextTestFixture,
+        utils::test::{NoContextTestFixture, copy_test_data_to_tmp},
     };
 
     struct TestFixture {
@@ -778,6 +941,157 @@ mod tests {
             dataset: Arc::new(Dataset::open(test_uri).await.unwrap()),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    /// The take is where a late-materialized plan gets its width, so the reported
+    /// size has to come from the output schema, including newly fetched columns.
+    #[tokio::test]
+    async fn test_take_statistics_measure_the_output_schema() {
+        use datafusion::common::stats::Precision;
+
+        let TestFixture { dataset, .. } = test_fixture().await;
+
+        let scan_arrow_schema = ArrowSchema::new(vec![Field::new("i", DataType::Int32, false)]);
+        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
+        let config = LanceScanConfig {
+            with_row_id: true,
+            ..Default::default()
+        };
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            scan_schema,
+            config,
+        ));
+        let input_stats = StatisticsContext::new()
+            .compute(input.as_ref(), &StatisticsArgs::new())
+            .unwrap();
+        // 30 rows of a non-null int32 plus the nullable row id: 12.125 bytes a row.
+        assert_eq!(input_stats.num_rows, Precision::Exact(30));
+        assert_eq!(input_stats.total_byte_size, Precision::Inexact(364));
+
+        // The take passes the row count through and bills the column it adds on top
+        // of the key its input reads: four more bytes a row of float32.
+        let widened = dataset
+            .empty_projection()
+            .union_column("f", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset.clone(), input.clone(), widened)
+            .unwrap()
+            .unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&take_exec, &StatisticsArgs::new())
+            .unwrap();
+        assert_eq!(stats.num_rows, input_stats.num_rows);
+        assert_eq!(stats.total_byte_size, Precision::Inexact(484));
+        // A variable-width column is seeded from the decoder's estimate rather than
+        // withdrawing the row: 64 bytes of string and a 4-byte offset on top.
+        let seeded = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, seeded).unwrap().unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&take_exec, &StatisticsArgs::new())
+            .unwrap();
+        assert_eq!(stats.num_rows, input_stats.num_rows);
+        assert_eq!(stats.total_byte_size, Precision::Inexact(2404));
+    }
+
+    /// A take carries its input's payload columns through, so it must suppress the
+    /// estimate whatever blob mode its own projection uses: with descriptions the
+    /// projection renders a descriptor while the output still holds the payload.
+    #[rstest]
+    #[case::take_projects_descriptions(None)]
+    #[case::take_projects_binary(Some(BlobHandling::AllBinary))]
+    #[test_log::test(tokio::test)]
+    async fn test_take_statistics_suppress_a_carried_blob_payload(
+        #[case] take_blob_handling: Option<BlobHandling>,
+    ) {
+        use arrow_array::UInt64Array;
+        use datafusion::common::stats::Precision;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::blob::{BlobArrayBuilder, blob_field};
+
+        let tmp_dir = TempStrDir::default();
+        let mut blobs = BlobArrayBuilder::new(3);
+        for payload in [b"foo".as_slice(), b"bar".as_slice(), b"baz".as_slice()] {
+            blobs.push_bytes(payload).unwrap();
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blob", true),
+            Field::new("idx", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                blobs.finish().unwrap(),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &tmp_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // The input materializes the payload, and must not bill it.
+        let scan_projection = dataset
+            .empty_projection()
+            .with_blob_handling(BlobHandling::AllBinary)
+            .union_column("blob", OnMissing::Error)
+            .unwrap();
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            Arc::new(scan_projection.to_bare_schema()),
+            LanceScanConfig {
+                with_row_id: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(input.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .total_byte_size,
+            Precision::Absent,
+            "the scan must not bill the payload it materialized"
+        );
+
+        // The take fetches only `idx`, but carries the payload either way.
+        let mut take_projection = dataset.empty_projection();
+        if let Some(handling) = take_blob_handling {
+            take_projection = take_projection.with_blob_handling(handling);
+        }
+        let take_projection = take_projection
+            .union_column("idx", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, take_projection)
+            .unwrap()
+            .unwrap();
+
+        let stats = StatisticsContext::new()
+            .compute(&take_exec, &StatisticsArgs::new())
+            .unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+        assert_eq!(
+            stats.total_byte_size,
+            Precision::Absent,
+            "a carried payload must suppress whatever the take projects"
+        );
     }
 
     #[tokio::test]
@@ -871,6 +1185,221 @@ mod tests {
         while let Some(batch) = stream.try_next().await.unwrap() {
             assert_eq!(&batch.schema().field_names(), &expected_fields);
         }
+    }
+
+    #[tokio::test]
+    async fn test_take_filters_stale_physical_row_ids() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+        let mut dataset = dataset.as_ref().clone();
+        dataset.delete("i = 1").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Simulate stale index results for a deleted row and a removed fragment.
+        let missing_fragment_row_id = u64::from(RowAddress::new_from_parts(99, 0));
+        let row_ids = Arc::new(UInt64Array::from(vec![
+            0_u64,
+            1,
+            2,
+            missing_fragment_row_id,
+        ]));
+        let scores = Arc::new(Int32Array::from(vec![10, 11, 12, 13]));
+        let input_batch = RecordBatch::try_from_iter(vec![
+            (ROW_ID, row_ids as ArrayRef),
+            ("score", scores as ArrayRef),
+        ])
+        .unwrap();
+        let schema = input_batch.schema();
+        let input_stream = futures::stream::iter(vec![Ok(input_batch)]);
+        let input_stream = Box::pin(RecordBatchStreamAdapter::new(schema, input_stream));
+        let input = Arc::new(OneShotExec::new(input_stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+        let result = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let result = concat_batches(&result[0].schema(), &result).unwrap();
+        assert_eq!(
+            result[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap(),
+            &UInt64Array::from(vec![0_u64, 2])
+        );
+        assert_eq!(
+            result["score"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap(),
+            &Int32Array::from(vec![10, 12])
+        );
+        assert_eq!(
+            result["s"].as_any().downcast_ref::<StringArray>().unwrap(),
+            &StringArray::from(vec!["str-0", "str-2"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_byte_limit_preserves_legacy_row_alignment() {
+        let directory = copy_test_data_to_tmp("v0.7.5/with_deletions").unwrap();
+        let dataset = Arc::new(Dataset::open(&directory.path_str()).await.unwrap());
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let data = dataset
+            .scan()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let indices = UInt32Array::from(vec![11, 0, 11, 1]);
+        let expected = arrow_select::take::take_record_batch(&data, &indices).unwrap();
+        let input = record_batch!(("score", Int32, [10, 11, 12, 13]))
+            .unwrap()
+            .try_with_column(
+                expected.schema().field_with_name(ROW_ADDR).unwrap().clone(),
+                expected[ROW_ADDR].clone(),
+            )
+            .unwrap();
+        let input_stream = Box::pin(RecordBatchStreamAdapter::new(
+            input.schema(),
+            futures::stream::iter([Ok(input.clone())]),
+        ));
+        let projection = dataset
+            .empty_projection()
+            .union_column("x", OnMissing::Error)
+            .unwrap();
+        let plan = TakeExec::try_new(
+            dataset.clone(),
+            Arc::new(OneShotExec::new(input_stream)),
+            projection,
+        )
+        .unwrap()
+        .unwrap();
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let mut stream = TakeStream::new(
+            dataset,
+            plan.schema_to_take.clone(),
+            plan.schema(),
+            scheduler,
+            &ExecutionPlanMetricsSet::new(),
+            0,
+            None,
+        );
+        // Exercise the production pre-concat limit without GiB allocations.
+        stream.max_batch_bytes = 8;
+        let output = Arc::new(stream).map_batch(input.clone(), 0).await.unwrap();
+        assert_eq!(output.len(), 4);
+        for (row, batch) in output.iter().enumerate() {
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch["score"].as_ref(),
+                input.slice(row, 1)["score"].as_ref()
+            );
+            assert_eq!(
+                batch[ROW_ADDR].as_ref(),
+                expected.slice(row, 1)[ROW_ADDR].as_ref()
+            );
+            assert_eq!(batch["x"].as_ref(), expected.slice(row, 1)["x"].as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_legacy_take_row_groups_and_indexed_update() {
+        let data = record_batch!(
+            ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            ("s", Utf8, ["a", "b", "c", "d", "e", "f", "g", "h"])
+        )
+        .unwrap();
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            max_rows_per_file: 4,
+            max_rows_per_group: 2,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        for fragment in dataset.get_fragments() {
+            let reader = fragment
+                .open(dataset.schema(), FragReadConfig::default())
+                .await
+                .unwrap();
+            let batches = reader
+                .take(&[0, 1, 2, 3], u32::MAX, None)
+                .await
+                .unwrap()
+                .buffered(2)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .collect::<Vec<_>>(),
+                [2, 2]
+            );
+        }
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                true,
+            )
+            .await
+            .unwrap();
+        let filter = "id IN (0, 2, 4, 6)";
+        let plan = dataset
+            .scan()
+            .filter(filter)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(plan.contains("Take"), "{plan}");
+        assert!(plan.contains("MaterializeIndex"), "{plan}");
+        assert!(plan.contains("@id_idx(BTree)"), "{plan}");
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where(filter)
+            .unwrap()
+            .set("s", "upper(s)")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 4);
+        let actual = result.new_dataset.scan().try_into_batch().await.unwrap();
+        let order = arrow::compute::sort_to_indices(&actual["id"], None, None).unwrap();
+        let actual = arrow_select::take::take_record_batch(&actual, &order).unwrap();
+        let expected = record_batch!(
+            ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            ("s", Utf8, ["A", "b", "C", "d", "E", "f", "G", "h"])
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1229,8 +1758,11 @@ mod tests {
             vec!["i", ROW_ID, "s", "f"],
         );
 
-        // with_new_children should preserve the output schema.
-        let edited = outer_take.with_new_children(vec![input])?;
+        // Replacing the children should preserve the output schema.
+        let edited = outer_take.replace_children(
+            vec![input],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
         assert_eq!(edited.schema().field_names(), vec!["i", ROW_ID, "f", "s"],);
         Ok(())
     }

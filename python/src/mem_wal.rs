@@ -21,8 +21,11 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
-use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
+use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
+use lance::dataset::mem_wal::{
+    LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids, evaluate_sharding_spec,
+};
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
@@ -34,6 +37,7 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
+use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::LanceSchema as PyLanceSchema;
 
@@ -331,7 +335,8 @@ impl PyShardWriter {
     /// Return a snapshot of current write statistics.
     ///
     /// Returns a dict with keys: put_count, put_time_ms, wal_flush_count,
-    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows.
+    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows,
+    /// memtable_flush_failures.
     pub fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
@@ -358,20 +363,27 @@ impl PyShardWriter {
     /// Return current MemTable statistics.
     ///
     /// Returns a dict with keys: row_count, batch_count, estimated_size_bytes,
-    /// generation.
+    /// index_bytes, frozen_bytes, generation.
     pub fn memtable_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
-        let stats = rt()
+        let (stats, bytes) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
-                    Some(w) => w.memtable_stats().await,
+                    // Byte totals come from `memory()`, the lock-free view;
+                    // `memtable_stats` carries none.
+                    Some(w) => w
+                        .memtable_stats()
+                        .await
+                        .map(|stats| (stats, Some(w.memory()))),
                     None => {
                         let closed_guard = closed_state.lock().await;
                         closed_guard
                             .as_ref()
-                            .map(|state| state.memtable_stats.clone())
+                            // A closed writer holds nothing, so the byte totals
+                            // are zero by construction rather than stale.
+                            .map(|state| (state.memtable_stats.clone(), None))
                             .ok_or_else(|| {
                                 lance_core::Error::invalid_input("ShardWriter is already closed")
                             })
@@ -380,12 +392,14 @@ impl PyShardWriter {
             })?
             .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))?;
 
-        memtable_stats_to_pydict(py, &stats)
+        memtable_stats_to_pydict(py, &stats, bytes.as_ref())
     }
 
-    /// Create an LSM scanner that includes the active MemTable for strong consistency.
+    /// Create an LSM scanner that includes this writer's in-memory MemTables
+    /// for strong consistency.
     ///
-    /// The scanner covers: base table + given SSTables + current active MemTable.
+    /// The scanner covers: base table + given SSTables + the active MemTable
+    /// and every frozen MemTable still awaiting flush.
     #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
@@ -402,18 +416,21 @@ impl PyShardWriter {
         let dataset = self.dataset.clone();
         let shard_id = self.shard_id;
 
-        let (active_ref, writer_snapshot) = rt()
+        let (in_memory_memtables, writer_snapshot) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
                     Some(w) => {
-                        let active_ref = w.active_memtable_ref().await?;
+                        // Capture the active memtable *and* any frozen-awaiting-flush
+                        // memtables so a concurrent flush rollover cannot hide
+                        // acknowledged writes from this read-your-writes scanner.
+                        let in_memory_memtables = w.in_memory_memtable_refs().await?;
                         let writer_snapshot = w
                             .manifest()
                             .await?
                             .map(shard_snapshot_from_manifest)
                             .unwrap_or_else(|| ShardSnapshot::new(shard_id));
-                        Ok((active_ref, writer_snapshot))
+                        Ok((in_memory_memtables, writer_snapshot))
                     }
                     None => Err(lance_core::Error::invalid_input(
                         "ShardWriter is already closed",
@@ -425,7 +442,7 @@ impl PyShardWriter {
         snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
-            .with_active_memtable(shard_id, active_ref);
+            .with_in_memory_memtables(shard_id, in_memory_memtables);
 
         Ok(PyLsmScanner {
             inner: Some(scanner),
@@ -677,6 +694,25 @@ impl PyLsmScanner {
         PyList::new(py, py_batches)
     }
 
+    /// Execute the scan and return a PyArrow RecordBatchReader that yields
+    /// batches as the scan produces them, instead of collecting them first.
+    pub fn to_reader(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let scanner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
+        let stream = rt()
+            .block_on(Some(py), scanner.try_into_stream())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
     /// Return the row count without loading all data.
     pub fn count_rows(&self, py: Python<'_>) -> PyResult<u64> {
         let scanner = self
@@ -719,8 +755,13 @@ impl PyLsmPointLookupPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
+        // A flushed generation stores the names it was written with, so the
+        // planner resolves its columns by id; `base_schema` carries none.
+        let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
-        let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone());
+        let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .with_identity_schema(identity_schema);
         Ok(Self {
             planner,
             dataset_schema: base_schema,
@@ -787,6 +828,8 @@ impl PyLsmVectorSearchPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
+        // See the point-lookup planner: a rename moves a name and keeps the id.
+        let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
 
         let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
 
@@ -807,6 +850,7 @@ impl PyLsmVectorSearchPlanner {
             vector_column,
             dist_type,
         )
+        .with_identity_schema(identity_schema)
         .with_dataset(ds);
         if let Some(filter) = filter {
             planner = planner.with_filter(Some(filter));
@@ -933,6 +977,7 @@ fn write_stats_to_pydict(py: Python<'_>, stats: &WriteStatsSnapshot) -> PyResult
     dict.set_item("wal_flush_time_ms", stats.wal_flush_time.as_millis() as u64)?;
     dict.set_item("memtable_flush_count", stats.memtable_flush_count)?;
     dict.set_item("memtable_flush_rows", stats.memtable_flush_rows)?;
+    dict.set_item("memtable_flush_failures", stats.memtable_flush_failures)?;
     dict.set_item(
         "memtable_flush_time_ms",
         stats.memtable_flush_time.as_millis() as u64,
@@ -940,11 +985,21 @@ fn write_stats_to_pydict(py: Python<'_>, stats: &WriteStatsSnapshot) -> PyResult
     Ok(dict.into_any().unbind())
 }
 
-fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<Py<PyAny>> {
+fn memtable_stats_to_pydict(
+    py: Python<'_>,
+    stats: &MemTableStats,
+    bytes: Option<&ShardMemory>,
+) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("row_count", stats.row_count)?;
     dict.set_item("batch_count", stats.batch_count)?;
-    dict.set_item("estimated_size_bytes", stats.estimated_size)?;
+    // Row data only, as this key has always meant; `index_bytes` below is the
+    // rest of the active memtable's footprint.
+    dict.set_item(
+        "estimated_size_bytes",
+        bytes.map_or(0, ShardMemory::row_bytes),
+    )?;
+    dict.set_item("index_bytes", bytes.map_or(0, ShardMemory::index_bytes))?;
     dict.set_item("generation", stats.generation)?;
     dict.set_item(
         "max_buffered_batch_position",
@@ -965,6 +1020,17 @@ fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<P
     dict.set_item(
         "pending_wal_estimated_bytes",
         stats.pending_wal_estimated_bytes,
+    )?;
+    dict.set_item("frozen_count", stats.frozen_count)?;
+    dict.set_item("frozen_bytes", bytes.map_or(0, ShardMemory::frozen_bytes))?;
+    // Flushed generations still lingering out `frozen_memtable_grace`. Resident,
+    // but no flush reclaims them, so they are not in `frozen_bytes`.
+    dict.set_item("grace_bytes", bytes.map_or(0, ShardMemory::grace_bytes))?;
+    // The whole footprint: what a process-wide budget meters, as opposed to
+    // `frozen_bytes` + active, which is only what a flush can give back.
+    dict.set_item(
+        "retained_bytes",
+        bytes.map_or(0, ShardMemory::retained_bytes),
     )?;
     Ok(dict.into_any().unbind())
 }
@@ -1034,6 +1100,13 @@ fn shard_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -
 }
 
 fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
+    // Close awaits every frozen memtable's flush, so nothing is owed afterwards
+    // regardless of whether the active memtable had buffered batches.
+    let stats_before_close = MemTableStats {
+        frozen_count: 0,
+        ..stats_before_close
+    };
+
     if stats_before_close.batch_count == 0 {
         return stats_before_close;
     }
@@ -1045,7 +1118,6 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
     MemTableStats {
         row_count: 0,
         batch_count: 0,
-        estimated_size: 0,
         generation: stats_before_close.generation.saturating_add(1),
         max_buffered_batch_position: None,
         durable_batch_count: global_end,
@@ -1055,5 +1127,6 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
         pending_wal_batch_count: 0,
         pending_wal_row_count: 0,
         pending_wal_estimated_bytes: 0,
+        frozen_count: 0,
     }
 }

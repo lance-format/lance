@@ -3,156 +3,25 @@
 
 //! MemWAL Index operations.
 //!
-//! The MemWAL Index stores:
-//! - Configuration (sharding_specs, maintained_indexes)
-//! - SSTable compaction progress
-//! - Shard state snapshots (eventually consistent)
-//!
-//! Writers no longer update the index on every write. Instead, they update
-//! shard manifests directly. This module provides functions to:
-//! - Load the MemWAL index
-//! - Update compacted SSTables (called during merge-insert commits)
+//! The index data structures and the helpers that read and update the index's
+//! `IndexMetadata` entry live in [`lance_table::system_index::mem_wal`]; this
+//! module holds the dataset-level operations built on top of them.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use lance_core::{Error, Result};
-use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails};
-use lance_table::format::{IndexMetadata, pb};
-use uuid::Uuid;
-
-/// Load MemWalIndexDetails from an IndexMetadata.
-pub(crate) fn load_mem_wal_index_details(index: IndexMetadata) -> Result<MemWalIndexDetails> {
-    if let Some(details_any) = index.index_details.as_ref() {
-        if !details_any.type_url.ends_with("MemWalIndexDetails") {
-            return Err(Error::index(format!(
-                "Index details is not for the MemWAL index, but {}",
-                details_any.type_url
-            )));
-        }
-
-        Ok(MemWalIndexDetails::try_from(
-            details_any.to_msg::<pb::MemWalIndexDetails>()?,
-        )?)
-    } else {
-        Err(Error::index("Index details not found for the MemWAL index"))
-    }
-}
-
-/// Open the MemWAL index from its metadata.
-pub(crate) fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex>> {
-    Ok(Arc::new(MemWalIndex::new(load_mem_wal_index_details(
-        index,
-    )?)))
-}
-
-/// Update `compacted_sstables` in the MemWAL index.
-///
-/// Called from the final data-changing merge-insert commit for a compaction
-/// target, so the rows and the generation that describes them publish
-/// together.
-///
-/// A proposed generation must be **strictly greater** than the one the latest
-/// state records for that shard, and a stale one fails the whole transaction.
-/// Accepting it while keeping the larger marker would publish that worker's row
-/// mutations under a generation it did not produce, and anything reading only
-/// the marker could then stop serving SSTables whose rows were never inserted.
-///
-/// Every other `MemWalIndexDetails` field is carried through untouched.
-pub(crate) fn update_mem_wal_index_compacted_sstables(
-    indices: &mut [IndexMetadata],
-    dataset_version: u64,
-    new_compacted_sstables: Vec<CompactedSsTable>,
-) -> Result<()> {
-    if new_compacted_sstables.is_empty() {
-        return Ok(());
-    }
-
-    let mut seen_shards = HashSet::with_capacity(new_compacted_sstables.len());
-    for sstable in &new_compacted_sstables {
-        if !seen_shards.insert(sstable.shard_id) {
-            return Err(Error::invalid_input(format!(
-                "Duplicate shard {} in one SSTable compaction update; each shard \
-                 may advance at most once per transaction",
-                sstable.shard_id
-            )));
-        }
-    }
-
-    // Default details would describe a table with no MemWAL shards at all, so
-    // the recorded generation would name a shard nothing can corroborate.
-    // Refuse instead of inventing metadata.
-    let pos = indices
-        .iter()
-        .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Cannot record SSTable compaction progress: the {} system index \
-                 does not exist on this table",
-                MEM_WAL_INDEX_NAME
-            ))
-        })?;
-
-    // Validated against a copy so a rejected update leaves `indices` exactly as
-    // the caller passed it.
-    let mut details = load_mem_wal_index_details(indices[pos].clone())?;
-
-    for new_sstable in new_compacted_sstables {
-        match details
-            .compacted_sstables
-            .iter_mut()
-            .find(|sstable| sstable.shard_id == new_sstable.shard_id)
-        {
-            Some(existing) if new_sstable.generation <= existing.generation => {
-                return Err(Error::invalid_input(format!(
-                    "Stale SSTable compaction for shard {}: proposed generation {} \
-                     is not greater than the recorded generation {}",
-                    new_sstable.shard_id, new_sstable.generation, existing.generation
-                )));
-            }
-            Some(existing) => existing.generation = new_sstable.generation,
-            None => details.compacted_sstables.push(new_sstable),
-        }
-    }
-
-    // Replaced in place so the index list keeps its order.
-    indices[pos] = new_mem_wal_index_meta(dataset_version, details)?;
-    Ok(())
-}
-
-/// Create a new MemWAL index metadata entry.
-///
-/// A fresh UUID is minted on every rewrite, including metadata-only updates.
-/// The decoded-details cache is keyed on that UUID, so the change of identity
-/// is what invalidates it; holding the UUID steady would leave a warmed reader
-/// answering with the state from before the update.
-pub(crate) fn new_mem_wal_index_meta(
-    dataset_version: u64,
-    details: MemWalIndexDetails,
-) -> Result<IndexMetadata> {
-    Ok(IndexMetadata {
-        uuid: Uuid::new_v4(),
-        name: MEM_WAL_INDEX_NAME.to_string(),
-        fields: vec![],
-        dataset_version,
-        fragment_bitmap: None,
-        index_details: Some(Arc::new(prost_types::Any::from_msg(
-            &pb::MemWalIndexDetails::from(&details),
-        )?)),
-        index_version: 0,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        // Memory WAL index is inline (no files)
-        files: None,
-    })
-}
+pub(crate) use lance_table::system_index::mem_wal::{
+    load_mem_wal_index_details, new_mem_wal_index_meta, open_mem_wal_index,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::collections::HashMap;
+
+    use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails};
+    use lance_table::format::IndexMetadata;
+    use lance_table::system_index::mem_wal::update_mem_wal_index_compacted_sstables;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use crate::index::DatasetIndexExt;
     use arrow_array::{Int32Array, RecordBatch};
@@ -205,6 +74,40 @@ mod tests {
             .execute(txn)
             .await
             .unwrap()
+    }
+
+    /// UpdateMemWalState touches indexes, not data, so it must carry the
+    /// fragment list forward. The operation builds its manifest from scratch,
+    /// and an unpopulated fragment list is published as an empty one.
+    #[tokio::test]
+    async fn test_update_mem_wal_state_preserves_fragments() {
+        let dataset = test_dataset_with_mem_wal().await;
+        let rows_before = dataset.count_rows(None).await.unwrap();
+        let fragments_before: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        assert!(rows_before > 0, "precondition: the table holds rows");
+
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(Uuid::new_v4(), 1)],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            fragments_before,
+            "UpdateMemWalState dropped fragments"
+        );
+        assert_eq!(
+            dataset.count_rows(None).await.unwrap(),
+            rows_before,
+            "UpdateMemWalState dropped rows"
+        );
     }
 
     /// Test that UpdateMemWalState with lower generation than committed fails without retry.
@@ -474,6 +377,298 @@ mod tests {
         );
     }
 
+    /// A table with `generation` folded into base.
+    async fn compacted_dataset(shard: Uuid, generation: u64) -> crate::Dataset {
+        let dataset = test_dataset_with_mem_wal().await;
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, generation)],
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap()
+    }
+
+    /// An index segment spanning `fragments`, as a completed build leaves.
+    fn index_over(name: &str, fragments: &[u32]) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: Some(roaring::RoaringBitmap::from_iter(fragments.iter().copied())),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    async fn catch_up_generation(dataset: &crate::Dataset, index: &str) -> Option<u64> {
+        let meta = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .unwrap()
+            .clone();
+        load_mem_wal_index_details(meta)
+            .unwrap()
+            .index_catchup
+            .into_iter()
+            .find(|entry| entry.index_name == index)
+            .and_then(|entry| entry.caught_up_generations.first().map(|g| g.generation))
+    }
+
+    /// The commit path, not the derivation in isolation: `commit_transaction`
+    /// has to load the read version's indices and hand them down.
+    #[tokio::test]
+    async fn an_index_covering_the_table_earns_catch_up_on_commit() {
+        let shard = Uuid::new_v4();
+        let dataset = compacted_dataset(shard, 5).await;
+
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        assert_eq!(catch_up_generation(&dataset, "idx").await, Some(5));
+    }
+
+    /// A repair with nothing to rebuild still has to commit.
+    ///
+    /// Coverage is derived at commit time, so an index that already spans the
+    /// table records its position only if there is a commit to record it on.
+    /// That is the ordinary case after a remap, or after a compaction that
+    /// advanced a generation without changing which fragments exist: the
+    /// optimize finds no unindexed fragments and has no new segment to publish.
+    /// Skipping the commit there leaves the position missing forever, the
+    /// scheduler repeating the same repair, and the last SSTable unretirable.
+    #[tokio::test]
+    async fn a_no_work_repair_still_records_derived_catch_up() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let shard = Uuid::new_v4();
+        let dataset = compacted_dataset(shard, 7).await;
+        // Already spans the table, so the optimize below has nothing to build.
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        // Compaction advances without adding a fragment, so the index still
+        // covers and the optimize stays a no-op.
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 9)],
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(vec!["idx".to_string()]))
+            .await
+            .unwrap();
+
+        assert_eq!(catch_up_generation(&dataset, "idx").await, Some(9));
+
+        // And once it is current, the next pass must not commit again:
+        // periodic maintenance would otherwise mint a version forever.
+        let after_repair = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(vec!["idx".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, after_repair);
+    }
+
+    /// A no-op optimize on a table that is not on the protocol must stay a
+    /// no-op: the early return is what keeps ordinary tables from committing an
+    /// empty version on every maintenance pass.
+    #[tokio::test]
+    async fn a_no_work_optimize_with_nothing_compacted_commits_nothing() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let dataset = test_dataset_with_mem_wal().await;
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        let before = dataset.manifest.version;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append().index_names(vec!["idx".to_string()]))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.manifest.version, before);
+    }
+
+    /// A table carrying compaction progress but no catch-up entry earns one
+    /// from an ordinary commit. This is how a table written before catch-up was
+    /// maintained heals itself: nothing has to be run against it.
+    #[tokio::test]
+    async fn a_table_with_no_catchup_entry_earns_one() {
+        let dataset = test_dataset_with_mem_wal().await;
+        let shard = Uuid::new_v4();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        assert_eq!(catch_up_generation(&dataset, "idx").await, Some(5));
+    }
+
+    /// What a commit earns is fixed by the version it read, and a rebase does
+    /// not move it. The builder inspected a one-fragment table with generation
+    /// 5 folded in; by the time it commits, an append has landed. It still
+    /// earns 5 -- judged against the table it never saw, it would earn nothing
+    /// and the SSTables would be retained forever.
+    #[tokio::test]
+    async fn credit_is_anchored_to_the_read_version_across_a_rebase() {
+        let shard = Uuid::new_v4();
+        let dataset = compacted_dataset(shard, 5).await;
+        let read_version = dataset.manifest.version;
+
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::from(dataset.schema())),
+            vec![
+                Arc::new(Int32Array::from_iter_values(10..20_i32)),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(0, 10))),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: crate::dataset::WriteMode::Append,
+                max_rows_per_file: 10,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        assert!(
+            dataset.get_fragments().len() > 1,
+            "the append must add a fragment the index has not seen"
+        );
+
+        // Built against `read_version`, and only ever saw fragment 0.
+        let txn = Transaction::new(
+            read_version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        assert_eq!(catch_up_generation(&dataset, "idx").await, Some(5));
+    }
+
+    /// A user index build that races a compaction commit is rejected outright
+    /// rather than rebased -- only the system index may rebase against
+    /// `UpdateMemWalState`. Anything scheduling catch-up work has to expect the
+    /// build to be thrown away and retried, so a busy shard needs the two kept
+    /// apart rather than merely retried.
+    #[tokio::test]
+    async fn a_user_index_build_cannot_rebase_past_a_compaction_commit() {
+        let shard = Uuid::new_v4();
+        let dataset = compacted_dataset(shard, 5).await;
+        let read_version = dataset.manifest.version;
+
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 9)],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        let txn = Transaction::new(
+            read_version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("incompatible"),
+            "expected an incompatible-transaction error, got {err}"
+        );
+    }
+
     /// One `__lance_mem_wal` entry carrying `details`, as a real table has.
     fn indices_with(details: MemWalIndexDetails) -> Vec<IndexMetadata> {
         vec![new_mem_wal_index_meta(1, details).unwrap()]
@@ -553,7 +748,7 @@ mod tests {
         assert_eq!(compacted_generation(&indices, shard), Some(10));
     }
 
-    /// Equal is also refused: it proves nothing new, and accepting it would let
+    /// Equal is also refused: it reports nothing new, and accepting it would let
     /// a retry publish a second set of row mutations under the same marker.
     #[test]
     fn an_equal_generation_rejects() {
@@ -618,7 +813,7 @@ mod tests {
     fn recording_progress_keeps_the_system_index_position() {
         let shard = Uuid::new_v4();
         let mut indices = indices_with(MemWalIndexDetails::default());
-        // A neighbour to prove the entry is replaced in place, not moved.
+        // A neighbour to show the entry is replaced in place, not moved.
         indices.push(IndexMetadata {
             name: "other_index".to_string(),
             ..indices[0].clone()
@@ -677,8 +872,6 @@ mod tests {
     /// so the rows and the number describing them would disagree.
     #[tokio::test]
     async fn a_stale_generation_against_latest_head_publishes_nothing() {
-        use lance_table::format::Fragment;
-
         let shard = Uuid::new_v4();
         let dataset = test_dataset_with_mem_wal().await;
         let version = dataset.manifest.version;
@@ -698,6 +891,10 @@ mod tests {
         let version_before = dataset.manifest.version;
         let fragments_before = dataset.get_fragments().len();
 
+        // Reuse written data so schema validation cannot mask the stale generation.
+        let mut new_fragment = dataset.fragments()[0].clone();
+        new_fragment.id = 999;
+
         // Built against the LATEST version, so there is nothing stale for the
         // conflict resolver to catch, and carrying a real row mutation.
         let stale = Transaction::new(
@@ -705,7 +902,7 @@ mod tests {
             Operation::Update {
                 removed_fragment_ids: vec![],
                 updated_fragments: vec![],
-                new_fragments: vec![Fragment::new(999)],
+                new_fragments: vec![new_fragment],
                 fields_modified: vec![],
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
                 fields_for_preserving_frag_bitmap: vec![],
@@ -724,6 +921,7 @@ mod tests {
         // refused by apply-time generation validation, not by something
         // incidental about the fragment.
         let err = result.expect_err("a stale generation must fail the whole commit");
+        assert!(matches!(err, crate::Error::InvalidInput { .. }));
         assert!(
             err.to_string().contains("Stale SSTable compaction"),
             "expected stale-generation rejection, got {err}"
@@ -757,6 +955,10 @@ mod tests {
             "the recorded generation must be unchanged"
         );
     }
+
+    /// The system index holds the catch-up positions the WAL pod retires SSTables against.
+    /// Erasing it through the ordinary index API would leave the table claiming
+    /// nothing was ever compacted while the SSTables are already gone.
 
     #[test]
     fn test_empty_compacted_sstables_noop() {

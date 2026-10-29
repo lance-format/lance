@@ -5,7 +5,7 @@ use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc, sync::Lazy
 
 use arrow::{
     array::{ArrayData, AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
-    buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
+    buffer::{BooleanBuffer, Buffer, MutableBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
         ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
         IntervalMonthDayNano, UInt32Type,
@@ -826,9 +826,9 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
         let num_bytes = length.0 * Self::byte_width()?;
-        let mut bytes = vec![0; num_bytes as usize];
-        rng.fill_bytes(&mut bytes);
-        let bytes = ScalarBuffer::new(Buffer::from(bytes), 0, length.0 as usize);
+        let mut bytes = MutableBuffer::from_len_zeroed(num_bytes as usize);
+        rng.fill_bytes(bytes.as_slice_mut());
+        let bytes = ScalarBuffer::new(bytes.into(), 0, length.0 as usize);
         Ok(Arc::new(
             PrimitiveArray::<T>::new(bytes, None).with_data_type(self.data_type.clone()),
         ))
@@ -3251,8 +3251,23 @@ mod tests {
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt32Array,
     };
+    use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::float16(DataType::Float16)]
+    #[case::decimal128(DataType::Decimal128(38, 10))]
+    #[case::decimal256(DataType::Decimal256(76, 10))]
+    fn test_random_bytes_generator_alignment(#[case] data_type: DataType) {
+        for length in [0, 3] {
+            let generated = array::rand_type(&data_type)
+                .generate_default(RowCount::from(length))
+                .unwrap();
+            assert_eq!(generated.data_type(), &data_type);
+            assert_eq!(generated.len(), length as usize);
+        }
+    }
 
     #[test]
     fn test_timestamp_timezone_is_preserved() {

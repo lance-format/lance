@@ -110,6 +110,12 @@ def test_delta_with_explicit_version_range():
 
     assert total_rows == 2
 
+    # Version 0 is the empty snapshot: (0, 1] holds the first write, (0, 0] nothing.
+    inserted = ds.delta(begin_version=0, end_version=1).get_inserted_rows()
+    assert sorted(inserted.read_all().column("id").to_pylist()) == [1, 2, 3]
+    empty = ds.delta(begin_version=0, end_version=0).get_inserted_rows()
+    assert empty.read_all().num_rows == 0
+
 
 def test_delta_validation_errors():
     table = pa.table({"id": pa.array([1, 2, 3], type=pa.int32())})
@@ -134,3 +140,35 @@ def test_delta_validation_errors():
         "and with_end_version",
     ):
         ds.delta(end_version=2)
+
+    # Error: compared_against combined with a version range
+    with pytest.raises(
+        ValueError,
+        match="Invalid user input: Cannot combine compared_against_version",
+    ):
+        ds.delta(compared_against=1, begin_version=1, end_version=1)
+
+
+def test_delta_get_deleted_row_ids():
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4], type=pa.int32()),
+            "val": pa.array(["a", "b", "c", "d"], type=pa.string()),
+        }
+    )
+    ds = write_dataset(
+        table, "memory://delta_api_test_delete", enable_stable_row_ids=True
+    )
+    row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+
+    ds.delete("id in (2, 3)")
+
+    delta = ds.delta(compared_against=1)
+    reader = delta.get_deleted_row_ids()
+
+    deleted = []
+    for batch in reader:
+        assert batch.schema.names == ["_rowid"]
+        deleted.extend(batch.column("_rowid").to_pylist())
+
+    assert sorted(deleted) == sorted([row_ids[1], row_ids[2]])

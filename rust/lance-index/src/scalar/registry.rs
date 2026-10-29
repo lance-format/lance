@@ -2,22 +2,25 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use arc_swap::ArcSwap;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use lance_core::{
     Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
-    deepsize::DeepSizeOf,
+    deepsize::{Context, DeepSizeOf},
 };
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+use lance_index_core::remapping::BatchRowIdRemapper;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
@@ -142,6 +145,19 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// newer version than this, it cannot be read
     fn version(&self) -> u32;
 
+    /// Whether Lance may maintain this index through `optimize_indices`.
+    ///
+    /// Return `false` when an external service owns refreshing and merging the
+    /// index. Table-wide optimization skips such indices without loading them;
+    /// explicitly naming one in an optimization request returns an error.
+    /// Creation, deletion, and compaction's fragment-coverage rules are unaffected.
+    ///
+    /// For example, a statistics plugin maintained by a separate refresh job can
+    /// override this method with `fn supports_optimization(&self) -> bool { false }`.
+    fn supports_optimization(&self) -> bool {
+        true
+    }
+
     /// Returns a new query parser for the index
     ///
     /// Can return None if this index cannot participate in query optimization
@@ -155,13 +171,57 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// The index details should match the details that were returned when the index was
     /// originally trained.
+    ///
+    /// `index_version` is this segment's own persisted format version (its
+    /// `IndexMetadata::index_version`), not [`Self::version`] (the plugin's
+    /// current maximum). Most plugins have only ever had one on-disk format and
+    /// can ignore it; a plugin that has changed its on-disk format over time
+    /// (e.g. which domain a stored row identifier is in) uses it to read an
+    /// older segment correctly instead of reinterpreting it under the newest
+    /// format.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Whether this plugin can await batch row-ID translation while loading its data.
+    ///
+    /// Returning `true` requires overriding
+    /// [`load_index_with_remapping`](Self::load_index_with_remapping).
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        false
+    }
+
+    /// Load under a mapping whose payload may require asynchronous reads.
+    ///
+    /// This entry point is additive; the legacy [`load_index`](Self::load_index)
+    /// path never routes through it.
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if remapping.is_some() {
+            debug_assert!(
+                !self.supports_batch_row_id_remapping(),
+                "{} advertises batch row-ID remapping but does not override load_index_with_remapping",
+                self.name()
+            );
+            return Err(lance_core::Error::not_supported(format!(
+                "{} does not support asynchronous row-ID remapping",
+                self.name()
+            )));
+        }
+        self.load_index(index_store, index_details, index_version, None, cache)
+            .await
+    }
 
     /// Look up a previously-opened index in the cache.
     ///
@@ -177,11 +237,14 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// without re-reading metadata.
     async fn get_from_cache(
         &self,
-        _index_store: Arc<dyn IndexStore>,
+        index_store: Arc<dyn IndexStore>,
         _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        Ok(cache.get_unsized_with_key(&ScalarIndexCacheKey).await)
+        let Some(entry) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await else {
+            return Ok(None);
+        };
+        Ok(entry.index_for_store(&index_store))
     }
 
     /// Store a freshly-opened index in the cache.
@@ -190,11 +253,49 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// [`get_from_cache`](Self::get_from_cache).
     ///
     /// The default implementation stores the `Arc<dyn ScalarIndex>` in-memory.
-    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+    async fn put_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
         cache
-            .insert_unsized_with_key(&ScalarIndexCacheKey, index)
+            .insert_unsized_with_key(
+                &ScalarIndexCacheKey,
+                Arc::new(StoreBoundScalarIndexCacheEntry::new(index_store, index)),
+            )
             .await;
         Ok(())
+    }
+
+    /// Provide cached state that owns no open readers or row-ID remappers.
+    ///
+    /// The cache keeps only a weak reference to the live index when this returns
+    /// `Some`. The plugin must reconstruct a request's live index from the state
+    /// in its open path. `None` preserves the default live-index cache.
+    ///
+    /// See [`single_flight_store_bound_open_with_snapshot`] for an example.
+    fn cache_snapshot(&self, _index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Ok(None)
+    }
+
+    /// Reconstruct cached state with the current store and batch row-ID remapper.
+    ///
+    /// The caller scopes the state to an immutable index and fragment-reuse
+    /// namespace. Implementations may share decoded and prewarmed data, but must
+    /// replace request-owned readers and remappers. Returning `None` falls back
+    /// to [`load_index_with_remapping`](Self::load_index_with_remapping).
+    /// Plugins providing a [`cache_snapshot`](Self::cache_snapshot) for batch
+    /// remapping should override this to preserve that state across requests.
+    ///
+    /// See [`single_flight_store_bound_open_with_snapshot`] for an example.
+    fn rebind_with_remapping(
+        &self,
+        _index: &dyn ScalarIndex,
+        _index_store: Arc<dyn IndexStore>,
+        _remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Ok(None)
     }
 
     /// Open an index through the cache, awaiting `load` only on a miss.
@@ -212,13 +313,13 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
         if let Some(index) = self
-            .get_from_cache(index_store, frag_reuse_index, cache)
+            .get_from_cache(index_store.clone(), frag_reuse_index, cache)
             .await?
         {
             return Ok(index);
         }
         let index = load.await?;
-        self.put_in_cache(cache, index.clone()).await?;
+        self.put_in_cache(index_store, cache, index.clone()).await?;
         Ok(index)
     }
 
@@ -233,6 +334,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<IndexPluginRegistry>) {}
+
+    /// Validate that new segments can join the segments of the same logical
+    /// index.
+    ///
+    /// Called before segments are committed next to `existing` segments (empty
+    /// for a new index) and before segments are merged. Plugins whose segments
+    /// are only compatible under identical parameters (for example shared hash
+    /// functions) override this to reject drift; the default accepts any mix.
+    fn validate_new_segments_against_existing(
+        &self,
+        _existing: &[&prost_types::Any],
+        _incoming: &[&prost_types::Any],
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Returns a JSON string representation of the provided index details
     ///
@@ -336,18 +452,256 @@ where
     from_state(state)
 }
 
-/// In-memory cache key for a whole `Arc<dyn ScalarIndex>`.
+/// Coalesce index loading, rebinding cached state when supported by the caller.
+pub async fn single_flight_store_bound_open<Rebind, RebindFuture>(
+    index_store: Arc<dyn IndexStore>,
+    cache: &LanceCache,
+    load: ScalarIndexLoad<'_>,
+    rebind: Rebind,
+) -> Result<Arc<dyn ScalarIndex>>
+where
+    Rebind: FnOnce(Arc<dyn ScalarIndex>) -> RebindFuture + Send,
+    RebindFuture: Future<Output = Result<Option<Arc<dyn ScalarIndex>>>> + Send,
+{
+    single_flight_store_bound_open_with_snapshot(index_store, cache, load, rebind, |_| Ok(None))
+        .await
+}
+
+/// Retain a reader-free snapshot and only a weak reference to the live index
+/// when the plugin supports it. Other indices keep their existing live cache.
+///
+/// If the state cannot be rebound, a new load supplies the request's readers.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance_core::{cache::LanceCache, Result};
+/// # use lance_index::scalar::{IndexStore, ScalarIndex};
+/// # use lance_index::scalar::registry::{ScalarIndexLoad, ScalarIndexPlugin,
+/// #     single_flight_store_bound_open_with_snapshot};
+/// # use lance_index_core::remapping::BatchRowIdRemapper;
+/// # async fn open(plugin: &dyn ScalarIndexPlugin, store: Arc<dyn IndexStore>,
+/// #     cache: &LanceCache, load: ScalarIndexLoad<'_>,
+/// #     remapping: Arc<dyn BatchRowIdRemapper>) -> Result<Arc<dyn ScalarIndex>> {
+/// let rebind_store = store.clone();
+/// single_flight_store_bound_open_with_snapshot(
+///     store, cache, load,
+///     |index| async move {
+///         plugin.rebind_with_remapping(index.as_ref(), rebind_store, Some(remapping))
+///     },
+///     |index| plugin.cache_snapshot(index),
+/// ).await
+/// # }
+/// ```
+pub async fn single_flight_store_bound_open_with_snapshot<Rebind, RebindFuture, Snapshot>(
+    index_store: Arc<dyn IndexStore>,
+    cache: &LanceCache,
+    load: ScalarIndexLoad<'_>,
+    rebind: Rebind,
+    snapshot: Snapshot,
+) -> Result<Arc<dyn ScalarIndex>>
+where
+    Rebind: FnOnce(Arc<dyn ScalarIndex>) -> RebindFuture + Send,
+    RebindFuture: Future<Output = Result<Option<Arc<dyn ScalarIndex>>>> + Send,
+    Snapshot: Fn(&dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> + Send + Sync,
+{
+    let pending_load = Arc::new(Mutex::new(Some(load)));
+    let cache_load = pending_load.clone();
+    let loaded_index = Arc::new(OnceLock::new());
+    let cache_loaded_index = loaded_index.clone();
+    let cache_index_store = index_store.clone();
+    let cache_snapshot = &snapshot;
+    let entry = cache
+        .get_or_insert_unsized_with_key(ScalarIndexCacheKey, move || async move {
+            let load = take_scalar_index_load(&cache_load)?.ok_or_else(|| {
+                lance_core::Error::internal(
+                    "store-bound scalar index cache loader was already consumed",
+                )
+            })?;
+            let index = load.await?;
+            cache_loaded_index.get_or_init(|| index.clone());
+            let snapshot = cache_snapshot(index.as_ref())?;
+            Ok(Arc::new(StoreBoundScalarIndexCacheEntry::with_snapshot(
+                cache_index_store,
+                index,
+                snapshot,
+            )))
+        })
+        .await?;
+
+    // Another request can replace the shared slot after our load is published
+    // but before this caller resumes. Keep the result of our own load so that
+    // this request always receives the storage binding it opened.
+    if let Some(index) = loaded_index.get() {
+        return Ok(index.clone());
+    }
+
+    let binding = entry.binding.load_full();
+    if index_store.is_same_storage_binding(binding.index_store.as_ref())
+        && let Some(index) = binding.live_index()
+    {
+        return Ok(index);
+    }
+
+    // Reader-free state can be rebound independently for each request. Do not
+    // let a slow or cancelled binding delay unrelated requests. Publish only
+    // if the source binding is still current, so a delayed caller cannot roll
+    // the cache back after another request has replaced it.
+    if let Some(index) = rebind(binding.index.clone()).await? {
+        let snapshot = snapshot(index.as_ref())?;
+        let previous = entry.binding.compare_and_swap(
+            &binding,
+            Arc::new(StoreBoundScalarIndexBinding::new(
+                index_store.clone(),
+                index.clone(),
+                snapshot,
+            )),
+        );
+        if !Arc::ptr_eq(&previous, &binding)
+            && index_store.is_same_storage_binding(previous.index_store.as_ref())
+            && let Some(index) = previous.live_index()
+        {
+            return Ok(index);
+        }
+        return Ok(index);
+    }
+
+    // The cache slot stays stable across rotations. Serialize replacements and
+    // recheck after locking so same-binding waiters reuse the first reload.
+    let _replacement_guard = entry.replacement_guard.lock().await;
+    if let Some(index) = entry.index_for_store(&index_store) {
+        return Ok(index);
+    }
+
+    let load = take_scalar_index_load(&pending_load)?.ok_or_else(|| {
+        lance_core::Error::internal("store-bound scalar index load has no retained result")
+    })?;
+    let index = load.await?;
+    let snapshot = snapshot(index.as_ref())?;
+    entry
+        .binding
+        .store(Arc::new(StoreBoundScalarIndexBinding::new(
+            index_store,
+            index.clone(),
+            snapshot,
+        )));
+    Ok(index)
+}
+
+fn take_scalar_index_load<'a>(
+    pending_load: &Arc<Mutex<Option<ScalarIndexLoad<'a>>>>,
+) -> Result<Option<ScalarIndexLoad<'a>>> {
+    pending_load
+        .lock()
+        .map_err(|_| {
+            lance_core::Error::internal("store-bound scalar index cache loader mutex was poisoned")
+        })
+        .map(|mut pending_load| pending_load.take())
+}
+
+/// Cached scalar state together with the store binding used to open it.
+struct StoreBoundScalarIndexBinding {
+    index_store: Arc<dyn IndexStore>,
+    index: Arc<dyn ScalarIndex>,
+    // With a snapshot, active requests may share a live reader, but the cache
+    // must not extend that reader's lifetime. None preserves live-only plugins.
+    live_index: Option<Weak<dyn ScalarIndex>>,
+}
+
+impl DeepSizeOf for StoreBoundScalarIndexBinding {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.index_store.deep_size_of_children(context) + self.index.deep_size_of_children(context)
+    }
+}
+
+impl StoreBoundScalarIndexBinding {
+    fn new(
+        index_store: Arc<dyn IndexStore>,
+        index: Arc<dyn ScalarIndex>,
+        snapshot: Option<Arc<dyn ScalarIndex>>,
+    ) -> Self {
+        let (index, live_index) = match snapshot {
+            Some(snapshot) => (snapshot, Some(Arc::downgrade(&index))),
+            None => (index, None),
+        };
+        Self {
+            index_store,
+            index,
+            live_index,
+        }
+    }
+
+    fn live_index(&self) -> Option<Arc<dyn ScalarIndex>> {
+        match &self.live_index {
+            Some(index) => index.upgrade(),
+            None => Some(self.index.clone()),
+        }
+    }
+}
+
+/// A stable cache slot for a scalar index's state and current storage binding.
+pub struct StoreBoundScalarIndexCacheEntry {
+    binding: ArcSwap<StoreBoundScalarIndexBinding>,
+    replacement_guard: tokio::sync::Mutex<()>,
+}
+
+impl DeepSizeOf for StoreBoundScalarIndexCacheEntry {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.binding.load_full().deep_size_of_children(context)
+    }
+}
+
+impl StoreBoundScalarIndexCacheEntry {
+    fn new(index_store: Arc<dyn IndexStore>, index: Arc<dyn ScalarIndex>) -> Self {
+        Self::with_snapshot(index_store, index, None)
+    }
+
+    pub(crate) fn with_snapshot(
+        index_store: Arc<dyn IndexStore>,
+        index: Arc<dyn ScalarIndex>,
+        snapshot: Option<Arc<dyn ScalarIndex>>,
+    ) -> Self {
+        Self {
+            binding: ArcSwap::from_pointee(StoreBoundScalarIndexBinding::new(
+                index_store,
+                index,
+                snapshot,
+            )),
+            replacement_guard: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub(crate) fn index_for_store(
+        &self,
+        index_store: &Arc<dyn IndexStore>,
+    ) -> Option<Arc<dyn ScalarIndex>> {
+        let binding = self.binding.load();
+        index_store
+            .is_same_storage_binding(binding.index_store.as_ref())
+            .then(|| binding.live_index())
+            .flatten()
+    }
+
+    /// Return the live index, or its reader-free snapshot after the request ends.
+    pub fn index(&self) -> Arc<dyn ScalarIndex> {
+        let binding = self.binding.load();
+        binding
+            .live_index()
+            .unwrap_or_else(|| binding.index.clone())
+    }
+}
+
+/// In-memory cache key for a scalar index's storage-bound state.
 ///
 /// Used by the default [`ScalarIndexPlugin::get_from_cache`] /
 /// [`ScalarIndexPlugin::put_in_cache`] implementations. The cache is already
-/// per-index namespaced by the caller, so a constant key suffices. Trait objects
+/// per-index namespaced by the caller, so a constant key suffices. The entry
 /// cannot be serialized, so this is an [`UnsizedCacheKey`] with no codec —
 /// plugins that want a persistable cache entry override those methods with a
 /// sized key.
 pub struct ScalarIndexCacheKey;
 
 impl UnsizedCacheKey for ScalarIndexCacheKey {
-    type ValueType = dyn ScalarIndex;
+    type ValueType = StoreBoundScalarIndexCacheEntry;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Borrowed("scalar_index")
@@ -358,10 +712,282 @@ impl UnsizedCacheKey for ScalarIndexCacheKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.scalar.registry.scalar-index-key", 1)
+        CacheKeySchema::new("lance.scalar.registry.scalar-index-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_variant(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::HashMap, pin::Pin};
+
+    use arrow_schema::Schema;
+    use futures::FutureExt;
+    use lance_core::cache::{
+        CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend,
+    };
+    use lance_io::object_store::ObjectStore;
+    use tokio::sync::Notify;
+
+    use crate::scalar::inverted::{
+        InvertedIndex, InvertedIndexParams, METADATA_FILE, TOKEN_SET_FORMAT_KEY, TokenSetFormat,
+    };
+    use crate::scalar::lance_format::LanceIndexStore;
+
+    /// Pause the cold caller after publication, allowing a warm caller to rotate
+    /// the same entry before the cold caller receives its result.
+    #[derive(Debug)]
+    struct PauseColdReturn {
+        inner: MokaCacheBackend,
+        published: Notify,
+        resume: Notify,
+    }
+
+    #[async_trait]
+    impl CacheBackend for PauseColdReturn {
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            self.inner.get(key, codec).await
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            size_bytes: usize,
+            codec: Option<CacheCodec>,
+        ) {
+            self.inner.insert(key, entry, size_bytes, codec).await;
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            let result = self.inner.get_or_insert(key, loader, codec).await?;
+            if !result.1 {
+                self.published.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(result)
+        }
+
+        async fn clear(&self) {
+            self.inner.clear().await;
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.inner.num_entries().await
+        }
+
+        async fn size_bytes(&self) -> usize {
+            self.inner.size_bytes().await
+        }
+    }
+
+    async fn empty_index_bindings() -> [(Arc<dyn IndexStore>, Arc<dyn ScalarIndex>); 2] {
+        let object_store = ObjectStore::memory();
+        let metadata_cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let store_a: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            Arc::new(object_store.clone()),
+            "index".into(),
+            metadata_cache.clone(),
+        ));
+        let store_b: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            Arc::new(object_store),
+            "index".into(),
+            metadata_cache,
+        ));
+        assert!(!store_a.is_same_storage_binding(store_b.as_ref()));
+        let mut writer = store_a
+            .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        writer
+            .finish_with_metadata(HashMap::from([
+                ("partitions".to_owned(), "[]".to_owned()),
+                (
+                    "params".to_owned(),
+                    serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+                ),
+                (
+                    TOKEN_SET_FORMAT_KEY.to_owned(),
+                    TokenSetFormat::default().to_string(),
+                ),
+            ]))
+            .await
+            .unwrap();
+        let index_cache = LanceCache::no_cache();
+        let index_a = InvertedIndex::load(store_a.clone(), None, &index_cache)
+            .await
+            .unwrap();
+        let index_b = InvertedIndex::load(store_b.clone(), None, &index_cache)
+            .await
+            .unwrap();
+        [(store_a, index_a), (store_b, index_b)]
+    }
+
+    #[tokio::test]
+    async fn test_cold_scalar_open_keeps_its_binding_after_concurrent_rotation() {
+        let [(store_a, index_a), (store_b, index_b)] = empty_index_bindings().await;
+        let backend = Arc::new(PauseColdReturn {
+            inner: MokaCacheBackend::with_capacity(1024 * 1024),
+            published: Notify::new(),
+            resume: Notify::new(),
+        });
+        let cache = LanceCache::with_backend(backend.clone());
+        let cold_cache = cache.clone();
+        let cold_index = index_a.clone();
+        let cold = tokio::spawn(async move {
+            single_flight_store_bound_open(
+                store_a,
+                &cold_cache,
+                async move { Ok(cold_index) }.boxed(),
+                |_| async { panic!("cold caller must keep its own loaded index") },
+            )
+            .await
+        });
+        backend.published.notified().await;
+        let replacement = index_b.clone();
+        let warm = single_flight_store_bound_open(
+            store_b,
+            &cache,
+            async { panic!("warm caller must rebind the cached index") }.boxed(),
+            |_| async move { Ok(Some(replacement)) },
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&warm, &index_b));
+        backend.resume.notify_one();
+        let cold = cold.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&cold, &index_a));
+        let cached = cache
+            .get_unsized_with_key(&ScalarIndexCacheKey)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached.index(), &index_b));
+    }
+
+    #[tokio::test]
+    async fn test_independent_scalar_rebinds_do_not_wait_for_each_other() {
+        let [(store_a, index_a), (store_b, index_b)] = empty_index_bindings().await;
+        let [(store_c, index_c), _] = empty_index_bindings().await;
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let entry = Arc::new(StoreBoundScalarIndexCacheEntry::new(store_a, index_a));
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, entry.clone())
+            .await;
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let slow_started = started.clone();
+        let slow_resume = resume.clone();
+        let slow_cache = cache.clone();
+        let slow_index = index_b.clone();
+        let slow = tokio::spawn(async move {
+            single_flight_store_bound_open(
+                store_b,
+                &slow_cache,
+                async { panic!("warm request must not reload metadata") }.boxed(),
+                |_| async move {
+                    slow_started.notify_one();
+                    slow_resume.notified().await;
+                    Ok(Some(slow_index))
+                },
+            )
+            .await
+        });
+        started.notified().await;
+        let fast_index = index_c.clone();
+        let fast = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            single_flight_store_bound_open(
+                store_c,
+                &cache,
+                async { panic!("warm request must not reload metadata") }.boxed(),
+                |_| async move { Ok(Some(fast_index)) },
+            ),
+        )
+        .await;
+        resume.notify_one();
+        let slow = slow.await.unwrap().unwrap();
+        let fast = fast
+            .expect("an independent request waited for another binding's rebind")
+            .unwrap();
+        assert!(Arc::ptr_eq(&slow, &index_b));
+        assert!(Arc::ptr_eq(&fast, &index_c));
+        assert!(
+            Arc::ptr_eq(&entry.index(), &index_c),
+            "a delayed rebind must not overwrite the newer cache binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_or_cancelled_scalar_rebind_preserves_cached_binding() {
+        let [(store_a, index_a), (store_b, index_b)] = empty_index_bindings().await;
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let entry = Arc::new(StoreBoundScalarIndexCacheEntry::new(
+            store_a,
+            index_a.clone(),
+        ));
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, entry.clone())
+            .await;
+        let error = single_flight_store_bound_open(
+            store_b.clone(),
+            &cache,
+            async { panic!("failed rebind must not fall back to loading") }.boxed(),
+            |_| async { Err(lance_core::Error::io("replacement credentials revoked")) },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("replacement credentials revoked")
+        );
+        assert!(Arc::ptr_eq(&entry.index(), &index_a));
+
+        let started = Arc::new(Notify::new());
+        let cancel_started = started.clone();
+        let cancel_cache = cache.clone();
+        let cancel_store = store_b.clone();
+        let cancelled = tokio::spawn(async move {
+            single_flight_store_bound_open(
+                cancel_store,
+                &cancel_cache,
+                async { panic!("cancelled rebind must not fall back to loading") }.boxed(),
+                |_| async move {
+                    cancel_started.notify_one();
+                    futures::future::pending().await
+                },
+            )
+            .await
+        });
+        started.notified().await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(Arc::ptr_eq(&entry.index(), &index_a));
+
+        let replacement = index_b.clone();
+        let reopened = single_flight_store_bound_open(
+            store_b,
+            &cache,
+            async { panic!("retry must rebind the cached index") }.boxed(),
+            |_| async move { Ok(Some(replacement)) },
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&reopened, &index_b));
+        assert!(Arc::ptr_eq(&entry.index(), &index_b));
     }
 }

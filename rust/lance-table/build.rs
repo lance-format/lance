@@ -16,6 +16,9 @@ fn main() -> Result<()> {
     prost_build.extern_path(".lance.file", "::lance_file::format::pb");
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.enable_type_names();
+    // Inline row id sequences are ~98% of a large manifest. Decoding them as
+    // `Bytes` slices the fetched buffer instead of copying into a `Vec<u8>`.
+    prost_build.bytes([".lance.table.DataFragment.inline_row_ids"]);
     prost_build.compile_protos(
         &[
             "./protos/table.proto",

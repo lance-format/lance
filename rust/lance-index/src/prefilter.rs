@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 
 /// A trait to be implemented by anything supplying a prefilter row addr mask
 ///
@@ -35,6 +35,23 @@ pub trait PreFilter: Send + Sync {
 
     /// If the filter is empty.
     fn is_empty(&self) -> bool;
+
+    /// Whether partition-local row coverage is needed to determine if this filter
+    /// can be replaced by [`NoFilter`].
+    ///
+    /// Most filters cannot make this proof and must not make an IVF search
+    /// enumerate a partition's row addresses just to call [`Self::is_empty_for`].
+    fn needs_partition_row_ids(&self) -> bool {
+        false
+    }
+
+    /// Whether this filter selects every row in a known partition.
+    ///
+    /// Callers must first call [`Self::wait_for_ready`]. Implementations that
+    /// cannot prove partition-local emptiness fall back to the global answer.
+    fn is_empty_for(&self, _rows: &RowAddrTreeMap) -> bool {
+        self.is_empty()
+    }
 
     /// Get the row addr mask for this prefilter
     ///

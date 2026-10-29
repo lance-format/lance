@@ -44,6 +44,7 @@ from ..dataset import (
     Transaction,
     UpdateResult,
     Version,
+    VersionRef,
 )
 from ..fragment import (
     DataFile,
@@ -53,6 +54,7 @@ from ..progress import FragmentWriteProgress as FragmentWriteProgress
 from ..progress import IndexProgress as IndexProgress
 from ..types import ReaderLike as ReaderLike
 from ..udf import BatchUDF as BatchUDF
+from .bitmap import Bitmap as Bitmap
 from .debug import format_fragment as format_fragment
 from .debug import format_manifest as format_manifest
 from .debug import format_schema as format_schema
@@ -147,6 +149,7 @@ class CleanupStats:
     transaction_files_removed: int
     index_files_removed: int
     deletion_files_removed: int
+    failed_deletes: int
 
 class CleanupCandidateFile:
     path: str
@@ -167,6 +170,9 @@ class CleanupExplanation:
     candidate_file_limit: int
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
+
+class FragmentAddColumnsCleanup:
+    def cleanup(self) -> None: ...
 
 class LanceFileWriteSummary:
     num_rows: int
@@ -205,10 +211,33 @@ class PackedBlobWriter:
     def write_blob(self, data: bytes) -> None: ...
     def write_blobs(
         self,
-        payloads: Union[pa.BinaryArray, pa.LargeBinaryArray, pa.ChunkedArray],
+        payloads: Union[
+            pa.BinaryArray,
+            pa.LargeBinaryArray,
+            pa.BinaryViewArray,
+            pa.FixedSizeBinaryArray,
+            pa.ChunkedArray,
+        ],
     ) -> None: ...
     def finish(self) -> List[BlobDescriptor]: ...
     def finish_array(self, field_name: str) -> pa.StructArray: ...
+
+class ManagedBlobWriter:
+    @property
+    def path(self) -> str: ...
+    def write_blob(self, data: bytes) -> None: ...
+    def write_blobs(
+        self,
+        payloads: Union[
+            pa.BinaryArray,
+            pa.LargeBinaryArray,
+            pa.BinaryViewArray,
+            pa.FixedSizeBinaryArray,
+            pa.ChunkedArray,
+        ],
+    ) -> None: ...
+    def finish(self) -> List[BlobDescriptor]: ...
+    def finish_column(self, field_name: str) -> tuple[pa.Field, pa.StructArray]: ...
 
 class DedicatedBlobWriter:
     @property
@@ -226,6 +255,9 @@ class BlobDescriptorArrayBuilder:
         self, blob_id: int, offsets: List[int], sizes: List[int]
     ) -> None: ...
     def append_dedicated(self, blob_id: int, size: int) -> None: ...
+    def append_managed(
+        self, uri: str, offset: int, size: int, *, base_id: Optional[int] = None
+    ) -> None: ...
     def append(self, value: BlobDescriptor) -> None: ...
     def extend(self, values: List[BlobDescriptor]) -> None: ...
     def append_inline(self, data: bytes) -> None: ...
@@ -252,6 +284,9 @@ class LanceFileSession:
         keep_original_array: Optional[bool] = None,
         max_page_bytes: Optional[int] = None,
     ) -> LanceFileWriter: ...
+    def open_managed_blob_writer(
+        self, *, base_id: Optional[int] = None
+    ) -> ManagedBlobWriter: ...
     def open_packed_blob_writer(self, path: str, blob_id: int) -> PackedBlobWriter: ...
     def open_dedicated_blob_writer(
         self, path: str, blob_id: int
@@ -348,6 +383,8 @@ class LanceBlobFile:
     def read_range(self, offset: int, length: int) -> bytes: ...
     def read_ranges(self, ranges: List[Tuple[int, int]]) -> List[bytes]: ...
     def read_into(self, b: bytearray) -> int: ...
+    def set_buffer_size(self, buffer_size: int) -> None: ...
+    def _range_submission_count(self) -> int: ...
 
 class _Dataset:
     @property
@@ -378,6 +415,7 @@ class _Dataset:
     def has_stable_row_ids(self) -> bool: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
+    def base_paths(self) -> Dict[int, DatasetBasePath]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
     def remap_row_addrs(self, addrs: pa.Array) -> Optional[pa.Array]: ...
     def scanner(
@@ -412,6 +450,9 @@ class _Dataset:
         order_by: Optional[List[Any]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_aggregate: Optional[bytes] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
+        minhash_query: Optional[Dict[str, str]] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(
@@ -478,15 +519,20 @@ class _Dataset:
     ) -> pa.RecordBatchReader: ...
     def alter_columns(self, alterations: List[AlterColumn]): ...
     def merge(self, reader: pa.RecordBatchReader, left_on: str, right_on: str): ...
-    def delete(self, predicate: str): ...
+    def delete(self, predicate: str | bytes): ...
     def update(
         self,
         updates: Dict[str, str],
-        predicate: Optional[str] = None,
+        predicate: Optional[str | bytes] = None,
+        conflict_retries: Optional[int] = None,
+        retry_timeout: Optional[timedelta] = None,
+        data_storage_version: Optional[str] = None,
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
     def versions(self) -> List[Version]: ...
+    def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
+    def current_version(self) -> Version: ...
     def latest_version(self) -> int: ...
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
@@ -506,6 +552,8 @@ class _Dataset:
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
+        delete_concurrency: Optional[int] = None,
     ) -> CleanupStats: ...
     def explain_cleanup_old_versions(
         self,
@@ -514,6 +562,7 @@ class _Dataset:
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
     ) -> CleanupExplanation: ...
@@ -583,6 +632,7 @@ class _Dataset:
         self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
     ) -> None: ...
     def count_fragments(self) -> int: ...
+    def fragment_ids(self) -> Bitmap: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
     def get_fragment(self, fragment_id: int) -> Optional[_Fragment]: ...
@@ -637,6 +687,24 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def find_duplicate_pairs(
+        self,
+        column: str,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
+    def find_duplicate_pairs_in_partition(
+        self,
+        column: str,
+        segment_id: str,
+        partition_id: int,
+        distance_threshold: float,
+        *,
+        memory_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> pa.RecordBatchReader: ...
     def hamming_clustering_for_ivf_partition(
         self,
         index_name: str,
@@ -670,6 +738,10 @@ class _MergeInsertBuilder:
     def when_matched_fail(self) -> Self: ...
     def when_not_matched_insert_all(self) -> Self: ...
     def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> Self: ...
+    def write_mode(
+        self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
+    ) -> Self: ...
+    def data_storage_version(self, version: str) -> Self: ...
     def target_bases(self, bases: list[str]) -> Self: ...
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
@@ -724,18 +796,36 @@ class _Fragment:
         batch_readahead: Optional[int] = None,
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
+        substrait_filter: Optional[bytes] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
         reader: ReaderLike,
         batch_size: Optional[int],
     ) -> Tuple[FragmentMetadata, LanceSchema]: ...
+    def add_columns_from_reader_with_cleanup(
+        self,
+        reader: ReaderLike,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
     def add_columns(
         self,
         transforms: Dict[str, str] | BatchUDF | ReaderLike,
         read_columns: Optional[List[str]],
         batch_size: Optional[int],
     ) -> Tuple[FragmentMetadata, LanceSchema]: ...
+    def add_columns_with_cleanup(
+        self,
+        transforms: Dict[str, str] | BatchUDF | ReaderLike,
+        read_columns: Optional[List[str]] = None,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
     def delete(self, predicate: str) -> Optional[_Fragment]: ...
     def delete_rows(self, offsets: List[int]) -> Optional[_Fragment]: ...
     def schema(self) -> pa.Schema: ...
@@ -772,6 +862,7 @@ def _write_fragments(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -792,6 +883,7 @@ def _write_fragments_transaction(
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
+    session: Optional[_Session] = None,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...
@@ -823,7 +915,7 @@ class _ShardWriter:
     def stats(self) -> Dict[str, Any]: ...
     def memtable_stats(self) -> Dict[str, Any]: ...
     def lsm_scanner(
-        self, shard_snapshots: Optional[List[_ShardSnapshot]] = None
+        self, shard_snapshots: List[_ShardSnapshot] = ...
     ) -> _LsmScanner: ...
 
 class _LsmScanner:
@@ -833,11 +925,12 @@ class _LsmScanner:
     ) -> _LsmScanner: ...
     def project(self, columns: List[str]) -> Self: ...
     def filter(self, expr: str) -> Self: ...
-    def limit(self, n: int, offset: Optional[int] = None) -> Self: ...
+    def limit(self, n: Optional[int] = None, offset: Optional[int] = None) -> Self: ...
     def with_row_address(self) -> Self: ...
     def with_memtable_gen(self) -> Self: ...
     def to_batch(self) -> pa.RecordBatch: ...
     def to_batches(self) -> List[pa.RecordBatch]: ...
+    def to_reader(self) -> pa.RecordBatchReader: ...
     def count_rows(self) -> int: ...
 
 class _ExecutionPlan:
@@ -866,6 +959,7 @@ class _LsmVectorSearchPlanner:
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
         distance_type: Optional[str] = None,
+        filter: Optional[str] = None,
     ) -> None: ...
     def plan_search(
         self,
@@ -873,6 +967,8 @@ class _LsmVectorSearchPlanner:
         k: int = 10,
         nprobes: int = 20,
         columns: Optional[List[str]] = None,
+        refine_base_table: bool = False,
+        overfetch_factor: float = 1.0,
     ) -> _ExecutionPlan: ...
 
 class _Hnsw:
@@ -942,6 +1038,13 @@ class PyFullTextQuery:
         boosts: Optional[List[float]] = None,
         operator: str = "OR",
     ) -> PyFullTextQuery: ...
+    @staticmethod
+    def combined_fields_query(
+        query: str,
+        columns: List[str],
+        boosts: Optional[List[float]] = None,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
     """Statistics about a scan operation."""
@@ -980,6 +1083,11 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+    all_times: Dict[str, int]
+    """Additional debugging timings in nanoseconds. Keys are subject to change.
+
+    Nested and concurrent stages overlap; summing these values does not
+    reconstruct query wall time."""
 
 class DatasetBasePath:
     def __init__(
@@ -989,6 +1097,14 @@ class DatasetBasePath:
         is_dataset_root: bool = False,
         id: Optional[int] = None,
     ) -> None: ...
+    @property
+    def id(self) -> int: ...
+    @property
+    def name(self) -> Optional[str]: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def is_dataset_root(self) -> bool: ...
 
 __version__: str
 language_model_home: Callable[[], str]

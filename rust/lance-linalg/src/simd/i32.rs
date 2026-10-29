@@ -15,20 +15,33 @@ use std::mem::transmute;
 
 use super::SIMD;
 
+/// 8 of 32-bit `i32` values. Use 256-bit SIMD if possible.
+///
+/// The x86_64 arm reaches AVX and AVX2 intrinsics with no `#[target_feature]`
+/// gate of its own, so callers must already be inside an AVX2-checked context.
+/// `x86_64-unknown-linux-gnu` is pinned to `target-cpu=x86-64-v2`
+/// (`.cargo/config.toml`), which is below AVX.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct i32x8(pub(crate) __m256i);
 
+/// 8 of 32-bit `i32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 pub struct i32x8(int32x4x2_t);
 
+/// 8 of 32-bit `i32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "loongarch64")]
 #[derive(Clone, Copy)]
 pub struct i32x8(v8i32);
+
+#[allow(non_camel_case_types)]
+#[cfg(simd_fallback)]
+#[derive(Clone, Copy)]
+pub struct i32x8([i32; 8]);
 
 impl std::fmt::Debug for i32x8 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -41,7 +54,17 @@ impl std::fmt::Debug for i32x8 {
 }
 
 impl From<&[i32]> for i32x8 {
+    /// Loads the first 8 values from `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` contains fewer than 8 values.
     fn from(value: &[i32]) -> Self {
+        assert!(
+            value.len() >= 8,
+            "i32x8 requires at least 8 values, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -67,6 +90,10 @@ impl SIMD<i32, 8> for i32x8 {
         unsafe {
             Self(lasx_xvreplgr2vr_w(val))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self([val; 8])
+        }
     }
 
     #[inline]
@@ -80,6 +107,10 @@ impl SIMD<i32, 8> for i32x8 {
             Self::splat(0)
         }
         #[cfg(target_arch = "loongarch64")]
+        {
+            Self::splat(0)
+        }
+        #[cfg(simd_fallback)]
         {
             Self::splat(0)
         }
@@ -99,13 +130,20 @@ impl SIMD<i32, 8> for i32x8 {
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self::load_unaligned(ptr) }
+        }
     }
 
     #[inline]
     unsafe fn load_unaligned(ptr: *const i32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_loadu_si256(ptr as *const __m256i))
+            // Treat the register as plain data so this load remains valid on
+            // pre-AVX hosts. LLVM still lowers this to an AVX move when AVX is
+            // enabled for the caller.
+            Self(ptr.cast::<__m256i>().read_unaligned())
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -114,6 +152,10 @@ impl SIMD<i32, 8> for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
+        }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self(std::ptr::read_unaligned(ptr as *const [i32; 8])) }
         }
     }
 
@@ -135,6 +177,10 @@ impl SIMD<i32, 8> for i32x8 {
         unsafe {
             lasx_xvst::<0>(transmute(self.0), transmute(ptr))
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { std::ptr::write_unaligned(ptr as *mut [i32; 8], self.0) }
+        }
     }
 
     fn reduce_sum(&self) -> i32 {
@@ -150,6 +196,10 @@ impl SIMD<i32, 8> for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         {
             self.as_array().iter().sum()
+        }
+        #[cfg(simd_fallback)]
+        {
+            self.0.iter().sum()
         }
     }
 
@@ -172,6 +222,10 @@ impl SIMD<i32, 8> for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             Self(lasx_xvmin_w(self.0, rhs.0))
+        }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].min(rhs.0[i])))
         }
     }
 
@@ -206,6 +260,12 @@ impl SIMD<i32, 8> for i32x8 {
                 }
             }
         }
+        #[cfg(simd_fallback)]
+        {
+            if let Some(i) = self.0.iter().position(|&v| v == val) {
+                return Some(i as i32);
+            }
+        }
         None
     }
 }
@@ -230,6 +290,10 @@ impl Add for i32x8 {
         unsafe {
             Self(lasx_xvadd_w(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].wrapping_add(rhs.0[i])))
+        }
     }
 }
 
@@ -248,6 +312,12 @@ impl AddAssign for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             self.0 = lasx_xvadd_w(self.0, rhs.0);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..8 {
+                self.0[i] = self.0[i].wrapping_add(rhs.0[i]);
+            }
         }
     }
 }
@@ -272,6 +342,10 @@ impl Sub for i32x8 {
         unsafe {
             Self(lasx_xvsub_w(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].wrapping_sub(rhs.0[i])))
+        }
     }
 }
 
@@ -291,17 +365,36 @@ impl SubAssign for i32x8 {
         unsafe {
             self.0 = lasx_xvsub_w(self.0, rhs.0);
         }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..8 {
+                self.0[i] = self.0[i].wrapping_sub(rhs.0[i]);
+            }
+        }
     }
 }
 
 impl Mul for i32x8 {
     type Output = Self;
 
+    /// Lane-wise product, keeping the low 32 bits of each result.
+    ///
+    /// `mul` wraps on overflow rather than panicking the way scalar `i32 * i32`
+    /// does in a debug build, and every arm agrees on that: `vpmulld`,
+    /// `vmulq_s32`, `lasx_xvmul_w` and `wrapping_mul` each discard the high
+    /// half. This is a statement about `mul` alone — `reduce_sum` sums in scalar
+    /// `i32` outside aarch64 (so it panics on overflow in a debug build) but
+    /// reduces in-register on aarch64, where it wraps.
+    ///
+    /// Picking a widening variant here is a silent wrong answer, not a compile
+    /// error: `_mm256_mul_epi32` (`vpmuldq`) multiplies only the even 32-bit
+    /// lanes and writes four 64-bit results, so `[1, 2, ..., 8]` squared came
+    /// back as `[1, 0, 9, 0, 25, 0, 49, 0]`.
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_mul_epi32(self.0, rhs.0))
+            Self(_mm256_mullo_epi32(self.0, rhs.0))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -314,8 +407,61 @@ impl Mul for i32x8 {
         unsafe {
             Self(lasx_xvmul_w(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].wrapping_mul(rhs.0[i])))
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[test]
+    fn test_slice_conversion_rejects_short_input() {
+        assert!(std::panic::catch_unwind(|| i32x8::from(&[0; 7][..])).is_err());
+    }
+
+    #[test]
+    fn test_slice_conversion_uses_cpu_baseline() {
+        let values = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+        let from_slice = i32x8::from(&values[..]);
+        let from_array = i32x8::from(&values);
+
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            std::hint::black_box((from_slice, from_array));
+            return;
+        }
+
+        assert_eq!(from_slice.as_array(), values);
+        assert_eq!(from_array.as_array(), values);
+    }
+
+    /// Lane-wise, low-32-bits multiplication is what every arm promises, so
+    /// this runs everywhere: only the x86 feature check is arch-gated, matching
+    /// `f32.rs`'s and `f64.rs`'s test modules.
+    ///
+    /// Every case below has to produce a different answer under the widening
+    /// `vpmuldq` this file used to call. All-zero *inputs* would not: `vpmuldq`
+    /// returns zeros for those too.
+    #[rstest]
+    #[case::squares([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8], [1, 4, 9, 16, 25, 36, 49, 64])]
+    #[case::mixed_signs([-3, 7, -3, 7, -3, 7, -3, 7], [7, -3, 7, -3, 7, -3, 7, -3], [-21; 8])]
+    #[case::wraps_to_low_32_bits([65536; 8], [65536; 8], [0; 8])]
+    fn mul_is_lane_wise(#[case] lhs: [i32; 8], #[case] rhs: [i32; 8], #[case] expected: [i32; 8]) {
+        // `load_unaligned` / `store_unaligned` are AVX and `mul` is AVX2, and
+        // none of them is `#[target_feature]`-gated, so a pre-Haswell host would
+        // SIGILL. The `qemu-pre-haswell` CI job runs exactly that.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let product = i32x8::from(&lhs) * i32x8::from(&rhs);
+
+        assert_eq!(product.as_array(), expected);
+    }
+}

@@ -1,0 +1,74 @@
+name: Daily Code Coverage
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-code-coverage
+  cancel-in-progress: false
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04-8x
+    timeout-minutes: 360
+    env:
+      CC: clang
+      CXX: clang++
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
+          rustup default nightly-2026-07-13
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          key: daily-code-coverage
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Start DynamoDB and S3
+        run: docker compose -f docker-compose.yml up -d --wait
+      - name: Run coverage tests
+        env:
+          NEXTEST_PROFILE: daily-code-coverage
+        run: |
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo +nightly-2026-07-13 llvm-cov nextest \
+            --codecov \
+            --output-path coverage.codecov \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}" \
+            --config-file .github/nextest/daily-code-coverage.toml
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: daily-rust-coverage
+          path: coverage.codecov
+          retention-days: 14
+          if-no-files-found: error
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.codecov
+          flags: unittests
+          name: daily-code-coverage
+          fail_ci_if_error: true

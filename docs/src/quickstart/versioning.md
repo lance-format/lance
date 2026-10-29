@@ -27,6 +27,17 @@ import pandas as pd
 import pyarrow as pa
 ```
 
+## Create a Dataset
+
+Start with a fresh dataset, which becomes version 1:
+
+```python
+shutil.rmtree("/tmp/test.lance", ignore_errors=True)
+
+df = pd.DataFrame({"a": [5]})
+dataset = lance.write_dataset(df, "/tmp/test.lance")
+```
+
 ## Append New Data to Your Dataset
 
 You can add new rows to your existing dataset, creating a new version while preserving the original data. Here is how to append rows:
@@ -63,6 +74,16 @@ List all versions of a dataset with this request:
 dataset.versions()
 ```
 
+If you only need version numbers, use the lightweight reference API. It lists manifest
+locations without reading and deserializing every manifest:
+
+```python
+dataset.version_refs()
+```
+
+Use `dataset.latest_version` instead when only the latest version of the current branch
+is needed.
+
 You can also access any available version:
 
 ```python
@@ -95,9 +116,11 @@ For advanced tag operations (e.g., tagging versions on specific branches), see [
 
 Branches manage parallel lines of dataset evolution. You can create branches from existing versions or tags, read and write to them independently, and checkout different branches.
 
+`main` refers to the default branch in checkout and reference APIs, but it is reserved and cannot be used as the name of a new branch.
+
 ```python
 # Create branch from current latest version
-experiment_branch = ds.create_branch("experiment")
+experiment_branch = dataset.create_branch("experiment")
 
 # Write to the branch (affects only that branch's history)
 tbl = pa.Table.from_pandas(pd.DataFrame({"a": [42]}))

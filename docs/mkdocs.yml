@@ -28,6 +28,9 @@ markdown_extensions:
       pygments_lang_class: true
   - pymdownx.inlinehilite
   - pymdownx.snippets:
+      # Fail the build instead of silently rendering an empty block when a
+      # snippet path or section is wrong.
+      check_paths: true
       # Allow snippets to pull in files from the repo root (e.g. shared docs
       # kept alongside Rust source). Paths are relative to the docs/ dir.
       base_path:
@@ -48,5 +51,8 @@ plugins:
   - awesome-pages
   - mkdocs_protobuf:
       proto_dir: ../protos
+
+hooks:
+  - hooks/pmc_roster.py
 
 copyright: © 2025 Lance Format. All rights reserved.

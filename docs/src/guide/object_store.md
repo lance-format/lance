@@ -30,16 +30,60 @@ These options apply to all object stores.
 | Key                          | Description                                                                                                                                                                                                                                                                                             |
 |------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allow_http`                 | Allow non-TLS, i.e. non-HTTPS connections. Default, `False`.                                                                                                                                                                                                                                            |
-| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `request_timeout`.                                                                                                    |
+| `block_size`                 | Gap in bytes below which two reads of one file are merged into a single request. Default, `4096` for local files and `65536` for object stores. Larger values cut the request count of scattered reads (for example a `take` of rows spread across a file) at the cost of reading the bytes in between.                                                                                                     |
+| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `timeout`.                                                                                                            |
 | `allow_invalid_certificates` | Skip certificate validation on https connections. Default, `False`. Warning: This is insecure and should only be used for testing.                                                                                                                                                                      |
 | `connect_timeout`            | Timeout for only the connect phase of a Client. Default, `5s`.                                                                                                                                                                                                                                          |
-| `request_timeout`            | Timeout for the entire request, from connection until the response body has finished. Default, `30s`.                                                                                                                                                                                                   |
+| `timeout`                    | Timeout for the entire request, from connection until the response body has finished. Default, `30s`. This applies to each individual request, so on a large write it must cover one complete multipart part upload; raise it alongside `LANCE_INITIAL_UPLOAD_SIZE`.                                    |
 | `user_agent`                 | User agent string to use in requests.                                                                                                                                                                                                                                                                   |
 | `proxy_url`                  | URL of a proxy server to use for requests. Default, `None`.                                                                                                                                                                                                                                             |
 | `proxy_ca_certificate`       | PEM-formatted CA certificate for proxy connections                                                                                                                                                                                                                                                      |
 | `proxy_excludes`             | List of hosts that bypass proxy. This is a comma separated list of domains and IP masks. Any subdomain of the provided domain will be bypassed. For example, `example.com, 192.168.1.0/24` would bypass `https://api.example.com`, `https://www.example.com`, and any IP in the range `192.168.1.0/24`. |
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
+
+### Local filesystem durability
+
+Set `local_fsync` to `"true"` for local datasets when writes must be durable
+before they return:
+
+```python
+import lance
+import pyarrow as pa
+
+lance.write_dataset(
+    pa.table({"id": [1]}),
+    "/path/to/data.lance",
+    storage_options={"local_fsync": "true"},
+)
+```
+
+The default is `"false"`. When enabled, Lance syncs local data, transaction,
+and manifest files before reporting successful writes, including copied files
+during deep clones. Local copies use the destination's setting. On Unix it also
+syncs their directory entries, including newly created directories. This increases
+write latency. Pass the option again when reopening a dataset for later writes;
+it is a store setting, not a dataset property. Only `"true"` and `"false"` are accepted.
+
+### Bulk copy strategy
+
+Lance streams bulk index-file movement and dataset deep-clone files through
+read and write APIs by default. This avoids requiring a provider-native copy
+operation and works across different object stores.
+
+Set `LANCE_IO_SERVER_SIDE_COPY_ENABLED` to a truthy value (`1`, `true`, `on`,
+`yes`, or `y`, case-insensitive) to opt cloud copies whose source and destination
+share the same object-store client into the provider-native server-side copy
+operation. Cross-client, cross-store, and local copies do not use this setting.
+Native copy can reduce client bandwidth and transfer cost, but it requires copy
+support from the object-store integration and is subject to the provider
+request's timeout and retry behavior.
+
+Deep clone bounds non-local file movement to four concurrent files by default.
+Set `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` to a positive integer to override this
+operation-specific limit. The bound also applies when server-side copy is
+enabled because S3 and GCS copies above the provider's single-copy size limit
+fall back to streaming through Lance.
 
 ## Per-Base Configuration
 
@@ -65,10 +109,14 @@ ds = lance.dataset(
 ```
 
 Base ids are assigned when bases are registered (`initial_bases` ids are assigned
-sequentially starting at 1, in order) and can be inspected through the manifest base
-paths. Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated
-as regular storage options. Exact per-base parameter maps (`base_store_params`,
-keyed by base path URI) take precedence over base-scoped keys for that base.
+sequentially starting at 1, in order) and can be inspected with
+`ds.base_paths()`. The returned dictionary maps each base id to its registered
+`DatasetBasePath`; its iteration order is unspecified, and it does not include the
+primary storage unless that path was explicitly registered as a base.
+
+Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated as
+regular storage options. Exact per-base parameter maps (`base_store_params`, keyed
+by base path URI) take precedence over base-scoped keys for that base.
 
 ## S3 Configuration
 
@@ -159,6 +207,36 @@ ds = lance.dataset(
 ```
 
 This can also be done with the `AWS_ENDPOINT` and `AWS_DEFAULT_REGION` environment variables.
+
+!!! warning
+
+    Safe concurrent writes through `s3://` require the store to atomically enforce
+    create-only `PutObject` requests with `If-None-Match: *`. Some S3-compatible
+    stores, including Garage, accept this header but ignore the condition and
+    overwrite existing objects. Concurrent writers can then both report success
+    while silently losing acknowledged data.
+
+    Lance does not check whether the store enforces this condition. Before using
+    concurrent writers, verify that your provider supports atomic conditional
+    writes, or configure a [custom distributed commit lock](#custom-commit-locks)
+    shared by every writer. Reads do not require a commit lock.
+
+#### Custom commit locks
+
+In Python, pass `commit_lock` to `lance.write_dataset` when creating or appending
+to a dataset, and to `lance.dataset` when opening a dataset for subsequent writes.
+The callback accepts the manifest version to commit and returns a context manager
+that acquires a distributed lock on entry and releases it on exit. Hold the lock
+for the entire context and release it even if the commit raises an exception.
+
+Every writer to the same dataset must use the same lock service and lock key for
+that dataset (optionally including the manifest version). The lock must coordinate
+writers across all processes and machines; a process-local lock is insufficient.
+
+Rust applications can provide a
+[`CommitLock`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitLock.html)
+implementation or a custom
+[`CommitHandler`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitHandler.html).
 
 ### S3 Express (Directory Bucket)
 
@@ -373,12 +451,49 @@ parameter; explicit `storage_options` override environment variables:
     settings such as the security token (`TENCENTCLOUD_SECURITY_TOKEN`) and region
     (`TENCENTCLOUD_REGION`) must be configured via environment variables.
 
+## Hugging Face Configuration
+
+Use `hf://datasets/<owner>/<repo>/<path>` to read a Lance dataset hosted on
+Hugging Face. Pass these options through `storage_options`:
+
+| Key | Description |
+| --- | --- |
+| `hf_token` | Hugging Face access token. Falls back to `HF_TOKEN` or `HUGGINGFACE_TOKEN` when omitted. |
+| `hf_revision` | Repository revision, such as a commit ID, branch, or tag. Defaults to `main`. |
+| `hf_download_mode` | `http` (default) or `xet`. |
+| `hf_enable_resolve_cache` | `"true"` reuses resolved HTTP download URLs and XET file metadata across readers. Defaults to `"false"`. |
+
+These options also accept names without the `hf_` prefix. The prefixed name
+takes precedence when both are supplied. `hf_enable_resolve_cache` accepts only
+the strings `"true"` and `"false"`.
+
+Enable the resolve cache only when existing files will not change. Updates,
+including changes behind a moving branch or tag, may remain invisible while
+cached results are reused. HTTP download URLs refresh near expiry, and issued
+URLs may remain usable until expiry after Hub permissions change. The cache
+reduces Hub resolution requests; it does not cache file contents.
+
+```python
+import lance
+
+ds = lance.dataset(
+    "hf://datasets/owner/repo/data.lance",
+    storage_options={"hf_enable_resolve_cache": "true"},
+)
+```
+
 ## GooseFS Configuration
 
 [GooseFS](https://cloud.tencent.com/product/goosefs) is a distributed caching
-filesystem. Lance accesses GooseFS through its Master gRPC service. The URL format
-is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
-(default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
+filesystem. Lance accesses GooseFS through its Master gRPC service. The URL
+format is either:
+
+- `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
+  (default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`)
+- `goosefs:///path`, with an empty authority, when the master address comes
+  from `goosefs_master_addr`, `GOOSEFS_MASTER_ADDR`, or
+  `goosefs-site.properties`
+
 `/path` is the filesystem path within GooseFS.
 
 Manifest commits on `goosefs://` use `ConditionalPutCommitHandler`
@@ -518,23 +633,39 @@ versioned manifests.
     For writes, the same `storageOptions(...)` setter is available on
     `WriteDatasetBuilder` and `WriteFragmentBuilder`.
 
-The Master address can be resolved from (in priority order):
+The Master address is resolved at OpenDAL build time (highest priority first):
 
-1. The `goosefs_master_addr` storage option (supports HA: `"addr1:port,addr2:port"`).
-2. The `GOOSEFS_MASTER_ADDR` environment variable.
-3. The host and port from the URL authority.
+1. The `GOOSEFS_MASTER_ADDR` environment variable.
+2. `goosefs.master.rpc.addresses` or `goosefs.master.hostname` in
+   `goosefs-site.properties` (discovered via `$GOOSEFS_CONFIG_FILE`,
+   `$GOOSEFS_CONF_DIR`, `$GOOSEFS_HOME/conf`, `~/.goosefs`, and
+   `/etc/goosefs`). This is the same file the GooseFS SDK already loads;
+   a Hadoop-style `goosefs:///path` URL relies on it.
+3. The `goosefs_master_addr` storage option (supports HA:
+   `"addr1:port,addr2:port"`).
+4. The host and port from the URL authority.
 
-The following keys can be used as both environment variables or keys in the
-`storage_options` parameter:
+Lance forwards `goosefs_master_addr` and the URL authority as OpenDAL's
+`master_addr`. It does **not** require a host in the URL, so
+`goosefs:///path` can rely on `goosefs-site.properties`. OpenDAL fails the
+store build only when none of the sources above supply an address.
 
-| Key | Description |
-|-----|-------------|
-| `goosefs_master_addr` / `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
-| `goosefs_write_type` / `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
-| `goosefs_block_size` / `GOOSEFS_BLOCK_SIZE` | GooseFS block size in bytes (this is the GooseFS-side block size, not Lance's I/O block size). Optional. |
-| `goosefs_chunk_size` / `GOOSEFS_CHUNK_SIZE` | Chunk size in bytes used when reading or writing files. Optional. |
-| `goosefs_auth_type` / `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
-| `goosefs_auth_username` / `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
+A site file that declares masters outranks the URL authority because the file
+can carry a full HA master list, which a single URI host cannot express.
+
+`storage_options` keys **must be lowercase**. Uppercase or mixed-case spellings
+such as `GOOSEFS_MASTER_ADDR` are rejected with an explicit error — they are
+not ignored, and they are not treated as the matching environment variable.
+Environment variables keep the `GOOSEFS_*` form.
+
+| storage_options key | env var | Description |
+|---------------------|---------|-------------|
+| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL, `GOOSEFS_MASTER_ADDR`, or `goosefs-site.properties`. |
+| `goosefs_write_type` | `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
+| `goosefs_block_size` | `GOOSEFS_BLOCK_SIZE` | GooseFS block size (this is the GooseFS-side block size, not Lance's I/O block size). Accepts a raw byte count or GooseFS suffixes such as `64MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_chunk_size` | `GOOSEFS_CHUNK_SIZE` | Chunk size used when reading or writing files. Accepts a raw byte count or GooseFS suffixes such as `4MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_auth_type` | `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
+| `goosefs_auth_username` | `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
 
 !!! note "Running the GooseFS integration tests"
 
@@ -548,3 +679,87 @@ The following keys can be used as both environment variables or keys in the
     cargo test -p lance-io --features "goosefs goosefs-test" \
         --test goosefs_integration -- --ignored --nocapture --test-threads=1
     ```
+
+### Apache Ozone Configuration
+
+[Apache Ozone](https://ozone.apache.org/) is a Scalable, reliable, distributed storage system 
+optimized for data analytics and object store workloads.  Its S3 Gateway service exposes the standard S3
+REST API, so Lance uses it through the existing S3 code path with no additional
+Rust features required.
+
+#### Prerequisites
+
+1. A secure Ozone cluster(>= 2.2.0 version) with the S3 Gateway service running (default HTTP port `9878`, HTTPS port `9879`).
+2. An Ozone bucket created for Lance datasets, for example:
+
+    ```bash
+    # both OBS (flat) and FSO (file-system-optimized) bucket layouts are supported
+    ozone sh bucket create /s3v/lance
+    ```
+
+3. Credential based on your kerberos keytab via:
+
+    ```bash
+    kinit -kt /etc/security/keytabs/<user>.keytab <user>@YOUR.REALM
+    ozone s3 getsecret
+    # → awsAccessKey=<user>@YOUR.REALM
+    #   awsSecret=<long‑hex‑string>
+    ```
+
+   The command prints an `awsAccessKey` / `awsSecret` pair
+   that maps to the Ozone user's S3 access credentials.
+
+#### Connection
+
+Point `endpoint` at the S3 Gateway address. By default, Ozone's S3 Gateway
+only handles path-style requests (`http://host:port/bucket/key`), so set
+`virtual_hosted_style_request` to `false`. Virtual-hosted style
+(`http://bucket.host:port/key`) is also supported when the gateway is
+configured with `ozone.s3g.domain.name`; in that case you can omit this
+option or set it to `true`.
+
+```python
+import lance
+
+ds = lance.dataset(
+    "s3://lance/path/to/dataset.lance",
+    storage_options={
+        "endpoint": "http://ozone-s3g-host:9878",
+        "region": "us-east-1",               # any non-empty string
+        "access_key_id": "<ozone-access-key>",
+        "secret_access_key": "<ozone-secret-key>",
+        "virtual_hosted_style_request": "false",
+        "allow_http": "true",                # omit when TLS is enabled
+    },
+)
+```
+
+When writing a new dataset:
+
+```python
+import lance
+import pyarrow as pa
+
+table = pa.table({"id": [1, 2, 3], "value": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]})
+ds = lance.write_dataset(
+    table,
+    "s3://lance/path/to/dataset.lance",
+    storage_options={
+        "endpoint": "http://ozone-s3g-host:9878",
+        "region": "us-east-1",
+        "access_key_id": "<ozone-access-key>",
+        "secret_access_key": "<ozone-secret-key>",
+        "virtual_hosted_style_request": "false",
+        "allow_http": "true",
+    },
+)
+```
+
+| Key | Description |
+|-----|-------------|
+| `endpoint` | Ozone S3 Gateway address (for example, `http://ozone-s3g-host:9878`). Required. |
+| `region` | Any non-empty string (for example, `us-east-1`). Required for S3-compatible stores. |
+| `access_key_id` | Ozone S3 access key obtained via `ozone s3 getsecret`. Required. |
+| `secret_access_key` | Ozone S3 secret key obtained via `ozone s3 getsecret`. Required. |
+| `virtual_hosted_style_request` | Set to `false` for path-style requests (the default Ozone mode). Set to `true` when the gateway is configured with `ozone.s3g.domain.name`. Default, `false`. |
+| `allow_http` | Set to `true` for non-TLS connections. Omit when TLS is enabled. Default, `false`. |

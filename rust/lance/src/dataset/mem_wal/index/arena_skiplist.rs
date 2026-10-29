@@ -51,8 +51,13 @@ const MAX_HEIGHT: usize = 16;
 /// Inverse promotion probability (p = 1/4): a node grows one level with prob
 /// 1/4. Matches RocksDB's default `kBranching`.
 const BRANCHING: u64 = 4;
-/// Bump-arena chunk size (1 MiB). Nodes are packed contiguously within a chunk.
-const CHUNK_SIZE: usize = 1 << 20;
+/// Largest bump-arena chunk (1 MiB). Nodes are packed contiguously within one.
+const MAX_CHUNK_SIZE: usize = 1 << 20;
+/// First chunk (4 KiB), doubling up to [`MAX_CHUNK_SIZE`], so an index holding
+/// few nodes is not charged a full chunk.
+const FIRST_CHUNK_SIZE: usize = 4 << 10;
+/// How many times the chunk size doubles before it reaches [`MAX_CHUNK_SIZE`].
+const CHUNK_DOUBLINGS: usize = (MAX_CHUNK_SIZE / FIRST_CHUNK_SIZE).trailing_zeros() as usize;
 
 /// Node header. The variable-length forward-pointer tower (`height` slots of
 /// `AtomicPtr<Node<K>>`) is laid out immediately after this header in the same
@@ -103,11 +108,12 @@ impl Arena {
     }
 
     /// Bump-allocate `layout`. Caller must have exclusive access (single writer).
-    unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+    /// `allocated` accumulates chunk bytes; only the cold `grow` path touches it.
+    unsafe fn alloc(&mut self, layout: Layout, allocated: &AtomicUsize) -> *mut u8 {
         let align = layout.align();
         let mut aligned = (self.cursor as usize).wrapping_add(align - 1) & !(align - 1);
         if self.cursor.is_null() || aligned + layout.size() > self.end as usize {
-            self.grow(layout);
+            self.grow(layout, allocated);
             aligned = (self.cursor as usize + align - 1) & !(align - 1);
         }
         self.cursor = (aligned + layout.size()) as *mut u8;
@@ -116,9 +122,10 @@ impl Arena {
 
     /// Allocate a fresh chunk large enough for `layout` and make it current.
     #[cold]
-    unsafe fn grow(&mut self, layout: Layout) {
+    unsafe fn grow(&mut self, layout: Layout, allocated: &AtomicUsize) {
         let align = layout.align().max(64);
-        let size = CHUNK_SIZE.max(layout.size().next_power_of_two());
+        let ramped = FIRST_CHUNK_SIZE << self.chunks.len().min(CHUNK_DOUBLINGS);
+        let size = ramped.max(layout.size().next_power_of_two());
         let chunk_layout = Layout::from_size_align(size, align).expect("valid chunk layout");
         let ptr = alloc::alloc(chunk_layout);
         if ptr.is_null() {
@@ -126,6 +133,7 @@ impl Arena {
         }
         self.chunks
             .push((NonNull::new_unchecked(ptr), chunk_layout));
+        allocated.fetch_add(size, Ordering::Relaxed);
         self.cursor = ptr;
         self.end = ptr.add(size);
     }
@@ -154,6 +162,10 @@ struct SkipListCore<K> {
     height: AtomicUsize,
     /// Number of entries.
     len: AtomicUsize,
+    /// Bytes of arena chunks allocated so far. Maintained here rather than read
+    /// off `arena.chunks` because the arena is writer-only; this is readable by
+    /// anyone. Only `Arena::grow` touches it, so it costs nothing per insert.
+    arena_bytes: AtomicUsize,
 }
 
 // SAFETY: `arena` (the only non-Sync field) is mutated exclusively by the single
@@ -174,6 +186,7 @@ impl<K> SkipListCore<K> {
             arena: UnsafeCell::new(Arena::new()),
             height: AtomicUsize::new(1),
             len: AtomicUsize::new(0),
+            arena_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -303,7 +316,8 @@ impl<K: Ord> SkipListWriter<K> {
         // only mutator, so no link changes between read and publish.
         let layout = node_layout::<K>(height);
         // SAFETY: single-writer exclusive access to the arena.
-        let node = unsafe { (*self.core.arena.get()).alloc(layout) } as *mut Node<K>;
+        let node = unsafe { (*self.core.arena.get()).alloc(layout, &self.core.arena_bytes) }
+            as *mut Node<K>;
         // SAFETY: `node` points to a fresh, uninitialized, correctly-sized and
         // -aligned block; we write the key then `height` tower slots.
         unsafe {
@@ -342,6 +356,17 @@ pub struct SkipListReader<K> {
 }
 
 impl<K: Ord> SkipListReader<K> {
+    /// Bytes of arena chunks backing this skiplist's nodes.
+    ///
+    /// Counts chunks, not entries, so it overshoots the live nodes by at most
+    /// one partly-filled chunk. Excludes any bytes a
+    /// key owns outside its node (e.g. a long `Box<[u8]>` key) — the arena
+    /// never sees those, so whoever built the key charges them; see
+    /// `BytesBackend::key_heap_bytes`.
+    pub fn resident_bytes(&self) -> usize {
+        self.core.arena_bytes.load(Ordering::Relaxed)
+    }
+
     /// Greatest node with `key <= target`, mapped through `f` while it is alive.
     /// Equivalent to crossbeam's `upper_bound(Included(target))`. `None` if no
     /// such node. The closure avoids cloning the key on the hot path.
@@ -420,6 +445,11 @@ impl<K: Ord> SkipListReader<K> {
     pub fn len(&self) -> usize {
         self.core.len()
     }
+
+    /// Whether no node has been inserted.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Forward iterator over keys in ascending order. Yields `&K` borrowed from the
@@ -463,6 +493,44 @@ mod tests {
         }
         assert_eq!(collect(&r), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(r.len(), 10);
+    }
+
+    /// Chunks double from the first size to the largest and stay there, so a
+    /// small index is charged little and a large one allocates rarely.
+    #[test]
+    fn chunks_ramp_up_to_the_largest_size() {
+        let (mut w, r) = new_skiplist::<i64>();
+        let mut charged = vec![0];
+        let mut key = 0;
+        while charged.len() <= CHUNK_DOUBLINGS + 3 {
+            w.insert(key);
+            key += 1;
+            if r.resident_bytes() != *charged.last().unwrap() {
+                charged.push(r.resident_bytes());
+            }
+        }
+        let chunks: Vec<usize> = charged.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut expected: Vec<usize> = (0..=CHUNK_DOUBLINGS)
+            .map(|doublings| FIRST_CHUNK_SIZE << doublings)
+            .collect();
+        expected.extend([MAX_CHUNK_SIZE; 2]);
+        assert_eq!(chunks, expected);
+        assert_eq!(collect(&r), (0..key).collect::<Vec<_>>());
+    }
+
+    /// A node larger than the current chunk gets a chunk of its own, and small
+    /// nodes keep allocating around it.
+    #[test]
+    fn oversized_nodes_mix_with_small_ones() {
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        struct Big(u32, [u8; 8192]);
+        let (mut w, r) = new_skiplist::<Big>();
+        for i in [5u32, 1, 9, 3] {
+            w.insert(Big(i, [i as u8; 8192]));
+        }
+        assert_eq!(r.iter().map(|b| b.0).collect::<Vec<_>>(), vec![1, 3, 5, 9]);
+        assert!(r.iter().all(|b| b.1.iter().all(|x| *x == b.0 as u8)));
+        assert!(r.resident_bytes() >= 4 * 8192);
     }
 
     #[test]

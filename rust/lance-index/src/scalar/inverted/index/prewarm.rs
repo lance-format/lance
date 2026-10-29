@@ -3,16 +3,21 @@
 
 use super::*;
 
-/// Target on-disk size of one prewarm chunk. Keep this large enough that cloud
-/// stores do not spend prewarm time on thousands of tiny range reads, but still
-/// bounded so one large partition is not materialized all at once.
-pub(super) const PREWARM_CHUNK_TARGET_BYTES: u64 = 128 << 20;
+/// Target on-disk size of one posting-list read chunk. Keep this large enough
+/// that cloud stores do not spend bulk reads on thousands of tiny ranges, but
+/// still bounded so one large partition is not materialized all at once.
+pub(super) const POSTING_READ_CHUNK_TARGET_BYTES: u64 = 128 << 20;
 
 /// Cap on token rows per chunk, bounding the built `Vec` when posting lists are tiny.
-pub(super) const PREWARM_MAX_CHUNK_TOKENS: usize = 256 * 1024;
+pub(super) const POSTING_READ_MAX_CHUNK_TOKENS: usize = 256 * 1024;
 
 /// Floor on token rows per chunk, so a partition always makes progress.
-pub(super) const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
+pub(super) const POSTING_READ_MIN_CHUNK_TOKENS: usize = 1;
+
+/// Maximum number of child values materialized in any 32-bit-offset posting
+/// column. The planner accounts for the widest selected column (impacts when
+/// present), keeping Arrow's `List<i32>` offsets representable.
+pub(super) const POSTING_READ_MAX_LIST_CHILDREN: u64 = i32::MAX as u64;
 
 /// Maximum number of posting lists in a runtime synthetic cache group. This is
 /// deliberately token-count based so grouping works for old v2 indexes without
@@ -98,13 +103,13 @@ impl PostingGrouping {
 }
 
 /// Token rows per chunk: byte target / average bytes-per-token, clamped to `[MIN, MAX]`.
-pub(super) fn prewarm_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
+pub(super) fn posting_read_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
     if token_count == 0 {
-        return PREWARM_MIN_CHUNK_TOKENS;
+        return POSTING_READ_MIN_CHUNK_TOKENS;
     }
     let bytes_per_token = (file_size_bytes / token_count as u64).max(1); // >= 1: no div-by-zero
-    let by_bytes = (PREWARM_CHUNK_TARGET_BYTES / bytes_per_token) as usize;
-    by_bytes.clamp(PREWARM_MIN_CHUNK_TOKENS, PREWARM_MAX_CHUNK_TOKENS)
+    let by_bytes = (POSTING_READ_CHUNK_TARGET_BYTES / bytes_per_token) as usize;
+    by_bytes.clamp(POSTING_READ_MIN_CHUNK_TOKENS, POSTING_READ_MAX_CHUNK_TOKENS)
 }
 
 pub(super) fn synthetic_group_aligned_chunk_end(

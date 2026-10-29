@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, sync::LazyLock};
 
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_ipc::CompressionType;
 use arrow_ipc::reader::FileReader as ArrowFileReader;
 use arrow_ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bytes::Buf;
 use lance_core::error::{CorruptFileSnafu, box_error};
 use lance_core::utils::deletion::DeletionVector;
@@ -24,14 +24,14 @@ use crate::format::{DeletionFile, DeletionFileType};
 
 pub const DELETIONS_DIR: &str = "_deletions";
 
-/// Get the Arrow schema for an Arrow deletion file.
-fn deletion_arrow_schema() -> Arc<Schema> {
+/// The Arrow schema for an Arrow deletion file.
+static DELETION_ARROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![Field::new(
         "row_id",
         DataType::UInt32,
         false,
     )]))
-}
+});
 
 /// Get the file path for a deletion file. This is relative to the dataset root.
 pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &DeletionFile) -> Path {
@@ -85,7 +85,7 @@ pub async fn write_deletion_file(
             let array = UInt32Array::from_iter(set.iter().copied());
             let array = Arc::new(array);
 
-            let schema = deletion_arrow_schema();
+            let schema = DELETION_ARROW_SCHEMA.clone();
             let batch = RecordBatch::try_new(schema.clone(), vec![array])?;
 
             let mut out: Vec<u8> = Vec::new();
@@ -170,12 +170,12 @@ pub async fn read_deletion_file(
             }
 
             let batch = batches.pop().unwrap();
-            if batch.schema() != deletion_arrow_schema() {
+            if batch.schema().as_ref() != DELETION_ARROW_SCHEMA.as_ref() {
                 return Err(Error::corrupt_file(
                     path,
                     format!(
                         "Expected schema {:?} in deletion file, got {:?}",
-                        deletion_arrow_schema(),
+                        DELETION_ARROW_SCHEMA.as_ref(),
                         batch.schema()
                     ),
                 ));
@@ -279,7 +279,7 @@ mod test {
 
         assert_eq!(batches.len(), 1);
         let batch = batches.pop().unwrap();
-        assert_eq!(batch.schema(), deletion_arrow_schema());
+        assert_eq!(batch.schema(), *DELETION_ARROW_SCHEMA);
         let array = batch["row_id"]
             .as_any()
             .downcast_ref::<UInt32Array>()

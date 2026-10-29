@@ -3,15 +3,17 @@
 
 use crate::{error::PythonErrorExt, rt};
 use arrow::{
-    array::{Array, ArrayRef, GenericBinaryArray, OffsetSizeTrait, cast::AsArray, make_array},
+    array::{Array, ArrayRef, make_array},
     pyarrow::{FromPyArrow, ToPyArrow},
 };
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use lance::{
-    BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
+    BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, ManagedBlobWriter,
+    PackedBlobWriter,
 };
+use lance_arrow::iter_binary_array;
 use pyo3::{
     Bound, PyErr, PyResult,
     exceptions::{PyRuntimeError, PyValueError},
@@ -91,9 +93,10 @@ fn descriptor_field_to_pyarrow<'py>(
 
 /// Normalize inputs accepted by [`PyPackedBlobWriter::write_blobs`] into Arrow arrays.
 ///
-/// BinaryArray, LargeBinaryArray, and ChunkedArray values of either binary type
-/// are accepted. Chunk boundaries, nulls, and empty values remain in the arrays;
-/// each row is later passed to the core writer as an optional byte slice.
+/// BinaryArray, LargeBinaryArray, BinaryViewArray, FixedSizeBinaryArray, and
+/// ChunkedArray values of any binary type are accepted. Chunk boundaries,
+/// nulls, and empty values remain in the arrays; each row is later passed to
+/// the core writer as an optional byte slice.
 fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     match ArrayData::from_pyarrow_bound(payloads) {
         Ok(data) => Ok(vec![validated_blob_payload(data, None)?]),
@@ -108,9 +111,9 @@ fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>>
             }
 
             let chunked_data_type = DataType::from_pyarrow_bound(&payloads.getattr("type")?)?;
-            if !matches!(chunked_data_type, DataType::Binary | DataType::LargeBinary) {
+            if !chunked_data_type.is_binary() {
                 return Err(PyValueError::new_err(format!(
-                    "Packed blob payloads must have Arrow type Binary or LargeBinary, got {chunked_data_type}"
+                    "Packed blob payloads must have a Binary Arrow type, got {chunked_data_type}"
                 )));
             }
 
@@ -129,9 +132,9 @@ fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResu
     let context = chunk_index
         .map(|index| format!("Packed blob payload chunk {index}"))
         .unwrap_or_else(|| "Packed blob payload array".to_string());
-    if !matches!(data.data_type(), DataType::Binary | DataType::LargeBinary) {
+    if !data.data_type().is_binary() {
         return Err(PyValueError::new_err(format!(
-            "{context} must have Arrow type Binary or LargeBinary, got {}",
+            "{context} must have a Binary Arrow type, got {}",
             data.data_type()
         )));
     }
@@ -147,20 +150,14 @@ fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResu
     Ok(make_array(data))
 }
 
-/// Stream one Arrow binary array into the core writer as zero-copy row slices.
-///
-/// Null rows become `None` so the core writer records null descriptors, keeping
-/// its output row-aligned with the input.
-async fn write_binary_payloads<O: OffsetSizeTrait>(
-    writer: &mut PackedBlobWriter,
-    payloads: &GenericBinaryArray<O>,
-) -> PyResult<()> {
-    writer
-        .write_packed_blobs(
-            (0..payloads.len()).map(|row| payloads.is_valid(row).then(|| payloads.value(row))),
-        )
-        .await
-        .infer_error()
+async fn write_binary_payloads(writer: &mut PackedBlobWriter, payloads: &ArrayRef) -> PyResult<()> {
+    let iter = iter_binary_array(payloads.as_ref()).map_err(|error| {
+        PyValueError::new_err(format!(
+            "Packed blob payloads must have a Binary Arrow type, got {}: {error}",
+            payloads.data_type()
+        ))
+    })?;
+    writer.write_packed_blobs(iter).await.infer_error()
 }
 
 #[pyclass(name = "BlobDescriptor", skip_from_py_object)]
@@ -238,6 +235,40 @@ impl PyBlobDescriptorArrayBuilder {
     pub fn append_dedicated(&mut self, blob_id: u32, size: u64) -> PyResult<()> {
         self.inner_mut()?
             .push_dedicated(blob_id, size)
+            .infer_error()
+    }
+
+    /// Append a reference to an existing immutable, table-managed blob object.
+    ///
+    /// ``uri`` is relative to the destination table's base, or to the registered
+    /// ``base_id`` when supplied. ``offset`` and ``size`` select an exact byte
+    /// range; a zero size means an empty value. This does not upload bytes or
+    /// commit a reference. Keep the source snapshot protected until the new
+    /// reference commits, and use Managed-aware clients for table maintenance.
+    /// References shared across independent tables are not supported.
+    ///
+    /// Examples
+    /// --------
+    /// >>> builder = BlobDescriptorArrayBuilder("blob")
+    /// >>> builder.append_managed("_blobs/existing.blob", 0, 100)
+    /// >>> builder.append_managed("_blobs/existing.blob", 0, 100)
+    /// >>> len(builder.finish())
+    /// 2
+    #[pyo3(signature = (uri, offset, size, *, base_id=None))]
+    pub fn append_managed(
+        &mut self,
+        uri: String,
+        offset: u64,
+        size: u64,
+        base_id: Option<u32>,
+    ) -> PyResult<()> {
+        self.inner_mut()?
+            .push(BlobDescriptor::Managed {
+                base_id,
+                uri,
+                offset,
+                size,
+            })
             .infer_error()
     }
 
@@ -348,7 +379,9 @@ impl PyPackedBlobWriter {
     ///
     /// Parameters
     /// ----------
-    /// payloads : pyarrow.BinaryArray, pyarrow.LargeBinaryArray, or pyarrow.ChunkedArray
+    /// payloads : pyarrow.BinaryArray, pyarrow.LargeBinaryArray,
+    ///     pyarrow.BinaryViewArray, pyarrow.FixedSizeBinaryArray, or
+    ///     pyarrow.ChunkedArray
     ///     A binary Arrow array. Every chunk of a chunked array must be binary.
     ///     Each input row produces one descriptor row, in order, across chunks
     ///     and repeated calls. Null rows produce null descriptors; empty but
@@ -368,19 +401,7 @@ impl PyPackedBlobWriter {
             let writer = self.inner_mut()?;
             rt().block_on(None, async {
                 for payloads in payloads {
-                    match payloads.data_type() {
-                        DataType::Binary => {
-                            write_binary_payloads(writer, payloads.as_binary::<i32>()).await?
-                        }
-                        DataType::LargeBinary => {
-                            write_binary_payloads(writer, payloads.as_binary::<i64>()).await?
-                        }
-                        data_type => {
-                            return Err(PyValueError::new_err(format!(
-                                "Packed blob payloads must have Arrow type Binary or LargeBinary, got {data_type}"
-                            )));
-                        }
-                    }
+                    write_binary_payloads(writer, &payloads).await?;
                 }
                 Ok(())
             })
@@ -443,6 +464,117 @@ impl PyPackedBlobWriter {
         let array = array.to_data().to_pyarrow(py)?;
         self.field = Some(field);
         Ok(array)
+    }
+}
+
+/// Upload immutable payloads and prepare references reusable across data files.
+///
+/// Create through ``LanceFileSession.open_managed_blob_writer``. This writer
+/// completes the object upload; use a descriptor builder and a dataset write to
+/// publish the references. Maintenance clients must support Managed Blobs.
+#[pyclass(name = "ManagedBlobWriter", skip_from_py_object)]
+pub struct PyManagedBlobWriter {
+    inner: Mutex<Option<ManagedBlobWriter>>,
+}
+
+impl PyManagedBlobWriter {
+    pub(crate) async fn try_new(
+        object_store: Arc<lance_io::object_store::ObjectStore>,
+        base_path: object_store::path::Path,
+        base_id: Option<u32>,
+    ) -> PyResult<Self> {
+        let inner = ManagedBlobWriter::try_new(object_store.as_ref().clone(), base_path, base_id)
+            .await
+            .infer_error()?;
+        Ok(Self {
+            inner: Mutex::new(Some(inner)),
+        })
+    }
+}
+
+#[pymethods]
+impl PyManagedBlobWriter {
+    /// Object path in the writer's object store, available until finish.
+    #[getter]
+    pub fn path(&self) -> PyResult<String> {
+        with_writer(&self.inner, "ManagedBlobWriter", |writer| {
+            writer.path().to_string()
+        })
+    }
+
+    /// Append one payload. Reuse its completed descriptor to share it across rows.
+    pub fn write_blob(&mut self, data: Cow<'_, [u8]>) -> PyResult<()> {
+        let writer = writer_mut(&mut self.inner, "ManagedBlobWriter")?;
+        rt().block_on(None, writer.write_blob(data.as_ref()))?
+            .infer_error()
+    }
+
+    /// Append a binary Arrow array or ChunkedArray, preserving null and empty rows.
+    ///
+    /// A failed or interrupted upload cannot be reused. Each input row has one
+    /// descriptor in the result of ``finish`` or ``finish_column``.
+    pub fn write_blobs(&mut self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
+        let payloads = extract_blob_payloads(payloads)?;
+        let result = {
+            let writer = writer_mut(&mut self.inner, "ManagedBlobWriter")?;
+            rt().block_on(None, async {
+                for payload in payloads {
+                    let values = iter_binary_array(payload.as_ref())
+                        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                    writer.write_blobs(values).await.infer_error()?;
+                }
+                Ok(())
+            })
+        };
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                take_writer(&mut self.inner, "ManagedBlobWriter")?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Complete the upload and return reusable Managed or null descriptors.
+    pub fn finish(&mut self) -> PyResult<Vec<PyBlobDescriptor>> {
+        let writer = take_writer(&mut self.inner, "ManagedBlobWriter")?;
+        let values = rt().block_on(None, writer.finish())?.infer_error()?;
+        Ok(values.into_iter().map(Into::into).collect())
+    }
+
+    /// Complete the upload and return a prepared field and Arrow array.
+    ///
+    /// The returned pair is ``(field, array)``. The field carries the Blob
+    /// extension metadata and ``field_name``; the array has one row per input
+    /// payload, including nulls. Use ``finish`` and a descriptor builder when
+    /// multiple rows should share one payload.
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile
+    /// >>> import pyarrow as pa
+    /// >>> from lance.file import LanceFileSession
+    /// >>> with tempfile.TemporaryDirectory() as uri:
+    /// ...     writer = LanceFileSession(uri).open_managed_blob_writer()
+    /// ...     writer.write_blobs(pa.array([b"value", None]))
+    /// ...     field, values = writer.finish_column("blob")
+    /// ...     table = pa.Table.from_arrays([values], schema=pa.schema([field]))
+    /// ...     table.num_rows
+    /// 2
+    pub fn finish_column<'py>(
+        &mut self,
+        py: pyo3::Python<'py>,
+        field_name: String,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let writer = take_writer(&mut self.inner, "ManagedBlobWriter")?;
+        let values = rt().block_on(None, writer.finish())?.infer_error()?;
+        let mut builder = BlobDescriptorArrayBuilder::new(field_name);
+        builder.extend(values).infer_error()?;
+        let (field, array) = builder.finish().infer_error()?.into_parts();
+        Ok((
+            descriptor_field_to_pyarrow(&field, py)?,
+            array.to_data().to_pyarrow(py)?,
+        ))
     }
 }
 

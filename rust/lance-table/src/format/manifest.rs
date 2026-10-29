@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::{
     encoding::populate_schema_dictionaries, reader::FileReader as V1FileReader,
 };
@@ -17,7 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
+use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
+use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -75,6 +77,10 @@ pub struct Manifest {
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
 
+    /// The highest field ID allocated since non-reusable field identity was activated.
+    /// `None` means the dataset still uses the legacy live-reference allocator.
+    pub max_allocated_field_id: Option<i32>,
+
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
 
@@ -103,6 +109,17 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Immutable clustering definitions referenced by fragment and index
+    /// segment `clustering_id`. Every referenced definition stays in the
+    /// manifest: a definition is removed only while nothing references it, and
+    /// is never redefined in place.
+    pub clustering: Vec<ClusteringDefinition>,
+
+    /// Highest clustering ID ever allocated in this lineage; zero before the
+    /// first. Allocation takes `max_clustering_id + 1` and the value never
+    /// decreases, including after definition removal or restore.
+    pub max_clustering_id: u32,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -169,6 +186,11 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Whether this table requires independently addressed Managed Blob support.
+    pub fn has_managed_blobs(&self) -> bool {
+        self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
@@ -187,9 +209,10 @@ impl Manifest {
             index_section: None,
             timestamp_nanos: 0,
             tag: None,
-            reader_feature_flags: 0,
-            writer_feature_flags: 0,
+            reader_feature_flags: 0, // These will be set on commit
+            writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: None,
+            max_allocated_field_id: None,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -198,6 +221,8 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            clustering: Vec::new(),
+            max_clustering_id: 0,
         }
     }
 
@@ -218,9 +243,10 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            reader_feature_flags: previous.reader_feature_flags & STICKY_READER_FLAGS,
+            writer_feature_flags: previous.writer_feature_flags & STICKY_WRITER_FLAGS,
             max_fragment_id: previous.max_fragment_id,
+            max_allocated_field_id: previous.max_allocated_field_id,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -229,6 +255,8 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            clustering: previous.clustering.clone(),
+            max_clustering_id: previous.max_clustering_id,
         }
     }
 
@@ -275,9 +303,24 @@ impl Manifest {
             index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            // Not derivable from the manifest, so it would be lost like any other
+            // zeroed word: a clone of a table with covering indexes would come
+            // back unfenced, and since the clone copies the index metadata
+            // wholesale -- `covering_fields` included -- a build that predates
+            // covering could then open it and read carried columns as keyed ones.
+            // Kept unconditionally rather than derived from the cloned indexes:
+            // over-fencing a clone is harmless, under-fencing one is not.
+            // Sticky capabilities are also retained because the clone keeps the
+            // source file identities that require them. So are stable row ids:
+            // they are otherwise derived from the fragments, so a clone of a table
+            // whose rows were all deleted would lose them and stop assigning ids
+            // from `next_row_id`.
+            reader_feature_flags: self.reader_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
+            writer_feature_flags: self.writer_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
             max_fragment_id: self.max_fragment_id,
+            max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
@@ -291,6 +334,10 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            // The clone keeps the source fragments and segments, so it keeps
+            // the definitions they reference and the allocation high-water mark.
+            clustering: self.clustering.clone(),
+            max_clustering_id: self.max_clustering_id,
         }
     }
 
@@ -375,6 +422,36 @@ impl Manifest {
         }
     }
 
+    /// Copy inline row ids out of the manifest buffer they were decoded from
+    /// when they are a small share of it.
+    ///
+    /// Inline row ids decoded from a `Bytes` buffer are slices of that buffer
+    /// (see [`InlineRowIds`]), and a slice keeps the whole allocation alive.
+    /// That is the right trade when the row ids are most of the manifest, as
+    /// they are for a compacted stable-row-id table, but a manifest whose row
+    /// ids are a few percent of its bytes would pin the rest for nothing.
+    /// `buffer_len` is the size of the decoded buffer.
+    pub fn detach_sparse_inline_row_ids(&mut self, buffer_len: usize) {
+        let inline_bytes: usize = self
+            .fragments
+            .iter()
+            .filter_map(|fragment| match &fragment.row_id_meta {
+                Some(RowIdMeta::Inline(data)) => Some(data.len()),
+                _ => None,
+            })
+            .sum();
+        // Keep the slices while the row ids are at least a quarter of the buffer.
+        if inline_bytes == 0 || inline_bytes.saturating_mul(4) >= buffer_len {
+            return;
+        }
+        for fragment in Arc::make_mut(&mut self.fragments) {
+            if let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta {
+                let copied = InlineRowIds::from(Bytes::copy_from_slice(data));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(copied));
+            }
+        }
+    }
+
     /// Check the current fragment list and update the high water mark
     pub fn update_max_fragment_id(&mut self) {
         // If there are no fragments, don't update max_fragment_id
@@ -420,20 +497,50 @@ impl Manifest {
         }
     }
 
-    /// Get the max used field id
+    /// Get the highest field ID that may not be allocated again.
     ///
     /// This is different than [Schema::max_field_id] because it also considers
-    /// the field ids in the data files that have been dropped from the schema.
+    /// the field ids in the data files that have been dropped from the schema,
+    /// including overlay files referenced by fragments.
     pub fn max_field_id(&self) -> i32 {
+        self.max_allocated_field_id
+            .unwrap_or_else(|| self.max_referenced_field_id())
+    }
+
+    pub(crate) fn max_referenced_field_id(&self) -> i32 {
         let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
         let fragment_max_id = self
             .fragments
             .iter()
-            .flat_map(|f| f.files.iter().flat_map(|file| file.fields.iter()))
+            .flat_map(|fragment| {
+                fragment
+                    .referenced_lance_files()
+                    .flat_map(|file| file.fields.iter())
+            })
+            .copied()
             .max()
-            .copied();
-        let fragment_max_id = fragment_max_id.unwrap_or(-1);
+            .unwrap_or(-1);
         schema_max_id.max(fragment_max_id)
+    }
+
+    /// Whether the non-reusable-field-ID allocation contract is active.
+    pub fn uses_non_reusable_field_ids(&self) -> bool {
+        self.max_allocated_field_id.is_some()
+    }
+
+    /// Activate non-reusable field IDs at the maximum ID visible in this snapshot.
+    pub fn activate_non_reusable_field_ids(&mut self) {
+        if self.max_allocated_field_id.is_none() {
+            self.max_allocated_field_id = Some(self.max_referenced_field_id());
+        }
+    }
+
+    /// Advance the persistent field-ID high-water mark to cover this manifest.
+    pub fn update_max_field_id(&mut self) {
+        let max_referenced_field_id = self.max_referenced_field_id();
+        if let Some(max_allocated_field_id) = &mut self.max_allocated_field_id {
+            *max_allocated_field_id = (*max_allocated_field_id).max(max_referenced_field_id);
+        }
     }
 
     /// Return the fragments that are newer than the given manifest.
@@ -501,10 +608,6 @@ impl Manifest {
     pub fn serialized(&self) -> Vec<u8> {
         let pb_manifest: pb::Manifest = self.into();
         pb_manifest.encode_to_vec()
-    }
-
-    pub fn should_use_legacy_format(&self) -> bool {
-        self.data_storage_format.version == ConcreteFileVersion::V1
     }
 
     /// Get the summary information of a manifest.
@@ -598,6 +701,25 @@ pub struct BasePath {
 }
 
 impl BasePath {
+    /// Choose an unused exact base ID without reserving zero or overflowing at
+    /// `u32::MAX`. The caller must publish the binding with its references and
+    /// reject a concurrent attempt to bind the chosen ID to another location.
+    pub fn unused_id(bases: impl IntoIterator<Item = u32>) -> Result<u32> {
+        let mut ids = bases.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut candidate = 0u32;
+        for id in ids {
+            if id != candidate {
+                break;
+            }
+            candidate = candidate
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("All u32 base IDs are already registered"))?;
+        }
+        Ok(candidate)
+    }
+
     /// Create a new BasePath
     ///
     /// # Arguments
@@ -659,16 +781,11 @@ impl DataStorageFormat {
     pub fn lance_file_format(&self) -> ConcreteFileVersion {
         self.version
     }
-
-    // Retained until all selector-based execution APIs migrate to exact versions.
-    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
-        Ok(self.version.into())
-    }
 }
 
 impl Default for DataStorageFormat {
     fn default() -> Self {
-        Self::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
+        Self::new(stable_file_version())
     }
 }
 
@@ -681,6 +798,63 @@ impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
             version: ConcreteFileVersion::from_manifest_string(&pb.version)?,
         })
     }
+}
+
+/// Options controlling how a new [`Manifest`] is assembled from a transaction.
+///
+/// The timestamp arrives already resolved to nanoseconds since the Unix epoch.
+/// Callers own the clock so that a caller wanting a mockable one keeps it: the
+/// `lance` crate mocks `SystemTime` under `cfg(test)`, which only takes effect in
+/// that crate.
+#[derive(Debug, Clone)]
+pub struct ManifestBuildConfig {
+    /// Recompute the manifest's feature flags from the fragments and settings
+    /// below. False leaves whatever flags the previous manifest carried.
+    pub auto_set_feature_flags: bool,
+    /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
+    pub timestamp_nanos: u128,
+    /// Request the stable row id feature. The flag is also inherited from the
+    /// previous manifest, so false does not turn it off for a dataset that has it.
+    pub use_stable_row_ids: bool,
+    /// Overwrite only: force the legacy (true) or v2 (false) file format. `None`
+    /// keeps the format the dataset already had.
+    pub use_legacy_format: Option<bool>,
+    /// Overwrite only: force this storage format, taking precedence over
+    /// `use_legacy_format`. `None` keeps the format the dataset already had.
+    pub storage_format: Option<DataStorageFormat>,
+    /// Skip writing a detached transaction file for this commit.
+    pub disable_transaction_file: bool,
+    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
+    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
+    /// sets `manifest.next_row_id` to the provided value before activating the flag.
+    pub migration_next_row_id: Option<u64>,
+    /// Whether this commit atomically activates non-reusable field IDs.
+    pub activate_non_reusable_field_ids: bool,
+    /// For an `UpdateConfig` commit only: the COMPLETE list of clustering
+    /// definitions the writer wants the next manifest to hold, built from the
+    /// manifest it read. A current definition the list keeps must be unchanged
+    /// (matched by id, content identical, order not significant); one it omits
+    /// is removed, which is allowed only while no fragment or index segment in
+    /// the landing snapshot references it; new ids continue `max_clustering_id`
+    /// in order, and the mark never moves backwards. `None` leaves the
+    /// definitions alone. This is a commit-time input, not part of the
+    /// transaction: the transaction file stays a plain `UpdateConfig` and the
+    /// manifest is the durable record of the definitions. Applied against the
+    /// manifest the commit actually lands on, so a list built from a stale
+    /// snapshot (a changed current definition, an omitted definition the writer
+    /// never read, or a new id that no longer continues the mark) is a
+    /// non-retryable commit conflict: the writer reloads and rebuilds the list.
+    /// A list identical to the current one is a no-op. Allocating a definition
+    /// on a table with reusable field ids activates non-reusable field ids in
+    /// the same commit, since definitions key on field ids.
+    pub clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    /// Row lineage sequences of the current manifest's fragments that live
+    /// outside the manifest, read ahead of the build. An update that rewrites
+    /// rows needs the existing row ids and created-at versions to carry each
+    /// row's lineage over, and a partial column rewrite needs the existing
+    /// last-updated-at versions; the build cannot read a data file itself. Only
+    /// consulted for fragments whose sequences are spilled.
+    pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -935,7 +1109,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 } else {
                     // No fragments to inspect, best we can do is look at writer flags
                     if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                        DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
+                        DataStorageFormat::new(stable_file_version())
                     } else {
                         DataStorageFormat::new(ConcreteFileVersion::V1)
                     }
@@ -958,13 +1132,17 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            max_allocated_field_id: p.max_allocated_field_id,
             fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
             } else {
                 Some(p.transaction_file)
             },
-            transaction_section: p.transaction_section.map(|i| i as usize),
+            transaction_section: p
+                .transaction_section
+                .or(p.transaction_section_deprecated)
+                .map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -975,6 +1153,12 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            clustering: p
+                .clustering
+                .into_iter()
+                .map(ClusteringDefinition::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            max_clustering_id: p.max_clustering_id,
         })
     }
 }
@@ -1002,6 +1186,8 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             version: m.version,
             branch: m.branch.clone(),
+            clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
+            max_clustering_id: m.max_clustering_id,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1012,6 +1198,7 @@ impl From<&Manifest> for pb::Manifest {
                     build_metadata: wv.build_metadata.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragment_tree: None,
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -1020,6 +1207,7 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
+            max_allocated_field_id: m.max_allocated_field_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
@@ -1042,6 +1230,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            transaction_section_deprecated: None,
         }
     }
 }
@@ -1106,23 +1295,190 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
-    use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
+    use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
     use std::num::NonZero;
+    use uuid::Uuid;
 
     use super::*;
 
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+    use roaring::RoaringBitmap;
+
+    #[test]
+    fn clustering_proto_retains_definitions_references_and_generic_metadata() {
+        let metadata = HashMap::from([
+            ("org.example.cluster.bucket".into(), "[0, 100)".into()),
+            (
+                "org.example.unknown".into(),
+                "  opaque value: 東京  ".into(),
+            ),
+            ("org.example.empty".into(), String::new()),
+        ]);
+        // The persisted messages and the runtime structs both carry the fields;
+        // the writer flag stays unsupported until maintenance rules are complete.
+        let manifest = pb::Manifest {
+            writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
+            max_clustering_id: 7,
+            clustering: vec![
+                pb::Clustering {
+                    id: 1,
+                    columns: vec![0, 1],
+                    provider: "org.example.cluster".into(),
+                    version: 8,
+                },
+                pb::Clustering {
+                    id: 5,
+                    columns: vec![1],
+                    provider: "org.example.other".into(),
+                    version: 9,
+                },
+            ],
+            table_metadata: HashMap::from([
+                (
+                    "org.example.cluster.1.boundaries".into(),
+                    "[0, 100, 200]".into(),
+                ),
+                (
+                    "org.example.cluster.1.unknown_option".into(),
+                    "  opaque value: 東京  ".into(),
+                ),
+            ]),
+            fragments: vec![
+                pb::DataFragment {
+                    id: 1,
+                    clustering_id: Some(1),
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                },
+                pb::DataFragment {
+                    id: 2,
+                    clustering_id: Some(5),
+                    ..Default::default()
+                },
+                pb::DataFragment {
+                    id: 3,
+                    clustering_id: None,
+                    metadata: metadata.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::Manifest::decode(manifest.encode_to_vec().as_slice()).unwrap(),
+            manifest
+        );
+        assert_eq!(manifest.reader_feature_flags, 0);
+        let segments = pb::IndexSection {
+            indices: vec![pb::IndexMetadata {
+                uuid: Some((&Uuid::new_v4()).into()),
+                name: "vectors".into(),
+                fields: vec![1],
+                clustering_id: Some(5),
+                metadata: metadata.clone(),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            pb::IndexSection::decode(segments.encode_to_vec().as_slice()).unwrap(),
+            segments
+        );
+        assert_eq!(manifest.clustering.len(), 2);
+        assert_eq!(manifest.max_clustering_id, 7);
+        assert_eq!(manifest.fragments[2].clustering_id, None);
+
+        // Runtime round trip: decode into the structs and encode back.
+        let runtime = Manifest::try_from(manifest.clone()).unwrap();
+        assert_eq!(runtime.max_clustering_id, 7);
+        assert_eq!(
+            runtime.clustering,
+            vec![
+                ClusteringDefinition {
+                    id: 1,
+                    columns: vec![0, 1],
+                    provider: "org.example.cluster".into(),
+                    version: 8,
+                },
+                ClusteringDefinition {
+                    id: 5,
+                    columns: vec![1],
+                    provider: "org.example.other".into(),
+                    version: 9,
+                },
+            ]
+        );
+        assert_eq!(runtime.fragments[0].clustering_id, Some(1));
+        assert_eq!(runtime.fragments[0].metadata, metadata);
+        assert_eq!(runtime.fragments[1].clustering_id, Some(5));
+        assert!(runtime.fragments[1].metadata.is_empty());
+        assert_eq!(runtime.fragments[2].clustering_id, None);
+        assert_eq!(runtime.fragments[2].metadata, metadata);
+        let encoded = pb::Manifest::from(&runtime);
+        assert_eq!(encoded.clustering, manifest.clustering);
+        assert_eq!(encoded.max_clustering_id, manifest.max_clustering_id);
+        for (encoded, original) in encoded.fragments.iter().zip(manifest.fragments.iter()) {
+            assert_eq!(encoded.clustering_id, original.clustering_id);
+            assert_eq!(encoded.metadata, original.metadata);
+        }
+        let segment = IndexMetadata::try_from(segments.indices[0].clone()).unwrap();
+        assert_eq!(segment.clustering_id, Some(5));
+        assert_eq!(segment.metadata, metadata);
+        let encoded = pb::IndexMetadata::from(&segment);
+        assert_eq!(encoded.clustering_id, Some(5));
+        assert_eq!(encoded.metadata, metadata);
+        let allocation_only = pb::Manifest {
+            writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
+            max_clustering_id: manifest.max_clustering_id,
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::Manifest::decode(allocation_only.encode_to_vec().as_slice()).unwrap(),
+            allocation_only
+        );
+        // Proto presence distinguishes an absent reference from an invalid zero.
+        let zero = pb::DataFragment {
+            clustering_id: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            pb::DataFragment::decode(zero.encode_to_vec().as_slice())
+                .unwrap()
+                .clustering_id,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn new_from_previous_keeps_clustering_definitions_and_high_water_mark() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut previous = Manifest::new(
+            Schema::try_from(&schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        previous.clustering = vec![ClusteringDefinition {
+            id: 2,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        }];
+        previous.max_clustering_id = 4;
+
+        let next =
+            Manifest::new_from_previous(&previous, previous.schema.clone(), Arc::new(vec![]));
+        assert_eq!(next.clustering, previous.clustering);
+        assert_eq!(next.max_clustering_id, 4);
+    }
 
     /// A shallow clone points every local file at the parent through `base_id`.
     /// An overlay's data file lives in the parent too, so it needs the same
     /// stamp; without it the clone looks for the overlay under its own root.
     #[test]
     fn shallow_clone_stamps_base_id_on_overlay_files() {
-        use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
-        use roaring::RoaringBitmap;
-
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "a",
             arrow_schema::DataType::Int64,
@@ -1179,7 +1535,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             recovered_stable.data_storage_format.lance_file_format(),
-            ConcreteFileVersion::from(LanceFileVersion::Stable)
+            stable_file_version()
         );
     }
 
@@ -1253,6 +1609,41 @@ mod tests {
                 .to_string()
                 .contains("All data files must have the same version")
         );
+    }
+
+    #[test]
+    fn test_detach_sparse_inline_row_ids_copies_only_small_shares() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]);
+        // Two 10 byte row id sequences sliced out of one buffer.
+        let buffer = Bytes::from(vec![7u8; 64]);
+        let fragments = [0..10, 20..30].into_iter().enumerate().map(|(id, range)| {
+            let mut fragment = Fragment::new(id as u64);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(InlineRowIds::from(buffer.slice(range))));
+            fragment
+        });
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(fragments.collect()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let ptr = |manifest: &Manifest, i: usize| match &manifest.fragments[i].row_id_meta {
+            Some(RowIdMeta::Inline(data)) => data.bytes().as_ptr(),
+            _ => unreachable!(),
+        };
+        let in_buffer = |p: *const u8| buffer.as_ptr_range().contains(&p);
+
+        // 20 of 80 bytes is a quarter: the slices stay.
+        manifest.detach_sparse_inline_row_ids(80);
+        assert!(in_buffer(ptr(&manifest, 0)) && in_buffer(ptr(&manifest, 1)));
+
+        // 20 of 81 bytes is below a quarter: copied out, contents intact.
+        manifest.detach_sparse_inline_row_ids(81);
+        assert!(!in_buffer(ptr(&manifest, 0)) && !in_buffer(ptr(&manifest, 1)));
+        let Some(RowIdMeta::Inline(copied)) = &manifest.fragments[1].row_id_meta else {
+            unreachable!()
+        };
+        assert_eq!(&**copied, &buffer[20..30]);
     }
 
     #[test]
@@ -1509,6 +1900,8 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -1522,6 +1915,8 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -1533,6 +1928,143 @@ mod tests {
         );
 
         assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn test_max_field_id_includes_overlay_files() {
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let schema = Schema {
+            fields: vec![field0],
+            metadata: Default::default(),
+        };
+
+        let mut fragment = Fragment {
+            id: 0,
+            files: vec![DataFile::new_legacy_from_fields("path1", vec![0], None)],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: None,
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![43], None),
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0_u32]))),
+            committed_version: 1,
+        }];
+
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn non_reusable_field_id_high_water_mark_survives_dropped_references_and_round_trip() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", arrow_schema::DataType::Int64, false),
+            ArrowField::new("b", arrow_schema::DataType::Int64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut fragment = Fragment::new(0);
+        fragment.files.push(DataFile::new(
+            "ab.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.activate_non_reusable_field_ids();
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+        assert_eq!(manifest.max_allocated_field_id, Some(1));
+
+        manifest.schema.fields.pop();
+        let file = &mut Arc::make_mut(&mut manifest.fragments)[0].files[0];
+        Arc::make_mut(&mut file.fields)[1] = TOMBSTONE_FIELD_ID;
+        manifest.update_max_field_id();
+
+        assert_eq!(manifest.max_referenced_field_id(), 0);
+        assert_eq!(manifest.max_field_id(), 1);
+
+        let encoded = manifest.serialized();
+        let mut recovered =
+            Manifest::try_from(pb::Manifest::decode(encoded.as_slice()).unwrap()).unwrap();
+        assert_eq!(recovered.max_allocated_field_id, Some(1));
+        assert_eq!(recovered.max_field_id(), 1);
+        assert_eq!(
+            recovered.fragments[0].files[0].fields.as_ref(),
+            &[0, TOMBSTONE_FIELD_ID]
+        );
+        assert_eq!(
+            recovered.fragments[0].files[0].column_indices.as_ref(),
+            &[0, 1]
+        );
+        assert_eq!(
+            recovered.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_ne!(
+            recovered.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
+            0
+        );
+
+        recovered.schema.fields.push(
+            Field::try_from(ArrowField::new("c", arrow_schema::DataType::Int64, false)).unwrap(),
+        );
+        let max_field_id = recovered.max_field_id();
+        recovered
+            .schema
+            .try_set_field_id(Some(max_field_id))
+            .unwrap();
+        assert_eq!(recovered.schema.field("c").unwrap().id, 2);
+        recovered.update_max_field_id();
+        assert_eq!(recovered.max_allocated_field_id, Some(2));
+    }
+
+    #[test]
+    fn shallow_clone_preserves_non_reusable_field_id_allocation_state() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.max_allocated_field_id = Some(41);
+        manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
+
+        assert_eq!(cloned.max_allocated_field_id, Some(41));
+        assert_eq!(cloned.reader_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
+        assert_ne!(cloned.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
     }
 
     #[test]
@@ -1565,6 +2097,36 @@ mod tests {
         config.remove("other-key");
         manifest.config_mut().remove("other-key");
         assert_eq!(manifest.config, config);
+    }
+
+    #[rstest::rstest]
+    #[case::only_current(Some(22), None, Some(22))]
+    #[case::only_deprecated(None, Some(21), Some(21))]
+    #[case::current_wins_over_deprecated(Some(22), Some(21), Some(22))]
+    #[case::neither(None, None, None)]
+    fn test_transaction_section_field_precedence(
+        #[case] current: Option<u64>,
+        #[case] deprecated: Option<u64>,
+        #[case] expected: Option<usize>,
+    ) {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int64, false)]);
+        let manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let mut pb_manifest = pb::Manifest::from(&manifest);
+        pb_manifest.transaction_section = current;
+        pb_manifest.transaction_section_deprecated = deprecated;
+
+        let manifest = Manifest::try_from(pb_manifest).unwrap();
+        assert_eq!(manifest.transaction_section, expected);
+
+        // Whatever was read, only the current field is ever written back.
+        let pb_manifest = pb::Manifest::from(&manifest);
+        assert_eq!(pb_manifest.transaction_section, expected.map(|p| p as u64));
+        assert_eq!(pb_manifest.transaction_section_deprecated, None);
     }
 
     #[test]
@@ -1643,7 +2205,7 @@ mod tests {
                 "data_with_deletion.lance",
                 vec![0, 1],
                 vec![0, 1],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                stable_file_version(),
                 NonZero::new(1000),
             )
             .with_physical_rows(50);

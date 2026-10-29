@@ -1,0 +1,30 @@
+name: Protobuf lint
+on:
+  push:
+    branches:
+      - main
+      - release/**
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - "**/*.proto"
+      - ci/check_proto_comments.py
+      - .github/workflows/proto-lint.yml
+permissions:
+  contents: read
+
+jobs:
+  comment-style:
+    name: Multi-line comment style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Check .proto comment style
+        run: python ci/check_proto_comments.py

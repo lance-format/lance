@@ -22,69 +22,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           fail_on_error: true
-  format-vote-reminder:
-    permissions:
-      pull-requests: write
-    name: Remind about format spec vote
-    runs-on: ubuntu-latest
-    # Comments on PRs that touch the Lance format specification (*.proto files
-    # and docs/src/format/**) to remind the author that substantive format
-    # changes require a PMC vote. Re-checks the full PR diff on every push, so a
-    # format change introduced by a later commit is still caught; a hidden
-    # marker keeps it to at most one comment.
-    steps:
-      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const prNumber = context.payload.pull_request.number;
-            const MARKER = '<!-- format-change-vote-reminder -->';
-
-            // The Lance format specification is the proto definitions plus the
-            // spec docs. Changes to either require a PMC vote.
-            const isFormatFile = (path) =>
-              path.endsWith('.proto') || path.startsWith('docs/src/format/');
-
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner, repo, pull_number: prNumber, per_page: 100,
-            });
-            const formatFiles = files.map((f) => f.filename).filter(isFormatFile);
-            if (formatFiles.length === 0) {
-              core.info('No format specification files changed; nothing to do.');
-              return;
-            }
-
-            // Best effort to comment only once: skip if our marker is present.
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number: prNumber, per_page: 100,
-            });
-            if (comments.some((c) => c.body && c.body.includes(MARKER))) {
-              core.info('Reminder already posted; skipping.');
-              return;
-            }
-
-            const body = [
-              MARKER,
-              '> [!IMPORTANT]',
-              '> **This PR touches the Lance format specification.**',
-              '>',
-              '> Substantive changes to the format specification — the `.proto` definitions',
-              '> and the spec docs under `docs/src/format/` — require a PMC vote before merge.',
-              '> Minor edits such as typo fixes, wording, or formatting are excluded; use your',
-              '> judgment.',
-              '>',
-              '> If this is a meaningful format change:',
-              '> - Start a vote following the [Lance community voting process](https://lance.org/community/voting/).',
-              '>   Format specification modifications need **3 binding +1 votes** (excluding the',
-              '>   proposer), held on GitHub Discussions, with a minimum voting period of **1 week**.',
-              '> - Once the vote passes, **link the completed vote in this PR**. It should not be',
-              '>   merged until the vote is linked.',
-            ].join('\n');
-
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: prNumber, body,
-            });
-            core.info(`Posted format vote reminder (changed: ${formatFiles.join(', ')}).`);
   commitlint:
     permissions:
       pull-requests: write
