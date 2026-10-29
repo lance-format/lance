@@ -25,7 +25,7 @@ use crate::EncodingsIo;
 use crate::compression::DecompressionStrategy;
 use crate::data::{concat_decoded_arrays, dictionary_batch_limit};
 use crate::decoder::{
-    ColumnInfo, DecodePageTask, DecodedArray, FilterExpression, IO_REQUEST_BATCH_BYTES,
+    ColumnInfo, DecodePageTask, DecodedArray, DrainLimit, FilterExpression, IO_REQUEST_BATCH_BYTES,
     LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch, ScheduledScanLine,
     SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
     StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
@@ -999,12 +999,18 @@ impl StructuralPrimitiveFieldDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
-    fn max_dictionary_rows(&self) -> Option<u64> {
-        self.page_decoders
+    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+        let dictionary_rows = self
+            .page_decoders
             .iter()
             .filter_map(|page| page.dictionary_len())
             .filter_map(|len| dictionary_batch_limit(self.field.data_type(), len))
-            .min()
+            .min();
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: 0,
+            dictionary_rows,
+        })
     }
 
     fn accept_page(&mut self, child: LoadedPageShard) -> Result<()> {

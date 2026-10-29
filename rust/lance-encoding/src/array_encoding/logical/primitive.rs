@@ -332,11 +332,6 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 }
 
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
-    fn max_dictionary_rows(&self) -> Option<u64> {
-        let dictionary_len = self.physical_decoder.as_ref()?.dictionary_len()?;
-        dictionary_batch_limit(&self.data_type, dictionary_len)
-    }
-
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {
@@ -383,29 +378,61 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
     }
 
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
-        if num_rows == 0 || !has_i32_offsets(&self.data_type) {
+        if num_rows == 0 {
             return Ok(DrainLimit {
                 rows: num_rows,
                 bytes: 0,
+                dictionary_rows: None,
             });
         }
+
+        let needs_dictionary_limit = matches!(self.data_type, DataType::Dictionary(_, _));
+        let needs_i32_limit = has_i32_offsets(&self.data_type);
+        if !needs_dictionary_limit && !needs_i32_limit {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: None,
+            });
+        }
+
         let Some(physical_decoder) = self.physical_decoder.as_ref() else {
             return Err(lance_core::Error::internal(format!(
                 "max_rows_to_drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited",
                 self.data_type, self.column_index
             )));
         };
-        match physical_decoder.variable_width_bytes(self.rows_drained, num_rows)? {
+
+        let dictionary_rows = if needs_dictionary_limit {
+            physical_decoder
+                .dictionary_len()
+                .and_then(|dictionary_len| dictionary_batch_limit(&self.data_type, dictionary_len))
+        } else {
+            None
+        };
+        let requested_rows = dictionary_rows
+            .map(|dictionary_rows| num_rows.min(dictionary_rows))
+            .unwrap_or(num_rows);
+        if !needs_i32_limit {
+            return Ok(DrainLimit {
+                rows: requested_rows,
+                bytes: 0,
+                dictionary_rows,
+            });
+        }
+
+        match physical_decoder.variable_width_bytes(self.rows_drained, requested_rows)? {
             Some(bytes) if bytes <= byte_budget => Ok(DrainLimit {
-                rows: num_rows,
+                rows: requested_rows,
                 bytes,
+                dictionary_rows,
             }),
             Some(_) => {
                 // Largest prefix of the request that still fits the budget.
                 // `variable_width_bytes` is monotonically non-decreasing in the row
                 // count; zero rows always fit.
                 let mut fits = 0u64;
-                let mut too_big = num_rows;
+                let mut too_big = requested_rows;
                 while fits + 1 < too_big {
                     let mid = fits + (too_big - fits) / 2;
                     let mid_bytes = physical_decoder
@@ -420,17 +447,26 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
                 let bytes = physical_decoder
                     .variable_width_bytes(self.rows_drained, fits)?
                     .unwrap_or(0);
-                Ok(DrainLimit { rows: fits, bytes })
+                Ok(DrainLimit {
+                    rows: fits,
+                    bytes,
+                    dictionary_rows,
+                })
             }
             // The encoding cannot report sizes.  Only accept this page's rows when
             // the batch has accumulated no variable-width bytes yet (the budget is
             // still whole), and charge the entire budget so nothing stacks after
             // them; otherwise contribute nothing so the batch ends before them.
             None if byte_budget >= I32_OFFSET_BYTE_BUDGET => Ok(DrainLimit {
-                rows: num_rows,
+                rows: requested_rows,
                 bytes: byte_budget,
+                dictionary_rows,
             }),
-            None => Ok(DrainLimit { rows: 0, bytes: 0 }),
+            None => Ok(DrainLimit {
+                rows: 0,
+                bytes: 0,
+                dictionary_rows,
+            }),
         }
     }
 
@@ -596,5 +632,94 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         _external_buffers: &mut OutOfLineBuffers,
     ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
         std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::DataType;
+    use lance_core::Result;
+
+    use super::{DataBlock, PrimitiveFieldDecoder};
+    use crate::decoder::{
+        DrainLimit, I32_OFFSET_BYTE_BUDGET, LogicalPageDecoder, PrimitivePageDecoder,
+    };
+
+    #[derive(Debug)]
+    struct PlanningPageDecoder {
+        dictionary_len: Option<u64>,
+        bytes_per_row: u64,
+    }
+
+    impl PrimitivePageDecoder for PlanningPageDecoder {
+        fn dictionary_len(&self) -> Option<u64> {
+            self.dictionary_len
+        }
+
+        fn decode(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<DataBlock> {
+            Ok(DataBlock::Empty())
+        }
+
+        fn variable_width_bytes(&self, _rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+            Ok(Some(num_rows * self.bytes_per_row))
+        }
+    }
+
+    fn dictionary_decoder(value_type: DataType, dictionary_len: u64) -> PrimitiveFieldDecoder {
+        PrimitiveFieldDecoder::new_from_data(
+            Arc::new(PlanningPageDecoder {
+                dictionary_len: Some(dictionary_len),
+                bytes_per_row: 1,
+            }),
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(value_type)),
+            300,
+            false,
+        )
+    }
+
+    #[test]
+    fn test_dictionary_capacity_limits_rows_independently_of_i32_bytes() {
+        let decoder = dictionary_decoder(DataType::Int32, 129);
+        let limit = decoder
+            .max_rows_to_drain(300, I32_OFFSET_BYTE_BUDGET)
+            .unwrap();
+
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 128,
+                bytes: 0,
+                dictionary_rows: Some(128),
+            }
+        );
+    }
+
+    #[test]
+    fn test_dictionary_and_i32_limits_keep_independent_dimensions() {
+        let decoder = dictionary_decoder(DataType::Utf8, 129);
+
+        let limit = decoder.max_rows_to_drain(300, 100).unwrap();
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 100,
+                bytes: 100,
+                dictionary_rows: Some(128),
+            }
+        );
+
+        let limit = decoder
+            .max_rows_to_drain(300, I32_OFFSET_BYTE_BUDGET)
+            .unwrap();
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 128,
+                bytes: 128,
+                dictionary_rows: Some(128),
+            }
+        );
     }
 }
