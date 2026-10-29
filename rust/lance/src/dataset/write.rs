@@ -1037,6 +1037,10 @@ where
                 let batch_chunk_rows =
                     batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
                 num_rows_in_current_file += batch_chunk_rows as u32;
+                // The writer owns the values it needs (either borrowed for an
+                // immediate page or detached into the queue).  Do not keep the
+                // input's parent buffers alive through the file finish below.
+                drop(batch_chunk);
 
                 let reached_planned_file_boundary = if has_file_row_counts {
                     let rows_remaining =

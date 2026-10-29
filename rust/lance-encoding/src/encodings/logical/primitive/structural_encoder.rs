@@ -2051,6 +2051,9 @@ impl PrimitiveStructuralEncoder {
         }
 
         let data_block = DataBlock::from_arrays(&arrays, num_values);
+        // The data block owns the normalized page buffers.  Release any
+        // detached source snapshots before compression allocates its output.
+        drop(arrays);
 
         if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let requested_encoding = encoding_metadata
