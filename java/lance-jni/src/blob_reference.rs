@@ -34,6 +34,7 @@ struct ReaderState {
 
 #[derive(Clone)]
 enum NativeHandle {
+    Dataset(Arc<lance::Dataset>),
     Capture(Arc<Mutex<BlobRefCapture>>),
     Reader(Arc<ReaderState>),
     Stream(Arc<BlobRefReadSession>),
@@ -410,6 +411,21 @@ pub extern "system" fn Java_org_lance_BlobReferences_captureNative(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobReferences_bindDatasetNative<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JObject,
+    source: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        (|| -> Result<_> {
+            let dataset = dataset(&mut env, source)?;
+            attach(&mut env, "DatasetBinding", NativeHandle::Dataset(dataset))
+        })()
+    )
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_BlobReferences_createReaderNative<'a>(
     mut env: JNIEnv<'a>,
     _class: JObject,
@@ -430,7 +446,9 @@ pub extern "system" fn Java_org_lance_BlobReferences_createReaderNative<'a>(
             let mut bindings = Vec::with_capacity(contexts.len());
             for (index, context) in contexts.into_iter().enumerate() {
                 let object = env.get_object_array_element(&datasets, index as jint)?;
-                let dataset = dataset(&mut env, object)?;
+                let NativeHandle::Dataset(dataset) = handle(&mut env, object)? else {
+                    return Err(invalid("Expected a dataset binding handle"));
+                };
                 bindings.push(BlobRefBinding::try_new(context, dataset)?);
             }
             let context =

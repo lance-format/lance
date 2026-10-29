@@ -17,6 +17,7 @@ import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
@@ -219,6 +220,10 @@ public final class BlobReferences {
     }
   }
 
+  private static final class DatasetBinding extends NativeResource {
+    private DatasetBinding() {}
+  }
+
   /** Capture session for one exact snapshot and original top-level Lance field ID. */
   public static final class Capture extends NativeResource {
     private Capture() {}
@@ -298,7 +303,9 @@ public final class BlobReferences {
 
     /**
      * Bind contexts to independently authenticated exact-version worker datasets, in context-table
-     * order. Per-base configuration and credential refresh come from those datasets.
+     * order. Per-base configuration and credential refresh come from those datasets. Each dataset
+     * is cloned independently; closing it after its binding is captured does not invalidate the
+     * reader.
      */
     public static Reader create(
         List<SourceContext> contexts,
@@ -306,17 +313,23 @@ public final class BlobReferences {
         long ioBufferSizeBytes,
         long materializationReadaheadBytes) {
       Preconditions.checkNotNull(datasets);
-      Dataset[] bindings = datasets.toArray(new Dataset[0]);
-      List<LockManager.ReadLock> readLocks = new ArrayList<>(bindings.length);
+      Dataset[] sourceDatasets = datasets.toArray(new Dataset[0]);
+      List<DatasetBinding> bindings = new ArrayList<>(sourceDatasets.length);
       try {
-        for (Dataset dataset : bindings) {
+        for (Dataset dataset : sourceDatasets) {
           Preconditions.checkNotNull(dataset);
-          readLocks.add(dataset.acquireReadLock());
+          // Never hold several lifecycle locks: queued close() calls can block new readers.
+          try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+            bindings.add(bindDatasetNative(dataset));
+          }
         }
         return createReaderNative(
-            encodeContexts(contexts), bindings, ioBufferSizeBytes, materializationReadaheadBytes);
+            encodeContexts(contexts),
+            bindings.toArray(new DatasetBinding[0]),
+            ioBufferSizeBytes,
+            materializationReadaheadBytes);
       } finally {
-        for (int i = readLocks.size() - 1; i >= 0; i--) readLocks.get(i).close();
+        AutoCloseables.closeNoChecked(AutoCloseables.all(bindings));
       }
     }
 
@@ -409,9 +422,11 @@ public final class BlobReferences {
       Capture capture, byte[] scanSource, String column, long array, long schema)
       throws IOException;
 
+  private static native DatasetBinding bindDatasetNative(Dataset dataset);
+
   private static native Reader createReaderNative(
       byte[][] contexts,
-      Dataset[] datasets,
+      DatasetBinding[] datasets,
       long ioBufferSizeBytes,
       long materializationReadaheadBytes);
 

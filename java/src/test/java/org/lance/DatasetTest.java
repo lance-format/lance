@@ -71,6 +71,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -94,6 +97,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
@@ -2370,6 +2374,22 @@ public class DatasetTest {
           IllegalArgumentException.class,
           () -> SnapshotRetention.acquire(original, snapshot, "other"));
       assertThrows(IllegalArgumentException.class, () -> token.release(original));
+      try (Dataset worker =
+          Dataset.open().allocator(allocator).uri(tempDir.resolve("closed").toString()).build()) {
+        assertThrows(
+            NullPointerException.class,
+            () -> Reader.create(List.of(source, source), Arrays.asList(worker, null), 1, 1));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Reader.create(List.of(source, source), List.of(worker, original), 1, 1));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Reader.create(List.of(source), List.of(worker, worker), 1, 1));
+        assertEquals(source.getVersion(), worker.version());
+        try (Reader reader = Reader.create(List.of(source), List.of(worker), 1, 1)) {
+          assertEquals(0, reader.getReservedBytes());
+        }
+      }
     }
   }
 
@@ -2419,6 +2439,77 @@ public class DatasetTest {
           assertTrue(reader.getReservedBytes() >= 2);
         }
         assertEquals(0, reader.getReservedBytes());
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testBlobReaderBindsDatasetsIndependently(boolean reverseOrder, @TempDir Path tempDir)
+      throws Exception {
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset left = createBlobV2SelectorDataset(allocator, tempDir.resolve("left").toString());
+        Dataset right =
+            createBlobV2SelectorDataset(allocator, tempDir.resolve("right").toString())) {
+      Dataset first = reverseOrder ? right : left;
+      Dataset second = reverseOrder ? left : right;
+      SourceContext firstSource = SourceContext.fromDataset(first, "catalog/first", "workers");
+      SourceContext secondSource = SourceContext.fromDataset(second, "catalog/second", "workers");
+      List<SourceContext> contexts = List.of(firstSource, secondSource);
+      List<Batch> references =
+          List.of(
+              capturePortableBlobBatches(first, firstSource, allocator)
+                  .get(0)
+                  .remapContexts(contexts),
+              capturePortableBlobBatches(second, secondSource, allocator)
+                  .get(0)
+                  .remapContexts(contexts));
+      FutureTask<Reader> creating =
+          new FutureTask<>(() -> Reader.create(contexts, List.of(first, second), 1, 1));
+      Thread binding = new Thread(creating, "blob-reader-binding");
+      binding.setDaemon(true);
+      ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+      try {
+        synchronized (second) {
+          binding.start();
+          long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+          ThreadInfo blocked = null;
+          while (System.nanoTime() < deadline) {
+            blocked = threads.getThreadInfo(binding.getId());
+            if (blocked != null
+                && blocked.getThreadState() == Thread.State.BLOCKED
+                && blocked.getLockInfo() != null
+                && blocked.getLockInfo().getIdentityHashCode() == System.identityHashCode(second)) {
+              break;
+            }
+            Thread.yield();
+          }
+          assertNotNull(blocked);
+          assertEquals(Thread.State.BLOCKED, blocked.getThreadState());
+          assertNotNull(blocked.getLockInfo());
+          assertEquals(
+              System.identityHashCode(second), blocked.getLockInfo().getIdentityHashCode());
+          // Binding the second dataset must not pin the first dataset's lifecycle lock.
+          executor.submit(first::close).get(1, TimeUnit.SECONDS);
+        }
+        try (Reader reader = creating.get(1, TimeUnit.SECONDS)) {
+          second.close();
+          for (Batch batch : references) {
+            try (ReadStream stream = reader.read(batch, List.of(Request.whole(0, 0)));
+                VectorSchemaRoot result = stream.next(allocator)) {
+              assertNotNull(result);
+              assertArrayEquals(
+                  new byte[] {0, 10}, ((LargeVarBinaryVector) result.getVector("data")).get(0));
+              assertNull(stream.next(allocator));
+            }
+          }
+        }
+      } finally {
+        // Release the blocked monitor before cleanup, including when this regression fails.
+        creating.get(1, TimeUnit.SECONDS).close();
       }
     } finally {
       executor.shutdownNow();
