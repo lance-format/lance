@@ -20,7 +20,12 @@ labels:
 - label: performance
   title: "(?i)^\\s*[\\[(]?\\s*(perf|performance)\\b"
 # --- Secondary fallback: keywords anywhere in the body ---
+# Feature and perf reports routinely mention panics or crashes in passing, and
+# `bug` triggers automated fixes, so the body fallback only applies when the
+# title has no type prefix ("feature:", "test:", "[perf]", ...). RE2 has no
+# negative lookahead, so this matches a title whose first word is a plain word.
 - label: bug
+  title: "^\\s*\\w+(\\s|$)"
   body: "(?i)(panic|segfault|traceback|stack ?trace|crash|corrupt|incorrect result|wrong result)"
 - label: performance
   body: "(?i)(regression|latency|throughput|\\bOOM\\b|out of memory|memory usage|too slow)"
