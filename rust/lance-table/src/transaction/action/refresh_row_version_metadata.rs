@@ -139,6 +139,8 @@ mod tests {
             physical_rows: Some(rows),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         refresh_row_latest_update_meta_for_full_frag_rewrite_cols(&mut fragment, 1).unwrap();
         make_stable_row_id_manifest(vec![fragment])
