@@ -174,7 +174,7 @@ impl Ref {
 ///
 /// A separate type because field ids are signed. Schema fields are `>= 0`, and
 /// [`AddDataFile::field_ids`] may also bind the reserved ids of the hidden row
-/// lineage columns ([`ROW_ID_FIELD_ID`](lance_core::ROW_ID_FIELD_ID) and its
+/// lineage columns ([`ROW_ID_FIELD_ID`] and its
 /// two siblings), the way a data file's own field list does. Every other field
 /// reference takes a schema field id; apply rejects anything else.
 ///
