@@ -228,10 +228,7 @@ pub(super) mod frag_reuse {
         }));
         actions.push(Action::AddDataFile(AddDataFile {
             fragment: Ref::Local(token),
-            file: DataFile::new_unstarted(
-                format!("data/compacted-{token}.lance"),
-                ConcreteFileVersion::V2_0,
-            ),
+            file: super::one_column_file(&format!("data/compacted-{token}.lance")),
             field_ids: vec![FieldRef::Committed(0)],
             data_change: false,
             base: None,

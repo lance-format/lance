@@ -543,8 +543,12 @@ mod tests {
         minted.last_updated_at_version_meta = Some(minted_with.clone());
         minted.created_at_version_meta = Some(minted_with.clone());
 
+        let mut manifest = stable_row_id_manifest(true);
+        // The overlay is the minted fragment's only data, which a required
+        // column forbids.
+        manifest.schema.field_by_id_mut(0).unwrap().nullable = true;
         let out = apply(
-            &stable_row_id_manifest(true),
+            &manifest,
             vec![
                 Action::AddFragment(minted),
                 add(Ref::Local(0), vec![overlay("a.lance", &[0])]),
