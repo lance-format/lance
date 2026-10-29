@@ -381,6 +381,7 @@ pub(super) fn plan_disjoint_blob_reads(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     use crate::dataset::blob::file::{BlobFile, BlobSource};
     use crate::dataset::blob::read::{
@@ -442,6 +443,42 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(selection_indices, vec![vec![0], vec![1]]);
+    }
+
+    #[rstest]
+    #[case::below(11, 2)]
+    #[case::exact(12, 1)]
+    #[case::above(13, 1)]
+    fn duplicate_output_budget_boundary(
+        #[case] materialization_limit: u64,
+        #[case] expected_batches: usize,
+        #[values(3, 4, 5)] io_limit: u64,
+    ) {
+        let (store, _) = recording_range_store(Bytes::from_static(b"abcd"));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
+        let entries = (0..2)
+            .map(|selection_index| BlobEntry {
+                selection_index,
+                row_address: 0,
+                file: BlobFile::with_source(source.clone(), 0, 4, BlobKind::Packed, None),
+                requested_range: None,
+            })
+            .collect();
+        let batches =
+            plan_blob_read_batches_with_limits(entries, io_limit, Some(materialization_limit))
+                .unwrap();
+        let expected_batches = if io_limit < 4 { 2 } else { expected_batches };
+        assert_eq!(batches.len(), expected_batches);
+        for batch in &batches {
+            assert_eq!(batch.physical_bytes, 4);
+            let count = batch
+                .plans
+                .iter()
+                .map(|plan| plan.reads.len())
+                .sum::<usize>();
+            assert_eq!(batch.materialized_bytes, 4 + count as u64 * 4);
+            assert_eq!(count, if expected_batches == 1 { 2 } else { 1 });
+        }
     }
 
     #[tokio::test]
