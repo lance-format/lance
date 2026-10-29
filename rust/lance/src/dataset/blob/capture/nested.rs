@@ -90,6 +90,14 @@ fn descend(
             ))
         })?;
         let nulls = NullBuffer::union(descriptors.nulls(), Some(&NullBuffer::from(visible)));
+        // Descriptor readers also treat a null kind as a SQL null blob.
+        // Keep the mapping consistent with the flat references for this form.
+        let nulls = NullBuffer::union(
+            nulls.as_ref(),
+            descriptors
+                .column_by_name("kind")
+                .and_then(|kind| kind.nulls()),
+        );
         let descriptors = StructArray::try_new(
             descriptors.fields().clone(),
             descriptors.columns().to_vec(),
