@@ -20,7 +20,7 @@ use arrow_array::{
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
-use futures::{FutureExt, SinkExt, stream};
+use futures::{FutureExt, SinkExt, stream, stream::BoxStream};
 use futures::{
     Stream,
     prelude::stream::{StreamExt, TryStreamExt},
@@ -45,7 +45,7 @@ use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
-    QuantizationMetadata, QuantizationType, QuantizerBuildParams,
+    QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
 };
 use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
@@ -99,7 +99,9 @@ use crate::index::vector::utils::infer_vector_dim;
 
 use super::v2::IVFIndex;
 use super::{
+    has_unowned_fragment_rows,
     ivf::load_precomputed_partitions_if_available,
+    remap_for_owned_fragments, resolve_shared_remap,
     utils::{self, get_vector_type},
 };
 
@@ -201,9 +203,23 @@ fn apply_centroid_splits(
 async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     index: &IVFIndex<S, Q>,
     partition_id: usize,
-    mapping: &RowAddrRemap,
+    mapping: Arc<RowAddrRemap>,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<(Q::Storage, S)> {
     let old_storage = index.load_partition_storage(partition_id, None).await?;
+    let filtered_mapping;
+    let mapping = if let Some(owned_fragments) = owned_fragments
+        && has_unowned_fragment_rows(old_storage.row_ids().copied(), owned_fragments)
+    {
+        filtered_mapping = remap_for_owned_fragments(
+            mapping.clone(),
+            old_storage.row_ids().copied(),
+            owned_fragments,
+        );
+        &filtered_mapping
+    } else {
+        mapping.as_ref()
+    };
     let storage = old_storage.remap(mapping)?;
     let graph = index.read_sub_index_batch(partition_id, None, None).await?;
 
@@ -435,6 +451,10 @@ type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin
 pub struct VectorIndexBuildSummary {
     pub indices_merged: usize,
     pub files: Vec<IndexFile>,
+    /// Vectors the shuffle assigned to partitions. Null and non-finite vectors
+    /// are not indexed and existing indices merged in are not shuffled, so
+    /// neither is counted; a train-only build shuffles nothing and counts zero.
+    pub num_vectors_shuffled: usize,
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
@@ -450,6 +470,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Result<Self> {
+        if let Some(ivf_params) = ivf_params.as_ref() {
+            // The legacy IVF_PQ writer checks these combinations in
+            // `sanity_check_ivf_params`; this path had no equivalent, so a
+            // precomputed input paired with trained centroids was accepted and
+            // produced an index whose partition ids belong to other centroids.
+            ivf_params.validate()?;
+        }
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
@@ -579,6 +606,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             progress.stage_complete("shuffle").await?;
         }
 
+        // Counted before the partitions are built: a split or join replaces the
+        // IVF model, and the shuffle's partition ids belong to the trained one.
+        let num_vectors_shuffled = self.num_vectors_shuffled()?;
+
         // step 3. build and merge partitions
         let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
         progress
@@ -591,6 +622,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(VectorIndexBuildSummary {
             indices_merged: self.merged_num,
             files,
+            num_vectors_shuffled,
+        })
+    }
+
+    fn num_vectors_shuffled(&self) -> Result<usize> {
+        let (Some(ivf), Some(reader)) = (self.ivf.as_ref(), self.shuffle_reader.as_ref()) else {
+            return Ok(0);
+        };
+        (0..ivf.num_partitions()).try_fold(0, |total, partition| {
+            Ok(total + reader.partition_size(partition)?)
         })
     }
 
@@ -598,17 +639,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// per-partition tasks are `'static`, so the map is shared through an
     /// owned translator (the same clone this method always made).
     pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
-        self.remap_with(RowAddrTranslator::sync(mapping.clone()))
+        self.remap_with(RowAddrTranslator::sync(mapping.clone()), None)
             .await
     }
 
     /// Remap through a translator whose payload may need reads, one
     /// partition's addresses at a time.
     pub async fn remap_streaming(&mut self, mapping: &RowAddrTranslator) -> Result<Vec<IndexFile>> {
-        self.remap_with(mapping.clone()).await
+        self.remap_with(mapping.clone(), None).await
     }
 
-    async fn remap_with(&mut self, mapping: RowAddrTranslator) -> Result<Vec<IndexFile>> {
+    pub(crate) async fn remap_with(
+        &mut self,
+        mapping: RowAddrTranslator,
+        owned_fragments: Option<&RoaringBitmap>,
+    ) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -620,9 +665,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
+        let owned_fragments = owned_fragments.cloned().map(Arc::new);
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
             let existing_index = existing_index.clone();
             let mapping = mapping.clone();
+            let owned_fragments = owned_fragments.clone();
             async move {
                 let ivf_index = existing_index
                     .as_any()
@@ -635,12 +682,33 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 // One partition's addresses are the unit of translation; the
                 // partition itself is the working set it always was.
                 let row_ids: Vec<u64> = part.storage.row_ids().copied().collect();
-                let mapping = mapping.resolve(row_ids).await?;
+                let mapping = resolve_shared_remap(&mapping, row_ids).await?;
                 let (storage, index) = if S::name() == HNSW::name() {
-                    remap_hnsw_partition(ivf_index, part_id, &mapping).await?
+                    remap_hnsw_partition(
+                        ivf_index,
+                        part_id,
+                        mapping.clone(),
+                        owned_fragments.as_deref(),
+                    )
+                    .await?
                 } else {
-                    let storage = part.storage.remap(&mapping)?;
-                    let index = part.index.remap(&mapping, &storage)?;
+                    let filtered_mapping;
+                    let mapping = if let Some(owned_fragments) = owned_fragments.as_deref()
+                        && has_unowned_fragment_rows(
+                            part.storage.row_ids().copied(),
+                            owned_fragments,
+                        ) {
+                        filtered_mapping = remap_for_owned_fragments(
+                            mapping.clone(),
+                            part.storage.row_ids().copied(),
+                            owned_fragments,
+                        );
+                        &filtered_mapping
+                    } else {
+                        mapping.as_ref()
+                    };
+                    let storage = part.storage.remap(mapping)?;
+                    let index = part.index.remap(mapping, &storage)?;
                     (storage, index)
                 };
                 Result::Ok(Budgeted::untracked(PartitionBuildResult {
@@ -840,37 +908,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(quantizer)
     }
 
-    fn rename_row_id(
-        stream: impl RecordBatchStream + Unpin + 'static,
-        row_id_idx: usize,
-    ) -> impl RecordBatchStream + Unpin + 'static {
-        let new_schema = Arc::new(arrow_schema::Schema::new(
-            stream
-                .schema()
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(field_idx, field)| {
-                    if field_idx == row_id_idx {
-                        arrow_schema::Field::new(
-                            ROW_ID,
-                            field.data_type().clone(),
-                            field.is_nullable(),
-                        )
-                    } else {
-                        field.as_ref().clone()
-                    }
-                })
-                .collect::<Fields>(),
-        ));
-        RecordBatchStreamAdapter::new(
-            new_schema.clone(),
-            stream.map_ok(move |batch| {
-                RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec()).unwrap()
-            }),
-        )
-    }
-
     async fn num_rows_to_shuffle(&self) -> Result<Option<u64>> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Ok(None);
@@ -936,7 +973,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             // When using precomputed shuffle buffers we can't use the column name _rowid
             // since it is reserved.  So we tolerate `row_id` as well here (and rename it
             // to _rowid to match the non-precomputed path)
-            self.shuffle_data(Some(Self::rename_row_id(stream, row_id_idx)))
+            self.shuffle_data(Some(rename_row_id(stream, row_id_idx)))
                 .await?;
         } else {
             self.shuffle_data(Some(stream)).await?;
@@ -1006,102 +1043,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )?,
         );
 
-        let precomputed_partitions = if let Some(params) = self.ivf_params.as_ref() {
-            load_precomputed_partitions_if_available(params)
-                .await?
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-
-        let partition_map = Arc::new(precomputed_partitions);
-        let mut transformed_stream = Box::pin(
-            data.map(move |batch| {
-                let partition_map = partition_map.clone();
-                let ivf_transformer = transformer.clone();
-                tokio::spawn(async move {
-                    let mut batch = batch?;
-                    if !partition_map.is_empty() {
-                        let row_ids = &batch[ROW_ID];
-                        let part_ids = UInt32Array::from_iter(
-                            row_ids
-                                .as_primitive::<UInt64Type>()
-                                .values()
-                                .iter()
-                                .map(|row_id| partition_map.get(row_id).copied()),
-                        );
-                        let part_ids = UInt32Array::from(part_ids);
-                        // A batch that already carries the column would make
-                        // this a duplicate-name error, so report it instead of
-                        // panicking inside the spawned task.
-                        batch = batch
-                            .try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids.clone()))
-                            .map_err(|e| {
-                                Error::invalid_input(format!(
-                                    "could not attach the precomputed partition ids to a batch \
-                                     with schema {}: {e}",
-                                    batch.schema()
-                                ))
-                            })?;
-
-                        if part_ids.null_count() > 0 {
-                            log::info!(
-                                "Filter out rows without valid partition IDs: null_count={}",
-                                part_ids.null_count()
-                            );
-                            let indices = UInt32Array::from_iter(
-                                part_ids
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(idx, v)| v.map(|_| idx as u32)),
-                            );
-                            assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
-                            batch = batch.take(&indices)?;
-                        }
-                    }
-
-                    match batch.schema().column_with_name(code_column) {
-                        Some(_) => {
-                            // this batch is already transformed (in case of GPU training)
-                            Ok(batch)
-                        }
-                        None => ivf_transformer.transform(&batch),
-                    }
-                })
-            })
-            .buffered(get_num_compute_intensive_cpus())
-            .map(|x| {
-                x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?
-            })
-            .peekable(),
-        );
-
-        let batch = transformed_stream.as_mut().peek_mut().await;
-        let schema = match batch {
-            Some(Ok(b)) => b.schema(),
-            Some(Err(e)) => return Err(std::mem::replace(e, Error::Stop)),
+        let shuffle_reader = shuffle_transformed(
+            data.boxed(),
+            transformer,
+            code_column,
+            self.ivf_params.as_ref(),
+            shuffler.as_ref(),
+        )
+        .await?;
+        self.shuffle_reader = Some(match shuffle_reader {
+            Some(reader) => reader.into(),
             None => {
                 log::info!("no data to shuffle");
-                self.shuffle_reader = Some(Arc::new(IvfShufflerReader::new(
+                Arc::new(IvfShufflerReader::new(
                     Arc::new(self.store.clone()),
                     self.temp_dir.clone(),
                     vec![0; ivf.num_partitions()],
                     0.0,
-                )));
-                return Ok(self);
+                ))
             }
-        };
-
-        self.shuffle_reader = Some(
-            shuffler
-                .shuffle(Box::new(RecordBatchStreamAdapter::new(
-                    schema,
-                    transformed_stream,
-                )))
-                .await?
-                .into(),
-        );
-
+        });
         Ok(self)
     }
 
@@ -1169,7 +1130,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 splits,
                 joins,
                 partition_sizes,
-            } = Self::check_partition_adjustment(
+            } = PartitionAdjuster::check_partition_adjustment(
                 ivf,
                 reader.as_ref(),
                 &self.existing_indices,
@@ -1184,7 +1145,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     target_partition_size,
                     self.existing_indices.len()
                 );
-                self.split_partitions_streaming(&splits, ivf)
+                self.partition_adjuster()
+                    .split_partitions_streaming(&splits, ivf)
                     .boxed()
                     .await?
             };
@@ -1211,6 +1173,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     self.existing_indices.len()
                 );
                 let results = self
+                    .partition_adjuster()
                     .join_partitions(
                         &joins,
                         ivf,
@@ -1995,6 +1958,173 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ])
     }
 
+    /// Rows per partition that split and join thresholds are derived from: the
+    /// value the index was created with when known, else the type default.
+    fn effective_target_partition_size(&self) -> Result<usize> {
+        if let Some(size) = self.target_partition_size {
+            return Ok(size);
+        }
+        let index_type = IndexType::try_from(
+            index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
+        )?;
+        Ok(index_type.target_partition_size())
+    }
+
+    fn partition_adjuster(&self) -> PartitionAdjuster<'_> {
+        PartitionAdjuster {
+            store: &self.store,
+            column: self.column.clone(),
+            temp_dir: &self.temp_dir,
+            distance_type: self.distance_type,
+            dataset: self.dataset.as_ref(),
+            quantizer: self.quantizer.clone().map(Into::into),
+            shuffle_reader: self.shuffle_reader.as_ref(),
+            existing_indices: &self.existing_indices,
+            format_version: self.format_version,
+        }
+    }
+}
+
+fn rename_row_id(
+    stream: impl RecordBatchStream + Unpin + 'static,
+    row_id_idx: usize,
+) -> impl RecordBatchStream + Unpin + 'static {
+    let new_schema = Arc::new(arrow_schema::Schema::new(
+        stream
+            .schema()
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(field_idx, field)| {
+                if field_idx == row_id_idx {
+                    arrow_schema::Field::new(ROW_ID, field.data_type().clone(), field.is_nullable())
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect::<Fields>(),
+    ));
+    RecordBatchStreamAdapter::new(
+        new_schema.clone(),
+        stream.map_ok(move |batch| {
+            RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec()).unwrap()
+        }),
+    )
+}
+
+/// Assign `data` to partitions and quantize it with `transformer`, then shuffle
+/// it by partition. `None` when `data` is empty.
+///
+/// Not a method of [`IvfIndexBuilder`] so that it is compiled once rather than
+/// once per sub-index and quantizer combination.
+async fn shuffle_transformed(
+    data: BoxStream<'static, Result<RecordBatch>>,
+    transformer: Arc<IvfTransformer>,
+    code_column: &'static str,
+    ivf_params: Option<&IvfBuildParams>,
+    shuffler: &dyn Shuffler,
+) -> Result<Option<Box<dyn ShuffleReader>>> {
+    let precomputed_partitions = if let Some(params) = ivf_params {
+        load_precomputed_partitions_if_available(params)
+            .await?
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let partition_map = Arc::new(precomputed_partitions);
+    let mut transformed_stream = Box::pin(
+        data.map(move |batch| {
+            let partition_map = partition_map.clone();
+            let ivf_transformer = transformer.clone();
+            tokio::spawn(async move {
+                let mut batch = batch?;
+                if !partition_map.is_empty() {
+                    let row_ids = &batch[ROW_ID];
+                    let part_ids = UInt32Array::from_iter(
+                        row_ids
+                            .as_primitive::<UInt64Type>()
+                            .values()
+                            .iter()
+                            .map(|row_id| partition_map.get(row_id).copied()),
+                    );
+                    let part_ids = UInt32Array::from(part_ids);
+                    // A batch that already carries the column would make
+                    // this a duplicate-name error, so report it instead of
+                    // panicking inside the spawned task.
+                    batch = batch
+                        .try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids.clone()))
+                        .map_err(|e| {
+                            Error::invalid_input(format!(
+                                "could not attach the precomputed partition ids to a batch \
+                                 with schema {}: {e}",
+                                batch.schema()
+                            ))
+                        })?;
+
+                    if part_ids.null_count() > 0 {
+                        log::info!(
+                            "Filter out rows without valid partition IDs: null_count={}",
+                            part_ids.null_count()
+                        );
+                        let indices = UInt32Array::from_iter(
+                            part_ids
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(idx, v)| v.map(|_| idx as u32)),
+                        );
+                        assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
+                        batch = batch.take(&indices)?;
+                    }
+                }
+
+                match batch.schema().column_with_name(code_column) {
+                    Some(_) => {
+                        // this batch is already transformed (in case of GPU training)
+                        Ok(batch)
+                    }
+                    None => ivf_transformer.transform(&batch),
+                }
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus())
+        .map(|x| x.map_err(|e| Error::internal(format!("shuffle transform task failed: {e}")))?)
+        .peekable(),
+    );
+
+    let batch = transformed_stream.as_mut().peek_mut().await;
+    let schema = match batch {
+        Some(Ok(b)) => b.schema(),
+        Some(Err(e)) => return Err(std::mem::replace(e, Error::Stop)),
+        None => return Ok(None),
+    };
+
+    shuffler
+        .shuffle(Box::new(RecordBatchStreamAdapter::new(
+            schema,
+            transformed_stream,
+        )))
+        .await
+        .map(Some)
+}
+
+/// What the split and join passes read from an [`IvfIndexBuilder`], with the
+/// quantizer type erased. These passes only route and re-quantize rows, so
+/// keeping them off the builder compiles them once instead of once per
+/// sub-index and quantizer combination.
+struct PartitionAdjuster<'a> {
+    store: &'a ObjectStore,
+    column: String,
+    temp_dir: &'a Path,
+    distance_type: DistanceType,
+    dataset: Option<&'a Dataset>,
+    quantizer: Option<Quantizer>,
+    shuffle_reader: Option<&'a Arc<dyn ShuffleReader>>,
+    existing_indices: &'a [ExistingIndex],
+    format_version: ConcreteFileVersion,
+}
+
+impl PartitionAdjuster<'_> {
     // take raw vectors from the dataset
     //
     // returns batches of schema | row_id | vector |
@@ -2075,18 +2205,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .as_fixed_size_list()
             .clone();
         Ok((row_ids, vectors))
-    }
-
-    /// Rows per partition that split and join thresholds are derived from: the
-    /// value the index was created with when known, else the type default.
-    fn effective_target_partition_size(&self) -> Result<usize> {
-        if let Some(size) = self.target_partition_size {
-            return Ok(size);
-        }
-        let index_type = IndexType::try_from(
-            index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
-        )?;
-        Ok(index_type.target_partition_size())
     }
 
     /// Decide which partitions to split and which to join away, from the
@@ -2382,7 +2500,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .collect();
         }
 
-        let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
+        let batches = Self::take_vectors(dataset, &self.column, self.store, &row_ids).await?;
         if batches.is_empty() {
             return Ok(None);
         }
@@ -2823,7 +2941,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             centroids.clone(),
             self.distance_type,
             vector_field.name().as_str(),
-            quantizer.into(),
+            quantizer,
             None,
         )?;
         Ok((transformer, vector_field))
@@ -3641,7 +3759,15 @@ mod tests {
         let reader = RecordBatchIterator::new(initial, schema.clone());
         let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        // Pin the type default target so the thresholds above are the ones this
+        // test reasons about; a build from a partition count would record its own.
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                ..IvfBuildParams::new(2)
+            },
+        );
         dataset
             .create_index(
                 &["vec"],
@@ -3718,6 +3844,48 @@ mod tests {
         (0..vectors.len())
             .map(|i| vectors.value(i).as_primitive::<Float32Type>().value(0))
             .collect()
+    }
+
+    /// The V3 builder is the current write path, so the contract the legacy
+    /// IVF_PQ writer enforces has to hold here too: precomputed partition ids
+    /// are only meaningful next to the centroids they were assigned against.
+    #[tokio::test]
+    async fn test_new_rejects_precomputed_buffers_without_centroids() {
+        use lance_index::vector::v3::shuffler::IvfShuffler;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = write_clusters(uri, &[(8, 0.0)]).await;
+        let index_dir = dataset.indices_dir().join("idx");
+
+        let mut ivf_params = IvfBuildParams::new(1);
+        ivf_params.precomputed_shuffle_buffers =
+            Some((Path::from("buffers/data"), vec!["buffer1.lance".to_owned()]));
+
+        let builder = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+            dataset,
+            "vec".to_owned(),
+            index_dir.clone(),
+            DistanceType::L2,
+            Box::new(IvfShuffler::new(index_dir, 1)),
+            Some(ivf_params),
+            Some(()),
+            (),
+            None,
+        );
+
+        let Err(err) = builder else {
+            panic!("expected the constructor to reject the params");
+        };
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("precomputed_shuffle_buffers requires centroids"),
+            "unexpected message: {err}"
+        );
     }
 
     fn cluster_batch(
@@ -3907,7 +4075,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let uri = tmp.path().to_str().unwrap();
         let mut dataset = write_clusters(uri, &[(15_000, 0.0), (1_500, 1000.0)]).await;
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        // Pin the type default target so the split below is the one this test
+        // reasons about; a build from a partition count would record its own.
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                ..IvfBuildParams::new(2)
+            },
+        );
         dataset
             .create_index(
                 &["vec"],
@@ -3962,7 +4138,12 @@ mod tests {
             &[(2_000, 0.0), (100, 1000.0), (100, 2000.0), (100, 3000.0)],
         )
         .await;
-        let params = ivf_flat_at_centers(&[0.0, 1000.0, 2000.0, 3000.0], None);
+        // Pin the type default target the threshold above is computed from; a
+        // build from a partition count would record its own.
+        let params = ivf_flat_at_centers(
+            &[0.0, 1000.0, 2000.0, 3000.0],
+            Some(IndexType::IvfFlat.target_partition_size()),
+        );
         dataset
             .create_index(
                 &["vec"],
@@ -4009,7 +4190,15 @@ mod tests {
         let uri = tmp.path().to_str().unwrap();
         // Two partitions of 1_500 rows, above the join threshold (25% of 4096).
         let mut dataset = write_clusters(uri, &[(1_500, 0.0), (1_500, 1000.0)]).await;
-        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        // Pin the type default target so the threshold above is the one this
+        // test reasons about; a build from a partition count would record its own.
+        let params = VectorIndexParams::with_ivf_flat_params(
+            MetricType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                ..IvfBuildParams::new(2)
+            },
+        );
         dataset
             .create_index(
                 &["vec"],

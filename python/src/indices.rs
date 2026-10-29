@@ -549,6 +549,8 @@ async fn do_load_shuffled_vectors(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        clustering_id: None,
+        metadata: Default::default(),
     };
     ds.commit_existing_index_segments(index_name, column, vec![metadata])
         .await

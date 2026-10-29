@@ -24,9 +24,12 @@ async-recursion.workspace = true
 async-trait.workspace = true
 bitvec.workspace = true
 datafusion-common.workspace = true
+datafusion-execution.workspace = true
 datafusion-expr.workspace = true
+datafusion-functions = { workspace = true, features = ["regex_expressions", "string_expressions"] }
+datafusion-functions-nested.workspace = true
 datafusion-physical-expr.workspace = true
-datafusion.workspace = true
+datafusion-physical-plan.workspace = true
 dirs.workspace = true
 nalgebra.workspace = true
 fst.workspace = true
@@ -44,7 +47,7 @@ lance-arrow.workspace = true
 lance-arrow-stats.workspace = true
 lance-core.workspace = true
 lance-index-core.workspace = true
-lance-datafusion.workspace = true
+lance-datafusion-exec.workspace = true
 lance-encoding.workspace = true
 lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
@@ -84,10 +87,12 @@ rangemap.workspace = true
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
+datafusion.workspace = true
 env_logger.workspace = true
 geo-traits.workspace = true
 lance-datagen.workspace = true
-lance-datafusion = { workspace = true, features = ["datagen"] }
+lance-datafusion.workspace = true
+lance-datafusion-exec = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true
 libc.workspace = true
 test-log.workspace = true

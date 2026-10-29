@@ -114,24 +114,31 @@ impl PrefixSums {
     pub fn find(&self, value: u64) -> usize {
         // Match the width once, then binary-search only the starts (not the
         // trailing total).  `partition_point` already yields the first of any
-        // duplicated starts; the `idx - 1` fallback is safe since `get(0) == 0`.
+        // duplicated starts.  A malformed index can have no chunks at all, so
+        // guard the empty array before indexing.
         match self {
             Self::U32(values) => {
-                let starts = &values[..values.len() - 1];
+                let starts = &values[..values.len().saturating_sub(1)];
+                if starts.is_empty() {
+                    return 0;
+                }
                 let idx = starts.partition_point(|&start| (start as u64) < value);
                 if idx < starts.len() && starts[idx] as u64 == value {
                     idx
                 } else {
-                    idx - 1
+                    idx.saturating_sub(1)
                 }
             }
             Self::U64(values) => {
-                let starts = &values[..values.len() - 1];
+                let starts = &values[..values.len().saturating_sub(1)];
+                if starts.is_empty() {
+                    return 0;
+                }
                 let idx = starts.partition_point(|&start| start < value);
                 if idx < starts.len() && starts[idx] == value {
                     idx
                 } else {
-                    idx - 1
+                    idx.saturating_sub(1)
                 }
             }
         }
@@ -163,7 +170,7 @@ impl ItemCounts {
                 values_per_chunk,
                 last_chunk_values,
             } => {
-                if i == num_chunks - 1 {
+                if i == num_chunks.saturating_sub(1) {
                     *last_chunk_values
                 } else {
                     *values_per_chunk
@@ -173,7 +180,7 @@ impl ItemCounts {
                 logs,
                 last_chunk_values,
             } => {
-                if i == num_chunks - 1 {
+                if i == num_chunks.saturating_sub(1) {
                     *last_chunk_values
                 } else {
                     1u64 << logs[i]
@@ -266,7 +273,7 @@ impl MiniBlockChunkIndex {
                 last_chunk_values,
                 ..
             } => {
-                if i == num_chunks - 1 {
+                if i == num_chunks.saturating_sub(1) {
                     *last_chunk_values
                 } else {
                     *values_per_chunk
@@ -284,7 +291,7 @@ impl MiniBlockChunkIndex {
                 values_per_chunk,
                 num_chunks,
                 ..
-            } => ((row / values_per_chunk) as usize).min(num_chunks - 1),
+            } => ((row / values_per_chunk) as usize).min(num_chunks.saturating_sub(1)),
             RowMapping::Flat { value_starts } => value_starts.find(row),
             RowMapping::Nested { row_starts, .. } => row_starts.find(row),
         }
@@ -532,5 +539,15 @@ mod tests {
                 assert_eq!(derived_preamble, block.has_preamble, "has_preamble[{i}]");
             }
         }
+    }
+
+    #[test]
+    fn find_handles_an_empty_index() {
+        // A malformed page can produce a chunk index with no chunks, i.e. a
+        // prefix-sum array holding only the trailing total.
+        assert_eq!(PrefixSums::U32(vec![0]).find(0), 0);
+        assert_eq!(PrefixSums::U32(vec![0]).find(7), 0);
+        assert_eq!(PrefixSums::U64(vec![0]).find(0), 0);
+        assert_eq!(PrefixSums::U64(vec![0]).find(7), 0);
     }
 }

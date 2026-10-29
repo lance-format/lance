@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::borrow::Cow;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
@@ -10,6 +10,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_file::versions::data_file_columns;
+use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexBuilderParams};
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     frag_reuse::CompactFragReuseIndex,
@@ -23,11 +24,12 @@ use lance_index::{
         lance_format::LanceIndexStore,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
+        zonemap::ZoneMapIndexVersion,
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::CachedFileSize;
 use lance_select::{RowAddrTreeMap, RowSetOps};
+use lance_table::format::overlay::staleness::field_affects_index;
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -77,6 +79,8 @@ impl IndexMergeResults<'_> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(self.files),
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 }
@@ -494,34 +498,80 @@ fn block_stale_rows(
     }
 }
 
-/// Attempt to read seed buffers for `index` from `fragments`' data files.
-///
-/// Returns `Some(vec)` only if every fragment has a seed entry whose field
-/// identity can be verified; returns `None` if a seed is missing, its file
-/// cannot be opened, or its physical column mapping cannot be verified.
-/// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
-/// caller via [`FragmentSeed::metadata_value`].
-async fn try_harvest_seeds(
-    dataset: &Dataset,
-    fragments: &[Fragment],
-    index: &IndexMetadata,
-) -> Result<Option<Vec<FragmentSeed>>> {
-    if fragments.is_empty() {
-        return Ok(Some(Vec::new()));
+/// Reads one column's write seeds from fragments' current data files.
+pub struct SeedHarvester<'a> {
+    dataset: &'a Dataset,
+    field: &'a lance_core::datatypes::Field,
+    /// One scheduler per base store, shared by concurrent harvests.
+    schedulers: std::sync::Mutex<HashMap<Option<u32>, Arc<ScanScheduler>>>,
+}
+
+impl<'a> SeedHarvester<'a> {
+    /// A harvester for the top-level field with `field_id`. `SeedCollector`
+    /// writes seeds only for top-level fields, and a nested leaf can share
+    /// its name with a different, seeded top-level column, so any other
+    /// field has no seeds to read.
+    pub fn for_field_id(dataset: &'a Dataset, field_id: i32) -> Option<Self> {
+        let field = dataset.schema().fields.iter().find(|f| f.id == field_id)?;
+        Some(Self {
+            dataset,
+            field,
+            schedulers: std::sync::Mutex::new(HashMap::new()),
+        })
     }
 
-    // SeedCollector writes seeds only for top-level keyed fields. A nested
-    // leaf can share its name with a different, seeded top-level column.
-    let Some(field_id) = index.keyed_field() else {
-        return Ok(None);
-    };
-    let Some(field) = dataset.schema().fields.iter().find(|f| f.id == field_id) else {
-        return Ok(None);
-    };
-    let mut seeds = Vec::with_capacity(fragments.len());
-    let mut schedulers = HashMap::new();
+    /// A harvester for the top-level column at field path `column`, which
+    /// may be quoted. A nested path has no seed of its own and yields `None`;
+    /// resolving the path keeps it apart from a top-level name that reads
+    /// the same.
+    pub fn for_column(dataset: &'a Dataset, column: &str) -> Option<Self> {
+        let path = dataset.schema().resolve(column)?;
+        let [field] = path.as_slice() else {
+            return None;
+        };
+        Self::for_field_id(dataset, field.id)
+    }
 
-    for fragment in fragments {
+    /// The scan scheduler for `base_id`, created on first use. A concurrent
+    /// first use may build one twice; the first one cached wins.
+    async fn scheduler(&self, base_id: Option<u32>) -> Result<Arc<ScanScheduler>> {
+        if let Some(scheduler) = self.schedulers.lock().unwrap().get(&base_id) {
+            return Ok(scheduler.clone());
+        }
+        let store = self.dataset.object_store(base_id).await?;
+        let config = SchedulerConfig::max_bandwidth(&store);
+        let scheduler = ScanScheduler::new(store, config);
+        Ok(self
+            .schedulers
+            .lock()
+            .unwrap()
+            .entry(base_id)
+            .or_insert(scheduler)
+            .clone())
+    }
+
+    /// The seed `fragment`'s current data file stores for the column.
+    ///
+    /// `None` if the fragment has no seed entry, its file cannot be opened,
+    /// or the seed's field identity cannot be verified. Index-type-specific
+    /// validation (e.g. `rows_per_zone` checks) is left to the caller via
+    /// [`FragmentSeed::metadata_value`].
+    pub async fn harvest(&self, fragment: &Fragment) -> Result<Option<FragmentSeed>> {
+        let dataset = self.dataset;
+        let field = self.field;
+        // An overlay on the column (or a field it contains or is nested in)
+        // changes values the base file's seed never saw, so that seed is no
+        // bound on the fragment's current values.
+        let indexed = [field.id];
+        if fragment.overlays.iter().any(|overlay| {
+            overlay
+                .data_file
+                .fields
+                .iter()
+                .any(|field_id| field_affects_index(*field_id, &indexed, dataset.schema()))
+        }) {
+            return Ok(None);
+        }
         // A column replacement can retain an older file for other columns.
         // Its seed still describes the old values, even after the manifest
         // stops mapping this column to that file.
@@ -536,15 +586,10 @@ async fn try_harvest_seeds(
         let path = dataset
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
-        let scheduler = match schedulers.entry(data_file.base_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let store = dataset.object_store(data_file.base_id).await?;
-                let config = SchedulerConfig::max_bandwidth(&store);
-                entry.insert(ScanScheduler::new(store, config))
-            }
-        };
-        let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
+        let scheduler = self.scheduler(data_file.base_id).await?;
+        // The manifest's size for the serving file, when it has one; the
+        // scheduler probes and caches it otherwise.
+        let Ok(file_scheduler) = scheduler.open_file(&path, &data_file.file_size_bytes).await
         else {
             return Ok(None);
         };
@@ -614,14 +659,41 @@ async fn try_harvest_seeds(
         let Some(physical_rows) = fragment.physical_rows else {
             return Ok(None);
         };
-        seeds.push(FragmentSeed {
+        Ok(Some(FragmentSeed {
             fragment_id: fragment.id,
             physical_rows: physical_rows as u64,
             bytes,
             metadata_value: meta_value,
-        });
+        }))
     }
+}
 
+/// Attempt to read seed buffers for `index` from `fragments`' data files.
+///
+/// Returns `Some(vec)` only if every fragment has a seed entry whose field
+/// identity can be verified; returns `None` if a seed is missing, its file
+/// cannot be opened, or its physical column mapping cannot be verified.
+async fn try_harvest_seeds(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    index: &IndexMetadata,
+) -> Result<Option<Vec<FragmentSeed>>> {
+    if fragments.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let Some(field_id) = index.keyed_field() else {
+        return Ok(None);
+    };
+    let Some(harvester) = SeedHarvester::for_field_id(dataset, field_id) else {
+        return Ok(None);
+    };
+    let mut seeds = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let Some(seed) = harvester.harvest(fragment).await? else {
+            return Ok(None);
+        };
+        seeds.push(seed);
+    }
     Ok(Some(seeds))
 }
 
@@ -641,6 +713,8 @@ async fn load_unindexed_training_data(
         field_path,
         &update_criteria.data_criteria,
         selection,
+        None,
+        None,
     )
     .await
 }
@@ -656,6 +730,26 @@ async fn rebuild_scalar_segment(
 ) -> Result<CreatedIndex> {
     let params = reference_index.derive_index_params()?;
     let update_criteria = reference_index.update_criteria();
+    // A zone map rebuild goes through the metadata-aware builder with the
+    // same fragment ids: it scans exactly those fragments (less what their
+    // seeds cover) and knows each fragment's physical row count, so its
+    // zones are cut at the configured boundaries even past deleted tails.
+    if let Some(zone_map) = reference_index.as_any().downcast_ref::<ZoneMapIndex>() {
+        let zone_map_params = serde_json::from_str::<ZoneMapIndexBuilderParams>(
+            params.params.as_deref().unwrap_or("{}"),
+        )?;
+        let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
+        return crate::index::scalar::zonemap::build_segment_with_seeds(
+            dataset,
+            field_path,
+            zone_map_params,
+            zone_map.value_type(),
+            Some(fragment_ids),
+            &update_criteria.data_criteria,
+            &index_store,
+        )
+        .await;
+    }
     let training_data = load_training_data(
         dataset,
         field_path,
@@ -663,6 +757,7 @@ async fn rebuild_scalar_segment(
         None,
         true,
         Some(fragment_ids),
+        None,
     )
     .await?;
     super::scalar::build_scalar_index(
@@ -913,6 +1008,14 @@ async fn merge_scalar_indices<'a>(
             .iter()
             .any(|segment| !segment.results_are_row_addrs());
 
+    // An older ZoneMap file version lacks statistics the current version
+    // stores (the NaN sign split, the maximum hidden by the NaN marker);
+    // only a scan recovers them, so such a segment is rebuilt, not merged.
+    let zonemap_requires_rebuild = index_type == IndexType::ZoneMap
+        && selected_old_indices
+            .iter()
+            .any(|segment| segment.index_version < ZoneMapIndexVersion::CURRENT as i32);
+
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
     //   - `effective_old_frags`: the selected segments' coverage intersected
@@ -928,6 +1031,7 @@ async fn merge_scalar_indices<'a>(
         && !update_criteria.requires_old_data
         && !ngram_requires_rebuild
         && !legacy_domain_mismatch
+        && !zonemap_requires_rebuild
         && (has_segment_merge_primitive || selected_old_indices.len() == 1);
 
     // The bitmap the merged segment commits, decided by how its content is
@@ -977,7 +1081,27 @@ async fn merge_scalar_indices<'a>(
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them, and never when
         // overlaid rows must be read: a seed predates any overlay.
-        let maybe_created = if plugin.might_use_seeds(&index_details) && stale_rows.is_empty() {
+        let maybe_created = if index_type == IndexType::ZoneMap && stale_rows.is_empty() {
+            // Zone maps go through the metadata-aware builder: zones are cut
+            // at the configured physical boundaries, seeds (when the index
+            // collects them) cover what they can, and the rest is scanned,
+            // in one segment write. (`stale_rows` is empty for a zone map,
+            // which does not remap; the guard keeps the generic rescan below
+            // authoritative if that ever changes.)
+            crate::index::scalar::zonemap::update_segment(
+                dataset.as_ref(),
+                &reference_index,
+                reference_idx,
+                field_path,
+                unindexed,
+                &update_criteria.data_criteria,
+                plugin.might_use_seeds(&index_details),
+                &new_store,
+            )
+            .await?
+        } else if !plugin.might_use_seeds(&index_details) || !stale_rows.is_empty() {
+            None
+        } else {
             if let Some(seeds) =
                 try_harvest_seeds(dataset.as_ref(), unindexed, reference_idx).await?
             {
@@ -987,8 +1111,6 @@ async fn merge_scalar_indices<'a>(
             } else {
                 None
             }
-        } else {
-            None
         };
 
         let created_index = if let Some(created) = maybe_created {
@@ -2142,6 +2264,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
             Uuid::new_v4(),
@@ -2241,6 +2365,242 @@ mod tests {
         result["id"]
             .as_primitive::<arrow::datatypes::Int32Type>()
             .value(0)
+    }
+
+    #[rstest]
+    #[case::recorded_versions(false, false)]
+    #[case::hnsw_new_data(true, false)]
+    #[case::hnsw_steady_state(true, true)]
+    #[tokio::test]
+    async fn test_default_optimize_preserves_shared_model_policy(
+        #[case] is_hnsw: bool,
+        #[case] is_steady_state: bool,
+    ) {
+        const DIM: usize = 8;
+        const ROWS: usize = 16;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let (first, vectors) = clustered_vector_batch(schema.clone(), 0, ROWS, DIM, 0.0);
+        let (second, _) = clustered_vector_batch(schema.clone(), ROWS as i32, ROWS, DIM, 1.0);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(first), Ok(second)], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: ROWS,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(
+                    vec![0.0; DIM]
+                        .into_iter()
+                        .chain(vec![100.0; DIM])
+                        .collect::<Vec<_>>(),
+                ),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        let params = |m| {
+            let mut ivf = IvfBuildParams::try_with_centroids(2, centroids.clone()).unwrap();
+            if !is_steady_state {
+                // Keep the split threshold below the appended partition size,
+                // so default optimization exercises consolidation each cycle.
+                ivf.target_partition_size = Some(4);
+            }
+            if is_hnsw {
+                VectorIndexParams::ivf_hnsw(
+                    MetricType::L2,
+                    ivf,
+                    HnswBuildParams {
+                        m,
+                        max_level: 2,
+                        ef_construction: 16,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf)
+            }
+        };
+        let first =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params(4))
+                .name("vector_idx".into())
+                .fragments(vec![0])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![first])
+            .await
+            .unwrap();
+        if is_hnsw {
+            let second =
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params(8))
+                    .name("vector_idx".into())
+                    .replace(true)
+                    .fragments(vec![1])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            let mut segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            segments.push(second);
+            let old_segment = segments[0].clone();
+            let txn = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: segments,
+                    removed_indices: vec![old_segment],
+                },
+                None,
+            );
+            dataset
+                .apply_commit(txn, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+        } else {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            let mut segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            assert_eq!(segments.len(), 2);
+            let old_segments = segments.clone();
+            assert_ne!(segments[0].index_version, 0);
+            segments[0].index_version = 0;
+            let txn = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: segments,
+                    removed_indices: old_segments,
+                },
+                None,
+            );
+            dataset
+                .apply_commit(txn, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        if is_steady_state {
+            let logical = dataset
+                .open_logical_vector_index("vector", "vector_idx")
+                .await
+                .unwrap();
+            assert_eq!(
+                select_steady_state_rebalance(
+                    &logical.as_ivf().unwrap(),
+                    VectorSegmentCompatibility::SharedModel
+                )
+                .unwrap(),
+                Some(SteadyStateRebalance::MergeAll)
+            );
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                dataset
+                    .load_indices_by_name("vector_idx")
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        for cycle in 0..if is_steady_state { 1 } else { 2 } {
+            if !is_steady_state {
+                let (batch, _) = clustered_vector_batch(
+                    schema.clone(),
+                    ((2 + cycle) * ROWS) as i32,
+                    ROWS,
+                    DIM,
+                    2.0 + cycle as f32,
+                );
+                dataset
+                    .append(RecordBatchIterator::new([Ok(batch)], schema.clone()), None)
+                    .await
+                    .unwrap();
+                dataset
+                    .optimize_indices(&OptimizeOptions::default())
+                    .await
+                    .unwrap();
+            }
+            let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+            assert_eq!(
+                segments.len(),
+                1,
+                "default optimize must consolidate shared models"
+            );
+            assert_eq!(
+                segments[0].fragment_bitmap.as_ref().unwrap(),
+                dataset.fragment_bitmap.as_ref()
+            );
+            let index = dataset
+                .open_vector_index("vector", &segments[0].uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let mut stored_rows = roaring::RoaringTreemap::new();
+            for partition in 0..index.ivf_model().num_partitions() {
+                let mut batches = index
+                    .partition_reader(partition, false, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                while let Some(batch) = batches.try_next().await.unwrap() {
+                    for &row_id in batch[lance_core::ROW_ID]
+                        .as_primitive::<arrow::datatypes::UInt64Type>()
+                        .values()
+                    {
+                        assert!(stored_rows.insert(row_id), "duplicate row address {row_id}");
+                    }
+                }
+            }
+            let expected_rows = dataset
+                .get_fragments()
+                .iter()
+                .flat_map(|fragment| {
+                    (0..ROWS as u32).map(move |offset| {
+                        u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                            fragment.id() as u32,
+                            offset,
+                        ))
+                    })
+                })
+                .collect::<roaring::RoaringTreemap>();
+            assert_eq!(stored_rows, expected_rows);
+            assert_eq!(
+                stored_rows.len(),
+                (dataset.get_fragments().len() * ROWS) as u64
+            );
+            let mut correct = 0;
+            for offset in [0, 4, 8, 12] {
+                let query = vectors.value(offset);
+                correct += usize::from(
+                    nearest_id(&dataset, query.as_primitive::<Float32Type>(), 2).await
+                        == offset as i32,
+                );
+            }
+            assert!(correct as f32 / 4.0 >= 0.5, "recall={}/4", correct);
+        }
     }
 
     #[rstest]
@@ -5307,6 +5667,7 @@ mod tests {
                 updated_fragments: vec![updated.fragment],
                 new_fragments: vec![],
                 fields_modified: updated.fields_modified,
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -5466,7 +5827,16 @@ mod tests {
                 &["vector"],
                 IndexType::Vector,
                 None,
-                &VectorIndexParams::ivf_flat(num_partitions, MetricType::L2),
+                // Pin the type default target: the join case needs its partitions
+                // under a quarter of it, and a build from a partition count would
+                // record its own.
+                &VectorIndexParams::with_ivf_flat_params(
+                    MetricType::L2,
+                    IvfBuildParams {
+                        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+                        ..IvfBuildParams::new(num_partitions)
+                    },
+                ),
                 true,
             )
             .await

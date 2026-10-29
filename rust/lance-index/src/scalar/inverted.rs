@@ -41,7 +41,7 @@ pub use compound::{
 };
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use documents::DocumentRemapping;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};

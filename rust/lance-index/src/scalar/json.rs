@@ -8,27 +8,25 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::{
-    execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
-};
 use datafusion_common::{DataFusionError, ScalarValue, config::ConfigOptions};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
-use futures::StreamExt;
+use datafusion_physical_plan::{
+    ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec,
+    stream::RecordBatchStreamAdapter,
+};
+use futures::{StreamExt, stream::BoxStream};
 use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
-use lance_datafusion::exec::{
-    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
-};
-use lance_datafusion::udf::json::JsonbType;
+use lance_datafusion_exec::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
+use lance_datafusion_exec::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -65,6 +63,30 @@ impl JsonIndex {
     pub fn new(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
         Self { target_index, path }
     }
+}
+
+/// The pre-migration, row-id-domain version for `builtin`'s on-disk format, if it has
+/// one (BTree, Bitmap, and LabelList are the only builtins with a second, address-domain
+/// format -- see `BTREE_ROW_ID_DOMAIN_VERSION`, `BITMAP_ROW_ID_DOMAIN_VERSION`, and
+/// `LABEL_LIST_ROW_ID_DOMAIN_VERSION`).
+fn legacy_row_id_domain_version(builtin_name: &str) -> Option<u32> {
+    [
+        (
+            BuiltinIndexType::BTree,
+            crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
+        ),
+        (
+            BuiltinIndexType::Bitmap,
+            crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
+        ),
+        (
+            BuiltinIndexType::LabelList,
+            crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
+        ),
+    ]
+    .into_iter()
+    .find(|(builtin, _)| builtin_name.eq_ignore_ascii_case(builtin.as_str()))
+    .map(|(_, version)| version)
 }
 
 impl DeepSizeOf for JsonIndex {
@@ -109,10 +131,10 @@ impl JsonIndex {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_created.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
             files: target_created.files,
         })
@@ -140,6 +162,18 @@ impl ScalarIndex for JsonIndex {
         self.target_index
             .search_with_options(query.target_query.as_ref(), options, metrics)
             .await
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        self.target_index.lookup(keys, metrics)
+    }
+
+    fn results_are_row_addresses(&self) -> bool {
+        self.target_index.results_are_row_addresses()
     }
 
     fn can_remap(&self) -> bool {
@@ -197,10 +231,10 @@ impl ScalarIndex for JsonIndex {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_created.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
             files: target_created.files,
         })
@@ -594,7 +628,7 @@ impl JsonIndexPlugin {
             Vec::with_capacity(input_schema.fields().len());
         exprs.push((
             Arc::new(ScalarFunctionExpr::try_new(
-                Arc::new(lance_datafusion::udf::json::json_extract_with_type_udf()),
+                Arc::new(lance_datafusion_exec::udf::json::json_extract_with_type_udf()),
                 vec![
                     Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
                     Arc::new(Literal::new(ScalarValue::Utf8(Some(path)))),
@@ -614,8 +648,9 @@ impl JsonIndexPlugin {
         }
 
         let project = ProjectionExec::try_new(exprs, input)?;
-        let ctx = get_session_context(&LanceExecutionOptions::default());
-        project.execute(0, ctx.task_ctx()).map_err(Into::into)
+        project
+            .execute(0, Arc::new(TaskContext::default()))
+            .map_err(Into::into)
     }
 
     fn infer_type_from_batch(batch: &RecordBatch, path: &str) -> Result<Option<DataType>> {
@@ -1065,7 +1100,7 @@ impl BasicTrainer for JsonIndexPlugin {
             &Field::new("", target_type, true),
         )?;
 
-        let target_index = target_trainer
+        let mut target_index = target_trainer
             .train_index(
                 converted_stream,
                 index_store,
@@ -1075,10 +1110,22 @@ impl BasicTrainer for JsonIndexPlugin {
             )
             .await?;
 
+        // BTree, Bitmap, and LabelList's `BasicTrainer::train_index` always reports the
+        // current (address-domain) version: that generic path has no dataset awareness
+        // to tell whether a row id and a row address coincide, unlike `build_scalar_index`
+        // in the `lance` crate, which downgrades to the row-id-domain version itself for
+        // exactly that reason. A JSON-wrapped target is never built on a stable-row-id
+        // dataset (`build_scalar_index`'s guard refuses one), so a row id and a row
+        // address always coincide here, and the row-id-domain version is always correct.
+        if let Some(floor_version) = legacy_row_id_domain_version(target_plugin.name()) {
+            target_index.index_version = floor_version;
+        }
+
         let index_details = crate::pb::JsonIndexDetails {
             path,
             target_details: Some(target_index.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_index.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
@@ -1149,48 +1196,23 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
-        // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
-        // the target's; `JsonIndexDetails` does not yet record the target's own
-        // version, so it has to be inferred here instead.
+
+        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`), not the
+        // target's. The target's own persisted version lives in `target_index_version`;
         //
-        // BTree, Bitmap, and LabelList are the one case where that matters. Unlike
-        // their non-wrapped builds (`build_scalar_index`/`build_bitmap_index_segment`
-        // in the `lance` crate), training through this wrapper has no dataset
-        // awareness to downgrade the version when a row id and a row address
-        // coincide -- their own `TrainingRequest`s always ask for addresses, so a
-        // JSON-wrapped instance's postings are always address-valued. That is only
-        // safe to persist as the pre-migration, row-id-domain floor version, never
-        // the current (address-domain) max: on a dataset without stable row ids the
-        // two values coincide, and `build_scalar_index`'s guard in the `lance` crate
-        // refuses to build one of these three as a JSON target at all once stable
-        // row ids are enabled (where they would not). Passing the current max here
-        // would misread a stable-row-id instance as address-domain and silently
-        // translate its row ids as if they were addresses. Every other target type
-        // never gained a second, incompatible on-disk format, so its current max
-        // version remains the accurate stand-in.
-        let legacy_row_id_domain_version = [
-            (
-                BuiltinIndexType::BTree,
-                crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
-            ),
-            (
-                BuiltinIndexType::Bitmap,
-                crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
-            ),
-            (
-                BuiltinIndexType::LabelList,
-                crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
-            ),
-        ]
-        .into_iter()
-        .find(|(builtin, _)| target_plugin.name().eq_ignore_ascii_case(builtin.as_str()))
-        .map(|(_, version)| version);
+        // If `target_index_version` is missing then we have to guess.  Our best guess
+        // is that this is an old index written before `target_index_version` was added.
+        // These indexes were the old versions that stored row ids and not row addresses.
+        let target_index_version = json_details.target_index_version.unwrap_or_else(|| {
+            // Minhash, ngram, and rtree have no row-id-domain version of their own.
+            legacy_row_id_domain_version(target_plugin.name()).unwrap_or(0)
+        });
+
         let target_index = target_plugin
             .load_index(
                 index_store,
                 target_details,
-                legacy_row_id_domain_version.unwrap_or_else(|| target_plugin.version()),
+                target_index_version,
                 frag_reuse_index,
                 cache,
             )
@@ -1214,10 +1236,16 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::bitmap::{BitmapIndex, BitmapIndexPlugin};
+    use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::lookup_test_util::lookup_pairs;
     use crate::scalar::{SargableQuery, TextQuery};
-    use arrow_array::{ArrayRef, RecordBatch};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, record_batch};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
+    use lance_io::object_store::ObjectStore;
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
@@ -1231,6 +1259,44 @@ mod tests {
     #[case::accessor_array_index("0", false)]
     fn test_path_matches_typed_accessor(#[case] path: &str, #[case] expected: bool) {
         assert_eq!(JsonQueryParser::path_matches_typed_accessor(path), expected);
+    }
+
+    /// Lookup keys are values of the indexed path, in the target index's
+    /// type, and are answered by the target index, in its row domain.
+    #[rstest]
+    #[case::row_addresses(true)]
+    #[case::row_ids(false)]
+    #[tokio::test]
+    async fn test_json_lookup_forwards_to_target(#[case] results_are_row_addresses: bool) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch =
+            record_batch!(("value", Int64, [1, 1, 2]), (ROW_ADDR, UInt64, [0, 2, 1])).unwrap();
+        let schema = batch.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok(batch) }),
+        ));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let target = BitmapIndex::load(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            results_are_row_addresses,
+        )
+        .await
+        .unwrap();
+        let index = JsonIndex::new(target, "x".to_string());
+        assert_eq!(index.results_are_row_addresses(), results_are_row_addresses);
+
+        let keys: ArrayRef = Arc::new(Int64Array::from(vec![1, 3]));
+        assert_eq!(lookup_pairs(&index, keys).await, vec![(0, 0), (0, 2)]);
     }
 
     #[test]
@@ -1358,6 +1424,7 @@ mod tests {
             path: "$.value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
         .unwrap();
 
@@ -1391,6 +1458,7 @@ mod tests {
             path: "$.value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
         .unwrap();
 
@@ -1408,7 +1476,7 @@ mod tests {
     #[tokio::test]
     async fn test_json_extract_with_type_info() {
         use arrow_array::{LargeBinaryArray, UInt64Array};
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
         use futures::stream;
 
         // Create test JSONB data

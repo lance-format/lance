@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use arc_swap::ArcSwap;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use lance_core::{
     Result,

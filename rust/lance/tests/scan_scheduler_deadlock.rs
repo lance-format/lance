@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::types::Int64Type;
 use arrow_array::{Int64Array, LargeBinaryArray, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
@@ -33,6 +34,9 @@ use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::{BatchUDF, NewColumnTransform, WriteParams};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datagen::{ByteCount, RowCount, array, gen_batch};
+use lance_file::version::LanceFileVersion;
+use lance_file::writer::FileWriterOptions;
 use rand::{RngCore, SeedableRng};
 use rstest::rstest;
 
@@ -338,4 +342,83 @@ fn add_fixed_column(name: &str, size: usize) -> NewColumnTransform {
         output_schema,
         result_checkpoint: None,
     })
+}
+
+#[tokio::test]
+async fn test_v2_0_indirect_multi_file_scan_with_small_budget() {
+    let test_dir = TempStrDir::default();
+    let expected = gen_batch()
+        .col("id", array::step::<Int64Type>())
+        .col("text", array::rand_utf8(ByteCount::from(256), false))
+        .col("items", array::rand_list(&DataType::Utf8, false))
+        .into_batch_rows(RowCount::from(128))
+        .unwrap();
+    let base = expected.project(&[0, 1]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(base.clone())], base.schema()),
+        test_dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            max_rows_per_file: 64,
+            file_writer_options: Some(FileWriterOptions {
+                max_page_bytes: Some(4096),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let items = expected.project(&[2]).unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::BatchUDF(BatchUDF {
+                output_schema: items.schema(),
+                mapper: Box::new(move |batch: &RecordBatch| {
+                    let ids = batch["id"].as_any().downcast_ref::<Int64Array>().unwrap();
+                    Ok(items.slice(ids.value(0) as usize, batch.num_rows()))
+                }),
+                result_checkpoint: None,
+            }),
+            Some(vec!["id".to_string()]),
+            Some(17),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    for fragment in dataset.get_fragments() {
+        assert_eq!(fragment.metadata().files.len(), 2);
+        for file in &fragment.metadata().files {
+            assert_eq!(
+                file.file_version().unwrap(),
+                LanceFileVersion::V2_0.resolve()
+            );
+        }
+    }
+
+    let mut scanner = dataset.scan();
+    scanner
+        .batch_size(7)
+        .batch_readahead(1)
+        .io_buffer_size(8192);
+    // Cancel a real scan with indirect reads outstanding, then scan every value.
+    // Both files must progress even when a sibling holds the small I/O budget.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut cancelled = scanner.try_into_stream().await.unwrap();
+        assert!(cancelled.try_next().await.unwrap().is_some());
+        drop(cancelled);
+        let mut stream = scanner.try_into_stream().await.unwrap();
+        let mut rows = 0;
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let wanted = expected.slice(rows, batch.num_rows());
+            for name in ["id", "text", "items"] {
+                assert_eq!(batch[name].as_ref(), wanted[name].as_ref());
+            }
+            rows += batch.num_rows();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rows, expected.num_rows());
+    })
+    .await
+    .expect("2.0 multi-file scan stalled with an 8 KiB I/O budget");
 }

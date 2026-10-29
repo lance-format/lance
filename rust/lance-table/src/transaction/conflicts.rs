@@ -138,6 +138,7 @@ impl PartialEq for Operation {
                     new_fragments: a_new,
                     fields_modified: a_fields,
                     compacted_sstables: a_compacted_sstables,
+                    mem_wal_dir_id: a_mem_wal_dir_id,
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
                     inserted_rows_filter: a_inserted_rows_filter,
@@ -149,6 +150,7 @@ impl PartialEq for Operation {
                     new_fragments: b_new,
                     fields_modified: b_fields,
                     compacted_sstables: b_compacted_sstables,
+                    mem_wal_dir_id: b_mem_wal_dir_id,
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
                     inserted_rows_filter: b_inserted_rows_filter,
@@ -160,6 +162,7 @@ impl PartialEq for Operation {
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
                     && compare_vec(a_compacted_sstables, b_compacted_sstables)
+                    && a_mem_wal_dir_id == b_mem_wal_dir_id
                     && compare_vec(
                         a_fields_for_preserving_frag_bitmap,
                         b_fields_for_preserving_frag_bitmap,
@@ -726,11 +729,13 @@ impl PartialEq for Operation {
             (
                 Self::UpdateMemWalState {
                     compacted_sstables: a_compacted,
+                    dir_id: a_dir_id,
                 },
                 Self::UpdateMemWalState {
                     compacted_sstables: b_compacted,
+                    dir_id: b_dir_id,
                 },
-            ) => compare_vec(a_compacted, b_compacted),
+            ) => compare_vec(a_compacted, b_compacted) && a_dir_id == b_dir_id,
             (Self::Clone { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
