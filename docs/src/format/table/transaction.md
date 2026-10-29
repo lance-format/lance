@@ -697,8 +697,9 @@ in that fragment with an `AddDataFile` that also has `data_change` false and
 holds the same base values (overlays not applied) for every physical row. No
 value a reader sees changes, so overlays keep shadowing the base, index
 coverage is kept, and no row's last-updated-at version moves. Nor does it count
-as writing values against a concurrent index build over those fields or a
-concurrent change that makes one of them required. Apply rejects a `false`
+as writing values against a concurrent overlay of those fields, a concurrent
+index build over them, or a concurrent change that makes one of them required.
+Apply rejects a `false`
 tombstone whose fields are not all re-bound that way, and an `AddDataFile`
 whose `data_change` differs from that of the tombstone it re-binds.
 
