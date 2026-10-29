@@ -67,12 +67,26 @@ fn byte_copy_sizes<T: ByteArrayType>(array: &GenericByteArray<T>) -> (usize, usi
     )
 }
 
-fn flat_buffer_ptr(array: &dyn Array) -> Option<usize> {
-    array
-        .to_data()
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FlatBufferIdentity(Vec<usize>);
+
+fn flat_buffer_identity(array: &dyn Array) -> Option<FlatBufferIdentity> {
+    let data = array.to_data();
+    let mut roots = data
         .buffers()
-        .first()
+        .iter()
+        .filter(|buffer| !buffer.is_empty() || buffer.capacity() > 0)
         .map(|buffer| buffer.data_ptr().as_ptr() as usize)
+        .collect::<Vec<_>>();
+    if let Some(nulls) = data.nulls() {
+        let buffer = nulls.inner().inner();
+        if !buffer.is_empty() || buffer.capacity() > 0 {
+            roots.push(buffer.data_ptr().as_ptr() as usize);
+        }
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    (!roots.is_empty()).then_some(FlatBufferIdentity(roots))
 }
 
 #[derive(Debug)]
@@ -91,7 +105,7 @@ pub struct AccumulationQueue {
     buffered_arrays: Vec<ArrayRef>,
     current_bytes: u64,
     // The source allocation shared by every retained slice in the current page.
-    shared_buffer: Option<usize>,
+    shared_buffer: Option<FlatBufferIdentity>,
     // A page completed while another page was already being returned.
     flush_pending: bool,
     // Row number of the first item in buffered_arrays, reset on flush
@@ -158,7 +172,7 @@ impl AccumulationQueue {
                     let original_bytes = array.get_array_memory_size();
                     let shared_buffer =
                         if self.retain_shared_slices && original_bytes > compacted_bytes {
-                            flat_buffer_ptr(array.as_ref())
+                            flat_buffer_identity(array.as_ref())
                         } else {
                             None
                         };
@@ -167,7 +181,7 @@ impl AccumulationQueue {
                         // from two parents would keep both buffers alive even
                         // though their visible bytes fit in the cache budget.
                         if !self.buffered_arrays.is_empty()
-                            && self.shared_buffer != Some(shared_buffer)
+                            && self.shared_buffer.as_ref() != Some(&shared_buffer)
                         {
                             debug_assert!(completed_page.is_none());
                             completed_page = self.take_page(false);
@@ -287,6 +301,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{Array, ArrayRef, BooleanArray, StringArray, UInt64Array};
+    use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::DataType;
     use lance_arrow::deepcopy::{deep_copy_array, deep_copy_array_sliced};
     use rstest::rstest;
@@ -390,6 +405,36 @@ mod tests {
             arrays[0].to_data().buffers()[0].data_ptr(),
             slice_b.to_data().buffers()[0].data_ptr()
         );
+    }
+
+    #[test]
+    fn test_shared_offsets_with_distinct_value_buffers_are_different_sources() {
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2]));
+        let values_a = {
+            let mut values = Vec::with_capacity(64 * 1024);
+            values.extend_from_slice(b"ab");
+            Buffer::from_vec(values)
+        };
+        let values_b = {
+            let mut values = Vec::with_capacity(128 * 1024);
+            values.extend_from_slice(b"ab");
+            Buffer::from_vec(values)
+        };
+        let array_a: ArrayRef = Arc::new(StringArray::new(offsets.clone(), values_a, None));
+        let array_b: ArrayRef = Arc::new(StringArray::new(offsets, values_b, None));
+        let copied_bytes = deep_copy_array_sliced(array_a.as_ref()).get_array_memory_size() as u64;
+        let mut queue =
+            AccumulationQueue::new_with_shared_slice_retention(copied_bytes * 2, 0, false, true);
+
+        assert!(queue.insert_with_page_info(array_a.clone(), 0, 2).is_none());
+        let page = queue.insert_with_page_info(array_b.clone(), 2, 2).unwrap();
+        assert!(!page.includes_inserted_array);
+        assert_eq!(page.arrays.len(), 1);
+        assert_eq!(page.arrays[0].as_ref(), array_a.as_ref());
+
+        let (arrays, row_number, num_rows) = queue.flush().unwrap();
+        assert_eq!((row_number, num_rows), (2, 2));
+        assert_eq!(arrays[0].as_ref(), array_b.as_ref());
     }
 
     #[rstest]
