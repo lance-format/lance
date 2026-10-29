@@ -6,6 +6,7 @@ syntax = "proto3";
 import "file.proto";
 import "table.proto";
 import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
 
 package lance.table;
 
@@ -424,6 +425,66 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  /* Register retention for the exact current source. Transaction.uuid is the
+   * pin ID and Transaction.read_version is the source version; neither is
+   * duplicated here. A fresh registration cannot rebase to another source.
+   */
+  message RegisterPin {
+    /* UUID of the source manifest's committing transaction.
+     * Absent or empty is invalid; compare exact UTF-8 bytes.
+     */
+    optional string source_transaction_uuid = 1;
+    /* UTC request creation time, fixed before the first send.
+     * Absent is invalid. The pin retains this value through retries/renewals.
+     */
+    google.protobuf.Timestamp created_at = 2;
+    /* Absolute UTC expiry time fixed before the first send.
+     * Absent or not later than created_at is invalid.
+     */
+    google.protobuf.Timestamp expires_at = 3;
+    /* Optional immutable context. Absent or empty means no label.
+     * Recovering an active registration returns its existing label.
+     */
+    optional string job_label = 4;
+  }
+
+  // Extend an existing pin; this operation never creates a missing pin.
+  message RenewPin {
+    // Target pin ID. Absent or empty is invalid.
+    optional string pin_id = 1;
+    /* Fixed requested absolute UTC expiry time. Absent is invalid.
+     * A current expires_at that meets or exceeds this request is a successful no-op.
+     */
+    google.protobuf.Timestamp expires_at = 2;
+  }
+
+  // Remove one pin; an absent target is a successful no-op.
+  message ReleasePin {
+    // Target pin ID. Absent or empty is invalid.
+    optional string pin_id = 1;
+  }
+
+  /* Revoke pins selected by ordinary cleanup. Re-evaluate each entry against
+   * current membership and exact expires_at; skip absent or changed entries.
+   * Duplicate candidate IDs are invalid. An empty effective set is a no-op.
+   */
+  message ExpirePins {
+    message Candidate {
+      // Target pin ID. Absent or empty is invalid.
+      optional string pin_id = 1;
+      /* The UTC expires_at observed during inspection. Absent is invalid.
+       * It must be at or before observed_at and still equal the current expires_at.
+       */
+      google.protobuf.Timestamp expected_expires_at = 2;
+    }
+    // Pins inspected for revocation. Absent/empty means no candidates.
+    repeated Candidate candidates = 1;
+    /* UTC time sampled by cleanup when it selected these candidates.
+     * Absent is invalid. Retrying this logical decision preserves this cutoff.
+     */
+    google.protobuf.Timestamp observed_at = 2;
+  }
+
   /* The operation of this transaction.
    *
    * Field numbers 100-199 are reserved for operations. A reader that sees a
@@ -447,6 +508,10 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    RegisterPin register_pin = 116;
+    RenewPin renew_pin = 117;
+    ReleasePin release_pin = 118;
+    ExpirePins expire_pins = 119;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

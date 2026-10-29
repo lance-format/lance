@@ -126,8 +126,12 @@ pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 /// them must refuse the dataset. Ordinary readers can ignore this metadata; all
 /// covered features share this one bit.
 pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
+/// Writer-only retention requirements for ongoing work pins in the current manifest.
+/// Reserved and unsupported until pin-aware writes and maintenance are implemented.
+/// Ordinary reads do not require support for the pin metadata.
+pub const FLAG_ONGOING_WORK_PINS: u64 = 1 << 19;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 18;
+pub const FLAG_UNKNOWN: u64 = 1 << 20;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -146,6 +150,7 @@ const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_ONGOING_WORK_PINS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -384,6 +389,9 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    // Bit 18 is left for separate format proposals and has no supported feature here.
+    mark_supported(&mut supported, 1 << 18, false);
+    mark_supported(&mut supported, FLAG_ONGOING_WORK_PINS, false);
     supported
 }
 
@@ -574,12 +582,42 @@ mod tests {
     use super::*;
     use crate::format::BasePath;
 
+    #[rstest::rstest]
+    #[case::unassigned_bit_18(1 << 18, 18)]
+    #[case::ongoing_work_pins(FLAG_ONGOING_WORK_PINS, 19)]
+    fn test_reserved_writer_flag_fences_writes_without_blocking_reads(
+        #[case] flag: u64,
+        #[case] bit: u32,
+        #[values(false, true)] overlay_enabled: bool,
+        #[values(false, true)] frag_reuse_with_stable_row_ids_enabled: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = flag;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(flag));
+        assert!(!can_write_dataset(flag));
+        assert_eq!(flag, 1 << bit);
+        assert_eq!(
+            supported_flags_when(overlay_enabled, frag_reuse_with_stable_row_ids_enabled) & flag,
+            0
+        );
+        // The zone seed bit is supported; ongoing-work pins remain reserved.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 20);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
     #[test]
     fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         assert!(can_read_dataset(FLAG_OBJECT_METADATA));
         assert!(can_write_dataset(FLAG_OBJECT_METADATA));
-        assert_eq!(FLAG_UNKNOWN, 1 << 18);
+        assert_eq!(FLAG_UNKNOWN, 1 << 20);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 

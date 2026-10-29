@@ -1188,6 +1188,8 @@ impl From<&Manifest> for pb::Manifest {
             branch: m.branch.clone(),
             clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
             max_clustering_id: m.max_clustering_id,
+            // Pin-aware writes are gated by the unsupported writer capability.
+            ongoing_work_pins: Vec::new(),
             writer_version: m
                 .writer_version
                 .as_ref()

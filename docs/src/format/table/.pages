@@ -5,6 +5,7 @@ nav:
   - Table Config: table_config.md
   - Versioning: versioning.md
   - Transactions: transaction.md
+  - Ongoing Work Pins: ongoing_work_pins.md
   - Layout: layout.md
   - Branch & Tag: branch_tag.md
   - Row ID & Lineage: row_id_lineage.md

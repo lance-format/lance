@@ -605,6 +605,66 @@ An UpdateBases operation only modifies the base paths. As a result, it only conf
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
 
+## Ongoing Work Pin Transactions
+
+The persisted operations are `RegisterPin` (field 116), `RenewPin` (117),
+`ReleasePin` (118), and `ExpirePins` (119), defined in `protos/transaction.proto`.
+They mutate only the authoritative current pin list and its required capability.
+They cannot be used in detached commits. The record, time, identity, no-op, and
+confirmation rules are specified in [Ongoing Work Pins](ongoing_work_pins.md).
+Their manifest conflict rules do not make physical cleanup or branch deletion
+atomic with acquisition; the existing [maintenance concurrency limits](ongoing_work_pins.md#maintenance-concurrency-limits)
+still apply.
+
+### Directional conflict rules
+
+For an incoming fresh RegisterPin, recover an identical active ID/source first.
+Otherwise require the exact current `(version, source transaction UUID)` to equal
+its fixed source, and publish only at that version plus one. Every intervening
+commit prevents fresh creation; there is no source-changing rebase. This guard
+does not require decoding intervening transactions or fetching their sidecars.
+A lost-response retry still needs current membership and source confirmation.
+
+For all other incoming operations, the following rules describe their behavior
+across a committed pin operation. Existing conflicts with other data operations
+still apply; this does not make a conflicting Append/Overwrite pair compatible.
+Unknown transaction operations retain their existing fail-closed conflict rule.
+
+| Incoming operation | Across committed RegisterPin, RenewPin, ReleasePin, or ExpirePins |
+| --- | --- |
+| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases | May rebase under their existing data rules; copy the current pin list unchanged. None may rewrite pins through config or metadata. Any FRI history removal must also obey current pin retention. |
+| CreateIndex | May rebase under existing index rules, preserve current pins, and revalidate retained FRI history if the operation replaces or trims it. Index attachment does not release a pin. |
+| Rewrite | Revalidate current pins at the final target. A result without required movement records is a conflict requiring replanning, even when planned before registration. Preserve current pin membership and required history. |
+| Restore, Overwrite | Preserve the current active list and sticky capability, including current `expires_at` values and fixed sources; never substitute historical or newly empty lists. Existing data conflicts remain. |
+| Clone | Does not copy source pins into the new branch/table. Preserve an inherited sticky capability and the source's independent snapshot protections. Source publication/retention rules still apply. |
+| RegisterPin | Recover the identical active ID/source or fail the fresh exact-source guard. Never move an existing acquisition to a new source. |
+| RenewPin | Re-read the target pin. Missing is an error; an already satisfied request is a no-op; otherwise extend to the fixed later `expires_at`. Another renewal cannot shorten it. |
+| ReleasePin | Remove only the target ID from the current list; absent is a no-op. Concurrent renewal does not prevent explicit release. |
+| ExpirePins | Compare each candidate's ID and `expected_expires_at` with current state. Skip missing IDs or changed `expires_at` values and remove only still-eligible candidates. |
+
+Incoming RenewPin, ReleasePin, and ExpirePins can re-evaluate over the existing
+known data operations against the resulting current list: ordinary writes,
+Restore, and Overwrite carry the list forward. They do not bypass ordinary
+writer-capability checks, branch identity, or unknown-operation rules. An
+operation cannot use this compatibility text to migrate an old handle to a
+recreated branch. Clone creates a separate destination and does not transfer
+ownership of a pin mutation there.
+
+A renewal that commits first changes `expires_at` and defeats an older
+expiration decision. If ReleasePin or ExpirePins removes the ID first, RenewPin
+fails rather than recreating it. An absent-ID ReleasePin does not fence a
+registration still in flight. Distinct IDs operate independently. Pin operations
+with no effect do not commit another version; committed mutations otherwise
+count as ordinary versions and cleanup intervals.
+
+All operations that remove FRI transitions must revalidate the union of current
+pin and attached-consumer requirements, using the representation-specific rules
+in [Ongoing Work Pins](ongoing_work_pins.md#retention-and-data-operations).
+Restore and Overwrite apply those rules to the resulting current history and
+may discard translation paths as described there; they must still preserve
+current pins and their source snapshots.
+Pin changes never loosen other transaction preconditions.
+
 ## Conflict Resolution
 
 ### Terminology

@@ -410,6 +410,12 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            // Reserved format operations remain unsupported until runtime
+            // handling is implemented. Unknown operations fail closed.
+            Some(pb::transaction::Operation::RegisterPin(_))
+            | Some(pb::transaction::Operation::RenewPin(_))
+            | Some(pb::transaction::Operation::ReleasePin(_))
+            | Some(pb::transaction::Operation::ExpirePins(_)) => Operation::Unknown {},
             // prost drops unrecognized oneof fields, so an operation from a
             // newer writer is indistinguishable from a missing one.
             None => Operation::Unknown {},
@@ -838,6 +844,31 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use prost::Message;
+
+    #[rstest::rstest]
+    #[case::register(pb::transaction::Operation::RegisterPin(Default::default()))]
+    #[case::renew(pb::transaction::Operation::RenewPin(Default::default()))]
+    #[case::release(pb::transaction::Operation::ReleasePin(Default::default()))]
+    #[case::expire(pb::transaction::Operation::ExpirePins(Default::default()))]
+    fn test_ongoing_work_pin_operations_remain_unsupported(
+        #[case] operation: pb::transaction::Operation,
+    ) {
+        let message = pb::Transaction {
+            read_version: 12,
+            uuid: "pin-operation".to_string(),
+            operation: Some(operation),
+            ..Default::default()
+        };
+        let decoded = pb::Transaction::decode(message.encode_to_vec().as_slice()).unwrap();
+        let transaction = Transaction::try_from(decoded).unwrap();
+        assert!(matches!(transaction.operation, Operation::Unknown {}));
+        assert_eq!(transaction.read_version, 12);
+        assert_eq!(transaction.uuid, "pin-operation");
+        let error = pb::Transaction::try_from(&transaction).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be re-encoded"));
+    }
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {

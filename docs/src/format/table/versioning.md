@@ -41,9 +41,36 @@ they should return an "unsupported" error on any read or write operation.
 | `2^15`   | `FLAG_NON_REUSABLE_FIELD_IDS`    | No              | Yes             | The manifest sets `max_allocated_field_id`, and a writer must assign new field IDs above it. Before activation, all clients that can write to the dataset must enforce writer feature flags. See [Field IDs](schema.md#field-ids). |
 | `2^16`   | `FLAG_ZONE_WRITE_SEEDS`         | Yes             | Yes             | Referenced data files contain version 1 [zone write seeds](../index/scalar/zone_write_seeds.md). Both bits remain set in derived snapshots, including clone and restore. Reserved and unsupported until implemented. |
 | `2^17`   | `FLAG_OBJECT_METADATA`         | No              | Yes             | The snapshot contains [clustering definitions, references, or a nonzero allocation high-water mark](clustering.md), nonempty [fragment metadata](index.md#fragment-metadata), or nonempty [index segment metadata](../index/index.md#index-segment-metadata). Reserved, unsupported until writers implement the maintenance rules. Readers may ignore this metadata. |
+| `2^19`   | `FLAG_ONGOING_WORK_PINS` | No | Yes | The current manifest owns the active [ongoing-work pin list](ongoing_work_pins.md). Sticky after first activation, including restore and an empty list. Reserved and unsupported until pin maintenance is implemented. |
 
 </div>
 
-Bits 16 and 17 are reserved but remain unsupported. Bits at positions 18 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, and zone write-seed reader and writer bits must each either both be set or both be clear; a half-set manifest is invalid.
+Bits 16, 17, and 19 are reserved but remain unsupported. Bit 18 is not assigned by this specification and must remain unsupported until separately defined and implemented. Bits at positions 20 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, and zone write-seed reader and writer bits must each either both be set or both be clear; a half-set manifest is invalid.
 
 Committing schema metadata `lance.blob.managed = "true"` activates the Managed Blob capability, even without new blob files. Ordinary Blob v2 writes without this opt-in do not activate it. Once activated, removing the opt-in, removing Blob fields, or restoring an older snapshot does not clear it. Before activation, all maintenance clients must support Managed Blobs: the flag cannot revoke old handles or prevent older clients from running cleanup through an unflagged historical snapshot. See [client compatibility](../../guide/blob.md#managed-objects-and-client-compatibility).
+
+## Current state for pin decisions
+
+Pin acquisition, recovery, renewal, expiration, ordinary writes carrying pins,
+restore, overwrite, compaction, retention planning, and branch-deletion checks
+must resolve the authoritative current attached manifest. A previously opened
+Dataset, historical transaction read-back, or hint that stops probing at a gap
+is insufficient.
+
+For ordinary file/object-store commit handlers, enumerate attached manifests
+using the active naming scheme, exclude detached and staging files, and choose
+the highest version. On an unordered store, consume every listing page. A
+lexically ordered V2 listing may stop at its first valid attached manifest when
+that naming scheme's ordering guarantee applies. Read the selected manifest;
+if it disappeared, restart resolution rather than accepting an older cached
+result. Propagate listing/read errors. An optimization is allowed only if it
+preserves this result in the presence of reclaimed slots and delayed writes.
+A hint that moves forward alone is not a correctness proof.
+
+External commit stores must resolve and finalize their selected authoritative
+head through their own commit protocol; do not replace their coordination with
+an uncoordinated object listing. A backend must provide the visibility guarantees
+required by its commit protocol or refuse pin acquisition. These reads do not
+lock current state. Apply the transaction's publication and retry rules after
+resolution; the [maintenance concurrency limits](ongoing_work_pins.md#maintenance-concurrency-limits)
+remain even when these reads succeed.

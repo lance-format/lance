@@ -28,6 +28,10 @@ A manifest describes a single version of the dataset.
 It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
 a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.
 
+[Ongoing work pins](ongoing_work_pins.md) record unfinished jobs' source snapshots
+and FRI retention requirements in the current manifest. See that specification
+for their lifecycle and the existing maintenance concurrency limits.
+
 `max_allocated_field_id` is optional. If a manifest sets it, the dataset uses non-reusable field IDs from
 that version onward. See [Field IDs](schema.md#field-ids).
 
