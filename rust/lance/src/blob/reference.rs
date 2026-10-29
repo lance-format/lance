@@ -2386,6 +2386,104 @@ mod tests {
     }
 
     #[rstest]
+    #[case::middle(false)]
+    #[case::last(true)]
+    #[tokio::test]
+    async fn read_refs_cancel_queued_stream_preserves_survivor(#[case] cancel_last: bool) {
+        let (reader, source, budget, recorded) = recorded_ref_reader(4, 8).await;
+        let mut streams = (0..3)
+            .map(|index| {
+                reader
+                    .read([ref_read_request(
+                        &source,
+                        index,
+                        index * 4,
+                        4,
+                        BlobRefDemand::Whole,
+                    )])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let first = streams[0].try_next().await.unwrap().unwrap();
+        assert!(streams[1].try_next().now_or_never().is_none());
+        assert!(streams[2].try_next().now_or_never().is_none());
+        let cancelled = if cancel_last { 2 } else { 1 };
+        let survivor = if cancel_last { 1 } else { 2 };
+        streams[cancelled].cancel();
+        let error = streams[cancelled].try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("cancelled"));
+        drop(first);
+        let result = tokio::time::timeout(Duration::from_secs(1), streams[survivor].try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.request_index, survivor as u64);
+        assert_eq!(
+            result.data.as_deref(),
+            Some(if cancel_last {
+                b"efgh".as_slice()
+            } else {
+                b"ijkl".as_slice()
+            })
+        );
+        assert_eq!(recorded.requested_blob_ranges().len(), 2);
+        drop(result);
+        drop(streams);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn read_refs_cancel_metadata_initializer_with_waiting_stream() {
+        let (reader, source, budget, recorded, gate) = external_metadata_ref_reader(2).await;
+        let reference = source
+            .reference(
+                "mock://objects/shared".into(),
+                0,
+                None,
+                BlobKind::External,
+                None,
+            )
+            .unwrap();
+        let request = BlobRefRequest::new(
+            0,
+            Some(reference),
+            BlobRefDemand::Range(BlobReadRange::new(2, 3)),
+        );
+        let mut first = reader.read([request.clone()]).unwrap();
+        let mut second = reader.read([request.clone()]).unwrap();
+        assert!(first.try_next().now_or_never().is_none());
+        assert!(second.try_next().now_or_never().is_none());
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 1);
+        first.cancel();
+        let error = first.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("cancelled"));
+        gate.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(1), second.try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.data.as_deref(), Some(b"cde".as_slice()));
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 2);
+        drop(result);
+        drop(second);
+        let repeated = reader
+            .read([request])
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.data.as_deref(), Some(b"cde".as_slice()));
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 2);
+        drop(repeated);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[rstest]
     #[case::cancel(true)]
     #[case::drop(false)]
     #[tokio::test]
