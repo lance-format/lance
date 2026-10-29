@@ -24,7 +24,8 @@ use crate::object_store::{
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
     throttle::{
-        AimdThrottleState, Transport, cloud_http_connector, shared_throttle_state, with_throttling,
+        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        shared_throttle_state, with_throttling,
     },
 };
 use lance_core::error::{Error, Result};
@@ -272,6 +273,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
+            reject_http_connector_for_opendal(params)?;
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
             // Listed in full: no paginated lister covers OpenDAL yet.
@@ -391,6 +393,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::object_store::test_utils::RecordingConnector;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
     use std::collections::HashMap;
@@ -788,5 +791,46 @@ mod tests {
         assert!(azdls_cap.rename, "Azdls should support rename");
         assert!(azdls_cap.create_dir, "Azdls should support create_dir");
         assert!(!azblob_cap.rename, "Azblob should not support rename");
+    }
+
+    #[tokio::test]
+    async fn test_azure_store_opens_its_clients_with_the_given_http_connector() {
+        let connector = Arc::new(RecordingConnector::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    (
+                        "azure_storage_account_name".to_string(),
+                        "account".to_string(),
+                    ),
+                    ("azure_skip_signature".to_string(), "true".to_string()),
+                ]),
+            ))),
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+
+        let url = Url::parse("az://container/path").unwrap();
+        let store = AzureBlobStoreProvider
+            .new_store(url, &params)
+            .await
+            .unwrap();
+        let found = object_store::ObjectStoreExt::get(
+            store.inner.as_ref(),
+            &object_store::path::Path::from("path/file"),
+        )
+        .await;
+
+        assert!(
+            matches!(found, Err(object_store::Error::NotFound { .. })),
+            "{found:?}"
+        );
+        assert!(connector.connects.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].ends_with("/container/path/file"),
+            "{requests:?}"
+        );
     }
 }

@@ -632,9 +632,9 @@ impl ObjectStoreMetricsExt for Arc<dyn object_store::ObjectStore> {
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 mod http {
     use super::*;
+    use crate::object_store::throttle::Transport;
     use object_store::client::{
-        ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse,
-        HttpService, ReqwestConnector,
+        ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService,
     };
 
     /// An [`HttpConnector`] that records throttle and retryable responses
@@ -643,25 +643,19 @@ mod http {
     #[derive(Debug)]
     pub struct MeteringHttpConnector {
         base: String,
-        inner: Arc<dyn HttpConnector>,
+        inner: Transport,
     }
 
     impl MeteringHttpConnector {
         pub fn new(base: String) -> Self {
-            Self {
-                base,
-                inner: Arc::new(ReqwestConnector::default()),
-            }
+            Self::with_transport(base, Transport::new(None))
         }
 
         /// Meter the clients `transport` opens, and not object_store's default ones.
-        pub(crate) fn with_transport(
-            base: String,
-            transport: crate::object_store::throttle::Transport,
-        ) -> Self {
+        pub(crate) fn with_transport(base: String, transport: Transport) -> Self {
             Self {
                 base,
-                inner: Arc::new(transport),
+                inner: transport,
             }
         }
     }

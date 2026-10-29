@@ -663,7 +663,7 @@ impl<C> AimdHttpConnector<C> {
 
 /// The caller's connector from [`ObjectStoreParams::http_connector`], or object_store's default.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Transport(Arc<dyn HttpConnector>);
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -682,6 +682,19 @@ impl HttpConnector for Transport {
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
         self.0.connect(options)
     }
+}
+
+/// OpenDAL opens its own HTTP clients, so it would drop the caller's connector without notice.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn reject_http_connector_for_opendal(
+    params: &ObjectStoreParams,
+) -> lance_core::Result<()> {
+    if params.http_connector.is_some() {
+        return Err(lance_core::Error::not_supported(
+            "OpendalStore does not support an explicit http_connector; unset use_opendal to use it",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(

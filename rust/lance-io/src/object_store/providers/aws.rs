@@ -36,7 +36,8 @@ use crate::object_store::{
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{
-        AimdThrottleState, Transport, cloud_http_connector, shared_throttle_state, with_throttling,
+        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        shared_throttle_state, with_throttling,
     },
 };
 use lance_core::error::{Error, Result};
@@ -266,6 +267,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
+            reject_http_connector_for_opendal(params)?;
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
             (
@@ -738,6 +740,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+    use crate::object_store::test_utils::RecordingConnector;
 
     #[rstest::rstest]
     #[case::canonical("aws_region", "region")]
@@ -1183,6 +1186,29 @@ mod tests {
         assert!(err.to_string().contains("aws_credentials"), "got: {err}");
     }
 
+    /// OpenDAL opens its own clients, so a connector handed to it would be dropped.
+    #[tokio::test]
+    async fn test_use_opendal_rejects_an_explicit_http_connector() {
+        let params = ObjectStoreParams {
+            http_connector: Some(Arc::new(RecordingConnector::default())),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let err = AwsStoreProvider.new_store(url, &params).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "got: {err:?}, expected NotSupported"
+        );
+        assert!(err.to_string().contains("http_connector"), "got: {err}");
+    }
+
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back
     /// continuation tokens, which is all the native store resumes from — so an Express bucket
     /// pages like any other. The OpenDAL arm has no lister to page with at all.
@@ -1211,44 +1237,6 @@ mod tests {
 
         assert!(!store.list_is_lexically_ordered);
         assert_eq!(store.paginated_lister.is_some(), paginated);
-    }
-
-    /// Answers every request with 404 and records what reached it.
-    #[derive(Debug, Default)]
-    struct RecordingConnector {
-        connects: AtomicUsize,
-        requests: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    #[derive(Debug)]
-    struct NotFound(Arc<std::sync::Mutex<Vec<String>>>);
-
-    #[async_trait::async_trait]
-    impl object_store::client::HttpService for NotFound {
-        async fn call(
-            &self,
-            req: object_store::client::HttpRequest,
-        ) -> std::result::Result<object_store::client::HttpResponse, object_store::client::HttpError>
-        {
-            self.0.lock().unwrap().push(req.uri().to_string());
-            let mut response = object_store::client::HttpResponse::new(
-                object_store::client::HttpResponseBody::from(String::new()),
-            );
-            *response.status_mut() = http::StatusCode::NOT_FOUND;
-            Ok(response)
-        }
-    }
-
-    impl object_store::client::HttpConnector for RecordingConnector {
-        fn connect(
-            &self,
-            _options: &ClientOptions,
-        ) -> object_store::Result<object_store::client::HttpClient> {
-            self.connects.fetch_add(1, Ordering::SeqCst);
-            Ok(object_store::client::HttpClient::new(NotFound(
-                self.requests.clone(),
-            )))
-        }
     }
 
     #[tokio::test]
