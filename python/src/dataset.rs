@@ -2328,7 +2328,7 @@ impl Dataset {
                 }
                 operation.execute().await
             })?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_timeout_error()?;
         Ok(cleanup_stats(stats))
     }
 

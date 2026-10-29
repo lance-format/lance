@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::dataset::retention::SnapshotMaintenanceLock;
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -564,9 +565,45 @@ impl Branches<'_> {
     ///
     /// If the `BranchContents` does not exist, it will return an error directly unless `force` is true.
     /// If `force` is true, it will try to delete the branch directories no matter `BranchContents` exists or not.
+    /// Ordinary deletion holds the exclusive snapshot maintenance lock from reference
+    /// checks through physical deletion. Contention returns [`Error::RefConflict`].
+    /// Forced deletion does not participate in snapshot-retention coordination.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// dataset.branches().delete("dev", false).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
+        let fence = if force {
+            None
+        } else {
+            SnapshotMaintenanceLock::for_branch_deletion(self.refs).await?
+        };
+        let result = self.delete_inner(branch, force, fence.as_ref()).await;
+        if let Some(fence) = fence {
+            let released = fence.release().await;
+            if result.is_ok() {
+                released?;
+            } else if let Err(error) = released {
+                log::warn!(
+                    "Failed to release branch-deletion maintenance lock for {branch}: {error}"
+                );
+            }
+        }
+        result
+    }
+
+    async fn delete_inner(
+        &self,
+        branch: &str,
+        force: bool,
+        fence: Option<&SnapshotMaintenanceLock>,
+    ) -> Result<()> {
         let all_branches = self.list().await?;
         let branch_id = all_branches
             .get(branch)
@@ -614,11 +651,18 @@ impl Branches<'_> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
+            if let Some(fence) = fence {
+                fence.check_valid()?;
+            }
             self.object_store().delete(&branch_file).await?;
         }
 
         // Clean up branch directories
-        self.cleanup_branch_directories(branch).await
+        self.cleanup_branch_directories(branch, fence).await?;
+        if let Some(fence) = fence {
+            fence.check_valid()?;
+        }
+        Ok(())
     }
 
     pub async fn list_ordered(
@@ -639,8 +683,15 @@ impl Branches<'_> {
     }
 
     /// Clean up empty parent directories
-    async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
+    async fn cleanup_branch_directories(
+        &self,
+        branch: &str,
+        fence: Option<&SnapshotMaintenanceLock>,
+    ) -> Result<()> {
         let branches = self.list().await?;
+        if let Some(fence) = fence {
+            fence.check_valid()?;
+        }
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
 
         if let Some(delete_path) =

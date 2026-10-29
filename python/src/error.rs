@@ -21,6 +21,13 @@ use pyo3::{
 
 use lance::Error as LanceError;
 
+pyo3::create_exception!(
+    lance,
+    RefConflictError,
+    PyRuntimeError,
+    "A reference or snapshot maintenance operation conflicts with another owner."
+);
+
 /// Return the `retryable` flag for a commit-conflict error.
 ///
 /// Mirrors the Rust conflict contract: `RetryableCommitConflict` and
@@ -89,12 +96,12 @@ fn namespace_error_to_pyerr(py: Python<'_>, ns_err: &NamespaceError) -> PyErr {
 pub trait PythonErrorExt<T> {
     /// Convert to a python error based on the Lance error type
     fn infer_error(self) -> PyResult<T>;
-    /// Convert to PyTimeoutError for `Error::Timeout`, otherwise PyIoError.
+    /// Surface timeout, reference, and commit conflicts distinctly; otherwise PyIoError.
     ///
     /// Used by call sites that historically mapped every `lance::Error` to
     /// PyIoError but should surface timeouts distinctly.
     fn io_or_timeout_error(self) -> PyResult<T>;
-    /// Convert commit conflicts to `CommitConflictError`, otherwise PyIoError.
+    /// Surface reference and commit conflicts distinctly; otherwise PyIoError.
     ///
     /// Used by call sites that historically mapped every `lance::Error` to
     /// PyIoError but should surface commit conflicts distinctly.
@@ -110,6 +117,7 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
         // shared cache/IO future maps to the same Python exception as the error
         // it wraps, rather than falling through to a generic RuntimeError.
         match err.find_root() {
+            LanceError::RefConflict { .. } => Err(RefConflictError::new_err(err.to_string())),
             LanceError::InvalidInput { .. }
             | LanceError::NotFound { .. }
             | LanceError::RefNotFound { .. }
@@ -145,6 +153,7 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
             return Ok(self.unwrap());
         };
         match err.find_root() {
+            LanceError::RefConflict { .. } => Err(RefConflictError::new_err(err.to_string())),
             LanceError::Timeout { .. } => Err(PyTimeoutError::new_err(err.to_string())),
             root @ (LanceError::RetryableCommitConflict { .. }
             | LanceError::CommitConflict { .. }
@@ -161,6 +170,7 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
             return Ok(self.unwrap());
         };
         match err.find_root() {
+            LanceError::RefConflict { .. } => Err(RefConflictError::new_err(err.to_string())),
             root @ (LanceError::RetryableCommitConflict { .. }
             | LanceError::CommitConflict { .. }
             | LanceError::IncompatibleTransaction { .. }) => {

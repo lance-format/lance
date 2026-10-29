@@ -13,6 +13,13 @@
  */
 package org.lance;
 
+import org.lance.BlobReferences.Batch;
+import org.lance.BlobReferences.Capture;
+import org.lance.BlobReferences.ReadStream;
+import org.lance.BlobReferences.Reader;
+import org.lance.BlobReferences.Request;
+import org.lance.BlobReferences.SourceContext;
+import org.lance.cleanup.CleanupPolicy;
 import org.lance.compaction.CompactionOptions;
 import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
@@ -58,6 +65,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -76,6 +86,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -2244,6 +2262,430 @@ public class DatasetTest {
   }
 
   // ===== Blob API tests =====
+
+  @ParameterizedTest
+  @ValueSource(strings = {"acquire", "release", "cleanup"})
+  void testSnapshotRetentionConflictException(String operation, @TempDir Path tempDir)
+      throws Exception {
+    Path path = tempDir.resolve("retention_conflict");
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            new TestUtils.SimpleTestDataset(allocator, path.toString()).createEmptyDataset()) {
+      SnapshotIdentity snapshot = SnapshotIdentity.fromDataset(dataset, "catalog/conflict");
+      SnapshotRetention token = SnapshotRetention.acquire(dataset, snapshot, "query");
+      Path owner =
+          path.resolve("_refs/retention-v1/maintenance").resolve(UUID.randomUUID().toString());
+      Files.createDirectories(owner.getParent());
+      Files.writeString(
+          owner, "{\"ticket\":1,\"expires_at\":\"2100-01-01T00:00:00Z\",\"mode\":\"exclusive\"}");
+      try {
+        LanceRefConflictException error =
+            assertThrows(
+                LanceRefConflictException.class,
+                () -> {
+                  switch (operation) {
+                    case "acquire":
+                      SnapshotRetention.acquire(dataset, snapshot, "other-query");
+                      break;
+                    case "release":
+                      token.release(dataset);
+                      break;
+                    case "cleanup":
+                      dataset.cleanup(CleanupPolicy.builder().build()).execute();
+                      break;
+                    default:
+                      throw new AssertionError(operation);
+                  }
+                });
+        assertTrue(error.getMessage().contains("maintenance lock"));
+      } finally {
+        Files.delete(owner);
+        token.release(dataset);
+      }
+      assertTrue(dataset.tags().list().isEmpty());
+    }
+  }
+
+  @Test
+  void testSnapshotAndBlobEntryPointsRejectNullAndClosedDatasets(@TempDir Path tempDir)
+      throws Exception {
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset original =
+            createBlobV2SelectorDataset(allocator, tempDir.resolve("closed").toString())) {
+      SourceContext source = SourceContext.fromDataset(original, "catalog/closed", "workers");
+      SnapshotIdentity snapshot = source.getSnapshotIdentity();
+      SnapshotRetention token = SnapshotRetention.acquire(original, snapshot, "query");
+      assertThrows(NullPointerException.class, () -> SnapshotIdentity.fromDataset(null, "table"));
+      assertThrows(
+          NullPointerException.class, () -> SourceContext.fromDataset(null, "table", "workers"));
+      assertThrows(NullPointerException.class, () -> Capture.create(null, source, 0));
+      assertThrows(
+          NullPointerException.class,
+          () -> Reader.create(List.of(source), Arrays.asList((Dataset) null), 1, 1));
+      assertThrows(
+          NullPointerException.class, () -> SnapshotRetention.acquire(null, snapshot, "other"));
+      assertThrows(NullPointerException.class, () -> token.release(null));
+      token.release(original);
+      original.close();
+      assertThrows(
+          IllegalArgumentException.class, () -> SnapshotIdentity.fromDataset(original, "table"));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> SourceContext.fromDataset(original, "table", "workers"));
+      assertThrows(IllegalArgumentException.class, () -> Capture.create(original, source, 0));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> Reader.create(List.of(source), List.of(original), 1, 1));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> SnapshotRetention.acquire(original, snapshot, "other"));
+      assertThrows(IllegalArgumentException.class, () -> token.release(original));
+      try (Dataset worker =
+          Dataset.open().allocator(allocator).uri(tempDir.resolve("closed").toString()).build()) {
+        assertThrows(
+            NullPointerException.class,
+            () -> Reader.create(List.of(source, source), Arrays.asList(worker, null), 1, 1));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Reader.create(List.of(source, source), List.of(worker, original), 1, 1));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Reader.create(List.of(source), List.of(worker, worker), 1, 1));
+        assertEquals(source.getVersion(), worker.version());
+        try (Reader reader = Reader.create(List.of(source), List.of(worker), 1, 1)) {
+          assertEquals(0, reader.getReservedBytes());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testBlobReferenceHandleCloneAndConcurrentClose(@TempDir Path tempDir) throws Exception {
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            createBlobV2SelectorDataset(allocator, tempDir.resolve("concurrent").toString())) {
+      SourceContext source = SourceContext.fromDataset(dataset, "catalog/concurrent", "workers");
+      Batch refs = capturePortableBlobBatches(dataset, source, allocator).get(0);
+      try (Reader reader = Reader.create(List.of(source), List.of(dataset), 1, 1)) {
+        Future<Long> reserved;
+        CountDownLatch started = new CountDownLatch(1);
+        synchronized (reader) {
+          reserved =
+              executor.submit(
+                  () -> {
+                    started.countDown();
+                    return reader.getReservedBytes();
+                  });
+          assertTrue(started.await(1, TimeUnit.SECONDS));
+          assertThrows(TimeoutException.class, () -> reserved.get(50, TimeUnit.MILLISECONDS));
+        }
+        assertEquals(0L, reserved.get(1, TimeUnit.SECONDS).longValue());
+        try (ReadStream stream =
+                reader.read(refs, List.of(Request.whole(0, 0), Request.whole(0, 1)));
+            VectorSchemaRoot held = stream.next(allocator)) {
+          assertNotNull(held);
+          CountDownLatch reading = new CountDownLatch(1);
+          Future<?> pending =
+              executor.submit(
+                  () -> {
+                    reading.countDown();
+                    try (VectorSchemaRoot next = stream.next(allocator)) {
+                      assertNull(next);
+                    } catch (IOException | IllegalArgumentException error) {
+                      assertTrue(
+                          error.getMessage().contains("cancel")
+                              || error.getMessage().contains("closed"));
+                    }
+                  });
+          assertTrue(reading.await(1, TimeUnit.SECONDS));
+          stream.close();
+          stream.cancel();
+          pending.get(1, TimeUnit.SECONDS);
+          assertTrue(reader.getReservedBytes() >= 2);
+        }
+        assertEquals(0, reader.getReservedBytes());
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testBlobReaderBindsDatasetsIndependently(boolean reverseOrder, @TempDir Path tempDir)
+      throws Exception {
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset left = createBlobV2SelectorDataset(allocator, tempDir.resolve("left").toString());
+        Dataset right =
+            createBlobV2SelectorDataset(allocator, tempDir.resolve("right").toString())) {
+      Dataset first = reverseOrder ? right : left;
+      Dataset second = reverseOrder ? left : right;
+      SourceContext firstSource = SourceContext.fromDataset(first, "catalog/first", "workers");
+      SourceContext secondSource = SourceContext.fromDataset(second, "catalog/second", "workers");
+      List<SourceContext> contexts = List.of(firstSource, secondSource);
+      List<Batch> references =
+          List.of(
+              capturePortableBlobBatches(first, firstSource, allocator)
+                  .get(0)
+                  .remapContexts(contexts),
+              capturePortableBlobBatches(second, secondSource, allocator)
+                  .get(0)
+                  .remapContexts(contexts));
+      FutureTask<Reader> creating =
+          new FutureTask<>(() -> Reader.create(contexts, List.of(first, second), 1, 1));
+      Thread binding = new Thread(creating, "blob-reader-binding");
+      binding.setDaemon(true);
+      ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+      try {
+        synchronized (second) {
+          binding.start();
+          long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+          ThreadInfo blocked = null;
+          while (System.nanoTime() < deadline) {
+            blocked = threads.getThreadInfo(binding.getId());
+            if (blocked != null
+                && blocked.getThreadState() == Thread.State.BLOCKED
+                && blocked.getLockInfo() != null
+                && blocked.getLockInfo().getIdentityHashCode() == System.identityHashCode(second)) {
+              break;
+            }
+            Thread.yield();
+          }
+          assertNotNull(blocked);
+          assertEquals(Thread.State.BLOCKED, blocked.getThreadState());
+          assertNotNull(blocked.getLockInfo());
+          assertEquals(
+              System.identityHashCode(second), blocked.getLockInfo().getIdentityHashCode());
+          // Binding the second dataset must not pin the first dataset's lifecycle lock.
+          executor.submit(first::close).get(1, TimeUnit.SECONDS);
+        }
+        try (Reader reader = creating.get(1, TimeUnit.SECONDS)) {
+          second.close();
+          for (Batch batch : references) {
+            try (ReadStream stream = reader.read(batch, List.of(Request.whole(0, 0)));
+                VectorSchemaRoot result = stream.next(allocator)) {
+              assertNotNull(result);
+              assertArrayEquals(
+                  new byte[] {0, 10}, ((LargeVarBinaryVector) result.getVector("data")).get(0));
+              assertNull(stream.next(allocator));
+            }
+          }
+        }
+      } finally {
+        // Release the blocked monitor before cleanup, including when this regression fails.
+        creating.get(1, TimeUnit.SECONDS).close();
+      }
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void testSnapshotRetentionForOrdinaryData(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("retained_data").toString();
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset fixture = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = fixture.createEmptyDataset();
+          Dataset first = fixture.write(empty.version(), 2);
+          Dataset original = fixture.write(first.version(), 2)) {
+        UpdateConfig config =
+            UpdateConfig.builder()
+                .configUpdates(
+                    UpdateMap.builder()
+                        .updates(Map.of("lance.snapshot_retention.lock_expiration_hours", "6"))
+                        .replace(false)
+                        .build())
+                .build();
+        try (Dataset configured =
+            original.newTransactionBuilder().operation(config).build().commit()) {
+          assertEquals(2, configured.getFragments().size());
+          SnapshotIdentity snapshot = SnapshotIdentity.fromDataset(configured, "catalog/ordinary");
+          snapshot = SnapshotIdentity.decode(snapshot.encode());
+          SnapshotRetention retention =
+              SnapshotRetention.acquire(configured, snapshot, "ordinary-query");
+          retention = SnapshotRetention.decode(retention.encode());
+          assertArrayEquals(snapshot.encode(), retention.getSnapshot().encode());
+          try (Dataset latest = Dataset.open().allocator(allocator).uri(path).build()) {
+            latest.delete("true");
+            CleanupPolicy policy =
+                CleanupPolicy.builder()
+                    .withBeforeTimestampMillis(Instant.now().plusSeconds(3600).toEpochMilli())
+                    .withErrorIfTaggedOldVersions(true)
+                    .build();
+            try {
+              latest.cleanup(policy).execute();
+              int rows = 0;
+              int sum = 0;
+              try (LanceScanner scanner = configured.newScan();
+                  ArrowReader reader = scanner.scanBatches()) {
+                while (reader.loadNextBatch()) {
+                  VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+                  IntVector ids = (IntVector) batch.getVector("id");
+                  rows += batch.getRowCount();
+                  for (int i = 0; i < batch.getRowCount(); i++) {
+                    sum += ids.get(i);
+                  }
+                }
+              }
+              assertEquals(4, rows);
+              assertEquals(2, sum);
+            } finally {
+              retention.release(latest);
+            }
+            retention.release(latest);
+            assertTrue(latest.cleanup(policy).execute().getDataFilesRemoved() >= 2);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testPortableBlobReferences(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("portable_blobs").toString();
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset original = createBlobV2SelectorDataset(allocator, path)) {
+      assertEquals(1, BlobReferences.getProtocolVersion());
+      assertArrayEquals(new int[] {1, 2}, BlobReferences.getSupportedCapabilities());
+      assertTrue(
+          Arrays.asList(BlobReferences.getSupportedOperations()).contains("snapshot_retention_v1"));
+      SourceContext source = SourceContext.fromDataset(original, "catalog/portable", "workers");
+      source = SourceContext.decode(source.encode());
+      assertEquals(original.version(), source.getVersion());
+      assertEquals("workers", source.getAccessContextKey());
+      assertNull(source.getBranch());
+      SnapshotRetention retention =
+          SnapshotRetention.acquire(original, source.getSnapshotIdentity(), "portable-query");
+      retention = SnapshotRetention.decode(retention.encode());
+      assertArrayEquals(source.getSnapshotIdentity().encode(), retention.getSnapshot().encode());
+      assertArrayEquals(
+          SnapshotIdentity.fromDataset(original, "catalog/portable").encode(),
+          source.getSnapshotIdentity().encode());
+      try {
+        List<Batch> batches = capturePortableBlobBatches(original, source, allocator);
+        try (Dataset latest = Dataset.open().allocator(allocator).uri(path).build()) {
+          latest.delete("true");
+          CleanupPolicy policy =
+              CleanupPolicy.builder()
+                  .withBeforeTimestampMillis(Instant.now().plusSeconds(3600).toEpochMilli())
+                  .withErrorIfTaggedOldVersions(true)
+                  .build();
+          latest.cleanup(policy).execute();
+          try (Dataset worker =
+                  Dataset.open()
+                      .allocator(allocator)
+                      .uri(source.getTableUri())
+                      .readOptions(
+                          new ReadOptions.Builder().setVersion(source.getVersion()).build())
+                      .build();
+              Reader reader = Reader.create(List.of(source), List.of(worker), 1024, 1024)) {
+            int fragment = 0;
+            for (Batch captured : batches) {
+              Batch batch = Batch.decode(captured.encode()).remapContexts(List.of(source));
+              try (VectorSchemaRoot root = batch.toArrow(allocator)) {
+                batch = Batch.fromArrow(Arrays.asList(batch.getContexts()), root, allocator);
+              }
+              Map<Long, byte[]> results = new HashMap<>();
+              try (ReadStream stream =
+                  reader.read(
+                      batch,
+                      List.of(
+                          Request.whole(0, -1L),
+                          Request.whole(1, 1),
+                          Request.whole(2, 2),
+                          Request.range(0, 3, 0, 1),
+                          Request.range(0, 4, 1, 1)))) {
+                VectorSchemaRoot next;
+                while ((next = stream.next(allocator)) != null) {
+                  try (VectorSchemaRoot result = next) {
+                    results.put(
+                        ((UInt8Vector) result.getVector("request_index")).get(0),
+                        ((LargeVarBinaryVector) result.getVector("data")).get(0));
+                  }
+                }
+              }
+              assertEquals(5, results.size());
+              assertArrayEquals(new byte[] {(byte) (3 * fragment), 10}, results.get(-1L));
+              assertTrue(results.containsKey(1L));
+              assertNull(results.get(1L));
+              assertArrayEquals(new byte[0], results.get(2L));
+              assertArrayEquals(new byte[] {(byte) (3 * fragment)}, results.get(3L));
+              assertArrayEquals(new byte[] {10}, results.get(4L));
+              assertEquals(0, reader.getReservedBytes());
+              assertEquals(0, reader.getIoReservedBytes());
+              fragment++;
+            }
+            assertEquals(2, fragment);
+          }
+          retention.release(latest);
+          retention.release(latest);
+          assertTrue(latest.cleanup(policy).execute().getDataFilesRemoved() >= 2);
+        }
+      } finally {
+        retention.release(original);
+      }
+    }
+  }
+
+  @Test
+  void testPortableBlobReferenceValidationAndCancellation(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            createBlobV2SelectorDataset(allocator, tempDir.resolve("refs").toString())) {
+      SourceContext source = SourceContext.fromDataset(dataset, "catalog/refs", "workers");
+      Batch batch = capturePortableBlobBatches(dataset, source, allocator).get(0);
+      try (Reader reader = Reader.create(List.of(source), List.of(dataset), 1, 1)) {
+        IllegalArgumentException error =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> reader.read(batch, List.of(Request.range(0, 1, 0, -1L))));
+        assertTrue(error.getMessage().contains("range"));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> reader.read(batch, List.of(Request.range(0, 1, -1L, 1))));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> reader.read(batch, List.of(Request.whole(0, 1), Request.whole(0, 1))));
+        try (ReadStream stream =
+                reader.read(batch, List.of(Request.whole(0, 0), Request.whole(0, 1)));
+            VectorSchemaRoot first = stream.next(allocator)) {
+          assertNotNull(first);
+          assertTrue(reader.getReservedBytes() >= 2);
+          stream.cancel();
+          IOException cancelled = assertThrows(IOException.class, () -> stream.next(allocator));
+          assertTrue(cancelled.getMessage().contains("cancel"));
+          stream.close();
+          assertNull(stream.next(allocator));
+          stream.cancel();
+          assertArrayEquals(
+              new byte[] {0, 10}, ((LargeVarBinaryVector) first.getVector("data")).get(0));
+          assertTrue(reader.getReservedBytes() >= 2);
+        }
+        assertEquals(0, reader.getReservedBytes());
+      }
+      byte[] unsupported = source.encode();
+      unsupported[1] = 99;
+      assertThrows(IllegalArgumentException.class, () -> SourceContext.decode(unsupported));
+    }
+  }
+
+  private static List<Batch> capturePortableBlobBatches(
+      Dataset dataset, SourceContext source, BufferAllocator allocator) throws Exception {
+    List<Batch> batches = new ArrayList<>();
+    try (Capture capture = Capture.create(dataset, source, 1);
+        LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder().columns(List.of("blobs")).withRowAddress(true).build());
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        batches.add(capture.capture(source, reader.getVectorSchemaRoot(), "blobs", allocator));
+      }
+    }
+    return batches;
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
   void testTakeBlobsSelectorsAcrossCompaction(boolean buffered, @TempDir Path tempDir)

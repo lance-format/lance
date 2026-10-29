@@ -37,6 +37,9 @@
 //! happening at the same time)
 
 use super::refs::TagContents;
+use super::retention::{
+    MaintenanceDeadline, MaintenanceDelete, SnapshotMaintenanceLock, clear_retiring, mark_retiring,
+};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -69,7 +72,7 @@ use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 use tokio::sync::{OnceCell, Semaphore};
@@ -336,6 +339,59 @@ struct DeleteExecution {
     concurrency: usize,
     permits: tokio::sync::Semaphore,
     limiter: Option<tokio::sync::Mutex<tokio::time::Interval>>,
+    maintenance_deadline: OnceLock<MaintenanceDeadline>,
+}
+
+impl DeleteExecution {
+    fn try_new(operation: &CleanupOperation<'_>) -> Result<Arc<Self>> {
+        let concurrency = operation
+            .delete_concurrency
+            .unwrap_or_else(|| operation.dataset.object_store.io_parallelism());
+        validate_delete_concurrency(concurrency)?;
+        Ok(Arc::new(Self {
+            concurrency,
+            maintenance_deadline: OnceLock::new(),
+            permits: tokio::sync::Semaphore::new(concurrency),
+            limiter: create_delete_limiter(
+                operation
+                    .delete_rate_limit
+                    .or(operation.policy.delete_rate_limit),
+            ),
+        }))
+    }
+
+    async fn delete(&self, store: &ObjectStore, path: &Path) -> Result<()> {
+        self.check_maintenance_deadline()?;
+        // Spend rate permits only when there is concurrency to start the request.
+        let _permit = self.permits.acquire().await.map_err(|error| {
+            Error::invalid_input(format!("cleanup delete semaphore closed: {error}"))
+        })?;
+        if let Some(limiter) = &self.limiter {
+            limiter.lock().await.tick().await;
+        }
+        self.check_maintenance_deadline()?;
+        let result = match store.delete(path).await {
+            Err(error) if error.is_not_found() => Ok(()),
+            result => result,
+        };
+        self.check_maintenance_deadline()?;
+        result
+    }
+
+    fn check_maintenance_deadline(&self) -> Result<()> {
+        if let Some(deadline) = self.maintenance_deadline.get() {
+            deadline.check()?;
+        }
+        Ok(())
+    }
+
+    fn maintenance_deleter(self: &Arc<Self>) -> Arc<MaintenanceDelete> {
+        let execution = self.clone();
+        Arc::new(move |store, path| {
+            let execution = execution.clone();
+            async move { execution.delete(&store, &path).await }.boxed()
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -550,7 +606,23 @@ impl<'a> CleanupOperation<'a> {
     pub async fn execute(&self) -> Result<RemovalStats> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.dataset.uri);
         let cleanup = CleanupTask::new(self, CleanupAction::Execute)?;
-        Ok(cleanup.run().await?.stats)
+        let execution = cleanup
+            .delete_execution
+            .as_ref()
+            .ok_or_else(|| Error::internal("Cleanup execute requires a deletion context"))?;
+        let fence =
+            SnapshotMaintenanceLock::for_cleanup(self.dataset, execution.maintenance_deleter())
+                .await?;
+        if let Some(fence) = &fence {
+            execution
+                .maintenance_deadline
+                .get_or_init(|| fence.deadline());
+        }
+        let result = cleanup.run().await;
+        if let Some(fence) = fence {
+            fence.release().await?;
+        }
+        Ok(result?.stats)
     }
 }
 
@@ -579,19 +651,7 @@ impl<'a> CleanupTask<'a> {
         managed_scan_permits: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
         if action.deletes_files() && delete_execution.is_none() {
-            let concurrency = operation
-                .delete_concurrency
-                .unwrap_or_else(|| operation.dataset.object_store.io_parallelism());
-            validate_delete_concurrency(concurrency)?;
-            delete_execution = Some(Arc::new(DeleteExecution {
-                concurrency,
-                permits: tokio::sync::Semaphore::new(concurrency),
-                limiter: create_delete_limiter(
-                    operation
-                        .delete_rate_limit
-                        .or(operation.policy.delete_rate_limit),
-                ),
-            }));
+            delete_execution = Some(DeleteExecution::try_new(operation)?);
         }
         let managed_scan_permits = managed_scan_permits.unwrap_or_else(|| {
             Arc::new(Semaphore::new(
@@ -661,11 +721,25 @@ impl<'a> CleanupTask<'a> {
             .process_manifests(&tagged_versions, &referenced_branches)
             .await?;
 
-        if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
-            return Err(tagged_old_versions_cleanup_error(
-                &tags,
-                &inspection.tagged_old_versions,
-            ));
+        if self.policy.error_if_tagged_old_versions {
+            // Query roots retain their snapshots without preventing cleanup of
+            // unrelated versions. Only user tags require operator intervention.
+            let user_tags = tags
+                .into_iter()
+                .filter(|(name, tag)| {
+                    !super::retention::is_retention_tag(name, tag)
+                        && tag.branch.as_deref() == current_branch.as_deref()
+                })
+                .collect::<HashMap<_, _>>();
+            if user_tags
+                .values()
+                .any(|tag| inspection.tagged_old_versions.contains(&tag.version))
+            {
+                return Err(tagged_old_versions_cleanup_error(
+                    &user_tags,
+                    &inspection.tagged_old_versions,
+                ));
+            }
         }
 
         if !referenced_branches.is_empty() {
@@ -1084,6 +1158,21 @@ impl<'a> CleanupTask<'a> {
         &self,
         mut inspection: CleanupInspection,
     ) -> Result<CleanupRunResult> {
+        if self.action.deletes_files() && self.dataset.object_store.scheme() != "cos" {
+            let execution = self
+                .delete_execution
+                .as_ref()
+                .ok_or_else(|| Error::internal("Cleanup execute requires a deletion context"))?;
+            stream::iter(inspection.old_manifests.keys().cloned().collect::<Vec<_>>())
+                .map(|path| async move {
+                    execution.check_maintenance_deadline()?;
+                    mark_retiring(self.dataset, &path).await?;
+                    execution.check_maintenance_deadline()
+                })
+                .buffer_unordered(self.dataset.object_store.io_parallelism())
+                .try_collect::<Vec<_>>()
+                .await?;
+        }
         let collect_frag_reuse_maps = !inspection.skip_frag_reuse_gc
             && self.resolve_frag_reuse_map_ids(&mut inspection).await;
         let inspection = inspection;
@@ -1263,7 +1352,7 @@ impl<'a> CleanupTask<'a> {
             let execution = self
                 .delete_execution
                 .as_ref()
-                .expect("execute requires a deletion context");
+                .ok_or_else(|| Error::internal("Cleanup execute requires a deletion context"))?;
             // Deleting here rather than through `remove_stream` keeps each outcome
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
@@ -1271,23 +1360,8 @@ impl<'a> CleanupTask<'a> {
             all_files_to_remove
                 .map(|file| async move {
                     let file = file?;
-                    // Acquire concurrency before QPS so queued deletes cannot spend
-                    // rate permits early and then start together when a slot opens.
-                    let _permit = execution.permits.acquire().await.map_err(|error| {
-                        Error::invalid_input(format!("cleanup delete semaphore closed: {error}"))
-                    })?;
-                    if let Some(limiter) = &execution.limiter {
-                        let mut ticker = limiter.lock().await;
-                        ticker.tick().await;
-                    }
-                    let outcome = match store.delete(&file.path).await {
-                        Ok(()) => Ok(()),
-                        // Cleanup lists first and deletes after, so a concurrent
-                        // writer or a second cleanup can remove a path in between.
-                        // Already gone is the outcome we wanted.
-                        Err(error) if error.is_not_found() => Ok(()),
-                        Err(error) => Err(error),
-                    };
+                    let outcome = execution.delete(store, &file.path).await;
+                    execution.check_maintenance_deadline()?;
                     Ok::<_, Error>((file, outcome))
                 })
                 .buffer_unordered(execution.concurrency)
@@ -1330,7 +1404,25 @@ impl<'a> CleanupTask<'a> {
             // manifest is retired by the next cleanup, the reverse is a lost
             // version.
             let undeleted = undeleted_manifest_versions.into_inner().unwrap();
+            if self.dataset.object_store.scheme() != "cos" {
+                let paths = inspection
+                    .old_manifests
+                    .iter()
+                    .filter(|(_, expired)| !undeleted.contains(&expired.version))
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>();
+                let delete = execution.maintenance_deleter();
+                stream::iter(paths)
+                    .map(|path| {
+                        let delete = delete.clone();
+                        async move { clear_retiring(self.dataset, &path, delete.as_ref()).await }
+                    })
+                    .buffer_unordered(execution.concurrency)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+            }
             for (version, identity) in &inspection.retired_records {
+                execution.check_maintenance_deadline()?;
                 if undeleted.contains(version) {
                     continue;
                 }
@@ -1345,6 +1437,7 @@ impl<'a> CleanupTask<'a> {
                     (indices_dir, retained_index_dirs, index_dirs_to_remove),
                     (data_dir, retained_data_dirs, data_dirs_to_remove),
                 ] {
+                    execution.check_maintenance_deadline()?;
                     let verified_dirs = dirs_to_remove.into_inner().map_err(|error| {
                         Error::internal(format!(
                             "Failed to read cleanup directory candidates: {error}"
@@ -2205,7 +2298,8 @@ pub struct CleanupPolicy {
     pub versions: Option<HashSet<u64>>,
     /// If true, delete unverified data files even if they are recent
     pub delete_unverified: bool,
-    /// If true, return an Error if a tagged version is old
+    /// If true, return an error if a user-tagged version is old.
+    /// Internal query retention tags always retain their snapshots without an error.
     pub error_if_tagged_old_versions: bool,
     /// If clean the referenced branches
     pub clean_referenced_branches: bool,
@@ -2414,15 +2508,26 @@ pub async fn cleanup_cascade_branch(
     let Some(operation) = build_cleanup_operation(dataset, manifest, false).await? else {
         return Ok(None);
     };
+    let execution = DeleteExecution::try_new(&operation)?;
+    let fence =
+        SnapshotMaintenanceLock::for_cleanup(dataset, execution.maintenance_deleter()).await?;
+    if let Some(fence) = &fence {
+        execution
+            .maintenance_deadline
+            .get_or_init(|| fence.deadline());
+    }
     let result = cleanup_cascade_branch_run(
         operation,
         CleanupAction::Execute,
         HashSet::new(),
-        None,
+        Some(execution),
         None,
     )
-    .await?;
-    Ok(Some(result.stats))
+    .await;
+    if let Some(fence) = fence {
+        fence.release().await?;
+    }
+    Ok(Some(result?.stats))
 }
 
 async fn cleanup_cascade_branch_run(
@@ -2745,7 +2850,12 @@ mod tests {
         if concurrency.is_some() {
             assert!(candidate_count >= window);
         }
-        let expected_duration = delete_latency * candidate_count.div_ceil(window) as u32;
+        // Dataset files and retirement markers each use the shared window. The
+        // fence is released only after both phases have completed.
+        let delete_windows = candidate_count.div_ceil(window)
+            + (explanation.stats.old_versions as usize).div_ceil(window)
+            + 1;
+        let expected_duration = delete_latency * delete_windows as u32;
         let start = tokio::time::Instant::now();
         let stats = operation.execute().await.unwrap();
         let elapsed = start.elapsed();
@@ -3106,7 +3216,12 @@ mod tests {
                 num_tx_files: 0,
                 num_bytes: 0,
             };
+            let retention_dir = path.clone().join("_refs").join("retention-v1");
             while let Some(path) = file_stream.try_next().await? {
+                // Operational coordination files are not dataset GC candidates.
+                if path.location.prefix_matches(&retention_dir) {
+                    continue;
+                }
                 file_count.num_bytes += path.size;
                 match path.location.extension() {
                     Some("lance") => file_count.num_data_files += 1,

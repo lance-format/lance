@@ -18,6 +18,7 @@ pub enum JavaExceptionClass {
     AlreadyInException,
     LanceNamespaceException,
     LanceTimeoutException,
+    LanceRefConflictException,
 }
 
 impl JavaExceptionClass {
@@ -31,6 +32,7 @@ impl JavaExceptionClass {
             Self::AlreadyInException => "AlreadyInException",
             Self::LanceNamespaceException => "org/lance/namespace/errors/LanceNamespaceException",
             Self::LanceTimeoutException => "org/lance/LanceTimeoutException",
+            Self::LanceRefConflictException => "org/lance/LanceRefConflictException",
         }
     }
 }
@@ -196,6 +198,9 @@ impl From<LanceError> for Error {
             | LanceError::InvalidInput { .. } => Self::input_error(message),
             LanceError::IO { .. } => Self::io_error(message),
             LanceError::Timeout { .. } => Self::timeout_error(message),
+            LanceError::RefConflict { .. } => {
+                Self::new(message, JavaExceptionClass::LanceRefConflictException)
+            }
             LanceError::NotSupported { .. } => Self::unsupported_error(message),
             LanceError::NotFound { .. } => Self::io_error(message),
             LanceError::Namespace { source, .. } => {
@@ -291,6 +296,28 @@ mod tests {
             JavaExceptionClass::IllegalArgumentException
         );
         assert!(jni_err.message.contains("my_dataset"));
+    }
+
+    #[test]
+    fn test_ref_conflict_maps_to_distinct_exception() {
+        for shared in [false, true] {
+            let conflict = LanceError::RefConflict {
+                message: "maintenance owner".into(),
+            };
+            let error: Error = if shared {
+                LanceError::Shared {
+                    source: std::sync::Arc::new(conflict),
+                }
+            } else {
+                conflict
+            }
+            .into();
+            assert_eq!(
+                *java_class(&error),
+                JavaExceptionClass::LanceRefConflictException
+            );
+            assert!(error.message.contains("maintenance owner"));
+        }
     }
 
     #[test]

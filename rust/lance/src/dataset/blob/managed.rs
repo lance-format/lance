@@ -333,7 +333,7 @@ pub async fn preserve_managed_descriptors(
         let kind = BlobKind::try_from(columns.kinds.value(row))?;
         match kind {
             BlobKind::Managed | BlobKind::ManagedWithBase => {
-                context.collect_managed(&columns, row, *row_addr).await?;
+                context.resolve_managed(&columns, row, *row_addr).await?;
                 builder.push(BlobDescriptor::Managed {
                     base_id: preserve_base(resolve_managed_base_id(
                         dataset,
@@ -380,7 +380,14 @@ pub async fn preserve_managed_descriptors(
                 size: columns.sizes.value(row),
             })?,
             BlobKind::Inline => {
-                let file = context.collect_inline(&columns, row, *row_addr).await?;
+                let file = context
+                    .collect_file(&columns, row, *row_addr)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Inline blob descriptor row {row} unexpectedly resolved to null"
+                        ))
+                    })?;
                 builder.push_inline(file.read().await?)?;
             }
         }

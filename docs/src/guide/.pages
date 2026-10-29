@@ -3,8 +3,10 @@ nav:
   - Data Types: data_types.md
   - Data Evolution: data_evolution.md
   - Blob API: blob.md
+  - Portable Blob References: blob_references.md
   - JSON Support: json.md
   - Tags and Branches: tags_and_branches.md
+  - Snapshot Retention: snapshot_retention.md
   - Object Store Configuration: object_store.md
   - Observability: observability.md
   - Distributed Write: distributed_write.md

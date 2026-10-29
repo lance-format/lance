@@ -18,7 +18,15 @@ fn main() -> Result<()> {
     prost_build.extern_path(".lance.datafusion", "::lance_datafusion::pb");
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.enable_type_names();
-    prost_build.compile_protos(&["./protos/ann.proto"], &["./protos"])?;
+    prost_build.bytes([".lance.blob.reference", ".lance.dataset.retention"]);
+    prost_build.compile_protos(
+        &[
+            "./protos/ann.proto",
+            "./protos/blob_reference.proto",
+            "./protos/snapshot_retention.proto",
+        ],
+        &["./protos"],
+    )?;
 
     Ok(())
 }
