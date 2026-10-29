@@ -779,8 +779,11 @@ exist.
 
 After such a race, an index can hold two segments whose coverage overlaps once
 the history is applied: one built late over a compacted source, and one built
-over the destination. Resolving the overlap is the index maintenance's
-concern, and it only ever loses coverage; it is never a conflict.
+over the destination. A reader must serve a fragment from a segment that
+covers it directly rather than translating another segment's coverage through
+the history, so the overlap never returns a row twice. Apply does not prune the
+overlap; dropping the superseded segment is the index maintenance's concern,
+and it only ever loses coverage; it is never a conflict.
 
 ### Isolation
 
