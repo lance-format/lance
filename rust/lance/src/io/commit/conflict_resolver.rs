@@ -307,21 +307,6 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
-/// Resolve the snapshot field lineage must use. Some rebased operations keep
-/// their original read version while the commit loop has already loaded a newer
-/// dataset, so callers cannot assume the two versions match.
-async fn dataset_at_read_version<'d>(
-    dataset: &'d Dataset,
-    transaction: &Transaction,
-) -> Result<Cow<'d, Dataset>> {
-    if transaction.read_version == 0 || dataset.manifest.version == transaction.read_version {
-        return Ok(Cow::Borrowed(dataset));
-    }
-    Ok(Cow::Owned(
-        dataset.checkout_version(transaction.read_version).await?,
-    ))
-}
-
 fn update_map_changes_metadata(update: &UpdateMap) -> bool {
     update.replace || !update.update_entries.is_empty()
 }
@@ -353,10 +338,34 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
-        let dataset = dataset_at_read_version(dataset, &transaction).await?;
-        let dataset = dataset.as_ref();
-        let read_version_schema = Arc::new(dataset.schema().clone());
+        let read_version_schema = if transaction.read_version == 0
+            || dataset.manifest.version == transaction.read_version
+        {
+            Arc::new(dataset.schema().clone())
+        } else {
+            Arc::new(
+                dataset
+                    .checkout_version(transaction.read_version)
+                    .await?
+                    .schema()
+                    .clone(),
+            )
+        };
+        Self::try_new_with_read_version_schema(
+            dataset,
+            transaction,
+            affected_rows,
+            read_version_schema,
+        )
+        .await
+    }
 
+    pub(crate) async fn try_new_with_read_version_schema(
+        dataset: &Dataset,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+        read_version_schema: Arc<Schema>,
+    ) -> Result<Self> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -441,7 +450,8 @@ impl<'a> TransactionRebase<'a> {
                 }
 
                 let initial_fragments =
-                    initial_fragments_for_rebase(dataset, &modified_fragment_ids);
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -479,7 +489,8 @@ impl<'a> TransactionRebase<'a> {
                 };
 
                 let initial_fragments =
-                    initial_fragments_for_rebase(dataset, &modified_fragment_ids);
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await?;
                 let reuse = rewrite_reuse_state(dataset, &transaction).await?;
                 Ok(Self {
                     transaction,
@@ -503,7 +514,8 @@ impl<'a> TransactionRebase<'a> {
                 let modified_fragment_ids =
                     replacements.iter().map(|r| r.0).collect::<HashSet<_>>();
                 let initial_fragments =
-                    initial_fragments_for_rebase(dataset, &modified_fragment_ids);
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -526,7 +538,8 @@ impl<'a> TransactionRebase<'a> {
                 let modified_fragment_ids =
                     groups.iter().map(|g| g.fragment_id).collect::<HashSet<_>>();
                 let initial_fragments =
-                    initial_fragments_for_rebase(dataset, &modified_fragment_ids);
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -548,7 +561,8 @@ impl<'a> TransactionRebase<'a> {
             Operation::Merge { fragments, .. } => {
                 let modified_fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
                 let initial_fragments =
-                    initial_fragments_for_rebase(dataset, &modified_fragment_ids);
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await?;
                 Ok(Self {
                     transaction,
                     affected_rows,
@@ -3465,15 +3479,22 @@ async fn rewrite_reuse_state(
     })
 }
 
-fn initial_fragments_for_rebase(
+async fn initial_fragments_for_rebase(
     dataset: &Dataset,
+    transaction: &Transaction,
     modified_fragment_ids: &HashSet<u64>,
-) -> HashMap<u64, (Fragment, bool)> {
+) -> Result<HashMap<u64, (Fragment, bool)>> {
     if modified_fragment_ids.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
 
-    dataset
+    let dataset = if dataset.manifest.version != transaction.read_version {
+        Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
+    } else {
+        Cow::Borrowed(dataset)
+    };
+
+    Ok(dataset
         .fragments()
         .iter()
         .filter(|fragment| {
@@ -3481,7 +3502,7 @@ fn initial_fragments_for_rebase(
             modified_fragment_ids.contains(&fragment.id)
         })
         .map(|fragment| (fragment.id, (fragment.clone(), false)))
-        .collect()
+        .collect())
 }
 
 /// Read a fragment's deletion vector as a bitmap of physical offsets, or an
@@ -5005,8 +5026,9 @@ mod tests {
                     Compatible,    // rewrite
                     Compatible,    // reserve
                     // That update rewrote field 0, which this transaction
-                    // redefines; the next case redefines a field it did not.
-                    Retryable,     // update
+                    // redefines. The stale metadata plan must be replanned, not
+                    // replayed. The next case redefines a field it did not write.
+                    NotCompatible, // update
                     NotCompatible, // update config
                 ],
             ),

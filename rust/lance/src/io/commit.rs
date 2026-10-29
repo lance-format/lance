@@ -1730,6 +1730,7 @@ pub(crate) async fn commit_transaction(
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
+    let original_dataset = dataset.clone();
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
@@ -1761,6 +1762,7 @@ pub(crate) async fn commit_transaction(
         manifest: read_version_dataset.manifest.as_ref(),
         indices: read_version_indices.as_slice(),
     });
+    let mut rebase_schema = Arc::new(read_version_dataset.schema().clone());
 
     let mut transaction = transaction.clone();
     // What a rewrite on a tagged fragment reuse history assembled for the
@@ -1812,8 +1814,13 @@ pub(crate) async fn commit_transaction(
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
 
-            let mut rebase =
-                TransactionRebase::try_new(&dataset, transaction, affected_rows).await?;
+            let mut rebase = TransactionRebase::try_new_with_read_version_schema(
+                &original_dataset,
+                transaction,
+                affected_rows,
+                rebase_schema.clone(),
+            )
+            .await?;
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
@@ -1860,6 +1867,9 @@ pub(crate) async fn commit_transaction(
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
             tagged_rewrite = assembly;
+            if transaction.read_version == dataset.manifest.version {
+                rebase_schema = Arc::new(dataset.schema().clone());
+            }
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
