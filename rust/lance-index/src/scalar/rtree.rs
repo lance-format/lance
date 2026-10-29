@@ -1328,7 +1328,7 @@ mod tests {
     use geo_types::{LineString, Rect, coord, line_string};
     use geoarrow_array::builder::{LineStringBuilder, PointBuilder, RectBuilder};
     use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
-    use lance_core::cache::{CacheDecode, CacheEntry};
+    use lance_core::cache::{CacheDecode, CacheEntry, CacheMissReason};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_geo::bbox::is_empty_rect;
     use rand::Rng;
@@ -1396,10 +1396,16 @@ mod tests {
                     .unwrap();
             assert_eq!(boxes.len(), expected.num_rows());
         }
-        assert!(matches!(
-            codec.deserialize(&bytes.slice(..bytes.len() / 2)),
-            CacheDecode::Miss(_)
-        ));
+        // The complete envelope ends at byte 39; the IPC section starts at byte 64.
+        for len in (39..=64).chain(std::iter::once(bytes.len() / 2)) {
+            assert!(
+                matches!(
+                    codec.deserialize(&bytes.slice(..len)),
+                    CacheDecode::Miss(CacheMissReason::BodyError)
+                ),
+                "truncated {kind} entry with {len} bytes must be a cache miss"
+            );
+        }
     }
 
     fn expected_num_pages(num_items: usize, page_size: u32) -> u64 {
