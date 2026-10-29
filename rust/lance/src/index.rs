@@ -22,6 +22,7 @@ pub(crate) mod frag_reuse_with_stable_row_ids;
 mod lifecycle;
 pub(crate) mod loading;
 pub mod mem_wal;
+pub(crate) mod memory_progress;
 pub mod optimize;
 pub mod prefilter;
 mod prewarm;
