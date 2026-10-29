@@ -378,26 +378,6 @@ fn section_padding(pos: usize) -> usize {
     (IPC_SECTION_ALIGNMENT - (pos % IPC_SECTION_ALIGNMENT)) % IPC_SECTION_ALIGNMENT
 }
 
-fn skip_section_padding(data: &Bytes, offset: &mut usize) -> Result<(), ArrowError> {
-    let stream_offset = offset
-        .checked_add(section_padding(*offset))
-        .filter(|&end| end <= data.len())
-        .ok_or_else(|| {
-            ArrowError::IoError(
-                format!(
-                    "IPC section: truncated alignment padding at offset {offset} (input length {})",
-                    data.len()
-                ),
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "truncated IPC alignment padding",
-                ),
-            )
-        })?;
-    *offset = stream_offset;
-    Ok(())
-}
-
 /// A [`Write`] adapter that counts the bytes written through it.
 struct CountingWriter<'a> {
     inner: &'a mut dyn Write,
@@ -427,6 +407,21 @@ fn write_section_padding(writer: &mut dyn Write, pos: &mut usize) -> Result<(), 
             .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
         *pos += pad;
     }
+    Ok(())
+}
+
+fn skip_section_padding(data: &Bytes, offset: &mut usize) -> Result<(), ArrowError> {
+    let aligned = offset
+        .checked_add(section_padding(*offset))
+        .filter(|&aligned| aligned <= data.len())
+        .ok_or_else(|| {
+            ArrowError::ParseError(format!(
+                "IPC section at offset {} cannot be aligned within {} bytes",
+                *offset,
+                data.len()
+            ))
+        })?;
+    *offset = aligned;
     Ok(())
 }
 
@@ -509,42 +504,31 @@ pub fn read_ipc_section_batches_at(
 #[cfg(test)]
 mod tests {
     use arrow_array::{ArrayRef, record_batch};
+    use rstest::rstest;
 
     use super::*;
 
-    #[rstest::rstest]
-    #[case::missing_padding(39, 39)]
-    #[case::partial_padding(63, 39)]
-    #[case::offset_past_end(8, 9)]
-    #[case::aligned_offset_past_end(8, 64)]
-    #[case::alignment_overflow(0, usize::MAX)]
-    fn test_ipc_section_rejects_invalid_padding(
-        #[case] data_len: usize,
-        #[case] initial_offset: usize,
-        #[values(false, true)] is_multi_batch: bool,
+    #[rstest]
+    #[case::truncated_padding(42, 42)]
+    #[case::partial_padding(42, 63)]
+    #[case::past_end(128, 64)]
+    #[case::alignment_overflow(usize::MAX, 64)]
+    fn test_ipc_section_rejects_invalid_alignment(
+        #[case] offset: usize,
+        #[case] len: usize,
+        #[values(false, true)] multiple_batches: bool,
     ) {
-        let data = Bytes::from(vec![0; data_len]);
-        let mut offset = initial_offset;
-        let error = if is_multi_batch {
-            read_ipc_section_batches_at(&data, &mut offset).unwrap_err()
+        let data = Bytes::from(vec![0; len]);
+        let mut next = offset;
+        let result = if multiple_batches {
+            read_ipc_section_batches_at(&data, &mut next).map(|_| ())
         } else {
-            read_ipc_section_at(&data, &mut offset).unwrap_err()
+            read_ipc_section_at(&data, &mut next).map(|_| ())
         };
-        assert!(
-            matches!(&error, ArrowError::IoError(_, source) if source.kind() == std::io::ErrorKind::UnexpectedEof),
-            "{error}"
-        );
-        let message = error.to_string();
-        assert!(message.contains("truncated alignment padding"), "{message}");
-        assert!(
-            message.contains(&format!("offset {initial_offset}")),
-            "{message}"
-        );
-        assert!(
-            message.contains(&format!("input length {data_len}")),
-            "{message}"
-        );
-        assert_eq!(offset, initial_offset);
+        let error = result.unwrap_err();
+        assert!(matches!(error, ArrowError::ParseError(_)), "{error}");
+        assert!(error.to_string().contains("IPC section"), "{error}");
+        assert_eq!(next, offset, "failed reads must preserve the offset");
     }
 
     #[test]

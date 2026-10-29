@@ -132,6 +132,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "argminmax"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "088a9c28ca36500c581f9f54b63460492d2b4f71e1e61d176e8fb79565109b01"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4291,6 +4300,7 @@ dependencies = [
  "log",
  "metrics",
  "moka",
+ "nix",
  "object_store 0.14.2",
  "object_store_opendal",
  "opendal",
@@ -4310,6 +4320,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4371,6 +4382,7 @@ dependencies = [
 name = "lance-linalg"
 version = "15.0.0-beta.5"
 dependencies = [
+ "argminmax",
  "arrow-array",
  "arrow-schema",
  "cc",
@@ -4479,6 +4491,7 @@ dependencies = [
  "lance-io",
  "lance-select",
  "log",
+ "num-traits",
  "object_store 0.14.2",
  "prost",
  "prost-build",

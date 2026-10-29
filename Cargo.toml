@@ -85,6 +85,7 @@ lance-test-macros = { version = "=15.0.0-beta.5", path = "./rust/lance-test-macr
 lance-testing = { version = "=15.0.0-beta.5", path = "./rust/lance-testing" }
 all_asserts = "2.3.1"
 approx = "0.5.1"
+argminmax = "0.7.1"
 # Note that this one does not include pyarrow
 arrow = { version = "59.2.0", optional = false, features = ["prettyprint"] }
 lance-arrow-scalar = { version = "=59.0.0", path = "./rust/arrow-scalar" }

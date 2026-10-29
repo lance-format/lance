@@ -9,6 +9,7 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 
 use crate::Result;
+use argminmax::ArgMinMax;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
 use lance_core::deepsize::DeepSizeOf;
@@ -953,10 +954,18 @@ impl L2Prepared {
 
     /// Return the index of the nearest target to `query`, using `buf` as scratch space.
     ///
-    /// `buf` must have length `num_targets`.
+    /// `buf` must have length `num_targets`. NaN distances are ignored; on ties the
+    /// lowest index wins. Returns `None` if there are no targets or no distance is finite.
     pub fn nearest_into(&self, query: &[f32], buf: &mut [f32]) -> Option<u32> {
         self.distances_into(query, buf);
-        crate::kernels::argmin_value_float(buf.iter().copied()).map(|(idx, _)| idx)
+        let distances: &[f32] = buf;
+        // `argmin` panics on an empty slice, and returns an index even when no
+        // distance is finite (all NaN or infinite).
+        if distances.is_empty() {
+            return None;
+        }
+        let idx = distances.argmin();
+        (distances[idx] < f32::INFINITY).then_some(idx as u32)
     }
 
     /// Return the index of the nearest target to `query`.
@@ -1484,6 +1493,22 @@ mod tests {
 
         assert_relative_eq!(d1[0], 0.0); // q1 == target[0]
         assert_relative_eq!(d2[1], 0.0); // q2 == target[1]
+    }
+
+    /// With dimension 1 and a zero query, the distance to target `t` is `t * t`.
+    /// PQ uses 16 (4-bit) or 256 (8-bit) targets. The 258 targets of `first_of_equal`
+    /// put 2 targets after the last full SIMD vector, so the tie spans both parts.
+    #[rstest::rstest]
+    #[case::last_of_16([vec![3.0; 15], vec![2.0]].concat(), Some(15))]
+    #[case::first_of_equal([3.0, 1.0, -1.0].repeat(86), Some(1))]
+    #[case::skips_nan([vec![f32::NAN; 255], vec![2.0]].concat(), Some(255))]
+    #[case::all_nan(vec![f32::NAN; 16], None)]
+    #[case::all_infinite(vec![f32::INFINITY; 256], None)]
+    #[case::nan_and_infinite([f32::NAN, f32::INFINITY].repeat(8), None)]
+    #[case::no_targets(vec![], None)]
+    fn test_l2_targets_nearest(#[case] targets: Vec<f32>, #[case] expected: Option<u32>) {
+        let prepared = L2Prepared::new(&targets, 1);
+        assert_eq!(prepared.nearest(&[0.0]), expected);
     }
 
     /// `l2_batch_into` must agree with the per-vector `l2` for the f32 batch

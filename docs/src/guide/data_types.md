@@ -38,10 +38,10 @@ For new datasets, use blob v2 (`lance.blob.v2`) via `blob_field` and `blob_array
 
 Blob versioning follows dataset file format rules:
 
-- `data_storage_version` is the Lance file format version of a dataset.
-- A dataset's `data_storage_version` is fixed once created.
-- For `data_storage_version >= 2.2`, legacy blob metadata (`lance-encoding:blob`) is rejected on write.
-- Legacy metadata-based blob write remains available for `0.1`, `2.0`, and `2.1`.
+- `data_storage_version` is the default Lance file format version of a dataset.
+- Within the `2.x` family, append, update, merge-insert, and compaction can select another exact `2.x` version without rewriting existing files or changing the dataset default. File format `0.1` cannot be mixed with `2.x`.
+- For target file versions `>= 2.2`, dataset writers use Blob v2 and also convert legacy blob-marked (`lance-encoding:blob`) binary inputs to Blob v2 on write.
+- Legacy metadata-based blob encoding remains available when writing file format `0.1`, `2.0`, or `2.1`.
 
 ```python
 import lance
