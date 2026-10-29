@@ -1031,7 +1031,7 @@ mod tests {
         ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{
-        default_build_config, make_stable_row_id_manifest, sample_index_metadata,
+        default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
     };
     use crate::transaction::{DataReplacementGroup, Operation, UpdateMap};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -1971,5 +1971,58 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("read version"), "{error}");
+    }
+
+    /// `backed_manifest` plus a nullable field 1 that fragment 0 stores no
+    /// data for, which is allowed while the field is nullable.
+    fn manifest_with_an_unstored_nullable_field() -> Manifest {
+        apply(
+            &backed_manifest(),
+            vec![Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: added_field("loose"),
+            })],
+        )
+        .unwrap()
+    }
+
+    /// A fragment that stores no data for a non-nullable field reads it back
+    /// as nulls, which the schema forbids. The legacy path checks every
+    /// fragment an operation writes (#10211). Making a field required is a
+    /// claim about every row, so it checks every fragment.
+    #[rstest]
+    #[case::minted_fragment_without_its_data(vec![mint_fragment(0)])]
+    #[case::required_field_without_data(vec![Action::AddField(AddField {
+        local: 0,
+        parent: None,
+        def: lance_core::datatypes::Field::try_from(ArrowField::new("strict", DataType::Int32, false))
+            .unwrap(),
+    })])]
+    #[case::tightened_field_without_data(vec![Action::AlterField(AlterField {
+        field: FieldRef::Committed(1),
+        name: None,
+        nullable: Some(false),
+    })])]
+    fn test_a_fragment_must_store_every_required_field(#[case] actions: Vec<Action>) {
+        let error = apply(&manifest_with_an_unstored_nullable_field(), actions).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("non-nullable field"), "{error}");
+    }
+
+    /// Only the fragments an operation writes are checked, so a fragment
+    /// committed before the check existed does not block an unrelated commit.
+    #[test]
+    fn test_an_unwritten_fragment_missing_a_required_field_does_not_block_a_commit() {
+        // sample_manifest's fragment 0 has no data files at all.
+        let manifest = sample_manifest();
+        let next = apply(
+            &manifest,
+            vec![
+                mint_fragment(0),
+                write_data(Ref::Local(0), FieldRef::Committed(0)),
+            ],
+        );
+        assert!(next.is_ok(), "{next:?}");
     }
 }
