@@ -228,7 +228,7 @@ pub(super) const BYTES_ACCUMULATED_WARNING_THRESHOLD: u64 = 1024 * 1024 * 1024; 
 ///
 /// The resulting batch will have three columns:
 /// - row_id: the row id of the document
-/// - all_tokens: the total number of tokens in the document
+/// - all_tokens: the BM25 document length, discounting code identifier overlaps
 /// - query_token_counts: a fixed size list of the count of each query token in the document
 ///
 /// This is an unbounded accumulation, however, for most queries, the per-row
@@ -246,6 +246,7 @@ pub(super) async fn tokenize_and_count(
     coordinate_rank: usize,
     phrase_slop: Option<u32>,
 ) -> DataFusionResult<RecordBatch> {
+    let discount_overlaps = tokenizer.discount_overlaps();
     let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
     output_fields.extend((0..coordinate_rank).map(|rank| {
         Arc::new(Field::new(
@@ -329,8 +330,12 @@ pub(super) async fn tokenize_and_count(
                     }
                     let mut stream = tokenizer.token_stream_for_doc(doc);
                     let mut all_tokens = 0;
+                    let mut last_position = None;
                     while let Some(token) = stream.next() {
-                        all_tokens += 1;
+                        if !discount_overlaps || last_position != Some(token.position) {
+                            all_tokens += 1;
+                        }
+                        last_position = Some(token.position);
                         if let Some(token_indices) = query_token_indices.get(&token.text) {
                             for token_index in token_indices {
                                 temp_query_token_counts[*token_index] += 1;
@@ -724,12 +729,17 @@ fn count_column_into(
     all_tokens: &mut [u64],
     counts: &mut [u64],
 ) -> DataFusionResult<()> {
+    let discount_overlaps = tokenizer.discount_overlaps();
     let mut record = |row: usize, doc: &str| {
         let slot = row * num_columns + column_slot;
         let base = slot * num_terms;
         let mut stream = tokenizer.token_stream_for_doc(doc);
+        let mut last_position = None;
         while let Some(token) = stream.next() {
-            all_tokens[slot] += 1;
+            if !discount_overlaps || last_position != Some(token.position) {
+                all_tokens[slot] += 1;
+            }
+            last_position = Some(token.position);
             if let Some(token_indices) = query_token_indices.get(&token.text) {
                 for token_index in token_indices {
                     counts[base + *token_index] += 1;
@@ -1025,7 +1035,7 @@ pub async fn flat_bm25_search_stream_with_metrics(
 ///
 /// ```no_run
 /// # async fn example(
-/// #     input: datafusion::execution::SendableRecordBatchStream,
+/// #     input: datafusion_execution::SendableRecordBatchStream,
 /// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// use lance_index::scalar::inverted::{
 ///     flat_bm25_search_stream_with_metrics_and_operator, query::Operator, InvertedIndexParams,

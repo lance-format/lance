@@ -93,6 +93,8 @@ pub struct IndexMetadata {
     ///
     /// This field is optional for backward compatibility. For existing indices created before
     /// this field was added, this will be None.
+    ///
+    /// An out-of-range value fails the conversion with [`Error::CorruptFile`] rather than defaulting.
     pub created_at: Option<DateTime<Utc>>,
 
     /// The base path index of the index files. Used when the index is imported or referred from another dataset.
@@ -105,6 +107,17 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// The clustering definition this segment was built under, by
+    /// `Manifest::clustering` id. Changes to the same segment keep it; a
+    /// segment built from this one does not inherit it.
+    pub clustering_id: Option<u32>,
+
+    /// Arbitrary metadata attached to this segment, like
+    /// `Manifest::table_metadata`. Changes to the same segment preserve every
+    /// entry, including keys this build does not understand; new segments
+    /// carry only what their creator sets.
+    pub metadata: HashMap<String, String>,
 }
 
 impl IndexMetadata {
@@ -371,6 +384,7 @@ impl DeepSizeOf for IndexMetadata {
                     }
                 })
                 .unwrap_or(0)
+            + self.metadata.deep_size_of_children(context)
     }
 }
 
@@ -402,6 +416,23 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             )
         };
 
+        let out_of_range = |ts: u64| {
+            Error::corrupt_file_named(
+                "index metadata",
+                format!(
+                    "index {} created_at timestamp out of range: {ts}",
+                    proto.name
+                ),
+            )
+        };
+        let created_at = proto
+            .created_at
+            .map(|ts| {
+                DateTime::from_timestamp_millis(i64::try_from(ts).map_err(|_| out_of_range(ts))?)
+                    .ok_or_else(|| out_of_range(ts))
+            })
+            .transpose()?;
+
         let metadata = Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
@@ -413,12 +444,11 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             fragment_bitmap,
             index_details: proto.index_details.map(Arc::new),
             index_version: proto.index_version.unwrap_or_default(),
-            created_at: proto.created_at.map(|ts| {
-                DateTime::from_timestamp_millis(ts as i64)
-                    .expect("Invalid timestamp in index metadata")
-            }),
+            created_at,
             base_id: proto.base_id,
             files,
+            clustering_id: proto.clustering_id,
+            metadata: proto.metadata,
         };
 
         // This is the single boundary between manifest bytes and
@@ -481,8 +511,8 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
                 .as_ref()
                 .map(|details| details.as_ref().clone()),
             index_version: Some(idx.index_version),
-            clustering_id: None,
-            metadata: Default::default(),
+            clustering_id: idx.clustering_id,
+            metadata: idx.metadata.clone(),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
@@ -570,6 +600,28 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashMap;
 
+    /// Provider metadata is heap-allocated and feeds bounded caches, so it has
+    /// to be in the deep size. Compares two entries rather than asserting
+    /// allocator byte counts, which would be brittle.
+    #[test]
+    fn provider_metadata_counts_towards_the_deep_size() {
+        use lance_core::deepsize::DeepSizeOf;
+
+        let bare = crate::transaction::test_support::sample_index_metadata("idx");
+        let mut carrying = bare.clone();
+        carrying.metadata = HashMap::from([(
+            "org.example.cluster.bucket".to_string(),
+            "a reasonably long provider value".to_string(),
+        )]);
+
+        assert!(
+            carrying.deep_size_of() > bare.deep_size_of(),
+            "metadata must contribute: bare={} carrying={}",
+            bare.deep_size_of(),
+            carrying.deep_size_of()
+        );
+    }
+
     #[test]
     fn test_fragment_bitmap_serialized_run_optimized() {
         let bitmap = RoaringBitmap::from_sorted_iter(0..1_000_000).unwrap();
@@ -587,6 +639,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&metadata);
@@ -600,6 +654,28 @@ mod tests {
 
         let recovered = IndexMetadata::try_from(proto).unwrap();
         assert_eq!(recovered.fragment_bitmap, Some(bitmap));
+    }
+
+    #[rstest]
+    #[case::above_chrono_max(9_000_000_000_000_000)]
+    #[case::negative_wrap_u64_max(u64::MAX)]
+    #[case::negative_wrap_i64_boundary(i64::MAX as u64 + 1)]
+    fn test_index_metadata_rejects_out_of_range_created_at(#[case] created_at: u64) {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        proto.created_at = Some(created_at);
+
+        let err = IndexMetadata::try_from(proto).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "got: {err:?}");
+        assert!(err.to_string().contains("created_at"), "got: {err}");
+    }
+
+    #[test]
+    fn test_index_metadata_created_at_roundtrip() {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.created_at = Some(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap());
+
+        let recovered = IndexMetadata::try_from(pb::IndexMetadata::from(&metadata)).unwrap();
+        assert_eq!(recovered.created_at, metadata.created_at);
     }
 
     #[test]
@@ -628,6 +704,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let with = |details: Arc<prost_types::Any>| IndexMetadata {
             index_details: Some(details),
@@ -675,6 +753,8 @@ mod tests {
                     size_bytes: 1024,
                     file_metadata_size_bytes: NonZero::new(256),
                 }]),
+                clustering_id: None,
+                metadata: Default::default(),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -688,6 +768,8 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -741,6 +823,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&original);
@@ -812,6 +896,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 

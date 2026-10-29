@@ -5,6 +5,7 @@ use crate::{format::pb, rowids::bitmap::Bitmap};
 use lance_core::{Error, Result};
 
 use super::{RowIdSequence, U64Segment, encoded_array::EncodedU64Array};
+use num_traits::ops::bytes::ToBytes;
 use std::ops::Range;
 
 use prost::Message;
@@ -45,16 +46,31 @@ fn validate_packed_array_length(array_type: &str, byte_len: usize, width: usize)
 /// `SegmentStats::n_holes` derives the hole count by subtracting the value
 /// count from the slot span, which underflows once a value is repeated.
 fn first_non_increasing_pair(array: &EncodedU64Array) -> Option<(usize, u64, u64)> {
-    let mut values = array.iter();
-    let previous = values.next()?;
-    values
-        .scan(previous, |previous, value| {
-            let pair = (*previous, value);
-            *previous = value;
-            Some(pair)
-        })
-        .enumerate()
-        .find_map(|(index, (previous, next))| (previous >= next).then_some((index, previous, next)))
+    // Offsets share one base, so their order is the values' order. One pass
+    // over the packed slice in blocks: a branch-free reduction per block
+    // vectorizes, and the first block that fails is scanned for the index,
+    // so a bad pair is found after at most one extra block.
+    fn find<T: Ord>(values: &[T]) -> Option<usize> {
+        const BLOCK: usize = 64;
+        let mut at = 0;
+        while at + 1 < values.len() {
+            let end = (at + BLOCK).min(values.len() - 1);
+            let pairs = || values[at..end].iter().zip(&values[at + 1..=end]);
+            if !pairs().fold(true, |sorted, (previous, next)| sorted & (previous < next)) {
+                return pairs()
+                    .position(|(previous, next)| previous >= next)
+                    .map(|offset| at + offset);
+            }
+            at = end;
+        }
+        None
+    }
+    let index = match array {
+        EncodedU64Array::U16 { offsets, .. } => find(offsets),
+        EncodedU64Array::U32 { offsets, .. } => find(offsets),
+        EncodedU64Array::U64(values) => find(values),
+    }?;
+    Some((index, array.get(index)?, array.get(index + 1)?))
 }
 
 /// Consecutive `Range` segments this far apart are not folded into one
@@ -70,7 +86,7 @@ const FOLD_GAP: u64 = 1 << 16;
 /// more than [`FOLD_GAP`] past it.
 ///
 /// A table whose deletions cluster is written as many small `Range` segments
-/// (see `RowIdSequence::use_range_segments`). Kept as separate segments they
+/// (see `RowIdSequence::reencode`). Kept as separate segments they
 /// would cost a heap-allocated enum each and linear scans in every lookup;
 /// folded, they are two `u32` per range and a binary search.
 fn push_range(pending: &mut Vec<Range<u64>>, out: &mut Vec<U64Segment>, range: Range<u64>) {
@@ -306,6 +322,16 @@ impl From<U64Segment> for pb::U64Segment {
     }
 }
 
+/// Little-endian bytes of packed `values`, written in one pass into a buffer
+/// of the final size.
+fn le_bytes<T: ToBytes>(values: &[T]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        bytes.extend_from_slice(value.to_le_bytes().as_ref());
+    }
+    bytes
+}
+
 impl From<EncodedU64Array> for pb::EncodedU64Array {
     fn from(array: EncodedU64Array) -> Self {
         match array {
@@ -313,10 +339,7 @@ impl From<EncodedU64Array> for pb::EncodedU64Array {
                 array: Some(pb::encoded_u64_array::Array::U16Array(
                     pb::encoded_u64_array::U16Array {
                         base,
-                        offsets: offsets
-                            .iter()
-                            .flat_map(|&offset| offset.to_le_bytes().to_vec())
-                            .collect(),
+                        offsets: le_bytes(&offsets),
                     },
                 )),
             },
@@ -324,20 +347,14 @@ impl From<EncodedU64Array> for pb::EncodedU64Array {
                 array: Some(pb::encoded_u64_array::Array::U32Array(
                     pb::encoded_u64_array::U32Array {
                         base,
-                        offsets: offsets
-                            .iter()
-                            .flat_map(|&offset| offset.to_le_bytes().to_vec())
-                            .collect(),
+                        offsets: le_bytes(&offsets),
                     },
                 )),
             },
             EncodedU64Array::U64(values) => Self {
                 array: Some(pb::encoded_u64_array::Array::U64Array(
                     pb::encoded_u64_array::U64Array {
-                        values: values
-                            .iter()
-                            .flat_map(|&value| value.to_le_bytes().to_vec())
-                            .collect(),
+                        values: le_bytes(&values),
                     },
                 )),
             },
@@ -687,6 +704,26 @@ mod test {
             }),
             message,
         );
+    }
+
+    /// The sorted check walks the packed slice in blocks of 64 pairs; the bad
+    /// pair must be found at every block boundary and in the last pair.
+    #[rstest]
+    #[case(63)]
+    #[case(64)]
+    #[case(65)]
+    #[case(127)]
+    #[case(128)]
+    fn test_first_non_increasing_pair_across_blocks(#[case] at: usize) {
+        let mut values: Vec<u64> = (0..130).collect();
+        values[at + 1] = values[at];
+        let array = EncodedU64Array::U64(values);
+        assert_eq!(
+            first_non_increasing_pair(&array),
+            Some((at, at as u64, at as u64))
+        );
+        let sorted = EncodedU64Array::U64((0..130).collect());
+        assert_eq!(first_non_increasing_pair(&sorted), None);
     }
 
     #[test]

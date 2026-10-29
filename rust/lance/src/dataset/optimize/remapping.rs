@@ -25,6 +25,7 @@ use lance_table::format::overlay::staleness::overlay_affects_index;
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
+use lance_table::transaction::RewriteGroup;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,6 +65,18 @@ pub trait IndexRemapper: Send + Sync {
         index_map: RowAddrRemap,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>>;
+
+    /// Remap with the completed rewrite groups that determine which source
+    /// segments must be published as one atomic replacement. Existing remappers
+    /// retain their independent-segment behavior through the default method.
+    async fn remap_indices_with_context(
+        &self,
+        index_map: RowAddrRemap,
+        affected_fragment_ids: &[u64],
+        _rewrite_groups: &[RewriteGroup],
+    ) -> Result<Vec<RemappedIndex>> {
+        self.remap_indices(index_map, affected_fragment_ids).await
+    }
 }
 
 /// Options for creating an [IndexRemapper]
@@ -72,6 +85,12 @@ pub trait IndexRemapper: Send + Sync {
 /// want to keep a placeholder
 #[async_trait]
 pub trait IndexRemapperOptions: Send + Sync {
+    /// Whether this publication path can atomically replace compatible vector
+    /// segments connected by a rewrite. The default preserves physical boundaries.
+    fn supports_vector_segment_replacement(&self) -> bool {
+        false
+    }
+
     /// Creates a remapper when the dataset has indices that need row address remapping.
     ///
     /// Returns `None` when no remappable indices exist, allowing compaction to avoid
@@ -320,6 +339,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         dataset,
         index_id,
         &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
+        None,
     )
     .await?;
 
@@ -370,6 +390,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -383,6 +405,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
     };
 
@@ -1018,7 +1042,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // is dropped.
         let translator =
             materialize_hops(dataset, &ledger, hops, admitted, coverage.clone()).await?;
-        match index::remap_index(dataset, index_id, &translator).await {
+        match index::remap_index(dataset, index_id, &translator, None).await {
             Ok(result) => result,
             // The index only knows the legacy in-memory remap and this build
             // cannot prepare a complete mapping for it within budget: not an
@@ -1073,6 +1097,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             // this dataset's own index directory.)
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -1086,6 +1112,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
     };
 

@@ -7,8 +7,8 @@ use std::{collections::VecDeque, task::Context};
 
 use arrow::compute::kernels;
 use arrow_array::RecordBatch;
-use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::DataFusionError;
+use datafusion_physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use futures::{Stream, StreamExt, TryStreamExt, ready};
 
 use lance_core::Result;
@@ -246,8 +246,8 @@ pub fn chunk_stream(
 /// # Example
 ///
 /// ```
-/// # use datafusion::physical_plan::SendableRecordBatchStream;
-/// # use lance_datafusion::chunker::break_stream_with_sizes;
+/// # use datafusion_physical_plan::SendableRecordBatchStream;
+/// # use lance_datafusion_exec::chunker::break_stream_with_sizes;
 /// # fn split_stream(stream: SendableRecordBatchStream) {
 /// let batches = break_stream_with_sizes(stream, vec![512, 512, 256]);
 /// # drop(batches);
@@ -354,8 +354,8 @@ where
 /// # Example
 ///
 /// ```
-/// # use datafusion::physical_plan::SendableRecordBatchStream;
-/// # use lance_datafusion::chunker::chunk_stream_with_sizes;
+/// # use datafusion_physical_plan::SendableRecordBatchStream;
+/// # use lance_datafusion_exec::chunker::chunk_stream_with_sizes;
 /// # fn split_stream(stream: SendableRecordBatchStream) {
 /// let chunks = chunk_stream_with_sizes(stream, vec![512, 512, 256]);
 /// # drop(chunks);
@@ -599,7 +599,7 @@ mod tests {
     };
 
     use arrow::datatypes::{Int32Type, Int64Type};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt};
     use lance_datagen::{BatchCount, RowCount, array};
 

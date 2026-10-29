@@ -178,6 +178,87 @@ impl CreateTableMode {
     }
 }
 
+/// `CreateNamespaceRequest.mode` from the Lance Namespace spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateNamespaceMode {
+    Create,
+    ExistOk,
+    Overwrite,
+}
+
+impl CreateNamespaceMode {
+    fn parse(mode: Option<&str>) -> Result<Self> {
+        match mode {
+            None => Ok(Self::Create),
+            Some(mode) if mode.eq_ignore_ascii_case("create") => Ok(Self::Create),
+            Some(mode)
+                if mode.eq_ignore_ascii_case("existok")
+                    || mode.eq_ignore_ascii_case("exist_ok") =>
+            {
+                Ok(Self::ExistOk)
+            }
+            Some(mode) if mode.eq_ignore_ascii_case("overwrite") => Ok(Self::Overwrite),
+            Some(mode) => Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Unsupported create_namespace mode '{}'. Supported modes are: 'Create', 'ExistOk', 'Overwrite'",
+                    mode
+                ),
+            }
+            .into()),
+        }
+    }
+}
+
+/// `DropNamespaceRequest.mode` from the Lance Namespace spec: what to do when the
+/// namespace to drop is not found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropNamespaceMode {
+    Fail,
+    Skip,
+}
+
+impl DropNamespaceMode {
+    fn parse(mode: Option<&str>) -> Result<Self> {
+        match mode {
+            None => Ok(Self::Fail),
+            Some(mode) if mode.eq_ignore_ascii_case("fail") => Ok(Self::Fail),
+            Some(mode) if mode.eq_ignore_ascii_case("skip") => Ok(Self::Skip),
+            Some(mode) => Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Unsupported drop_namespace mode '{}'. Supported modes are: 'Fail', 'Skip'",
+                    mode
+                ),
+            }
+            .into()),
+        }
+    }
+}
+
+/// `DropNamespaceRequest.behavior` from the Lance Namespace spec: what to do when the
+/// namespace to drop still has children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropNamespaceBehavior {
+    Restrict,
+    Cascade,
+}
+
+impl DropNamespaceBehavior {
+    fn parse(behavior: Option<&str>) -> Result<Self> {
+        match behavior {
+            None => Ok(Self::Restrict),
+            Some(behavior) if behavior.eq_ignore_ascii_case("restrict") => Ok(Self::Restrict),
+            Some(behavior) if behavior.eq_ignore_ascii_case("cascade") => Ok(Self::Cascade),
+            Some(behavior) => Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Unsupported drop_namespace behavior '{}'. Supported behaviors are: 'Restrict', 'Cascade'",
+                    behavior
+                ),
+            }
+            .into()),
+        }
+    }
+}
+
 /// Information about a table stored in the manifest
 #[derive(Debug, Clone)]
 pub struct TableInfo {
@@ -1335,6 +1416,8 @@ impl ManifestNamespace {
             created_at: None,
             base_id: None,
             files: Some(index_files_to_table(trained_index.created_index.files)),
+            clustering_id: None,
+            metadata: Default::default(),
         })
     }
 
@@ -2316,9 +2399,51 @@ impl ManifestNamespace {
             .is_some())
     }
 
+    /// Resolve a relative table location to the storage path that
+    /// [`Self::construct_full_uri`] addresses.
+    ///
+    /// `construct_full_uri` splits on `/` and drops empty segments, and the URL
+    /// segment extension also drops `.` and `..` segments. Reproduce the empty and
+    /// `.` handling so probes and deletes target the same physical directory as the
+    /// writer instead of a percent-encoded single segment (`Path::join`) or an
+    /// `EmptySegment` error for accepted inputs like `a//b`. `..` stays rejected to
+    /// match `register_table`'s traversal contract rather than silently rewriting
+    /// such input. `Path::parse` preserves raw segment bytes, so escaped slashes and
+    /// non-ASCII names stay literal.
+    fn join_location(
+        base: &object_store::path::Path,
+        location: &str,
+    ) -> Result<object_store::path::Path> {
+        let mut canonical = String::new();
+        for segment in location.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == ".." {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Table location must stay within the namespace root, got '{}'",
+                        location
+                    ),
+                }
+                .into());
+            }
+            if !canonical.is_empty() {
+                canonical.push('/');
+            }
+            canonical.push_str(segment);
+        }
+        if canonical.is_empty() {
+            return Ok(base.clone());
+        }
+        Ok(object_store::path::Path::parse(format!(
+            "{base}/{canonical}"
+        ))?)
+    }
+
     async fn location_has_actual_manifests(&self, location: &str) -> Result<bool> {
-        Self::path_has_actual_manifests(&self.object_store, &self.base_path.clone().join(location))
-            .await
+        let path = Self::join_location(&self.base_path, location)?;
+        Self::path_has_actual_manifests(&self.object_store, &path).await
     }
 
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
@@ -3037,6 +3162,12 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
+        // Reject a table in a namespace that does not exist, matching register_table.
+        // Without this the table is written but invisible to namespace listings.
+        if !namespace.is_empty() {
+            self.validate_namespace_levels_exist(&namespace).await?;
+        }
+
         // Refuse before writing any table data if this build cannot write the
         // manifest, so a refused create leaves no orphaned dataset behind.
         self.ensure_manifest_writable().await?;
@@ -3258,12 +3389,23 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
+                // Resolve and validate the target before mutating the manifest so a
+                // root-equivalent location cannot delete the namespace root after the
+                // row is already gone.
+                let table_path = Self::join_location(&self.base_path, info.location.as_str())?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                if table_path == self.base_path {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "Refusing to drop table '{}': location '{}' resolves to the namespace root",
+                            object_id, info.location
+                        ),
+                    }
+                    .into());
+                }
+
                 // Delete from manifest first
                 self.delete_from_manifest(&object_id).boxed().await?;
-
-                // Delete physical data directory using the dir_name from manifest
-                let table_path = self.base_path.clone().join(info.location.as_str());
-                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
                 self.object_store
@@ -3403,6 +3545,8 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
+        let mode = CreateNamespaceMode::parse(request.mode.as_deref())?;
+
         // Validate parent namespaces exist (but not the namespace being created)
         if namespace_id.len() > 1 {
             self.validate_namespace_levels_exist(&namespace_id[..namespace_id.len() - 1])
@@ -3411,10 +3555,40 @@ impl LanceNamespace for ManifestNamespace {
 
         let object_id = namespace_id.join(DELIMITER);
         if self.manifest_contains_object(&object_id).await? {
-            return Err(NamespaceError::NamespaceAlreadyExists {
-                message: object_id.to_string(),
-            }
-            .into());
+            return match mode {
+                CreateNamespaceMode::Create => Err(NamespaceError::NamespaceAlreadyExists {
+                    message: object_id.to_string(),
+                }
+                .into()),
+                // ExistOk keeps the existing namespace and reports its properties. The
+                // manifest hit above can also be a table, so require a namespace entry:
+                // reporting success for a table would claim a namespace exists where
+                // `describe_namespace` then fails.
+                CreateNamespaceMode::ExistOk => {
+                    let info = self
+                        .query_manifest_for_namespace(&object_id)
+                        .await?
+                        .ok_or_else(|| NamespaceError::NamespaceAlreadyExists {
+                            message: format!(
+                                "'{}' is already taken by a table, not a namespace",
+                                object_id
+                            ),
+                        })?;
+                    Ok(CreateNamespaceResponse {
+                        properties: info.metadata,
+                        ..Default::default()
+                    })
+                }
+                // Overwrite must drop and recreate the namespace; not supported yet, so
+                // fail loudly rather than silently keeping the existing one.
+                CreateNamespaceMode::Overwrite => Err(NamespaceError::Unsupported {
+                    message: format!(
+                        "create_namespace mode 'Overwrite' is not supported for existing namespace '{}'",
+                        object_id
+                    ),
+                }
+                .into()),
+            };
         }
 
         let metadata =
@@ -3452,6 +3626,9 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
+        let mode = DropNamespaceMode::parse(request.mode.as_deref())?;
+        let behavior = DropNamespaceBehavior::parse(request.behavior.as_deref())?;
+
         let object_id = namespace_id.join(DELIMITER);
 
         // Check if namespace exists. A table's id is not a namespace, and
@@ -3462,10 +3639,14 @@ impl LanceNamespace for ManifestNamespace {
             .await?
             .is_none()
         {
-            return Err(NamespaceError::NamespaceNotFound {
-                message: object_id.to_string(),
-            }
-            .into());
+            // Skip treats a missing namespace as a successful no-op.
+            return match mode {
+                DropNamespaceMode::Skip => Ok(DropNamespaceResponse::default()),
+                DropNamespaceMode::Fail => Err(NamespaceError::NamespaceNotFound {
+                    message: object_id.to_string(),
+                }
+                .into()),
+            };
         }
 
         // Check for child namespaces
@@ -3491,10 +3672,21 @@ impl LanceNamespace for ManifestNamespace {
         })?;
 
         if count > 0 {
-            return Err(NamespaceError::NamespaceNotEmpty {
-                message: format!("'{}' (contains {} child objects)", object_id, count),
-            }
-            .into());
+            // Cascade would drop all children first; not supported yet, so fail loudly
+            // instead of silently ignoring the requested behavior.
+            return match behavior {
+                DropNamespaceBehavior::Restrict => Err(NamespaceError::NamespaceNotEmpty {
+                    message: format!("'{}' (contains {} child objects)", object_id, count),
+                }
+                .into()),
+                DropNamespaceBehavior::Cascade => Err(NamespaceError::Unsupported {
+                    message: format!(
+                        "drop_namespace behavior 'Cascade' is not supported for non-empty namespace '{}' (contains {} child objects)",
+                        object_id, count
+                    ),
+                }
+                .into()),
+            };
         }
 
         self.delete_from_manifest(&object_id).boxed().await?;
@@ -3546,6 +3738,13 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
+        // Reject a table in a namespace that does not exist, matching register_table.
+        // Validating before the reservation marker is written keeps a rejected declare
+        // from leaving an orphaned `.lance-reserved` file behind.
+        if !namespace.is_empty() {
+            self.validate_namespace_levels_exist(&namespace).await?;
+        }
+
         // Tables and namespaces share object ids. We refuse an id that either
         // one holds before we write the marker.
         if self.manifest_contains_object(&object_id).await? {
@@ -3565,7 +3764,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_path = self.base_path.clone().join(dir_name.as_str());
+        let table_path = Self::join_location(&self.base_path, &dir_name)?;
         let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
@@ -3950,7 +4149,7 @@ mod tests {
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
-        DropTableRequest, ListTablesRequest, TableExistsRequest,
+        DropTableRequest, ListTablesRequest, RegisterTableRequest, TableExistsRequest,
     };
     use lance_table::feature_flags::FLAG_UNKNOWN;
     use lance_table::format::Fragment;
@@ -5772,6 +5971,293 @@ mod tests {
     #[case::with_optimization(true)]
     #[case::without_optimization(false)]
     #[tokio::test]
+    async fn test_create_table_in_missing_namespace_fails(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{CreateTableRequest, NamespaceExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // "ghost" is never created, so create_table must not silently orphan a table.
+        let buffer = create_test_ipc_data();
+        let mut create_table_req = CreateTableRequest::new();
+        create_table_req.id = Some(vec!["ghost".to_string(), "table1".to_string()]);
+        let result = dir_namespace
+            .create_table(create_table_req, Bytes::from(buffer))
+            .await;
+        assert!(
+            result.is_err(),
+            "create_table into a missing namespace should fail"
+        );
+
+        // The failed create must not implicitly materialize the namespace either.
+        let exists_req = NamespaceExistsRequest {
+            id: Some(vec!["ghost".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            dir_namespace.namespace_exists(exists_req).await.is_err(),
+            "missing namespace should not be auto-created by a failed create_table"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_declare_table_in_missing_namespace_fails(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{DeclareTableRequest, NamespaceExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["ghost".to_string(), "table1".to_string()]);
+        let result = dir_namespace.declare_table(declare_req).await;
+        assert!(
+            result.is_err(),
+            "declare_table into a missing namespace should fail"
+        );
+
+        let exists_req = NamespaceExistsRequest {
+            id: Some(vec!["ghost".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            dir_namespace.namespace_exists(exists_req).await.is_err(),
+            "missing namespace should not be auto-created by a failed declare_table"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_namespace_exist_ok(#[case] inline_optimization: bool) {
+        use lance_namespace::models::CreateNamespaceRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["ns1".to_string()]);
+        dir_namespace.create_namespace(create_req).await.unwrap();
+
+        // Default (Create) mode still fails on the second attempt.
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["ns1".to_string()]);
+        assert!(
+            dir_namespace.create_namespace(create_req).await.is_err(),
+            "default create mode should fail when the namespace already exists"
+        );
+
+        // ExistOk is idempotent.
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["ns1".to_string()]);
+        create_req.mode = Some("exist_ok".to_string());
+        assert!(
+            dir_namespace.create_namespace(create_req).await.is_ok(),
+            "exist_ok should succeed when the namespace already exists"
+        );
+    }
+
+    /// The manifest hit for `exist_ok` can be a table. Only a real namespace
+    /// entry may be reported as an idempotent success; a table must be
+    /// rejected so callers don't assume `describe_namespace` will work.
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_namespace_exist_ok_rejects_table_collision(
+        #[case] inline_optimization: bool,
+    ) {
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DeclareTableRequest, DescribeNamespaceRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let id = vec!["same".to_string()];
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(id.clone());
+        dir_namespace.declare_table(declare_req).await.unwrap();
+
+        // The object at this ID is a table, so there is no namespace to keep.
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(id.clone());
+        create_req.mode = Some("exist_ok".to_string());
+        let result = dir_namespace.create_namespace(create_req).await;
+        assert!(
+            result.is_err(),
+            "a table collision must not report successful namespace creation: {result:?}"
+        );
+
+        // The table is untouched and still not a namespace.
+        let mut describe_req = DescribeNamespaceRequest::new();
+        describe_req.id = Some(id);
+        assert!(
+            dir_namespace
+                .describe_namespace(describe_req)
+                .await
+                .is_err(),
+            "the collision must not have materialized a namespace"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_namespace_overwrite_unsupported(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{CreateNamespaceRequest, NamespaceExistsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["ns1".to_string()]);
+        dir_namespace.create_namespace(create_req).await.unwrap();
+
+        // Overwrite of an existing namespace is rejected, not silently ignored.
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["ns1".to_string()]);
+        create_req.mode = Some("overwrite".to_string());
+        assert!(
+            dir_namespace.create_namespace(create_req).await.is_err(),
+            "overwrite is unsupported and should error"
+        );
+
+        // The rejected overwrite must leave the existing namespace intact.
+        let exists_req = NamespaceExistsRequest {
+            id: Some(vec!["ns1".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            dir_namespace.namespace_exists(exists_req).await.is_ok(),
+            "rejected overwrite must not drop the existing namespace"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_drop_namespace_skip_missing(#[case] inline_optimization: bool) {
+        use lance_namespace::models::DropNamespaceRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Default (Fail) mode errors on a missing namespace.
+        let mut drop_req = DropNamespaceRequest::new();
+        drop_req.id = Some(vec!["ghost".to_string()]);
+        assert!(
+            dir_namespace.drop_namespace(drop_req).await.is_err(),
+            "default drop mode should fail for a missing namespace"
+        );
+
+        // Skip mode turns the missing namespace into a successful no-op.
+        let mut drop_req = DropNamespaceRequest::new();
+        drop_req.id = Some(vec!["ghost".to_string()]);
+        drop_req.mode = Some("skip".to_string());
+        assert!(
+            dir_namespace.drop_namespace(drop_req).await.is_ok(),
+            "skip mode should succeed for a missing namespace"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_drop_namespace_cascade_unsupported(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{
+            CreateNamespaceRequest, DropNamespaceRequest, NamespaceExistsRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["parent".to_string()]);
+        dir_namespace.create_namespace(create_req).await.unwrap();
+
+        let mut create_req = CreateNamespaceRequest::new();
+        create_req.id = Some(vec!["parent".to_string(), "child".to_string()]);
+        dir_namespace.create_namespace(create_req).await.unwrap();
+
+        // Cascade on a non-empty namespace is rejected, not silently ignored.
+        let mut drop_req = DropNamespaceRequest::new();
+        drop_req.id = Some(vec!["parent".to_string()]);
+        drop_req.behavior = Some("cascade".to_string());
+        assert!(
+            dir_namespace.drop_namespace(drop_req).await.is_err(),
+            "cascade is unsupported and should error"
+        );
+
+        // The rejected cascade must not drop the namespace or its children.
+        for id in [
+            vec!["parent".to_string()],
+            vec!["parent".to_string(), "child".to_string()],
+        ] {
+            let exists_req = NamespaceExistsRequest {
+                id: Some(id.clone()),
+                ..Default::default()
+            };
+            assert!(
+                dir_namespace.namespace_exists(exists_req).await.is_ok(),
+                "rejected cascade must not drop {:?}",
+                id
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
     async fn test_concurrent_create_and_drop_single_instance(#[case] inline_optimization: bool) {
         use futures::future::join_all;
         use std::sync::Arc;
@@ -6546,5 +7032,241 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.alter_table_drop_columns(request).await;
         assert!(result.is_err(), "Should fail when table does not exist");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_drop_nested_table_removes_physical_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+        let nested = std::path::Path::new(temp_path).join("outside/held");
+        std::fs::create_dir_all(nested.join("_versions")).unwrap();
+        std::fs::write(nested.join("_versions/1.manifest"), b"{}").unwrap();
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["nested".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        req.location = "outside/held".to_string();
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop_request = DropTableRequest::new();
+        drop_request.id = Some(vec!["nested".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop_request).await.unwrap();
+        assert!(!nested.exists());
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_real_writer_nested_location_drop_cleans_data(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Write a real lance dataset at outside/held using Dataset::write
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+                1i64, 2, 3,
+            ]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let nested_uri = format!("{}/outside/held", temp_path);
+        lance::dataset::Dataset::write(Box::new(reader), &nested_uri, None)
+            .await
+            .unwrap();
+
+        let mut ns = CreateNamespaceRequest::new();
+        ns.id = Some(vec!["n".to_string()]);
+        dir_namespace.create_namespace(ns).await.unwrap();
+        // Register + drop
+        let mut req = RegisterTableRequest::new("outside/held".to_string());
+        req.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["n".to_string(), "held".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(
+            !std::path::Path::new(&nested_uri).exists(),
+            "nested data must be removed"
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_declare_unicode_name_drop_marker_clean(#[case] inline_optimization: bool) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        for name in ["plain", "räksmörgås", "growth%"] {
+            let mut req = DeclareTableRequest::new();
+            req.id = Some(vec![name.to_string()]);
+            dir_namespace.declare_table(req).await.unwrap();
+            let mut drop = DropTableRequest::new();
+            drop.id = Some(vec![name.to_string()]);
+            dir_namespace.drop_table(drop).await.unwrap();
+            // List temp dir: only manifest + expected parents, no stray encoded marker
+            let entries: Vec<_> = std::fs::read_dir(temp_path)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "only __manifest should remain, got {:?}",
+                entries
+            );
+        }
+    }
+
+    async fn write_single_column_dataset(uri: &str) {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+        let reader = arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        lance::dataset::Dataset::write(Box::new(reader), uri, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_registered_location_matches_construct_full_uri_canonicalization() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        // construct_full_uri maps `a//b` and `c/d//` to `a/b` and `c/d`, so write
+        // the datasets there. `a%2Fb` stays a literal escaped-slash segment.
+        for dir in ["a/b", "c/d", "a%2Fb"] {
+            write_single_column_dataset(&format!("{temp_path}/{dir}")).await;
+        }
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["canon".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        for (name, location) in [
+            ("empty-segments", "a//b"),
+            ("trailing-slashes", "c/d//"),
+            ("escaped-slash", "a%2Fb"),
+        ] {
+            let mut req = RegisterTableRequest::new(location.to_string());
+            req.id = Some(vec!["canon".to_string(), name.to_string()]);
+            dir_namespace.register_table(req).await.unwrap();
+        }
+
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["canon".to_string()]);
+        list.include_declared = Some(false);
+        let listed = dir_namespace.list_tables(list).await.unwrap();
+        assert_eq!(
+            listed.tables,
+            vec!["empty-segments", "escaped-slash", "trailing-slashes"]
+        );
+
+        let mut describe = DescribeTableRequest::new();
+        describe.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        describe.check_declared = Some(true);
+        let described = dir_namespace.describe_table(describe).await.unwrap();
+        assert_eq!(described.is_only_declared, Some(false));
+
+        // Dropping the canonicalized location removes `a/b` and leaves the literal
+        // `a%2Fb` directory untouched.
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "empty-segments".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a/b")).exists());
+        assert!(std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "trailing-slashes".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/c/d")).exists());
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["canon".to_string(), "escaped-slash".to_string()]);
+        dir_namespace.drop_table(drop).await.unwrap();
+        assert!(!std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+    }
+
+    #[rstest]
+    #[case::empty_location("")]
+    #[case::dot_location(".")]
+    #[tokio::test]
+    async fn test_drop_rejects_root_equivalent_location(#[case] location: &str) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let mut ns_req = CreateNamespaceRequest::new();
+        ns_req.id = Some(vec!["root".to_string()]);
+        dir_namespace.create_namespace(ns_req).await.unwrap();
+
+        let mut req = RegisterTableRequest::new(location.to_string());
+        req.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        dir_namespace.register_table(req).await.unwrap();
+
+        // Physical data that a root-directory delete would destroy.
+        std::fs::write(std::path::Path::new(temp_path).join("keep.txt"), b"keep").unwrap();
+
+        // Probing must not turn the whole listing into an error for these rows.
+        let mut list = ListTablesRequest::new();
+        list.id = Some(vec!["root".to_string()]);
+        list.include_declared = Some(false);
+        assert!(
+            dir_namespace
+                .list_tables(list)
+                .await
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        let error = dir_namespace.drop_table(drop).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("namespace root"), "{message}");
+
+        // The manifest row and physical data must both survive the rejected drop.
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(vec!["root".to_string(), "danger".to_string()]);
+        assert!(dir_namespace.table_exists(exists).await.is_ok());
+        assert!(std::path::Path::new(temp_path).join("keep.txt").exists());
+        assert!(std::path::Path::new(temp_path).join("__manifest").exists());
     }
 }

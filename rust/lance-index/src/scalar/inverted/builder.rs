@@ -16,7 +16,7 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_arrow::json::JsonEncoding;
@@ -76,6 +76,9 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
+// Bound the payload copied into each v3 write batch. A single posting can
+// exceed this target; it remains indivisible in the current format.
+const POSTING_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -495,6 +498,8 @@ impl InvertedIndexBuilder {
                     progress
                         .stage_progress("tokenize_docs", tokenized_count)
                         .await?;
+                    // A ready async-channel receiver does not consume Tokio's cooperative budget.
+                    tokio::task::yield_now().await;
                 }
                 worker.finish().await
             });
@@ -1309,7 +1314,10 @@ impl InnerBuilder {
                             &mut batch_builder,
                             format_version,
                         )?;
-                        if batch_builder.len() >= batch_rows {
+                        if batch_builder.len() >= batch_rows
+                            || (format_version == InvertedListFormatVersion::V3
+                                && batch_builder.payload_bytes() >= POSTING_BATCH_BYTES)
+                        {
                             batch = Some(batch_builder.finish()?);
                             break;
                         }
@@ -1676,6 +1684,7 @@ impl IndexWorker {
         doc_index: &[u32],
     ) -> Result<()> {
         let with_position = self.has_position();
+        let discount_overlaps = self.tokenizer.discount_overlaps();
         let builder_was_empty = self.builder.docs.is_empty();
         let old_temporary_memory_size = self.temporary_memory_size();
         let old_token_memory_size = self.builder.tokens.memory_size() as u64;
@@ -1700,6 +1709,7 @@ impl IndexWorker {
                 let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    let mut last_position = None;
                     while token_stream.advance() {
                         let token = token_stream.token();
                         let position = Self::checked_token_position(row_id, token.position)?;
@@ -1732,7 +1742,14 @@ impl IndexWorker {
                         let new_posting_memory_size = posting_list.size();
                         posting_memory_delta +=
                             new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                        token_num += 1;
+                        if !discount_overlaps || last_position != Some(token.position) {
+                            token_num = token_num.checked_add(1).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "document length overflow for row_id={row_id}"
+                                ))
+                            })?;
+                        }
+                        last_position = Some(token.position);
                     }
                     Ok(())
                 };
@@ -1758,21 +1775,31 @@ impl IndexWorker {
                 let tokenizer = &mut self.tokenizer;
                 let builder = &mut self.builder;
                 let token_ids = &mut self.token_ids;
-                let mut process_text = |text: &str| {
+                let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    let mut last_position = None;
                     while token_stream.advance() {
-                        let token_id = builder.tokens.get_or_add(&token_stream.token().text);
+                        let token = token_stream.token();
+                        let token_id = builder.tokens.get_or_add(&token.text);
                         token_ids.push(token_id);
-                        token_num += 1;
+                        if !discount_overlaps || last_position != Some(token.position) {
+                            token_num = token_num.checked_add(1).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "document length overflow for row_id={row_id}"
+                                ))
+                            })?;
+                        }
+                        last_position = Some(token.position);
                     }
+                    Ok(())
                 };
 
                 match document {
-                    DocumentSource::Text(doc) => process_text(doc),
+                    DocumentSource::Text(doc) => process_text(doc)?,
                     DocumentSource::StringList(elements) => {
                         let doc = Self::materialize_string_list(elements);
-                        process_text(&doc);
+                        process_text(&doc)?;
                     }
                 }
             }
@@ -3135,7 +3162,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream::{self, BoxStream};
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
@@ -4652,8 +4679,15 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::single_worker(1)]
+    #[case::multiple_workers(3)]
     #[tokio::test]
-    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats(
+        #[case] workers: usize,
+        #[values(false, true)] with_position: bool,
+        #[values(128, 256)] block_size: usize,
+    ) -> Result<()> {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -4669,14 +4703,18 @@ mod tests {
             None,
             Some("hello"),
         ]);
-        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let batches = (0..batch.num_rows())
+            .map(|row| Ok(batch.slice(row, 1)))
+            .collect::<Vec<_>>();
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(batches));
         let params =
             InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
-                .with_position(false)
+                .with_position(with_position)
                 .remove_stop_words(true)
                 .stem(false)
                 .max_token_length(Some(6))
-                .num_workers(1);
+                .block_size(block_size)?
+                .num_workers(workers);
 
         let mut builder = InvertedIndexBuilder::new(params);
         builder
@@ -5741,7 +5779,7 @@ mod tests {
             let first_callback_started = first_callback_started.clone();
             async move {
                 first_callback_started.notified().await;
-                Err(datafusion::error::DataFusionError::Execution(
+                Err(datafusion_common::DataFusionError::Execution(
                     "injected stream failure".to_owned(),
                 ))
             }

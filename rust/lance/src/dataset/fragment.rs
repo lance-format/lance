@@ -318,19 +318,55 @@ impl GenericFileReader for V1Reader {
         projection: Arc<Schema>,
         _take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-        let indices_vec = indices.to_vec();
+        // Keep stored row groups separate: combining otherwise readable groups
+        // can exceed Arrow's offset limits before the caller can split them.
+        let mut groups = Vec::new();
+        let mut indices = indices.to_vec();
+        indices.sort_unstable();
+        let mut remaining = indices.as_slice();
+        let mut batch_end = 0_u64;
+        for batch_id in 0..self.reader.num_batches() {
+            let batch_start = batch_end;
+            batch_end += self.reader.num_rows_in_batch(batch_id as i32) as u64;
+            let count = remaining.partition_point(|&index| u64::from(index) < batch_end);
+            if count > 0 {
+                let offsets = remaining[..count]
+                    .iter()
+                    .map(|&index| (u64::from(index) - batch_start) as u32)
+                    .collect::<Vec<_>>();
+                groups.push((Some(batch_id as i32), offsets));
+                remaining = &remaining[count..];
+            }
+            if remaining.is_empty() {
+                break;
+            }
+        }
+        // Preserve the file reader's validation of out-of-bounds indices and
+        // its empty-selection result.
+        if !remaining.is_empty() || groups.is_empty() {
+            groups.push((None, remaining.to_vec()));
+        }
         let reader = self.reader.clone();
-        let num_rows = indices.len() as u32;
         async move {
             // In the new path the row id is added by the fragment and not the file
-            let task_fut =
-                async move { reader.take(&indices_vec, projection.as_ref()).await }.boxed();
-            let task = std::future::ready(ReadBatchTask {
-                task: task_fut,
-                num_rows,
-            })
-            .boxed();
-            Ok(futures::stream::once(task).boxed())
+            Ok(stream::iter(groups)
+                .map(move |(batch_id, indices)| {
+                    let reader = reader.clone();
+                    let projection = projection.clone();
+                    let num_rows = indices.len() as u32;
+                    let task = async move {
+                        if let Some(batch_id) = batch_id {
+                            reader
+                                .read_batch(batch_id, indices.as_slice(), projection.as_ref())
+                                .await
+                        } else {
+                            reader.take(&indices, projection.as_ref()).await
+                        }
+                    }
+                    .boxed();
+                    ReadBatchTask { task, num_rows }
+                })
+                .boxed())
         }
         .boxed()
     }
@@ -6550,6 +6586,7 @@ mod tests {
             updated_fragments: vec![u1.fragment],
             new_fragments: vec![],
             fields_modified: u1.fields_modified,
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -6631,6 +6668,7 @@ mod tests {
             updated_fragments: vec![u2.fragment],
             new_fragments: vec![],
             fields_modified: u2.fields_modified,
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),

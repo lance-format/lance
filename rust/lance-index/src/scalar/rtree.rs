@@ -20,9 +20,9 @@ use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use geoarrow_array::array::{RectArray, from_arrow_array};
@@ -30,13 +30,16 @@ use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+    KeyBuilder, LanceCache, WeakLanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
-use lance_datafusion::chunker::chunk_concat_stream;
+use lance_datafusion_exec::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{
@@ -276,6 +279,21 @@ impl DeepSizeOf for RTreeCacheValue {
     }
 }
 
+impl CacheCodecImpl for RTreeCacheValue {
+    const TYPE_ID: &'static str = "lance.scalar.RTreeCacheValue";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+        // Preserve the GeoArrow field metadata on pages and the binary bitmap
+        // column on the null entry using the same Arrow IPC representation.
+        writer.write_ipc(&self.0)
+    }
+
+    fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+        Ok(Self(Arc::new(reader.read_ipc()?)))
+    }
+}
+
 impl CacheKey for RTreeCacheKey {
     type ValueType = RTreeCacheValue;
 
@@ -288,6 +306,10 @@ impl CacheKey for RTreeCacheKey {
 
     fn type_name() -> &'static str {
         "RTree"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<RTreeCacheValue>())
     }
 
     fn schema() -> CacheKeySchema {
@@ -334,20 +356,7 @@ impl RTreeIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
-        let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
-        validate_stored_page_size(metadata.page_size, metadata.num_items)?;
-        let nulls_reader = store.open_index_file(RTREE_NULLS_NAME).await?;
-
-        Ok(Arc::new(Self {
-            metadata: Arc::new(metadata),
-            store,
-            frag_reuse_index,
-            batch_remapper: None,
-            index_cache: WeakLanceCache::from(index_cache),
-            pages_reader,
-            nulls_reader,
-        }))
+        Self::load_inner(store, frag_reuse_index, None, index_cache).await
     }
 
     /// Additive sibling of [`Self::load`] for mappings that require
@@ -358,6 +367,19 @@ impl RTreeIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
+        Self::load_inner(store, None, remapping, index_cache).await
+    }
+
+    async fn load_inner(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        debug_assert!(
+            frag_reuse_index.is_none() || batch_remapper.is_none(),
+            "RTree legacy and batch remappers are mutually exclusive"
+        );
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
         validate_stored_page_size(metadata.page_size, metadata.num_items)?;
@@ -366,8 +388,8 @@ impl RTreeIndex {
         Ok(Arc::new(Self {
             metadata: Arc::new(metadata),
             store,
-            frag_reuse_index: None,
-            batch_remapper: remapping,
+            frag_reuse_index,
+            batch_remapper,
             index_cache: WeakLanceCache::from(index_cache),
             pages_reader,
             nulls_reader,
@@ -474,6 +496,40 @@ impl RTreeIndex {
         Ok(null_map)
     }
 
+    async fn remap_row_addrs(&self, row_addrs: RowAddrTreeMap) -> Result<RowAddrTreeMap> {
+        if let Some(remapper) = &self.frag_reuse_index {
+            Ok(remapper.remap_row_addrs_tree_map(&row_addrs))
+        } else if let Some(remapper) = &self.batch_remapper {
+            remap_row_addrs_tree_map_async(remapper.as_ref(), &row_addrs).await
+        } else {
+            Ok(row_addrs)
+        }
+    }
+
+    /// Prepare old entries in the current row-ID domain before filtering either
+    /// representation. New input must bypass this helper, even when it reuses old IDs.
+    async fn retained_data(
+        &self,
+        old_data_filter: Option<&OldIndexDataFilter>,
+    ) -> Result<(SendableRecordBatchStream, RowAddrTreeMap)> {
+        let null_map = self.search_null(&NoOpMetricsCollector).await?;
+        let mut null_map = self.remap_row_addrs(null_map).await?;
+        if let Some(filter) = old_data_filter {
+            filter.retain_old_rows(&mut null_map);
+        }
+
+        let mut data = self.clone().into_data_stream().await?;
+        if let Some(remapper) = self.frag_reuse_index.clone() {
+            data = remap_rtree_data(data, remapper);
+        } else if let Some(remapper) = self.batch_remapper.clone() {
+            data = remap_rtree_data_async(data, remapper);
+        }
+        if let Some(filter) = old_data_filter {
+            data = filter_rtree_data(data, filter.clone());
+        }
+        Ok((data, null_map))
+    }
+
     /// Create a stream of all the data in the index, in the format (bbox, row_id)
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(RTREE_PAGES_NAME).await?;
@@ -495,24 +551,6 @@ impl RTreeIndex {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             BBOX_ROWID_SCHEMA.clone(),
             batches,
-        )))
-    }
-
-    async fn combine_old_new(
-        self,
-        new_input: SendableRecordBatchStream,
-    ) -> Result<SendableRecordBatchStream> {
-        let old_input = self.into_data_stream().await?;
-        debug_assert_eq!(
-            old_input.schema().flattened_fields().len(),
-            new_input.schema().flattened_fields().len()
-        );
-
-        let merged = futures::stream::select(old_input, new_input);
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            BBOX_ROWID_SCHEMA.clone(),
-            merged,
         )))
     }
 }
@@ -637,31 +675,9 @@ pub async fn merge_rtree_indices(
                 page_size, source.metadata.page_size
             )));
         }
-        let mut source_nulls = source.search_null(&NoOpMetricsCollector).await?;
-        if let Some(remapper) = &source.frag_reuse_index {
-            // Legacy synchronous remapping path.
-            source_nulls = remapper.remap_row_addrs_tree_map(&source_nulls);
-        } else if let Some(remapper) = &source.batch_remapper {
-            // Tagged asynchronous path.
-            source_nulls = remap_row_addrs_tree_map_async(remapper.as_ref(), &source_nulls).await?;
-        }
-        if let Some(filter) = filter {
-            filter.retain_old_rows(&mut source_nulls);
-        }
+        let (data, source_nulls) = source.retained_data(filter.as_ref()).await?;
+        data_streams.push(data);
         null_map |= &source_nulls;
-
-        let mut data = source.as_ref().clone().into_data_stream().await?;
-        if let Some(remapper) = source.frag_reuse_index.clone() {
-            // Legacy synchronous remapping path.
-            data = remap_rtree_data(data, remapper);
-        } else if let Some(remapper) = source.batch_remapper.clone() {
-            // Tagged asynchronous path.
-            data = remap_rtree_data_async(data, remapper);
-        }
-        data_streams.push(match filter {
-            Some(filter) => filter_rtree_data(data, filter.clone()),
-            None => data,
-        });
     }
 
     let combined = Box::pin(RecordBatchStreamAdapter::new(
@@ -772,32 +788,17 @@ impl ScalarIndex for RTreeIndex {
                 let geo_array =
                     extract_bounding_boxes(query.value.to_array()?.as_ref(), &query.field)?;
                 let bbox = total_bounds(&geo_array)?;
-                let mut rowids = self.search_bbox(bbox, metrics).await?;
-                let mut null_map = self.search_null(metrics).await?;
-
-                if let Some(fri) = &self.frag_reuse_index {
-                    // Legacy synchronous remapping path.
-                    rowids = fri.remap_row_addrs_tree_map(&rowids);
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
-                } else if let Some(remapper) = &self.batch_remapper {
-                    // Tagged asynchronous path.
-                    rowids = remap_row_addrs_tree_map_async(remapper.as_ref(), &rowids).await?;
-                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-                }
+                let rowids = self.search_bbox(bbox, metrics).await?;
+                let null_map = self.search_null(metrics).await?;
+                let rowids = self.remap_row_addrs(rowids).await?;
+                let null_map = self.remap_row_addrs(null_map).await?;
                 Ok(SearchResult::AtMost(NullableRowAddrSet::new(
                     rowids, null_map,
                 )))
             }
             GeoQuery::IsNull => {
-                let mut null_map = self.search_null(metrics).await?;
-
-                if let Some(fri) = &self.frag_reuse_index {
-                    // Legacy synchronous remapping path.
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
-                } else if let Some(remapper) = &self.batch_remapper {
-                    // Tagged asynchronous path.
-                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-                }
+                let null_map = self.search_null(metrics).await?;
+                let null_map = self.remap_row_addrs(null_map).await?;
                 Ok(SearchResult::Exact(NullableRowAddrSet::new(
                     null_map,
                     RowAddrTreeMap::default(),
@@ -835,10 +836,14 @@ impl ScalarIndex for RTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
-        let combined_bbox_data = self.clone().combine_old_new(bbox_data).await?;
+        let (old_data, null_map) = self.retained_data(old_data_filter.as_ref()).await?;
+        let combined_bbox_data = Box::pin(RecordBatchStreamAdapter::new(
+            BBOX_ROWID_SCHEMA.clone(),
+            stream::select(old_data, bbox_data),
+        ));
         let tmpdir = Arc::new(TempDir::default());
         let spill_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -852,7 +857,6 @@ impl ScalarIndex for RTreeIndex {
         )
         .await?;
 
-        let null_map = self.search_null(&NoOpMetricsCollector).await?;
         stats.null_map |= &null_map;
 
         let files = RTreeIndexPlugin::train_rtree_index(
@@ -1315,9 +1319,85 @@ mod tests {
     use geo_types::{LineString, Rect, coord, line_string};
     use geoarrow_array::builder::{LineStringBuilder, PointBuilder, RectBuilder};
     use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
+    use lance_core::cache::{CacheDecode, CacheEntry, CacheMissReason};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_geo::bbox::is_empty_rect;
     use rand::Rng;
+
+    #[rstest::rstest]
+    #[case::leaf("leaf")]
+    #[case::internal("internal")]
+    #[case::nulls("nulls")]
+    #[case::empty_leaf("empty_leaf")]
+    #[case::empty_nulls("empty_nulls")]
+    fn test_rtree_cache_codec(#[case] kind: &str) {
+        let codec = RTreeCacheKey::codec().expect("RTree entries must support disk caching");
+        let batch = if kind.ends_with("nulls") {
+            let mut bitmap = Vec::new();
+            RowAddrTreeMap::from_iter([7, (2_u64 << 32) | 9])
+                .serialize_into(&mut bitmap)
+                .unwrap();
+            RecordBatch::try_new(
+                RTREE_NULLS_SCHEMA.clone(),
+                vec![Arc::new(BinaryArray::from_vec(vec![bitmap.as_slice()]))],
+            )
+            .unwrap()
+        } else {
+            let mut rects = RectBuilder::new(RectType::new(Dimension::XY, Default::default()));
+            for i in 0..3 {
+                rects.push_rect(Some(&Rect::new(
+                    coord! { x: i as f64, y: -1.0 },
+                    coord! { x: i as f64 + 0.5, y: 1.0 },
+                )));
+            }
+            RecordBatch::try_new(
+                if kind == "internal" {
+                    RTREE_PAGE_SCHEMA.clone()
+                } else {
+                    BBOX_ROWID_SCHEMA.clone()
+                },
+                vec![
+                    rects.finish().to_array_ref(),
+                    Arc::new(UInt64Array::from(vec![0, 7, u64::MAX])),
+                ],
+            )
+            .unwrap()
+            .slice(1, 2)
+        };
+        let batch = if kind.starts_with("empty") {
+            batch.slice(0, 0)
+        } else {
+            batch
+        };
+        let expected = Arc::new(batch);
+        let entry: CacheEntry = Arc::new(RTreeCacheValue(expected.clone()));
+        let dir = TempDir::default();
+        let path = dir.std_path().join("rtree.cache");
+        codec
+            .serialize(&entry, &mut std::fs::File::create(&path).unwrap())
+            .unwrap();
+        drop(entry);
+        let bytes = bytes::Bytes::from(std::fs::read(path).unwrap());
+        let restored = codec.deserialize(&bytes).hit().unwrap();
+        let restored = restored.downcast_ref::<RTreeCacheValue>().unwrap();
+        assert_eq!(restored.0, expected);
+        if !kind.ends_with("nulls") {
+            let boxes =
+                extract_bounding_boxes(restored.0.column(0).as_ref(), restored.0.schema().field(0))
+                    .unwrap();
+            assert_eq!(boxes.len(), expected.num_rows());
+        }
+        // The complete envelope ends at byte 39; the IPC section starts at byte 64.
+        for len in (39..=64).chain(std::iter::once(bytes.len() / 2)) {
+            assert!(
+                matches!(
+                    codec.deserialize(&bytes.slice(..len)),
+                    CacheDecode::Miss(CacheMissReason::BodyError)
+                ),
+                "truncated {kind} entry with {len} bytes must be a cache miss"
+            );
+        }
+    }
 
     fn expected_num_pages(num_items: usize, page_size: u32) -> u64 {
         RTreeMetadata::calculate_page_offsets(num_items, page_size).len() as u64
@@ -1630,101 +1710,153 @@ mod tests {
         assert!(analyzed.try_next().await.unwrap().is_none());
     }
 
+    #[rstest::rstest]
+    #[case::unmapped_rows("none", "rows")]
+    #[case::sync_rows("sync", "rows")]
+    #[case::async_rows("async", "rows")]
+    #[case::unmapped_fragments("none", "fragments")]
+    #[case::sync_fragments("sync", "fragments")]
+    #[case::async_fragments("async", "fragments")]
+    #[case::all_filtered("none", "all_filtered")]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_merge_rtree_indices_filters_rows_and_nulls() {
+    async fn test_merge_rtree_indices_filters_rows_and_nulls(
+        #[case] remapping: &str,
+        #[case] filter_kind: &str,
+    ) {
         let point_type = PointType::new(Dimension::XY, Default::default());
         let mut first_builder = PointBuilder::new(point_type.clone());
         first_builder.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
         first_builder.push_null();
+        first_builder.push_point(Some(&geo_types::point!(x: 50.0, y: 50.0)));
+        first_builder.push_null();
         let first = first_builder.finish();
-
+        // Use two source fragments so even the unmapped fragment filter retains
+        // only part of each stored representation.
+        let source_ids: Vec<u64> = (0..4)
+            .map(|id| RowAddress::new_from_parts(id / 2, id % 2).into())
+            .collect();
+        let first_tmpdir = TempObjDir::default();
+        let first_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            first_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        RTreeIndexPlugin
+            .train_index(
+                convert_bbox_rowid_batch_stream(
+                    &first,
+                    Arc::new(UInt64Array::from(source_ids.clone())),
+                ),
+                first_store.as_ref(),
+                Box::new(RTreeTrainingRequest::new(RTreeParameters {
+                    page_size: Some(4),
+                })),
+                None,
+                crate::progress::noop_progress(),
+            )
+            .await
+            .unwrap();
+        let first_index = RTreeIndex::load(first_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let mut first_index = first_index.as_ref().clone();
+        let mapped_ids: Vec<u64> = (0..4)
+            .map(|id| {
+                if remapping == "none" {
+                    source_ids[id as usize]
+                } else {
+                    RowAddress::new_from_parts(2 + id / 2, id % 2).into()
+                }
+            })
+            .collect();
+        match remapping {
+            "sync" => {
+                first_index.frag_reuse_index = Some(Arc::new(FragReuseIndexHandle(Arc::new(
+                    FragReuseIndex::new(
+                        uuid::Uuid::new_v4(),
+                        vec![
+                            source_ids
+                                .iter()
+                                .copied()
+                                .zip(mapped_ids.iter().copied().map(Some))
+                                .collect(),
+                        ],
+                        FragReuseIndexDetails { versions: vec![] },
+                    ),
+                ))));
+            }
+            "async" => first_index.batch_remapper = Some(Arc::new(TestRemapper)),
+            _ => {}
+        }
+        let filter = match filter_kind {
+            "rows" => OldIndexDataFilter::RowIds(mapped_ids[..2].iter().copied().collect()),
+            "fragments" => OldIndexDataFilter::Fragments {
+                to_keep: RoaringBitmap::from_iter([if remapping == "none" { 0 } else { 2 }]),
+                to_remove: RoaringBitmap::from_iter([1, 3]),
+            },
+            _ => OldIndexDataFilter::RowIds(
+                [u64::from(RowAddress::new_from_parts(9, 0))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let empty = PointBuilder::new(point_type.clone()).finish();
+        let (empty_index, _empty_store, _empty_tmpdir) = train_index(&empty, Some(8)).await;
         let mut second_builder = PointBuilder::new(point_type);
         second_builder.push_point(Some(&geo_types::point!(x: 100.0, y: 100.0)));
         second_builder.push_null();
-        let second = second_builder.finish();
-        let empty = PointBuilder::new(PointType::new(Dimension::XY, Default::default())).finish();
-
-        let (empty_index, _empty_store, _empty_tmpdir) = train_index(&empty, Some(8)).await;
-        let (first_index, _first_store, _first_tmpdir) = train_index(&first, Some(4)).await;
-        let (second_index, _second_store, _second_tmpdir) = train_index(&second, Some(4)).await;
-        let mut near_origin = BoundingBox::new();
-        near_origin.add_rect(&Rect::new(
-            coord! { x: 9.0, y: 9.0 },
-            coord! { x: 11.0, y: 11.0 },
-        ));
-        let mut expected_geometry = RowAddrTreeMap::new();
-        expected_geometry.insert(0);
-        assert_eq!(
-            first_index
-                .search_bbox(near_origin, &NoOpMetricsCollector)
-                .await
-                .unwrap(),
-            expected_geometry
-        );
+        // A fully excluded source must not trigger a page-size mismatch.
+        let (second_index, _second_store, _second_tmpdir) =
+            train_index(&second_builder.finish(), Some(8)).await;
         let merged_tmpdir = TempObjDir::default();
         let merged_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             merged_tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-
-        let remapped_geometry = RowAddress::new_from_parts(2, 0).into();
-        let remapped_null = RowAddress::new_from_parts(2, 1).into();
-        expected_geometry = RowAddrTreeMap::new();
-        expected_geometry.insert(remapped_geometry);
-        let remapper = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
-            uuid::Uuid::new_v4(),
-            vec![HashMap::from([
-                (0, Some(remapped_geometry)),
-                (1, Some(remapped_null)),
-            ])],
-            FragReuseIndexDetails { versions: vec![] },
-        )));
-        let mut first_index = first_index.as_ref().clone();
-        first_index.frag_reuse_index = Some(Arc::new(remapper));
-
-        let mut keep_first_rows = RowAddrTreeMap::new();
-        keep_first_rows.insert(remapped_geometry);
-        keep_first_rows.insert(remapped_null);
         merge_rtree_indices(
             &[empty_index, Arc::new(first_index), second_index],
             merged_store.as_ref(),
             &[
                 None,
-                Some(OldIndexDataFilter::RowIds(keep_first_rows)),
+                Some(filter),
                 Some(OldIndexDataFilter::RowIds(RowAddrTreeMap::new())),
             ],
         )
         .await
         .unwrap();
-
         let merged = RTreeIndex::load(merged_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
-        assert_eq!(merged.metadata.num_items, 1);
-        assert_eq!(merged.metadata.bbox.minx(), 10.0);
-        assert_eq!(merged.metadata.bbox.miny(), 10.0);
-        assert_eq!(merged.metadata.bbox.maxx(), 10.0);
-        assert_eq!(merged.metadata.bbox.maxy(), 10.0);
-        assert!(
-            merged.metadata.bbox.rect_intersects(&near_origin),
-            "merged bounds {:?} do not intersect {:?}",
-            merged.metadata.bbox,
-            near_origin
-        );
+        let mut expected_geometry = RowAddrTreeMap::new();
+        let mut expected_nulls = RowAddrTreeMap::new();
+        if filter_kind == "all_filtered" {
+            assert_eq!(merged.metadata.num_items, 0);
+            assert_eq!(merged.metadata.num_pages, 0);
+        } else {
+            expected_geometry.insert(mapped_ids[0]);
+            expected_nulls.insert(mapped_ids[1]);
+            assert_eq!(merged.metadata.num_items, 1);
+            assert_eq!(merged.metadata.bbox.minx(), 10.0);
+            assert_eq!(merged.metadata.bbox.miny(), 10.0);
+            assert_eq!(merged.metadata.bbox.maxx(), 10.0);
+            assert_eq!(merged.metadata.bbox.maxy(), 10.0);
+        }
+        let bounds = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 0.0, y: 0.0 },
+            coord! { x: 101.0, y: 101.0 },
+        ));
         assert_eq!(
             merged
-                .search_bbox(near_origin, &NoOpMetricsCollector)
+                .search_bbox(bounds, &NoOpMetricsCollector)
                 .await
                 .unwrap(),
             expected_geometry
         );
-        let mut expected_null = RowAddrTreeMap::new();
-        expected_null.insert(remapped_null);
         assert_eq!(
             merged.search_null(&NoOpMetricsCollector).await.unwrap(),
-            expected_null
+            expected_nulls
         );
     }
 
@@ -1792,6 +1924,175 @@ mod tests {
             .unwrap();
         assert_eq!(updated.metadata.num_items, 0);
         assert_eq!(updated.metadata.num_pages, 0);
+    }
+
+    #[derive(Debug)]
+    struct TestRemapper;
+
+    #[async_trait]
+    impl BatchRowIdRemapper for TestRemapper {
+        async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+            Ok(row_ids
+                .iter()
+                .map(|id| {
+                    let address = RowAddress::from(*id);
+                    let fragment = address.fragment_id();
+                    let offset = address.row_offset();
+                    Some(RowAddress::new_from_parts(2 + fragment + offset / 2, offset % 2).into())
+                })
+                .collect())
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::row_ids("rows")]
+    #[case::fragments("fragments")]
+    #[case::empty_row_ids("empty_rows")]
+    #[case::empty_fragments("empty_fragments")]
+    #[case::unfiltered("none")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_update_filters_old_rows(
+        #[case] filter_kind: &str,
+        #[values("mixed", "empty", "all_null")] new_input: &str,
+        #[values("none", "sync", "async")] remapping: &str,
+    ) {
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut builder = PointBuilder::new(point_type.clone());
+        builder.push_null();
+        builder.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+        builder.push_null();
+        builder.push_point(Some(&geo_types::point!(x: 3.0, y: 3.0)));
+        let (index, _store, _tmpdir) = train_index(&builder.finish(), Some(4)).await;
+        let mut index = index.as_ref().clone();
+        let old_ids: Vec<u64> = (0..4)
+            .map(|id| {
+                if remapping == "none" {
+                    id
+                } else {
+                    RowAddress::new_from_parts(2 + (id / 2) as u32, (id % 2) as u32).into()
+                }
+            })
+            .collect();
+        match remapping {
+            "sync" => {
+                index.frag_reuse_index = Some(Arc::new(FragReuseIndexHandle(Arc::new(
+                    FragReuseIndex::new(
+                        uuid::Uuid::new_v4(),
+                        vec![(0..4).zip(old_ids.iter().copied().map(Some)).collect()],
+                        FragReuseIndexDetails { versions: vec![] },
+                    ),
+                ))));
+            }
+            "async" => index.batch_remapper = Some(Arc::new(TestRemapper)),
+            _ => {}
+        }
+        let retained_ids = old_ids[2..].iter().copied().collect::<RowAddrTreeMap>();
+        let filter = match filter_kind {
+            "rows" => Some(OldIndexDataFilter::RowIds(retained_ids)),
+            "empty_rows" => Some(OldIndexDataFilter::RowIds(RowAddrTreeMap::new())),
+            "fragments" | "empty_fragments" => Some(OldIndexDataFilter::Fragments {
+                to_keep: if filter_kind == "fragments" && remapping != "none" {
+                    RoaringBitmap::from_iter([3])
+                } else {
+                    RoaringBitmap::new()
+                },
+                to_remove: RoaringBitmap::from_iter([0, 2]),
+            }),
+            _ => None,
+        };
+        let mut new_builder = PointBuilder::new(point_type);
+        if new_input != "empty" {
+            if new_input == "mixed" {
+                new_builder.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
+            } else {
+                new_builder.push_null();
+            }
+            new_builder.push_null();
+        }
+        // Both replacements reuse excluded old IDs. The old-data filter must not
+        // remove the new point or the new NULL at those IDs.
+        let new_ids = if new_input == "empty" {
+            vec![]
+        } else {
+            old_ids[..2].to_vec()
+        };
+        let new_stream = convert_bbox_rowid_batch_stream(
+            &new_builder.finish(),
+            Arc::new(UInt64Array::from(new_ids)),
+        );
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        index
+            .update(new_stream, dest_store.as_ref(), filter)
+            .await
+            .unwrap();
+        let updated = RTreeIndex::load(dest_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let mut expected_nulls = RowAddrTreeMap::new();
+        let mut expected_points = RowAddrTreeMap::new();
+        if filter_kind == "none" {
+            expected_nulls.insert(old_ids[0]);
+            expected_points.insert(old_ids[1]);
+        }
+        if filter_kind == "none"
+            || filter_kind == "rows"
+            || (filter_kind == "fragments" && remapping != "none")
+        {
+            expected_nulls.insert(old_ids[2]);
+            expected_points.insert(old_ids[3]);
+        }
+        if new_input != "empty" {
+            expected_nulls.insert(old_ids[1]);
+            if new_input == "all_null" {
+                expected_nulls.insert(old_ids[0]);
+            } else {
+                expected_points.insert(old_ids[0]);
+            }
+        }
+        let null_result = updated
+            .search(&GeoQuery::IsNull, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let SearchResult::Exact(nulls) = null_result else {
+            panic!("NULL search must be exact")
+        };
+        assert_eq!(
+            nulls,
+            NullableRowAddrSet::new(expected_nulls, RowAddrTreeMap::new())
+        );
+        let bounds = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 0.0, y: 0.0 },
+            coord! { x: 11.0, y: 11.0 },
+        ));
+        assert_eq!(
+            updated
+                .search_bbox(bounds, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_points
+        );
+        let obsolete_bounds = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 0.5, y: 0.5 },
+            coord! { x: 1.5, y: 1.5 },
+        ));
+        let mut expected_obsolete = RowAddrTreeMap::new();
+        if filter_kind == "none" {
+            expected_obsolete.insert(old_ids[1]);
+        }
+        assert_eq!(
+            updated
+                .search_bbox(obsolete_bounds, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_obsolete
+        );
     }
 
     #[tokio::test]

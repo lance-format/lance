@@ -4,13 +4,13 @@
 //! Exec plan planner
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
-use crate::signed_zero::{normalize_zero_comparisons, rewrite_signed_zero_comparisons};
+use crate::logical_expr::{coerce_filter_type_to_boolean, resolve_expr};
+use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -20,11 +20,12 @@ use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
@@ -1116,7 +1117,8 @@ impl Planner {
         // `-1.0 * 0.0 < (1.0 - 1.0)` answered `true` where IEEE says false, and a
         // wrapper such as `IS TRUE` or a `CAST` did the same to the comparison's
         // own result.
-        let expr = normalize_zero_comparisons(expr, &|operand| simplifier.simplify(operand))?;
+        let expr =
+            normalize_float_comparisons(expr, &|operand| simplifier.simplify(operand), &df_schema)?;
 
         // Again after simplify, which is what expands `BETWEEN` into two
         // comparisons and folds the casts `coerce` inserts, so those forms only
@@ -1125,7 +1127,7 @@ impl Planner {
         // Running the rewrite more than once is safe because its output is a fixed
         // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
         let expr = simplifier.simplify(expr)?;
-        let expr = rewrite_signed_zero_comparisons(expr)?;
+        let expr = rewrite_float_comparisons(expr, &df_schema)?;
 
         Ok(expr)
     }
@@ -1137,6 +1139,7 @@ impl Planner {
             expr,
             df_schema.as_ref(),
             &Default::default(),
+            &PhysicalPlanningContext::default(),
         )?)
     }
 
@@ -1157,60 +1160,7 @@ impl Planner {
     /// If the expr refers to nested columns these will be returned
     /// as dotted paths (x.y.z)
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
-        let mut visitor = ColumnCapturingVisitor {
-            current_path: VecDeque::new(),
-            columns: BTreeSet::new(),
-        };
-        expr.visit(&mut visitor).unwrap();
-        visitor.columns.into_iter().collect()
-    }
-}
-
-struct ColumnCapturingVisitor {
-    // Current column path. If this is empty, we are not in a column expression.
-    current_path: VecDeque<String>,
-    columns: BTreeSet<String>,
-}
-
-impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
-    type Node = Expr;
-
-    fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
-        match node {
-            Expr::Column(Column { name, .. }) => {
-                // Build the field path from the column name and any nested fields
-                // The nested field names from get_field already come as literal strings,
-                // so we just need to concatenate them properly
-                let mut path = name.clone();
-                for part in self.current_path.drain(..) {
-                    path.push('.');
-                    // Check if the part needs quoting (contains dots)
-                    if part.contains('.') || part.contains('`') {
-                        // Quote the field name with backticks and escape any existing backticks
-                        let escaped = part.replace('`', "``");
-                        path.push('`');
-                        path.push_str(&escaped);
-                        path.push('`');
-                    } else {
-                        path.push_str(&part);
-                    }
-                }
-                self.columns.insert(path);
-                self.current_path.clear();
-            }
-            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
-                if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
-                    self.current_path.push_front(name.to_string())
-                } else {
-                    self.current_path.clear();
-                }
-            }
-            _ => {
-                self.current_path.clear();
-            }
-        }
-
-        Ok(TreeNodeRecursion::Continue)
+        lance_datafusion_exec::expr::column_names_in_expr(expr)
     }
 }
 

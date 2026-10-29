@@ -49,7 +49,7 @@ use tracing::{info, instrument};
 use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::blob::{
-    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
+    BlobPayloadInventory, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata,
 };
@@ -940,6 +940,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     mut seeds: seeds::SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<Vec<Fragment>>
 where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
@@ -966,6 +967,7 @@ where
         params.blob_pack_file_size_threshold,
         file_writer_options,
         preassigned_data_file_name,
+        created_blob_payloads,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1763,6 +1765,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         file_row_counts,
         None,
         false,
+        None,
     )
     .await
 }
@@ -1779,7 +1782,8 @@ pub(crate) async fn write_fragments_internal_impl(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1799,7 +1803,8 @@ pub(crate) async fn write_fragments_internal_impl(
         target_bases_info,
         file_row_counts,
         preassigned_data_file_name,
-        keep_field_ids,
+        inherited_field_ids,
+        created_blob_payloads,
     )
     .await
 }
@@ -1813,20 +1818,26 @@ pub(super) fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
+/// Give a new table its field IDs. `inherited` IDs are an existing table's,
+/// such as a MemWAL generation's, and may exceed the new-table limit.
+pub(crate) fn assign_new_table_field_ids(schema: &mut Schema, inherited: bool) -> Result<()> {
+    if inherited {
+        schema.try_keep_field_ids()
+    } else {
+        schema.try_assign_new_table_field_ids()
+    }
+}
+
 pub(super) fn prepare_write_schema(
     dataset: Option<&Dataset>,
     normalized_converted_schema: Schema,
     params: &WriteParams,
     mut schema_compare_options: lance_core::datatypes::SchemaCompareOptions,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
 ) -> Result<Schema> {
     let schema = if dataset.is_none() {
         let mut schema = normalized_converted_schema;
-        if keep_field_ids {
-            schema.try_set_field_id(None)?;
-        } else {
-            schema.try_reassign_field_ids(None)?;
-        }
+        assign_new_table_field_ids(&mut schema, inherited_field_ids)?;
         schema
     } else if let Some(dataset) = dataset
         && matches!(params.mode, WriteMode::Append | WriteMode::Create)
@@ -2202,6 +2213,7 @@ pub(crate) struct WriterOptions {
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 }
 
 impl WriterOptions {
@@ -2329,6 +2341,7 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
         file_writer_options,
+        created_blob_payloads,
     } = options;
     let (data_file_key, filename, data_dir, final_path) = prepare_data_file_path(
         base_dir,
@@ -2371,7 +2384,9 @@ where
             ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
         )
     {
-        preprocessor = preprocessor.with_managed_base(base_id, base_dir.clone());
+        preprocessor = preprocessor
+            .with_managed_base(base_id, base_dir.clone())
+            .with_created_payloads(created_blob_payloads);
     }
     Ok(Box::new(V2WriterAdapter::new(
         file_writer,
@@ -2449,6 +2464,7 @@ struct WriterGenerator<OpenWriter> {
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
     writers_created: AtomicUsize,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
@@ -2474,6 +2490,7 @@ where
         blob_pack_file_size_threshold: Option<usize>,
         file_writer_options: FileWriterOptions,
         preassigned_data_file_name: Option<Arc<String>>,
+        created_blob_payloads: Option<BlobPayloadInventory>,
     ) -> Self {
         Self {
             object_store,
@@ -2489,6 +2506,7 @@ where
             blob_pack_file_size_threshold,
             file_writer_options,
             preassigned_data_file_name,
+            created_blob_payloads,
             writers_created: AtomicUsize::new(0),
             next_base_index: AtomicUsize::new(0),
         }
@@ -2535,6 +2553,7 @@ where
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                     file_writer_options: self.file_writer_options.clone(),
+                    created_blob_payloads: self.created_blob_payloads.clone(),
                 },
             )
             .await?
@@ -2554,6 +2573,7 @@ where
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
                     file_writer_options: self.file_writer_options.clone(),
+                    created_blob_payloads: self.created_blob_payloads.clone(),
                 },
             )
             .await?
@@ -3322,16 +3342,15 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
         assert_eq!(fragment.files.len(), 1);
-        // New datasets canonicalize incoming field IDs before writing while
-        // preserving the schema's field order.
+        // A new dataset keeps the supplied field IDs, in the schema's field order.
         assert_eq!(
             written_schema
                 .fields_pre_order()
                 .map(|field| field.id)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![3, 0, 1]
         );
-        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 2]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
 
         let path = base_path
             .clone()
@@ -3345,7 +3364,7 @@ mod tests {
             written_schema.clone(),
             0,
             0,
-            2,
+            3,
             None,
         )
         .await
@@ -3536,6 +3555,7 @@ mod tests {
             None,
             FileWriterOptions::default(),
             None,
+            None,
         );
 
         // Create a writer
@@ -3655,6 +3675,7 @@ mod tests {
             ObjectStoreParams::default(),
             None,
             FileWriterOptions::default(),
+            None,
             None,
         );
 
@@ -4914,6 +4935,7 @@ mod tests {
             seeds::SeedCollector::disabled(),
             None,
             None,
+            None,
         )
         .await;
 
@@ -4977,6 +4999,7 @@ mod tests {
             seeds::SeedCollector::disabled(),
             None,
             None,
+            None,
         )
         .await;
 
@@ -5024,6 +5047,8 @@ mod tests {
             physical_rows: Some(0),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
@@ -5105,6 +5130,8 @@ mod tests {
             physical_rows: Some(0),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         let target_bases = vec![
@@ -5205,6 +5232,7 @@ mod tests {
             },
             Some(target_bases),
             seeds::SeedCollector::disabled(),
+            None,
             None,
             None,
         )

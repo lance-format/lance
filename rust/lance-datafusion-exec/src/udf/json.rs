@@ -6,10 +6,8 @@ use arrow_array::builder::{
 };
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow_schema::DataType;
-use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{ScalarUDF, Volatility};
-use datafusion::physical_plan::ColumnarValue;
-use datafusion::prelude::create_udf;
+use datafusion_common::{DataFusionError, Result};
+use datafusion_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
 use lance_arrow::json::{json_path_exists, select_json_path, select_json_path_values};
 use std::sync::Arc;
 

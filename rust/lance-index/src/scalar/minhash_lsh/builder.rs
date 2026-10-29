@@ -10,7 +10,7 @@ use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
 use lance_arrow::iter_str_array;
-use lance_datafusion::exec::LanceExecutionOptions;
+use lance_datafusion_exec::exec::LanceExecutionOptions;
 use tokio::sync::mpsc;
 
 use super::index::{scan_rows, signature_columns};
