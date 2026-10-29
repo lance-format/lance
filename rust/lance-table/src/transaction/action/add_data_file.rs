@@ -136,6 +136,9 @@ impl AddDataFile {
         for field_id in bound_fields.iter() {
             state.note_rebind(fragment_id, *field_id, self.data_change)?;
         }
+        if self.data_change {
+            state.note_data_change(fragment_id);
+        }
         Ok(())
     }
 

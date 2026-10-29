@@ -7,10 +7,13 @@
 //! [`Ref`], [`FieldRef`], [`CompositeOperation`], and [`UserStep`] wrappers, the dispatch over
 //! the `oneof`, and the helpers the per-action conversions share.
 //!
-//! Reading is fail-closed: an action this build does not implement is an error,
+//! Reading is fail-closed: an action this build does not recognize is an error,
 //! never a silently skipped element. The commit path collects concurrent
 //! transactions with `try_collect`, so a transaction carrying an unknown action
-//! must abort the commit rather than be treated as a no-op.
+//! must abort the commit rather than be treated as a no-op. Every specified action
+//! is implemented, so an unrecognized one can only come from a newer Lance --
+//! which protobuf decodes as no variant at all, since it drops the field it does
+//! not know.
 
 use super::{Action, CompositeOperation, FieldRef, Ref, UserStep};
 use crate::format::pb_actions;
@@ -156,15 +159,13 @@ macro_rules! define_action_proto {
                     $(Some(pb_actions::action::Action::$variant(action)) => {
                         Ok(Self::$variant(action.try_into()?))
                     })*
-                    // The specified vocabulary is larger than what is implemented.
-                    // Reject rather than skip: silently dropping an action would
-                    // apply a partial transaction.
-                    Some(other) => Err(Error::not_supported(format!(
-                        "the action-based transaction uses action {other:?}, which is specified \
-                         but not implemented by this version of Lance",
-                    ))),
-                    None => Err(Error::invalid_input(
-                        "an Action in a user operation was empty",
+                    // An action written by a newer Lance decodes to no known
+                    // variant, because protobuf drops the field it does not
+                    // know. Reject rather than skip: silently dropping an
+                    // action would apply a partial transaction.
+                    None => Err(Error::not_supported(
+                        "an Action in a user operation carried no change this version of Lance \
+                         understands; it was either empty or written by a newer version",
                     )),
                 }
             }
@@ -177,19 +178,24 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::key_existence::{FilterType, KeyExistenceFilter};
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
     use crate::rowids::version::RowDatasetVersionMeta;
+    use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
-        TombstoneFieldData,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
+        DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
+        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -247,6 +253,20 @@ mod tests {
                 data_change: true,
                 base: Some(Ref::Committed(2)),
             }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Committed(6),
+                overlays: vec![DataOverlayFile {
+                    data_file: sample_data_file(),
+                    coverage: OverlayCoverage::PerField(vec![Arc::new(
+                        [1u32, 4].into_iter().collect::<RoaringBitmap>(),
+                    )]),
+                    committed_version: 11,
+                }],
+                data_change: true,
+            }),
+            Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                fragment_ids: vec![4, 6],
+            }),
             Action::AlterField(AlterField {
                 field: FieldRef::Committed(2),
                 name: Some("renamed".into()),
@@ -291,6 +311,32 @@ mod tests {
                 remove_fragments: vec![2, 3],
                 fields: vec![FieldRef::Committed(0)],
                 covering_fields: vec![FieldRef::Committed(1)],
+            }),
+            Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(Uuid::from_u128(10), 2),
+                    CompactedSsTable::new(Uuid::from_u128(11), 5),
+                ],
+            }),
+            Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
+                },
+            }),
+            Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(1)],
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 5,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
+                    },
+                ],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
@@ -342,30 +388,16 @@ mod tests {
     }
 
     #[test]
-    fn test_unimplemented_action_is_rejected() {
-        let message = pb_actions::Action {
-            action: Some(pb_actions::action::Action::RefreshRowVersionMetadata(
-                pb_actions::RefreshRowVersionMetadata {
-                    fragment_ids: vec![1],
-                },
-            )),
-        };
-        let error = Action::try_from(message).unwrap_err();
+    fn test_an_unrecognized_action_is_rejected() {
+        // An empty action and one a newer Lance wrote decode the same way:
+        // protobuf drops the field this build does not know.
+        let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
         assert!(
             matches!(error, Error::NotSupported { .. }),
             "expected NotSupported, got {error:?}"
         );
         assert!(
-            error.to_string().contains("not implemented"),
-            "unexpected message: {error}"
-        );
-    }
-
-    #[test]
-    fn test_empty_action_is_rejected() {
-        let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
-        assert!(
-            error.to_string().contains("was empty"),
+            error.to_string().contains("written by a newer version"),
             "unexpected message: {error}"
         );
     }

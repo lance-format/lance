@@ -2413,7 +2413,7 @@ mod composite {
     use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema};
-    use futures::stream;
+    use futures::{TryStreamExt, stream};
     use lance_core::datatypes::Field as LanceField;
     use lance_index::IndexType;
     use lance_index::pb::vector_index_details::{
@@ -2422,15 +2422,23 @@ mod composite {
     use lance_index::pb::{HnswParameters, VectorIndexDetails, VectorMetricType};
     use lance_index::scalar::ScalarIndexParams;
     use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+    use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
     };
     use lance_table::rowids::{RowIdSequence, write_row_ids};
+    use lance_table::system_index::mem_wal::{
+        CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails, load_mem_wal_index_details,
+        new_mem_wal_index_meta,
+    };
     use lance_table::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
-        TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
+        CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RefreshRowVersionMetadata,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
+        RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -2460,7 +2468,12 @@ mod composite {
     /// A data file of `fragment`, as an `AddDataFile` carries it: with no
     /// field list of its own, since the action's `field_ids` is that list.
     fn existing_data_file(dataset: &Dataset, fragment: usize) -> DataFile {
-        without_fields(dataset.fragments()[fragment].files[0].clone())
+        without_fields(existing_overlay_file(dataset, fragment))
+    }
+
+    /// A data file of `fragment` as an overlay carries it, field list and all.
+    fn existing_overlay_file(dataset: &Dataset, fragment: usize) -> DataFile {
+        dataset.fragments()[fragment].files[0].clone()
     }
 
     fn without_fields(file: DataFile) -> DataFile {
@@ -3234,6 +3247,124 @@ mod composite {
         assert!(
             error.to_string().contains("preempted"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// One fragment of five rows with `a` = 0..5 and `b` = 10..15.
+    async fn two_column_dataset() -> Dataset {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..5)),
+                Arc::new(Int32Array::from_iter_values(10..15)),
+            ],
+        )
+        .unwrap();
+        InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap()
+    }
+
+    /// `UPDATE t SET {target} = {source}` over the only fragment, as an action
+    /// set: rewrite `target` with `source`'s values, and declare the read of
+    /// `source` when `declare_read` is set.
+    async fn set_column_from(
+        dataset: &Dataset,
+        target: &str,
+        source: &str,
+        declare_read: bool,
+    ) -> Vec<Action> {
+        let fragment = dataset.get_fragments().remove(0);
+        let source_values = dataset
+            .scan()
+            .project(&[source])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .clone();
+        let target_schema = dataset.schema().project(&[target]).unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::from(&target_schema)), vec![source_values])
+                .unwrap();
+        let (fragment_id, file) = fragment
+            .write_columns(stream::iter(vec![Ok(batch)]), &target_schema)
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        let target_id = dataset.schema().field(target).unwrap().id;
+        let source_id = dataset.schema().field(source).unwrap().id;
+
+        let mut actions = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment_id),
+                field_ids: vec![FieldRef::Committed(target_id)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment_id),
+                file: without_fields(file),
+                field_ids: vec![FieldRef::Committed(target_id)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        if declare_read {
+            actions.push(Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(source_id)],
+                rows: vec![RowSelection {
+                    fragment_id: u32::try_from(fragment_id).unwrap(),
+                    rows: SelectedRows::Full,
+                }],
+            }));
+        }
+        actions
+    }
+
+    /// `a = b` and `b = a` from one snapshot write disjoint columns. Without
+    /// declared reads both commit and the columns end up swapped, which neither
+    /// serial order produces (either leaves them equal) -- snapshot isolation.
+    /// With each declaring the column it read, the second commit conflicts.
+    #[rstest::rstest]
+    #[case::reads_declared(true)]
+    #[case::reads_undeclared(false)]
+    #[tokio::test]
+    async fn test_swapping_two_columns_concurrently(#[case] declare_reads: bool) {
+        let dataset = two_column_dataset().await;
+        let read_version = dataset.version().version;
+        let a_from_b = set_column_from(&dataset, "a", "b", declare_reads).await;
+        let b_from_a = set_column_from(&dataset, "b", "a", declare_reads).await;
+
+        let updated = commit(dataset, a_from_b).await;
+        let result = CommitBuilder::new(Arc::new(updated))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, b_from_a))
+            .await;
+
+        if declare_reads {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error:?}"
+            );
+            return;
+        }
+        let swapped = result.unwrap();
+        let batch = swapped.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["a"].as_ref(),
+            &Int32Array::from_iter_values(10..15) as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            batch["b"].as_ref(),
+            &Int32Array::from_iter_values(0..5) as &dyn arrow_array::Array
         );
     }
 
@@ -4270,5 +4401,861 @@ mod composite {
             .expect_err("a Dot segment cannot join an L2 index");
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("metric"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_overlays_what_was_already_there() {
+        let dataset = test_dataset(false).await;
+        let overlaid = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+        let overlay_file = existing_overlay_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                Action::AddOverlays(AddOverlays {
+                    fragment: Ref::Committed(overlaid),
+                    overlays: vec![DataOverlayFile {
+                        data_file: overlay_file,
+                        coverage: OverlayCoverage::dense([0u32, 2].into_iter().collect()),
+                        // Left for the commit to stamp.
+                        committed_version: 0,
+                    }],
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), 3);
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == overlaid)
+            .unwrap();
+        assert_eq!(fragment.overlays.len(), 1);
+        assert_eq!(fragment.overlays[0].committed_version, expected_version);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_restamps_row_versions_for_a_fragment_it_rewrote() {
+        let dataset = test_dataset(true).await;
+        let rewritten = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                // Rewriting a column in place leaves the rows where they are, so
+                // nothing else in the commit says when they last changed.
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(rewritten),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(rewritten),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                    fragment_ids: vec![rewritten],
+                }),
+            ],
+        )
+        .await;
+
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == rewritten)
+            .unwrap();
+        let sequence = fragment
+            .last_updated_at_version_meta
+            .as_ref()
+            .expect("the rewritten fragment should carry a last-updated sequence")
+            .load_sequence()
+            .unwrap();
+        let versions = (0..fragment.physical_rows.unwrap())
+            .map(|offset| sequence.version_at(offset).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec![expected_version; versions.len()]);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_records_mem_wal_compaction_progress() {
+        let dataset = test_dataset(false).await;
+        let shard = Uuid::new_v4();
+
+        // Progress is only recordable against a table that already carries the
+        // index, so put one there the way the MemWAL writer would.
+        let read_version = dataset.version().version;
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![
+                        new_mem_wal_index_meta(read_version, MemWalIndexDetails::default())
+                            .unwrap(),
+                    ],
+                    removed_indices: Vec::new(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let dataset = commit(
+            dataset,
+            vec![Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
+            })],
+        )
+        .await;
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let mem_wal = indices
+            .iter()
+            .find(|index| index.name == MEM_WAL_INDEX_NAME)
+            .expect("the MemWAL index should still be there");
+        let details = load_mem_wal_index_details((*mem_wal).clone()).unwrap();
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(details.compacted_sstables[0].shard_id, shard);
+        assert_eq!(details.compacted_sstables[0].generation, 3);
+
+        // The data is untouched: recording where rows live is not a change to
+        // them.
+        assert_eq!(dataset.fragments().len(), 2);
+    }
+
+    /// An append of five rows, asserting the hashes of their keys over `a`
+    /// when `key_hashes` is given.
+    fn keyed_append(dataset: &Dataset, key_hashes: Option<&[u64]>) -> Vec<Action> {
+        let mut actions = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        if let Some(key_hashes) = key_hashes {
+            actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(0)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet(key_hashes.iter().copied().collect()),
+                },
+            }));
+        }
+        actions
+    }
+
+    #[tokio::test]
+    async fn test_a_key_assertion_commits_alongside_the_insert_it_guards() {
+        let dataset = test_dataset(false).await;
+        let before = dataset.fragments().len();
+        let actions = keyed_append(&dataset, Some(&[11, 12]));
+
+        let dataset = commit(dataset, actions).await;
+
+        assert_eq!(dataset.fragments().len(), before + 1);
+    }
+
+    /// The assertion travels through the transaction file and is compared by
+    /// the commit path's conflict check, not just by footprints in memory.
+    #[rstest::rstest]
+    #[case::overlapping_keys(Some(&[2, 3][..]), true)]
+    #[case::disjoint_keys(Some(&[3, 4][..]), false)]
+    #[case::unqualified_append(None, true)]
+    #[tokio::test]
+    async fn test_a_concurrent_insert_is_checked_against_a_key_assertion(
+        #[case] stale_key_hashes: Option<&'static [u64]>,
+        #[case] is_conflict: bool,
+    ) {
+        let dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+        let committed = commit(dataset.clone(), keyed_append(&dataset, Some(&[1, 2]))).await;
+        let stale = keyed_append(&dataset, stale_key_hashes);
+
+        if is_conflict {
+            commit_expecting_conflict(&committed, read_version, stale).await;
+        } else {
+            let landed = CommitBuilder::new(Arc::new(committed.clone()))
+                .with_experimental_composite_operations(true)
+                .execute(composite_txn(read_version, stale))
+                .await
+                .unwrap();
+            assert_eq!(landed.fragments().len(), committed.fragments().len() + 1);
+        }
+    }
+
+    fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {
+        Action::AddOverlays(AddOverlays {
+            fragment: Ref::Committed(fragment),
+            overlays: vec![DataOverlayFile {
+                data_file: existing_overlay_file(dataset, 1),
+                coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
+                committed_version: 0,
+            }],
+            data_change: true,
+        })
+    }
+
+    /// Incremental consumers find changed rows through the last-updated
+    /// versions, so an overlay has to restamp the rows it covers -- including
+    /// on a fragment migrated to stable row ids, which has no sequence yet.
+    #[rstest::rstest]
+    #[case::stable_from_creation(false)]
+    #[case::migrated(true)]
+    #[tokio::test]
+    async fn test_overlaid_rows_are_reported_as_updated(#[case] migrated: bool) {
+        let mut dataset = test_dataset(!migrated).await;
+        if migrated {
+            dataset.migrate_to_stable_row_ids().await.unwrap();
+            assert!(
+                dataset.fragments()[0]
+                    .last_updated_at_version_meta
+                    .is_none()
+            );
+        }
+        let fragment = dataset.fragments()[0].id;
+        let before = dataset.version().version;
+        let actions = vec![overlay_action(&dataset, fragment)];
+
+        let dataset = commit(dataset, actions).await;
+
+        let delta = dataset
+            .delta()
+            .with_begin_version(before)
+            .with_end_version(before + 1)
+            .build()
+            .unwrap();
+        let updated: Vec<RecordBatch> = delta
+            .get_updated_rows()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(updated.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+    }
+
+    /// A row-moving update deletes rows from the fragment and re-creates them
+    /// elsewhere from the base the overlay never modified.
+    #[tokio::test]
+    async fn test_an_overlay_and_a_row_moving_update_conflict_in_either_order() {
+        let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
+            vec![
+                Action::SetDeletionFile(SetDeletionFile {
+                    fragment,
+                    deletion_file: Some(DeletionFile {
+                        read_version,
+                        id: 1,
+                        file_type: DeletionFileType::Array,
+                        num_deleted_rows: Some(1),
+                        base_id: None,
+                    }),
+                    data_change: true,
+                    base: None,
+                }),
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 1,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: existing_data_file(dataset, 0),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ]
+        };
+
+        let original = test_dataset(false).await;
+        let fragment = original.fragments()[0].id;
+        let read_version = original.version().version;
+        let overlaid = commit(original.clone(), vec![overlay_action(&original, fragment)]).await;
+        commit_expecting_conflict(
+            &overlaid,
+            read_version,
+            moving_update(&original, fragment, read_version),
+        )
+        .await;
+
+        let original = test_dataset(false).await;
+        let updated = commit(
+            original.clone(),
+            moving_update(&original, fragment, read_version),
+        )
+        .await;
+        commit_expecting_conflict(
+            &updated,
+            read_version,
+            vec![overlay_action(&original, fragment)],
+        )
+        .await;
+    }
+
+    /// A re-encode keeps every row where it was and leaves the overlays alone,
+    /// so whichever lands first, the overlay still wins its cells.
+    #[rstest::rstest]
+    #[case::overlay_first(true)]
+    #[case::reencode_first(false)]
+    #[tokio::test]
+    async fn test_an_overlay_and_a_reencode_of_its_column_both_land(#[case] overlay_first: bool) {
+        let original = test_dataset(false).await;
+        let fragment = original.fragments()[0].id;
+        let read_version = original.version().version;
+        let overlay = vec![overlay_action(&original, fragment)];
+        let reencode = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment),
+                file: existing_data_file(&original, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+                base: None,
+            }),
+        ];
+        let (first, second) = if overlay_first {
+            (overlay, reencode)
+        } else {
+            (reencode, overlay)
+        };
+
+        let committed = commit(original, first).await;
+        let landed = CommitBuilder::new(Arc::new(committed))
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, second))
+            .await
+            .unwrap();
+
+        assert_eq!(landed.fragments()[0].overlays.len(), 1);
+        let values = landed.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            values.column(0).as_ref(),
+            &Int32Array::from_iter_values((5..10).chain(5..10)) as &dyn arrow_array::Array
+        );
+    }
+
+    /// A stale append that carries an overlay for a column a concurrent set
+    /// dropped would leave values for a field the schema no longer has.
+    #[tokio::test]
+    async fn test_an_overlay_on_a_minted_fragment_conflicts_with_a_dropped_field() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let read_version = dataset.version().version;
+        // The base file is declared for `b` alone, so the conflict with dropping
+        // `a` comes from the overlay, whose file carries `a`.
+        let stale_append = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(&dataset, 0),
+                field_ids: vec![FieldRef::Committed(1)],
+                data_change: true,
+                base: None,
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Local(0),
+                overlays: vec![DataOverlayFile {
+                    data_file: existing_overlay_file(&dataset, 1),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
+                    committed_version: 0,
+                }],
+                data_change: true,
+            }),
+        ];
+
+        let dropped = commit(
+            dataset.clone(),
+            vec![Action::DropField(DropField {
+                field: FieldRef::Committed(0),
+            })],
+        )
+        .await;
+
+        commit_expecting_conflict(&dropped, read_version, stale_append).await;
+    }
+
+    /// The fragment reuse actions against a real dataset, and how index
+    /// builds race the compactions that record them.
+    mod frag_reuse {
+        use super::*;
+        use crate::dataset::WriteMode;
+        use lance_core::utils::address::RowAddress;
+        use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+        use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use lance_table::transaction::action::{
+            AppendFragReuseTransition, FragReuseMapping, TrimFragReuse,
+        };
+        use roaring::RoaringTreemap;
+
+        const ROWS_PER_FRAGMENT: i32 = 5;
+
+        /// Four fragments of five rows; `a` runs 0..20 in fragment order.
+        async fn four_fragments() -> Dataset {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+            let data = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int32Array::from_iter_values(
+                    0..4 * ROWS_PER_FRAGMENT,
+                ))],
+            )
+            .unwrap();
+            InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                    ..Default::default()
+                })
+                .execute(vec![data])
+                .await
+                .unwrap()
+        }
+
+        /// Rewrite `sources` into one new fragment holding their rows in scan
+        /// order, recording the move as a transition when asked.
+        async fn compaction(
+            dataset: &Dataset,
+            sources: &[u64],
+            record_transition: bool,
+        ) -> Vec<Action> {
+            let fragments = sources
+                .iter()
+                .map(|id| {
+                    dataset
+                        .fragments()
+                        .iter()
+                        .find(|fragment| fragment.id == *id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut scan = dataset.scan();
+            scan.with_fragments(fragments.clone());
+            let batch = scan.try_into_batch().await.unwrap();
+            let written = InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 1 << 20,
+                    ..Default::default()
+                })
+                .execute_uncommitted(vec![batch])
+                .await
+                .unwrap();
+            let Operation::Append { fragments: written } = written.operation else {
+                unreachable!()
+            };
+            let [written] = written.as_slice() else {
+                panic!("the rows fit one fragment");
+            };
+
+            let mut actions: Vec<Action> = sources
+                .iter()
+                .map(|source| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(*source),
+                        data_change: false,
+                    })
+                })
+                .collect();
+            actions.push(Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: written.physical_rows.unwrap() as u64,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: false,
+            }));
+            for file in &written.files {
+                actions.push(Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    field_ids: file
+                        .fields
+                        .iter()
+                        .copied()
+                        .map(FieldRef::Committed)
+                        .collect(),
+                    file: without_fields(file.clone()),
+                    data_change: false,
+                    base: None,
+                }));
+            }
+            if record_transition {
+                let mut survivors = RoaringTreemap::new();
+                for fragment in &fragments {
+                    for offset in 0..fragment.physical_rows.unwrap() as u32 {
+                        survivors
+                            .insert(RowAddress::new_from_parts(fragment.id as u32, offset).into());
+                    }
+                }
+                let mut changed_row_addrs = Vec::new();
+                survivors.serialize_into(&mut changed_row_addrs).unwrap();
+                actions.push(Action::AppendFragReuseTransition(
+                    AppendFragReuseTransition {
+                        sources: sources.iter().copied().map(Ref::Committed).collect(),
+                        destinations: vec![Ref::Local(0)],
+                        mapping: FragReuseMapping::OrderedCompaction(pb_fri::OrderedCompaction {
+                            changed_row_addrs,
+                        }),
+                    },
+                ));
+            }
+            actions
+        }
+
+        /// A B-tree segment of `a_idx` over `fragments`, built at `dataset`'s
+        /// version and not yet committed.
+        async fn build_segment(dataset: &Dataset, fragments: Vec<u32>) -> IndexMetadata {
+            let mut dataset = dataset.clone();
+            dataset
+                .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("a_idx".into())
+                .fragments(fragments)
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        }
+
+        fn newest_fragment(dataset: &Dataset) -> u32 {
+            dataset.fragments().iter().map(|f| f.id).max().unwrap() as u32
+        }
+
+        /// The number of transitions the history records, or `None` without one.
+        async fn recorded_transitions(dataset: &Dataset) -> Option<usize> {
+            let indices = load_all_indices(dataset).await.unwrap();
+            let entry = indices
+                .iter()
+                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)?;
+            let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry)
+                .await
+                .unwrap();
+            Some(ledger.transitions().len())
+        }
+
+        /// Every value of `a` that should be there is found exactly once,
+        /// whether the index or a scan answers.
+        async fn assert_each_value_once(dataset: &Dataset, values: std::ops::Range<i32>) {
+            for value in values.clone() {
+                assert_eq!(
+                    dataset
+                        .count_rows(Some(format!("a = {value}")))
+                        .await
+                        .unwrap(),
+                    1,
+                    "a = {value}"
+                );
+            }
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!(
+                        "a >= {} AND a < {}",
+                        values.start, values.end
+                    )))
+                    .await
+                    .unwrap(),
+                values.len()
+            );
+        }
+
+        /// How many rows the index alone returns for `a = value`: a fast
+        /// search skips every fragment no segment serves.
+        async fn indexed_matches(dataset: &Dataset, value: i32) -> usize {
+            let mut scan = dataset.scan();
+            scan.filter(&format!("a = {value}"))
+                .unwrap()
+                .fast_search()
+                .project(&["a"])
+                .unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+
+        /// Removal isn't staleness: an index build and a compaction of the
+        /// fragments it covers both commit, in either order, with or without
+        /// a transition. With one the segment translates onto the
+        /// destination; without one it loses that coverage and the rows are
+        /// scanned. Either way every row is found once.
+        #[rstest::rstest]
+        #[case::build_lands_first_with_transition(true, true)]
+        #[case::build_lands_first_without_transition(true, false)]
+        #[case::compaction_lands_first_with_transition(false, true)]
+        #[case::compaction_lands_first_without_transition(false, false)]
+        #[tokio::test]
+        async fn test_an_index_build_and_a_compaction_both_commit(
+            #[case] build_lands_first: bool,
+            #[case] record_transition: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let compact = compaction(&dataset, &[0, 1], record_transition).await;
+
+            let dataset = if build_lands_first {
+                let dataset = commit(dataset, vec![add_built_segment(segment)]).await;
+                drop(dataset);
+                commit_from_stale(stale, compact).await.unwrap()
+            } else {
+                let dataset = commit(dataset, compact).await;
+                drop(dataset);
+                commit_from_stale(stale, vec![add_built_segment(segment)])
+                    .await
+                    .unwrap()
+            };
+
+            let destination = newest_fragment(&dataset);
+            let served = dataset
+                .load_indices_by_name("a_idx")
+                .await
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment.fragment_bitmap.clone().unwrap_or_default())
+                .collect::<RoaringBitmap>();
+            assert_eq!(
+                served.contains(destination),
+                record_transition,
+                "{served:?}"
+            );
+            if record_transition {
+                for value in 0..2 * ROWS_PER_FRAGMENT {
+                    assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+                }
+            }
+            assert_eq!(
+                recorded_transitions(&dataset).await.is_some(),
+                record_transition
+            );
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// Deleting a whole covered fragment is a removal too, and does not
+        /// fence a concurrent build either.
+        #[tokio::test]
+        async fn test_an_index_build_survives_a_whole_fragment_deletion() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let deleted = commit(
+                dataset,
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(0),
+                    data_change: true,
+                })],
+            )
+            .await;
+            drop(deleted);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(segment)])
+                .await
+                .unwrap();
+
+            assert_eq!(dataset.count_rows(Some("a < 5".into())).await.unwrap(), 0);
+            assert_each_value_once(&dataset, ROWS_PER_FRAGMENT..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A column written into a committed fragment dies with the fragment,
+        /// so that write still conflicts with the fragment's removal.
+        #[tokio::test]
+        async fn test_a_column_written_into_a_fragment_conflicts_with_its_removal() {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let new_column = vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: int32_field("b"),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(0),
+                    file: existing_data_file(&dataset, 0),
+                    field_ids: vec![FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ];
+            let compacted = commit(dataset, compaction_without_files(&[0])).await;
+
+            commit_expecting_conflict(&compacted, read_version, new_column).await;
+        }
+
+        /// The removal half of a compaction, which is all a conflict test
+        /// needs.
+        fn compaction_without_files(sources: &[u64]) -> Vec<Action> {
+            sources
+                .iter()
+                .map(|source| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(*source),
+                        data_change: false,
+                    })
+                })
+                .collect()
+        }
+
+        /// Compactions of disjoint fragments both record their transitions;
+        /// compactions sharing a source conflict through its removal.
+        #[rstest::rstest]
+        #[case::disjoint_sources(&[2, 3], true)]
+        #[case::shared_source(&[1, 2], false)]
+        #[tokio::test]
+        async fn test_two_compactions_recording_transitions(
+            #[case] theirs: &[u64],
+            #[case] both_commit: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let stale = compaction(&dataset, theirs, true).await;
+            let first = commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+
+            if !both_commit {
+                commit_expecting_conflict(&first, read_version, stale).await;
+                return;
+            }
+            let second = commit_from_stale(Arc::new(dataset), stale).await.unwrap();
+            assert_eq!(recorded_transitions(&second).await, Some(2));
+            assert_each_value_once(&second, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A trim planned before a compaction landed judges the history it
+        /// lands on, so the compaction's transition, still needed by the
+        /// index over its sources, survives. Neither conflicts.
+        #[tokio::test]
+        async fn test_a_trim_keeps_a_transition_appended_concurrently() {
+            let dataset = four_fragments().await;
+            let segment = build_segment(&dataset, vec![0, 1, 2, 3]).await;
+            let dataset = commit(dataset, vec![add_built_segment(segment)]).await;
+            let stale = Arc::new(dataset.clone());
+            let compacted =
+                commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+            drop(compacted);
+
+            let trimmed = commit_from_stale(stale, vec![Action::TrimFragReuse(TrimFragReuse {})])
+                .await
+                .unwrap();
+
+            assert_eq!(recorded_transitions(&trimmed).await, Some(1));
+            assert_each_value_once(&trimmed, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A trim that drops a transition an in-flight build will need costs
+        /// that build its coverage of the moved rows, not correctness: both
+        /// commit and the rows are scanned.
+        #[tokio::test]
+        async fn test_a_trim_racing_an_index_build_loses_coverage_not_rows() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let compacted =
+                commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+            let trimmed = commit(compacted, vec![Action::TrimFragReuse(TrimFragReuse {})]).await;
+            assert_eq!(recorded_transitions(&trimmed).await, None);
+            drop(trimmed);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(segment)])
+                .await
+                .unwrap();
+
+            let served = dataset.load_indices_by_name("a_idx").await.unwrap();
+            assert!(
+                served.iter().all(|segment| !segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(newest_fragment(&dataset)))),
+                "{served:?}"
+            );
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A segment built late over a compacted source and a newer one built
+        /// over its destination both cover the moved rows once the history is
+        /// applied. The reader gives direct
+        /// coverage precedence, so no row is counted twice.
+        #[tokio::test]
+        async fn test_a_late_source_segment_beside_a_destination_segment_counts_rows_once() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let late = build_segment(&dataset, vec![1]).await;
+            let compacted = commit(dataset.clone(), compaction(&dataset, &[1], true).await).await;
+            let destination = newest_fragment(&compacted);
+            let direct = build_segment(&compacted, vec![destination]).await;
+            let indexed = commit(compacted, vec![add_built_segment(direct)]).await;
+            drop(indexed);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(late)])
+                .await
+                .unwrap();
+
+            let stored = load_all_indices(&dataset).await.unwrap();
+            assert_eq!(
+                stored.iter().filter(|index| index.name == "a_idx").count(),
+                2
+            );
+            for value in ROWS_PER_FRAGMENT..2 * ROWS_PER_FRAGMENT {
+                assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+            }
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
     }
 }

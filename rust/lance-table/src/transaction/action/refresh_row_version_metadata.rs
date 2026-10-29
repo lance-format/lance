@@ -1,0 +1,334 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Restamp the row-version metadata of fragments rewritten in place.
+
+use super::apply::ApplyState;
+use super::{Coordinate, Footprint, Ref};
+use crate::format::pb_actions;
+use crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols;
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, Result};
+
+/// Record that every row of these fragments was updated by this operation.
+///
+/// What it writes: every row's `last_updated_at_version` becomes the commit
+/// version. The fragment's sequence, inline or spilled to a column, is
+/// replaced with an inline uniform one. `created_at_version` is untouched: the
+/// rows are the same rows, and a row minted by this operation gets both stamps
+/// from the [`AddFragment`](super::AddFragment) that minted it.
+///
+/// Why it is an action rather than implied by the data files the operation
+/// writes: how many rows a column rewrite restamps is not a function of the
+/// file. An update in rewrite-columns mode, and merge-insert's partial-fragment
+/// path, write a whole-fragment column file but restamp only the matched rows;
+/// a key-only merge-insert match restamps rows with no file at all; a `Merge`
+/// restamps on removing a file or changing its path.
+/// [`AddOverlays`](super::AddOverlays) can imply its restamp only because its
+/// coverage bitmap is exactly the set of changed rows. This action covers the
+/// whole-fragment case, mirroring the refresh a legacy `Merge` performs.
+///
+/// Fragments are named by committed id. A fragment this operation minted has
+/// nothing to restamp.
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct RefreshRowVersionMetadata {
+    /// Committed fragment ids, every row of which is restamped.
+    pub fragment_ids: Vec<u64>,
+}
+
+impl RefreshRowVersionMetadata {
+    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        if !self.fragment_ids.is_empty() && !state.uses_stable_row_ids() {
+            return Err(Error::invalid_input(
+                "RefreshRowVersionMetadata restamps the per-row version sequences, which only \
+                 exist on a dataset using stable row ids",
+            ));
+        }
+        let new_version = state.new_version();
+        for fragment_id in &self.fragment_ids {
+            let fragment_id = state.resolve_fragment(Ref::Committed(*fragment_id))?;
+            let fragment = state.fragment_mut(fragment_id, "RefreshRowVersionMetadata")?;
+            refresh_row_latest_update_meta_for_full_frag_rewrite_cols(fragment, new_version)?;
+            state.note_refreshed(fragment_id);
+        }
+        Ok(())
+    }
+
+    /// The rows themselves are restated elsewhere in the operation -- by the
+    /// data files it writes -- so this is bookkeeping about that change, not a
+    /// change of its own.
+    pub(super) fn is_data_change(&self) -> bool {
+        false
+    }
+
+    /// Each fragment's version sequence, whole. The sequence is one value per
+    /// fragment, restamped for every row at once, so two sets refreshing the
+    /// same fragment collide even when the column rewrites that prompted them
+    /// touched different fields. Over-strict, and cheap: the alternative is a
+    /// sequence that records which columns each row's version speaks for.
+    ///
+    /// An [`AddOverlays`](super::AddOverlays) restamps the same sequence
+    /// without claiming it, so the two do not collide: the overlay sets only
+    /// the rows it covers and keeps whatever the rest hold when it applies,
+    /// which composes with a refresh in either order. Two refreshes would
+    /// compose too -- each stamps every row, and the later version wins -- so
+    /// their conflict is part of the same over-strictness, tracked in
+    /// <https://github.com/lance-format/lance/issues/10189>.
+    pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        for fragment_id in &self.fragment_ids {
+            footprint.write(Coordinate::FragmentRowVersions(*fragment_id));
+        }
+    }
+}
+
+impl From<&RefreshRowVersionMetadata> for pb_actions::RefreshRowVersionMetadata {
+    fn from(value: &RefreshRowVersionMetadata) -> Self {
+        Self {
+            fragment_ids: value.fragment_ids.clone(),
+        }
+    }
+}
+
+impl TryFrom<pb_actions::RefreshRowVersionMetadata> for RefreshRowVersionMetadata {
+    type Error = Error;
+
+    fn try_from(message: pb_actions::RefreshRowVersionMetadata) -> Result<Self> {
+        Ok(Self {
+            fragment_ids: message.fragment_ids,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{DataFile, Fragment, RowIdMeta};
+    use crate::rowids::{RowIdSequence, write_row_ids};
+    use crate::transaction::action::test_support::{
+        apply, backed_manifest, footprint, one_column_file,
+    };
+    use crate::transaction::action::{
+        Action, AddDataFile, AddFragment, FieldRef, Ref, RemoveFragment, TombstoneFieldData,
+    };
+    use crate::transaction::test_support::make_stable_row_id_manifest;
+    use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    fn refresh(fragment_ids: Vec<u64>) -> Action {
+        Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata { fragment_ids })
+    }
+
+    /// A stable-row-id manifest whose fragment 0 has `rows` rows, all last
+    /// updated at version 1.
+    fn manifest_with_rows(rows: usize) -> crate::format::Manifest {
+        let row_ids = RowIdSequence::from((0..rows as u64).collect::<Vec<_>>().as_slice());
+        let mut fragment = Fragment {
+            id: 0,
+            files: vec![DataFile::new(
+                "data.lance",
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            )],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids).into())),
+            physical_rows: Some(rows),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        refresh_row_latest_update_meta_for_full_frag_rewrite_cols(&mut fragment, 1).unwrap();
+        make_stable_row_id_manifest(vec![fragment])
+    }
+
+    fn last_updated_versions(fragment: &Fragment) -> Vec<u64> {
+        let meta = fragment
+            .last_updated_at_version_meta
+            .as_ref()
+            .expect("the fragment should carry a last-updated sequence");
+        let sequence = meta.load_sequence().unwrap();
+        (0..fragment.physical_rows.unwrap())
+            .map(|offset| sequence.version_at(offset).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_refresh_stamps_every_row_with_the_version_the_commit_produces() {
+        let manifest = manifest_with_rows(3);
+        let expected = manifest.version + 1;
+
+        let out = apply(&manifest, vec![refresh(vec![0])]).unwrap();
+
+        assert_eq!(last_updated_versions(&out.fragments[0]), vec![expected; 3]);
+    }
+
+    #[test]
+    fn test_refresh_leaves_the_created_at_sequence_alone() {
+        let mut manifest = manifest_with_rows(3);
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.created_at_version_meta = fragment.last_updated_at_version_meta.clone();
+        let created_at = fragment.created_at_version_meta.clone();
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        let out = apply(&manifest, vec![refresh(vec![0])]).unwrap();
+
+        assert_eq!(out.fragments[0].created_at_version_meta, created_at);
+    }
+
+    #[test]
+    fn test_refreshing_no_fragments_is_allowed_on_any_dataset() {
+        // An empty list is what a writer emits when nothing was rewritten in
+        // place, so it must not depend on stable row ids.
+        apply(&backed_manifest(), vec![refresh(vec![])]).unwrap();
+    }
+
+    #[test]
+    fn test_refreshing_without_stable_row_ids_is_rejected() {
+        let error = apply(&backed_manifest(), vec![refresh(vec![0])]).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("stable row ids"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A fragment id the read version handed out but no longer holds, and
+    /// one it never handed out, which may since name another writer's
+    /// fragment.
+    #[rstest]
+    #[case::removed(
+        Some(7),
+        "RefreshRowVersionMetadata targets fragment 7, which does not exist"
+    )]
+    #[case::beyond_the_read_version(None, "fragment 7 by a Committed ref")]
+    fn test_refreshing_a_fragment_that_is_not_there_is_rejected(
+        #[case] fragment_mark: Option<u32>,
+        #[case] expected: &str,
+    ) {
+        let mut manifest = manifest_with_rows(3);
+        manifest.max_fragment_id = fragment_mark;
+
+        let error = apply(&manifest, vec![refresh(vec![7])]).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_two_writers_refreshing_the_same_fragment_conflict() {
+        let ours = footprint(vec![refresh(vec![0])]);
+        let same = footprint(vec![refresh(vec![0, 1])]);
+        let other = footprint(vec![refresh(vec![1])]);
+
+        assert!(ours.conflicts_with(&same));
+        assert!(!ours.conflicts_with(&other));
+    }
+
+    /// The version sequence lives in the fragment, so a concurrent removal of
+    /// it leaves nothing to restamp, in either order.
+    #[test]
+    fn test_refreshing_a_fragment_a_concurrent_writer_removes_conflicts() {
+        let ours = footprint(vec![refresh(vec![0])]);
+        let removal = |fragment: u64| {
+            footprint(vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(fragment),
+                data_change: true,
+            })])
+        };
+
+        assert!(ours.conflicts_with(&removal(0)));
+        assert!(removal(0).conflicts_with(&ours));
+        assert!(!ours.conflicts_with(&removal(1)));
+        assert!(!removal(1).conflicts_with(&ours));
+    }
+
+    fn rewrite_field_zero(fragment: Ref, data_change: bool) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if fragment.committed().is_some() {
+            actions.push(Action::TombstoneFieldData(TombstoneFieldData {
+                fragment,
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change,
+            }));
+        }
+        actions.push(Action::AddDataFile(AddDataFile {
+            fragment,
+            file: one_column_file("data/rewritten.lance"),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change,
+            base: None,
+        }));
+        actions
+    }
+
+    fn append() -> Vec<Action> {
+        let mut actions = vec![Action::AddFragment(AddFragment {
+            id: Ref::Local(0),
+            physical_rows: 3,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })];
+        actions.extend(rewrite_field_zero(Ref::Local(0), true));
+        actions
+    }
+
+    /// Which rows a change restamps is not implied by the file it writes, so
+    /// apply does not derive it: a data change written into a fragment that
+    /// was already there has to say so with a refresh, or its rows keep the
+    /// versions from before the change and a reader of changes since then
+    /// misses them. A fragment the operation adds is stamped as a whole
+    /// anyway.
+    #[rstest]
+    #[case::rewrite_without_refresh(
+        true,
+        rewrite_field_zero(Ref::Committed(0), true),
+        Some("fragment 0")
+    )]
+    #[case::rewrite_with_refresh(
+        true,
+        [rewrite_field_zero(Ref::Committed(0), true), vec![refresh(vec![0])]].concat(),
+        None
+    )]
+    #[case::refresh_before_the_rewrite(
+        true,
+        [vec![refresh(vec![0])], rewrite_field_zero(Ref::Committed(0), true)].concat(),
+        None
+    )]
+    #[case::rearrangement(true, rewrite_field_zero(Ref::Committed(0), false), None)]
+    #[case::fragment_added_in_the_operation(true, append(), None)]
+    #[case::no_stable_row_ids(false, rewrite_field_zero(Ref::Committed(0), true), None)]
+    fn test_a_data_change_to_an_existing_fragment_needs_a_refresh(
+        #[case] stable_row_ids: bool,
+        #[case] actions: Vec<Action>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let manifest = if stable_row_ids {
+            manifest_with_rows(3)
+        } else {
+            backed_manifest()
+        };
+
+        let result = apply(&manifest, actions);
+
+        let Some(expected_error) = expected_error else {
+            result.unwrap();
+            return;
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(expected_error), "{message}");
+        assert!(message.contains("RefreshRowVersionMetadata"), "{message}");
+    }
+}

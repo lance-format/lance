@@ -105,7 +105,7 @@ pub struct FragReuseLedger {
 
 /// The single content field of FRI details: `(1, inline history)` or
 /// `(2, external file reference)`, as raw bytes.
-fn content_field(details: &prost_types::Any) -> Result<(u32, Bytes)> {
+pub(crate) fn content_field(details: &prost_types::Any) -> Result<(u32, Bytes)> {
     if details.type_url.rsplit('/').next() != Some("lance.table.FragmentReuseIndexDetails") {
         return Err(corrupt(format!(
             "unexpected FRI details type {:?}",
@@ -179,7 +179,7 @@ impl FragReuseLedger {
 
     // Each legacy group owns a compaction remap. Address resolution follows its
     // fragment lineage, rather than searching every group in a legacy version.
-    fn decode_content(index_version: i32, content: Bytes) -> Result<Self> {
+    pub(crate) fn decode_content(index_version: i32, content: Bytes) -> Result<Self> {
         validate_index_version(index_version)?;
         let mut remaining = content;
         let mut transitions = Vec::new();
