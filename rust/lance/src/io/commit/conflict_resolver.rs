@@ -6519,6 +6519,7 @@ mod tests {
         new_fragments: vec![],
         fields_modified: vec![],
         compacted_sstables: vec![],
+        mem_wal_dir_id: None,
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: None,
         inserted_rows_filter: None,
@@ -6554,6 +6555,7 @@ mod tests {
     })]
     #[case::update_mem_wal_state(Operation::UpdateMemWalState {
         compacted_sstables: vec![],
+        dir_id: String::new(),
     })]
     #[tokio::test]
     async fn test_a_legacy_operation_conflicts_with_an_action_txn(#[case] legacy: Operation) {

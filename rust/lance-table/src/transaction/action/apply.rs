@@ -24,7 +24,7 @@
 //! own module.
 
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
-use crate::feature_flags::inherit_sticky_feature_flags;
+use crate::feature_flags::{apply_index_object_metadata_flag, inherit_sticky_feature_flags};
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
     BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
@@ -312,6 +312,7 @@ impl<'a> ApplyState<'a> {
             config,
         )?;
         inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
+        apply_index_object_metadata_flag(&mut manifest, &indices);
 
         for base in new_bases {
             manifest.base_paths.insert(base.id, base);
@@ -1061,7 +1062,9 @@ fn duplicate_token_err(space: &str, token: u32) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::{FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS};
+    use crate::feature_flags::{
+        FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_OBJECT_METADATA,
+    };
     use crate::format::DataFile;
     use crate::rowids::write_row_ids;
     use crate::system_index::mem_wal::{
@@ -2074,5 +2077,28 @@ mod tests {
             ],
         );
         assert!(next.is_ok(), "{next:?}");
+    }
+
+    /// The object-metadata writer bit is derived from the index list on every
+    /// commit, so an action set has to set it too, or it would drop the fence
+    /// for segments it carries over unchanged.
+    #[test]
+    fn test_an_action_set_keeps_the_object_metadata_fence() {
+        let mut index = sample_index_metadata("idx");
+        index
+            .metadata
+            .insert("org.example.test".into(), "opaque".into());
+
+        let (manifest, _) = apply_with_indices(
+            &backed_manifest(),
+            vec![
+                mint_fragment(0),
+                write_data(Ref::Local(0), FieldRef::Committed(0)),
+            ],
+            vec![index],
+        )
+        .unwrap();
+
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
     }
 }

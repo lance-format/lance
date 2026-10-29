@@ -75,6 +75,8 @@ impl AddFragment {
             physical_rows: Some(self.physical_rows as usize),
             last_updated_at_version_meta: self.last_updated_at_version_meta.clone(),
             created_at_version_meta: self.created_at_version_meta.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         });
         Ok(())
     }
