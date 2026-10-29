@@ -315,16 +315,29 @@ major, minor, or patch release.
    or reuse its release branch **before** opening the Lance RC upgrade draft PR.
    Target that branch, especially when LanceDB main already uses a newer Lance
    development version. Follow the [LanceDB release process](https://github.com/lancedb/lancedb/blob/main/release_process.md#prepare-a-stable-release).
-3. Complete the relevant downstream PR CI against the exact RC. Record the
-   downstream base and PR head SHAs (and tested merge commit, when applicable),
-   dependency references, CI links, and any expected skips. Keep local source
-   checks and tests of published artifacts identifiable in the vote evidence.
-4. If the RC, downstream candidate, or its release-branch base changes, rerun the
+3. Bring the LanceDB RC pin PR to a **ready-to-merge state before publishing
+   Lance stable**. Complete the relevant CI and code/compatibility reviews against
+   the exact RC. If draft status skips Gatekeeper or another applicable review,
+   mark the PR ready for review or explicitly run that review. A skipped review
+   is missing validation evidence. Read review bodies and inline threads: a
+   request-changes recommendation or unresolved blocking finding still blocks
+   approval when GitHub records it as a comment and CI is green.
+4. Record the downstream base and PR head SHAs (and tested merge commit, when
+   applicable), dependency references, CI links, review outcomes and any expected
+   skips. Keep local source checks and tests of published artifacts identifiable
+   in the vote evidence. Refresh reviews and comments immediately before approval.
+5. If the RC, downstream candidate, or its release-branch base changes, rerun the
    affected validation before using the result to approve the release. Bring
    required fixes into the selected branch through reviewed backports instead of
    silently switching the release to a later main snapshot.
-5. Confirm that the workflow will promote the voted RC. Changes that require a
+6. Confirm that the workflow will promote the voted RC. Changes that require a
    new candidate must go through **Create RC** and renewed validation and voting.
+
+Ready to merge does not mean merging the RC dependency before Lance approval.
+All substantive code, compatibility and review work must be complete on the RC
+pin PR. After stable packages are published, only the mechanical RC-to-stable
+reference update and verification of those packages should remain; review of the
+dependency upgrade must not start after Lance stable has already been published.
 
 Coordinate any additional downstream checks with their owners. Projects should
 keep commands that require restricted access in their own runbooks and
