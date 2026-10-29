@@ -209,6 +209,7 @@ pub struct PrimitiveStructuralEncoder {
     accumulation_queue: AccumulationQueue,
 
     keep_original_array: bool,
+    flush_next: bool,
     accumulated_repdefs: Vec<RepDefBuilder>,
     page_encodings: Arc<[PrimitivePageEncoding]>,
     column_index: u32,
@@ -308,6 +309,7 @@ impl PrimitiveStructuralEncoder {
                 options.keep_original_array,
             ),
             keep_original_array: options.keep_original_array,
+            flush_next: false,
             accumulated_repdefs: Vec::new(),
             column_index,
             page_encodings,
@@ -2649,9 +2651,14 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         let array = Self::extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
 
-        let pages = self
-            .accumulation_queue
-            .insert_with_pages(array, row_number, num_rows);
+        let pages = if self.flush_next {
+            self.flush_next = false;
+            self.accumulation_queue
+                .insert_for_page_boundary(array, row_number, num_rows)
+        } else {
+            self.accumulation_queue
+                .insert_with_pages(array, row_number, num_rows)
+        };
         if pages.is_empty() {
             return Ok(vec![]);
         }
@@ -2707,6 +2714,10 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
             }
         }
         Ok(tasks)
+    }
+
+    fn prepare_for_flush(&mut self) {
+        self.flush_next = true;
     }
 
     // If there is any data left in the buffer then create an encode task from it

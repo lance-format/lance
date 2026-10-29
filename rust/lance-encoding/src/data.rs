@@ -2255,7 +2255,7 @@ impl DataBlock {
             | DataType::UInt32
             | DataType::UInt64
             | DataType::UInt8 => {
-                let data = if !encoding && arrays.len() == 1 {
+                let data = if arrays.len() == 1 {
                     let data = arrays[0].to_data();
                     let width = data_type.byte_width();
                     LanceBuffer::from(

@@ -219,6 +219,28 @@ impl AccumulationQueue {
         pages
     }
 
+    pub(crate) fn insert_for_page_boundary(
+        &mut self,
+        array: ArrayRef,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Vec<AccumulatedPage> {
+        let mut pages = Vec::with_capacity(2);
+        if let Some(page) = self.take_page(false) {
+            pages.push(page);
+        }
+        if self.row_number == u64::MAX {
+            self.row_number = row_number;
+        }
+        self.num_rows = num_rows;
+        self.current_bytes = array.get_array_memory_size() as u64;
+        self.buffered_arrays.push(array);
+        if let Some(page) = self.take_page(true) {
+            pages.push(page);
+        }
+        pages
+    }
+
     pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.buffered_arrays.is_empty() {
             trace!(
@@ -384,6 +406,22 @@ mod tests {
             slice.to_data().buffers()[0].data_ptr()
         );
         assert!(Arc::ptr_eq(&pages[1].arrays[0], &parent));
+    }
+
+    #[test]
+    fn test_page_boundary_flushes_borrowed_input_without_copy() {
+        let parent: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..4096));
+        let slice = parent.slice(17, 32);
+        let copied_bytes = deep_copy_array_sliced(slice.as_ref()).get_array_memory_size() as u64;
+        let mut queue = AccumulationQueue::new(copied_bytes * 2, 0, false);
+
+        assert!(queue.insert_with_pages(slice.clone(), 17, 32).is_empty());
+        let pages = queue.insert_for_page_boundary(parent.clone(), 49, 4096);
+        assert_eq!(pages.len(), 2);
+        assert!(!pages[0].includes_inserted_array);
+        assert!(pages[1].includes_inserted_array);
+        assert!(Arc::ptr_eq(&pages[1].arrays[0], &parent));
+        assert!(queue.flush().is_none());
     }
 
     #[rstest]

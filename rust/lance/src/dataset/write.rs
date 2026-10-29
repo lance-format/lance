@@ -1030,13 +1030,21 @@ where
                 let active_writer = writer.as_mut().ok_or_else(|| {
                     Error::internal("Writer was not initialized before writing a batch")
                 })?;
+                let batch_chunk_rows =
+                    batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
+                let reaches_row_limit = if has_file_row_counts {
+                    rows_remaining_in_planned_file == Some(batch_chunk_rows)
+                } else {
+                    num_rows_in_current_file + batch_chunk_rows >= params.max_rows_per_file
+                };
+                if reaches_row_limit {
+                    active_writer.prepare_for_flush();
+                }
                 active_writer.write(&batch_chunk).await?;
                 for batch in &batch_chunk {
                     seeds.observe(batch)?;
                 }
-                let batch_chunk_rows =
-                    batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
-                num_rows_in_current_file += batch_chunk_rows as u32;
+                num_rows_in_current_file += batch_chunk_rows;
                 // The writer owns the values it needs (either borrowed for an
                 // immediate page or detached into the queue).  Do not keep the
                 // input's parent buffers alive through the file finish below.
@@ -1084,7 +1092,7 @@ where
                 let reached_row_limit = if has_file_row_counts {
                     reached_planned_file_boundary
                 } else {
-                    num_rows_in_current_file >= params.max_rows_per_file as u32
+                    num_rows_in_current_file >= params.max_rows_per_file
                 };
                 let reached_byte_limit = current_file_bytes >= params.max_bytes_per_file as u64;
 
@@ -1119,7 +1127,7 @@ where
                     seeds.flush(w.as_mut()).await?;
                     let (num_rows, data_file) = w.finish().await?;
                     info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-                    debug_assert_eq!(num_rows, num_rows_in_current_file);
+                    debug_assert_eq!(num_rows as usize, num_rows_in_current_file);
                     bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
                     rows_completed += num_rows as u64;
                     files_written += 1;
@@ -1966,6 +1974,8 @@ fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+    /// Mark the next batch as ending the current file page.
+    fn prepare_for_flush(&mut self) {}
     /// Get the file path and base ID for the data file being written.
     fn data_file_path(&self) -> (&str, Option<u32>);
     /// Get the current position in the file
@@ -2151,6 +2161,9 @@ impl GenericWriter for V2WriterAdapter {
             self.write_batch(batch).await?;
         }
         Ok(())
+    }
+    fn prepare_for_flush(&mut self) {
+        self.writer.prepare_for_flush();
     }
     async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
         if self.preprocessor.is_some() {
