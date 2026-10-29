@@ -90,12 +90,11 @@ impl TryFrom<pb_actions::AddBase> for AddBase {
 mod tests {
     use super::*;
     use crate::transaction::action::Action;
-    use crate::transaction::action::test_support::apply;
-    use crate::transaction::test_support::sample_manifest;
+    use crate::transaction::action::test_support::{apply, unbacked_manifest};
 
     #[test]
     fn test_add_base_mints_an_id_and_rejects_duplicates() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let next = apply(
             &manifest,
             vec![Action::AddBase(AddBase {
@@ -129,7 +128,7 @@ mod tests {
     /// with `is_some()` for the same reason.
     #[test]
     fn test_unnamed_bases_do_not_collide_with_each_other() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let next = apply(
             &manifest,
             vec![
@@ -152,7 +151,7 @@ mod tests {
     /// operation.
     #[test]
     fn test_two_add_bases_in_one_operation_see_each_other() {
-        let manifest = sample_manifest();
+        let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
             vec![

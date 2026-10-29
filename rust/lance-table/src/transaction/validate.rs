@@ -659,7 +659,7 @@ fn overwrite_fragments_valid(fragments: &[Fragment]) -> Result<()> {
     Ok(())
 }
 
-fn schema_fragments_valid(
+pub fn schema_fragments_valid(
     manifest: Option<&Manifest>,
     schema: &Schema,
     fragments: &[Fragment],
