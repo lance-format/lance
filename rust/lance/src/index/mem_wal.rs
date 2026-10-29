@@ -29,7 +29,13 @@ mod tests {
 
     use crate::dataset::mem_wal::DatasetMemWalExt;
     use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::write::merge_insert::{
+        MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+    };
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use arrow_array::cast::AsArray;
+    use arrow_array::record_batch;
+    use arrow_array::types::Int32Type;
 
     async fn test_dataset() -> crate::Dataset {
         let write_params = WriteParams {
@@ -1295,6 +1301,75 @@ mod tests {
         )
         .await
         .expect("a compaction from the current MemWAL commits");
+    }
+
+    /// Every merge-insert executor carries the MemWAL named by
+    /// `mark_sstables_as_compacted` into its commit, including the in-place
+    /// column rewrite and chunks that record no progress.
+    #[rstest::rstest]
+    #[case::rewrite_rows(MergeInsertWriteMode::RewriteRows)]
+    #[case::rewrite_columns(MergeInsertWriteMode::RewriteColumns)]
+    #[tokio::test]
+    async fn test_merge_insert_checks_its_mem_wal(#[case] write_mode: MergeInsertWriteMode) {
+        let initial = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [10, 20, 30, 40]),
+            ("other", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(enable(disable(enable(dataset, DIR_A).await).await, DIR_B).await);
+
+        let merge = |dir_id: &str, compacted: Vec<CompactedSsTable>, value: i32| {
+            let dataset = dataset.clone();
+            let dir_id = dir_id.to_string();
+            async move {
+                let source = record_batch!(("id", Int32, [1]), ("value", Int32, [value])).unwrap();
+                let uncommitted = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".into()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .use_index(false)
+                    .write_mode(write_mode)
+                    .mark_sstables_as_compacted(dir_id, compacted)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted_batches(vec![source])
+                    .await
+                    .unwrap();
+                CommitBuilder::new(dataset)
+                    .execute(uncommitted.transaction)
+                    .await
+            }
+        };
+
+        let stale = merge(DIR_A, vec![], 999)
+            .await
+            .expect_err("a progress-less chunk from the replaced MemWAL");
+        assert!(stale.is_stale_mem_wal(), "unexpected: {stale}");
+
+        let merged = merge(DIR_B, vec![CompactedSsTable::new(Uuid::new_v4(), 1)], 11)
+            .await
+            .expect("progress for the current MemWAL commits");
+        let batch = merged
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["value"].as_primitive::<Int32Type>().values(),
+            &[11],
+            "only the current MemWAL's merge lands"
+        );
     }
 
     #[tokio::test]
