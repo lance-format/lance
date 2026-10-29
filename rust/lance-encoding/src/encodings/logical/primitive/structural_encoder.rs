@@ -302,10 +302,11 @@ impl PrimitiveStructuralEncoder {
                 .validate_field(&field, &encoding_metadata)?;
         }
         Ok(Self {
-            accumulation_queue: AccumulationQueue::new(
+            accumulation_queue: AccumulationQueue::new_with_shared_slice_retention(
                 options.cache_bytes_per_column,
                 column_index,
                 options.keep_original_array,
+                true,
             ),
             keep_original_array: options.keep_original_array,
             accumulated_repdefs: Vec::new(),
@@ -2646,11 +2647,26 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         let array = Self::extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
 
-        if let Some((arrays, row_number, num_rows)) =
-            self.accumulation_queue.insert(array, row_number, num_rows)
+        if let Some(page) = self
+            .accumulation_queue
+            .insert_with_page_info(array, row_number, num_rows)
         {
+            let current_repdef = if page.includes_inserted_array {
+                None
+            } else {
+                self.accumulated_repdefs.pop()
+            };
             let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
-            Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
+            let tasks = self.do_flush(
+                page.arrays,
+                accumulated_repdefs,
+                page.row_number,
+                page.num_rows,
+            )?;
+            if let Some(current_repdef) = current_repdef {
+                self.accumulated_repdefs.push(current_repdef);
+            }
+            Ok(tasks)
         } else {
             Ok(vec![])
         }
