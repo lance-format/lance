@@ -1213,6 +1213,7 @@ impl WalAppender {
     /// reading 0 until the first append has discovered the true tip. The
     /// authoritative position counter is still discovered lazily on the
     /// first append.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_claimed_epoch(
         object_store: Arc<ObjectStore>,
         base_path: Path,
