@@ -3540,6 +3540,53 @@ def portable_blob_references(tmp_path):
     return dataset, source, references
 
 
+def test_portable_nested_capture_null_kind(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"blob": lance.blob_array([b"a", None])}),
+        tmp_path / "null-kind.lance",
+        data_storage_version="2.2",
+    )
+    scanned = dataset.to_table(with_row_address=True).combine_chunks().to_batches()[0]
+    descriptors = scanned["blob"]
+    # Arrow operators may retain valid structs while making their children nullable.
+    descriptors = pa.StructArray.from_arrays(
+        [pa.array([None, None], type=pa.uint8())]
+        + [descriptors.field(i) for i in range(1, len(descriptors.type))],
+        fields=[field.with_nullable(True) for field in descriptors.type],
+    )
+    field = scanned.schema.field("blob").with_type(descriptors.type)
+    source = BlobSourceContext.from_dataset(dataset, "catalog/null-kind", "workers")
+    with BlobRefCapture(
+        dataset, source, dataset.lance_schema.field("blob").id()
+    ) as capture:
+        before = dataset.io_stats_snapshot()
+        nested = capture.capture_nested(source, field, scanned["_rowaddr"], descriptors)
+        assert dataset.io_stats_snapshot().read_iops == before.read_iops
+    assert nested.references.array.to_pylist() == [None, None]
+    assert nested.indices.column(0).to_pylist() == [None, None]
+
+
+@pytest.mark.parametrize("offset", [None, 0, 1])
+@pytest.mark.parametrize("sort_column", ["id", "blob"])
+def test_blob_zero_limit_sort(tmp_path, offset, sort_column):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 0], "blob": lance.blob_array([b"a", b"b"])}),
+        tmp_path / "zero-limit.lance",
+        data_storage_version="2.2",
+    )
+    before = dataset.io_stats_snapshot()
+    result = dataset.to_table(
+        columns=["id"],
+        order_by=[sort_column],
+        blob_handling="all_binary",
+        limit=0,
+        offset=offset,
+    )
+    assert result.schema == pa.schema([pa.field("id", pa.int64())])
+    assert result.num_rows == 0
+    assert dataset.io_stats_snapshot().read_iops == before.read_iops
+
+
 def test_portable_blob_reference_requests(portable_blob_references):
     dataset, source, references = portable_blob_references
     assert BlobSourceContext.protocol_version() == 1

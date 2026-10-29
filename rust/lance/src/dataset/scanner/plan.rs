@@ -24,6 +24,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_optimizer::output_requirements::OutputRequirementExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, expressions};
@@ -1039,6 +1040,11 @@ impl Scanner {
             .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
+
+        // Avoid zero-capacity Top-K sorting and payload reads while preserving the output schema.
+        if self.limit == Some(0) {
+            return Ok(Arc::new(EmptyExec::new(plan.schema())));
+        }
 
         // If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
