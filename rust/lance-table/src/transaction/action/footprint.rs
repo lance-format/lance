@@ -151,7 +151,10 @@ enum Mode {
     /// Writes some of the coordinate and leaves the rest as it was. An overlay
     /// is the case: new values for a subset of one field's cells in one
     /// fragment. Two of these commute -- both land, the newer wins where they
-    /// overlap -- which is what sets it apart from a full write.
+    /// overlap -- which is what sets it apart from a full write. So does a
+    /// move: it keeps every physical row where it was and leaves the overlays
+    /// alone, so the overlay's offsets still address its cells and the newer
+    /// overlay still wins them.
     ///
     /// It also serves as a conflict marker on a coordinate the set does not
     /// change at all, where it needs exactly this row and column of the table:
@@ -160,9 +163,10 @@ enum Mode {
     /// [`Footprint::write_part_of_deletions`].
     WritesPart,
     /// Replaces how the coordinate is stored without changing its values: a
-    /// re-encode with `data_change` false. It collides with any write, as a
-    /// write does, but not with a requirement -- an index segment built over
-    /// the values still describes them after they move.
+    /// re-encode with `data_change` false. It collides with a full write and
+    /// with another move, but not with a partial write or a requirement -- an
+    /// overlay still shadows the moved values, and an index segment built over
+    /// them still describes them.
     Moves,
     /// Replaces the coordinate. Two of these on one coordinate never commute.
     Writes,
@@ -205,8 +209,8 @@ impl Region {
 /// | committing \ committed | Writes   | Moves    | WritesPart | Requires | RequiresUnlessRemoved |
 /// |------------------------|----------|----------|------------|----------|-----------------------|
 /// | Writes                 | conflict | conflict | conflict   | ok       | ok                    |
-/// | Moves                  | conflict | conflict | conflict   | ok       | ok                    |
-/// | WritesPart             | conflict | conflict | ok         | ok       | ok                    |
+/// | Moves                  | conflict | conflict | ok         | ok       | ok                    |
+/// | WritesPart             | conflict | ok       | ok         | ok       | ok                    |
 /// | Requires               | conflict | ok       | ok         | ok       | ok                    |
 /// | RequiresUnlessRemoved  | conflict | ok       | ok         | ok       | ok                    |
 ///
@@ -231,9 +235,10 @@ impl Region {
 fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     match (committing, committed) {
         (_, Mode::Writes) => true,
-        (Mode::Writes | Mode::Moves, Mode::Moves | Mode::WritesPart) => true,
-        (Mode::WritesPart, Mode::Moves) => true,
-        (Mode::WritesPart, Mode::WritesPart) => false,
+        (Mode::Writes, Mode::Moves | Mode::WritesPart) => true,
+        (Mode::Moves, Mode::Moves) => true,
+        (Mode::Moves, Mode::WritesPart) => false,
+        (Mode::WritesPart, Mode::Moves | Mode::WritesPart) => false,
         (Mode::Requires | Mode::RequiresUnlessRemoved, Mode::Moves | Mode::WritesPart) => false,
         (_, Mode::Requires | Mode::RequiresUnlessRemoved) => false,
     }
