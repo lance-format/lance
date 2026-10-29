@@ -516,6 +516,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            predicate: None,
         }
     }
 }

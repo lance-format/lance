@@ -52,8 +52,9 @@ An index is made up of multiple **index segments**, identified by their unique U
 Each segment is an independent, self-contained index covering a subset of the data.
 
 Each index segment covers a disjoint subset of fragments in the dataset. The segments must cover
-all rows in the fragments they cover, with one exception: if a fragment has delete markers at the time
-of index creation, the index segment is allowed to not contain the deleted rows. The fragments an index
+all rows in the fragments they cover, with two exceptions: if a fragment has delete markers at the time
+of index creation, the index segment is allowed to not contain the deleted rows, and a segment with a
+[predicate](#index-predicates) contains only the rows where the predicate is TRUE. The fragments an index
 covers are those recorded in the `fragment_bitmap` field.
 
 Index segments together **do not** need to cover all fragments. This means an index isn't required to
@@ -77,6 +78,49 @@ Consider the example dataset in the figure above:
 - There is another index called "vec_idx", which has a single segment covering all three fragments.
   Because it covers all fragments, queries using this index do not need to scan any fragments directly.
   They do, however, need to filter out the 10 deleted rows from fragment 1.
+
+## Index Predicates
+
+An index may restrict itself to the rows where a boolean predicate is TRUE. The predicate is stored on
+every segment in `IndexMetadata.predicate`, and all segments of one index carry byte-identical
+predicates. Two writers can encode one predicate in different bytes, so a writer that adds segments to
+an existing index reuses the predicate its segments store.
+
+A predicate changes what covering a fragment means. Every live row of the fragments in the segment's
+`fragment_bitmap` was evaluated against the predicate, and the segment holds exactly the rows where it
+was TRUE. Rows where it was FALSE or NULL are absent. The index type's own rules still apply to the rows
+that pass. A segment without a predicate covers every live row of its fragments.
+
+The predicate is an `IndexPredicate` message with two fields, neither of which may be empty:
+
+- `substrait`: a Substrait `ExtendedExpression` holding one boolean expression. Its base schema has one
+  column per entry of `fields`, and column `i` is the field whose id is `fields[i]`. Readers bind the
+  columns by position and ignore their names, so renaming a field leaves the stored predicate valid. The
+  expression references every column, and each column's type matches its field's type.
+- `fields`: the ids of the top-level fields that the base schema columns bind to, in column order.
+
+For example, `rejected = true AND lang = 'en'` over field ids 7 and 3 is stored as the Substrait form of
+`$1 = true AND $2 = 'en'` over a base schema with columns `$1` and `$2`, and fields `[7, 3]`.
+
+Version 1 predicates combine these terms with `AND`, `OR`, and `NOT`: a comparison between a column and
+a non-NULL literal, `IN` with a list of non-NULL literals, `BETWEEN` with non-NULL literal bounds,
+`IS [NOT] NULL`, `IS [NOT] TRUE` and `IS [NOT] FALSE` on a boolean column, and a bare boolean column.
+Columns are boolean, integer, floating point, or string fields. An engine that cannot bind a predicate
+must not use its segments.
+
+An engine may answer a query from a segment with a predicate only when every row that satisfies the
+query's filter also satisfies the predicate, and the filter applies before any step that keeps a limited
+number of rows, such as a vector search's top `k`. A query without a filter never uses such a segment.
+
+The predicate's `fields` are dependencies of the index, alongside `fields` and `covering_fields`: an
+in-place update or overlay that writes one of them invalidates the covered fragment, because it can move
+rows into or out of the predicate. A writer that derives a segment from an existing one, for example by
+remapping, merging, or adding a delta segment, must carry the predicate forward unchanged.
+
+Writers must set `FLAG_INDEX_PREDICATES` (`1 << 19`) in both `reader_feature_flags` and
+`writer_feature_flags` whenever any index in the manifest has a predicate, and clear it once none does.
+A reader that ignored the predicate would answer queries as if the segment held every row, and a writer
+that ignored it would drop the predicate from the next manifest it commits.
 
 ## Index Storage
 
@@ -105,6 +149,8 @@ Index segments are created and updated through a transactional process:
      that carries no extra columns. Declaring a column here does not by itself make it servable --
      see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
+   - `predicate`: Optional. Restricts the segment to the rows where the predicate is TRUE and must match
+     the other segments of the index -- see [Index Predicates](#index-predicates).
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
    - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
@@ -114,9 +160,9 @@ Index segments are created and updated through a transactional process:
    as data writes.
 
 When updating a column in place (without deleting the row), the engine must remove the
-affected fragment IDs from the `fragment_bitmap` field of any index segment whose `fields`
-or `covering_fields` include that column. This marks those fragments as needing re-indexing
-without invalidating the entire segment and prevents invalid data from being read from the
+affected fragment IDs from the `fragment_bitmap` field of any index segment whose `fields`,
+`covering_fields`, or `predicate.fields` include that column. This marks those fragments as needing
+re-indexing without invalidating the entire segment and prevents invalid data from being read from the
 index.
 
 ## Index Compatibility
@@ -230,18 +276,22 @@ The `IndexMetadata` message contains important information about the index segme
   [Serving carried columns](#serving-carried-columns) and the legacy interpretation under
   [Covering-field contracts](#covering-field-contracts).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
+- `predicate`: optional. When present, the segment holds only the rows of its covered fragments where
+  the predicate is TRUE -- see [Index Predicates](#index-predicates).
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
 
 <details>
   <summary>Full protobuf definitions</summary>
 
-There are both part of the `table.proto` file in the Lance source code.
+These are all part of the `table.proto` file in the Lance source code.
 
 ```protobuf
 %%% proto.message.IndexSection %%%
 
 %%% proto.message.IndexMetadata %%%
+
+%%% proto.message.IndexPredicate %%%
 ```
 
 </details>
@@ -282,9 +332,11 @@ There are four situations to consider:
 3. **A fragment has had one of the index's columns updated in place.** This cannot be detected
    just by examining metadata. To prevent reading invalid data, the engine should filter out any
    row addresses that are not in the index's current `fragment_bitmap`.
-   The column need not be one the index is keyed on: every column in the union of `fields` and
-   `covering_fields` counts. A carried column can be updated while the keyed column is untouched,
-   and a segment left covering that fragment would answer from an obsolete carried value.
+   The column need not be one the index is keyed on: every column in the union of `fields`,
+   `covering_fields`, and `predicate.fields` counts. A carried column can be updated while the
+   keyed column is untouched, and a segment left covering that fragment would answer from an
+   obsolete carried value. An update to a predicate column can move rows into or out of the
+   predicate, so a segment left covering that fragment would hold the wrong rows.
 4. **A fragment has an updated value in an [overlay file](../table/data_overlay_file.md).**
    This can be detected by checking if any of the fragments in the index's `fragment_bitmap`
    have overlay files. For each overlay whose `committed_version` is greater than the index
@@ -292,10 +344,10 @@ There are four situations to consider:
    so its covered rows must be excluded from index results. Excluded rows are re-evaluated
    against their current (overlaid) values on the flat path — dropping them without
    re-evaluation would silently lose rows that match under the new value. Exclusion is
-   field-aware: only overlays covering a column in the union of the index's `fields` and
-   `covering_fields` matter. Restricting this to the keyed columns would leave a fragment
-   covered after an overlay updated a carried one, and the index would then serve a stale
-   carried value.
+   field-aware: only overlays covering a column in the union of the index's `fields`,
+   `covering_fields`, and `predicate.fields` matter. Restricting this to the keyed columns would
+   leave a fragment covered after an overlay updated a carried or predicate one, and the index
+   would then serve a stale carried value or the wrong rows.
    You may exclude just the affected rows or the whole fragment; the latter is simpler and
    safer but re-evaluates more rows than necessary.
    See [Data Overlay Files](../table/data_overlay_file.md#index-integration)
@@ -332,8 +384,8 @@ logical identifier that remains constant even when rows are moved during compact
 **Benefits:**
 
 - No remapping needed after compaction
-- Updates only invalidate the index if data in the union of its `fields` and
-  `covering_fields` changes
+- Updates only invalidate the index if data in the union of its `fields`,
+  `covering_fields`, and `predicate.fields` changes
 
 **Tradeoffs:**
 

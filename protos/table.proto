@@ -165,6 +165,10 @@ message Manifest {
    *   derived snapshots, including clone and restore, because data files may
    *   retain version 1 seeds. Legacy seeds may coexist and must be decoded
    *   with their original semantics.
+   * * 1 << 19: some index has a predicate (see IndexPredicate). Both feature
+   *   words must carry the bit while any index in the manifest has one. A
+   *   reader or writer that ignores it would treat a partial index as covering
+   *   every row.
    */
   uint64 reader_feature_flags = 9;
 
@@ -426,8 +430,8 @@ message IndexMetadata {
    * When the manifest has feature flag 1 << 13, this declaration is independent
    * of `fields` and has no positional relationship to it. A field may occur in
    * both lists when the index carries a value it is also keyed on. Consumers
-   * must use the union of `fields` and `covering_fields` as the index dependency
-   * set.
+   * must use the union of `fields`, `covering_fields`, and `predicate.fields` as
+   * the index dependency set.
    *
    * Without feature flag 1 << 13, the legacy contract applies: the carried columns
    * form the trailing suffix of `fields` in emission order. A column the
@@ -459,6 +463,27 @@ message IndexMetadata {
    * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
    */
   map<string, string> metadata = 13;
+
+  /* Restricts the index to rows where this predicate is TRUE. Absent means
+   * the index covers every live row of the fragments in fragment_bitmap.
+   * Requires feature flag 1 << 19 in both reader_feature_flags and
+   * writer_feature_flags while any index in the manifest sets this field.
+   */
+  optional IndexPredicate predicate = 14;
+}
+
+message IndexPredicate {
+  /* A Substrait ExtendedExpression holding one boolean expression. Its base
+   * schema has one column per entry of fields, and column i is the field whose
+   * id is fields[i]: readers bind the columns by position and ignore their
+   * names. The expression references every column and nothing else.
+   */
+  bytes substrait = 1;
+
+  /* Ids of the top-level fields the base schema columns bind to, in column
+   * order. Not empty.
+   */
+  repeated int32 fields = 2;
 }
 
 // Metadata about a single file within an index segment.
