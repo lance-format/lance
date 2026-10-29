@@ -13,7 +13,10 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
+
 import com.google.common.base.MoreObjects;
+import org.apache.arrow.util.Preconditions;
 
 import java.util.HashMap;
 import java.util.List;
@@ -33,6 +36,7 @@ public class WriteParams {
   private final Optional<Integer> maxRowsPerFile;
   private final Optional<Integer> maxRowsPerGroup;
   private final Optional<Long> maxBytesPerFile;
+  private final FileWriteOptions fileWriteOptions;
   private final Optional<WriteMode> mode;
   private final Optional<Boolean> enableStableRowIds;
   private final Optional<String> dataStorageVersion;
@@ -48,6 +52,7 @@ public class WriteParams {
       Optional<Integer> maxRowsPerFile,
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
+      FileWriteOptions fileWriteOptions,
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<String> dataStorageVersion,
@@ -61,6 +66,7 @@ public class WriteParams {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
+    this.fileWriteOptions = fileWriteOptions;
     this.mode = mode;
     this.enableStableRowIds = enableStableRowIds;
     this.dataStorageVersion = dataStorageVersion;
@@ -83,6 +89,10 @@ public class WriteParams {
 
   public Optional<Long> getMaxBytesPerFile() {
     return maxBytesPerFile;
+  }
+
+  public FileWriteOptions getFileWriteOptions() {
+    return fileWriteOptions;
   }
 
   /**
@@ -151,6 +161,8 @@ public class WriteParams {
         .add("maxRowsPerFile", maxRowsPerFile.orElse(null))
         .add("maxRowsPerGroup", maxRowsPerGroup.orElse(null))
         .add("maxBytesPerFile", maxBytesPerFile.orElse(null))
+        .add("dataCacheBytes", fileWriteOptions.getDataCacheBytes().orElse(null))
+        .add("maxPageBytes", fileWriteOptions.getMaxPageBytes().orElse(null))
         .add("mode", mode.orElse(null))
         .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .toString();
@@ -161,6 +173,7 @@ public class WriteParams {
     private Optional<Integer> maxRowsPerFile = Optional.empty();
     private Optional<Integer> maxRowsPerGroup = Optional.empty();
     private Optional<Long> maxBytesPerFile = Optional.empty();
+    private FileWriteOptions fileWriteOptions = FileWriteOptions.builder().build();
     private Optional<WriteMode> mode = Optional.empty();
     private Optional<Boolean> enableStableRowIds = Optional.empty();
     private Optional<String> dataStorageVersion = Optional.empty();
@@ -184,6 +197,18 @@ public class WriteParams {
 
     public Builder withMaxBytesPerFile(long maxBytesPerFile) {
       this.maxBytesPerFile = Optional.of(maxBytesPerFile);
+      return this;
+    }
+
+    /**
+     * Set options for configuring the current-format file writer.
+     *
+     * @param fileWriteOptions file writer options
+     * @return this builder
+     */
+    public Builder withFileWriteOptions(FileWriteOptions fileWriteOptions) {
+      this.fileWriteOptions =
+          Preconditions.checkNotNull(fileWriteOptions, "fileWriteOptions must not be null");
       return this;
     }
 
@@ -282,6 +307,7 @@ public class WriteParams {
           maxRowsPerFile,
           maxRowsPerGroup,
           maxBytesPerFile,
+          fileWriteOptions,
           mode,
           enableStableRowIds,
           dataStorageVersion,

@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use futures::TryStreamExt;
 use lance_file::{
     version::ConcreteFileVersion,
@@ -22,7 +22,7 @@ use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
     object_store::ObjectStore,
     traits::{WriteExt, Writer},
-    utils::{METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
+    utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
 use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
@@ -43,6 +43,15 @@ pub async fn read_manifest(
     } else {
         object_store.inner.head(path).await?.size
     };
+    if file_size < 16 {
+        if known_size.is_some() {
+            return Box::pin(read_manifest(object_store, path, None)).await;
+        }
+        return Err(Error::corrupt_file(
+            path.clone(),
+            format!("Invalid format: manifest is only {file_size} bytes (minimum 16)"),
+        ));
+    }
     const PREFETCH_SIZE: u64 = 64 * 1024;
     let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
     let range = Range {
@@ -83,33 +92,48 @@ pub async fn read_manifest(
         let reader = object_store
             .open_with_size(path, file_size as usize)
             .await?;
-        let mut buf2 = BytesMut::with_capacity(manifest_len);
         let mut chunks = read_range_in_chunks(
             reader.as_ref(),
             manifest_pos..(file_size - PREFETCH_SIZE) as usize,
             METADATA_READ_CHUNK_SIZE,
         );
+        // Decode straight from the chunks rather than re-copying ~all of the
+        // file into one buffer; see `ChunkedBuf`.
+        let mut chunked = ChunkedBuf::default();
         while let Some(chunk) = chunks.try_next().await? {
-            buf2.extend_from_slice(&chunk);
+            chunked.push(chunk);
         }
-        buf2.extend_from_slice(&buf);
-        buf2.freeze()
+        chunked.push(buf);
+        // A u32 length prefix in front, the 16 byte footer behind.
+        if chunked.remaining() < 20 {
+            return Err(Error::corrupt_file(
+                path.clone(),
+                "Invalid format: manifest shorter than its length prefix and footer".to_string(),
+            ));
+        }
+        let recorded_length = chunked.get_u32_le() as usize;
+        chunked.truncate(chunked.remaining() - 16);
+        return decode_manifest(chunked, recorded_length);
     };
 
     let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
     // Need to trim the magic number at end and message length at beginning
     let buf = buf.slice(4..buf.len() - 16);
+    decode_manifest(buf, recorded_length)
+}
 
-    if buf.len() != recorded_length {
+fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<Manifest> {
+    if buf.remaining() != recorded_length {
         return Err(Error::invalid_input(format!(
             "Invalid format: manifest length does not match. Expected {}, got {}",
             recorded_length,
-            buf.len()
+            buf.remaining()
         )));
     }
-
     let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    let mut manifest = Manifest::try_from(proto)?;
+    manifest.detach_sparse_inline_row_ids(recorded_length);
+    Ok(manifest)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -247,9 +271,25 @@ mod test {
         reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
     };
     use rand::{Rng, distr::Alphanumeric};
+    use rstest::rstest;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    #[rstest]
+    #[case::listed_size(Some(0))]
+    #[case::head_size(None)]
+    #[tokio::test]
+    async fn test_read_empty_manifest_reports_path(#[case] known_size: Option<u64>) {
+        let store = ObjectStore::memory();
+        let path = Path::from("dataset/_versions/1.manifest");
+        store.inner.put(&path, Bytes::new().into()).await.unwrap();
+
+        let error = read_manifest(&store, &path, known_size).await.unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(error.to_string().contains(path.as_ref()), "{error}");
+        assert!(error.to_string().contains("0 bytes"), "{error}");
+    }
 
     async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
         let store = ObjectStore::memory();

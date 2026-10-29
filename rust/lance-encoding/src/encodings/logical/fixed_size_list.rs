@@ -12,7 +12,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, cast::AsArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{Error, Result};
 
@@ -123,6 +123,27 @@ impl StructuralFixedSizeListScheduler {
             dimension: dimension as u64,
         }
     }
+
+    fn child_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Range<u64>>> {
+        ranges
+            .iter()
+            .map(|range| {
+                let start = range.start.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fixed-size-list child range start overflowed: {} * {}",
+                        range.start, self.dimension
+                    ))
+                })?;
+                let end = range.end.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fixed-size-list child range end overflowed: {} * {}",
+                        range.end, self.dimension
+                    ))
+                })?;
+                Ok(start..end)
+            })
+            .collect()
+    }
 }
 
 impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
@@ -132,10 +153,7 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
         filter: &FilterExpression,
     ) -> Result<Box<dyn StructuralSchedulingJob + 'a>> {
         // Scale ranges by dimension for the child - each FSL row becomes `dimension` child rows
-        let child_ranges: Vec<Range<u64>> = ranges
-            .iter()
-            .map(|r| (r.start * self.dimension)..(r.end * self.dimension))
-            .collect();
+        let child_ranges = self.child_ranges(ranges)?;
         let child = self.child.schedule_ranges(&child_ranges, filter)?;
         Ok(Box::new(StructuralFixedSizeListSchedulingJob::new(
             child,
@@ -145,10 +163,21 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
+        let child_ranges = match requested_ranges.map(|ranges| self.child_ranges(ranges)) {
+            Some(Ok(child_ranges)) => Some(child_ranges),
+            Some(Err(error)) => return std::future::ready(Err(error)).boxed(),
+            None => None,
+        };
+        async move {
+            self.child
+                .initialize(child_ranges.as_deref(), filter, context)
+                .await
+        }
+        .boxed()
     }
 }
 
@@ -533,7 +562,9 @@ mod tests {
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
-        testing::{TestCases, TestEncoding, check_specific_random},
+        testing::{
+            TestCases, TestEncoding, check_round_trip_encoding_of_data, check_specific_random,
+        },
     };
 
     fn make_fsl_struct_type(struct_fields: Fields, dimension: i32) -> DataType {
@@ -771,5 +802,45 @@ mod tests {
         let result = filter_nested_fsl_garbage(&fsl, &[false, true, false], 2);
         // Should return the same array unchanged
         assert_eq!(result.len(), 3);
+    }
+
+    /// A null-free nested FSL written with a forced full-zip layout goes through the
+    /// per-value path that flattens it. Both layers are nullable, as Arrow and pyarrow
+    /// build them by default, and the data carries no nulls.
+    #[rstest]
+    #[case::outer_wider(22, 3)]
+    #[case::inner_wider(3, 22)]
+    #[tokio::test]
+    async fn test_nested_fsl_full_zip_round_trip(#[case] outer_dim: i32, #[case] inner_dim: i32) {
+        let num_rows = 3;
+        let inner_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let leaf = Arc::new(arrow_array::Int32Array::from_iter_values(
+            0..num_rows * outer_dim * inner_dim,
+        ));
+        let inner = FixedSizeListArray::new(inner_field.clone(), inner_dim, leaf, None);
+        let outer = FixedSizeListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(inner_field, inner_dim),
+                true,
+            )),
+            outer_dim,
+            Arc::new(inner),
+            None,
+        );
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(outer)],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_range(0..1)
+                .with_range(1..3)
+                .with_indices(vec![0, 2]),
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_FULLZIP.to_string(),
+            )]),
+        )
+        .await;
     }
 }

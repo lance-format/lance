@@ -30,8 +30,10 @@ use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use super::sstable_cache::{DatasetCache, SsTableWarmer};
+use super::vector_search::ProbeBounds;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
+use crate::dataset::utils::SchemaAdapter;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -45,11 +47,10 @@ struct LsmVectorQuery {
     key: Arc<dyn Array>,
     /// Number of nearest neighbors to fetch per source before the global merge.
     k: usize,
-    /// Number of IVF partitions to probe on the base arm.
-    nprobes: usize,
-    /// Re-rank base candidates with exact distances when set (refine factor is
-    /// treated as a boolean; the LSM merge needs exact base distances).
-    refine: bool,
+    /// IVF partition probe bounds for indexed arms.
+    probe_bounds: ProbeBounds,
+    /// Refine factor for the base and SSTable arms; `None` leaves them unrefined.
+    refine_factor: Option<u32>,
     /// Distance metric; `None` defaults to L2 (matching the unindexed memtable arm).
     metric_type: Option<DistanceType>,
 }
@@ -186,10 +187,11 @@ fn key_to_fsl(key: &dyn Array, dim: i32) -> Result<FixedSizeListArray> {
 /// ```
 ///
 /// The query-building methods mirror [`crate::dataset::scanner::Scanner`]:
-/// [`Self::nearest`] (+ [`Self::nprobes`] / [`Self::refine`] /
-/// [`Self::distance_metric`]) for vector search and [`Self::full_text_search`]
-/// for FTS are state setters, and [`Self::create_plan`] dispatches to the right
-/// planner — so an LSM read reads like a normal scan.
+/// [`Self::nearest`] (+ [`Self::nprobes`] / [`Self::minimum_nprobes`] /
+/// [`Self::maximum_nprobes`] / [`Self::refine`] / [`Self::distance_metric`])
+/// for vector search and [`Self::full_text_search`] for FTS are state setters,
+/// and [`Self::create_plan`] dispatches to the right planner — so an LSM read
+/// reads like a normal scan.
 pub struct LsmScanner {
     // Data sources
     base: BaseSource,
@@ -197,6 +199,9 @@ pub struct LsmScanner {
     /// Derived from the base dataset when one is present, otherwise supplied
     /// explicitly by [`Self::without_base_table`].
     schema: SchemaRef,
+    /// [`Self::schema`] with each field's id, which is what resolves a
+    /// generation's stored columns to the table's.
+    identity_schema: SchemaRef,
     shard_snapshots: Vec<ShardSnapshot>,
     /// In-memory memtables by shard (active + frozen-awaiting-flush), so
     /// the scanner path carries frozen-undrained generations too.
@@ -233,6 +238,8 @@ pub struct LsmScanner {
     /// Over-fetch multiple for block-listed sources in search plans
     /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
     overfetch_factor: Option<f64>,
+    /// See [`Self::with_memtable_filter_indexes`].
+    memtable_filter_indexes: bool,
 }
 
 impl LsmScanner {
@@ -259,6 +266,9 @@ impl LsmScanner {
         // path-bound store binding.
         let store_params = base_table.store_params().map(derived_store_params);
         Self {
+            identity_schema: Arc::new(crate::dataset::mem_wal::arrow_schema_with_field_ids(
+                base_table.schema(),
+            )),
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),
             shard_snapshots,
@@ -277,6 +287,7 @@ impl LsmScanner {
             sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
+            memtable_filter_indexes: false,
         }
     }
 
@@ -284,7 +295,7 @@ impl LsmScanner {
     /// SSTables) without including a base Lance table.
     ///
     /// This is useful when the caller owns the base read path separately and
-    /// only needs the WAL's contribution: active memtable ∪ L0 SSTables.
+    /// only needs the WAL's contribution: active memtable ∪ SSTables.
     /// Deduplication semantics are unchanged — newer generations
     /// still win on PK conflicts.
     ///
@@ -302,6 +313,9 @@ impl LsmScanner {
         pk_columns: Vec<String>,
     ) -> Self {
         Self {
+            // Name matching until the caller supplies ids, as it was before
+            // ids existed. See [`Self::with_identity_schema`].
+            identity_schema: schema.clone(),
             base: BaseSource::PathOnly(base_path.into()),
             schema,
             shard_snapshots,
@@ -320,6 +334,7 @@ impl LsmScanner {
             sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
+            memtable_filter_indexes: false,
         }
     }
 
@@ -336,6 +351,18 @@ impl LsmScanner {
                 });
             }
         }
+        self
+    }
+
+    /// Supply [`Self::schema`] with each field's id, so a flushed generation's
+    /// columns resolve to the table's by id rather than by name. A rename keeps
+    /// the id and moves the name, so without this a renamed column reads as
+    /// absent. Built with
+    /// [`arrow_schema_with_field_ids`](crate::dataset::mem_wal::arrow_schema_with_field_ids).
+    ///
+    /// Set for you by [`Self::new`], which has the dataset to read them from.
+    pub fn with_identity_schema(mut self, identity_schema: SchemaRef) -> Self {
+        self.identity_schema = identity_schema;
         self
     }
 
@@ -387,6 +414,15 @@ impl LsmScanner {
     /// default, so behavior is unchanged unless opted in.
     pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
+        self
+    }
+
+    /// Answer a filtered scan of in-memory memtables from their filter indexes,
+    /// keeping a match only when it is its key's newest visible version. A
+    /// filter matching too many rows to check one by one reads every in-memory
+    /// row instead. Off by default: every in-memory row is read.
+    pub fn with_memtable_filter_indexes(mut self, enabled: bool) -> Self {
+        self.memtable_filter_indexes = enabled;
         self
     }
 
@@ -451,7 +487,8 @@ impl LsmScanner {
     /// [`crate::dataset::scanner::Scanner::nearest`]; the LSM path supports a
     /// single Float32 query vector. When combined with an offset, the LSM path
     /// fetches `k + offset` per source before applying the final page. Tune with
-    /// [`Self::nprobes`], [`Self::refine`], and [`Self::distance_metric`].
+    /// [`Self::nprobes`], [`Self::minimum_nprobes`], [`Self::maximum_nprobes`],
+    /// [`Self::refine`], and [`Self::distance_metric`].
     pub fn nearest(mut self, column: &str, key: &dyn Array, k: usize) -> Result<Self> {
         if k == 0 {
             return Err(Error::invalid_input("k must be positive".to_string()));
@@ -465,28 +502,50 @@ impl LsmScanner {
             column: column.to_string(),
             key: key.slice(0, key.len()),
             k,
-            nprobes: 1,
-            refine: false,
+            probe_bounds: ProbeBounds::default(),
+            refine_factor: None,
             metric_type: None,
         });
         Ok(self)
     }
 
-    /// Number of IVF partitions to probe on the base arm (default 1). No-op
-    /// unless [`Self::nearest`] was called.
+    /// Search exactly `nprobes` IVF partitions on indexed arms by setting both
+    /// probe bounds. No-op unless [`Self::nearest`] was called.
     pub fn nprobes(mut self, nprobes: usize) -> Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.nprobes = nprobes;
+            q.probe_bounds.minimum_nprobes = Some(nprobes);
+            q.probe_bounds.maximum_nprobes = Some(nprobes);
         }
         self
     }
 
-    /// Re-rank base-table candidates with exact distances so they are directly
-    /// comparable to the exact memtable distances in the cross-source merge.
-    /// The factor is treated as a boolean today. No-op unless `nearest` was set.
+    /// Set the minimum number of IVF partitions to search on indexed arms.
+    ///
+    /// When unset, the underlying Lance scanner supplies its default. No-op
+    /// unless [`Self::nearest`] was called.
+    pub fn minimum_nprobes(mut self, minimum_nprobes: usize) -> Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.probe_bounds.minimum_nprobes = Some(minimum_nprobes);
+        }
+        self
+    }
+
+    /// Set the maximum number of IVF partitions to search on indexed arms.
+    ///
+    /// When unset, all partitions may be searched if needed. No-op unless
+    /// [`Self::nearest`] was called.
+    pub fn maximum_nprobes(mut self, maximum_nprobes: usize) -> Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.probe_bounds.maximum_nprobes = Some(maximum_nprobes);
+        }
+        self
+    }
+
+    /// Re-rank base and SSTable candidates by exact distance over `refine_factor`
+    /// times as many. `0` clears it; no-op unless `nearest` was set.
     pub fn refine(mut self, refine_factor: u32) -> Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.refine = refine_factor > 0;
+            q.refine_factor = (refine_factor > 0).then_some(refine_factor);
         }
         self
     }
@@ -585,7 +644,9 @@ impl LsmScanner {
             nearest.column.clone(),
             distance_type,
         )
-        .with_filter(self.filter.clone());
+        .with_identity_schema(Arc::clone(&self.identity_schema))
+        .with_filter(self.filter.clone())
+        .with_refine_factor(nearest.refine_factor);
         if let BaseSource::Table(dataset) = &self.base {
             planner = planner.with_dataset(dataset.clone());
         }
@@ -607,12 +668,12 @@ impl LsmScanner {
         let per_source_k = nearest.k.saturating_add(self.offset.unwrap_or(0));
         let overfetch_factor = self.overfetch_factor.unwrap_or(1.0);
         let plan = planner
-            .plan_search(
+            .plan_search_with_probe_bounds(
                 &query_fsl,
                 per_source_k,
-                nearest.nprobes,
+                nearest.probe_bounds,
                 self.projection.as_deref(),
-                nearest.refine,
+                false,
                 overfetch_factor,
             )
             .await?;
@@ -627,18 +688,6 @@ impl LsmScanner {
             .full_text_query
             .as_ref()
             .expect("plan_fts requires a full-text query");
-        let columns: Vec<String> = query.columns().into_iter().collect();
-        if columns.len() > 1 {
-            return Err(Error::invalid_input(
-                "LSM full-text search supports a single column".to_string(),
-            ));
-        }
-        let column = columns.into_iter().next().ok_or_else(|| {
-            Error::invalid_input(
-                "full_text_search requires a column; set it with `FullTextSearchQuery::with_column`"
-                    .to_string(),
-            )
-        })?;
         let base_schema = self.schema();
         let query_limit = query
             .limit
@@ -664,6 +713,7 @@ impl LsmScanner {
         let collector = self.build_collector();
         let mut planner =
             super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema)
+                .with_identity_schema(Arc::clone(&self.identity_schema))
                 .with_filter(self.filter.clone());
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
@@ -681,12 +731,7 @@ impl LsmScanner {
             planner = planner.with_overfetch_factor(factor);
         }
         let plan = planner
-            .plan_search(
-                &column,
-                query.clone(),
-                source_limit,
-                self.projection.as_deref(),
-            )
+            .plan_search(query.clone(), source_limit, self.projection.as_deref())
             .await?;
         Ok(self.apply_limit_offset(plan))
     }
@@ -714,7 +759,8 @@ impl LsmScanner {
                 extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
         {
             let mut planner =
-                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema);
+                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema)?
+                    .with_identity_schema(Arc::clone(&self.identity_schema));
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());
             }
@@ -736,7 +782,13 @@ impl LsmScanner {
             });
         }
 
-        let mut planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        let mut planner = LsmScanPlanner::new(
+            collector,
+            self.pk_columns.clone(),
+            base_schema,
+            Arc::clone(&self.identity_schema),
+        );
+        planner = planner.with_memtable_filter_indexes(self.memtable_filter_indexes);
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
@@ -776,7 +828,16 @@ impl LsmScanner {
     }
 
     /// Execute the scan and return a stream of record batches.
+    ///
+    /// Lance JSON columns are returned as Arrow JSON, as
+    /// [`crate::dataset::scanner::Scanner::try_into_stream`] does.
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
+        let stream = self.execute_plan().await?;
+        Ok(SchemaAdapter::new(stream.schema()).to_logical_stream(stream))
+    }
+
+    /// Execute the scan without converting Lance JSON columns to Arrow JSON.
+    async fn execute_plan(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
@@ -804,7 +865,8 @@ impl LsmScanner {
 
     /// Count the number of rows that match the query.
     pub async fn count_rows(&self) -> Result<u64> {
-        let stream = self.try_into_stream().await?;
+        // Counting needs no JSON conversion, so skip decoding the values.
+        let stream = self.execute_plan().await?;
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
@@ -1260,6 +1322,52 @@ mod tests {
             Field::new("id", DataType::Int32, false).with_metadata(id_meta),
             extra,
         ]))
+    }
+
+    #[test]
+    fn vector_probe_settings_preserve_adaptive_defaults() {
+        use arrow_array::Float32Array;
+        use arrow_schema::{DataType, Field};
+
+        let schema = pk_schema_with(Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            false,
+        ));
+        let new_scanner = || {
+            LsmScanner::without_base_table(
+                schema.clone(),
+                "memory://",
+                vec![],
+                vec!["id".to_string()],
+            )
+            .nearest(
+                "vector",
+                &Float32Array::from(vec![0.0f32, 1.0, 2.0, 3.0]),
+                1,
+            )
+            .unwrap()
+        };
+
+        let scanner = new_scanner();
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, None);
+        assert_eq!(query.probe_bounds.maximum_nprobes, None);
+
+        let scanner = new_scanner().nprobes(20);
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, Some(20));
+        assert_eq!(query.probe_bounds.maximum_nprobes, Some(20));
+
+        let scanner = new_scanner().minimum_nprobes(20);
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, Some(20));
+        assert_eq!(query.probe_bounds.maximum_nprobes, None);
+
+        let scanner = new_scanner().maximum_nprobes(20);
+        let query = scanner.nearest.as_ref().unwrap();
+        assert_eq!(query.probe_bounds.minimum_nprobes, None);
+        assert_eq!(query.probe_bounds.maximum_nprobes, Some(20));
     }
 
     /// `LsmScanner::nearest(..).create_plan()` must route through the vector
@@ -1862,6 +1970,102 @@ mod tests {
         );
     }
 
+    /// A query naming several columns searches all of them and returns one row
+    /// per match, not one per matching field. `with_columns` on an unbound query
+    /// is the binding path a caller with out-of-band columns takes, and it
+    /// expands to the multi-match the cross-column planner decomposes.
+    #[tokio::test]
+    async fn full_text_search_spans_every_named_column() {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+
+        // id=1 matches in `title` only, id=2 in `body` only, id=3 in both — so a
+        // planner that kept one hit per field would return four rows, and one
+        // that searched only the first column would miss id=2.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["lance", "unrelated", "lance"])),
+                Arc::new(StringArray::from(vec!["unrelated", "lance", "lance"])),
+            ],
+        )
+        .unwrap();
+
+        let store = Arc::new(BatchStore::with_capacity(16));
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        index.add_fts("title_fts".to_string(), 1, "title".to_string());
+        index.add_fts("body_fts".to_string(), 2, "body".to_string());
+        store.append(batch.clone()).unwrap();
+        index
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            "memory://multi_column_fts",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store: store,
+                    index_store: Arc::new(index),
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        )
+        .full_text_search(
+            FullTextSearchQuery::new("lance".to_string())
+                .with_columns(&["title".to_string(), "body".to_string()])
+                .unwrap(),
+        )
+        .unwrap();
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column_by_name("id").expect("id is projected");
+                let ids = column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32");
+                ids.values().to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "every named column must be searched and a row matching in both must collapse to one"
+        );
+    }
+
     #[tokio::test]
     async fn full_text_search_supports_nested_list_element_path() {
         let doc_fields = Fields::from(vec![Field::new("content", DataType::Utf8, true)]);
@@ -1992,8 +2196,15 @@ mod tests {
         use arrow_array::{Int32Array, StringArray};
 
         let store = BatchStore::with_capacity(8);
-        let mut index = IndexStore::new();
-        index.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let index = IndexStore::from_specs(
+            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+                "id_idx", 0, "id",
+            )],
+            &lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
+            100,
+            8,
+        )
+        .unwrap();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

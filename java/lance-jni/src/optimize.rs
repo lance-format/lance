@@ -49,6 +49,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
+    data_storage_version: JObject,            // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -68,7 +69,8 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             max_source_fragments,
             max_source_rows,
             max_source_bytes,
-            excluded_fragment_ids
+            excluded_fragment_ids,
+            data_storage_version
         ),
         JObject::null()
     )
@@ -92,6 +94,7 @@ fn inner_plan_compaction<'local>(
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
+    data_storage_version: JObject,            // Optional<String>
 ) -> Result<JObject<'local>> {
     let config = {
         let dataset =
@@ -114,6 +117,7 @@ fn inner_plan_compaction<'local>(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        &data_storage_version,
         &config,
     )?;
 
@@ -212,6 +216,7 @@ fn inner_commit_compaction<'local>(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        &JObject::null(),
         &config,
     )?;
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
@@ -252,6 +257,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
+    data_storage_version: JObject,            // Optional<String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -273,7 +279,8 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             max_source_fragments,
             max_source_rows,
             max_source_bytes,
-            excluded_fragment_ids
+            excluded_fragment_ids,
+            data_storage_version
         ),
         JObject::null()
     )
@@ -299,6 +306,7 @@ fn inner_execute_task<'local>(
     max_source_rows: JObject,                 // Optional<Long>
     max_source_bytes: JObject,                // Optional<Long>
     excluded_fragment_ids: JObject,           // List<Long>
+    data_storage_version: JObject,            // Optional<String>
 ) -> Result<JObject<'local>> {
     let task_data: TaskData = task_data.extract_object(env)?;
     let config = {
@@ -322,6 +330,7 @@ fn inner_execute_task<'local>(
         &max_source_rows,
         &max_source_bytes,
         &excluded_fragment_ids,
+        &data_storage_version,
         &config,
     )?;
     let compaction_task = CompactionTask {
@@ -349,10 +358,26 @@ const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
+
+/// The Java `TaskData` carries no output properties, so a task whose outputs
+/// carry a clustering id or metadata cannot cross into Java without losing
+/// the planner's instruction; it is refused rather than exported stripped.
+fn refuse_output_properties(task: &TaskData) -> Result<()> {
+    if task.output_clustering_id.is_none() && task.output_metadata.is_empty() {
+        return Ok(());
+    }
+    Err(crate::Error::unsupported_error(format!(
+        "a compaction task whose outputs carry clustering definition {:?} and {} metadata \
+         entries cannot be passed through the Java binding, which has no fields for them",
+        task.output_clustering_id,
+        task.output_metadata.len()
+    )))
+}
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        refuse_output_properties(self)?;
         let fragments = export_vec(env, &self.fragments)?;
         Ok(env.new_object(
             TASK_DATA_CLASS,
@@ -431,6 +456,11 @@ impl IntoJava for &CompactionOptions {
             .map(|fragment_id| to_java_long_obj(env, Some(*fragment_id as i64)))
             .collect::<Result<Vec<_>>>()?;
         let excluded_fragment_ids = to_java_list(env, &excluded_fragment_ids)?;
+        let data_storage_version = match self.data_storage_version {
+            Some(version) => env.new_string(version.to_string())?.into(),
+            None => JObject::null(),
+        };
+        let data_storage_version_opt = to_java_optional(env, data_storage_version)?;
 
         Ok(env.new_object(
             COMPACTION_OPTIONS_CLASS,
@@ -450,6 +480,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&max_source_rows_opt),
                 JValueGen::Object(&max_source_bytes_opt),
                 JValueGen::Object(&excluded_fragment_ids),
+                JValueGen::Object(&data_storage_version_opt),
             ],
         )?)
     }
@@ -519,8 +550,12 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         let task_data = import_vec_from_method(env, self, "getFragments", |env, fragment| {
             fragment.extract_object(env)
         })?;
+        // A Java task carries no output properties: its outputs carry no
+        // definition and no metadata.
         Ok(TaskData {
             fragments: task_data,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
         })
     }
 }
@@ -561,5 +596,37 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             original_fragments,
             row_addrs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lance::dataset::optimize::TaskData;
+
+    use super::refuse_output_properties;
+
+    fn task(clustering_id: Option<u32>, metadata: &[(&str, &str)]) -> TaskData {
+        TaskData {
+            fragments: vec![],
+            output_clustering_id: clustering_id,
+            output_metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_task_with_output_properties_is_refused_and_a_plain_one_passes() {
+        refuse_output_properties(&task(None, &[])).unwrap();
+        for (id, metadata) in [
+            (Some(7), &[][..]),
+            (None, &[("bucket", "3")][..]),
+            (Some(7), &[("bucket", "3")][..]),
+        ] {
+            let error = refuse_output_properties(&task(id, metadata)).unwrap_err();
+            let text = format!("{error:?}");
+            assert!(text.contains("Java binding"), "{text}");
+        }
     }
 }

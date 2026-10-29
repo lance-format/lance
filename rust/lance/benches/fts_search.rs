@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![recursion_limit = "256"]
-
 /// This is a rust end-to-end benchmark for full text search.  It is meant to be supplementary to the
 /// python benchmark located at python/python/ci_benchmarks/benchmarks/test_fts_search.py.  You can use
 /// the python/python/ci_benchmarks/datagen/wikipedia.py script to generate the dataset.  You will need

@@ -339,6 +339,9 @@ impl Tags<'_> {
             }
         };
 
+        // Direct Ref::Version construction bypasses normalization in the tuple conversions.
+        let branch = branch.as_deref().and_then(standardize_branch);
+
         let branch_location = self.refs.base_location.find_branch(branch.as_deref())?;
         let manifest_file = if let Some(version_number) = version_number {
             self.refs
@@ -388,32 +391,36 @@ impl Branches<'_> {
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_branches_contents_path(&root_location.path);
-        let branch_files = self.object_store().read_dir(base_path).await?;
+        // Branch names may contain '/'. Some object store adapters preserve the
+        // encoded separator in a flat key while others expose it as nested paths.
+        // Recursively list the metadata prefix so both layouts are discoverable.
+        let branch_files = self
+            .object_store()
+            .list(Some(base_path.clone()))
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        let branch_names: Vec<String> = branch_files
-            .iter()
-            .filter_map(|name| name.strip_suffix(".json"))
-            .map(|str| {
-                Path::from_url_path(str)
-                    .map_err(|e| Error::InvalidRef {
-                        message: format!(
-                            "Failed to decode branch name: {} due to exception {}",
-                            str, e
-                        ),
-                    })
-                    .map(|path| path.to_string())
+        let branches: Vec<(String, Path)> = branch_files
+            .into_iter()
+            .filter_map(|meta| {
+                let relative_path = Path::from_iter(meta.location.prefix_match(&base_path)?);
+                let name = relative_path.as_ref().strip_suffix(".json")?;
+                Some(
+                    Path::from_url_path(name)
+                        .map_err(|e| Error::InvalidRef {
+                            message: format!(
+                                "Failed to decode branch name: {} due to exception {}",
+                                name, e
+                            ),
+                        })
+                        .map(|path| (path.to_string(), meta.location)),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let branch_path = &root_location.path;
-        futures::stream::iter(branch_names)
-            .map(|name| async move {
-                let contents = BranchContents::from_path(
-                    &branch_contents_path(branch_path, &name),
-                    self.object_store(),
-                    &name,
-                )
-                .await?;
+        futures::stream::iter(branches)
+            .map(|(name, path)| async move {
+                let contents = BranchContents::from_path(&path, self.object_store(), &name).await?;
                 Ok((name, contents))
             })
             .buffer_unordered(10)
@@ -867,7 +874,9 @@ impl BranchIdentifier {
         }
 
         let version_mapping = parts
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 let version = chunk[0].parse::<u64>().map_err(|e| Error::InvalidRef {
                     message: format!("Invalid version number '{}': {}", chunk[0], e),
@@ -924,7 +933,8 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
     base_tags_path(base_path).join(format!("{}.json", branch))
 }
 
-// Note: child will encode '/' to '%2F'
+// Path::join encodes '/' to '%2F'. Some object store adapters decode that
+// separator when translating the path into a provider key.
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
@@ -1042,7 +1052,8 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
 
     if branch_name.eq("main") {
         return Err(Error::InvalidRef {
-            message: "Branch name cannot be 'main'".to_string(),
+            message: "\"main\" is reserved for the default branch; use a different branch name"
+                .to_string(),
         });
     }
     Ok(())

@@ -62,7 +62,7 @@ pub(super) fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer);
+    let query_tokens = try_collect_query_tokens(query, &mut tokenizer)?;
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -88,7 +88,7 @@ pub(super) fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
     let mut results = Vec::new();
     let mut tokenizer =
         tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
-    let query_tokens = collect_query_tokens(query, &mut tokenizer);
+    let query_tokens = try_collect_query_tokens(query, &mut tokenizer)?;
 
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -156,6 +156,7 @@ pub(super) fn document_matches_flat_query(
     }
     Ok(phrase_matches_positions(
         query_tokens,
+        &query_position_groups(query_tokens),
         &document_positions,
         slop,
     ))
@@ -165,29 +166,45 @@ pub(super) const FLAT_ALL_TOKENS_COL: &str = "all_tokens";
 pub(super) const FLAT_QUERY_TOKEN_COUNTS_COL: &str = "query_token_counts";
 pub(super) const FLAT_PHRASE_MATCH_COL: &str = "phrase_match";
 
+static FLAT_ALL_TOKENS_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false)));
+static FLAT_QUERY_TOKEN_COUNTS_ITEM_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new("item", DataType::UInt64, true)));
+static FLAT_PHRASE_MATCH_FIELD: LazyLock<Arc<Field>> =
+    LazyLock::new(|| Arc::new(Field::new(FLAT_PHRASE_MATCH_COL, DataType::Boolean, false)));
+
 pub(super) fn phrase_matches_positions(
     query_tokens: &Tokens,
+    query_groups: &[Vec<usize>],
     document_positions: &[Vec<u32>],
     slop: u32,
 ) -> bool {
-    let Some(first_positions) = document_positions.first() else {
+    debug_assert_eq!(query_tokens.len(), document_positions.len());
+    let Some(first_group) = query_groups.first() else {
         return false;
     };
-    if first_positions.is_empty() {
+    // Same-position tokens are alternatives, just like the indexed posting unions.
+    let mut candidates = first_group
+        .iter()
+        .flat_map(|index| &document_positions[*index])
+        .copied()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
         return false;
     }
 
-    let mut candidates = first_positions.clone();
-    debug_assert_eq!(query_tokens.len(), document_positions.len());
-    for (query_index, positions) in document_positions.iter().enumerate().skip(1) {
+    for groups in query_groups.windows(2) {
         let Some(query_delta) = query_tokens
-            .position(query_index)
-            .checked_sub(query_tokens.position(query_index - 1))
+            .position(groups[1][0])
+            .checked_sub(query_tokens.position(groups[0][0]))
         else {
             return false;
         };
         let mut next_candidates = Vec::new();
-        for &position in positions {
+        for &position in groups[1]
+            .iter()
+            .flat_map(|index| &document_positions[*index])
+        {
             let position = u64::from(position);
             if candidates.iter().any(|candidate| {
                 let least = u64::from(*candidate) + u64::from(query_delta);
@@ -229,28 +246,32 @@ pub(super) async fn tokenize_and_count(
     coordinate_rank: usize,
     phrase_slop: Option<u32>,
 ) -> DataFusionResult<RecordBatch> {
-    let mut output_fields = vec![ROW_ID_FIELD.clone()];
-    output_fields.extend(
-        (0..coordinate_rank)
-            .map(|rank| Field::new(doc_index_storage_column(rank), DataType::UInt32, false)),
-    );
+    let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
+    output_fields.extend((0..coordinate_rank).map(|rank| {
+        Arc::new(Field::new(
+            doc_index_storage_column(rank),
+            DataType::UInt32,
+            false,
+        ))
+    }));
     output_fields.extend([
-        Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false),
-        Field::new(
+        FLAT_ALL_TOKENS_FIELD.clone(),
+        Arc::new(Field::new(
             FLAT_QUERY_TOKEN_COUNTS_COL,
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt64, true)),
+                FLAT_QUERY_TOKEN_COUNTS_ITEM_FIELD.clone(),
                 query_tokens.len() as i32,
             ),
             false,
-        ),
+        )),
     ]);
     if phrase_slop.is_some() {
-        output_fields.push(Field::new(FLAT_PHRASE_MATCH_COL, DataType::Boolean, false));
+        output_fields.push(FLAT_PHRASE_MATCH_FIELD.clone());
     }
     let output_schema = Arc::new(Schema::new(output_fields));
     let output_schema_clone = output_schema.clone();
     let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+    let query_groups = Arc::new(query_position_groups(query_tokens.as_ref()));
     let bytes_accumulated = Arc::new(AtomicU64::new(0));
     let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
 
@@ -260,6 +281,7 @@ pub(super) async fn tokenize_and_count(
             let output_schema = output_schema.clone();
             let query_tokens = query_tokens.clone();
             let query_token_indices = query_token_indices.clone();
+            let query_groups = query_groups.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
@@ -328,6 +350,7 @@ pub(super) async fn tokenize_and_count(
                     let matches = phrase_slop.is_none_or(|slop| {
                         phrase_matches_positions(
                             query_tokens.as_ref(),
+                            &query_groups,
                             &temp_query_positions,
                             slop,
                         )
@@ -518,6 +541,223 @@ pub(super) fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
         }
     }
 
+    Ok(())
+}
+
+/// One chunk's worth of blended per-row BM25F scoring inputs: everything a flat
+/// `combined_fields` scan retains until the corpus statistics are complete.
+/// `8 + 4·(1 + t)` bytes per row for `t` terms, independent of the column count.
+pub(in super::super) struct BlendedRows {
+    /// `_rowid` of every retained row.
+    pub(in super::super) row_ids: Vec<u64>,
+    /// `dl'(d) = Σ_f w_f · dl_f(d)`, one per retained row.
+    pub(in super::super) doc_lengths: Vec<f32>,
+    /// `tf'(t, d) = Σ_f w_f · tf_f(t, d)`, `num_terms`-strided by row.
+    pub(in super::super) term_freqs: Vec<f32>,
+}
+
+/// Count the query tokens in every target column of a flat batch stream and blend
+/// them into per-row BM25F scoring inputs.
+///
+/// Unlike [`tokenize_and_count`], this walks all target columns in one pass,
+/// since a row may be empty in one field and populated in another. The
+/// per-column counts are dropped with each batch once blended; only the
+/// fixed-size [`FlatFieldStats`] needs them, so it is folded here, gated by
+/// `stats_masks`.
+///
+/// Every non-empty row is folded into the statistics, but only a row that can
+/// score is retained: one `emit_mask` selects and that holds a query term (every
+/// query term when `require_all_terms`). So the retained memory tracks the
+/// matches, not the scanned rows.
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) async fn tokenize_and_blend_multi(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    doc_col_indices: Arc<Vec<usize>>,
+    weights: Arc<Vec<f32>>,
+    stats_masks: Arc<Vec<Arc<RowAddrMask>>>,
+    emit_mask: Option<Arc<RowAddrMask>>,
+    require_all_terms: bool,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<(Vec<BlendedRows>, FlatFieldStats)> {
+    let num_columns = doc_col_indices.len();
+    let num_terms = query_tokens.len();
+    let retained_bytes_per_row = (size_of::<u64>() + (1 + num_terms) * size_of::<f32>()) as u64;
+    let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+    let bytes_accumulated = Arc::new(AtomicU64::new(0));
+    let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
+
+    let tasks = input
+        .map(move |batch| {
+            let mut tokenizer = tokenizer.box_clone();
+            let query_token_indices = query_token_indices.clone();
+            let doc_col_indices = doc_col_indices.clone();
+            let weights = weights.clone();
+            let stats_masks = stats_masks.clone();
+            let emit_mask = emit_mask.clone();
+            let bytes_accumulated = bytes_accumulated.clone();
+            let bytes_warning_emitted = bytes_warning_emitted.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            spawn_cpu(move || {
+                let start = std::time::Instant::now();
+                let batch = batch?;
+                let num_rows = batch.num_rows();
+                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+
+                // Dense `(row, column)`-strided scratch, freed with the batch:
+                // whether a row is retained depends on all of its columns, so every
+                // column is counted before any row is filtered.
+                let mut all_tokens = vec![0u64; num_rows * num_columns];
+                let mut counts = vec![0u64; num_rows * num_columns * num_terms];
+                for (column_slot, doc_col_idx) in doc_col_indices.iter().enumerate() {
+                    count_column_into(
+                        batch.column(*doc_col_idx),
+                        num_columns,
+                        num_terms,
+                        column_slot,
+                        &mut tokenizer,
+                        &query_token_indices,
+                        &mut all_tokens,
+                        &mut counts,
+                    )?;
+                }
+
+                let mut blended = BlendedRows {
+                    row_ids: Vec::with_capacity(num_rows),
+                    doc_lengths: Vec::with_capacity(num_rows),
+                    term_freqs: Vec::with_capacity(num_rows * num_terms),
+                };
+                let mut stats = FlatFieldStats::zeros(num_columns, num_terms);
+                let counts_stride = num_columns * num_terms;
+                for row in 0..num_rows {
+                    let lengths = &all_tokens[row * num_columns..(row + 1) * num_columns];
+                    // Empty in every target column: `dl' == 0` and `tf' == 0`, so the
+                    // row cannot score. Dropping it here also keeps it out of the
+                    // corpus statistics, matching the indexed side (a row absent from
+                    // every field's DocSet contributes to no `docCount_f`).
+                    if lengths.iter().all(|length| *length == 0) {
+                        continue;
+                    }
+                    let row_id = row_id_array.value(row);
+                    let row_counts = &counts[row * counts_stride..(row + 1) * counts_stride];
+                    stats.fold_row(row_id, &stats_masks, lengths, row_counts);
+                    if emit_mask.as_ref().is_some_and(|mask| !mask.selected(row_id)) {
+                        continue;
+                    }
+
+                    // Accumulate in column-slot order. f32 addition is not
+                    // associative, so this order is part of the contract: it keeps
+                    // the scores identical to summing the same contributions
+                    // downstream from a materialized breakdown.
+                    let terms_start = blended.term_freqs.len();
+                    blended.term_freqs.resize(terms_start + num_terms, 0.0);
+                    let term_freqs = &mut blended.term_freqs[terms_start..];
+                    let mut doc_length = 0f32;
+                    for (column, weight) in weights.iter().enumerate() {
+                        doc_length += weight * lengths[column] as f32;
+                        let base = column * num_terms;
+                        for (term, tf) in term_freqs.iter_mut().enumerate() {
+                            *tf += weight * row_counts[base + term] as f32;
+                        }
+                    }
+                    // `And` spans the virtual field, so it checks the blended `tf'`.
+                    let matches = if require_all_terms {
+                        term_freqs.iter().all(|tf| *tf > 0.0)
+                    } else {
+                        term_freqs.iter().any(|tf| *tf > 0.0)
+                    };
+                    if !matches {
+                        blended.term_freqs.truncate(terms_start);
+                        continue;
+                    }
+                    blended.row_ids.push(row_id);
+                    blended.doc_lengths.push(doc_length);
+                }
+
+                let bytes_accumulated = bytes_accumulated.fetch_add(
+                    blended.row_ids.len() as u64 * retained_bytes_per_row,
+                    Ordering::Relaxed,
+                );
+                if bytes_accumulated > BYTES_ACCUMULATED_WARNING_THRESHOLD
+                    && !bytes_warning_emitted.swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        "Flat combined_fields search is accumulating a large number of bytes.  Consider indexing every target column instead."
+                    );
+                }
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
+                DataFusionResult::Ok((blended, stats))
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus());
+
+    // Folded incrementally rather than collected and concatenated: the retained
+    // rows are already the whole accumulation, so a second contiguous copy would
+    // double the peak for nothing.
+    let mut tasks = std::pin::pin!(tasks);
+    let mut chunks = Vec::new();
+    // Seeded rather than taken from the first batch so that a scan with no batches
+    // at all still reports statistics, as all-zero totals.
+    let mut totals = FlatFieldStats::zeros(num_columns, num_terms);
+    while let Some(counted) = tasks.next().await {
+        let (blended, stats) = counted?;
+        totals.merge(stats);
+        chunks.push(blended);
+    }
+    Ok((chunks, totals))
+}
+
+/// Tokenize one column into the `(row, column_slot)`-strided slots of
+/// `all_tokens` / `counts`. Mirrors [`tokenize_and_count`]'s per-type handling: a
+/// list column sums over its elements and a null leaves the slots at zero.
+#[allow(clippy::too_many_arguments)]
+fn count_column_into(
+    doc_col: &ArrayRef,
+    num_columns: usize,
+    num_terms: usize,
+    column_slot: usize,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+    query_token_indices: &HashMap<String, Vec<usize>>,
+    all_tokens: &mut [u64],
+    counts: &mut [u64],
+) -> DataFusionResult<()> {
+    let mut record = |row: usize, doc: &str| {
+        let slot = row * num_columns + column_slot;
+        let base = slot * num_terms;
+        let mut stream = tokenizer.token_stream_for_doc(doc);
+        while let Some(token) = stream.next() {
+            all_tokens[slot] += 1;
+            if let Some(token_indices) = query_token_indices.get(&token.text) {
+                for token_index in token_indices {
+                    counts[base + *token_index] += 1;
+                }
+            }
+        }
+    };
+    match doc_col.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            for (row, doc) in iter_str_array(doc_col.as_ref()).enumerate() {
+                if let Some(doc) = doc {
+                    record(row, doc);
+                }
+            }
+        }
+        // One string per row is the whole contract: a caller whose field path
+        // crosses a `List` owes a column already reduced to a row's document text
+        // (the planner uses `flatten_fts_document_column`), because reducing it
+        // here would count the elements separately and diverge from the single row
+        // document the index builder wrote.
+        data_type => {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "flat combined_fields search needs one string per row per column, got {}; \
+                 reduce a list-bearing field path to its row document first",
+                data_type
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -785,7 +1025,7 @@ pub async fn flat_bm25_search_stream_with_metrics(
 ///
 /// ```no_run
 /// # async fn example(
-/// #     input: datafusion::execution::SendableRecordBatchStream,
+/// #     input: datafusion_execution::SendableRecordBatchStream,
 /// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// use lance_index::scalar::inverted::{
 ///     flat_bm25_search_stream_with_metrics_and_operator, query::Operator, InvertedIndexParams,
@@ -875,7 +1115,7 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
 
     // Pre-await synchronous work: query tokenization + chunk-stream setup.
     let pre_await_start = std::time::Instant::now();
-    let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
+    let query_tokens = Arc::new(try_collect_query_tokens(&query, &mut tokenizer)?);
 
     // A query that tokenizes to no terms (e.g. only stop words) has no
     // searchable content and matches nothing. Return early rather than
@@ -948,13 +1188,7 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     )?;
 
     // Finally we emit batches according to the target batch size
-    let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
-    let mut batches = Vec::with_capacity(num_out_batches);
-    for i in 0..num_out_batches {
-        let start = i * target_batch_size;
-        let len = (scores.num_rows() - start).min(target_batch_size);
-        batches.push(Ok(scores.slice(start, len)));
-    }
+    let batches = slice_into_batches(scores, target_batch_size);
     if let Some(t) = &elapsed_compute {
         t.add_duration(post_await_start.elapsed());
     }
@@ -965,6 +1199,23 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
         )),
         scorer,
     ))
+}
+
+/// Cut one scored batch into the `target_batch_size` chunks a flat FTS scan
+/// emits. Slicing is zero-copy, so the whole scan's scores stay in one
+/// allocation.
+pub(in super::super) fn slice_into_batches(
+    batch: RecordBatch,
+    target_batch_size: usize,
+) -> Vec<DataFusionResult<RecordBatch>> {
+    let num_out_batches = batch.num_rows().div_ceil(target_batch_size);
+    let mut batches = Vec::with_capacity(num_out_batches);
+    for i in 0..num_out_batches {
+        let start = i * target_batch_size;
+        let len = (batch.num_rows() - start).min(target_batch_size);
+        batches.push(Ok(batch.slice(start, len)));
+    }
+    batches
 }
 
 pub fn is_phrase_query(query: &str) -> bool {

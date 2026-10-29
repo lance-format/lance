@@ -51,6 +51,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -71,6 +72,18 @@ public class ScannerTest {
     if (dataset != null) {
       dataset.close();
     }
+  }
+
+  @Test
+  void testIndexSegmentOptions() {
+    List<UUID> segments = List.of(UUID.randomUUID());
+    ScanOptions options =
+        new ScanOptions.Builder().indexSegments(segments).batchSizeBytes(1024).build();
+    assertEquals(segments, options.getIndexSegments().orElseThrow());
+    ScanOptions copy = new ScanOptions.Builder(options).build();
+    assertEquals(segments, copy.getIndexSegments().orElseThrow());
+    assertEquals(1024L, copy.getBatchSizeBytes().orElseThrow());
+    assertTrue(new ScanOptions.Builder().build().getIndexSegments().isEmpty());
   }
 
   @Test

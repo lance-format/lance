@@ -112,6 +112,30 @@ pub fn encode_pk_batch(batch: &RecordBatch, pk_indices: &[usize]) -> Result<Bina
     Ok(BinaryArray::from_iter_values(keys.iter()))
 }
 
+/// Whether [`encode_pk_tuple`] can encode a value of this type.
+pub fn is_encodable(data_type: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Boolean
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

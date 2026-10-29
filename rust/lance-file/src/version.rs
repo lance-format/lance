@@ -8,6 +8,7 @@ use std::{
 
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const LEGACY_FORMAT_VERSION: &str = "0.1";
 pub const V2_FORMAT_2_0: &str = "2.0";
@@ -102,6 +103,25 @@ impl FromStr for LanceFileVersion {
             "next" => Ok(Self::Next),
             _ => Err(unknown_version(value)),
         }
+    }
+}
+
+impl Serialize for LanceFileVersion {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for LanceFileVersion {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
     }
 }
 

@@ -42,7 +42,7 @@ use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::PutOptions;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
-use tracing::info;
+use tracing::{debug, info};
 use url::Url;
 
 #[cfg(feature = "dynamodb")]
@@ -224,7 +224,13 @@ pub fn write_manifest_file_to_path<'a>(
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
         let res = Writer::shutdown(&mut object_writer).await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string(), size_bytes = res.size, version = manifest.version);
+        debug!(
+            version = manifest.version,
+            size_bytes = res.size,
+            path = path.to_string(),
+            "wrote dataset manifest"
+        );
         Ok(res)
     })
 }
@@ -595,34 +601,17 @@ async fn resolve_version_from_listing(
     match (first, object_store.list_is_lexically_ordered) {
         // If the first valid manifest we see is V2, we can assume that we are using
         // V2 naming scheme for all manifests.
+        //
+        // V2 filenames are `u64::MAX - version` zero-padded to 20 digits, so on a
+        // lexically ordered store the first entry is the newest version and nothing
+        // after it can change the answer. We stop there rather than validating the
+        // entries behind it: that check was bounded in *valid manifests*, not keys,
+        // so a directory holding anything the filter drops made it spill into
+        // further listing pages on every open.
         (Some((scheme @ ManifestNamingScheme::V2, meta)), true) => {
             let version = scheme
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
-
-            // Sanity check: verify at least for the first 1k files that they are all V2
-            // and that the version numbers are decreasing. We use the first 1k because
-            // this is the typical size of an object store list endpoint response page.
-            for (scheme, meta) in valid_manifests.take(999).try_collect::<Vec<_>>().await? {
-                if scheme != ManifestNamingScheme::V2 {
-                    warn!(
-                        "Found V1 Manifest in a V2 directory. Use `migrate_manifest_paths_v2` \
-                         to migrate the directory."
-                    );
-                    break;
-                }
-                let next_version = scheme
-                    .parse_version(meta.location.filename().unwrap())
-                    .unwrap();
-                if next_version >= version {
-                    warn!(
-                        "List operation was expected to be lexically ordered, but was not. This \
-                         could mean a corrupt read. Please make a bug report on the lance-format/lance \
-                         GitHub repository."
-                    );
-                    break;
-                }
-            }
 
             Ok(ManifestLocation {
                 version,
@@ -948,6 +937,29 @@ pub trait CommitHandler: Debug + Send + Sync {
             Ok(_) => Ok(true),
             Err(ObjectStoreError::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether `path` is the handler's authoritative location for `version`.
+    ///
+    /// Cleanup uses this to revalidate staging-shaped manifest candidates that
+    /// may not appear in [`Self::list_manifest_locations`]. The default uses
+    /// the handler's version resolver; handlers whose resolver performs repair
+    /// should override this with a read-only authority lookup.
+    async fn is_manifest_path_authoritative(
+        &self,
+        base_path: &Path,
+        version: u64,
+        path: &Path,
+        object_store: &dyn OSObjectStore,
+    ) -> Result<bool> {
+        match self
+            .resolve_version_location(base_path, version, object_store)
+            .await
+        {
+            Ok(location) => Ok(location.path == *path),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -1765,11 +1777,107 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::ops::Range;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use lance_core::utils::tempfile::TempObjDir;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct FailingManifestListStore {
+        inner: Arc<dyn OSObjectStore>,
+        first_path: Path,
+    }
+
+    impl std::fmt::Display for FailingManifestListStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingManifestListStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for FailingManifestListStore {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            data: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(path, data, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, opts).await
+        }
+
+        async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, opts).await
+        }
+
+        async fn get_ranges(
+            &self,
+            path: &Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.inner.get_ranges(path, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let first_path = self.first_path.clone();
+            self.inner
+                .list(prefix)
+                .filter(move |item| {
+                    future::ready(item.as_ref().is_ok_and(|meta| meta.location == first_path))
+                })
+                .take(1)
+                .chain(futures::stream::once(async {
+                    Err(ObjectStoreError::Generic {
+                        store: "test",
+                        source: "listing failed before the newest manifest".into(),
+                    })
+                }))
+                .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
 
     #[test]
     fn test_manifest_naming_scheme() {
@@ -2100,6 +2208,29 @@ mod tests {
         // The stale hint is ignored; listing finds version 5.
         let location = current_manifest_path(&object_store, &base).await.unwrap();
         assert_eq!(location.version, 5);
+
+        // A newer manifest can be missed if an unordered list fails after an
+        // older entry. The fallback must report the failure, not version 5.
+        object_store
+            .put(&naming_scheme.manifest_path(&base, 11), b"".as_slice())
+            .await
+            .unwrap();
+        write_version_hint(&object_store, &base, 20).await;
+        let mut failing_store = (*object_store).clone();
+        failing_store.inner = Arc::new(FailingManifestListStore {
+            inner: failing_store.inner.clone(),
+            first_path: naming_scheme.manifest_path(&base, 5),
+        });
+        let error = current_manifest_path(&failing_store, &base)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("listing failed before the newest manifest"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2438,6 +2569,68 @@ mod tests {
             release_calls.load(Ordering::SeqCst),
             2,
             "expected the hung explicit release plus one best-effort drop release"
+        );
+    }
+
+    /// The V2 naming scheme sorts the latest version first, so on a lexically
+    /// ordered store the resolver should stop at the first *valid* manifest.
+    /// Anything the filter drops sorts where its name sorts, so junk ahead of the
+    /// answer costs exactly itself and nothing behind the answer is read at all.
+    ///
+    /// Listing streams are lazy, so the entries the resolver pulls are exactly the
+    /// entries a real object store would be billed for.
+    #[rstest::rstest]
+    #[case::clean(false, 1)]
+    #[case::leftover_staging_manifest(true, 2)]
+    #[tokio::test]
+    async fn test_resolve_latest_version_stops_at_first_valid_manifest(
+        #[case] leftover_staging: bool,
+        #[case] expected_entries_listed: usize,
+    ) {
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = true;
+
+        let base = Path::from("base");
+        for version in 0..10u64 {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+        if leftover_staging {
+            // A staging manifest orphaned by an interrupted commit of version 10.
+            // Its inverted version is smaller than version 9's, so it sorts ahead
+            // of the answer, and `detect_scheme` drops it for the `-{uuid}` suffix.
+            let final_path = ManifestNamingScheme::V2.manifest_path(&base, 10);
+            let staging_path = make_staging_manifest_path(&final_path).unwrap();
+            object_store
+                .put(&staging_path, b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        let entries_listed = Arc::new(AtomicUsize::new(0));
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_obj_meta_policy(
+            "count_listed_entries",
+            Arc::new({
+                let entries_listed = entries_listed.clone();
+                move |op: &str, meta: object_store::ObjectMeta| {
+                    if op == "list" {
+                        entries_listed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(meta)
+                }
+            }),
+        );
+        object_store.inner = Arc::new(ProxyObjectStore::new(object_store.inner.clone(), policy));
+
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 9);
+        assert_eq!(
+            entries_listed.load(Ordering::Relaxed),
+            expected_entries_listed,
+            "the resolver must stop at the first valid manifest: the check that \
+             used to follow it drained up to a thousand more, spilling into \
+             further listing pages"
         );
     }
 }

@@ -12,7 +12,6 @@ use futures::stream::FuturesOrdered;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
-use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
     ArrayFieldEncodingStrategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
     EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
@@ -34,7 +33,7 @@ use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::writer::{
-    ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriteSummary, FileWriterOptions,
+    ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, ExpectedTypes, FileWriteSummary, FileWriterOptions,
     PAGE_BUFFER_ALIGNMENT,
 };
 
@@ -154,6 +153,7 @@ enum PageSpillState {
 pub struct Writer {
     writer: Box<dyn ObjectWriter>,
     schema: Option<LanceSchema>,
+    expected_types: Option<ExpectedTypes>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
     field_id_to_column_indices: Vec<(u32, u32)>,
@@ -200,6 +200,7 @@ impl Writer {
         Self {
             writer: object_writer,
             schema: None,
+            expected_types: None,
             column_writers: Vec::new(),
             column_metadata: Vec::new(),
             num_columns: 0,
@@ -242,10 +243,7 @@ impl Writer {
             buffer_sizes.push(buffer.len() as u64);
             Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = crate::writer::encode_page_encoding(&encoded_page.description)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -322,6 +320,7 @@ impl Writer {
     }
 
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
+        self.options.validate()?;
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
             data_cache_bytes / schema.fields.len() as u64
         } else {
@@ -453,6 +452,13 @@ impl Writer {
             batch.get_array_memory_size()
         );
         self.ensure_initialized(batch)?;
+        let schema = self
+            .schema
+            .as_ref()
+            .expect("ensure_initialized sets the schema");
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_batch(batch)?;
         let field_arrays = self.field_arrays(batch)?;
         let field_arrays = self.prepare_field_arrays(field_arrays)?;
         let num_rows = batch.num_rows() as u64;
@@ -545,6 +551,9 @@ impl Writer {
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
+        self.expected_types
+            .get_or_insert_with(|| ExpectedTypes::new(schema))
+            .check_column(column_index, &array)?;
         let array = self.column_writers[column_index].prepare_array(array)?;
 
         // A never-advanced field simply remains a zero-length column, which the
@@ -867,14 +876,7 @@ pub fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<B
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = crate::writer::encode_page_encoding(&page_info.encoding)?;
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
                     .as_ref()

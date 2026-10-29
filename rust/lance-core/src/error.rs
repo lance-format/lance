@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt;
+use std::sync::Arc;
 
 use arrow_schema::ArrowError;
 use snafu::{IntoError as _, Location, Snafu};
@@ -422,6 +423,14 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// An error shared behind an [`Arc`] so it can be cloned cheaply without
+    /// deep-copying its source (see [`CloneableError`]). Accessors that read a
+    /// variant or typed source rather than the message — [`Error::external_source`],
+    /// [`Error::fence_reason`], [`Error::is_backpressure`], [`Error::is_not_found`],
+    /// [`Error::is_commit_status_unknown`], [`Error::backtrace`] — see through this
+    /// wrapper, so a shared error answers them exactly as the error it wraps.
+    #[snafu(transparent)]
+    Shared { source: Arc<Self> },
 }
 
 impl Error {
@@ -474,6 +483,8 @@ impl Error {
             | Self::DiskCapExceeded { .. }
             | Self::Fenced { .. }
             | Self::Backpressure { .. } => None,
+            // A shared error delegates to the error it wraps.
+            Self::Shared { source } => source.backtrace(),
         }
     }
 
@@ -538,10 +549,25 @@ impl Error {
         .build()
     }
 
+    /// Peel every [`Error::Shared`] wrapper and return the underlying error.
+    ///
+    /// Accessors route through this, so a shared error answers the same as the
+    /// error it wraps. Callers that need to match a concrete variant without an
+    /// accessor (such as [`Error::Timeout`]) should match on `find_root()`, so
+    /// the match still holds after the error has been shared through a
+    /// [`CloneableError`].
+    pub fn find_root(&self) -> &Self {
+        let mut current = self;
+        while let Self::Shared { source } = current {
+            current = source.as_ref();
+        }
+        current
+    }
+
     /// The [`FenceReason`] if this is [`Error::Fenced`], else `None`. Prefer this
     /// over matching the error message to decide how to react to a fence.
     pub fn fence_reason(&self) -> Option<FenceReason> {
-        match self {
+        match self.find_root() {
             Self::Fenced { reason, .. } => Some(*reason),
             _ => None,
         }
@@ -561,7 +587,7 @@ impl Error {
     /// full" signal rather than a real failure. Prefer this over matching the
     /// error message.
     pub fn is_backpressure(&self) -> bool {
-        matches!(self, Self::Backpressure { .. })
+        matches!(self.find_root(), Self::Backpressure { .. })
     }
 
     #[track_caller]
@@ -600,7 +626,7 @@ impl Error {
 
     /// Return whether this error or one of its typed sources is a missing object.
     pub fn is_not_found(&self) -> bool {
-        match self {
+        match self.find_root() {
             Self::NotFound { .. } => true,
             Self::Wrapped { error, .. }
                 if error.downcast_ref::<CommitStatusUnknownError>().is_some() =>
@@ -754,7 +780,7 @@ impl Error {
     /// not be determined safely.
     pub fn is_commit_status_unknown(&self) -> bool {
         matches!(
-            self,
+            self.find_root(),
             Self::Wrapped { error, .. }
                 if error.downcast_ref::<CommitStatusUnknownError>().is_some()
         )
@@ -789,22 +815,32 @@ impl Error {
         }
     }
 
-    /// Returns a reference to the external error source if this is an `External` variant.
+    /// Returns a reference to the external error source if this is an `External`
+    /// variant, seeing through any `Shared` wrapper.
     ///
     /// This allows downcasting to recover the original error type.
     pub fn external_source(&self) -> Option<&BoxedError> {
-        match self {
+        match self.find_root() {
             Self::External { source } => Some(source),
             _ => None,
         }
     }
 
-    /// Consumes the error and returns the external source if this is an `External` variant.
+    /// Consumes the error and returns the external source if this is an `External`
+    /// variant, seeing through a sole-owner `Shared` wrapper.
     ///
-    /// Returns `Err(self)` if this is not an `External` variant, allowing for chained handling.
+    /// Otherwise returns `Err` with an equivalent error for chained handling: a
+    /// sole-owner `Shared` is unwrapped to its inner error, a still-shared one
+    /// stays wrapped, and any other error is returned as-is.
     pub fn into_external(self) -> std::result::Result<BoxedError, Self> {
         match self {
             Self::External { source } => Ok(source),
+            // A sole-owner Shared can surrender its inner error; a still-shared
+            // one cannot, so it stays wrapped (`external_source` reads it by ref).
+            Self::Shared { source } => match Arc::try_unwrap(source) {
+                Ok(inner) => inner.into_external(),
+                Err(shared) => Err(Self::Shared { source: shared }),
+            },
             other => Err(other),
         }
     }
@@ -1055,49 +1091,50 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
     std::panic::Location::caller()
 }
 
-/// Wrap an error in a new error type that implements Clone
+/// An [`Error`] that can be cloned, for sharing one fallible source across
+/// several consumers (for example a shared future two streams both await).
 ///
-/// This is useful when two threads/streams share a common fallible source
-/// Definite not-found errors preserve typed source-chain detection and their
-/// human-readable representation. Timeout and I/O errors preserve their error
-/// categories. Other cloned results use Error::Cloned with the string
-/// representation of the base error.
-pub struct CloneableError(pub Error);
+/// The error is held behind an [`Arc`], so a clone shares it rather than
+/// rebuilding it. Every accessor — `is_not_found`, `fence_reason`,
+/// `is_backpressure`, `is_commit_status_unknown`, `external_source` — therefore
+/// answers the same on every clone, including `external_source`, whose downcast
+/// a message-based rebuild could not preserve. Use [`CloneableError::inner`] to
+/// borrow the error and [`CloneableError::into_inner`] to recover it by value.
+pub struct CloneableError(Arc<Error>);
 
-struct DisplayError(Error);
-
-impl fmt::Debug for DisplayError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
+impl CloneableError {
+    /// Wrap an [`Error`] so it can be shared and cloned.
+    ///
+    /// An already-shared error reuses its inner `Arc` rather than nesting
+    /// another [`Error::Shared`], so repeatedly wrapping and recovering the
+    /// same error keeps the wrapper flat instead of growing a `Shared` chain.
+    pub fn new(error: Error) -> Self {
+        Self(match error {
+            Error::Shared { source } => source,
+            other => Arc::new(other),
+        })
     }
-}
 
-impl fmt::Display for DisplayError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+    /// Borrow the shared error.
+    pub fn inner(&self) -> &Error {
+        &self.0
     }
-}
 
-impl std::error::Error for DisplayError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+    /// Recover the error by value. When other clones are still alive the error
+    /// cannot be moved out, so it is returned wrapped in [`Error::Shared`],
+    /// which answers every accessor the same as the error it wraps.
+    pub fn into_inner(self) -> Error {
+        Arc::try_unwrap(self.0).unwrap_or_else(|shared| Error::Shared { source: shared })
     }
 }
 
 impl Clone for CloneableError {
-    #[track_caller]
     fn clone(&self) -> Self {
-        match &self.0 {
-            Error::NotFound { uri, .. } => Self(Error::wrapped(Box::new(DisplayError(
-                Error::not_found(uri.clone()),
-            )))),
-            error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
-                Error::not_found(error.to_string()),
-            )))),
-            Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
-            Error::IO { source, .. } => Self(Error::io(source.to_string())),
-            error => Self(Error::cloned(error.to_string())),
-        }
+        // Cheap and lossless: every clone shares one `Arc<Error>`, so accessors
+        // (`external_source`, `fence_reason`, ...) answer identically on every
+        // side. Recovering an owned error from a still-shared clone yields
+        // `Error::Shared`; see `into_inner`.
+        Self(Arc::clone(&self.0))
     }
 }
 
@@ -1106,61 +1143,212 @@ pub struct CloneableResult<T: Clone>(pub std::result::Result<T, CloneableError>)
 
 impl<T: Clone> From<Result<T>> for CloneableResult<T> {
     fn from(result: Result<T>) -> Self {
-        Self(result.map_err(CloneableError))
+        Self(result.map_err(CloneableError::new))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::error::Error as _;
     use std::fmt;
+
+    /// The variants whose meaning lives in an accessor rather than in the
+    /// message: collapsing them into a cloned string drops the signal.
+    #[test]
+    fn cloneable_error_preserves_accessor_contracts() {
+        // Both reasons, because carrying `reason` through is the arm's whole job.
+        for (original, expected) in [
+            (
+                Error::fenced_by_peer("peer claimed epoch 7"),
+                FenceReason::PeerClaimedEpoch,
+            ),
+            (
+                Error::writer_poisoned("wal flush failed"),
+                FenceReason::PersistenceFailure,
+            ),
+        ] {
+            let original = CloneableError::new(original);
+            assert_eq!(original.inner().fence_reason(), Some(expected));
+            assert_eq!(original.clone().inner().fence_reason(), Some(expected));
+        }
+
+        let original = CloneableError::new(Error::backpressure("writer at memory ceiling"));
+        let cloned = original.clone();
+        assert!(original.inner().is_backpressure());
+        assert!(cloned.inner().is_backpressure());
+
+        let original = CloneableError::new(Error::commit_status_unknown_source(
+            7,
+            box_error(Error::timeout("put timed out")),
+        ));
+        let cloned = original.clone();
+        // Cloning the clone must not degrade it further.
+        let twice = cloned.clone();
+        assert!(original.inner().is_commit_status_unknown());
+        assert!(cloned.inner().is_commit_status_unknown());
+        assert!(!cloned.inner().is_not_found());
+        assert!(twice.inner().is_commit_status_unknown());
+    }
+
+    /// The signal #9541 could not fix by rebuilding: an external source must
+    /// still downcast to its original type on the far side of a clone.
+    #[test]
+    fn cloneable_error_preserves_external_source_across_clone() {
+        let original = CloneableError::new(Error::external(Box::new(MyCustomError {
+            code: 7,
+            message: "external across clone".into(),
+        })));
+        let cloned = original.clone();
+        // Both the original and the clone must still downcast to the source type.
+        for err in [&original, &cloned] {
+            let source = err
+                .inner()
+                .external_source()
+                .expect("external source must survive a clone");
+            assert_eq!(source.downcast_ref::<MyCustomError>().unwrap().code, 7);
+        }
+    }
+
+    /// `new` must reuse an already-shared error's Arc instead of nesting another
+    /// `Shared` layer, so repeated share/recover cycles cannot grow the depth
+    /// (and with it the depth-proportional recursion in `into_external`,
+    /// `Display`, `backtrace`, and `Drop`).
+    #[test]
+    fn cloneable_error_new_flattens_shared() {
+        let shared = Error::Shared {
+            source: Arc::new(Error::io("disk gone")),
+        };
+        let wrapped = CloneableError::new(shared);
+        assert!(matches!(wrapped.inner(), Error::IO { .. }));
+        assert!(!matches!(wrapped.inner(), Error::Shared { .. }));
+    }
+
+    /// A sole owner recovers the concrete inner error, not a `Shared` wrapper —
+    /// the common consumer path (e.g. moka's `unwrap_or_clone(..).into_inner()`).
+    #[test]
+    fn into_inner_sole_owner_returns_concrete_variant() {
+        let recovered = CloneableError::new(Error::io("solo")).into_inner();
+        assert!(matches!(recovered, Error::IO { .. }));
+    }
+
+    /// A still-shared error cannot surrender ownership of its source, so
+    /// `into_external` returns it re-wrapped rather than the boxed source.
+    #[test]
+    fn into_external_keeps_multi_owner_shared_wrapped() {
+        let arc = Arc::new(Error::external(Box::new(MyCustomError {
+            code: 5,
+            message: "still shared".into(),
+        })));
+        let _second_owner = arc.clone(); // refcount 2 → try_unwrap must fail
+        match (Error::Shared { source: arc }).into_external() {
+            Err(Error::Shared { .. }) => {}
+            other => panic!("multi-owner Shared must stay wrapped, got {other:?}"),
+        }
+    }
+
+    /// `backtrace()` delegates through the `Shared` wrapper to the inner error.
+    #[test]
+    fn backtrace_sees_through_shared() {
+        let shared = Error::Shared {
+            source: Arc::new(Error::io("io")),
+        };
+        assert_eq!(
+            shared.backtrace().is_some(),
+            Error::io("io").backtrace().is_some()
+        );
+    }
+
+    /// Every accessor that reads a variant or typed source rather than the
+    /// message must see through an `Error::Shared` wrapper, including nested
+    /// ones, so a shared error answers exactly as the error it wraps.
+    #[test]
+    fn accessors_see_through_shared_wrapper() {
+        let external = Error::Shared {
+            source: Arc::new(Error::external(Box::new(MyCustomError {
+                code: 7,
+                message: "wrapped".into(),
+            }))),
+        };
+        let source = external
+            .external_source()
+            .expect("external_source must see through Shared");
+        assert_eq!(source.downcast_ref::<MyCustomError>().unwrap().code, 7);
+
+        let fenced = Error::Shared {
+            source: Arc::new(Error::writer_poisoned("wal flush failed")),
+        };
+        assert_eq!(fenced.fence_reason(), Some(FenceReason::PersistenceFailure));
+
+        let backpressure = Error::Shared {
+            source: Arc::new(Error::backpressure("at ceiling")),
+        };
+        assert!(backpressure.is_backpressure());
+
+        let commit_unknown = Error::Shared {
+            source: Arc::new(Error::commit_status_unknown_source(
+                9,
+                box_error(Error::timeout("put timed out")),
+            )),
+        };
+        assert!(commit_unknown.is_commit_status_unknown());
+
+        // find_root peels every layer, so nested wrappers still answer.
+        let nested = Error::Shared {
+            source: Arc::new(Error::Shared {
+                source: Arc::new(Error::not_found("deep")),
+            }),
+        };
+        assert!(nested.is_not_found());
+
+        // Sole-owner Shared can still surrender ownership of the external source.
+        let owned = Error::Shared {
+            source: Arc::new(Error::external(Box::new(MyCustomError {
+                code: 11,
+                message: "owned".into(),
+            }))),
+        };
+        match owned.into_external() {
+            Ok(source) => assert_eq!(source.downcast::<MyCustomError>().unwrap().code, 11),
+            Err(e) => panic!("into_external should unwrap a sole-owner Shared, got {e:?}"),
+        }
+    }
 
     #[test]
     fn cloneable_error_preserves_not_found_contract() {
-        let original = CloneableError(Error::not_found("metadata.lance"));
+        let original = CloneableError::new(Error::not_found("metadata.lance"));
         let cloned = original.clone();
         let cloned_again = cloned.clone();
-        assert!(matches!(original.0, Error::NotFound { .. }));
-        assert!(cloned.0.is_not_found());
-        assert!(cloned_again.0.is_not_found());
-        assert!(cloned.0.to_string().to_lowercase().contains("not found"));
+        // Sharing means every clone is still the real NotFound, not a rebuild.
+        assert!(matches!(original.inner(), Error::NotFound { .. }));
+        assert!(matches!(cloned.inner(), Error::NotFound { .. }));
+        assert!(matches!(cloned_again.inner(), Error::NotFound { .. }));
         assert!(
-            cloned_again
-                .0
+            cloned
+                .inner()
                 .to_string()
                 .to_lowercase()
                 .contains("not found")
         );
-        assert!(
-            format!("{:?}", cloned.0)
-                .to_lowercase()
-                .contains("not found")
-        );
-        assert!(cloned.0.source().is_some_and(|source| source.is::<Error>()
-            || source.source().is_some_and(|source| source.is::<Error>())));
+
+        // Taken by value while other clones live, a clone becomes `Error::Shared`;
+        // is_not_found must still propagate through a downstream error chain.
         let downstream_error = Error::wrapped(Box::new(Error::io_source(Box::new(
             object_store::Error::Generic {
                 store: "N/A",
-                source: Box::new(cloned.0),
+                source: Box::new(cloned.into_inner()),
             },
         ))));
         assert!(downstream_error.is_not_found());
-        assert!(
-            format!("{downstream_error:?}")
-                .to_lowercase()
-                .contains("not found")
-        );
 
-        let original = CloneableError(Error::timeout("metadata read timed out"));
+        let original = CloneableError::new(Error::timeout("metadata read timed out"));
         let cloned = original.clone();
-        assert!(matches!(original.0, Error::Timeout { .. }));
-        assert!(matches!(cloned.0, Error::Timeout { .. }));
+        assert!(matches!(original.inner(), Error::Timeout { .. }));
+        assert!(matches!(cloned.inner(), Error::Timeout { .. }));
 
-        let original = CloneableError(Error::io("metadata read was denied"));
+        let original = CloneableError::new(Error::io("metadata read was denied"));
         let cloned = original.clone();
-        assert!(matches!(original.0, Error::IO { .. }));
-        assert!(matches!(cloned.0, Error::IO { .. }));
+        assert!(matches!(original.inner(), Error::IO { .. }));
+        assert!(matches!(cloned.inner(), Error::IO { .. }));
     }
 
     #[test]

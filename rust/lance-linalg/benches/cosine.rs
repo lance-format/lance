@@ -97,7 +97,9 @@ fn bench_distance(c: &mut Criterion) {
             b.iter(|| {
                 black_box(
                     target_u8
-                        .chunks_exact(DIMENSION)
+                        .as_chunks::<DIMENSION>()
+                        .0
+                        .iter()
                         .map(|tgt| cosine_u8_scalar(&key_u8, tgt))
                         .fold(0.0, |acc: f32, v| acc + v),
                 );
@@ -108,7 +110,9 @@ fn bench_distance(c: &mut Criterion) {
             b.iter(|| {
                 black_box(
                     target_u8
-                        .chunks_exact(DIMENSION)
+                        .as_chunks::<DIMENSION>()
+                        .0
+                        .iter()
                         .map(|tgt| cosine_u8(&key_u8, tgt))
                         .fold(0.0, |acc: f32, v| acc + v),
                 );

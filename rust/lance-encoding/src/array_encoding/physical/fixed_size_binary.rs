@@ -76,6 +76,10 @@ pub struct FixedSizeBinaryDecoder {
 }
 
 impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
+    fn variable_width_bytes(&self, _rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        Ok(Some(num_rows * self.byte_width))
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let rows_to_skip = rows_to_skip * self.byte_width;
         let num_bytes = num_rows * self.byte_width;
@@ -306,5 +310,57 @@ mod tests {
         assert_eq!(string_array.len(), num_values as usize);
         assert_eq!(string_array.value(0), "aaa");
         assert_eq!(string_array.value(1), "bbb");
+    }
+
+    #[test]
+    fn test_fixed_size_binary_pages_split_by_byte_budget() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::array_encoding::logical::r#struct::SimpleStructDecoder;
+        use crate::decoder::{DecoderReady, DrainLimit, LogicalPageDecoder};
+        use arrow_schema::{Field as ArrowField, Fields};
+        use lance_core::Result;
+        use std::collections::VecDeque;
+
+        #[derive(Debug)]
+        struct NeverDecodedStub;
+
+        impl PrimitivePageDecoder for NeverDecodedStub {
+            fn decode(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<DataBlock> {
+                unreachable!("byte accounting must not decode any values")
+            }
+        }
+
+        // Two pages of 3 rows x 10 bytes each; each page fits the budget alone
+        // but the pair does not.
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let mut root = SimpleStructDecoder::new(fields, 6);
+        for _ in 0..2 {
+            root.accept_child(DecoderReady {
+                decoder: Box::new(PrimitiveFieldDecoder::new_from_data(
+                    Arc::new(FixedSizeBinaryDecoder {
+                        bytes_decoder: Box::new(NeverDecodedStub),
+                        byte_width: 10,
+                        bytes_per_offset: 4,
+                    }),
+                    DataType::Utf8,
+                    3,
+                    false,
+                )),
+                path: VecDeque::from([0]),
+            })
+            .unwrap();
+        }
+
+        // Budget for page 1 plus two rows of page 2.
+        let limit = root.max_rows_to_drain(6, 50).unwrap();
+        assert_eq!(limit, DrainLimit { rows: 5, bytes: 50 });
+
+        // Budget for exactly one page: the batch stops at the page boundary.
+        let limit = root.max_rows_to_drain(6, 30).unwrap();
+        assert_eq!(limit, DrainLimit { rows: 3, bytes: 30 });
+
+        // Both pages fit a large enough budget.
+        let limit = root.max_rows_to_drain(6, 60).unwrap();
+        assert_eq!(limit, DrainLimit { rows: 6, bytes: 60 });
     }
 }

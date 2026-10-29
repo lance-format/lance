@@ -53,6 +53,12 @@ The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
+`index_version` also tracks the row domain of the auxiliary file's `_rowid`
+or `_rowaddr` column. From version 3 onward, a segment stores the physical row
+address (`fragment_id << 32 | offset`) of each vector in `_rowaddr` instead of the
+dataset's logical row id in `_rowid`. A segment persisted below version 3 stores
+row ids throughout, and merging never combines segments of differing domain.
+
 ## Storage Layout (V3)
 
 Each vector index is stored as 2 regular Lance files - index file and auxiliary file.
@@ -161,14 +167,28 @@ the Arrow schema of the Lance file varies depending on the quantization method u
 !!! note
     All partitions are stored in the same file, and partitions must be written in order.
 
+Every quantization format below lists only its internal columns. When a V3 IVF
+writer materializes carried values, it appends one trailing column per carried
+field after them, named and typed exactly as in the dataset schema. This physical
+payload may be a subset of the manifest's `covering_fields` declaration (see
+[Index Metadata](../index.md)). A reader returns only columns whose physical
+schema and dataset field ids it verifies across every selected segment; all other
+projected columns come from a base-table take.
+
+A reader discovers carried columns by exclusion, not by position: any column in the
+auxiliary file's schema that is not one of the quantizer's internal columns is a
+carried column. Writers append them in trailing order, but a reader must not depend
+on that ordering to identify them.
+
 ##### FLAT
 
 No quantization applied - stores original vectors in their full precision:
 
-| Column   | Type                     | Nullable | Description                                           |
-| -------- | ------------------------ | -------- | ----------------------------------------------------- |
-| `_rowid` | uint64                   | true     | Row identifier                                        |
-| `flat`   | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
+| Column     | Type                     | Nullable | Description                                           |
+| ---------- | ------------------------ | -------- | ----------------------------------------------------- |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
+| `flat`     | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
 
 ##### PQ
 
@@ -176,7 +196,8 @@ Compresses vectors using product quantization for significant memory savings:
 
 | Column      | Type                                            | Nullable | Description                                   |
 | ----------- | ----------------------------------------------- | -------- | --------------------------------------------- |
-| `_rowid`    | uint64                                          | true     | Row identifier                                |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
 | `__pq_code` | list<uint8>[num_sub_vectors * num_bits / 8]     | true     | PQ codes, packed to `num_bits` per subvector  |
 
 ##### SQ
@@ -185,7 +206,8 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 | Column      | Type                   | Nullable | Description                             |
 | ----------- | ---------------------- | -------- | --------------------------------------- |
-| `_rowid`    | uint64                 | true     | Row identifier                          |
+| `_rowid`    | uint64                 | true     | Row identifier (present when version <= 2) |
+| `_rowaddr`  | uint64                 | true     | Row address (present when version >= 3) |
 | `__sq_code` | list<uint8>[dimension] | true     | SQ codes (list_size = vector dimension) |
 
 ##### RQ
@@ -194,7 +216,7 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 
 | Column               | Type                                             | Nullable | Present when                | Description                                                     |
 | -------------------- | ------------------------------------------------ | -------- | --------------------------- | --------------------------------------------------------------- |
-| `_rowid`             | uint64                                           | true     | always                      | Row identifier                                                  |
+| `_rowid`             | uint64                                           | true     | always                      | Row identifier (a physical row address from 3 onward; a row id in a segment persisted at version <= 2) |
 | `_rabit_codes`       | list<uint8>[ceil(code_dim / 8)]                  | true     | always                      | Binary quantized codes (1 bit per dimension, packed into bytes) |
 | `__add_factors`      | float32                                          | true     | always                      | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | true     | always                      | Scale correction factors for distance computation               |
@@ -228,6 +250,17 @@ It's only used for tracking each partition's offset and length in the auxiliary 
 Contains RabitQ-specific metadata in JSON format (only present for RQ quantization).
 This includes the rotation matrix position, number of bits, and packing information.
 See the RQ metadata specification in the "storage_metadata" section below.
+
+##### "covering_field_ids"
+
+The dataset field ids of the storage file's physical carried columns,
+comma separated in physical schema order (only present when the storage carries
+values). Arrow fields carry no Lance field id, so names and types alone cannot
+prove which logical column a payload came from. Readers use these ids to bind
+physical values to the segment's `covering_fields` declaration, and treat missing,
+malformed, ambiguous, or mismatched metadata as no servable carried capability.
+A merge must not combine shards whose carried columns disagree on these ids, even
+when those columns match by name and type.
 
 ##### "storage_metadata"
 

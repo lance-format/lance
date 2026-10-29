@@ -58,10 +58,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
-use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod bitmap;
 pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
@@ -97,14 +97,17 @@ use crate::utils::KMeans;
 pub use dataset::Dataset;
 pub use dataset::serialize_row_addrs;
 pub use dataset::write_dataset;
-use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
+use fragment::{
+    FileFragment, FragmentAddColumnsCleanup, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta,
+};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
 use crate::blob::{
-    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
+    PyPackedBlobWriter,
 };
 use crate::executor::BackgroundExecutor;
 
@@ -265,6 +268,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
+    m.add_class::<FragmentAddColumnsCleanup>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
     m.add_class::<PyRowIdSequence>()?;
@@ -275,6 +279,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBlobDescriptor>()?;
     m.add_class::<PyBlobDescriptorArrayBuilder>()?;
     m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyManagedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
@@ -306,6 +311,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
+    m.add_class::<bitmap::PyBitmap>()?;
+    m.add_class::<bitmap::PyBitmapIter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
@@ -485,7 +492,6 @@ impl FFILanceTableProvider {
         py: Python<'py>,
         session: Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let name = CString::new("datafusion_table_provider").unwrap();
         let a_lance_table_provider = Arc::new(LanceTableProvider::new(
             self.dataset.clone(),
             self.with_row_id,
@@ -499,7 +505,7 @@ impl FFILanceTableProvider {
             rt().get_runtime_handle(),
             codec,
         );
-        PyCapsule::new(py, ffi_provider, Some(name.clone()))
+        PyCapsule::new_with_value(py, ffi_provider, c"datafusion_table_provider")
     }
 }
 

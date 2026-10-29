@@ -210,15 +210,21 @@ impl ObjectStoreRegistry {
         provider: Arc<dyn ObjectStoreProvider>,
         base_path: Url,
         params: &ObjectStoreParams,
-        store_prefix: &str,
+        metrics_base: &str,
     ) -> Result<Arc<ObjectStore>> {
         let mut store = provider.new_store(base_path, params).await?;
+        // Providers only know the explicit parameter; the storage option is
+        // applied here so every store honours it the same way.
+        if let Some(block_size) = params.resolved_block_size()? {
+            store.block_size = block_size;
+        }
 
         store.inner = store.inner.traced();
 
         // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
-        // `az$container@account`) so multiple stores on one cloud differ.
-        crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, store_prefix);
+        // `az$container@account`) so multiple stores on one cloud differ, or by
+        // the dataset URI when the label mode asks for it.
+        crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, metrics_base);
 
         if let Some(wrapper) = &params.object_store_wrapper {
             store.apply_wrapper(wrapper.as_ref());
@@ -251,8 +257,9 @@ impl ObjectStoreRegistry {
         };
         let store_prefix =
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let metrics_base = crate::object_store::metrics_base(&store_prefix, &base_path);
 
-        self.build_store(provider, base_path, params, &store_prefix)
+        self.build_store(provider, base_path, params, &metrics_base)
             .await
     }
 
@@ -277,8 +284,12 @@ impl ObjectStoreRegistry {
             return Err(self.scheme_not_found_error(scheme));
         };
 
-        let cache_path =
+        // Keyed by the metrics identity rather than the bare prefix: in
+        // `dataset` label mode that is the dataset URI, so datasets sharing a
+        // bucket get separate stores and their metrics stay attributed.
+        let store_prefix =
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let cache_path = crate::object_store::metrics_base(&store_prefix, &base_path);
         let cache_key = (cache_path.clone(), params.clone());
 
         // Check if we have a cached store for this base path and params
