@@ -27,7 +27,7 @@ use crate::{
         ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
         RLE_THRESHOLD_META_KEY,
     },
-    data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
+    data::{DataBlock, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
         logical::primitive::{
             fullzip::PerValueCompressor,
@@ -842,15 +842,34 @@ pub fn try_fixed_packed_struct_miniblock(
     )))
 }
 
+/// The value encoder can store fixed-size lists only when every layer wraps
+/// fixed-width values or an all-null leaf.
+fn fixed_size_list_can_use_value_encoder(fsl: &FixedSizeListBlock) -> bool {
+    let mut child = fsl.child.as_ref();
+    loop {
+        child = match child {
+            DataBlock::FixedSizeList(inner) => inner.child.as_ref(),
+            DataBlock::Nullable(inner) => inner.data.as_ref(),
+            DataBlock::FixedWidth(_) | DataBlock::AllNull(_) => return true,
+            _ => return false,
+        };
+    }
+}
+
 /// Store fixed-size-list miniblocks without a value codec.
 pub fn try_raw_fixed_size_list_miniblock(data: &DataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
-    matches!(data, DataBlock::FixedSizeList(_)).then(|| Box::new(ValueEncoder::default()) as _)
+    matches!(data, DataBlock::FixedSizeList(fsl) if fixed_size_list_can_use_value_encoder(fsl))
+        .then(|| Box::new(ValueEncoder::default()) as _)
 }
 
 /// Store fixed-width and fixed-size-list values directly in full-zip pages.
 pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>> {
-    matches!(data, DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_))
-        .then(|| Box::new(ValueEncoder::default()) as _)
+    let raw = match data {
+        DataBlock::FixedWidth(_) => true,
+        DataBlock::FixedSizeList(fsl) => fixed_size_list_can_use_value_encoder(fsl),
+        _ => false,
+    };
+    raw.then(|| Box::new(ValueEncoder::default()) as _)
 }
 
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {

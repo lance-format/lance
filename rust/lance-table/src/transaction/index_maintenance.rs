@@ -441,12 +441,17 @@ impl Transaction {
         }
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
-        let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
+        // System fields have negative IDs and cannot be modified by a user-column
+        // rewrite. A signed comparison also avoids aliasing a large u32 to one.
+        let fields_modified_set = fields_modified
+            .iter()
+            .map(|&field_id| i64::from(field_id))
+            .collect::<HashSet<_>>();
         for index in indices.iter_mut() {
             if index
                 .dependency_fields()
                 .iter()
-                .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
+                .any(|field_id| fields_modified_set.contains(&i64::from(*field_id)))
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
                 *fragment_bitmap -= fragment_ids;
@@ -2416,6 +2421,35 @@ mod withdrawal_tests {
         segment.fields = fields;
         segment.fragment_bitmap = bitmap.map(|ids| ids.iter().copied().collect());
         segment
+    }
+
+    #[rstest::rstest]
+    #[case::user_field(vec![0], vec![0], true)]
+    #[case::other_user_field(vec![1], vec![0], false)]
+    #[case::row_id(vec![-3], vec![0], false)]
+    #[case::mixed_fields(vec![-3, 0], vec![0], true)]
+    #[case::no_unsigned_alias(vec![-1], vec![u32::MAX], false)]
+    #[case::largest_field(vec![i32::MAX], vec![i32::MAX as u32], true)]
+    #[test]
+    fn prune_updated_fields_preserves_system_fields(
+        #[case] fields: Vec<i32>,
+        #[case] modified: Vec<u32>,
+        #[case] is_modified: bool,
+    ) {
+        let mut indices = vec![segment(Some(&[0, 1, 2]), fields)];
+        Transaction::prune_updated_fragment_ids_from_indices(
+            &mut indices,
+            &RoaringBitmap::from_iter([1]),
+            &modified,
+        );
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter(if is_modified {
+                vec![0, 2]
+            } else {
+                vec![0, 1, 2]
+            }))
+        );
     }
 
     fn lineage(entry: &IndexMetadata) -> TaggedLineage {

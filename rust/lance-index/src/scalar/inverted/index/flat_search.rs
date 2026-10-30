@@ -156,7 +156,7 @@ pub(super) fn document_matches_flat_query(
     }
     Ok(phrase_matches_positions(
         query_tokens,
-        &query_position_groups(query_tokens),
+        &query_position_groups(query_tokens, true),
         &document_positions,
         slop,
     ))
@@ -272,7 +272,10 @@ pub(super) async fn tokenize_and_count(
     let output_schema = Arc::new(Schema::new(output_fields));
     let output_schema_clone = output_schema.clone();
     let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
-    let query_groups = Arc::new(query_position_groups(query_tokens.as_ref()));
+    let query_groups = Arc::new(query_position_groups(
+        query_tokens.as_ref(),
+        phrase_slop.is_some(),
+    ));
     let bytes_accumulated = Arc::new(AtomicU64::new(0));
     let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
 
@@ -874,7 +877,7 @@ pub(super) fn flat_bm25_score(
             false,
         ))
     });
-    let query_groups = query_position_groups(query_tokens);
+    let query_groups = query_position_groups(query_tokens, phrase_slop.is_some());
 
     let mut row_ids_iter = counted_input[ROW_ID]
         .as_primitive::<UInt64Type>()
@@ -960,11 +963,14 @@ pub(super) fn flat_bm25_score(
     Ok(batch)
 }
 
-pub(super) fn query_position_groups(query_tokens: &Tokens) -> Vec<Vec<usize>> {
+pub(super) fn query_position_groups(
+    query_tokens: &Tokens,
+    is_phrase_query: bool,
+) -> Vec<Vec<usize>> {
     let mut groups = Vec::new();
     let mut current_position = None;
     for idx in 0..query_tokens.len() {
-        let position = query_tokens.position(idx);
+        let position = query_tokens.position_for_query(idx, is_phrase_query);
         if current_position != Some(position) {
             current_position = Some(position);
             groups.push(Vec::new());
