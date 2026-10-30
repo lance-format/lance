@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
+};
 use std::time::Duration;
 use std::vec;
 
@@ -32,8 +35,13 @@ use tokio::sync::Barrier;
 use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
 use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
+use futures::stream::BoxStream;
 use lance_core::Error;
-use object_store::{ObjectStoreExt as _, path::Path};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, path::Path,
+};
 use rstest::rstest;
 use std::cmp::Ordering;
 
@@ -1273,6 +1281,79 @@ async fn test_list_hierarchical_branches() {
     assert!(branches.contains_key("features/nested"));
 }
 
+#[derive(Debug)]
+struct DirectoryMarkerStore {
+    inner: Arc<dyn OSObjectStore>,
+    marker: Path,
+    listings: AtomicUsize,
+}
+
+impl std::fmt::Display for DirectoryMarkerStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DirectoryMarkerStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for DirectoryMarkerStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        let mut entries = self.inner.list_with_delimiter(prefix).await?;
+        if prefix == Some(&self.marker) {
+            // Fail promptly if cleanup requeues the marker instead of hanging.
+            if self.listings.fetch_add(1, AtomicOrdering::SeqCst) > 0 {
+                return Err(object_store::Error::Generic {
+                    store: "DirectoryMarkerStore",
+                    source: "shared directory was listed more than once".into(),
+                });
+            }
+            // Hierarchical OpenDAL stores can return the listed directory itself.
+            entries.common_prefixes.push(self.marker.clone());
+        }
+        Ok(entries)
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 #[rstest]
 #[case::child("a/b", false)]
 #[case::nested_child("a/b/c", false)]
@@ -1284,6 +1365,7 @@ async fn test_delete_branch_with_shared_directory(
     #[case] remaining_branch: &str,
     #[case] force: bool,
     #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_directory_marker: bool,
 ) {
     let tempdir = TempDir::default();
     let uri = if use_object_store {
@@ -1311,12 +1393,31 @@ async fn test_delete_branch_with_shared_directory(
         .unwrap();
     remaining.append(data(20), Some(params())).await.unwrap();
 
+    let marker_store = has_directory_marker.then(|| {
+        let mut store = dataset.object_store.as_ref().clone();
+        let marker_store = Arc::new(DirectoryMarkerStore {
+            inner: store.inner.clone(),
+            marker: deleted.base.clone(),
+            listings: AtomicUsize::new(0),
+        });
+        store.inner = marker_store.clone();
+        let store = Arc::new(store);
+        dataset.object_store = store.clone();
+        dataset.refs.object_store = store;
+        marker_store
+    });
     if force {
         let metadata = branch_contents_path(&dataset.base, "a");
         dataset.object_store.delete(&metadata).await.unwrap();
         dataset.force_delete_branch("a").await.unwrap();
     } else {
         dataset.delete_branch("a").await.unwrap();
+    }
+    if let Some(marker_store) = marker_store {
+        assert_eq!(
+            marker_store.listings.load(AtomicOrdering::SeqCst),
+            usize::from(remaining_branch.starts_with("a/"))
+        );
     }
     let branches = dataset.list_branches().await.unwrap();
     assert_eq!(branches.len(), 1);
@@ -1327,7 +1428,8 @@ async fn test_delete_branch_with_shared_directory(
             error,
             Error::NotFound { .. } | Error::DatasetNotFound { .. }
         ));
-        assert!(error.to_string().contains(deleted.base.as_ref()), "{error}");
+        let message = error.to_string().replace('\\', "/");
+        assert!(message.contains(deleted.base.as_ref()), "{error}");
     }
     let files = dataset
         .object_store

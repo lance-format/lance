@@ -673,7 +673,13 @@ impl Branches<'_> {
                         |file| async move { self.object_store().delete(&file.location).await },
                     )
                     .await?;
-                pending.extend(entries.common_prefixes);
+                // Hierarchical stores may include the listed directory's marker.
+                pending.extend(
+                    entries
+                        .common_prefixes
+                        .into_iter()
+                        .filter(|child| child != &path && child.prefix_matches(&path)),
+                );
             } else if let Err(e) = self.object_store().remove_dir_all(path).await {
                 match &e {
                     Error::NotFound { .. } => {
