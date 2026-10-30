@@ -638,20 +638,49 @@ impl Branches<'_> {
         Ok(branches)
     }
 
-    /// Clean up empty parent directories
+    /// Remove branch files while preserving branches that share directories.
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
-
-        if let Some(delete_path) =
+        let delete_path =
             Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?
-            && let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await
-        {
-            match &e {
-                Error::NotFound { .. } => {
-                    log::debug!("Branch directory already deleted");
+                .unwrap_or(self.refs.base_location.find_branch(Some(branch))?.path);
+        let remaining_paths = remaining_branches
+            .iter()
+            .map(|branch| {
+                self.refs
+                    .base_location
+                    .find_branch(Some(branch))
+                    .map(|location| location.path)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut pending = vec![delete_path];
+        while let Some(path) = pending.pop() {
+            if remaining_paths.contains(&path) {
+                continue;
+            }
+            if remaining_paths
+                .iter()
+                .any(|remaining| remaining.prefix_matches(&path))
+            {
+                // A shared directory must remain, but the deleted branch's own
+                // files (especially its manifests) must not remain accessible.
+                let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
+                futures::stream::iter(entries.objects.into_iter().map(Ok))
+                    .try_for_each_concurrent(
+                        self.object_store().io_parallelism(),
+                        |file| async move { self.object_store().delete(&file.location).await },
+                    )
+                    .await?;
+                pending.extend(entries.common_prefixes);
+            } else if let Err(e) = self.object_store().remove_dir_all(path).await {
+                match &e {
+                    Error::NotFound { .. } => {
+                        log::debug!("Branch directory already deleted");
+                    }
+                    _ => return Err(e),
                 }
-                _ => return Err(e),
             }
         }
         Ok(())
@@ -677,8 +706,8 @@ impl Branches<'_> {
         related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
         if let Some(branch) = related_branches.first() {
             if branch.is_child(&deleted_branch) || branch == &deleted_branch {
-                // There are children of the deleted branch, we can't delete any directory for now
-                // Example: deleted_branch = "a/b/c", remaining_branches = ["a/b/c/d"], we need to delete nothing
+                // No single recursive deletion can preserve the remaining branches.
+                // The caller must clean the shared directories selectively instead.
                 return Ok(None);
             } else {
                 // We pick the longest common directory between the deleted branch and the remaining branches

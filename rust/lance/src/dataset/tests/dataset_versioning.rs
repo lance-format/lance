@@ -1273,6 +1273,88 @@ async fn test_list_hierarchical_branches() {
     assert!(branches.contains_key("features/nested"));
 }
 
+#[rstest]
+#[case::child("a/b", false)]
+#[case::nested_child("a/b/c", false)]
+#[case::data_directory("a/data/child", false)]
+#[case::force("a/b", true)]
+#[case::sibling("ab", false)]
+#[tokio::test]
+async fn test_delete_branch_with_shared_directory(
+    #[case] remaining_branch: &str,
+    #[case] force: bool,
+    #[values(false, true)] use_object_store: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let data = |start| {
+        gen_batch()
+            .col("id", array::step_custom::<Int32Type>(start, 1))
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1))
+    };
+    let params = || WriteParams {
+        max_rows_per_file: 1,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(data(0), &uri, Some(params())).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let mut deleted = dataset.create_branch("a", 1, None).await.unwrap();
+    deleted.append(data(10), Some(params())).await.unwrap();
+    let mut remaining = dataset
+        .create_branch(remaining_branch, 1, None)
+        .await
+        .unwrap();
+    remaining.append(data(20), Some(params())).await.unwrap();
+
+    if force {
+        let metadata = branch_contents_path(&dataset.base, "a");
+        dataset.object_store.delete(&metadata).await.unwrap();
+        dataset.force_delete_branch("a").await.unwrap();
+    } else {
+        dataset.delete_branch("a").await.unwrap();
+    }
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 1);
+    assert!(branches.contains_key(remaining_branch));
+    for version in [None, Some(1), Some(2)] {
+        let error = dataset.checkout_version(("a", version)).await.unwrap_err();
+        assert!(matches!(
+            error,
+            Error::NotFound { .. } | Error::DatasetNotFound { .. }
+        ));
+        assert!(error.to_string().contains(deleted.base.as_ref()), "{error}");
+    }
+    let files = dataset
+        .object_store
+        .list(Some(deleted.base.clone()))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        files
+            .iter()
+            .all(|file| file.location.prefix_matches(&remaining.base))
+    );
+
+    let mut recreated = dataset.create_branch("a", 1, None).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
+    recreated.append(data(30), Some(params())).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 4);
+
+    let mut remaining = dataset.checkout_branch(remaining_branch).await.unwrap();
+    remaining.append(data(40), Some(params())).await.unwrap();
+    let batch = remaining.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 1, 20, 21, 40, 41]
+    );
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
