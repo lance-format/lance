@@ -41,6 +41,7 @@ These options apply to all object stores.
 | `proxy_excludes`             | List of hosts that bypass proxy. This is a comma separated list of domains and IP masks. Any subdomain of the provided domain will be bypassed. For example, `example.com, 192.168.1.0/24` would bypass `https://api.example.com`, `https://www.example.com`, and any IP in the range `192.168.1.0/24`. |
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
+| `object_store_cache_prune_threshold` | Smallest number of cached object stores at which a session's object store cache sweeps out entries for stores that are no longer in use. Default, `64`; `0` disables the sweep. The cache is shared by every dataset opened with the same session, and the last value seen applies to all of them. Mainly relevant when a shared session opens many tables with distinct storage options, such as tables opened through a namespace that vends per-table credentials. |
 
 ### Local filesystem durability
 
