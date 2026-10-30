@@ -105,6 +105,10 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
+/// Storage option that sets the registry-wide minimum prune threshold of the
+/// object store cache; see [`StorageOptions::object_store_cache_prune_threshold`].
+pub const OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION: &str = "object_store_cache_prune_threshold";
+
 #[derive(Debug)]
 struct StreamCopyError {
     stage: &'static str,
@@ -1944,6 +1948,26 @@ impl StorageOptions {
             ))
         })?;
         Ok(Some(block_size))
+    }
+
+    /// Minimum cache size at which the session's object store registry sweeps
+    /// out entries whose store is no longer in use; `0` disables the sweep.
+    /// See [`ObjectStoreRegistry::get_store()`].
+    pub fn object_store_cache_prune_threshold(&self) -> Result<Option<usize>> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION))
+        else {
+            return Ok(None);
+        };
+        let threshold = value.trim().parse::<usize>().map_err(|err| {
+            Error::invalid_input(format!(
+                "storage option {OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION} must be a \
+                 non-negative integer, got `{value}`: {err}"
+            ))
+        })?;
+        Ok(Some(threshold))
     }
 
     /// Whether local writes must sync files and directory entries before returning.

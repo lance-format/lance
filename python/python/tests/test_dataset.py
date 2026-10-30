@@ -7197,21 +7197,11 @@ def test_transaction_audit_fields(tmp_path):
         pa.table({"id": [3, 4]}), tmp_path / "base", mode="append"
     )
 
-    empty = lance.LanceOperation.UpdateMemWalState()
-    tagged = lance.Transaction(
-        read_version=dataset.version, operation=empty, tag="audit-window"
-    )
-    dataset = lance.LanceDataset.commit(dataset, tagged)
-    read_back = dataset.read_transaction(dataset.version)
-    assert read_back.tag == "audit-window"
-    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
-    assert list(read_back.operation.compacted_sstables) == []
-
     shard_id = str(uuid.uuid4())
     recorded = lance.LanceOperation.UpdateMemWalState(
         compacted_sstables=[CompactedSsTable(shard_id, 3)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="Stale MemWAL"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=recorded),
@@ -7220,11 +7210,24 @@ def test_transaction_audit_fields(tmp_path):
     update = lance.LanceOperation.Update(
         compacted_sstables=[CompactedSsTable(shard_id, 1)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="mem_wal_dir_id"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=update),
         )
+
+    dataset.initialize_mem_wal(unsharded=True)
+    dir_id = dataset.mem_wal_index_details()["dir_id"]
+    empty = lance.LanceOperation.UpdateMemWalState(dir_id=dir_id)
+    tagged = lance.Transaction(
+        read_version=dataset.version, operation=empty, tag="audit-window"
+    )
+    dataset = lance.LanceDataset.commit(dataset, tagged)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.tag == "audit-window"
+    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
+    assert list(read_back.operation.compacted_sstables) == []
+    assert read_back.operation.dir_id == dir_id
 
     dataset.optimize.compact_files()
     rewrite = dataset.read_transaction(dataset.version)

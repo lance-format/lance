@@ -3,6 +3,7 @@
 
 //! Metadata for index
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
@@ -61,7 +62,8 @@ pub struct IndexMetadata {
     ///
     /// These ids also appear in [`Self::fields`]. That is deliberate: every
     /// consumer that reads `fields` as the index's dependency set then covers
-    /// them with no change.
+    /// them with no change. Dependency checks read
+    /// [`Self::dependency_fields`], which does not rely on that repetition.
     pub covering_fields: Vec<i32>,
 
     /// Human readable index name
@@ -93,6 +95,8 @@ pub struct IndexMetadata {
     ///
     /// This field is optional for backward compatibility. For existing indices created before
     /// this field was added, this will be None.
+    ///
+    /// An out-of-range value fails the conversion with [`Error::CorruptFile`] rather than defaulting.
     pub created_at: Option<DateTime<Utc>>,
 
     /// The base path index of the index files. Used when the index is imported or referred from another dataset.
@@ -270,8 +274,8 @@ impl IndexMetadata {
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
     /// columns of [`Self::covering_fields`] removed.
     ///
-    /// Only this prefix decides which column an index answers for; the full
-    /// `fields` vector answers what invalidates it. Empty for a system index
+    /// Only this prefix decides which column an index answers for;
+    /// [`Self::dependency_fields`] answers what invalidates it. Empty for a system index
     /// that declares no fields, and empty for a declaration longer than
     /// `fields`: decoding validates, but metadata built by a caller this build
     /// never validated does not, and failing closed beats an underflow.
@@ -290,6 +294,55 @@ impl IndexMetadata {
             [only] => Some(*only),
             _ => None,
         }
+    }
+
+    /// Every field whose change can leave this index stale: [`Self::fields`],
+    /// then each of [`Self::covering_fields`] that `fields` does not list,
+    /// once.
+    ///
+    /// The suffix contract repeats every carried column in `fields`, and then
+    /// this borrows `fields`. A declaration whose `fields` holds only keyed
+    /// columns lists the carried ones in `covering_fields` alone, so a
+    /// dependency check that reads `fields` would miss them.
+    ///
+    /// ```
+    /// use lance_table::format::IndexMetadata;
+    ///
+    /// let mut index = IndexMetadata {
+    ///     uuid: uuid::Uuid::new_v4(),
+    ///     name: "vector_idx".to_string(),
+    ///     fields: vec![0, 1],
+    ///     covering_fields: vec![1],
+    ///     dataset_version: 1,
+    ///     fragment_bitmap: None,
+    ///     index_details: None,
+    ///     index_version: 0,
+    ///     created_at: None,
+    ///     base_id: None,
+    ///     files: None,
+    ///     clustering_id: None,
+    ///     metadata: Default::default(),
+    /// };
+    /// assert_eq!(index.dependency_fields().as_ref(), &[0, 1]);
+    ///
+    /// index.fields = vec![0];
+    /// assert_eq!(index.dependency_fields().as_ref(), &[0, 1]);
+    /// ```
+    pub fn dependency_fields(&self) -> Cow<'_, [i32]> {
+        if self
+            .covering_fields
+            .iter()
+            .all(|field| self.fields.contains(field))
+        {
+            return Cow::Borrowed(&self.fields);
+        }
+        let mut fields = self.fields.clone();
+        for field in &self.covering_fields {
+            if !fields.contains(field) {
+                fields.push(*field);
+            }
+        }
+        Cow::Owned(fields)
     }
 
     /// Check the covering declaration against [`Self::fields`].
@@ -414,6 +467,23 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             )
         };
 
+        let out_of_range = |ts: u64| {
+            Error::corrupt_file_named(
+                "index metadata",
+                format!(
+                    "index {} created_at timestamp out of range: {ts}",
+                    proto.name
+                ),
+            )
+        };
+        let created_at = proto
+            .created_at
+            .map(|ts| {
+                DateTime::from_timestamp_millis(i64::try_from(ts).map_err(|_| out_of_range(ts))?)
+                    .ok_or_else(|| out_of_range(ts))
+            })
+            .transpose()?;
+
         let metadata = Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
@@ -425,10 +495,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             fragment_bitmap,
             index_details: proto.index_details.map(Arc::new),
             index_version: proto.index_version.unwrap_or_default(),
-            created_at: proto.created_at.map(|ts| {
-                DateTime::from_timestamp_millis(ts as i64)
-                    .expect("Invalid timestamp in index metadata")
-            }),
+            created_at,
             base_id: proto.base_id,
             files,
             clustering_id: proto.clustering_id,
@@ -640,6 +707,28 @@ mod tests {
         assert_eq!(recovered.fragment_bitmap, Some(bitmap));
     }
 
+    #[rstest]
+    #[case::above_chrono_max(9_000_000_000_000_000)]
+    #[case::negative_wrap_u64_max(u64::MAX)]
+    #[case::negative_wrap_i64_boundary(i64::MAX as u64 + 1)]
+    fn test_index_metadata_rejects_out_of_range_created_at(#[case] created_at: u64) {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        proto.created_at = Some(created_at);
+
+        let err = IndexMetadata::try_from(proto).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "got: {err:?}");
+        assert!(err.to_string().contains("created_at"), "got: {err}");
+    }
+
+    #[test]
+    fn test_index_metadata_created_at_roundtrip() {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.created_at = Some(DateTime::from_timestamp_millis(1_700_000_000_000).unwrap());
+
+        let recovered = IndexMetadata::try_from(pb::IndexMetadata::from(&metadata)).unwrap();
+        assert_eq!(recovered.created_at, metadata.created_at);
+    }
+
     #[test]
     fn test_deep_size_counts_index_details() {
         // Spare capacity on both buffers, so counting `len()` instead of `capacity()` fails.
@@ -843,6 +932,27 @@ mod tests {
 
         assert_eq!(metadata.keyed_fields(), expected_keyed.as_slice());
         assert_eq!(metadata.keyed_field(), expected_single);
+    }
+
+    /// The dependency set is the same whether or not `fields` repeats the
+    /// carried columns, and borrows `fields` when it does.
+    #[rstest]
+    #[case::not_covered(vec![7], vec![], vec![7], true)]
+    #[case::suffix(vec![7, 11], vec![11], vec![7, 11], true)]
+    #[case::keys_only(vec![7], vec![11], vec![7, 11], false)]
+    #[case::partial_overlap(vec![7, 11], vec![11, 13], vec![7, 11, 13], false)]
+    #[case::duplicate_carried(vec![7], vec![11, 11], vec![7, 11], false)]
+    fn test_dependency_fields(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected: Vec<i32>,
+        #[case] borrows: bool,
+    ) {
+        let metadata = index_metadata_with(fields, covering_fields);
+        let dependency_fields = metadata.dependency_fields();
+
+        assert_eq!(dependency_fields.as_ref(), expected.as_slice());
+        assert_eq!(matches!(dependency_fields, Cow::Borrowed(_)), borrows);
     }
 
     fn index_metadata_with(fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
