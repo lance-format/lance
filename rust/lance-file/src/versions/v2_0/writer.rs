@@ -501,6 +501,12 @@ impl Writer {
         Ok(())
     }
 
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.column_writers {
+            encoder.prepare_for_flush();
+        }
+    }
+
     /// Write a single column, advancing only that column's row counter.
     ///
     /// Unlike [`write_batch`](Self::write_batch), which advances every column

@@ -481,6 +481,8 @@ impl DataFileFieldInterner {
             physical_rows,
             last_updated_at_version_meta,
             created_at_version_meta,
+            clustering_id: p.clustering_id,
+            metadata: p.metadata,
         })
     }
 }
@@ -578,6 +580,19 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// The clustering definition this fragment was organized under when it
+    /// was created, by `Manifest::clustering` id. Operations on the same
+    /// fragment keep it; a fragment written from this one does not inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clustering_id: Option<u32>,
+
+    /// Arbitrary metadata attached to this fragment, like
+    /// `Manifest::table_metadata`. Operations on the same fragment preserve
+    /// every entry, including keys this build does not understand; new
+    /// fragments carry only what their writer sets.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
 }
 
 impl Fragment {
@@ -591,6 +606,8 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -629,6 +646,8 @@ impl Fragment {
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
+            clustering_id: _,
+            metadata: _,
         } = self;
         files
             .iter()
@@ -650,6 +669,8 @@ impl Fragment {
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
+            clustering_id: _,
+            metadata: _,
         } = self;
         files
             .iter_mut()
@@ -769,6 +790,8 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -888,6 +911,8 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            clustering_id: p.clustering_id,
+            metadata: p.metadata,
         })
     }
 }
@@ -926,8 +951,8 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
-            clustering_id: None,
-            metadata: Default::default(),
+            clustering_id: f.clustering_id,
+            metadata: f.metadata.clone(),
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }

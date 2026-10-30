@@ -151,39 +151,83 @@ pub(crate) fn derived_store_params(params: &ObjectStoreParams) -> ObjectStorePar
     }
 }
 
+/// Name of the legacy MemWAL directory, used when the index carries no `dir_id`.
+const LEGACY_MEM_WAL_DIR: &str = "_mem_wal";
+
+/// Name of the MemWAL directory for `dir_id`: `_{dir_id}_mem_wal`, or the
+/// legacy `_mem_wal` when `dir_id` is empty.
+pub fn mem_wal_dir_name(dir_id: &str) -> String {
+    if dir_id.is_empty() {
+        LEGACY_MEM_WAL_DIR.to_string()
+    } else {
+        format!("_{dir_id}_mem_wal")
+    }
+}
+
+/// Mint a random 8-hex-character `dir_id`; callers re-mint on collision.
+pub(crate) fn generate_mem_wal_dir_id(base_uri: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let random: u64 = rand::random();
+    let mut hasher = DefaultHasher::new();
+    random.hash(&mut hasher);
+    base_uri.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
 /// Path to the MemWAL root directory.
 ///
-/// Returns: `{base_path}/_mem_wal/`
-pub fn mem_wal_path(base_path: &Path) -> Path {
-    base_path.clone().join("_mem_wal")
+/// Returns: `{base_path}/{mem_wal_dir}/`
+pub fn mem_wal_path(base_path: &Path, dir_id: &str) -> Path {
+    base_path.clone().join(mem_wal_dir_name(dir_id))
 }
 
 /// Base path for a shard within the MemWAL directory.
 ///
-/// Returns: `{base_path}/_mem_wal/{shard_id}/`
-pub fn shard_base_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    mem_wal_path(base_path).join(shard_id.as_hyphenated().to_string())
+/// Returns: `{base_path}/{mem_wal_dir}/{shard_id}/`
+pub fn shard_base_path(base_path: &Path, dir_id: &str, shard_id: &Uuid) -> Path {
+    mem_wal_path(base_path, dir_id).join(shard_id.as_hyphenated().to_string())
 }
 
 /// Path to the WAL directory for a shard.
 ///
-/// Returns: `{base_path}/_mem_wal/{shard_id}/wal/`
-pub fn shard_wal_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    shard_base_path(base_path, shard_id).join("wal")
+/// Returns: `{base_path}/{mem_wal_dir}/{shard_id}/wal/`
+pub fn shard_wal_path(base_path: &Path, dir_id: &str, shard_id: &Uuid) -> Path {
+    shard_base_path(base_path, dir_id, shard_id).join("wal")
 }
 
 /// Path to the manifest directory for a shard.
 ///
-/// Returns: `{base_path}/_mem_wal/{shard_id}/manifest/`
-pub fn shard_manifest_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    shard_base_path(base_path, shard_id).join("manifest")
+/// Returns: `{base_path}/{mem_wal_dir}/{shard_id}/manifest/`
+pub fn shard_manifest_path(base_path: &Path, dir_id: &str, shard_id: &Uuid) -> Path {
+    shard_base_path(base_path, dir_id, shard_id).join("manifest")
 }
 
 /// Path to an SSTable directory.
 ///
-/// Returns: `{base_path}/_mem_wal/{shard_id}/{random_hash}_gen_{generation}/`
-pub fn sstable_path(base_path: &Path, shard_id: &Uuid, random_hash: &str, generation: u64) -> Path {
-    shard_base_path(base_path, shard_id).join(format!("{}_gen_{}", random_hash, generation))
+/// Returns: `{base_path}/{mem_wal_dir}/{shard_id}/{random_hash}_gen_{generation}/`
+pub fn sstable_path(
+    base_path: &Path,
+    dir_id: &str,
+    shard_id: &Uuid,
+    random_hash: &str,
+    generation: u64,
+) -> Path {
+    shard_base_path(base_path, dir_id, shard_id).join(format!("{}_gen_{}", random_hash, generation))
+}
+
+/// URI of an SSTable directory, from the table-root URI and the folder name
+/// recorded in `SsTable.path`.
+///
+/// Returns: `{base_uri}/{mem_wal_dir}/{shard_id}/{folder_name}`
+pub fn sstable_uri(base_uri: &str, dir_id: &str, shard_id: &Uuid, folder_name: &str) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        base_uri.trim_end_matches('/'),
+        mem_wal_dir_name(dir_id),
+        shard_id,
+        folder_name
+    )
 }
 
 /// Subdirectory of an SSTable holding its standalone primary-key
@@ -278,10 +322,10 @@ mod tests {
     #[test]
     fn test_mem_wal_path() {
         let base_path = Path::from("my/dataset");
-        assert_eq!(mem_wal_path(&base_path).as_ref(), "my/dataset/_mem_wal");
+        assert_eq!(mem_wal_path(&base_path, "").as_ref(), "my/dataset/_mem_wal");
 
         let empty_base = Path::from("");
-        assert_eq!(mem_wal_path(&empty_base).as_ref(), "_mem_wal");
+        assert_eq!(mem_wal_path(&empty_base, "").as_ref(), "_mem_wal");
     }
 
     #[test]
@@ -290,29 +334,29 @@ mod tests {
         let shard_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
 
         assert_eq!(
-            shard_base_path(&base_path, &shard_id).as_ref(),
+            shard_base_path(&base_path, "", &shard_id).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000"
         );
 
         assert_eq!(
-            shard_wal_path(&base_path, &shard_id).as_ref(),
+            shard_wal_path(&base_path, "", &shard_id).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/wal"
         );
 
         assert_eq!(
-            shard_manifest_path(&base_path, &shard_id).as_ref(),
+            shard_manifest_path(&base_path, "", &shard_id).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/manifest"
         );
 
         assert_eq!(
-            sstable_path(&base_path, &shard_id, "a1b2c3d4", 5).as_ref(),
+            sstable_path(&base_path, "", &shard_id, "a1b2c3d4", 5).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/a1b2c3d4_gen_5"
         );
 
         // Test with empty base path
         let empty_base = Path::from("");
         assert_eq!(
-            shard_wal_path(&empty_base, &shard_id).as_ref(),
+            shard_wal_path(&empty_base, "", &shard_id).as_ref(),
             "_mem_wal/550e8400-e29b-41d4-a716-446655440000/wal"
         );
     }

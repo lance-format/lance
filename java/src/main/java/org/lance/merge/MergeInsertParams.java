@@ -15,6 +15,7 @@ package org.lance.merge;
 
 import org.lance.DataStorageVersion;
 import org.lance.memwal.CompactedSsTable;
+import org.lance.memwal.MemWalIndexDetails;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -43,6 +44,7 @@ public class MergeInsertParams {
   private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
   private MergeWriteMode writeMode = MergeWriteMode.Auto;
   private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+  private Optional<String> memWalDirId = Optional.empty();
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -291,13 +293,30 @@ public class MergeInsertParams {
    * process then died before the matching upsert, the recorded progress would claim rows were
    * copied in that never were.
    *
+   * <p>The commit fails if the table's MemWAL has since been disabled or replaced. Pass an empty
+   * {@code sstables} on the passes that record no progress, so they are checked too.
+   *
+   * @param dirId the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL the SSTables belong to
    * @param sstables the SSTables being compacted
    * @return This MergeInsertParams instance
    */
-  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
+  public MergeInsertParams markSstablesAsCompacted(String dirId, List<CompactedSsTable> sstables) {
+    Preconditions.checkNotNull(dirId, "dirId must not be null");
     Preconditions.checkNotNull(sstables, "sstables must not be null");
+    this.memWalDirId = Optional.of(dirId);
     this.compactedSstables = sstables;
     return this;
+  }
+
+  /**
+   * Mark SSTables of a MemWAL without a {@code dirId} as compacted.
+   *
+   * @deprecated Use {@link #markSstablesAsCompacted(String, List)}, which names the MemWAL the
+   *     SSTables belong to.
+   */
+  @Deprecated
+  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
+    return markSstablesAsCompacted("", sstables);
   }
 
   public List<String> on() {
@@ -306,6 +325,11 @@ public class MergeInsertParams {
 
   public List<CompactedSsTable> getCompactedSstables() {
     return compactedSstables;
+  }
+
+  /** The {@code dirId} passed to {@link #markSstablesAsCompacted(String, List)}, if any. */
+  public Optional<String> getMemWalDirId() {
+    return memWalDirId;
   }
 
   public WhenMatched whenMatched() {

@@ -1579,9 +1579,12 @@ async fn test_constant_layout_out_of_line_utf8_v2_2() {
     assert!(layout.inline_value.is_none());
     assert_eq!(page.data.len(), 1);
 
+    // No definition levels here, so the row count of a mid-page read comes from `drain`
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(100..300)
+        .with_indices(vec![1, 150, 400]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
@@ -1661,7 +1664,9 @@ async fn test_constant_layout_nullable_item_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..4)
+        .with_indices(vec![1, 4]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
@@ -1706,7 +1711,9 @@ async fn test_constant_layout_list_repdef_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..3)
+        .with_indices(vec![1, 3]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 

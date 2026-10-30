@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::Float32Array;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance::dataset::statistics::DatasetStatisticsExt;
@@ -2123,20 +2122,13 @@ impl LanceNamespace for DirectoryNamespace {
         // Build scanner
         let mut scanner = dataset.scan();
 
-        // Check if this is a vector search query
-        // vector is Box<QueryTableRequestVector>, not Option
-        let has_vector_query = request
-            .vector
-            .single_vector
-            .as_ref()
-            .map(|sv| !sv.is_empty())
-            .unwrap_or(false)
-            || request
-                .vector
-                .multi_vector
-                .as_ref()
-                .map(|mv| !mv.is_empty())
-                .unwrap_or(false);
+        let query_array =
+            Self::query_vector_array(&request.vector, request.offset).map_err(|e| {
+                NamespaceError::InvalidInput {
+                    message: format!("Invalid vector search for query_table: {}", e),
+                }
+            })?;
+        let has_vector_query = query_array.is_some();
 
         // Apply prefilter setting (must be set before nearest)
         if let Some(prefilter) = request.prefilter {
@@ -2144,84 +2136,67 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Apply vector search if query vector is provided
-        if has_vector_query {
+        if let Some(query_array) = query_array {
             let vector_column = request.vector_column.as_deref().unwrap_or("vector");
 
-            // Get the query vector(s)
-            let query_vector: Vec<f32> = request
-                .vector
-                .single_vector
-                .clone()
-                .or_else(|| {
-                    request
-                        .vector
-                        .multi_vector
-                        .as_ref()
-                        .and_then(|mv| mv.first().cloned())
-                })
-                .unwrap_or_default();
+            let k = if request.k > 0 {
+                request.k as usize
+            } else {
+                10
+            };
+            scanner
+                .nearest(vector_column, query_array.as_ref(), k)
+                .map_err(|e| NamespaceError::InvalidInput {
+                    message: format!("Invalid vector search: {:?}", e),
+                })?;
 
-            if !query_vector.is_empty() {
-                let k = if request.k > 0 {
-                    request.k as usize
-                } else {
-                    10
-                };
-                let query_array = Float32Array::from(query_vector);
-                scanner
-                    .nearest(vector_column, &query_array, k)
-                    .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid vector search: {:?}", e),
-                    })?;
-
-                // Apply distance type if specified
-                if let Some(ref distance_type) = request.distance_type {
-                    let metric = match distance_type.to_lowercase().as_str() {
-                        "l2" | "euclidean" => MetricType::L2,
-                        "cosine" => MetricType::Cosine,
-                        "dot" | "inner_product" => MetricType::Dot,
-                        "hamming" => MetricType::Hamming,
-                        _ => {
-                            return Err(NamespaceError::InvalidInput {
-                                message: format!("Unknown distance type: {}", distance_type),
-                            }
-                            .into());
+            // Apply distance type if specified
+            if let Some(ref distance_type) = request.distance_type {
+                let metric = match distance_type.to_lowercase().as_str() {
+                    "l2" | "euclidean" => MetricType::L2,
+                    "cosine" => MetricType::Cosine,
+                    "dot" | "inner_product" => MetricType::Dot,
+                    "hamming" => MetricType::Hamming,
+                    _ => {
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!("Unknown distance type: {}", distance_type),
                         }
-                    };
-                    scanner.distance_metric(metric);
-                }
+                        .into());
+                    }
+                };
+                scanner.distance_metric(metric);
+            }
 
-                apply_probe_bounds(
-                    &mut scanner,
-                    request.nprobes,
-                    request.minimum_nprobes,
-                    request.maximum_nprobes,
-                )?;
+            apply_probe_bounds(
+                &mut scanner,
+                request.nprobes,
+                request.minimum_nprobes,
+                request.maximum_nprobes,
+            )?;
 
-                // Apply ef (HNSW search effort) if specified
-                if let Some(ef) = request.ef {
-                    scanner.ef(ef as usize);
-                }
+            // Apply ef (HNSW search effort) if specified
+            if let Some(ef) = request.ef {
+                scanner.ef(ef as usize);
+            }
 
-                // Apply refine_factor if specified
-                if let Some(refine_factor) = request.refine_factor {
-                    scanner.refine(refine_factor as u32);
-                }
+            // Apply refine_factor if specified
+            if let Some(refine_factor) = request.refine_factor {
+                scanner.refine(refine_factor as u32);
+            }
 
-                // Apply distance bounds if specified
-                if request.lower_bound.is_some() || request.upper_bound.is_some() {
-                    scanner.distance_range(request.lower_bound, request.upper_bound);
-                }
+            // Apply distance bounds if specified
+            if request.lower_bound.is_some() || request.upper_bound.is_some() {
+                scanner.distance_range(request.lower_bound, request.upper_bound);
+            }
 
-                // Apply use_index (inverse of bypass_vector_index)
-                if let Some(bypass) = request.bypass_vector_index {
-                    scanner.use_index(!bypass);
-                }
+            // Apply use_index (inverse of bypass_vector_index)
+            if let Some(bypass) = request.bypass_vector_index {
+                scanner.use_index(!bypass);
+            }
 
-                // Apply fast_search if specified
-                if request.fast_search == Some(true) {
-                    scanner.fast_search();
-                }
+            // Apply fast_search if specified
+            if request.fast_search == Some(true) {
+                scanner.fast_search();
             }
         }
 

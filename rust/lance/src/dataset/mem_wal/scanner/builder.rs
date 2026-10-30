@@ -206,6 +206,8 @@ pub struct LsmScanner {
     /// In-memory memtables by shard (active + frozen-awaiting-flush), so
     /// the scanner path carries frozen-undrained generations too.
     in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
+    /// The MemWAL's `dir_id`, handed to the collector.
+    mem_wal_dir_id: String,
 
     // Query configuration
     projection: Option<Vec<String>>,
@@ -273,6 +275,7 @@ impl LsmScanner {
             schema: Arc::new(arrow_schema),
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            mem_wal_dir_id: String::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -320,6 +323,7 @@ impl LsmScanner {
             schema,
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            mem_wal_dir_id: String::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -376,6 +380,13 @@ impl LsmScanner {
         memtables: InMemoryMemTables,
     ) -> Self {
         self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Set the MemWAL `dir_id` the snapshots' SSTables live under. See
+    /// [`LsmDataSourceCollector::with_mem_wal_dir_id`].
+    pub fn with_mem_wal_dir_id(mut self, dir_id: impl Into<String>) -> Self {
+        self.mem_wal_dir_id = dir_id.into();
         self
     }
 
@@ -953,7 +964,8 @@ impl LsmScanner {
                 path.clone(),
                 self.shard_snapshots.clone(),
             ),
-        };
+        }
+        .with_mem_wal_dir_id(self.mem_wal_dir_id.clone());
 
         for (shard_id, mems) in &self.in_memory_memtables {
             collector = collector.with_in_memory_memtables(*shard_id, mems.clone());

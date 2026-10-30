@@ -127,7 +127,7 @@ tbl = pa.Table.from_pandas(pd.DataFrame({"a": [42]}))
 lance.write_dataset(tbl, experiment_branch, mode="append")
 ```
 
-For more details, see [Tags and Branches](../guide/tags_and_branches.md).
+For more details, see [Tags and Branches](../guide/tags_and_branches.md). To preserve logical row identity across updates and compaction, see [Stable Row IDs and Lineage](../guide/row_ids.md).
 
 ## Next Steps
 

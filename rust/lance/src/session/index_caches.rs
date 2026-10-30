@@ -230,11 +230,15 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        // v2 holds every index the manifest names; v1 held only the ones the
-        // writing build could read. The fields are identical, so on a persistent
-        // backend shared with another release nothing but this version stops each
-        // build from reading the other's entry as its own meaning.
-        CacheKeySchema::new("lance.index.metadata-key", 2)
+        // v3 entries carry each segment's clustering reference and metadata;
+        // a v2 entry, written by a build that did not know those fields, holds
+        // every segment unlabelled, and a writer trusting it would republish
+        // the index section without the labels. v2 in turn holds every index
+        // the manifest names where v1 held only the readable ones. On a
+        // persistent backend shared with another release nothing but this
+        // version stops each build from reading the other's entry as its own
+        // meaning.
+        CacheKeySchema::new("lance.index.metadata-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
