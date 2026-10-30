@@ -818,6 +818,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - rows_scanned: total rows examined during the scan
         - iops: number of I/O operations performed
         - requests: number of storage requests made
+        - task_wait_time: time spent waiting for scheduled I/O
+        - decode_time: time spent decoding, summed over concurrent decode tasks
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
 
