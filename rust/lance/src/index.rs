@@ -4137,6 +4137,27 @@ pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
 }
 
 impl Dataset {
+    /// The FRI part of a segment's vector cache keys, resolved the way the
+    /// open path resolves it (see [`frag_reuse::fri_cache_id`]). `None` when
+    /// it cannot be resolved here.
+    async fn segment_cache_id(
+        &self,
+        uuid: &Uuid,
+        purpose: frag_reuse::OpenPurpose,
+    ) -> Option<Option<Uuid>> {
+        let index = self.load_index_with_purpose(uuid, purpose).await.ok()??;
+        let resolved = frag_reuse::open_row_id_remapping_with_plan(
+            self,
+            &index,
+            None,
+            purpose,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .ok()?;
+        Some(frag_reuse::fri_cache_id(&resolved).copied())
+    }
+
     /// The segment's metadata for the given purpose. A query sees the derived
     /// listing only. Maintenance also reaches a registered segment the tagged
     /// reader left out of the listing (its coverage was withdrawn by an
@@ -4177,9 +4198,15 @@ impl Dataset {
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
         // key is a plugin detail), so there is no cheap scalar check here.
         let frag_reuse_uuid = v0_frag_reuse_cache_id(self).await;
+        // A cached legacy entry is returned without resolving the segment
+        // again, so an unresolved one probes under the whole history.
+        let segment_cache_id = self
+            .segment_cache_id(uuid, purpose)
+            .await
+            .unwrap_or(frag_reuse_uuid);
 
         // Check sized cache for IvfIndexState (v2+ indices).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let state_key = IvfIndexStateCacheKey::new(uuid, segment_cache_id.as_ref());
         if self.index_cache.get_with_key(&state_key).await.is_some() {
             // Reconstruct via open_vector_index which will hit the same sized key.
             let index = self
@@ -4189,7 +4216,7 @@ impl Dataset {
         }
 
         // Fallback: in-memory cache for legacy indices.
-        let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, segment_cache_id.as_ref());
         if let Some(cached) = self.index_cache.get_with_key(&vector_cache_key).await {
             return Ok(cached.0.clone().as_index());
         }

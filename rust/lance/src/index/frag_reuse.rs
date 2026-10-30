@@ -40,7 +40,12 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
     /// A v0 FRI mapping served by the compact in-memory handle.
-    V0(Arc<dyn RowIdRemapper>),
+    V0 {
+        remapper: Arc<dyn RowIdRemapper>,
+        /// The segment's cache identity under this history (see
+        /// [`v0_segment_cache_id`]).
+        cache_id: Option<Uuid>,
+    },
     /// A tagged history under which this segment's rows are unchanged.
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
@@ -55,7 +60,10 @@ pub(crate) enum ResolvedRemapping {
 impl std::fmt::Debug for ResolvedRemapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
+            Self::V0 { cache_id, .. } => f
+                .debug_struct("V0")
+                .field("cache_id", cache_id)
+                .finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
             Self::V1Translate { remapper, .. } => {
                 f.debug_tuple("V1Translate").field(remapper).finish()
@@ -94,18 +102,62 @@ pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uui
     Uuid::from_bytes(identity)
 }
 
+/// The part of a v0 history that can change one segment's decoded rows, as a
+/// cache identity, or `None` when no part can.
+///
+/// A v0 remapper is applied while the segment is decoded, but a version the
+/// segment has caught up on moves none of its rows: that is the condition
+/// under which the trim may drop the version (`is_index_remap_caught_up`), so
+/// decoding with or without it gives the same rows. Keying on the contents of
+/// the remaining versions keeps a segment warm across compactions of
+/// fragments it never covered and across trims, while a version on its path
+/// still changes the key. A segment with no fragment bitmap cannot be
+/// classified and keeps the whole history's identity.
+fn v0_segment_cache_id(
+    history: Uuid,
+    details: &FragReuseIndexDetails,
+    segment: &IndexMetadata,
+) -> Option<Uuid> {
+    if segment.fragment_bitmap.is_none() {
+        return Some(history);
+    }
+    let chain = crate::dataset::index::frag_reuse::reuse_chain_frag_bitmap(&details.versions);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lance.frag_reuse.v0_segment_cache_id");
+    let mut on_path = false;
+    for version in &details.versions {
+        // A version the gate cannot classify is treated as on the path.
+        let caught_up =
+            crate::dataset::index::frag_reuse::is_index_remap_caught_up(version, segment, &chain)
+                .unwrap_or(false);
+        if caught_up {
+            continue;
+        }
+        on_path = true;
+        let encoded = pb_fri::Version::from(version).encode_to_vec();
+        hasher.update(&(encoded.len() as u64).to_le_bytes());
+        hasher.update(&encoded);
+    }
+    on_path.then(|| {
+        let mut identity = [0; 16];
+        identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Uuid::from_bytes(identity)
+    })
+}
+
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the history, by its
-/// [`v0_cache_identity`], identify cached content. Under a tagged history the
-/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
-/// for transitions a segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the history identify
+/// cached content, and only through the versions on the segment's path (see
+/// [`v0_segment_cache_id`]). Under a tagged history the FRI is deliberately
+/// left out: every rewrite and trim mints a new UUID, even for transitions a
+/// segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
     match resolved {
-        Some((uuid, ResolvedRemapping::V0(_))) => Some(uuid),
+        Some((_, ResolvedRemapping::V0 { cache_id, .. })) => cache_id.as_ref(),
         _ => None,
     }
 }
@@ -616,10 +668,15 @@ pub(super) async fn open_row_id_remapping_with_plan(
         index,
     )?;
     if fri.index_version == 0 {
+        let history = v0_cache_identity(dataset, fri);
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
+            let cache_id = v0_segment_cache_id(history, &legacy.details, index);
             (
-                v0_cache_identity(dataset, fri),
-                ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
+                history,
+                ResolvedRemapping::V0 {
+                    remapper: Arc::new(CompactFragReuseIndexHandle(legacy)),
+                    cache_id,
+                },
             )
         }));
     }
