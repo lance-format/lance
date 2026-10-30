@@ -1037,7 +1037,16 @@ where
                 } else {
                     num_rows_in_current_file + batch_chunk_rows >= params.max_rows_per_file
                 };
-                if reaches_row_limit {
+                let input_memory = batch_chunk
+                    .iter()
+                    .map(RecordBatch::get_array_memory_size)
+                    .sum::<usize>();
+                let data_cache_bytes = params
+                    .file_writer_options
+                    .as_ref()
+                    .and_then(|options| options.data_cache_bytes)
+                    .unwrap_or(8 * 1024 * 1024);
+                if reaches_row_limit && input_memory > data_cache_bytes as usize {
                     active_writer.prepare_for_flush();
                 }
                 active_writer.write(&batch_chunk).await?;
