@@ -40,6 +40,11 @@ impl LocalDirOperations for FileSystemDirOperations {
         .await
         .map_err(|error| Error::io(format!("recursive directory removal task failed: {error}")))?
     }
+
+    async fn canonicalize(&self, path: &Path) -> Result<Option<std::path::PathBuf>> {
+        let local_path = self.local_file_system.path_to_filesystem(path)?;
+        Ok(tokio::fs::canonicalize(local_path).await.ok())
+    }
 }
 
 #[cfg(windows)]
@@ -272,6 +277,27 @@ mod tests {
             .unwrap();
 
         assert!(!dataset.exists(), "recursive deletion must remove the tree");
+    }
+
+    #[tokio::test]
+    async fn test_rooted_canonicalize_uses_local_root() {
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("share");
+        let dataset = root.join("dataset");
+        create_dir_all(&dataset).unwrap();
+        let store = rooted_local_store(&root);
+
+        let canonical = store
+            .canonicalize_local_path(&Path::from("dataset"))
+            .await
+            .unwrap()
+            .expect("rooted local paths should canonicalize");
+
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(dataset).unwrap(),
+            "canonicalization must use the store's filesystem root"
+        );
     }
 
     #[cfg(unix)]

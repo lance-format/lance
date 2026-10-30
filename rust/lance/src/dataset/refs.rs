@@ -6,7 +6,6 @@ use std::ops::Range;
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_io::local::to_local_path;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
@@ -670,17 +669,9 @@ impl Branches<'_> {
                             .map(|location| location.path)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                // Case-insensitive local filesystems can expose a surviving branch under a
-                // different spelling. Remote object stores remain case-sensitive.
-                let canonicalize_local_paths = self.object_store().has_direct_local_paths()
-                    || self.object_store().scheme() == "file-object-store";
                 let mut remaining_paths = Vec::with_capacity(branch_paths.len());
                 for path in branch_paths {
-                    let canonical_path = if canonicalize_local_paths {
-                        tokio::fs::canonicalize(to_local_path(&path)).await.ok()
-                    } else {
-                        None
-                    };
+                    let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
                     remaining_paths.push(RemainingBranchPath {
                         path,
                         canonical_path,
@@ -689,12 +680,9 @@ impl Branches<'_> {
 
                 let mut pending = vec![delete_path];
                 while let Some(path) = pending.pop() {
-                    match Self::classify_shared_branch_path(
-                        &path,
-                        &remaining_paths,
-                        canonicalize_local_paths,
-                    )
-                    .await
+                    match self
+                        .classify_shared_branch_path(&path, &remaining_paths)
+                        .await?
                     {
                         SharedBranchPath::Remaining => continue,
                         SharedBranchPath::Ancestor => {
@@ -795,32 +783,28 @@ impl Branches<'_> {
     }
 
     async fn classify_shared_branch_path(
+        &self,
         path: &Path,
         remaining_paths: &[RemainingBranchPath],
-        canonicalize_local_paths: bool,
-    ) -> SharedBranchPath {
-        let canonical_path = if canonicalize_local_paths {
-            tokio::fs::canonicalize(to_local_path(path)).await.ok()
-        } else {
-            None
-        };
+    ) -> Result<SharedBranchPath> {
+        let canonical_path = self.object_store().canonicalize_local_path(path).await?;
         let mut is_ancestor = false;
         for remaining in remaining_paths {
             match (&canonical_path, &remaining.canonical_path) {
                 (Some(path), Some(remaining)) if path == remaining => {
-                    return SharedBranchPath::Remaining;
+                    return Ok(SharedBranchPath::Remaining);
                 }
                 (Some(path), Some(remaining)) => {
                     is_ancestor |= remaining.starts_with(path);
                 }
-                _ if &remaining.path == path => return SharedBranchPath::Remaining,
+                _ if &remaining.path == path => return Ok(SharedBranchPath::Remaining),
                 _ => is_ancestor |= remaining.path.prefix_matches(path),
             }
         }
         if is_ancestor {
-            SharedBranchPath::Ancestor
+            Ok(SharedBranchPath::Ancestor)
         } else {
-            SharedBranchPath::Unrelated
+            Ok(SharedBranchPath::Unrelated)
         }
     }
 

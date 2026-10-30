@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -174,6 +175,7 @@ pub trait ObjectStoreExt {
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+    async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
 }
 
 #[async_trait]
@@ -788,6 +790,20 @@ impl ObjectStore {
     /// their inner object-store implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
         self.is_local() && self.store_prefix == self.scheme
+    }
+
+    /// Canonicalize a local object path, resolving rooted and UNC stores through
+    /// their filesystem root mapping. Returns `None` for non-local stores.
+    pub async fn canonicalize_local_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            return local_dir_operations.canonicalize(path).await;
+        }
+        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+            return Ok(tokio::fs::canonicalize(super::local::to_local_path(path))
+                .await
+                .ok());
+        }
+        Ok(None)
     }
 
     pub fn is_cloud(&self) -> bool {
