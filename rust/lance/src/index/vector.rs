@@ -884,6 +884,12 @@ pub(crate) async fn build_distributed_vector_index(
             pq_params.num_sub_vectors,
             pq_params.num_bits,
         )?;
+        let (_, value_type) =
+            crate::index::vector::utils::get_vector_type(filtered_dataset.schema(), column)?;
+        lance_index::vector::pq::validate_codebook_value_type(
+            pre_codebook.data_type(),
+            &value_type,
+        )?;
         let codebook_fsl =
             arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
 
@@ -1950,7 +1956,7 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let frag_reuse_uuid = crate::index::frag_reuse_cache_scope(&dataset).await;
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -2049,7 +2055,7 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let frag_reuse_uuid = crate::index::frag_reuse_cache_scope(&dataset).await;
     // Load the index metadata to get the correct index directory
     let index_meta = dataset
         .load_index(uuid)
@@ -2517,7 +2523,8 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+        Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, RecordBatch,
+        RecordBatchIterator,
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -3511,6 +3518,61 @@ mod tests {
             result.is_ok(),
             "Expected Ok for invalid fragment ids, got {:?}",
             result
+        );
+    }
+
+    /// Distributed builds take the codebook through their own path, so they
+    /// need the same value-type check as `create_index`.
+    #[tokio::test]
+    async fn test_build_distributed_rejects_codebook_of_another_value_type() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float16Array::from_iter_values((0..128 * 32).map(|i| half::f16::from_f32(i as f32))),
+            32,
+        )
+        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("vector", Arc::new(vectors) as arrow_array::ArrayRef)])
+                .unwrap();
+        let schema = batch.schema();
+        let dataset = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema), &uri, None)
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float16Array::from(vec![half::f16::ZERO; 2 * 32]),
+            32,
+        )
+        .unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap();
+        let codebook = Arc::new(Float32Array::from(vec![0.0f32; 256 * 32]));
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            ivf_params,
+            PQBuildParams::with_codebook(4, 8, codebook),
+        );
+        let fragments: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+
+        let error = build_distributed_vector_index(
+            &dataset,
+            "vector",
+            "vector_ivf_pq_dist",
+            Uuid::new_v4(),
+            &params,
+            None,
+            &fragments,
+            noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "PQ codebook value type Float32 does not match the vector value type Float16"
+            ),
+            "{error}"
         );
     }
 
