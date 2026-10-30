@@ -1698,3 +1698,127 @@ async fn test_branch() {
         .unwrap();
     assert!(branches.is_empty());
 }
+
+fn id_rows(start: i32, rows: u64) -> impl RecordBatchReader + Send + 'static {
+    gen_batch()
+        .col("id", array::step_custom::<Int32Type>(start, 1))
+        .into_reader_rows(RowCount::from(rows), BatchCount::from(1))
+}
+
+// Simulate a branch created before the new name validation.
+async fn create_branch_before_name_check(source: &Dataset, branch: &str) {
+    let version = source.version().version;
+    let source_branch = source.manifest.branch.clone();
+    let source_location = source
+        .branch_location()
+        .find_branch(source_branch.as_deref())
+        .unwrap();
+    let location = source.branch_location().find_branch(Some(branch)).unwrap();
+    let clone = Operation::Clone {
+        is_shallow: true,
+        ref_name: source_branch.clone(),
+        ref_version: version,
+        ref_path: source_location.uri,
+        branch_name: Some(branch.to_string()),
+    };
+    CommitBuilder::new(location.uri.as_str())
+        .with_store_params(source.store_params.as_deref().cloned().unwrap_or_default())
+        .with_object_store(Arc::new(source.object_store.as_ref().clone()))
+        .with_commit_handler(source.commit_handler.clone())
+        .with_exact_storage_format(source.manifest.data_storage_format.lance_file_format())
+        .execute(Transaction::new(version, clone, None))
+        .await
+        .unwrap();
+    source
+        .branches()
+        .create(branch, version, source_branch.as_deref())
+        .await
+        .unwrap();
+}
+
+#[rstest]
+#[case::data_directory("data", true)]
+#[case::data_directory_case_alias("Data", true)]
+#[case::versions_directory("_versions", true)]
+#[case::deletions_directory("_deletions", true)]
+#[case::dir_id_mem_wal_directory("_a1b2c3d4_mem_wal", true)]
+#[case::ordinary_name("child", false)]
+#[tokio::test]
+async fn deleting_nested_branch_preserves_parent(
+    #[case] segment: &str,
+    #[case] directory_stays: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.as_str();
+    let mut root = Dataset::write(id_rows(0, 4), uri, None).await.unwrap();
+    let mut outer = root
+        .create_branch("outer", root.version().version, None)
+        .await
+        .unwrap();
+    outer.delete("id = 0").await.unwrap();
+    outer.append(id_rows(4, 2), None).await.unwrap();
+    let nested = format!("outer/{segment}");
+    create_branch_before_name_check(&outer, &nested).await;
+    assert!(root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_rows = root.checkout_branch(&nested).await.unwrap();
+    assert_eq!(nested_rows.count_rows(None).await.unwrap(), 5);
+
+    root.delete_branch(&nested).await.unwrap();
+
+    assert!(!root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_dir = std::path::Path::new(uri).join("tree/outer").join(segment);
+    if directory_stays {
+        let preserved = root.checkout_branch(&nested).await.unwrap_or_else(|error| {
+            panic!("deleted branch {nested} should stay openable: {error}")
+        });
+        assert_eq!(preserved.count_rows(None).await.unwrap(), 5);
+    } else {
+        assert!(
+            !nested_dir.exists(),
+            "ordinary nested branch directory should be removed: {}",
+            nested_dir.display()
+        );
+    }
+    let outer = Dataset::open(uri)
+        .await
+        .unwrap()
+        .checkout_branch("outer")
+        .await
+        .unwrap_or_else(|error| panic!("branch outer is gone: {error}"));
+    let rows = outer
+        .count_rows(Some("id >= 0".to_string()))
+        .await
+        .unwrap_or_else(|error| panic!("branch outer cannot be scanned: {error}"));
+    assert_eq!(rows, 5);
+}
+
+#[rstest]
+#[case::data_directory("data")]
+#[case::versions_directory("_versions")]
+#[case::deletions_directory("_deletions")]
+#[tokio::test]
+async fn create_branch_refuses_a_nested_name_of_a_dataset_directory(#[case] segment: &str) {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.as_str();
+    let mut root = Dataset::write(id_rows(0, 4), uri, None).await.unwrap();
+    let mut outer = root
+        .create_branch("outer", root.version().version, None)
+        .await
+        .unwrap();
+    let nested = format!("outer/{segment}");
+
+    let error = outer
+        .create_branch(&nested, outer.version().version, None)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+    assert!(!root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_versions = std::path::Path::new(uri)
+        .join("tree/outer")
+        .join(segment)
+        .join("_versions");
+    assert!(!nested_versions.exists(), "{}", nested_versions.display());
+    let outer = root.checkout_branch("outer").await.unwrap();
+    assert_eq!(outer.count_rows(None).await.unwrap(), 4);
+}
