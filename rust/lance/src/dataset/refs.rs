@@ -21,7 +21,7 @@ use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::path::PathBuf;
@@ -646,7 +646,7 @@ impl Branches<'_> {
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
-        let mut cleanup =
+        let cleanup =
             Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?;
         if matches!(cleanup, BranchCleanup::Skip) {
             return Ok(());
@@ -654,9 +654,12 @@ impl Branches<'_> {
 
         let has_local_paths =
             self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
-        let mut remaining_paths = Vec::with_capacity(remaining_branches.len());
-        for remaining in &remaining_branches {
-            let path = self.refs.base_location.find_branch(Some(remaining))?.path;
+        let mut remaining_paths = Vec::with_capacity(remaining_branches.len() + 1);
+        // Main owns dataset directories too, but is absent from the named-branch listing.
+        for remaining in
+            std::iter::once(None).chain(remaining_branches.iter().map(|branch| Some(*branch)))
+        {
+            let path = self.refs.base_location.find_branch(remaining)?.path;
             let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
             if has_local_paths && canonical_path.is_none() {
                 log::warn!(
@@ -693,20 +696,11 @@ impl Branches<'_> {
             });
         }
 
-        if has_local_paths {
-            let path = match &cleanup {
-                BranchCleanup::Recursive(path) | BranchCleanup::Selective(path) => path,
-                BranchCleanup::Skip => return Ok(()),
-            };
-            cleanup = match self
-                .classify_shared_branch_path(path, &remaining_paths)
-                .await?
-            {
-                SharedBranchPath::Remaining => BranchCleanup::Skip,
-                SharedBranchPath::Ancestor => BranchCleanup::Selective(path.clone()),
-                SharedBranchPath::Unrelated => cleanup,
-            };
-        }
+        // Local directory aliases need ownership checks even without a shared branch prefix.
+        let cleanup = match cleanup {
+            BranchCleanup::Recursive(path) if has_local_paths => BranchCleanup::Selective(path),
+            cleanup => cleanup,
+        };
 
         match cleanup {
             BranchCleanup::Skip => Ok(()),
@@ -723,13 +717,44 @@ impl Branches<'_> {
             }
             BranchCleanup::Selective(delete_path) => {
                 let mut pending = vec![delete_path];
+                let mut visited_local_dirs = HashSet::new();
                 while let Some(path) = pending.pop() {
-                    match self
-                        .classify_shared_branch_path(&path, &remaining_paths)
-                        .await?
-                    {
+                    let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+                    if has_local_paths {
+                        let Some(canonical_path) = &canonical_path else {
+                            log::warn!(
+                                "Keeping local branch directory {path}: cannot resolve filesystem identity"
+                            );
+                            continue;
+                        };
+                        if !visited_local_dirs.insert(canonical_path.clone()) {
+                            log::warn!(
+                                "Keeping local branch directory {path}: filesystem directory was already visited"
+                            );
+                            continue;
+                        }
+                    }
+                    match Self::classify_shared_branch_path(
+                        &path,
+                        canonical_path.as_deref(),
+                        &remaining_paths,
+                    ) {
                         SharedBranchPath::Remaining => continue,
-                        SharedBranchPath::Ancestor => {
+                        SharedBranchPath::Unrelated
+                            if self.object_store().scheme() != "file-object-store" =>
+                        {
+                            if let Err(e) = self.object_store().remove_dir_all(path).await {
+                                match &e {
+                                    Error::NotFound { .. } => {
+                                        log::debug!("Branch directory already deleted");
+                                    }
+                                    _ => return Err(e),
+                                }
+                            }
+                        }
+                        SharedBranchPath::Ancestor | SharedBranchPath::Unrelated => {
+                            // Object-store local traversal follows directory symlinks. Inspect
+                            // every directory before deleting files, including unrelated subtrees.
                             // A shared directory must remain, but the deleted branch's own
                             // files (especially its manifests) must not remain accessible.
                             let entries =
@@ -749,16 +774,6 @@ impl Branches<'_> {
                                     .into_iter()
                                     .filter(|child| child != &path && child.prefix_matches(&path)),
                             );
-                        }
-                        SharedBranchPath::Unrelated => {
-                            if let Err(e) = self.object_store().remove_dir_all(path).await {
-                                match &e {
-                                    Error::NotFound { .. } => {
-                                        log::debug!("Branch directory already deleted");
-                                    }
-                                    _ => return Err(e),
-                                }
-                            }
                         }
                     }
                 }
@@ -826,24 +841,16 @@ impl Branches<'_> {
         Ok(BranchCleanup::Recursive(absolute_dir.path))
     }
 
-    async fn classify_shared_branch_path(
-        &self,
+    fn classify_shared_branch_path(
         path: &Path,
+        canonical_path: Option<&std::path::Path>,
         remaining_paths: &[RemainingBranchPath],
-    ) -> Result<SharedBranchPath> {
-        let canonical_path = self.object_store().canonicalize_local_path(path).await?;
-        if canonical_path.is_none()
-            && (self.object_store().is_local()
-                || self.object_store().scheme() == "file-object-store")
-        {
-            log::warn!("Keeping local branch directory {path}: cannot resolve filesystem identity");
-            return Ok(SharedBranchPath::Remaining);
-        }
+    ) -> SharedBranchPath {
         let mut is_ancestor = false;
         for remaining in remaining_paths {
-            match (&canonical_path, &remaining.canonical_path) {
+            match (canonical_path, remaining.canonical_path.as_deref()) {
                 (Some(path), Some(remaining)) if path == remaining => {
-                    return Ok(SharedBranchPath::Remaining);
+                    return SharedBranchPath::Remaining;
                 }
                 (Some(path), Some(canonical_remaining)) => {
                     if remaining
@@ -851,7 +858,7 @@ impl Branches<'_> {
                         .iter()
                         .any(|directory| path.starts_with(directory))
                     {
-                        return Ok(SharedBranchPath::Remaining);
+                        return SharedBranchPath::Remaining;
                     }
                     is_ancestor |= canonical_remaining.starts_with(path)
                         || remaining
@@ -859,14 +866,14 @@ impl Branches<'_> {
                             .iter()
                             .any(|directory| directory.starts_with(path));
                 }
-                _ if &remaining.path == path => return Ok(SharedBranchPath::Remaining),
+                _ if &remaining.path == path => return SharedBranchPath::Remaining,
                 _ => is_ancestor |= remaining.path.prefix_matches(path),
             }
         }
         if is_ancestor {
-            Ok(SharedBranchPath::Ancestor)
+            SharedBranchPath::Ancestor
         } else {
-            Ok(SharedBranchPath::Unrelated)
+            SharedBranchPath::Unrelated
         }
     }
 

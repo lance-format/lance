@@ -1422,7 +1422,7 @@ async fn test_delete_branch_with_shared_directory(
     if let Some(marker_store) = marker_store {
         assert_eq!(
             marker_store.listings.load(AtomicOrdering::SeqCst),
-            usize::from(remaining_branch.starts_with("a/"))
+            usize::from(use_object_store || remaining_branch.starts_with("a/"))
         );
     }
     let branches = dataset.list_branches().await.unwrap();
@@ -1720,6 +1720,156 @@ async fn test_delete_branch_preserves_relocated_parent_data(
         let mut survivor = root.checkout_branch(branch).await.unwrap();
         survivor.append(id_rows(30, 1), None).await.unwrap();
         let batch = survivor.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 30]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::direct_nested(false, true)]
+#[case::object_store_nested(true, true)]
+#[case::direct_alias(false, false)]
+#[case::object_store_alias(true, false)]
+#[tokio::test]
+async fn test_delete_branch_preserves_nested_dataset_data(
+    #[case] use_object_store: bool,
+    #[case] relocate_into_deleted: bool,
+    #[values(false, true)] deep_alias: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("A", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+    let mut deleted = root.create_branch("a", 1, None).await.unwrap();
+    deleted.append(id_rows(20, 1), None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+
+    let parent_data = tempdir.std_path().join("tree/A/data");
+    let container = tempdir.std_path().join(if deep_alias {
+        "tree/a/container"
+    } else {
+        "tree/a"
+    });
+    std::fs::create_dir_all(&container).unwrap();
+    let nested_data = container.join("parent-data");
+    if relocate_into_deleted {
+        std::fs::rename(&parent_data, &nested_data).unwrap();
+        std::os::unix::fs::symlink(&nested_data, &parent_data).unwrap();
+    } else {
+        std::os::unix::fs::symlink(&parent_data, &nested_data).unwrap();
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+            assert!(!root.list_branches().await.unwrap().contains_key("a"));
+        }
+        let mut parent = Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("A")
+            .await
+            .unwrap();
+        let batch = parent.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            parent.append(id_rows(30, 1), None).await.unwrap();
+            assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+        }
+    }
+    let error = root.checkout_branch("a").await.unwrap_err();
+    assert!(matches!(
+        error,
+        Error::NotFound { .. } | Error::DatasetNotFound { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .replace('\\', "/")
+            .contains(deleted.base.as_ref()),
+        "{error}"
+    );
+    let mut recreated = root.create_branch("a", 1, None).await.unwrap();
+    recreated.append(id_rows(40, 1), None).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
+    if has_child {
+        let mut child = root.checkout_branch("a/b").await.unwrap();
+        child.append(id_rows(50, 1), None).await.unwrap();
+        let batch = child.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 50]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::data("data")]
+#[case::versions("_versions")]
+#[tokio::test]
+async fn test_delete_branch_preserves_aliased_main_dataset(
+    #[case] dataset_dir: &str,
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.append(id_rows(10, 1), None).await.unwrap();
+    std::fs::create_dir_all(tempdir.std_path().join("tree")).unwrap();
+    std::os::unix::fs::symlink(
+        tempdir.std_path().join(dataset_dir),
+        tempdir.std_path().join("tree/a"),
+    )
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+            assert!(!root.list_branches().await.unwrap().contains_key("a"));
+        }
+        let mut main = Dataset::open(&uri).await.unwrap();
+        let batch = main.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            main.append(id_rows(20, 1), None).await.unwrap();
+            let batch = main.scan().try_into_batch().await.unwrap();
+            assert_eq!(
+                batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+                &[0, 10, 20]
+            );
+        }
+    }
+    if has_child {
+        let mut child = root.checkout_branch("a/b").await.unwrap();
+        child.append(id_rows(30, 1), None).await.unwrap();
+        let batch = child.scan().try_into_batch().await.unwrap();
         assert_eq!(
             batch["id"].as_primitive::<Int32Type>().values().as_ref(),
             &[0, 30]
