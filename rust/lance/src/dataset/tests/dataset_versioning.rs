@@ -1355,15 +1355,16 @@ impl OSObjectStore for DirectoryMarkerStore {
 }
 
 #[rstest]
-#[case::child("a/b", false)]
-#[case::nested_child("a/b/c", false)]
-#[case::data_directory("a/data/child", false)]
-#[case::force("a/b", true)]
-#[case::sibling("ab", false)]
+#[case::child("a/b", false, false)]
+#[case::nested_child("a/b/c", false, false)]
+#[case::data_directory("a/data/child", false, true)]
+#[case::force("a/b", true, false)]
+#[case::sibling("ab", false, false)]
 #[tokio::test]
 async fn test_delete_branch_with_shared_directory(
     #[case] remaining_branch: &str,
     #[case] force: bool,
+    #[case] use_legacy_branch_creation: bool,
     #[values(false, true)] use_object_store: bool,
     #[values(false, true)] has_directory_marker: bool,
 ) {
@@ -1387,10 +1388,15 @@ async fn test_delete_branch_with_shared_directory(
     assert_eq!(dataset.get_fragments().len(), 2);
     let mut deleted = dataset.create_branch("a", 1, None).await.unwrap();
     deleted.append(data(10), Some(params())).await.unwrap();
-    let mut remaining = dataset
-        .create_branch(remaining_branch, 1, None)
-        .await
-        .unwrap();
+    if use_legacy_branch_creation {
+        create_branch_before_name_check(&dataset, remaining_branch).await;
+    } else {
+        dataset
+            .create_branch(remaining_branch, 1, None)
+            .await
+            .unwrap();
+    }
+    let mut remaining = dataset.checkout_branch(remaining_branch).await.unwrap();
     remaining.append(data(20), Some(params())).await.unwrap();
 
     let marker_store = has_directory_marker.then(|| {

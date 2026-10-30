@@ -645,66 +645,93 @@ impl Branches<'_> {
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
-        let delete_path =
-            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?
-                .unwrap_or(self.refs.base_location.find_branch(Some(branch))?.path);
-        let remaining_paths = remaining_branches
-            .iter()
-            .map(|branch| {
-                self.refs
-                    .base_location
-                    .find_branch(Some(branch))
-                    .map(|location| location.path)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut pending = vec![delete_path];
-        while let Some(path) = pending.pop() {
-            if remaining_paths.contains(&path) {
-                continue;
-            }
-            if remaining_paths
-                .iter()
-                .any(|remaining| remaining.prefix_matches(&path))
-            {
-                // A shared directory must remain, but the deleted branch's own
-                // files (especially its manifests) must not remain accessible.
-                let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
-                futures::stream::iter(entries.objects.into_iter().map(Ok))
-                    .try_for_each_concurrent(
-                        self.object_store().io_parallelism(),
-                        |file| async move { self.object_store().delete(&file.location).await },
-                    )
-                    .await?;
-                // Hierarchical stores may include the listed directory's marker.
-                pending.extend(
-                    entries
-                        .common_prefixes
-                        .into_iter()
-                        .filter(|child| child != &path && child.prefix_matches(&path)),
-                );
-            } else if let Err(e) = self.object_store().remove_dir_all(path).await {
-                match &e {
-                    Error::NotFound { .. } => {
-                        log::debug!("Branch directory already deleted");
+        match Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)? {
+            BranchCleanup::Skip => Ok(()),
+            BranchCleanup::Recursive(path) => {
+                if let Err(e) = self.object_store().remove_dir_all(path).await {
+                    match &e {
+                        Error::NotFound { .. } => {
+                            log::debug!("Branch directory already deleted");
+                        }
+                        _ => return Err(e),
                     }
-                    _ => return Err(e),
                 }
+                Ok(())
+            }
+            BranchCleanup::Selective(delete_path) => {
+                let remaining_paths = remaining_branches
+                    .iter()
+                    .map(|branch| {
+                        self.refs
+                            .base_location
+                            .find_branch(Some(branch))
+                            .map(|location| location.path)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let mut pending = vec![delete_path];
+                while let Some(path) = pending.pop() {
+                    if remaining_paths.contains(&path) {
+                        continue;
+                    }
+                    if remaining_paths.iter().any(|remaining| {
+                        remaining.prefix_matches(&path) || path.prefix_matches(remaining)
+                    }) {
+                        // A shared directory must remain, but the deleted branch's own
+                        // files (especially its manifests) must not remain accessible.
+                        let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
+                        futures::stream::iter(entries.objects.into_iter().map(Ok))
+                            .try_for_each_concurrent(
+                                self.object_store().io_parallelism(),
+                                |file| async move {
+                                    self.object_store().delete(&file.location).await
+                                },
+                            )
+                            .await?;
+                        // Hierarchical stores may include the listed directory's marker.
+                        pending.extend(
+                            entries
+                                .common_prefixes
+                                .into_iter()
+                                .filter(|child| child != &path && child.prefix_matches(&path)),
+                        );
+                    } else if let Err(e) = self.object_store().remove_dir_all(path).await {
+                        match &e {
+                            Error::NotFound { .. } => {
+                                log::debug!("Branch directory already deleted");
+                            }
+                            _ => return Err(e),
+                        }
+                    }
+                }
+                Ok(())
             }
         }
-        Ok(())
     }
 
     fn get_cleanup_path(
         branch: &str,
         remaining_branches: &[&str],
         base_location: &BranchLocation,
-    ) -> Result<Option<Path>> {
+    ) -> Result<BranchCleanup> {
         let deleted_branch = BranchRelativePath::new(branch);
+
+        // Older releases allowed branches like `a/data`, which overlap
+        // directories owned by their ancestors. Preserve those directories.
+        if let Some(owner) = Self::dataset_dir_owner(&deleted_branch, remaining_branches) {
+            log::warn!(
+                "Keeping {} after deleting branch {}, since it lies in a dataset directory of branch {}",
+                branch,
+                branch,
+                owner
+            );
+            return Ok(BranchCleanup::Skip);
+        }
+
         let mut related_branches = Vec::new();
         let mut relative_dir = branch.to_string();
-        for branch in remaining_branches {
-            let branch = BranchRelativePath::new(branch);
+        for remaining_branch in remaining_branches {
+            let branch = BranchRelativePath::new(remaining_branch);
             if branch.is_parent(&deleted_branch) || branch.is_child(&deleted_branch) {
                 related_branches.push(branch);
             } else if let Some(common_prefix) = deleted_branch.find_common_prefix(&branch) {
@@ -713,19 +740,21 @@ impl Branches<'_> {
         }
 
         related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
-        if let Some(branch) = related_branches.first() {
-            if branch.is_child(&deleted_branch) || branch == &deleted_branch {
-                // No single recursive deletion can preserve the remaining branches.
-                // The caller must clean the shared directories selectively instead.
-                return Ok(None);
+        if let Some(related_branch) = related_branches.first() {
+            if related_branch == &deleted_branch {
+                return Ok(BranchCleanup::Skip);
+            } else if related_branch.is_child(&deleted_branch) {
+                // No single recursive deletion can preserve child branches.
+                let absolute_dir = base_location.find_branch(Some(branch))?;
+                return Ok(BranchCleanup::Selective(absolute_dir.path));
             } else {
                 // We pick the longest common directory between the deleted branch and the remaining branches
                 // Then delete the first child of this common directory
                 // Example: deleted_branch = "a/b/c", remaining_branches = ["a"], we need to delete "a/b"
                 relative_dir = format!(
                     "{}/{}",
-                    branch.segments.join("/"),
-                    deleted_branch.segments[branch.segments.len()]
+                    related_branch.segments.join("/"),
+                    deleted_branch.segments[related_branch.segments.len()]
                 );
             }
         } else if !deleted_branch.segments.is_empty() {
@@ -735,26 +764,27 @@ impl Branches<'_> {
             relative_dir = deleted_branch.segments[0].to_string();
         }
 
-        // Older releases allowed branches like `a/data`, which share
-        // `a`'s data directory. Don't delete the parent's files.
-        let target = BranchRelativePath::new(&relative_dir);
-        if let Some(owner) = remaining_branches.iter().find(|remaining| {
-            let remaining = BranchRelativePath::new(remaining);
-            remaining.is_parent(&target)
-                && is_dataset_dir(target.segments[remaining.segments.len()])
-        }) {
-            log::warn!(
-                "Keeping {} after deleting branch {}, since it lies in a dataset directory of branch {}",
-                relative_dir,
-                branch,
-                owner
-            );
-            return Ok(None);
-        }
-
         let absolute_dir = base_location.find_branch(Some(relative_dir.as_str()))?;
-        Ok(Some(absolute_dir.path))
+        Ok(BranchCleanup::Recursive(absolute_dir.path))
     }
+
+    fn dataset_dir_owner<'a>(
+        deleted_branch: &BranchRelativePath<'_>,
+        remaining_branches: &[&'a str],
+    ) -> Option<&'a str> {
+        remaining_branches.iter().copied().find(|remaining| {
+            let remaining = BranchRelativePath::new(remaining);
+            remaining.is_parent(deleted_branch)
+                && is_dataset_dir(deleted_branch.segments[remaining.segments.len()])
+        })
+    }
+}
+
+#[derive(Debug)]
+enum BranchCleanup {
+    Skip,
+    Recursive(Path),
+    Selective(Path),
 }
 
 #[derive(Debug, PartialEq)]
@@ -1507,27 +1537,27 @@ mod tests {
     }
 
     #[rstest]
-    #[case("feature/auth", &["feature/auth/sub"], None)]
-    #[case("feature", &["feature/sub1", "feature/sub2"], None)]
-    #[case("a/b", &["a/b/c", "b/c/d"], None)]
-    #[case("main", &[], Some("main"))]
-    #[case("a", &["a"], None)]
-    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
-    #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
-    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
-    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
-    #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
-    #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
-    #[case::data_directory_of_a_remaining_parent("outer/data", &["outer"], None)]
-    #[case::dir_id_mem_wal_directory_of_a_remaining_parent("outer/_a1b2c3d4_mem_wal", &["outer"], None)]
-    #[case::versions_directory_of_a_nested_parent("a/b/_versions", &["a", "a/b", "c"], None)]
-    #[case::inside_the_data_directory_of_a_remaining_ancestor("a/data/x", &["a", "a/data/y"], None)]
-    #[case::directory_name_without_a_remaining_parent("outer/data", &["other"], Some("outer"))]
-    #[case::ordinary_name_below_a_directory_name("outer/data/x", &["outer/data"], Some("outer/data/x"))]
+    #[case("feature/auth", &["feature/auth/sub"], ExpectedCleanup::Selective("feature/auth"))]
+    #[case("feature", &["feature/sub1", "feature/sub2"], ExpectedCleanup::Selective("feature"))]
+    #[case("a/b", &["a/b/c", "b/c/d"], ExpectedCleanup::Selective("a/b"))]
+    #[case("main", &[], ExpectedCleanup::Recursive("main"))]
+    #[case("a", &["a"], ExpectedCleanup::Skip)]
+    #[case("feature/auth", &["feature/login", "feature/signup"], ExpectedCleanup::Recursive("feature/auth"))]
+    #[case("feature/sub", &["feature", "other"], ExpectedCleanup::Recursive("feature/sub"))]
+    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], ExpectedCleanup::Recursive("very/long/common/prefix/branch1"))]
+    #[case("feature/auth/module", &["feature/other"], ExpectedCleanup::Recursive("feature/auth"))]
+    #[case("feature/dev", &["bugfix", "hotfix"], ExpectedCleanup::Recursive("feature"))]
+    #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], ExpectedCleanup::Recursive("branch1"))]
+    #[case::data_directory_of_a_remaining_parent("outer/data", &["outer"], ExpectedCleanup::Skip)]
+    #[case::dir_id_mem_wal_directory_of_a_remaining_parent("outer/_a1b2c3d4_mem_wal", &["outer"], ExpectedCleanup::Skip)]
+    #[case::versions_directory_of_a_nested_parent("a/b/_versions", &["a", "a/b", "c"], ExpectedCleanup::Skip)]
+    #[case::inside_the_data_directory_of_a_remaining_ancestor("a/data/x", &["a", "a/data/y"], ExpectedCleanup::Skip)]
+    #[case::directory_name_without_a_remaining_parent("outer/data", &["other"], ExpectedCleanup::Recursive("outer"))]
+    #[case::ordinary_name_below_a_directory_name("outer/data/x", &["outer/data"], ExpectedCleanup::Recursive("outer/data/x"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
         #[case] remaining_branches: &[&str],
-        #[case] expected_relative_cleanup_path: Option<&str>,
+        #[case] expected: ExpectedCleanup,
     ) {
         let dataset_root_dir = "file:///var/balabala/dataset1".to_string();
         let base_location = BranchLocation {
@@ -1540,28 +1570,27 @@ mod tests {
             Branches::get_cleanup_path(branch_to_delete, remaining_branches, &base_location)
                 .unwrap();
 
-        match expected_relative_cleanup_path {
-            Some(expected_relative) => {
-                assert!(
-                    result.is_some(),
-                    "Expected cleanup path but got None for branch: {}",
-                    branch_to_delete
-                );
-                let expected_full_path = base_location
-                    .find_branch(Some(expected_relative))
-                    .unwrap()
-                    .path;
-                assert_eq!(result.unwrap().as_ref(), expected_full_path.as_ref());
+        match (expected, result) {
+            (ExpectedCleanup::Skip, BranchCleanup::Skip) => {}
+            (ExpectedCleanup::Recursive(relative), BranchCleanup::Recursive(actual))
+            | (ExpectedCleanup::Selective(relative), BranchCleanup::Selective(actual)) => {
+                let expected = base_location.find_branch(Some(relative)).unwrap().path;
+                assert_eq!(actual, expected);
             }
-            None => {
-                assert!(
-                    result.is_none(),
-                    "Expected no cleanup but got: {:?} for branch: {}",
-                    result,
-                    branch_to_delete
+            (expected, actual) => {
+                panic!(
+                    "Expected {:?} but got {:?} for branch {}",
+                    expected, actual, branch_to_delete
                 );
             }
         }
+    }
+
+    #[derive(Debug)]
+    enum ExpectedCleanup {
+        Skip,
+        Recursive(&'static str),
+        Selective(&'static str),
     }
 
     /// Build a reusable mocked BranchContents map mirroring cleanup::lineage_tests::build_lineage_datasets.
