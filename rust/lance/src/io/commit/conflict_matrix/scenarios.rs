@@ -23,8 +23,9 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::transaction::action::{
-    Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, CompositeOperation,
-    ConfigUpdate, FieldRef, Ref, RefreshRowVersionMetadata, TombstoneFieldData, UserStep,
+    Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, AssertUniqueKeys,
+    CompositeOperation, ConfigUpdate, FieldRef, Ref, RefreshRowVersionMetadata, RemoveFragment,
+    SetDeletionFile, TombstoneFieldData, UserStep,
 };
 use lance_table::transaction::{UpdateMap, UpdateMapEntry};
 
@@ -134,6 +135,15 @@ pub(super) enum Scenario {
     /// will get. A segment over a minted fragment claims no committed coverage,
     /// so the dataset-free tier covers that shape instead.
     ActionAppendAndIndex,
+    /// [`Scenario::Delete`]'s deletion file as a `SetDeletionFile`, carrying
+    /// the same affected rows.
+    ActionDelete,
+    /// [`Scenario::DeleteWholeFragment`]'s removal as a `RemoveFragment`.
+    ActionDeleteWholeFragment,
+    /// [`Scenario::UpdateRewriteRows`] as a vertical update: the moved rows'
+    /// deletions as `SetDeletionFile`, their new fragment as `AddFragment` +
+    /// `AddDataFile`, and the inserted keys as `AssertUniqueKeys`.
+    ActionUpdate,
 }
 
 /// What a staged `theirs` touches, relative to what every `ours` in the matrix
@@ -193,7 +203,7 @@ impl Placement {
 }
 
 impl Scenario {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 27] = [
         Self::Append,
         Self::Delete,
         Self::DeleteWholeFragment,
@@ -218,6 +228,9 @@ impl Scenario {
         Self::ActionRenameColumn,
         Self::ActionCreateIndex,
         Self::ActionAppendAndIndex,
+        Self::ActionDelete,
+        Self::ActionDeleteWholeFragment,
+        Self::ActionUpdate,
     ];
 
     /// Two-letter column heading for the matrix grid in `cases`.
@@ -247,6 +260,9 @@ impl Scenario {
             Self::ActionRenameColumn => "vm",
             Self::ActionCreateIndex => "vi",
             Self::ActionAppendAndIndex => "vj",
+            Self::ActionDelete => "vd",
+            Self::ActionDeleteWholeFragment => "vf",
+            Self::ActionUpdate => "vu",
         }
     }
 
@@ -276,6 +292,9 @@ impl Scenario {
             Self::ActionRenameColumn => "action_rename_column",
             Self::ActionCreateIndex => "action_create_index",
             Self::ActionAppendAndIndex => "action_append_and_index",
+            Self::ActionDelete => "action_delete",
+            Self::ActionDeleteWholeFragment => "action_delete_whole_fragment",
+            Self::ActionUpdate => "action_update",
         }
     }
 
@@ -295,6 +314,9 @@ impl Scenario {
             Self::ActionRenameColumn => vec![Self::Project],
             Self::ActionCreateIndex => vec![Self::CreateIndex],
             Self::ActionAppendAndIndex => vec![Self::Append, Self::CreateIndex],
+            Self::ActionDelete => vec![Self::Delete],
+            Self::ActionDeleteWholeFragment => vec![Self::DeleteWholeFragment],
+            Self::ActionUpdate => vec![Self::UpdateRewriteRows],
             legacy => vec![legacy],
         }
     }
@@ -326,6 +348,9 @@ impl Scenario {
                 | Self::DataReplacement
                 | Self::CreateIndex
                 | Self::Rewrite
+                | Self::ActionDelete
+                | Self::ActionDeleteWholeFragment
+                | Self::ActionUpdate
         )
     }
 
@@ -389,6 +414,14 @@ impl Scenario {
             Self::ActionRenameColumn => stage_action_rename_column(dataset),
             Self::ActionCreateIndex => stage_action_create_index(dataset, false).await,
             Self::ActionAppendAndIndex => stage_action_create_index(dataset, true).await,
+            Self::ActionDelete => as_action_set(dataset, stage_delete(dataset, fragment).await?),
+            Self::ActionDeleteWholeFragment => as_action_set(
+                dataset,
+                stage_delete_whole_fragment(dataset, fragment).await?,
+            ),
+            Self::ActionUpdate => {
+                as_action_set(dataset, stage_update_rewrite_rows(dataset, fragment).await?)
+            }
         }
     }
 }
@@ -440,8 +473,12 @@ async fn stage_overwrite(dataset: &Arc<Dataset>) -> Result<Staged> {
 /// A single-row delete on `fragment`. The fixture's fragment `n` holds
 /// `a = 3n..3n+2`, so the predicate picks that fragment's first row.
 async fn stage_delete(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
-    let predicate = format!("a = {}", fragment * 3);
-    let staged = DeleteBuilder::new(dataset.clone(), &predicate)
+    stage_delete_row(dataset, fragment as i32 * 3).await
+}
+
+/// A delete of the one row whose `a` is `key`.
+pub(super) async fn stage_delete_row(dataset: &Arc<Dataset>, key: i32) -> Result<Staged> {
+    let staged = DeleteBuilder::new(dataset.clone(), &format!("a = {key}"))
         .execute_uncommitted()
         .await?;
     Ok(Staged::with_affected_rows(
@@ -728,6 +765,98 @@ async fn stage_action_create_index(dataset: &Arc<Dataset>, with_append: bool) ->
     Ok(stage_action_set(dataset, actions))
 }
 
+/// A staged legacy `Delete` or row-moving `Update`, re-expressed as actions
+/// that write the same files and carry the same affected rows.
+///
+/// Rows removed from a fragment in place become a `SetDeletionFile`, a
+/// fragment emptied a `RemoveFragment`, and an update's new fragments an
+/// `AddFragment` + `AddDataFile`, keeping the moved rows' ids and versions.
+/// The inserted-key filter becomes an `AssertUniqueKeys`.
+pub(super) fn as_action_set(dataset: &Dataset, staged: Staged) -> Result<Staged> {
+    let (updated, removed, added, filter) = match staged.transaction.operation {
+        Operation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            ..
+        } => (updated_fragments, deleted_fragment_ids, Vec::new(), None),
+        Operation::Update {
+            updated_fragments,
+            removed_fragment_ids,
+            new_fragments,
+            inserted_rows_filter,
+            ..
+        } => (
+            updated_fragments,
+            removed_fragment_ids,
+            new_fragments,
+            inserted_rows_filter,
+        ),
+        other => {
+            return Err(crate::Error::invalid_input(format!(
+                "only a Delete or an Update re-expresses as a delete-and-append, not {other}"
+            )));
+        }
+    };
+    let mut actions = Vec::new();
+    for fragment in updated {
+        actions.push(Action::SetDeletionFile(SetDeletionFile {
+            fragment: fragment.id,
+            deletion_file: fragment.deletion_file,
+            data_change: true,
+            base: None,
+        }));
+    }
+    for fragment in removed {
+        actions.push(Action::RemoveFragment(RemoveFragment {
+            fragment: Ref::Committed(fragment),
+            data_change: true,
+        }));
+    }
+    for (token, fragment) in (0u32..).zip(added) {
+        actions.push(Action::AddFragment(AddFragment {
+            id: Ref::Local(token),
+            physical_rows: fragment
+                .physical_rows
+                .expect("a freshly written fragment knows its row count")
+                as u64,
+            row_id_meta: fragment.row_id_meta,
+            last_updated_at_version_meta: fragment.last_updated_at_version_meta,
+            created_at_version_meta: fragment.created_at_version_meta,
+            data_change: true,
+        }));
+        for mut file in fragment.files {
+            let field_ids = file
+                .fields
+                .iter()
+                .copied()
+                .map(FieldRef::Committed)
+                .collect();
+            file.fields = Default::default();
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(token),
+                file,
+                field_ids,
+                data_change: true,
+                base: None,
+            }));
+        }
+    }
+    if let Some(filter) = filter {
+        actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+            key_fields: filter
+                .field_ids
+                .iter()
+                .copied()
+                .map(FieldRef::Committed)
+                .collect(),
+            filter,
+        }));
+    }
+    let mut action_set = stage_action_set(dataset, actions);
+    action_set.affected_rows = staged.affected_rows;
+    Ok(action_set)
+}
+
 /// The id of the field called `name`. An error rather than a panic, so a
 /// scenario staged after a concurrent rename or drop reports that it cannot be
 /// staged, which the oracle's serial run takes as nothing to compare.
@@ -745,7 +874,16 @@ fn field_id(dataset: &Dataset, name: &str) -> Result<i32> {
 async fn stage_update_rewrite_rows(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
     // `new_rows(n)` carries keys n and n+1, so starting at the fragment's second
     // row keeps both matches inside it and inserts nothing.
-    let source = new_rows(fragment as i32 * 3 + 1);
+    stage_merge_insert(dataset, new_rows(fragment as i32 * 3 + 1)).await
+}
+
+/// A merge insert of the one row whose `a` is `key`, which moves it out of its
+/// fragment with `b = key * 10`.
+pub(super) async fn stage_update_row(dataset: &Arc<Dataset>, key: i32) -> Result<Staged> {
+    stage_merge_insert(dataset, new_rows(key).slice(0, 1)).await
+}
+
+async fn stage_merge_insert(dataset: &Arc<Dataset>, source: RecordBatch) -> Result<Staged> {
     let reader = arrow_array::RecordBatchIterator::new(vec![Ok(source.clone())], source.schema());
     let staged = MergeInsertBuilder::try_new(dataset.clone(), vec!["a".into()])?
         .when_matched(crate::dataset::WhenMatched::UpdateAll)

@@ -5911,6 +5911,156 @@ mod tests {
         }
     }
 
+    /// Which form a side of [`test_overlay_against_a_row_moving_update_across_forms`]
+    /// takes, and whether it is the one committing over the other.
+    #[derive(Debug, Clone, Copy)]
+    enum Side {
+        LegacyOverlay,
+        ActionOverlay,
+        LegacyUpdate,
+        ActionUpdate,
+    }
+
+    /// The mixed-form counterparts of
+    /// `test_data_overlay_finish_conflicts_with_row_moving_update`: an overlay
+    /// and an update that moves row 0 of fragment 0 out to a new fragment
+    /// collide only where the moved row is one the overlay covers, whichever
+    /// side is an action set and whichever commits first.
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_overlay_against_a_row_moving_update_across_forms(
+        #[values(
+            (Side::LegacyOverlay, Side::ActionUpdate),
+            (Side::ActionOverlay, Side::LegacyUpdate),
+            (Side::ActionOverlay, Side::ActionUpdate),
+            (Side::ActionUpdate, Side::LegacyOverlay),
+            (Side::ActionUpdate, Side::ActionOverlay)
+        )]
+        sides: (Side, Side),
+        #[values((vec![0u32], true), (vec![3u32], false))] coverage: (Vec<u32>, bool),
+    ) {
+        use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use lance_table::transaction::action::{AddDataFile, AddOverlays, SetDeletionFile};
+
+        let (ours, theirs) = sides;
+        let (coverage, expect_conflict) = coverage;
+        let dataset = test_dataset(5, 1).await;
+        let mut fragment = dataset.fragments().as_slice()[0].clone();
+        let deleted = apply_deletion(&[0], &mut fragment, &dataset).await;
+        let data_file = |path: &str| {
+            Fragment::new(0)
+                .with_file(
+                    path,
+                    vec![0],
+                    vec![0],
+                    LanceFileVersion::Stable.resolve(),
+                    NonZero::new(10),
+                )
+                .files
+                .remove(0)
+        };
+        let moved_file = data_file("moved.lance");
+        let overlay = DataOverlayFile {
+            data_file: data_file("overlay.lance"),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(coverage)),
+            committed_version: 0,
+        };
+
+        let stage = |side: Side| {
+            let operation = match side {
+                Side::LegacyOverlay => Operation::DataOverlay {
+                    groups: vec![DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![overlay.clone()],
+                    }],
+                },
+                Side::ActionOverlay => {
+                    Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                        "overlay",
+                        vec![TxnAction::AddOverlays(AddOverlays {
+                            fragment: ActionRef::Committed(0),
+                            overlays: vec![overlay.clone()],
+                            data_change: true,
+                        })],
+                    )]))
+                }
+                Side::LegacyUpdate => Operation::Update {
+                    updated_fragments: vec![deleted.clone()],
+                    removed_fragment_ids: vec![],
+                    new_fragments: vec![{
+                        let mut moved = Fragment::new(0).with_physical_rows(1);
+                        moved.files.push(moved_file.clone());
+                        moved
+                    }],
+                    fields_modified: vec![],
+                    compacted_sstables: Vec::new(),
+                    mem_wal_dir_id: None,
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: Some(UpdateMode::RewriteRows),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                },
+                Side::ActionUpdate => {
+                    Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                        "update",
+                        vec![
+                            TxnAction::SetDeletionFile(SetDeletionFile {
+                                fragment: 0,
+                                deletion_file: deleted.deletion_file.clone(),
+                                data_change: true,
+                                base: None,
+                            }),
+                            TxnAction::AddFragment(AddFragment {
+                                id: ActionRef::Local(0),
+                                physical_rows: 1,
+                                row_id_meta: None,
+                                last_updated_at_version_meta: None,
+                                created_at_version_meta: None,
+                                data_change: true,
+                            }),
+                            TxnAction::AddDataFile(AddDataFile {
+                                fragment: ActionRef::Local(0),
+                                file: DataFile {
+                                    fields: Default::default(),
+                                    ..moved_file.clone()
+                                },
+                                field_ids: vec![FieldRef::Committed(0)],
+                                data_change: true,
+                                base: None,
+                            }),
+                        ],
+                    )]))
+                }
+            };
+            Transaction::new_from_version(dataset.manifest.version, operation)
+        };
+        let commit = |dataset: &Dataset, side: Side, transaction: Transaction| {
+            let mut builder = CommitBuilder::new(Arc::new(dataset.clone()))
+                .with_experimental_composite_operations(true);
+            if matches!(side, Side::LegacyUpdate | Side::ActionUpdate) {
+                builder = builder.with_affected_rows(RowAddrTreeMap::from_iter([0u64]));
+            }
+            builder.execute(transaction)
+        };
+
+        commit(&dataset, theirs, stage(theirs)).await.unwrap();
+        let result = commit(&dataset, ours, stage(ours)).await;
+        if expect_conflict {
+            assert!(
+                matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                "{ours:?} over {theirs:?}: an overlay covering the moved row conflicts, got \
+                 {result:?}"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "{ours:?} over {theirs:?}: an overlay disjoint from the moved row lands, got \
+                 {result:?}"
+            );
+        }
+    }
+
     #[rstest::rstest]
     #[test]
     #[case::indexed_field_updated(0, vec![0])]
