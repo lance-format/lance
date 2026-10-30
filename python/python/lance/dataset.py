@@ -5620,6 +5620,10 @@ class LanceDataset(pa.dataset.Dataset):
         current version against a specific older version) or both ``begin_version``
         and ``end_version`` for an explicit range.
 
+        Reading row changes requires stable row IDs at both nonzero endpoints.
+        Enable them when creating the dataset with ``enable_stable_row_ids=True``.
+        Transaction listing is available without stable row IDs.
+
         Parameters
         ----------
         compared_against : int, optional
@@ -5654,24 +5658,21 @@ class LanceDataset(pa.dataset.Dataset):
             # Write initial data (v1)
             ds = lance.write_dataset(
                 pa.table({"id": [1, 2], "val": ["a", "b"]}),
-                "memory://delta_demo"
+                "memory://delta_demo",
+                enable_stable_row_ids=True,
             )
 
             # Append some data to create v2
-            ds_append = lance.write_dataset(
-                pa.table({"id": [3], "val": ["c"]}),
-                "memory://delta_demo",
-                mode="append"
-            )
+            ds.insert(pa.table({"id": [3], "val": ["c"]}))
 
             # Compute inserted rows from v1 -> v2 (shorthand)
-            delta = ds_append.delta(compared_against=1)
+            delta = ds.delta(compared_against=1)
             reader = delta.get_inserted_rows()
             for batch in reader:
                 print(batch)
 
             # Or using explicit version range
-            delta = ds_append.delta(begin_version=1, end_version=2)
+            delta = ds.delta(begin_version=1, end_version=2)
         """
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
@@ -6209,12 +6210,16 @@ class DatasetDelta:
     def get_inserted_rows(self) -> pa.RecordBatchReader:
         """
         Return a streaming RecordBatchReader for inserted rows.
+
+        Raises ``ValueError`` if either nonzero endpoint lacks stable row IDs.
         """
         return self._delta.get_inserted_rows()
 
     def get_updated_rows(self) -> pa.RecordBatchReader:
         """
         Return a streaming RecordBatchReader for updated rows.
+
+        Raises ``ValueError`` if either nonzero endpoint lacks stable row IDs.
         """
         return self._delta.get_updated_rows()
 
