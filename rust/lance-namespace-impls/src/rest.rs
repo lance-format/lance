@@ -63,7 +63,7 @@ use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
-use lance_namespace::error::NamespaceError;
+use lance_namespace::error::{ErrorCode, NamespaceError};
 
 /// HTTP client wrapper that supports per-request header injection.
 ///
@@ -579,6 +579,19 @@ fn parse_error(e: serde_json::Error) -> Error {
     .into()
 }
 
+/// Parses the `Retry-After` response header into a duration.
+///
+/// Only the delay-seconds form defined by RFC 9110 is supported. The
+/// HTTP-date form is ignored, since callers cannot act on an absolute
+/// timestamp without trusting the server's clock.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
 /// Parses a JSON response. Every object response is a model with a context
 /// field, which we fill from the response headers.
 fn parse_response<R: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> Result<R> {
@@ -682,12 +695,26 @@ impl RestNamespace {
     /// Deserializes the response as an `ErrorResponse` model (the spec-defined
     /// flat JSON format with a required numeric `code` field). The error code is
     /// the sole source of truth for error classification. When deserialization
-    /// fails, returns Internal with the raw response as context.
-    fn parse_error_response(status: reqwest::StatusCode, content: &str) -> lance_core::Error {
+    /// fails, returns Internal with the raw response as context. Throttling
+    /// errors additionally carry the normalized `Retry-After` header, when the
+    /// server sent one.
+    fn parse_error_response(
+        status: reqwest::StatusCode,
+        headers: &HeaderMap,
+        content: &str,
+    ) -> lance_core::Error {
         match serde_json::from_str::<ErrorResponse>(content) {
             Ok(err_resp) => {
                 let message = err_resp.error.as_deref().unwrap_or(content);
-                NamespaceError::from_code(err_resp.code as u32, message).into()
+                if err_resp.code == ErrorCode::Throttling.as_u32() as i32 {
+                    NamespaceError::Throttling {
+                        message: message.to_string(),
+                        retry_after: parse_retry_after(headers),
+                    }
+                    .into()
+                } else {
+                    NamespaceError::from_code(err_resp.code as u32, message).into()
+                }
             }
             Err(e) => NamespaceError::Internal {
                 message: format!(
@@ -744,6 +771,7 @@ impl RestNamespace {
         } else {
             Err(Self::parse_error_response(
                 status,
+                &headers,
                 &String::from_utf8_lossy(&content),
             ))
         }
@@ -2196,6 +2224,58 @@ mod tests {
 
         // Should return an error
         assert!(result.is_err());
+    }
+
+    async fn throttling_error_with_retry_after(retry_after: Option<&str>) -> lance_core::Error {
+        let mock_server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "code": 21,
+            "error": "Too many requests",
+        }));
+        if let Some(retry_after) = retry_after {
+            response = response.insert_header("Retry-After", retry_after);
+        }
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .respond_with(response)
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let request = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+        namespace
+            .list_namespaces(request)
+            .await
+            .expect_err("throttling response should fail")
+    }
+
+    #[tokio::test]
+    async fn test_throttling_error_preserves_retry_after() {
+        let err = throttling_error_with_retry_after(Some("2")).await;
+        let Error::Namespace { source, .. } = err else {
+            panic!("expected namespace error, got {err:?}");
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected NamespaceError source");
+        assert_eq!(ns_err.code(), ErrorCode::Throttling);
+        assert_eq!(ns_err.retry_after(), Some(Duration::from_secs(2)));
+    }
+
+    #[tokio::test]
+    async fn test_throttling_error_without_retry_after() {
+        let err = throttling_error_with_retry_after(None).await;
+        let Error::Namespace { source, .. } = err else {
+            panic!("expected namespace error, got {err:?}");
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected NamespaceError source");
+        assert_eq!(ns_err.code(), ErrorCode::Throttling);
+        assert_eq!(ns_err.retry_after(), None);
     }
 
     #[tokio::test]

@@ -25,6 +25,8 @@
 //! let lance_err: lance_core::Error = err.into();
 //! ```
 
+use std::time::Duration;
+
 use snafu::Snafu;
 
 /// Lance Namespace error codes.
@@ -267,7 +269,12 @@ pub enum NamespaceError {
 
     /// Request was throttled due to rate limiting or too many concurrent operations.
     #[snafu(display("Throttling: {message}"))]
-    Throttling { message: String },
+    Throttling {
+        message: String,
+        /// Server-suggested delay before retrying, from the `Retry-After`
+        /// response header when one was provided.
+        retry_after: Option<Duration>,
+    },
 
     /// The specified table branch does not exist.
     #[snafu(display("Table branch not found: {message}"))]
@@ -307,9 +314,21 @@ impl NamespaceError {
             | Self::Internal { message }
             | Self::InvalidTableState { message }
             | Self::TableSchemaValidationError { message }
-            | Self::Throttling { message }
+            | Self::Throttling { message, .. }
             | Self::TableBranchNotFound { message }
             | Self::TableBranchAlreadyExists { message } => message,
+        }
+    }
+
+    /// Returns the server-suggested retry delay for a throttling error.
+    ///
+    /// This is the normalized value of the `Retry-After` response header when
+    /// the server provided one. Returns `None` for non-throttling errors and
+    /// for throttling errors without retry guidance.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Throttling { retry_after, .. } => *retry_after,
+            _ => None,
         }
     }
 
@@ -374,7 +393,10 @@ impl NamespaceError {
             Some(ErrorCode::TableSchemaValidationError) => {
                 Self::TableSchemaValidationError { message }
             }
-            Some(ErrorCode::Throttling) => Self::Throttling { message },
+            Some(ErrorCode::Throttling) => Self::Throttling {
+                message,
+                retry_after: None,
+            },
             Some(ErrorCode::TableBranchNotFound) => Self::TableBranchNotFound { message },
             Some(ErrorCode::TableBranchAlreadyExists) => Self::TableBranchAlreadyExists { message },
             None => Self::Internal { message },
@@ -460,5 +482,26 @@ mod tests {
             message: "users".to_string(),
         };
         assert_eq!(err.to_string(), "Table not found: users");
+    }
+
+    #[test]
+    fn test_throttling_retry_after() {
+        let err = NamespaceError::Throttling {
+            message: "slow down".to_string(),
+            retry_after: Some(Duration::from_secs(5)),
+        };
+        assert_eq!(err.code(), ErrorCode::Throttling);
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(5)));
+
+        let err = NamespaceError::from_code(21, "slow down");
+        assert_eq!(err.retry_after(), None);
+    }
+
+    #[test]
+    fn test_retry_after_only_for_throttling() {
+        let err = NamespaceError::Internal {
+            message: "boom".to_string(),
+        };
+        assert_eq!(err.retry_after(), None);
     }
 }
