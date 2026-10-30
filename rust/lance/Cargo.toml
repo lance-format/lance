@@ -122,6 +122,7 @@ lance-index = { workspace = true, features = ["test-oracle"] }
 lance-arrow-scalar = { workspace = true }
 lance-arrow-stats = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+tracing-mock.workspace = true
 env_logger.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
@@ -149,10 +150,6 @@ reqwest = { workspace = true, features = ["rustls"] }
 [[test]]
 name = "arrow_ordering"
 test = false
-
-[[test]]
-name = "memory_metrics"
-required-features = ["metrics"]
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
