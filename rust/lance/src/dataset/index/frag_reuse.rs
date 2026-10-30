@@ -286,7 +286,7 @@ pub(crate) fn is_index_remap_caught_up(
         return Ok(false);
     }
 
-    match index_meta.fragment_bitmap.clone() {
+    match &index_meta.fragment_bitmap {
         Some(index_frag_bitmap) => {
             for group in frag_reuse_version.groups.iter() {
                 let mut old_frag_in_index = 0;

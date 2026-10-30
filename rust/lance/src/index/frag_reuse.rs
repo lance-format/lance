@@ -3,6 +3,9 @@
 
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
+use crate::index::frag_reuse_v0_cache::{
+    V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
+};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
@@ -40,7 +43,12 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
     /// A v0 FRI mapping served by the compact in-memory handle.
-    V0(Arc<dyn RowIdRemapper>),
+    V0 {
+        remapper: Arc<dyn RowIdRemapper>,
+        /// The segment's cache identity under this history (see
+        /// [`v0_segment_cache_id`]).
+        cache_id: Option<Uuid>,
+    },
     /// A tagged history under which this segment's rows are unchanged.
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
@@ -55,7 +63,10 @@ pub(crate) enum ResolvedRemapping {
 impl std::fmt::Debug for ResolvedRemapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
+            Self::V0 { cache_id, .. } => f
+                .debug_struct("V0")
+                .field("cache_id", cache_id)
+                .finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
             Self::V1Translate { remapper, .. } => {
                 f.debug_tuple("V1Translate").field(remapper).finish()
@@ -97,15 +108,16 @@ pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uui
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the history, by its
-/// [`v0_cache_identity`], identify cached content. Under a tagged history the
-/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
-/// for transitions a segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the history identify
+/// cached content, and only through the versions on the segment's path (see
+/// [`v0_segment_cache_id`]). Under a tagged history the FRI is deliberately
+/// left out: every rewrite and trim mints a new UUID, even for transitions a
+/// segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
     match resolved {
-        Some((uuid, ResolvedRemapping::V0(_))) => Some(uuid),
+        Some((_, ResolvedRemapping::V0 { cache_id, .. })) => cache_id.as_ref(),
         _ => None,
     }
 }
@@ -116,9 +128,10 @@ pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Opti
 /// by what they depend on rather than by snapshot:
 ///
 /// * Content decoded without translation (an identity segment under a
-///   tagged history, a v0 history, no history) depends only on the index
-///   file, so it lives in the plain per-index namespace and an append or an
-///   unrelated rewrite never cold-starts it.
+///   tagged history, no history) depends only on the index file, so it
+///   lives in the plain per-index namespace and an append or an unrelated
+///   rewrite never cold-starts it. Content decoded through a v0 remapper
+///   also lives here, under the per-index id from [`fri_cache_id`].
 /// * Content that embeds translated addresses (pages, postings, partitions
 ///   loaded through a `V1Translate` remapper) depends on the segment's
 ///   translation state, so it lives under a namespace named by the segment's
@@ -616,12 +629,24 @@ pub(super) async fn open_row_id_remapping_with_plan(
         index,
     )?;
     if fri.index_version == 0 {
-        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
-            (
-                v0_cache_identity(dataset, fri),
-                ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
-            )
-        }));
+        let Some(legacy) = dataset.open_frag_reuse_index(metrics).await? else {
+            return Ok(None);
+        };
+        let history = v0_cache_identity(dataset, fri);
+        let digests = dataset
+            .index_cache
+            .get_or_insert_with_key(V0HistoryDigestsKey { history: &history }, || async {
+                Ok(V0HistoryDigests::new(&legacy.details))
+            })
+            .await?;
+        let cache_id = v0_segment_cache_id(history, &legacy.details, &digests, index);
+        return Ok(Some((
+            history,
+            ResolvedRemapping::V0 {
+                remapper: Arc::new(CompactFragReuseIndexHandle(legacy)),
+                cache_id,
+            },
+        )));
     }
     if fri.index_version != 1 {
         return Err(Error::not_supported(format!(

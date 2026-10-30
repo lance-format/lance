@@ -1072,6 +1072,177 @@ async fn rtree_queries_translate_partition_addresses() {
     );
 }
 
+// Under a v0 history a segment's cache key covers only the versions on its
+// path. Compacting fragments a segment never covered, and the trim after the
+// covering segment is remapped, both give the history a new identity; the
+// untouched scalar and vector segments must stay warm through both, while the
+// covering segment reloads.
+#[tokio::test]
+async fn v0_history_keeps_untouched_segments_warm() {
+    fn rows(values: std::ops::Range<i32>) -> RecordBatch {
+        let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
+            arrow_array::types::Float32Type,
+            _,
+            _,
+        >(values.clone().map(|v| Some(vec![Some(v as f32); 4])), 4);
+        RecordBatch::try_from_iter([
+            (
+                "i",
+                Arc::new(arrow_array::Int32Array::from_iter_values(values.clone()))
+                    as arrow_array::ArrayRef,
+            ),
+            (
+                "j",
+                Arc::new(arrow_array::Int32Array::from_iter_values(values))
+                    as arrow_array::ArrayRef,
+            ),
+            ("vector", Arc::new(vectors) as arrow_array::ArrayRef),
+        ])
+        .unwrap()
+    }
+    async fn index_loads(dataset: &Dataset, column: &str, name: &str) -> usize {
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|index| index.name == name).unwrap();
+        let metrics = lance_index::metrics::LocalMetricsCollector::default();
+        if column == "vector" {
+            dataset
+                .open_vector_index(column, &index.uuid, &metrics)
+                .await
+                .unwrap();
+        } else {
+            crate::index::scalar::open_scalar_index(dataset, column, index, &metrics)
+                .await
+                .unwrap();
+        }
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    async fn assert_queries(dataset: &Dataset) {
+        for (column, value) in [("i", 5), ("i", 100), ("j", 101)] {
+            let filter = format!("{column} = {value}");
+            assert_eq!(dataset.count_rows(Some(filter)).await.unwrap(), 1);
+        }
+        for value in [5, 100] {
+            let query = arrow_array::Float32Array::from(vec![value as f32; 4]);
+            let mut scan = dataset.scan();
+            scan.nearest("vector", &query, 1).unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), value);
+        }
+    }
+    async fn history(dataset: &Dataset) -> Option<Uuid> {
+        crate::index::load_all_indices(dataset)
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .map(|fri| super::super::frag_reuse::v0_cache_identity(dataset, fri))
+    }
+
+    // Two full fragments covered by i_idx and vector_idx, then two one-row
+    // fragments covered only by j_idx, which compaction merges.
+    let initial = rows(0..12);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 6,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &crate::index::vector::VectorIndexParams::ivf_flat(
+                1,
+                lance_linalg::distance::DistanceType::L2,
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+    for value in [100, 101] {
+        let appended = rows(value..value + 1);
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .create_index(
+            &["j"],
+            IndexType::BTree,
+            Some("j_idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let segments = [("i", "i_idx"), ("vector", "vector_idx"), ("j", "j_idx")];
+    for (column, name) in segments {
+        assert_eq!(index_loads(&dataset, column, name).await, 1, "{name}");
+    }
+
+    crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions {
+            target_rows_per_fragment: 6,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(assert_legacy_metadata(&dataset).await.is_some());
+    assert_eq!(index_loads(&dataset, "i", "i_idx").await, 0);
+    assert_eq!(index_loads(&dataset, "vector", "vector_idx").await, 0);
+    assert_eq!(
+        index_loads(&dataset, "j", "j_idx").await,
+        1,
+        "the compaction rewrote fragments j_idx covers"
+    );
+    assert_queries(&dataset).await;
+
+    let compacted = history(&dataset).await;
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["j"],
+        Some("j_idx".into()),
+    )
+    .await
+    .unwrap();
+    crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+        .await
+        .unwrap();
+    assert_ne!(
+        history(&dataset).await,
+        compacted,
+        "the trim changes the history"
+    );
+    assert_eq!(index_loads(&dataset, "i", "i_idx").await, 0);
+    assert_eq!(index_loads(&dataset, "vector", "vector_idx").await, 0);
+    assert_queries(&dataset).await;
+}
+
 async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
     let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     assert_eq!(dataset.manifest.reader_feature_flags & flag, 0);
@@ -1095,7 +1266,7 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
                 uuid,
                 super::super::frag_reuse::v0_cache_identity(dataset, fri)
             );
-            let super::super::frag_reuse::ResolvedRemapping::V0(remapper) = remapping else {
+            let super::super::frag_reuse::ResolvedRemapping::V0 { remapper, .. } = remapping else {
                 panic!("V1 must use the synchronous remapper");
             };
             let legacy = dataset

@@ -86,6 +86,7 @@ mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
+mod frag_reuse_v0_cache;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 pub mod mem_wal;
 pub mod optimize;
@@ -4177,9 +4178,18 @@ impl Dataset {
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
         // key is a plugin detail), so there is no cheap scalar check here.
         let frag_reuse_uuid = v0_frag_reuse_cache_id(self).await;
+        // Only a v0 history keys vector entries. A cached legacy entry is
+        // returned without resolving the segment again, so a segment that
+        // cannot be resolved here probes under the whole history.
+        let segment_cache_id = match frag_reuse_uuid {
+            Some(history) => frag_reuse_v0_cache::segment_cache_id(self, uuid, purpose)
+                .await
+                .unwrap_or(Some(history)),
+            None => None,
+        };
 
         // Check sized cache for IvfIndexState (v2+ indices).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let state_key = IvfIndexStateCacheKey::new(uuid, segment_cache_id.as_ref());
         if self.index_cache.get_with_key(&state_key).await.is_some() {
             // Reconstruct via open_vector_index which will hit the same sized key.
             let index = self
@@ -4189,7 +4199,7 @@ impl Dataset {
         }
 
         // Fallback: in-memory cache for legacy indices.
-        let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, segment_cache_id.as_ref());
         if let Some(cached) = self.index_cache.get_with_key(&vector_cache_key).await {
             return Ok(cached.0.clone().as_index());
         }
