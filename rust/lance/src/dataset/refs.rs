@@ -717,19 +717,16 @@ impl Branches<'_> {
             };
         }
 
+        if self.object_store().scheme() == "file-object-store" {
+            cleanup = match cleanup {
+                BranchCleanup::Recursive(path) => BranchCleanup::Selective(path),
+                cleanup => cleanup,
+            };
+        }
+
         match cleanup {
             BranchCleanup::Skip => Ok(()),
             BranchCleanup::Recursive(path) => {
-                if has_local_paths
-                    && self
-                        .recursive_delete_would_touch_retained_data(&path, &remaining_paths)
-                        .await?
-                {
-                    log::warn!(
-                        "Keeping branch directory after deleting {branch}: recursive deletion below {path} would reach retained dataset data"
-                    );
-                    return Ok(());
-                }
                 if let Err(e) = self.object_store().remove_dir_all(path).await {
                     match &e {
                         Error::NotFound { .. } => {
@@ -743,75 +740,72 @@ impl Branches<'_> {
             BranchCleanup::Selective(delete_path) => {
                 let mut pending = vec![delete_path];
                 while let Some(path) = pending.pop() {
-                    match self
+                    let classification = self
                         .classify_shared_branch_path(&path, &remaining_paths)
-                        .await?
+                        .await?;
+                    if matches!(classification, SharedBranchPath::Remaining) {
+                        continue;
+                    }
+                    let traverse_unrelated =
+                        if matches!(classification, SharedBranchPath::Unrelated)
+                            && self.object_store().scheme() == "file-object-store"
+                        {
+                            self.recursive_delete_would_touch_retained_data(&path, &remaining_paths)
+                                .await?
+                        } else {
+                            false
+                        };
+                    if matches!(classification, SharedBranchPath::Unrelated) && !traverse_unrelated
                     {
-                        SharedBranchPath::Remaining => continue,
-                        SharedBranchPath::Ancestor => {
-                            // A shared directory must remain, but the deleted branch's own
-                            // files (especially its manifests) must not remain accessible.
-                            let entries =
-                                self.object_store().list_with_delimiter(Some(&path)).await?;
-                            futures::stream::iter(entries.objects.into_iter().map(Ok))
-                                .try_for_each_concurrent(
-                                    self.object_store().io_parallelism(),
-                                    |file| async move {
-                                        self.object_store().delete(&file.location).await
-                                    },
-                                )
-                                .await?;
-                            // Hierarchical stores may include the listed directory's marker.
-                            let canonical_path = if has_local_paths {
-                                self.object_store().canonicalize_local_path(&path).await?
-                            } else {
-                                None
-                            };
-                            for child in entries
-                                .common_prefixes
-                                .into_iter()
-                                .filter(|child| child != &path && child.prefix_matches(&path))
-                            {
-                                if has_local_paths {
-                                    let canonical_child =
-                                        self.object_store().canonicalize_local_path(&child).await?;
-                                    match (&canonical_path, canonical_child) {
-                                        (Some(parent), Some(child))
-                                            if child.starts_with(parent) => {}
-                                        _ => {
-                                            log::warn!(
-                                                "Keeping aliased branch subtree {child}: canonical path leaves parent {path}"
-                                            );
-                                            continue;
-                                        }
-                                    }
+                        if let Err(e) = self.object_store().remove_dir_all(path).await {
+                            match &e {
+                                Error::NotFound { .. } => {
+                                    log::debug!("Branch directory already deleted");
                                 }
-                                pending.push(child);
+                                _ => return Err(e),
                             }
                         }
-                        SharedBranchPath::Unrelated => {
-                            if has_local_paths
-                                && self
-                                    .recursive_delete_would_touch_retained_data(
-                                        &path,
-                                        &remaining_paths,
-                                    )
-                                    .await?
-                            {
-                                log::warn!(
-                                    "Keeping aliased branch subtree {path}: recursive deletion would reach retained dataset data"
-                                );
-                                continue;
-                            }
-                            if let Err(e) = self.object_store().remove_dir_all(path).await {
-                                match &e {
-                                    Error::NotFound { .. } => {
-                                        log::debug!("Branch directory already deleted");
-                                    }
-                                    _ => return Err(e),
+                        continue;
+                    }
+                    if traverse_unrelated {
+                        log::warn!(
+                            "Inspecting branch subtree {path}: recursive deletion would reach retained dataset data"
+                        );
+                    }
+                    // A shared directory must remain, but the deleted branch's own
+                    // files (especially its manifests) must not remain accessible.
+                    let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
+                    futures::stream::iter(entries.objects.into_iter().map(Ok))
+                        .try_for_each_concurrent(
+                            self.object_store().io_parallelism(),
+                            |file| async move { self.object_store().delete(&file.location).await },
+                        )
+                        .await?;
+                    // Hierarchical stores may include the listed directory's marker.
+                    let canonical_path = if has_local_paths {
+                        self.object_store().canonicalize_local_path(&path).await?
+                    } else {
+                        None
+                    };
+                    for child in entries
+                        .common_prefixes
+                        .into_iter()
+                        .filter(|child| child != &path && child.prefix_matches(&path))
+                    {
+                        if has_local_paths {
+                            let canonical_child =
+                                self.object_store().canonicalize_local_path(&child).await?;
+                            match (&canonical_path, canonical_child) {
+                                (Some(parent), Some(child)) if child.starts_with(parent) => {}
+                                _ => {
+                                    log::warn!(
+                                        "Keeping aliased branch subtree {child}: canonical path leaves parent {path}"
+                                    );
+                                    continue;
                                 }
                             }
                         }
+                        pending.push(child);
                     }
                 }
                 Ok(())
@@ -825,54 +819,33 @@ impl Branches<'_> {
         deleted_branch: &str,
     ) -> Result<Option<Vec<PathBuf>>> {
         let mut canonical_retained_dirs = HashSet::with_capacity(DATASET_DIRS.len() + 1);
+        let mut pending = Vec::new();
         for name in self.object_store().read_dir(path.clone()).await? {
             if name != REFS_DIR && !is_dataset_dir(&name) {
                 continue;
             }
-            let dataset_path = path.clone().join(name);
-            if !self
-                .collect_retained_dir_tree(
-                    &dataset_path,
-                    deleted_branch,
-                    &mut canonical_retained_dirs,
-                )
-                .await?
-            {
+            pending.push(path.clone().join(name));
+        }
+        while let Some(dir) = pending.pop() {
+            let Some(canonical) = self.object_store().canonicalize_local_path(&dir).await? else {
+                log::warn!(
+                    "Keeping branch directories after deleting {deleted_branch}: cannot resolve retained directory at {dir}"
+                );
                 return Ok(None);
+            };
+            if !canonical_retained_dirs.insert(canonical) {
+                continue;
             }
+            pending.extend(
+                self.object_store()
+                    .list_with_delimiter(Some(&dir))
+                    .await?
+                    .common_prefixes
+                    .into_iter()
+                    .filter(|child| child != &dir && child.prefix_matches(&dir)),
+            );
         }
         Ok(Some(canonical_retained_dirs.into_iter().collect()))
-    }
-
-    async fn collect_retained_dir_tree(
-        &self,
-        path: &Path,
-        deleted_branch: &str,
-        retained: &mut HashSet<PathBuf>,
-    ) -> Result<bool> {
-        let Some(canonical) = self.object_store().canonicalize_local_path(path).await? else {
-            log::warn!(
-                "Keeping branch directories after deleting {deleted_branch}: cannot resolve retained directory at {path}"
-            );
-            return Ok(false);
-        };
-        if !retained.insert(canonical) {
-            return Ok(true);
-        }
-        let entries = self.object_store().list_with_delimiter(Some(path)).await?;
-        for child in entries
-            .common_prefixes
-            .into_iter()
-            .filter(|child| child != &path && child.prefix_matches(&path))
-        {
-            if !self
-                .collect_retained_dir_tree(&child, deleted_branch, retained)
-                .await?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     async fn recursive_delete_would_touch_retained_data(
