@@ -2683,10 +2683,9 @@ impl Scanner {
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
     ///
     /// When unset, the search ranks by the metric of the vector index it chooses for the
-    /// column, also where it falls back to flat KNN over fragments that index does not
-    /// cover. A search that chooses no index, such as one with [`Self::use_index`] false
-    /// or a full-text filter under [`Self::prefilter`], uses the column type's default:
-    /// Hamming for uint8 vectors and L2 otherwise.
+    /// column, including when it falls back to flat KNN for filtered rows or fragments
+    /// that index does not cover. A search with [`Self::use_index`] false uses the column
+    /// type's default: Hamming for uint8 vectors and L2 otherwise.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = Some(metric_type)
