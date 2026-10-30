@@ -659,6 +659,42 @@ mod tests {
     #[rstest]
     #[case::modern(false)]
     #[case::legacy(true)]
+    fn test_ipc_stream_at_stops_after_unsupported_message(#[case] legacy: bool) {
+        let batch_a = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
+        let batch_b = record_batch!(("v", Int64, [4i64, 5])).unwrap();
+        let mut stream_a = write_ipc_stream_for_test(std::slice::from_ref(&batch_a), legacy);
+        let stream_b = write_ipc_stream_for_test(std::slice::from_ref(&batch_b), legacy);
+        let eos_len = if legacy { 4 } else { 8 };
+        stream_a.truncate(stream_a.len() - eos_len);
+        let stream_a_len = stream_a.len();
+        let schema_b_len = match read_one_ipc_message(&Bytes::from(stream_b.clone())).unwrap() {
+            IpcMessageRead::Message(message) => message.buffer.len(),
+            IpcMessageRead::End { .. } => panic!("expected schema message"),
+        };
+
+        // The second stream starts with a complete schema message, which is
+        // unsupported after the first schema. Leave its record batch, EOS, and
+        // malformed trailing bytes unread so this locks the exact stop offset.
+        let malformed = [0xFF, 0xFF, 0xFF, 0xFF];
+        let mut blob = stream_a;
+        blob.extend_from_slice(&stream_b);
+        blob.extend_from_slice(&malformed);
+
+        let data = Bytes::from(blob);
+        let mut offset = 0;
+        let read = read_ipc_stream_at(&data, &mut offset).unwrap();
+
+        assert_eq!(read, vec![batch_a]);
+        assert_eq!(offset, stream_a_len + schema_b_len);
+        assert_eq!(
+            &data[offset..],
+            [&stream_b[schema_b_len..], &malformed].concat()
+        );
+    }
+
+    #[rstest]
+    #[case::modern(false)]
+    #[case::legacy(true)]
     fn test_ipc_stream_at_zero_length_body(#[case] legacy: bool) {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let batch = RecordBatch::new_empty(schema);
