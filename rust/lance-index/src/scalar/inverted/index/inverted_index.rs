@@ -162,6 +162,12 @@ impl InvertedIndex {
         self
     }
 
+    /// The rows this segment may answer for, when the opener restricted it
+    /// (see [`Self::with_allowed_rows`]).
+    pub fn allowed_rows(&self) -> Option<&Arc<RowAddrMask>> {
+        self.allowed_rows.as_ref()
+    }
+
     /// The mask this segment searches with: `mask` restricted to its allowed rows.
     pub(crate) fn restrict_mask(&self, mask: Arc<RowAddrMask>) -> Arc<RowAddrMask> {
         match &self.allowed_rows {
