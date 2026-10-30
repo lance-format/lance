@@ -64,7 +64,9 @@ impl Footprint {
             match after_by_id.get(&fragment.id) {
                 None if moves_rows => self.move_rows_out_of(fragment.id),
                 None => self.remove_fragment(fragment.id),
-                Some(changed) => self.changes_within(&before.schema, fragment, changed),
+                Some(changed) => {
+                    self.changes_within(&before.schema, &after.schema, fragment, changed)
+                }
             }
         }
 
@@ -91,10 +93,24 @@ impl Footprint {
     }
 
     /// What changed inside one fragment that is in both manifests.
-    fn changes_within(&mut self, schema: &Schema, before: &Fragment, after: &Fragment) {
+    ///
+    /// A field the commit dropped from the schema has its files pruned, which
+    /// is part of the drop rather than a write of the fragment: the field's
+    /// existence already says it, and no reader sees the files.
+    fn changes_within(
+        &mut self,
+        schema: &Schema,
+        after_schema: &Schema,
+        before: &Fragment,
+        after: &Fragment,
+    ) {
         let id = before.id;
         if before.deletion_file != after.deletion_file {
-            self.write(Coordinate::FragmentDeletions(id));
+            if adds_deletions(before, after) {
+                self.add_deletions(id);
+            } else {
+                self.write(Coordinate::FragmentDeletions(id));
+            }
         }
         // Added overlays restamp the rows they cover, as an `AddOverlays` does
         // without claiming the sequence: the restamp composes with a refresh in
@@ -109,13 +125,16 @@ impl Footprint {
         }
 
         let (before_backing, after_backing) = (backing(before), backing(after));
-        let changed: HashSet<i32> = before_backing
+        let (changed, pruned): (HashSet<i32>, HashSet<i32>) = before_backing
             .keys()
             .chain(after_backing.keys())
             .filter(|field| before_backing.get(field) != after_backing.get(field))
             .copied()
-            .collect();
-        if !changed.is_empty() || before.files.len() != after.files.len() {
+            .partition(|field| {
+                !is_committed(schema, FieldRef::Committed(*field))
+                    || after_schema.field_by_id(*field).is_some()
+            });
+        if !changed.is_empty() || (before.files.len() != after.files.len() && pruned.is_empty()) {
             self.write_part(Coordinate::FragmentFiles(id));
         }
         for field in changed {
@@ -251,6 +270,23 @@ impl Footprint {
                 key: key.clone(),
             });
         }
+    }
+}
+
+/// Whether `after`'s deletions can only have added to `before`'s, as far as
+/// the manifests tell: there is a deletion file, and it counts no fewer rows.
+/// A rebase that merges the deletions reads both files to make sure.
+fn adds_deletions(before: &Fragment, after: &Fragment) -> bool {
+    let deleted = |fragment: &Fragment| {
+        fragment
+            .deletion_file
+            .as_ref()
+            .map(|file| file.num_deleted_rows)
+    };
+    match (deleted(before), deleted(after)) {
+        (_, None) => false,
+        (Some(Some(before)), Some(Some(after))) => after >= before,
+        _ => true,
     }
 }
 

@@ -478,7 +478,7 @@ async fn stage_delete(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged>
 
 /// A delete of the one row whose `a` is `key`.
 pub(super) async fn stage_delete_row(dataset: &Arc<Dataset>, key: i32) -> Result<Staged> {
-    let staged = DeleteBuilder::new(dataset.clone(), &format!("a = {key}"))
+    let staged = DeleteBuilder::new(dataset.clone(), format!("a = {key}"))
         .execute_uncommitted()
         .await?;
     Ok(Staged::with_affected_rows(
