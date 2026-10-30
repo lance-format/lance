@@ -434,25 +434,82 @@ lance_core::dispatch! {
     };
 }
 
-#[cfg(target_arch = "x86_64")]
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(L2_F64_PORTABLE: PairKernel<f64>)]
+    /// The x86_64 fallback below AVX, and the only kernel elsewhere. On
+    /// x86_64 `simd::f64` requires AVX, so this body is plain Rust there;
+    /// elsewhere `simd::f64` is backed by the baseline NEON or LSX.
     #[inline]
     fn l2_f64_portable(x: &[f64], y: &[f64]) -> f32 {
-        x.iter()
-            .zip(y.iter())
-            .map(|(&a, &b)| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            x.iter()
+                .zip(y.iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum::<f64>() as f32
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            use crate::simd::f64::{f64x4, f64x8};
+            use crate::simd::{FloatSimd, SIMD};
+
+            // Callers pass equal lengths; `min` keeps the unchecked loads in
+            // bounds for any input, as a safe function must.
+            let dim = x.len().min(y.len());
+            let unrolled_len = dim / 8 * 8;
+
+            let mut acc8 = f64x8::zeros();
+            for i in (0..unrolled_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
+                let (a, b) = unsafe {
+                    (
+                        f64x8::load_unaligned(x.as_ptr().add(i)),
+                        f64x8::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
                 let diff = a - b;
-                diff * diff
-            })
-            .sum::<f64>() as f32
+                acc8.multiply_add(diff, diff);
+            }
+
+            let aligned_len = dim / 4 * 4;
+            let mut acc4 = f64x4::zeros();
+            for i in (unrolled_len..aligned_len).step_by(4) {
+                // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
+                let (a, b) = unsafe {
+                    (
+                        f64x4::load_unaligned(x.as_ptr().add(i)),
+                        f64x4::load_unaligned(y.as_ptr().add(i)),
+                    )
+                };
+                let diff = a - b;
+                acc4.multiply_add(diff, diff);
+            }
+
+            let tail: f64 = x[aligned_len..]
+                .iter()
+                .zip(y[aligned_len..].iter())
+                .map(|(&a, &b)| {
+                    let diff = a - b;
+                    diff * diff
+                })
+                .sum();
+
+            (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
+        }
     }
 }
 
 lance_core::dispatch! {
     /// Each batch candidate loops over its tier's `L2_F64` kernel, so the
-    /// selection runs once per batch and the pair kernel inlines.
+    /// selection runs once per batch and the pair kernel inlines. Unlike
+    /// `L2_F32_BATCH`, this keeps an AVX-512 candidate: f64 batches have
+    /// always used the AVX-512 kernel on AVX-512 hosts, and matching `L2_F64`
+    /// tier for tier keeps batch results bit-identical to `l2`, at one
+    /// indirect call per batch on Haswell builds.
     static L2_F64_BATCH: Dispatch<BatchKernel<f64>> = {
         #[cfg(target_arch = "x86_64")]
         {
@@ -877,61 +934,6 @@ mod x86 {
             let sum = unsafe { hsum256_ps(acc) };
             sum + tail
         }
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-lance_core::target_kernel! {
-    #[target_features()]
-    #[candidate(L2_F64_PORTABLE: PairKernel<f64>)]
-    /// `simd::f64` is backed by the baseline NEON or LSX on these architectures.
-    #[inline]
-    fn l2_f64_portable(x: &[f64], y: &[f64]) -> f32 {
-        use crate::simd::f64::{f64x4, f64x8};
-        use crate::simd::{FloatSimd, SIMD};
-
-        // Callers pass equal lengths; `min` keeps the unchecked loads in
-        // bounds for any input, as a safe function must.
-        let dim = x.len().min(y.len());
-        let unrolled_len = dim / 8 * 8;
-
-        let mut acc8 = f64x8::zeros();
-        for i in (0..unrolled_len).step_by(8) {
-            // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-            let (a, b) = unsafe {
-                (
-                    f64x8::load_unaligned(x.as_ptr().add(i)),
-                    f64x8::load_unaligned(y.as_ptr().add(i)),
-                )
-            };
-            let diff = a - b;
-            acc8.multiply_add(diff, diff);
-        }
-
-        let aligned_len = dim / 4 * 4;
-        let mut acc4 = f64x4::zeros();
-        for i in (unrolled_len..aligned_len).step_by(4) {
-            // SAFETY: `i + 4 <= dim`, which is in bounds for both slices.
-            let (a, b) = unsafe {
-                (
-                    f64x4::load_unaligned(x.as_ptr().add(i)),
-                    f64x4::load_unaligned(y.as_ptr().add(i)),
-                )
-            };
-            let diff = a - b;
-            acc4.multiply_add(diff, diff);
-        }
-
-        let tail: f64 = x[aligned_len..]
-            .iter()
-            .zip(y[aligned_len..].iter())
-            .map(|(&a, &b)| {
-                let diff = a - b;
-                diff * diff
-            })
-            .sum();
-
-        (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
     }
 }
 
