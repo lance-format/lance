@@ -1159,6 +1159,20 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// Delete every location in `locations`, using the backend's bulk delete when it
+    /// has one.
+    ///
+    /// The returned stream yields one result per input location.  The backend may
+    /// coalesce many paths into a single request (S3: up to 1000 paths per
+    /// `DeleteObjects`), so this is preferable to issuing one request per path.
+    /// Order is not preserved.
+    pub fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
     /// AWS S3 and GCS reject a single-shot server-side copy whose source is
     /// larger than this; such sources are streamed through a multipart write.
     const MAX_SINGLE_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
@@ -3606,6 +3620,31 @@ mod tests {
             observations.delete_max_in_flight.load(Ordering::SeqCst) > 1,
             "deletions ran one at a time; remove_stream must overlap them"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_stream_removes_every_path() {
+        let store = ObjectStore::memory();
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let mut reported = store
+            .delete_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Bulk deletion does not preserve order.
+        reported.sort_unstable();
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        for path in &paths {
+            assert!(!store.exists(path).await.unwrap(), "{path} still present");
+        }
     }
 
     #[tokio::test]

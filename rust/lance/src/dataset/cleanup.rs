@@ -444,6 +444,12 @@ impl CleanupInspection {
 /// If a file cannot be verified then it will only be deleted if it is at least
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
+/// Paths handed to one bulk-delete request.  S3's `DeleteObjects` accepts up to
+/// 1000 keys per request; other stores may split or process them individually.
+const BULK_DELETE_BATCH_FILES: usize = 1_000;
+/// Below this many paths a single-object delete per path issues no more requests than
+/// a bulk request, while preserving precise per-path outcomes.
+const BULK_DELETE_MIN_FILES: usize = 100;
 const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
 /// Overlap fragment I/O even for a single manifest without queuing all its scans.
 /// The operation's shared permits bound active scans across manifests and branches.
@@ -473,9 +479,10 @@ impl<'a> CleanupOperation<'a> {
         }
     }
 
-    /// Set the maximum in-flight file deletes shared with all cascaded branches.
+    /// Set the maximum in-flight delete operations shared with all cascaded branches.
     ///
-    /// If unset, the initiating dataset's object store I/O parallelism is used.
+    /// Each operation is one manifest delete or one bulk request (which may carry many
+    /// paths). If unset, the initiating dataset's object store I/O parallelism is used.
     /// Returns an invalid-input error outside `1..=tokio::sync::Semaphore::MAX_PERMITS`.
     ///
     /// ```
@@ -495,10 +502,12 @@ impl<'a> CleanupOperation<'a> {
         Ok(self)
     }
 
-    /// Set the maximum delete requests per second shared with all cascaded branches.
+    /// Set the maximum delete paths per second shared with all cascaded branches.
     ///
     /// Overrides [`CleanupPolicy::delete_rate_limit`]; without an override, the
     /// policy's rate applies. If neither is set, deletes are not rate limited.
+    /// Bulk deletes may carry several paths per request, so this bounds the paths
+    /// removed per second, not the HTTP request rate.
     /// Returns a cleanup error if `rate` is zero. See [`Self::with_delete_concurrency`]
     /// for an example configuring both limits.
     pub fn with_delete_rate_limit(mut self, rate: u64) -> Result<Self> {
@@ -1272,69 +1281,34 @@ impl<'a> CleanupTask<'a> {
         if deletes_files {
             let execution = self
                 .delete_execution
-                .as_ref()
+                .clone()
                 .expect("execute requires a deletion context");
             // Deleting here rather than through `remove_stream` keeps each outcome
             // attached to its file, which is what lets the stats below count what was
-            // actually removed instead of what was merely attempted.
-            let store = &self.dataset.object_store;
-            all_files_to_remove
-                .map(|file| async move {
-                    let file = file?;
-                    // Acquire concurrency before QPS so queued deletes cannot spend
-                    // rate permits early and then start together when a slot opens.
-                    let _permit = execution.permits.acquire().await.map_err(|error| {
-                        Error::invalid_input(format!("cleanup delete semaphore closed: {error}"))
-                    })?;
-                    if let Some(limiter) = &execution.limiter {
-                        let mut ticker = limiter.lock().await;
-                        ticker.tick().await;
-                    }
-                    let outcome = match store.delete(&file.path).await {
-                        Ok(()) => Ok(()),
-                        // Cleanup lists first and deletes after, so a concurrent
-                        // writer or a second cleanup can remove a path in between.
-                        // Already gone is the outcome we wanted.
-                        Err(error) if error.is_not_found() => Ok(()),
-                        Err(error) => Err(error),
-                    };
-                    Ok::<_, Error>((file, outcome))
-                })
-                .buffer_unordered(execution.concurrency)
-                .try_for_each(|(file, outcome)| {
-                    let mut result = cleanup_result.lock().unwrap();
-                    match outcome {
-                        Ok(()) => result.record_file(
-                            &file,
-                            candidate_file_limit,
-                            self.track_removed_manifests,
-                        ),
-                        // One transient failure must not discard a sweep over
-                        // millions of objects. The file stays, is not counted as
-                        // removed, and the next run finds it again by listing.
-                        Err(error) => {
-                            // Only the first is warned; a failing backend would
-                            // otherwise emit a line per object.
-                            if result.stats.failed_deletes == 0 {
-                                warn!(path = %file.path, error = %error,
-                                      "failed to delete file; continuing and counting it");
-                            } else {
-                                debug!(path = %file.path, error = %error, "failed to delete file");
-                            }
-                            result.stats.failed_deletes += 1;
-                            if matches!(file.kind, CleanupFileKind::Manifest)
-                                && let Some(expired) = inspection.old_manifests.get(&file.path)
-                            {
-                                undeleted_manifest_versions
-                                    .lock()
-                                    .unwrap()
-                                    .insert(expired.version);
-                            }
-                        }
-                    }
-                    future::ready(Ok(()))
-                })
+            // actually removed instead of what was merely attempted.  Candidates are
+            // processed in batches sized so each concurrent slot hands the store one
+            // bulk request's worth of paths.
+            let store = self.dataset.object_store.as_ref();
+            let candidate_file_limit = self.action.candidate_file_limit();
+            let track_removed_manifests = self.track_removed_manifests;
+            let concurrency = execution.concurrency.max(1);
+            let batch_size = concurrency.saturating_mul(BULK_DELETE_BATCH_FILES);
+            let mut chunks = all_files_to_remove.try_chunks(batch_size);
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|error| error.1)?;
+                Self::delete_chunk(
+                    chunk,
+                    store,
+                    Arc::clone(&execution),
+                    concurrency,
+                    &inspection.old_manifests,
+                    &cleanup_result,
+                    &undeleted_manifest_versions,
+                    candidate_file_limit,
+                    track_removed_manifests,
+                )
                 .await?;
+            }
 
             // Only after the objects are gone: a record that outlives its
             // manifest is retired by the next cleanup, the reverse is a lost
@@ -1415,6 +1389,263 @@ impl<'a> CleanupTask<'a> {
         );
 
         Ok(cleanup_result)
+    }
+
+    /// Deletes one batch of cleanup candidates.
+    ///
+    /// Manifests are deleted one at a time because a failed manifest delete must keep
+    /// its commit-handler record; every other kind goes through the store's bulk
+    /// delete, which providers may coalesce into a single request.
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_chunk(
+        chunk: Vec<CleanupFile>,
+        store: &ObjectStore,
+        execution: Arc<DeleteExecution>,
+        concurrency: usize,
+        old_manifests: &HashMap<Path, ExpiredManifest>,
+        cleanup_result: &Mutex<CleanupRunResult>,
+        undeleted_manifest_versions: &Mutex<HashSet<u64>>,
+        candidate_file_limit: Option<usize>,
+        track_removed_manifests: bool,
+    ) -> Result<()> {
+        let (manifests, bulk): (Vec<_>, Vec<_>) = chunk
+            .into_iter()
+            .partition(|file| matches!(file.kind, CleanupFileKind::Manifest));
+
+        // Manifests always use a single-object delete so a failed delete keeps its
+        // commit-handler record.  Small batches do the same: one request per path is no
+        // worse than a bulk request, and the per-path outcome is exact.
+        let mut singles = manifests;
+        let bulk = if bulk.len() < BULK_DELETE_MIN_FILES {
+            singles.extend(bulk);
+            Vec::new()
+        } else {
+            bulk
+        };
+
+        stream::iter(singles)
+            .map(|file| {
+                let execution = Arc::clone(&execution);
+                async move {
+                    Self::delete_single_file(
+                        file,
+                        store,
+                        &execution,
+                        old_manifests,
+                        cleanup_result,
+                        undeleted_manifest_versions,
+                        candidate_file_limit,
+                        track_removed_manifests,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        if bulk.is_empty() {
+            return Ok(());
+        }
+
+        // Split the chunk into bulk-request-sized sub-batches.  The chunk is sized at
+        // `concurrency * BULK_DELETE_BATCH_FILES`, so this yields at most `concurrency`
+        // sub-batches.
+        let sub_batch_size = BULK_DELETE_BATCH_FILES;
+        let mut sub_batches = Vec::with_capacity(bulk.len().div_ceil(sub_batch_size));
+        let mut current = Vec::with_capacity(sub_batch_size);
+        for file in bulk {
+            current.push(file);
+            if current.len() == sub_batch_size {
+                sub_batches.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            sub_batches.push(current);
+        }
+
+        stream::iter(sub_batches)
+            .map(|files| {
+                let execution = Arc::clone(&execution);
+                async move {
+                    Self::delete_bulk_batch(
+                        files,
+                        store,
+                        execution,
+                        cleanup_result,
+                        candidate_file_limit,
+                        track_removed_manifests,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok(())
+    }
+
+    /// Deletes one candidate with a single-object delete.
+    ///
+    /// A manifest's precise outcome decides whether its commit-handler record may be
+    /// retired, so manifests never go through the bulk path; small batches use this path
+    /// too because it reports each outcome exactly.
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_single_file(
+        file: CleanupFile,
+        store: &ObjectStore,
+        execution: &DeleteExecution,
+        old_manifests: &HashMap<Path, ExpiredManifest>,
+        cleanup_result: &Mutex<CleanupRunResult>,
+        undeleted_manifest_versions: &Mutex<HashSet<u64>>,
+        candidate_file_limit: Option<usize>,
+        track_removed_manifests: bool,
+    ) -> Result<()> {
+        // Acquire concurrency before QPS so queued deletes cannot spend rate permits
+        // early and then start together when a slot opens.
+        let _permit = execution.permits.acquire().await.map_err(|error| {
+            Error::invalid_input(format!("cleanup delete semaphore closed: {error}"))
+        })?;
+        if let Some(limiter) = &execution.limiter {
+            let mut ticker = limiter.lock().await;
+            ticker.tick().await;
+        }
+        let outcome = match store.delete(&file.path).await {
+            Ok(()) => Ok(()),
+            // Cleanup lists first and deletes after, so a concurrent writer or a
+            // second cleanup can remove a path in between.  Already gone is the
+            // outcome we wanted.
+            Err(error) if error.is_not_found() => Ok(()),
+            Err(error) => Err(error),
+        };
+        let mut result = cleanup_result.lock().unwrap();
+        match outcome {
+            Ok(()) => result.record_file(&file, candidate_file_limit, track_removed_manifests),
+            // One transient failure must not discard a sweep over millions of objects.
+            // The file stays, is not counted as removed, and the next run finds it again
+            // by listing.
+            Err(error) => {
+                // Only the first is warned; a failing backend would otherwise emit a
+                // line per object.
+                if result.stats.failed_deletes == 0 {
+                    warn!(path = %file.path, error = %error,
+                          "failed to delete file; continuing and counting it");
+                } else {
+                    debug!(path = %file.path, error = %error, "failed to delete file");
+                }
+                result.stats.failed_deletes += 1;
+                if let Some(expired) = old_manifests.get(&file.path) {
+                    undeleted_manifest_versions
+                        .lock()
+                        .unwrap()
+                        .insert(expired.version);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes one sub-batch through the store's bulk delete and records each outcome.
+    async fn delete_bulk_batch(
+        files: Vec<CleanupFile>,
+        store: &ObjectStore,
+        execution: Arc<DeleteExecution>,
+        cleanup_result: &Mutex<CleanupRunResult>,
+        candidate_file_limit: Option<usize>,
+        track_removed_manifests: bool,
+    ) -> Result<()> {
+        // One permit per bulk request keeps the shared delete concurrency bound across
+        // branches; the store coalesces the paths into one or more requests.
+        let _permit = execution.permits.acquire().await.map_err(|error| {
+            Error::invalid_input(format!("cleanup delete semaphore closed: {error}"))
+        })?;
+
+        let mut pending: HashMap<Path, CleanupFile> = files
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect();
+        let paths = pending.keys().cloned().collect::<Vec<_>>();
+
+        // The bulk API consumes a `'static` stream.  Feed it owned paths and apply the
+        // path-rate limit as the store pulls them, so a batch cannot admit more paths
+        // than the configured rate.
+        let limiter_execution = Arc::clone(&execution);
+        let locations = stream::iter(paths)
+            .then(move |path| {
+                let execution = Arc::clone(&limiter_execution);
+                async move {
+                    if let Some(limiter) = &execution.limiter {
+                        let mut ticker = limiter.lock().await;
+                        ticker.tick().await;
+                    }
+                    Ok::<Path, object_store::Error>(path)
+                }
+            })
+            .boxed();
+
+        let mut results = store.delete_stream(locations);
+        let mut errors_without_path = 0u64;
+        let mut first_error: Option<object_store::Error> = None;
+        while let Some(outcome) = results.next().await {
+            match outcome {
+                Ok(path) => {
+                    if let Some(file) = pending.remove(&path) {
+                        cleanup_result.lock().unwrap().record_file(
+                            &file,
+                            candidate_file_limit,
+                            track_removed_manifests,
+                        );
+                    }
+                }
+                Err(error) => {
+                    // A path that is already gone is the outcome we wanted.
+                    if let object_store::Error::NotFound { path, .. } = &error {
+                        if let Ok(path) = Path::parse(path.as_str())
+                            && let Some(file) = pending.remove(&path)
+                        {
+                            cleanup_result.lock().unwrap().record_file(
+                                &file,
+                                candidate_file_limit,
+                                track_removed_manifests,
+                            );
+                        }
+                        continue;
+                    }
+                    errors_without_path += 1;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        // A whole-request failure comes back as one error and leaves every path of the
+        // request unresolved.  Some stores also report per-path failures without the
+        // path.  Counting the unresolved candidates is conservative and never
+        // under-counts failures.
+        let failed = (pending.len() as u64).max(errors_without_path);
+        if failed > 0 {
+            let mut result = cleanup_result.lock().unwrap();
+            if result.stats.failed_deletes == 0 {
+                match &first_error {
+                    Some(error) => warn!(
+                        count = failed,
+                        error = %error,
+                        "failed to delete files in a bulk delete; continuing and counting them"
+                    ),
+                    None => warn!(
+                        count = failed,
+                        "failed to delete files in a bulk delete; some paths were not reported by the store"
+                    ),
+                }
+            } else {
+                debug!(count = failed, "failed to delete files in a bulk delete");
+            }
+            result.stats.failed_deletes += failed;
+        }
+
+        Ok(())
     }
 
     async fn cleanup_file_if_not_referenced(
@@ -2171,16 +2402,16 @@ fn create_delete_limiter(rate: Option<u64>) -> Option<tokio::sync::Mutex<tokio::
     })
 }
 
-/// The interval between delete permits for a `delete_rate_limit` of `rate` requests/s.
+/// The interval between delete permits for a `delete_rate_limit` of `rate` paths/s.
 ///
-/// One permit issues exactly one `delete`, so the interval is the reciprocal of the
-/// rate. Scaling it by a bulk-delete batch size would only be correct if a permit
-/// covered a whole batch; nothing coalesces paths into a single request, so doing so
-/// lets the limiter issue `batch_size` times the configured rate.
+/// One permit admits exactly one path, even when the store coalesces paths into a bulk
+/// request, so the interval is the reciprocal of the path rate. Scaling it by a
+/// bulk-delete batch size would let the limiter admit `batch_size` times the configured
+/// path rate.
 fn calculate_duration(rate: u64) -> Duration {
     let effective_rate = rate.max(1);
     info!(
-        "delete_rate_limit enabled: limit {} delete requests/sec",
+        "delete_rate_limit enabled: limit {} delete paths/sec",
         effective_rate
     );
     Duration::from_nanos(1_000_000_000u64.div_ceil(effective_rate).max(1))
@@ -2219,11 +2450,12 @@ pub struct CleanupPolicy {
     pub error_if_tagged_old_versions: bool,
     /// If clean the referenced branches
     pub clean_referenced_branches: bool,
-    /// Maximum number of delete requests per second. If None, no rate limiting is applied.
+    /// Maximum number of delete paths per second. If None, no rate limiting is applied.
     ///
     /// Use this to avoid hitting S3 (or other object store) request rate limits during
-    /// cleanup. Cleanup deletes one path per request, so this is also the number of
-    /// paths removed per second. For example, `Some(100)` limits deletions to 100
+    /// cleanup.  Cleanup may coalesce paths into a bulk request (for example S3
+    /// `DeleteObjects`), so this bounds the paths removed per second; the HTTP request
+    /// rate can be lower. For example, `Some(100)` limits deletions to 100
     /// delete requests per second.
     /// The budget is shared by this cleanup and all cascaded branches, ignoring
     /// their own rate settings. `None` leaves deletes unthrottled unless overridden.
@@ -2361,11 +2593,11 @@ impl CleanupPolicyBuilder {
         self
     }
 
-    /// Limit the number of delete requests per second during cleanup.
+    /// Limit the number of delete paths per second during cleanup.
     ///
     /// By default (None), deletions run at full speed. Set this to a positive value to
     /// throttle deletions and avoid hitting object store request rate limits (e.g. S3 HTTP 503).
-    /// The request budget is shared with all cascaded branches, overriding their rate settings.
+    /// The path budget is shared with all cascaded branches, overriding their rate settings.
     ///
     /// # Errors
     ///
@@ -4517,6 +4749,34 @@ mod tests {
         // Appends leave every fragment referenced by the latest version.
         assert_eq!(after_count.num_data_files, 3);
     }
+
+    #[tokio::test]
+    async fn cleanup_deletes_a_large_orphan_sweep() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let dataset = fixture.open().await.unwrap();
+        let data_dir = dataset.data_dir();
+        for index in 0..200 {
+            let orphan = data_dir.clone().join(format!("orphan-{index:03}.lance"));
+            dataset.object_store.put(&orphan, &[0u8; 64]).await.unwrap();
+        }
+        drop(dataset);
+
+        let removed = fixture
+            .run_cleanup_with_override(
+                utc_now() + TimeDelta::try_days(1).unwrap(),
+                Some(true),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Enough unverified files to take the bulk-delete path.
+        assert_eq!(removed.data_files_removed, 200);
+        assert_eq!(removed.failed_deletes, 0);
+    }
+
     #[tokio::test]
     async fn auto_cleanup_old_versions() {
         // Every n commits, all versions older than T should be deleted.
