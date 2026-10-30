@@ -55,9 +55,11 @@ lance_core::dispatch! {
         {
             &[aarch64::HAMMING_NEON, HAMMING_PORTABLE]
         }
-        // No AVX-512 candidate: it would make Haswell builds, whose baseline
-        // already covers AVX2, select at runtime on every pair. The batch
-        // kernels below select once per batch and do list it.
+        // No AVX-512 candidate. A `Dispatch` resolves at compile time only
+        // when the build baseline covers its first candidate; Haswell builds
+        // cover AVX2 but not AVX-512, so listing AVX-512 first would turn this
+        // per-pair call into a runtime selection. The batch kernels below
+        // select once per batch, so they do list it.
         #[cfg(target_arch = "x86_64")]
         {
             &[x86::HAMMING_AVX2, HAMMING_PORTABLE]
@@ -90,13 +92,22 @@ lance_core::dispatch! {
     };
 }
 
-/// Bytes the NEON kernel sums into 16-bit lanes before widening them. Each
-/// lane gains at most 8 per pair of input bytes, so a lane covering
-/// `1023 * 64` bytes stays below `u16::MAX`.
+/// Bytes the NEON kernel sums into its 16-bit lanes before widening them.
+///
+/// Each 64-byte step adds four `vcntq_u8` vectors (each byte lane at most 8,
+/// so at most 32 per byte lane, which fits `u8`) and pairwise-widens them with
+/// `vpadalq_u8`, adding at most `2 * 32 = 64` to each of the 8 `u16` lanes.
+/// A block of `1023 * 64` bytes takes at most 1023 such steps, so a lane
+/// reaches at most `1023 * 64 = 65472 <= u16::MAX`. A trailing 16-byte step
+/// adds at most 16 per lane, and replaces 16 of the 64 bytes a full step would
+/// take, so it never raises that bound.
 #[cfg_attr(not(any(target_arch = "aarch64", test)), allow(dead_code))]
 const HAMMING_NEON_FLUSH_BYTES: usize = 1023 * 64;
 
 /// Hamming distance between two vectors.
+///
+/// Like [`hamming_scalar`], compares only the first `min(x.len(), y.len())`
+/// bytes when the lengths differ.
 #[inline]
 pub fn hamming(x: &[u8], y: &[u8]) -> f32 {
     HAMMING.get().call(x, y)
@@ -547,12 +558,12 @@ lance_core::dispatch! {
             &[
                 x86::HAMMING_BATCH_U64_AVX512,
                 x86::HAMMING_BATCH_U64_AVX2,
-                HAMMING_BATCH_U64_SCALAR,
+                HAMMING_BATCH_U64_PORTABLE,
             ]
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            &[HAMMING_BATCH_U64_SCALAR]
+            &[HAMMING_BATCH_U64_PORTABLE]
         }
     };
 }
@@ -581,11 +592,11 @@ pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
 
 lance_core::target_kernel! {
     #[target_features()]
-    #[candidate(HAMMING_BATCH_U64_SCALAR: HammingBatchU64Kernel)]
-    /// Portable kernel. A plain zip lets LLVM vectorize the popcount (NEON
-    /// `cnt` on aarch64) with no per-element bounds checks.
+    #[candidate(HAMMING_BATCH_U64_PORTABLE: HammingBatchU64Kernel)]
+    /// A plain zip lets LLVM vectorize the popcount (NEON `cnt` on aarch64)
+    /// with no per-element bounds checks.
     #[inline]
-    fn hamming_batch_scalar(query: u64, targets: &[u64], results: &mut [u32]) {
+    fn hamming_batch_portable(query: u64, targets: &[u64], results: &mut [u32]) {
         for (result, &target) in results.iter_mut().zip(targets) {
             *result = (query ^ target).count_ones();
         }
@@ -942,6 +953,9 @@ fn process_row_range(
 ) -> PairwiseResult {
     let n = hashes.len();
     let mut result = PairwiseResult::new();
+    // Selected once per range rather than per row through `hamming_batch_u64`,
+    // whose length assert is redundant here: each row slices `distances` to
+    // exactly the targets' length.
     let kernel = HAMMING_BATCH_U64.get();
     // Rows only get shorter, so the first row's buffer fits every later one,
     // and the kernel overwrites each slot it is handed.
@@ -1321,6 +1335,7 @@ mod tests {
     /// Lengths straddle the 16- and 64-byte steps of the NEON kernel; the
     /// longest ones run past the block after which it flushes its 16-bit
     /// accumulators, with every bit differing so each lane is at its maximum.
+    /// Unequal inputs compare their common prefix, as `hamming_scalar` does.
     #[rstest]
     #[case::empty(0)]
     #[case::one(1)]
@@ -1335,16 +1350,18 @@ mod tests {
     #[case::one_flush(HAMMING_NEON_FLUSH_BYTES + 81)]
     #[case::two_flushes(2 * HAMMING_NEON_FLUSH_BYTES + 17)]
     fn test_hamming_kernels_match_reference(#[case] len: usize) {
-        let random: Vec<u8> = (0..2 * len as u64)
+        const EXTRA: usize = 17;
+        let random: Vec<u8> = (0..(2 * len + EXTRA) as u64)
             .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8)
             .collect();
+        let zeros = vec![0; len];
+        let ones = vec![u8::MAX; len + EXTRA];
         let inputs = [
-            ("random", &random[..len], &random[len..]),
-            (
-                "all bits differ",
-                &vec![0; len][..],
-                &vec![u8::MAX; len][..],
-            ),
+            ("random", &random[..len], &random[len..2 * len]),
+            ("all bits differ", &zeros[..], &ones[..len]),
+            ("y longer", &zeros[..], &ones[..]),
+            ("x longer", &ones[..], &zeros[..]),
+            ("random y longer", &random[..len], &random[len..]),
         ];
         for (pattern, x, y) in inputs {
             let want = hamming_scalar(x, y);
@@ -1368,28 +1385,40 @@ mod tests {
     #[case::two_hundred(200)]
     fn test_hamming_batch_kernels_match_reference(#[case] dimension: usize) {
         const NUM_VECTORS: usize = 5;
-        let bytes: Vec<u8> = (0..(NUM_VECTORS + 1) * dimension)
+        let random: Vec<u8> = (0..(NUM_VECTORS + 1) * dimension)
             .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8)
             .collect();
-        let (query, vectors) = bytes.split_at(dimension);
-        let want: Vec<f32> = vectors
-            .chunks_exact(dimension)
-            .map(|vector| hamming_scalar(query, vector))
-            .collect();
-        for candidate in HAMMING_BATCH.candidates() {
-            let Some(kernel) = candidate.kernel() else {
-                continue;
-            };
+        let zeros = vec![0; dimension];
+        let ones = vec![u8::MAX; NUM_VECTORS * dimension];
+        let inputs = [
+            ("random", &random[..dimension], &random[dimension..]),
+            ("all bits differ", &zeros[..], &ones[..]),
+        ];
+        for (pattern, query, vectors) in inputs {
+            let want: Vec<f32> = vectors
+                .chunks_exact(dimension)
+                .map(|vector| hamming_scalar(query, vector))
+                .collect();
+            for candidate in HAMMING_BATCH.candidates() {
+                let Some(kernel) = candidate.kernel() else {
+                    continue;
+                };
+                let mut got = vec![f32::NAN; NUM_VECTORS];
+                kernel.call(query, vectors, dimension, &mut got);
+                assert_eq!(
+                    got,
+                    want,
+                    "{} [{pattern}] dimension={dimension}",
+                    candidate.name()
+                );
+            }
             let mut got = vec![f32::NAN; NUM_VECTORS];
-            kernel.call(query, vectors, dimension, &mut got);
-            assert_eq!(got, want, "{} dimension={dimension}", candidate.name());
+            hamming_distance_batch_into(query, vectors, dimension, &mut got);
+            assert_eq!(
+                got, want,
+                "hamming_distance_batch_into [{pattern}] dimension={dimension}"
+            );
         }
-        let mut got = vec![f32::NAN; NUM_VECTORS];
-        hamming_distance_batch_into(query, vectors, dimension, &mut got);
-        assert_eq!(
-            got, want,
-            "hamming_distance_batch_into dimension={dimension}"
-        );
     }
 
     #[test]
@@ -1465,10 +1494,10 @@ mod tests {
         }
     }
 
-    /// Each candidate takes a fixed number of targets per chunk and finishes
-    /// the rest in a remainder loop: 8 for AVX-512 and the vectorized scalar
-    /// kernel on aarch64, 4 for AVX2. The cases cover every residue of both
-    /// widths, with and without a chunk ahead of it.
+    /// The x86 candidates take a fixed number of targets per chunk and finish
+    /// the rest in a remainder loop: 8 for AVX-512, 4 for AVX2. The portable
+    /// kernel's chunking is whatever LLVM vectorizes it to. The cases cover
+    /// every residue of both widths, with and without a chunk ahead of it.
     #[rstest]
     #[case::one(1)]
     #[case::two(2)]
@@ -1846,6 +1875,46 @@ mod tests {
 
         assert_eq!(result_to_sorted_vec(&par), result_to_sorted_vec(&seq));
         assert!(par.len() >= 80);
+    }
+
+    /// Parallel chunks start past row 0, and the last chunk can hold only the
+    /// final row, which has no later row to pair with.
+    #[rstest]
+    #[case::whole(0, 40)]
+    #[case::middle(5, 23)]
+    #[case::tail(30, 40)]
+    #[case::last_row_only(39, 40)]
+    fn test_process_row_range_matches_sequential(#[case] start_row: usize, #[case] end_row: usize) {
+        const NUM_ROWS: usize = 40;
+        const THRESHOLD: u32 = 40;
+        let lane_values: Vec<u64> = (0..2 * NUM_ROWS as u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let hashes = BinaryHashValues::try_new(lane_values, NUM_ROWS, 16).unwrap();
+        let row_ids: Vec<u64> = (0..NUM_ROWS as u64).map(|i| 1000 + i).collect();
+        let in_range = |result: &PairwiseResult| -> Vec<(u64, u64, u32)> {
+            result_to_sorted_vec(result)
+                .into_iter()
+                .filter(|&(a, _, _)| (start_row..end_row).contains(&((a - 1000) as usize)))
+                .collect()
+        };
+
+        let lane = hashes.lane(0);
+        let want = in_range(&pairwise_hamming_distance(
+            lane,
+            Some(&row_ids),
+            Some(THRESHOLD),
+        ));
+        let got = process_row_range(lane, Some(&row_ids), THRESHOLD, start_row, end_row);
+        assert_eq!(result_to_sorted_vec(&got), want);
+
+        let want = in_range(&pairwise_hamming_distance_binary(
+            &hashes,
+            Some(&row_ids),
+            Some(THRESHOLD),
+        ));
+        let got = process_row_range_binary(&hashes, Some(&row_ids), THRESHOLD, start_row, end_row);
+        assert_eq!(result_to_sorted_vec(&got), want);
     }
 
     #[test]
