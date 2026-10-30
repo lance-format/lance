@@ -552,6 +552,8 @@ impl Default for AutoCleanupParams {
 #[derive(Debug, Clone)]
 pub struct WriteParams {
     /// Max number of records per file.
+    ///
+    /// Must not exceed `u32::MAX`, the row capacity of a fragment.
     pub max_rows_per_file: usize,
 
     /// Max number of rows per row group.
@@ -2063,7 +2065,13 @@ where
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         let summary = self.writer.finish().await?;
         Ok((
-            summary.num_rows as u32,
+            u32::try_from(summary.num_rows).map_err(|_| {
+                Error::internal(format!(
+                    "data file has {} rows, exceeding the fragment capacity of {} rows",
+                    summary.num_rows,
+                    u32::MAX
+                ))
+            })?,
             DataFile::new_legacy(
                 self.path.clone(),
                 self.writer.schema(),
@@ -2225,7 +2233,14 @@ impl GenericWriter for V2WriterAdapter {
         data_file.fields = field_ids.into();
         data_file.column_indices = column_indices.into();
         data_file.file_size_bytes = NonZero::new(write_summary.size_bytes).into();
-        Ok((write_summary.num_rows as u32, data_file))
+        let num_rows = u32::try_from(write_summary.num_rows).map_err(|_| {
+            Error::internal(format!(
+                "data file has {} rows, exceeding the fragment capacity of {} rows",
+                write_summary.num_rows,
+                u32::MAX
+            ))
+        })?;
+        Ok((num_rows, data_file))
     }
 
     async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
@@ -3046,6 +3061,37 @@ mod tests {
                 .map(|fragment| fragment.physical_rows.unwrap())
                 .collect::<Vec<_>>(),
             [1, 1, 5, 4, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_rows_per_file_rejects_fragment_row_overflow() {
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(UInt64Array::from_iter_values(0..4)) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+
+        let error = Dataset::write(
+            reader,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: u32::MAX as usize + 1,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot exceed the fragment row capacity"),
+            "{error}"
         );
     }
 

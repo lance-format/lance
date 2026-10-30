@@ -419,7 +419,6 @@ mod tests {
     fn test_page_boundary_flushes_borrowed_input_without_copy() {
         let parent: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..2_097_152));
         let slice = parent.slice(17, 32_768);
-        let copied_bytes = deep_copy_array_sliced(slice.as_ref()).get_array_memory_size() as u64;
         let mut queue = AccumulationQueue::new(8 * 1024 * 1024, 0, false);
 
         assert!(
