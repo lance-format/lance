@@ -1,0 +1,769 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! The ordered-pair matrix, the runner that executes one cell, and the cells
+//! deliberately left out of it.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
+
+use futures::future::BoxFuture;
+use rstest::rstest;
+
+use super::invariants;
+use super::oracle;
+use super::scenarios::{OVERLAY_VALUE, Placement, Scenario, Staged, fixture};
+use super::{Isolation, Outcome};
+use crate::{Dataset, Error};
+
+/// What each ordered pair does today, observed rather than derived, stated
+/// under [`Isolation::Legacy`].
+///
+/// Rows are `ours` — the transaction that has to rebase. Columns are `theirs`,
+/// the one that landed underneath it, keyed by [`Scenario::code`]. Cells are
+/// `L` lands, `R` retryable, `X` incompatible, and `!` excluded because what
+/// the code does today is wrong (see [`KNOWN_BUGS`]).
+///
+/// The `action_*` rows and `v*` columns hold Transaction V2 action sets to
+/// legacy parity: each cell must be at least as permissive as the strictest
+/// cell among its legacy analogues' pairs (see [`Scenario::analogues`] and
+/// [`legacy_bar`]). A cell suffixed `*` is a known parity gap, stricter than
+/// that bar, and must have a reason in [`PARITY_GAPS`]; the suffix is checked,
+/// so closing a gap means dropping it. Today every action set against a legacy
+/// operation fails closed in `check_action_txn`, so those cells are retryable
+/// and every one where legacy does better is a gap.
+///
+/// This grid is the expectation table, not a rendering of one: it is parsed at
+/// run time, so there is a single place to read and a single place to change.
+/// A row landing here also opts that pair into the invariant battery, so a cell
+/// is a claim about the resulting manifest as much as about the verdict.
+///
+/// Regenerate with the `discover` test below after a deliberate behaviour
+/// change; do not hand-edit a cell to make a failing test pass. When isolation
+/// levels become configurable this grows a grid per level.
+const MATRIX: &str = "\
+                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+
+append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  R* R* R*
+delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  R* R* R*
+delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  R* R* R*
+update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  R* R* R*
+update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  R* R* R*
+data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  R* R* R*
+data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  R* R* R*
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  R* R* R*
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  R  R* R
+merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
+merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
+create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  R* R* R*
+rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  R* R* R*
+overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  R* R* R*
+restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  R* R  R
+update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  R* R  R
+action_append             | R* R* R* R* R* R* R* R* R  R* R  R* R* R  R  R* L  L  L
+action_update_config      | R* R* R* R* R* R* R* R* R* R  R  R* R* R  R  R  L  R  R
+action_append_and_config  | R* R* R* R* R* R* R* R* R  R  R  R* R* R  R  R  L  R  R
+";
+
+/// The level [`MATRIX`] was observed under.
+const MATRIX_ISOLATION: Isolation = Isolation::Legacy;
+
+/// One asserted cell of [`MATRIX`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Expected {
+    outcome: Outcome,
+    /// Marked `*`: stricter than [`legacy_bar`] allows, as a known gap.
+    parity_gap: bool,
+}
+
+/// Parsed form of [`MATRIX`]. `None` marks a cell excluded as a known bug.
+static MATRIX_CELLS: LazyLock<HashMap<(Scenario, Scenario), Option<Expected>>> =
+    LazyLock::new(parse_matrix);
+
+fn parse_matrix() -> HashMap<(Scenario, Scenario), Option<Expected>> {
+    let scenario_by = |field: fn(Scenario) -> &'static str, value: &str| {
+        Scenario::ALL
+            .into_iter()
+            .find(|s| field(*s) == value)
+            .unwrap_or_else(|| panic!("matrix names an unknown scenario {value:?}"))
+    };
+
+    let mut lines = MATRIX.lines().filter(|line| !line.trim().is_empty());
+    let header = lines.next().expect("the matrix has a header row");
+    let columns: Vec<Scenario> = header
+        .split_once('|')
+        .expect("the header row is delimited by `|`")
+        .1
+        .split_whitespace()
+        .map(|code| scenario_by(Scenario::code, code))
+        .collect();
+    assert_eq!(
+        columns.len(),
+        Scenario::ALL.len(),
+        "the matrix header has {} columns but there are {} scenarios",
+        columns.len(),
+        Scenario::ALL.len(),
+    );
+
+    let mut cells = HashMap::new();
+    for line in lines {
+        let (label, rest) = line
+            .split_once('|')
+            .expect("a matrix row is delimited by `|`");
+        let ours = scenario_by(Scenario::name, label.trim());
+        let symbols: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(
+            symbols.len(),
+            columns.len(),
+            "matrix row {} has {} cells but there are {} columns",
+            ours.name(),
+            symbols.len(),
+            columns.len(),
+        );
+        for (theirs, symbol) in columns.iter().zip(symbols) {
+            let cell = (symbol != "!").then(|| match symbol.strip_suffix('*') {
+                Some(outcome) => Expected {
+                    outcome: Outcome::from_symbol(outcome),
+                    parity_gap: true,
+                },
+                None => Expected {
+                    outcome: Outcome::from_symbol(symbol),
+                    parity_gap: false,
+                },
+            });
+            assert!(
+                cells.insert((ours, *theirs), cell).is_none(),
+                "the matrix has two rows for {}",
+                ours.name(),
+            );
+        }
+    }
+    cells
+}
+
+/// Render a grid in [`MATRIX`]'s format, for the `discover` tool.
+fn render_matrix(cell: impl Fn(Scenario, Scenario) -> String) -> String {
+    let width = Scenario::ALL
+        .into_iter()
+        .map(|s| s.name().len())
+        .max()
+        .expect("there is at least one scenario")
+        + 1;
+    let mut out = format!("{:width$}| ", "");
+    for theirs in Scenario::ALL {
+        out.push_str(theirs.code());
+        out.push(' ');
+    }
+    for ours in Scenario::ALL {
+        out = out.trim_end().to_string();
+        out.push('\n');
+        out.push_str(&format!("{:width$}| ", ours.name()));
+        for theirs in Scenario::ALL {
+            out.push_str(&format!("{:<3}", cell(ours, theirs)));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Ordered pairs this suite deliberately leaves out of [`MATRIX`],
+/// because what the code does with them today is wrong.
+///
+/// Each is written up below as a `#[ignore]`d test asserting the *correct*
+/// behaviour, against the issue named here. Recording the broken behaviour as
+/// an expectation instead would make the matrix assert that the bug is still
+/// present, and the fix would then have to edit this table to land.
+///
+/// When a fix lands, remove the pair from here, un-`#[ignore]` its test, which
+/// stays as a regression test, and re-run `discover` to pick the cell back up.
+const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[(
+    Scenario::DataOverlay,
+    Scenario::Project,
+    "an overlay rebased over a project keeps a column the project dropped: \
+     https://github.com/lance-format/lance/issues/9724",
+)];
+
+pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
+    KNOWN_BUGS
+        .iter()
+        .find(|(o, t, _)| *o == ours && *t == theirs)
+        .map(|(_, _, reason)| *reason)
+}
+
+/// Why an action set's `*` cells in [`MATRIX`] fall short of [`legacy_bar`],
+/// keyed by the action scenario on either side of the pair.
+///
+/// Keyed by scenario rather than by cell because a gap comes from how the
+/// resolver treats a kind of action set, not from one particular pairing. When
+/// the last `*` cell involving a scenario is closed, its entry goes too.
+const PARITY_GAPS: &[(Scenario, &str)] = &[
+    (Scenario::ActionAppend, MIXED_PAIRS_FAIL_CLOSED),
+    (Scenario::ActionUpdateConfig, MIXED_PAIRS_FAIL_CLOSED),
+    (Scenario::ActionAppendAndConfig, MIXED_PAIRS_FAIL_CLOSED),
+];
+
+const MIXED_PAIRS_FAIL_CLOSED: &str = "check_action_txn fails every mixed pair closed; \
+     conflict parity 1/5 (Append + ConfigUpdate) gives legacy operations footprints";
+
+fn parity_gap_reason(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
+    [ours, theirs].into_iter().find_map(|scenario| {
+        PARITY_GAPS
+            .iter()
+            .find(|(gap, _)| *gap == scenario)
+            .map(|(_, reason)| *reason)
+    })
+}
+
+fn expectation(ours: Scenario, theirs: Scenario) -> Option<Outcome> {
+    MATRIX_CELLS
+        .get(&(ours, theirs))
+        .copied()
+        .flatten()
+        .map(|cell| cell.outcome)
+}
+
+/// The least permissive outcome a pair may have and still be at legacy parity:
+/// the strictest outcome among the pairs of its legacy analogues.
+///
+/// For a pair of legacy scenarios this is just its own outcome. `None` when an
+/// analogue pair is excluded as a known bug, since there is then no legacy
+/// behaviour to hold it to.
+fn legacy_bar(
+    ours: Scenario,
+    theirs: Scenario,
+    outcome: impl Fn(Scenario, Scenario) -> Option<Outcome>,
+) -> Option<Outcome> {
+    let mut bar: Option<Outcome> = None;
+    for ours in ours.analogues() {
+        for theirs in theirs.analogues() {
+            let analogue = outcome(ours, theirs)?;
+            if bar.is_none_or(|bar| analogue.permissiveness() < bar.permissiveness()) {
+                bar = Some(analogue);
+            }
+        }
+    }
+    bar
+}
+
+/// Whether `outcome` falls short of `ours` over `theirs`'s [`legacy_bar`].
+fn stricter_than_legacy(
+    ours: Scenario,
+    theirs: Scenario,
+    outcome: Outcome,
+    legacy: impl Fn(Scenario, Scenario) -> Option<Outcome>,
+) -> bool {
+    legacy_bar(ours, theirs, legacy)
+        .is_some_and(|bar| outcome.permissiveness() < bar.permissiveness())
+}
+
+/// What one cell produces: the verdict, and — when `ours` landed — the dataset
+/// `theirs` committed alongside the one `ours` committed.
+type Landing = (Outcome, Option<(Arc<Dataset>, Dataset)>);
+
+/// Run one ordered pair: stage `ours` against the fixture, land `theirs`
+/// underneath it, then commit `ours` so it has to rebase over `theirs`.
+///
+/// `ours` always works on fragment 0; `placement` says which fragment `theirs`
+/// touches, which is what the `placement` module varies.
+///
+/// Returns the observed outcome and, when it landed, the dataset `theirs`
+/// produced alongside the one `ours` produced.
+///
+/// Boxed rather than a plain `async fn`: three commit sequences over a
+/// four-column fixture make the future large enough to trip
+/// `clippy::large_futures` at every caller, and boxing once here is one comment
+/// instead of four.
+pub(super) fn run(
+    ours: Scenario,
+    theirs: Scenario,
+    placement: Placement,
+) -> BoxFuture<'static, Landing> {
+    Box::pin(async move {
+        let base = fixture().await;
+
+        let staged: Staged = ours
+            .stage(&base)
+            .await
+            .unwrap_or_else(|e| panic!("staging {} failed: {e}", ours.name()));
+
+        let concurrent = theirs
+            .stage_with(&base, placement)
+            .await
+            .unwrap_or_else(|e| panic!("staging {} failed: {e}", theirs.name()));
+        let after_theirs = Arc::new(
+            concurrent
+                .commit(&base)
+                .await
+                .unwrap_or_else(|e| panic!("{} could not land uncontended: {e}", theirs.name())),
+        );
+
+        let result = staged.commit(&base).await;
+        let outcome = Outcome::of(&result);
+        let landed = result.ok().map(|dataset| (after_theirs, dataset));
+        (outcome, landed)
+    })
+}
+
+/// Every ordered pair in one row of the matrix, plus the invariant battery on
+/// each landing.
+///
+/// One test per row rather than per cell: a row is twelve commits against a
+/// six-row in-memory dataset, which stays well inside the per-test budget while
+/// keeping a failure pinned to a named row.
+#[rstest]
+#[case::append(Scenario::Append)]
+#[case::delete(Scenario::Delete)]
+#[case::delete_whole_fragment(Scenario::DeleteWholeFragment)]
+#[case::update_rewrite_rows(Scenario::UpdateRewriteRows)]
+#[case::update_rewrite_columns(Scenario::UpdateRewriteColumns)]
+#[case::data_overlay(Scenario::DataOverlay)]
+#[case::data_replacement(Scenario::DataReplacement)]
+#[case::project(Scenario::Project)]
+#[case::project_alter_nullability(Scenario::ProjectAlterNullability)]
+#[case::merge(Scenario::Merge)]
+#[case::merge_alter_nullability(Scenario::MergeAlterNullability)]
+#[case::create_index(Scenario::CreateIndex)]
+#[case::rewrite(Scenario::Rewrite)]
+#[case::overwrite(Scenario::Overwrite)]
+#[case::restore(Scenario::Restore)]
+#[case::update_config(Scenario::UpdateConfig)]
+#[case::action_append(Scenario::ActionAppend)]
+#[case::action_update_config(Scenario::ActionUpdateConfig)]
+#[case::action_append_and_config(Scenario::ActionAppendAndConfig)]
+#[tokio::test]
+async fn matrix_row(#[case] ours: Scenario) {
+    for theirs in Scenario::ALL {
+        if known_bug(ours, theirs).is_some() {
+            continue;
+        }
+        let expected = expectation(ours, theirs).unwrap_or_else(|| {
+            panic!(
+                "({}, {}) is neither in EXPECTATIONS nor in KNOWN_BUGS; re-run `discover`",
+                ours.name(),
+                theirs.name(),
+            )
+        });
+        let context = format!("({} over {})", ours.name(), theirs.name());
+        let (outcome, landed) = run(ours, theirs, Placement::Same).await;
+        let gap = MATRIX_CELLS[&(ours, theirs)]
+            .filter(|cell| cell.parity_gap)
+            .and_then(|_| parity_gap_reason(ours, theirs))
+            .map(|reason| format!(" (a known parity gap: {reason})"))
+            .unwrap_or_default();
+        assert_eq!(
+            outcome, expected,
+            "{context}: expected {expected:?}{gap} but observed {outcome:?}",
+        );
+        if let Some((before, after)) = landed {
+            invariants::check_all(&before, &after, ours, &context).await;
+            // Boxed: the oracle runs a whole second commit sequence, so its
+            // future is large enough to trip `clippy::large_futures` inline.
+            Box::pin(oracle::check(
+                MATRIX_ISOLATION,
+                ours,
+                theirs,
+                Placement::Same,
+                &after,
+                &context,
+            ))
+            .await;
+        }
+    }
+}
+
+/// Every scenario must land and read back correctly with nothing to rebase
+/// over.
+///
+/// This is the harness's own precondition: a matrix cell that fails is only
+/// evidence about conflict resolution if the operation is sound on its own.
+#[rstest]
+#[case::append(Scenario::Append)]
+#[case::delete(Scenario::Delete)]
+#[case::delete_whole_fragment(Scenario::DeleteWholeFragment)]
+#[case::update_rewrite_rows(Scenario::UpdateRewriteRows)]
+#[case::update_rewrite_columns(Scenario::UpdateRewriteColumns)]
+#[case::data_overlay(Scenario::DataOverlay)]
+#[case::data_replacement(Scenario::DataReplacement)]
+#[case::project(Scenario::Project)]
+#[case::project_alter_nullability(Scenario::ProjectAlterNullability)]
+#[case::merge(Scenario::Merge)]
+#[case::merge_alter_nullability(Scenario::MergeAlterNullability)]
+#[case::create_index(Scenario::CreateIndex)]
+#[case::rewrite(Scenario::Rewrite)]
+#[case::overwrite(Scenario::Overwrite)]
+#[case::restore(Scenario::Restore)]
+#[case::update_config(Scenario::UpdateConfig)]
+#[case::action_append(Scenario::ActionAppend)]
+#[case::action_update_config(Scenario::ActionUpdateConfig)]
+#[case::action_append_and_config(Scenario::ActionAppendAndConfig)]
+#[tokio::test]
+async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
+    let base = fixture().await;
+    let staged = scenario
+        .stage(&base)
+        .await
+        .unwrap_or_else(|e| panic!("staging {} failed: {e}", scenario.name()));
+    let committed = staged
+        .commit(&base)
+        .await
+        .unwrap_or_else(|e| panic!("{} could not land uncontended: {e}", scenario.name()));
+    let context = format!("({} uncontended)", scenario.name());
+    invariants::check_all(&base, &committed, scenario, &context).await;
+}
+
+/// The matrix must cover the whole grid, and its exclusions must be exactly the
+/// pairs [`KNOWN_BUGS`] documents.
+///
+/// The grid and the bug list are separate on purpose — the grid says which cells
+/// are excluded, the list says why and against which issue — so they have to be
+/// held to agreeing.
+#[test]
+fn matrix_is_total() {
+    assert_eq!(
+        MATRIX_CELLS.len(),
+        Scenario::ALL.len() * Scenario::ALL.len(),
+        "the matrix does not cover every ordered pair",
+    );
+    for ours in Scenario::ALL {
+        for theirs in Scenario::ALL {
+            let cell = MATRIX_CELLS.get(&(ours, theirs)).unwrap_or_else(|| {
+                panic!(
+                    "({}, {}) is missing from the matrix; re-run `discover`",
+                    ours.name(),
+                    theirs.name()
+                )
+            });
+            let bug = known_bug(ours, theirs);
+            assert_eq!(
+                cell.is_none(),
+                bug.is_some(),
+                "({}, {}) is marked {} in the matrix but {} in KNOWN_BUGS",
+                ours.name(),
+                theirs.name(),
+                if cell.is_none() {
+                    "excluded"
+                } else {
+                    "expected"
+                },
+                if bug.is_some() { "listed" } else { "absent" },
+            );
+        }
+    }
+}
+
+/// Every cell must be at least as permissive as its [`legacy_bar`], unless it
+/// is marked `*` as a known gap with a reason in [`PARITY_GAPS`], and every `*`
+/// must still be a gap.
+///
+/// Reads the grid rather than running anything: `matrix_row` already holds each
+/// cell to what the code does.
+#[test]
+fn matrix_is_at_legacy_parity() {
+    let mut explained = HashSet::new();
+    for ours in Scenario::ALL {
+        for theirs in Scenario::ALL {
+            let Some(Some(cell)) = MATRIX_CELLS.get(&(ours, theirs)).copied() else {
+                continue;
+            };
+            if cell.parity_gap {
+                assert!(
+                    parity_gap_reason(ours, theirs).is_some(),
+                    "({} over {}) is marked `*` but neither side has a reason in PARITY_GAPS",
+                    ours.name(),
+                    theirs.name(),
+                );
+                explained.extend([ours, theirs]);
+            }
+            let stricter = stricter_than_legacy(ours, theirs, cell.outcome, expectation);
+            let bar = legacy_bar(ours, theirs, expectation);
+            assert!(
+                !stricter || cell.parity_gap,
+                "({} over {}) is {:?}, stricter than its legacy analogues' {bar:?}. Make it at \
+                 least as permissive, or mark the cell `*` as a known gap",
+                ours.name(),
+                theirs.name(),
+                cell.outcome,
+            );
+            assert!(
+                stricter || !cell.parity_gap,
+                "({} over {}) is marked `*` but {:?} is no stricter than its legacy analogues' \
+                 {bar:?}; drop the marker",
+                ours.name(),
+                theirs.name(),
+                cell.outcome,
+            );
+        }
+    }
+    for (scenario, _) in PARITY_GAPS {
+        assert!(
+            explained.contains(scenario),
+            "PARITY_GAPS explains {} but no `*` cell involves it any more; drop the entry",
+            scenario.name(),
+        );
+    }
+}
+
+/// A `Delete` must not drop an overlay that landed concurrently.
+///
+/// Regression test for <https://github.com/lance-format/lance/issues/9216>.
+/// `Operation::Delete`'s apply replaced the fragment entry wholesale from a
+/// post-image built at the read version, and — unlike `Operation::Update`'s arm
+/// — did not carry `overlays` forward. `check_delete_txn` explicitly permits a
+/// concurrent `DataOverlay`, so the pair landed and the overlay was silently
+/// lost. Ordering-dependent: overlay-after-delete was fine.
+///
+/// The loss was observable from a plain scan, not just from the manifest: the
+/// overlaid cell reverts to its base value.
+#[tokio::test]
+async fn delete_must_not_drop_a_concurrent_overlay() {
+    let base = fixture().await;
+    let staged = Scenario::Delete.stage(&base).await.unwrap();
+
+    let overlay = Scenario::DataOverlay.stage(&base).await.unwrap();
+    let after_overlay = overlay.commit(&base).await.unwrap();
+    let overlaid = after_overlay.scan().try_into_batch().await.unwrap();
+    assert!(
+        int_column(&overlaid, "c").contains(&OVERLAY_VALUE),
+        "precondition: the overlay is visible before the delete",
+    );
+
+    let committed = staged.commit(&base).await.unwrap();
+    let after = committed.scan().try_into_batch().await.unwrap();
+    assert!(
+        int_column(&after, "c").contains(&OVERLAY_VALUE),
+        "the delete dropped the concurrently committed overlay: `c` reads back as {:?}, \
+         with the overlaid value {OVERLAY_VALUE} gone",
+        int_column(&after, "c"),
+    );
+}
+
+/// A `Delete` must not reinstate a data file a concurrent `Project` pruned.
+///
+/// Regression test for <https://github.com/lance-format/lance/issues/9217>.
+/// Same mechanism as the overlay bug: the post-image was built before the
+/// `Project` landed, so a file the projection dropped whole came back. The
+/// resulting manifest had a data file none of whose fields are in the schema,
+/// which also pushed `Manifest::max_field_id` back up over a field id the
+/// projection had retired — so a later write can mint an id that is already in
+/// a data file.
+#[tokio::test]
+async fn delete_must_not_reinstate_a_pruned_data_file() {
+    let base = fixture().await;
+    let staged = Scenario::Delete.stage(&base).await.unwrap();
+
+    let project = Scenario::Project.stage(&base).await.unwrap();
+    let after_project = project.commit(&base).await.unwrap();
+    assert_eq!(
+        after_project.fragments()[0].files.len(),
+        2,
+        "precondition: the projection pruned `c`'s data file, leaving `a`/`b`'s and `d`'s",
+    );
+    let watermark = after_project.manifest.max_field_id();
+    let file_fields = |dataset: &Dataset| {
+        dataset.fragments()[0]
+            .files
+            .iter()
+            .map(|f| f.fields.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let committed = staged.commit(&base).await.unwrap();
+    assert_eq!(
+        file_fields(&committed),
+        file_fields(&after_project),
+        "the delete reinstated the data file the projection pruned",
+    );
+    assert!(
+        committed.manifest.max_field_id() <= watermark,
+        "the field-id watermark went back up from {watermark} to {} across the delete",
+        committed.manifest.max_field_id(),
+    );
+}
+
+/// An `Update` must not reinstate a data file a concurrent `Project` pruned.
+///
+/// The same defect as [`delete_must_not_reinstate_a_pruned_data_file`], reached
+/// through `Operation::Update`'s apply instead of `Operation::Delete`'s: both
+/// installed a post-image of the fragment built at the read version. Recorded
+/// separately because fixing one arm does not fix the other.
+#[tokio::test]
+async fn update_must_not_reinstate_a_pruned_data_file() {
+    let base = fixture().await;
+    let staged = Scenario::UpdateRewriteRows.stage(&base).await.unwrap();
+
+    let project = Scenario::Project.stage(&base).await.unwrap();
+    let after_project = project.commit(&base).await.unwrap();
+    assert_eq!(
+        after_project.fragments()[0].files.len(),
+        2,
+        "precondition: the projection pruned `c`'s data file, leaving `a`/`b`'s and `d`'s",
+    );
+
+    let committed = staged.commit(&base).await.unwrap();
+    let live: Vec<i32> = committed
+        .manifest
+        .schema
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect();
+    for fragment in committed.fragments().iter() {
+        for file in fragment.files.iter() {
+            assert!(
+                file.fields.iter().any(|id| live.contains(id)),
+                "the update reinstated a data file the projection pruned: fragment {} carries \
+                 fields {:?}, none of which are in the schema {live:?}",
+                fragment.id,
+                file.fields,
+            );
+        }
+    }
+}
+
+/// A `Project` must drop the overlays of the columns it drops.
+///
+/// Regression test for <https://github.com/lance-format/lance/issues/9313>.
+/// `Operation::Project`'s apply computed the surviving field ids and pruned the
+/// data files none of whose fields survive, but applied the same rule to
+/// `fragment.overlays` nowhere. An overlay supplying only dropped fields was
+/// left on the fragment, where nothing would read it and `cleanup` had no
+/// reason to believe it was dead.
+///
+/// Not a conflict-resolution defect — it reproduced with no concurrency, as
+/// written here — but it made the two `data_overlay`/`project` cells
+/// unassertable, so it is recorded with the rest.
+#[tokio::test]
+async fn project_must_drop_the_overlays_of_dropped_columns() {
+    let base = fixture().await;
+    let after_overlay = Arc::new(
+        Scenario::DataOverlay
+            .stage(&base)
+            .await
+            .unwrap()
+            .commit(&base)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !after_overlay.fragments()[0].overlays.is_empty(),
+        "precondition: the overlay landed on fragment 0",
+    );
+
+    let committed = Scenario::Project
+        .stage(&after_overlay)
+        .await
+        .unwrap()
+        .commit(&after_overlay)
+        .await
+        .unwrap();
+    let live: Vec<i32> = committed
+        .manifest
+        .schema
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect();
+    for fragment in committed.fragments().iter() {
+        for overlay in fragment.overlays.iter() {
+            assert!(
+                overlay.data_file.fields.iter().any(|id| live.contains(id)),
+                "the projection left behind an overlay for a column it dropped: fragment {} \
+                 carries an overlay supplying fields {:?}, none of which are in the schema \
+                 {live:?}",
+                fragment.id,
+                overlay.data_file.fields,
+            );
+        }
+    }
+}
+
+/// A `DataOverlay` must not keep a column a concurrent `Project` dropped.
+///
+/// The `Project` and `Merge` apply arms prune overlays for the fields they
+/// drop, but the `DataOverlay` arm does not check that its own fields survive a
+/// schema change it was rebased over. So an overlay staged before the `Project`
+/// lands supplying only a dropped field. Either outcome is correct: a retryable
+/// conflict, or a commit without that overlay.
+#[tokio::test]
+#[ignore = "bug: https://github.com/lance-format/lance/issues/9724"]
+async fn overlay_must_not_keep_a_concurrently_dropped_column() {
+    let base = fixture().await;
+    let staged = Scenario::DataOverlay.stage(&base).await.unwrap();
+    Scenario::Project
+        .stage(&base)
+        .await
+        .unwrap()
+        .commit(&base)
+        .await
+        .unwrap();
+
+    let committed = match staged.commit(&base).await {
+        Err(Error::RetryableCommitConflict { .. }) => return,
+        result => result.unwrap(),
+    };
+    let live: Vec<i32> = committed
+        .manifest
+        .schema
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect();
+    for fragment in committed.fragments().iter() {
+        for overlay in fragment.overlays.iter() {
+            assert!(
+                overlay.data_file.fields.iter().any(|id| live.contains(id)),
+                "the overlay landed supplying fields {:?} on fragment {}, none of which are in \
+                 the schema {live:?} left by the concurrent projection",
+                overlay.data_file.fields,
+                fragment.id,
+            );
+        }
+    }
+}
+
+fn int_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<i32> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
+    batch[name]
+        .as_primitive::<Int32Type>()
+        .iter()
+        .flatten()
+        .collect()
+}
+
+/// Print the observed outcome for every ordered pair, as a grid.
+///
+/// Not an assertion — this is the tool that regenerates [`MATRIX`]. Run it with:
+///
+/// ```text
+/// cargo test -p lance --lib conflict_matrix::cases::discover -- --ignored --nocapture
+/// ```
+///
+/// Cells that are excluded in the current matrix are re-emitted as `!` rather
+/// than as whatever they do, so regenerating never silently turns a known bug
+/// back into an expectation. Cells stricter than their [`legacy_bar`] are
+/// emitted with the `*` gap marker.
+#[tokio::test]
+#[ignore = "discovery tool, not an assertion; regenerates the MATRIX grid"]
+// Stdout is the output format here: this test's job is to emit a grid to paste
+// back into `MATRIX`, so a logging framework would be the wrong sink.
+#[allow(clippy::print_stdout)]
+async fn discover() {
+    let mut observed = HashMap::new();
+    for ours in Scenario::ALL {
+        for theirs in Scenario::ALL {
+            let outcome = if known_bug(ours, theirs).is_some() {
+                None
+            } else {
+                Some(run(ours, theirs, Placement::Same).await.0)
+            };
+            observed.insert((ours, theirs), outcome);
+        }
+    }
+    let observed_outcome = |ours, theirs| observed[&(ours, theirs)];
+    println!(
+        "{}",
+        render_matrix(|ours, theirs| match observed_outcome(ours, theirs) {
+            None => "!".to_string(),
+            Some(outcome) if stricter_than_legacy(ours, theirs, outcome, observed_outcome) => {
+                format!("{}*", outcome.symbol())
+            }
+            Some(outcome) => outcome.symbol().to_string(),
+        })
+    );
+}
