@@ -8188,6 +8188,40 @@ class Tags:
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
 
+    def get(self, tag: str) -> Tag:
+        """
+        Get metadata for a dataset tag by name without listing all tags.
+
+        Parameters
+        ----------
+        tag: str
+            The name of the tag to retrieve.
+
+        Returns
+        -------
+        Tag
+            Tag metadata with the same fields as the values returned by
+            :meth:`list`, including the referenced branch, version, timestamps,
+            manifest size, and attached metadata.
+
+        Raises
+        ------
+        ValueError
+            If the tag does not exist or its name is invalid.
+
+        Examples
+        --------
+        >>> import tempfile
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> with tempfile.TemporaryDirectory() as uri:
+        ...     ds = lance.write_dataset(pa.table({"id": [1, 2]}), uri)
+        ...     ds.tags.create("v1", 1)
+        ...     ds.tags.get("v1")["version"]
+        1
+        """
+        return self._ds.get_tag(tag)
+
     def list(self) -> dict[str, Tag]:
         """
         List all dataset tags.
