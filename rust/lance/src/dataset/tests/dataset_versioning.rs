@@ -30,7 +30,7 @@ use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
 use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
-use crate::utils::test::copy_test_data_to_tmp;
+use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure, copy_test_data_to_tmp};
 use futures::TryStreamExt;
 use lance_core::Error;
 use object_store::{ObjectStoreExt as _, path::Path};
@@ -1235,6 +1235,175 @@ async fn test_cannot_delete_branch_referenced_by_tag() {
     assert!(matches!(&error, Error::RefConflict { .. }));
     assert!(error.to_string().contains("keep-dev"));
     dataset.checkout_version("keep-dev").await.unwrap();
+}
+
+#[rstest]
+#[case::older_source(1, 2)]
+#[case::newer_source(2, 1)]
+#[tokio::test]
+async fn test_duplicate_branch_creation_preserves_dataset(
+    #[case] source_version: u64,
+    #[case] conflicting_version: u64,
+) {
+    let tempdir = TempStrDir::default();
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(
+        data(),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.append(data(), None).await.unwrap();
+
+    let branch = dataset
+        .create_branch("race", source_version, None)
+        .await
+        .unwrap();
+    let expected = branch.scan().try_into_batch().await.unwrap();
+    let contents = dataset.branches().get("race").await.unwrap();
+
+    let error = dataset
+        .create_branch("race", conflicting_version, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("branch race already exists"));
+
+    let branch = dataset.checkout_branch("race").await.unwrap();
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(
+        branch
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![source_version]
+    );
+    assert_eq!(
+        serde_json::to_value(dataset.branches().get("race").await.unwrap()).unwrap(),
+        serde_json::to_value(contents).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_branch_creation_preserves_winner() {
+    let tempdir = TempStrDir::default();
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.delete("id >= 2").await.unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (1..=2)
+        .map(|version| {
+            let mut dataset = dataset.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                (version, dataset.create_branch("race", version, None).await)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut successful_version = None;
+    let mut conflicts = 0;
+    for handle in handles {
+        let (version, result) = handle.await.unwrap();
+        match result {
+            Ok(_) => {
+                assert!(successful_version.replace(version).is_none());
+            }
+            Err(error) => {
+                assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+                assert!(error.to_string().contains("branch race already exists"));
+                conflicts += 1;
+            }
+        }
+    }
+    assert_eq!(conflicts, 1);
+    let successful_version = successful_version.unwrap();
+    let branch = dataset.checkout_branch("race").await.unwrap();
+    let source = dataset.checkout_version(successful_version).await.unwrap();
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        source.scan().try_into_batch().await.unwrap()
+    );
+    assert_eq!(
+        branch
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![successful_version]
+    );
+    let contents = dataset.branches().get("race").await.unwrap();
+    assert_eq!(contents.parent_version, successful_version);
+    assert_eq!(contents.parent_branch, None);
+}
+
+#[tokio::test]
+async fn test_failed_branch_clone_can_be_deleted_and_recreated() {
+    let tempdir = TempStrDir::default();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        data,
+        &tempdir,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    handler.fail_next(AmbiguousFailure::FailOutright);
+
+    let error = dataset.create_branch("retry", 1, None).await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated outright commit failure")
+    );
+    // The name stays reserved even if the clone fails, so another creator
+    // cannot race with an interrupted or ambiguously successful commit.
+    let contents = dataset.branches().get("retry").await.unwrap();
+    assert_eq!(contents.parent_version, 1);
+    let error = dataset.create_branch("retry", 1, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("branch retry already exists"));
+
+    dataset.force_delete_branch("retry").await.unwrap();
+    let branch = dataset.create_branch("retry", 1, None).await.unwrap();
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        dataset.scan().try_into_batch().await.unwrap()
+    );
 }
 
 #[tokio::test]
