@@ -2325,7 +2325,7 @@ impl CleanupPolicyBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if `n` is zero.
+    /// Returns an error if `n` is zero or the dataset has no attached versions.
     pub async fn retain_n_versions(mut self, dataset: &Dataset, n: usize) -> Result<Self> {
         if n == 0 {
             return Err(Error::invalid_input(format!(
@@ -2333,8 +2333,13 @@ impl CleanupPolicyBuilder {
             )));
         }
         let versions = dataset.version_refs().await?;
+        let Some(first_version) = versions.first() else {
+            // Preserve the missing-reference error used by other cleanup policies.
+            dataset.branch_identifier().await?;
+            return Err(Error::not_found(dataset.uri()));
+        };
         self.policy.before_version = if versions.len() <= n {
-            Some(versions[0].version)
+            Some(first_version.version)
         } else {
             Some(versions[versions.len() - n].version)
         };
@@ -5853,6 +5858,59 @@ mod tests {
 
         assert_eq!(policy.before_version, Some(2));
         assert_eq!(io_stats.read_bytes, 0);
+    }
+
+    #[rstest]
+    #[case::deleted_branch(Some("b"))]
+    #[case::deleted_dataset(None)]
+    #[tokio::test]
+    async fn retain_n_versions_rejects_deleted_dataset(#[case] branch: Option<&str>) {
+        let tmpdir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            lance_datagen::gen_batch()
+                .col(
+                    "x",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(2.into(), 1.into()),
+            tmpdir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let deleted = if let Some(branch) = branch {
+            let deleted = dataset
+                .create_branch(branch, (None, None), None)
+                .await
+                .unwrap();
+            dataset.delete_branch(branch).await.unwrap();
+            deleted
+        } else {
+            dataset
+                .object_store
+                .remove_dir_all(dataset.base.clone())
+                .await
+                .unwrap();
+            dataset
+        };
+        assert!(deleted.version_refs().await.unwrap().is_empty());
+
+        let error = CleanupPolicyBuilder::default()
+            .retain_n_versions(&deleted, 1)
+            .await
+            .err()
+            .expect("retaining versions of a deleted dataset should return an error");
+        if let Some(branch) = branch {
+            assert!(matches!(&error, Error::RefNotFound { .. }), "{error}");
+            assert_contains!(error.to_string(), format!("branch {branch} does not exist"));
+        } else {
+            assert!(matches!(&error, Error::NotFound { .. }), "{error}");
+            assert_contains!(error.to_string(), deleted.uri());
+        }
     }
 
     #[tokio::test]
