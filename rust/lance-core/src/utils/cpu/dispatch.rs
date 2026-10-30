@@ -119,6 +119,7 @@ impl_call!(
     <A: ?Sized, B: ?Sized, D: ?Sized, E: ?Sized>
     fn(a: &A, b: &B, c: usize, d: &D, e: &mut E)
 );
+impl_call!(<B: ?Sized, C: ?Sized> fn(a: u64, b: &B, c: &mut C));
 
 /// One operation's kernels, best first, with the host's choice made once.
 ///
@@ -462,10 +463,29 @@ mod tests {
         static DOUBLY_SCALED: Dispatch<DoublyScaledSumFn> = &[DOUBLY_SCALED_SUM];
     }
 
+    type BroadcastFn = unsafe fn(u64, &[u64], &mut [u32]);
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(BROADCAST_XOR_POPCOUNT: BroadcastFn)]
+        fn broadcast_xor_popcount(x: u64, y: &[u64], out: &mut [u32]) {
+            for (o, y) in out.iter_mut().zip(y) {
+                *o = (x ^ y).count_ones();
+            }
+        }
+    }
+
+    crate::dispatch! {
+        static BROADCAST: Dispatch<BroadcastFn> = &[BROADCAST_XOR_POPCOUNT];
+    }
+
     #[test]
     fn scalar_argument_kernels_are_callable() {
         assert_eq!(SCALED.get().call(&[1.0], 2.0, &[3.0]), 8.0);
         assert_eq!(DOUBLY_SCALED.get().call(&[1.0], 2.0, 3.0, &[3.0]), 24.0);
+        let mut out = [0; 2];
+        BROADCAST.get().call(0b1010, &[0b0110, 0b1010], &mut out);
+        assert_eq!(out, [2, 0]);
     }
 
     #[test]
