@@ -646,7 +646,71 @@ impl Branches<'_> {
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
-        match Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)? {
+        let mut cleanup =
+            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?;
+        if matches!(cleanup, BranchCleanup::Skip) {
+            return Ok(());
+        }
+
+        let has_local_paths =
+            self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
+        let mut remaining_paths = Vec::with_capacity(remaining_branches.len());
+        for remaining in &remaining_branches {
+            let path = self.refs.base_location.find_branch(Some(remaining))?.path;
+            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            if has_local_paths && canonical_path.is_none() {
+                log::warn!(
+                    "Keeping branch directories after deleting {branch}: cannot resolve surviving local branch at {path}"
+                );
+                return Ok(());
+            }
+            remaining_paths.push(RemainingBranchPath {
+                path,
+                canonical_path,
+            });
+        }
+
+        if has_local_paths {
+            // A legacy dataset-directory name can belong to a surviving parent
+            // reached through a different spelling or symbolic link.
+            let deleted_branch = BranchRelativePath::new(branch);
+            for index in 1..deleted_branch.segments.len() {
+                if !is_dataset_dir(deleted_branch.segments[index]) {
+                    continue;
+                }
+                let owner = deleted_branch.segments[..index].join("/");
+                let owner_path = self.refs.base_location.find_branch(Some(&owner))?.path;
+                let canonical_owner = self
+                    .object_store()
+                    .canonicalize_local_path(&owner_path)
+                    .await?;
+                if canonical_owner.is_none()
+                    || remaining_paths
+                        .iter()
+                        .any(|remaining| remaining.canonical_path == canonical_owner)
+                {
+                    log::warn!(
+                        "Keeping branch directory after deleting {branch}: dataset-directory ownership at {owner_path} cannot be excluded"
+                    );
+                    return Ok(());
+                }
+            }
+
+            let path = match &cleanup {
+                BranchCleanup::Recursive(path) | BranchCleanup::Selective(path) => path,
+                BranchCleanup::Skip => return Ok(()),
+            };
+            cleanup = match self
+                .classify_shared_branch_path(path, &remaining_paths)
+                .await?
+            {
+                SharedBranchPath::Remaining => BranchCleanup::Skip,
+                SharedBranchPath::Ancestor => BranchCleanup::Selective(path.clone()),
+                SharedBranchPath::Unrelated => cleanup,
+            };
+        }
+
+        match cleanup {
             BranchCleanup::Skip => Ok(()),
             BranchCleanup::Recursive(path) => {
                 if let Err(e) = self.object_store().remove_dir_all(path).await {
@@ -660,24 +724,6 @@ impl Branches<'_> {
                 Ok(())
             }
             BranchCleanup::Selective(delete_path) => {
-                let branch_paths = remaining_branches
-                    .iter()
-                    .map(|branch| {
-                        self.refs
-                            .base_location
-                            .find_branch(Some(branch))
-                            .map(|location| location.path)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let mut remaining_paths = Vec::with_capacity(branch_paths.len());
-                for path in branch_paths {
-                    let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
-                    remaining_paths.push(RemainingBranchPath {
-                        path,
-                        canonical_path,
-                    });
-                }
-
                 let mut pending = vec![delete_path];
                 while let Some(path) = pending.pop() {
                     match self
@@ -788,6 +834,13 @@ impl Branches<'_> {
         remaining_paths: &[RemainingBranchPath],
     ) -> Result<SharedBranchPath> {
         let canonical_path = self.object_store().canonicalize_local_path(path).await?;
+        if canonical_path.is_none()
+            && (self.object_store().is_local()
+                || self.object_store().scheme() == "file-object-store")
+        {
+            log::warn!("Keeping local branch directory {path}: cannot resolve filesystem identity");
+            return Ok(SharedBranchPath::Remaining);
+        }
         let mut is_ancestor = false;
         for remaining in remaining_paths {
             match (&canonical_path, &remaining.canonical_path) {

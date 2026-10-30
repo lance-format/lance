@@ -806,8 +806,20 @@ impl ObjectStore {
     /// Canonicalize a local object path, resolving rooted and UNC stores through
     /// their filesystem root mapping.
     ///
-    /// Returns `Ok(None)` for non-local stores and paths that no longer exist.
-    /// Other local filesystem errors are returned to the caller.
+    /// Returns `Ok(None)` for non-local stores and when the filesystem identity cannot
+    /// be resolved, including missing paths and unsupported local root mappings. Other
+    /// local filesystem errors are returned to the caller.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn same_directory(store: &ObjectStore, a: &Path, b: &Path) -> Result<bool> {
+    /// let a = store.canonicalize_local_path(a).await?;
+    /// let b = store.canonicalize_local_path(b).await?;
+    /// # Ok(a.is_some() && a == b)
+    /// # }
+    /// ```
     pub async fn canonicalize_local_path(&self, path: &Path) -> Result<Option<PathBuf>> {
         if let Some(local_dir_operations) = &self.local_dir_operations {
             return local_dir_operations.canonicalize(path).await;
