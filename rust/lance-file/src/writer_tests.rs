@@ -15,11 +15,11 @@ mod tests {
     use crate::writer::{
         ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
     };
-    use arrow_array::builder::{Float32Builder, Int32Builder};
-    use arrow_array::types::Float64Type;
+    use arrow_array::builder::{Float32Builder, Int32Builder, StringDictionaryBuilder};
+    use arrow_array::types::{Float64Type, Int32Type};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
-        RecordBatchReader, StringArray, StructArray, UInt64Array,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, LargeBinaryArray, ListArray,
+        RecordBatch, RecordBatchReader, StringArray, StructArray, UInt64Array,
     };
     use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
@@ -32,7 +32,9 @@ mod tests {
     use lance_core::utils::tempfile::TempObjFile;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
-    use lance_encoding::constants::PACKED_STRUCT_META_KEY;
+    use lance_encoding::constants::{
+        PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE,
+    };
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::encoder::{
         BatchEncoder, ColumnIndexSequence, EncodingOptions, FieldEncodingContext, OutOfLineBuffers,
@@ -966,6 +968,169 @@ mod tests {
         // A bare array carries no extension of its own.
         assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
         assert_eq!(mismatch.actual.extension_type_name(), None);
+    }
+
+    /// The value encoder stores each fixed-size list as one fixed-width value, so
+    /// writing a list of strings or binaries fails with an error, not a panic.
+    #[rstest]
+    #[case::utf8(DataType::Utf8, false)]
+    #[case::large_binary(DataType::LargeBinary, false)]
+    #[case::nested_utf8(DataType::Utf8, true)]
+    #[tokio::test]
+    async fn test_writer_rejects_fixed_size_list_of_variable_width_items(
+        #[case] item_type: DataType,
+        #[case] nested: bool,
+        #[values(false, true)] null_lists: bool,
+        // Lists of 200-byte items are too wide for mini-block pages and use full zip.
+        #[values(2, 200)] item_len: usize,
+        // 2.3 sparse pages choose their compressors without the dense page path.
+        #[values(
+            (ConcreteFileVersion::V2_0, None),
+            (ConcreteFileVersion::V2_1, None),
+            (ConcreteFileVersion::V2_2, None),
+            (ConcreteFileVersion::V2_3, None),
+            (ConcreteFileVersion::V2_3, Some(STRUCTURAL_ENCODING_SPARSE))
+        )]
+        target: (ConcreteFileVersion, Option<&str>),
+    ) {
+        let (version, structural_encoding) = target;
+        let items = (0..8).map(|i| format!("{i:0>item_len$}"));
+        let values: ArrayRef = match item_type {
+            DataType::Utf8 => Arc::new(StringArray::from_iter_values(items)),
+            DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter_values(items)),
+            _ => unreachable!(),
+        };
+        let item_field = Arc::new(ArrowField::new("item", item_type, true));
+        // A null list makes the encoder write definition levels.
+        let nulls = null_lists.then(|| NullBuffer::from(vec![true, false, true, true]));
+        let mut tags: ArrayRef = Arc::new(FixedSizeListArray::new(item_field, 2, values, nulls));
+        if nested {
+            let item_field = Arc::new(ArrowField::new("item", tags.data_type().clone(), true));
+            tags = Arc::new(FixedSizeListArray::new(item_field, 2, tags, None));
+        }
+        let metadata = structural_encoding.map(|encoding| {
+            (
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                encoding.to_string(),
+            )
+        });
+        let tags_field = ArrowField::new("tags", tags.data_type().clone(), true)
+            .with_metadata(metadata.into_iter().collect());
+        let schema = Arc::new(ArrowSchema::new(vec![tags_field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![tags]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("a fixed-size list of variable-width items was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    /// A row with more rep/def levels than one mini-block chunk holds is checked
+    /// for full-zip support before any compressor is chosen.
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_rejects_large_row_of_fixed_size_lists_of_strings(
+        // 2.3 writes such a row as a sparse page, which has no such limit.
+        #[values(ConcreteFileVersion::V2_1, ConcreteFileVersion::V2_2)]
+        version: ConcreteFileVersion,
+    ) {
+        let item_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
+        let items = Arc::new(StringArray::from(vec!["a", "b"]));
+        let tags = FixedSizeListArray::new(item_field, 2, items, None);
+        // One row of 70,000 lists, all empty but the first, has a level for each
+        // list but a single value.
+        let num_lists = 70_000;
+        let offsets = std::iter::once(0).chain(std::iter::repeat_n(1, num_lists));
+        let list_field = Arc::new(ArrowField::new("item", tags.data_type().clone(), true));
+        let lists = ListArray::new(
+            list_field,
+            OffsetBuffer::new(ScalarBuffer::from_iter(offsets)),
+            Arc::new(tags),
+            None,
+        );
+        let row_field = Arc::new(ArrowField::new("item", lists.data_type().clone(), true));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, num_lists as i32]));
+        let row: ArrayRef = Arc::new(ListArray::new(row_field, offsets, Arc::new(lists), None));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "tags",
+            row.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![row]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("a fixed-size list of variable-width items was written");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_rejects_fixed_size_list_of_dictionary_strings(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        for i in 0..8 {
+            builder.append_value(format!("item-{i}"));
+        }
+        let values: ArrayRef = Arc::new(builder.finish());
+        let item_field = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
+        let tags = FixedSizeListArray::new(item_field, 2, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "tags",
+            tags.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(tags)]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("fixed-size list of dictionary strings was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("FixedSizeList"), "{error}");
     }
 
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
