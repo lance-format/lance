@@ -4003,6 +4003,103 @@ def test_merge_insert_analyze_plan_matches_execute_routing():
     assert "join_type=Right" in streaming, streaming
 
 
+@pytest.mark.parametrize("source_state", ["plain", "deleted", "older_version"])
+def test_merge_insert_native_dataset_matches_scanner(
+    tmp_path, monkeypatch, source_state
+):
+    source_data = pa.table(
+        {"id": [1, 2, 3], "value": [10, 20, 30]}
+    ).replace_schema_metadata({b"source": b"metadata"})
+    source = lance.write_dataset(source_data, tmp_path / "source", max_rows_per_file=1)
+    if source_state == "deleted":
+        source.delete("id = 2")
+    elif source_state == "older_version":
+        lance.write_dataset(
+            pa.table({"id": [4], "value": [40]}).replace_schema_metadata(
+                {b"source": b"metadata"}
+            ),
+            tmp_path / "source",
+            mode="append",
+        )
+        source = lance.dataset(tmp_path / "source").checkout_version(1)
+
+    scanner = source.scanner()
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("native source must not create a Python scanner")
+
+    monkeypatch.setattr(source, "scanner", unexpected_scan)
+    results = []
+    for kind in ("native", "scanner"):
+        target = lance.write_dataset(
+            pa.table({"id": [0, 1], "value": [-1, -1]}), tmp_path / kind
+        )
+        data = source if kind == "native" else scanner
+        target.merge_insert(
+            "id"
+        ).when_matched_update_all().when_not_matched_insert_all().execute(data)
+        results.append(target.to_table().sort_by("id"))
+    assert results[0] == results[1]
+    assert results[0].schema.equals(results[1].schema, check_metadata=True)
+
+
+def test_native_dataset_falls_back_for_blob_v2(tmp_path, monkeypatch):
+    def table(ids, values):
+        return pa.table({"id": ids, "blob": lance.blob_array(values)})
+
+    source = lance.write_dataset(
+        table([1, 2], [b"new", b"insert"]),
+        tmp_path / "source",
+        max_rows_per_file=1,
+        data_storage_version="2.2",
+    )
+    target = lance.write_dataset(
+        table([0, 1], [b"keep", b"old"]),
+        tmp_path / "target",
+        data_storage_version="2.2",
+    )
+    calls = []
+    scanner = source.scanner
+
+    def track_scanner(*args, **kwargs):
+        calls.append(True)
+        return scanner(*args, **kwargs)
+
+    monkeypatch.setattr(source, "scanner", track_scanner)
+    with pytest.raises(OSError, match="mismatched children"):
+        target.merge_insert(
+            "id"
+        ).when_matched_update_all().when_not_matched_insert_all().execute(source)
+    assert calls == [True]
+
+
+def test_merge_insert_native_dataset_build_side(tmp_path):
+    rows = 128 * 1024 + 1
+    target = lance.write_dataset(
+        pa.table({"id": range(rows), "value": range(rows), "wide": ["x" * 128] * rows}),
+        tmp_path / "target",
+    )
+    source = lance.write_dataset(
+        pa.table({"id": [1, rows + 1], "value": [999, 1000]}), tmp_path / "source"
+    )
+
+    def analyze(data):
+        return (
+            target.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .write_mode("rewrite_rows")
+            .analyze_plan(data)
+        )
+
+    native = analyze(source)
+    scanner = analyze(source.scanner())
+    assert "mode=CollectLeft, join_type=Left" in native, native
+    assert "mode=Partitioned, join_type=Right" in scanner, scanner
+    assert "StreamingTableExec" not in native, native
+    assert "StreamingTableExec" in scanner, scanner
+
+
 def _commit_competing_write(uri, conflict_kind="update"):
     """Change target rows so a merge from the previous version must retry."""
     competing = lance.dataset(uri)
@@ -4110,6 +4207,156 @@ def test_write_source_registry_is_internal():
 
     assert not hasattr(source_types, "WriteSource")
     assert not hasattr(source_types, "coerce_source")
+
+
+def test_native_dataset_retry_without_scanner_or_replay_spill(tmp_path, monkeypatch):
+    source = lance.write_dataset(
+        pa.table({"id": [0, 1, 2], "value": [10, 11, 12]}),
+        tmp_path / "source",
+        max_rows_per_file=1,
+    )
+    uri = tmp_path / "target"
+    lance.write_dataset(pa.table({"id": [0], "value": [-1]}), uri)
+    target = lance.dataset(uri)
+    _commit_competing_write(uri)
+    spill_dir = tmp_path / "spill"
+    spill_dir.mkdir()
+    monkeypatch.setenv("TMPDIR", str(spill_dir))
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("native source must not create a Python scanner")
+
+    monkeypatch.setattr(source, "scanner", unexpected_scan)
+    target.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().conflict_retries(
+        2
+    ).execute(source)
+    assert target.version == 3
+    assert target.to_table().sort_by("id") == pa.table(
+        {"id": [0, 1, 2], "value": [10, 11, 12]}
+    )
+    assert list(spill_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "default_scan_options",
+    [
+        {"filter": "id > 0"},
+        {"limit": 1},
+        {"scan_in_order": False},
+        {"batch_size": 1},
+    ],
+)
+@pytest.mark.parametrize(
+    "operation", ["execute", "execute_uncommitted", "analyze_plan"]
+)
+def test_native_dataset_falls_back_for_scan_defaults(
+    tmp_path, monkeypatch, operation, default_scan_options
+):
+    data = pa.table({"id": [0, 1, 2], "value": [10, 11, 12]})
+    lance.write_dataset(data, tmp_path / "source")
+    source = lance.dataset(
+        tmp_path / "source", default_scan_options=default_scan_options
+    )
+    initial = data.slice(0, 1)
+    target = lance.write_dataset(initial, tmp_path / "target")
+    expected_target = lance.write_dataset(initial, tmp_path / "expected")
+    calls = []
+    scanner = source.scanner
+
+    def track_scanner(*args, **kwargs):
+        calls.append(True)
+        return scanner(*args, **kwargs)
+
+    monkeypatch.setattr(source, "scanner", track_scanner)
+    builder = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+    result = getattr(builder, operation)(source)
+    assert calls
+
+    expected_builder = (
+        expected_target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+    expected_result = getattr(expected_builder, operation)(scanner())
+    if operation == "execute_uncommitted":
+        transaction, _ = result
+        target = lance.LanceDataset.commit(target, transaction)
+        expected_transaction, _ = expected_result
+        expected_target = lance.LanceDataset.commit(
+            expected_target, expected_transaction
+        )
+    if operation != "analyze_plan":
+        assert target.to_table().sort_by("id") == expected_target.to_table().sort_by(
+            "id"
+        )
+
+
+def test_native_dataset_falls_back_for_schema_changing_scan_defaults(
+    tmp_path, monkeypatch
+):
+    data = pa.table({"id": [0, 1], "value": [10, 11]})
+    lance.write_dataset(data, tmp_path / "source")
+    source = lance.dataset(
+        tmp_path / "source", default_scan_options={"with_row_id": True}
+    )
+    target = lance.write_dataset(data.slice(0, 1), tmp_path / "target")
+    calls = []
+    scanner = source.scanner
+
+    def track_scanner(*args, **kwargs):
+        calls.append(True)
+        return scanner(*args, **kwargs)
+
+    monkeypatch.setattr(source, "scanner", track_scanner)
+    with pytest.raises(OSError, match="_rowid"):
+        target.merge_insert("id").when_not_matched_insert_all().execute(source)
+    assert calls
+
+
+def test_native_dataset_execute_uncommitted_without_scanner(tmp_path, monkeypatch):
+    source = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}),
+        tmp_path / "source",
+        max_rows_per_file=1,
+    )
+    target = lance.write_dataset(
+        pa.table({"id": [0, 1], "value": [-1, -1]}), tmp_path / "target"
+    )
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("native source must not create a Python scanner")
+
+    monkeypatch.setattr(source, "scanner", unexpected_scan)
+    transaction, stats = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute_uncommitted(source)
+    )
+    check_merge_stats(stats, (1, 1, 0))
+    committed = lance.LanceDataset.commit(target, transaction)
+    assert committed.to_table().sort_by("id") == pa.table(
+        {"id": [0, 1, 2], "value": [-1, 10, 20]}
+    )
+
+
+def test_native_dataset_falls_back_for_subclasses(tmp_path):
+    class FilteredDataset(lance.LanceDataset):
+        def scanner(self, **kwargs):
+            return super().scanner(filter="id > 0", **kwargs)
+
+    data = pa.table({"id": [0, 1], "value": [10, 11]})
+    lance.write_dataset(data, tmp_path / "source")
+    source = FilteredDataset(tmp_path / "source")
+    target = lance.write_dataset(data.slice(0, 1), tmp_path / "target")
+    target.merge_insert("id").when_not_matched_insert_all().execute(source)
+    assert target.to_table().sort_by("id") == data
 
 
 def test_registered_source_retry_and_lifecycle(tmp_path):

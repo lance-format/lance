@@ -535,6 +535,20 @@ impl MergeInsertBuilder {
         Ok(Self::build_stats(&stats, py)?.into())
     }
 
+    pub fn execute_dataset(&mut self, source: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let py = source.py();
+        let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (dataset, stats) = rt()
+            .spawn(Some(py), job.execute_dataset(source))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.dataset.bind(py).borrow_mut().ds = dataset;
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
     /// Execute the merge insert from fully-materialized data.
     ///
     /// The data is read into memory and wrapped in an in-memory table, so retries
@@ -560,6 +574,26 @@ impl MergeInsertBuilder {
         dataset.borrow_mut().ds = new_dataset;
 
         Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    /// [`Self::execute_batches`] without committing; returns the transaction.
+    pub fn execute_uncommitted_dataset<'a>(
+        &mut self,
+        source: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = source.py();
+        let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = rt()
+            .spawn(Some(py), job.execute_uncommitted_dataset(source))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let stats = Self::build_stats(&stats, py)?;
+        Ok((PyLance(transaction), stats))
     }
 
     /// [`Self::execute_batches`] without committing; returns the transaction.
@@ -635,6 +669,21 @@ impl MergeInsertBuilder {
         rt().spawn(Some(factory.py()), async move {
             job.analyze_plan_provider(provider).await
         })?
+        .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    pub fn analyze_plan_dataset(&mut self, source: &Bound<'_, PyAny>) -> PyResult<String> {
+        let py = source.py();
+        let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        rt().spawn(
+            Some(py),
+            async move { job.analyze_plan_dataset(source).await },
+        )?
         .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 

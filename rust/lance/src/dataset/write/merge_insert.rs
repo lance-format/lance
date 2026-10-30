@@ -1688,6 +1688,23 @@ fn target_blob_handling(dataset: &Dataset) -> lance_core::datatypes::BlobHandlin
 }
 
 impl MergeInsertJob {
+    fn dataset_source_provider(source: Arc<Dataset>) -> Arc<dyn TableProvider> {
+        Arc::new(
+            crate::datafusion::dataframe::LanceTableProvider::new(source, false, false)
+                .with_blob_handling(lance_core::datatypes::BlobHandling::default()),
+        )
+    }
+
+    /// Executes the merge insert job from a native Lance dataset source.
+    ///
+    /// The dataset handle is scanned directly through [`LanceTableProvider`].
+    ///
+    /// [`LanceTableProvider`]: crate::datafusion::LanceTableProvider
+    pub async fn execute_dataset(self, source: Arc<Dataset>) -> Result<(Arc<Dataset>, MergeStats)> {
+        self.execute_provider(Self::dataset_source_provider(source))
+            .await
+    }
+
     /// Clone one execution attempt while preserving the spill manager owned by
     /// the surrounding retry loop.
     fn clone_for_retry(&self) -> Self {
@@ -2972,6 +2989,27 @@ impl MergeInsertJob {
             .await
     }
 
+    /// Like [`Self::execute_uncommitted_batches`] for a native Lance dataset.
+    pub async fn execute_uncommitted_dataset(
+        self,
+        source: Arc<Dataset>,
+    ) -> Result<UncommittedMergeInsert> {
+        self.execute_uncommitted_impl(
+            Self::dataset_source_provider(source),
+            SourceProviderMode::Rescannable,
+        )
+        .await
+    }
+
+    /// Like [`Self::execute_uncommitted_batches`] for a re-scannable provider.
+    pub async fn execute_uncommitted_provider(
+        self,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<UncommittedMergeInsert> {
+        self.execute_uncommitted_impl(provider, SourceProviderMode::Rescannable)
+            .await
+    }
+
     /// Wrap materialized batches in a multi-partition in-memory [`MemTable`].
     fn batches_to_provider(&self, batches: Vec<RecordBatch>) -> Result<Arc<dyn TableProvider>> {
         let schema = batches
@@ -4112,6 +4150,12 @@ impl MergeInsertJob {
             .collect();
 
         Ok(filtered_lines.join("\n"))
+    }
+
+    /// [`Self::analyze_plan_provider`] for a native Lance dataset.
+    pub async fn analyze_plan_dataset(&self, source: Arc<Dataset>) -> Result<String> {
+        self.analyze_plan_provider(Self::dataset_source_provider(source))
+            .await
     }
 
     /// Delete the files an executed-but-uncommitted merge wrote.
@@ -14784,6 +14828,69 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             "Expected error to be InvalidInput with message about ambiguous merge insert and multiple source rows, got: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn test_first_seen_native_source_matches_ordered_scanner() {
+        let source_batch = record_batch!(
+            ("key", UInt32, [2, 2, 3, 3, 5]),
+            ("value", UInt32, [100, 200, 400, 500, 600])
+        )
+        .unwrap();
+        let source = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(source_batch.clone())], source_batch.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let initial =
+            record_batch!(("key", UInt32, [1, 2, 3]), ("value", UInt32, [10, 20, 30])).unwrap();
+        let mut results = Vec::new();
+        for native in [true, false] {
+            let target = Arc::new(
+                Dataset::write(
+                    RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+                    "memory://",
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            let job = MergeInsertBuilder::try_new(target, vec!["key".into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+                .try_build()
+                .unwrap();
+            let (result, stats) = if native {
+                job.execute_dataset(source.clone()).await.unwrap()
+            } else {
+                job.execute(source.scan().try_into_stream().await.unwrap().into())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(stats.num_skipped_duplicates, 2);
+            let batch = result.scan().try_into_batch().await.unwrap();
+            let keys = batch.column(0).as_primitive::<UInt32Type>();
+            let values = batch.column(1).as_primitive::<UInt32Type>();
+            let mut rows = keys
+                .values()
+                .iter()
+                .zip(values.values())
+                .map(|(&k, &v)| (k, v))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            results.push(rows);
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], vec![(1, 10), (2, 100), (3, 400), (5, 600)]);
     }
 
     #[tokio::test]

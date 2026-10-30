@@ -375,6 +375,38 @@ def _resolve_blob_selection(
     raise ValueError("Either ids, addresses, or indices must be specified")
 
 
+def _type_contains_blob_v2(data_type: pa.DataType) -> bool:
+    if isinstance(data_type, pa.ExtensionType):
+        return data_type.extension_name == "lance.blob.v2"
+    if pa.types.is_struct(data_type):
+        return any(
+            _type_contains_blob_v2(data_type.field(index).type)
+            for index in range(data_type.num_fields)
+        )
+    if (
+        pa.types.is_list(data_type)
+        or pa.types.is_large_list(data_type)
+        or pa.types.is_fixed_size_list(data_type)
+    ):
+        return _type_contains_blob_v2(data_type.value_type)
+    if pa.types.is_map(data_type):
+        return _type_contains_blob_v2(data_type.item_type)
+    return False
+
+
+def _dataset_contains_blob_v2(data_obj: LanceDataset) -> bool:
+    return any(_type_contains_blob_v2(field.type) for field in data_obj._ds.schema)
+
+
+def _is_native_dataset_source(data_obj: ReaderLike) -> bool:
+    """Whether a merge can use the Lance dataset handle without a Python scanner."""
+    return (
+        type(data_obj) is LanceDataset
+        and not data_obj._default_scan_options
+        and not _dataset_contains_blob_v2(data_obj)
+    )
+
+
 class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
         """Executes the merge insert operation
@@ -400,6 +432,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         Keep external source files unchanged until the operation finishes.
         Sources without a repeatability contract retain the replay buffer.
         """
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).execute_dataset(data_obj._ds)
         source = _coerce_source(data_obj, schema)
         if source.mode == "replayable":
             return super(MergeInsertBuilder, self).execute_replayable(
@@ -430,6 +464,10 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_dataset(
+                data_obj._ds
+            )
         source = _coerce_source(data_obj, schema)
         reader = source.open_reader()
         if source.mode == "materialized":
@@ -825,6 +863,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - iops: number of I/O operations performed
         - requests: number of storage requests made
         """  # noqa: E501
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_dataset(data_obj._ds)
         source = _coerce_source(data_obj, schema)
         if source.mode == "replayable":
             return super(MergeInsertBuilder, self).analyze_plan_replayable(
