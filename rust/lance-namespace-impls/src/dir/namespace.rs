@@ -2546,9 +2546,13 @@ impl LanceNamespace for DirectoryNamespace {
             )
             .await
             .map_err(|e| {
-                // After load_dataset + the dup pre-check, a DatasetNotFound from create_branch
-                // means the requested fork source (from_branch/from_version) doesn't exist.
-                if matches!(e, lance_core::Error::DatasetNotFound { .. }) {
+                // Missing sources can be detected while reserving the branch name or cloning.
+                // Both phases must preserve the create API's InvalidInput response.
+                if matches!(
+                    e,
+                    lance_core::Error::DatasetNotFound { .. }
+                        | lance_core::Error::VersionNotFound { .. }
+                ) {
                     NamespaceError::InvalidInput {
                         message: format!(
                             "from_branch/from_version for branch '{}' refers to a source that does not exist: {}",
