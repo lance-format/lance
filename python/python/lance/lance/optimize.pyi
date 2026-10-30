@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from lance import LanceDataset
 from lance.fragment import FragmentMetadata
@@ -138,3 +138,47 @@ class Compaction:
         rewrites: List[RewriteResult],
         options: Optional[CompactionOptions] = None,
     ) -> CompactionMetrics: ...
+
+class IndexSegmentResult:
+    group: int
+
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> IndexSegmentResult: ...
+
+class OptimizeIndexTask:
+    index_name: str
+    fragments: List[int]
+
+    def execute(self, dataset: "LanceDataset") -> Optional[IndexSegmentResult]: ...
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> OptimizeIndexTask: ...
+
+class OptimizeIndexMerge:
+    group: int
+
+    def execute(
+        self, dataset: "LanceDataset", task_results: List[Optional[IndexSegmentResult]]
+    ) -> Optional[IndexSegmentResult]: ...
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> OptimizeIndexMerge: ...
+
+class OptimizeIndicesPlan:
+    tasks: List[OptimizeIndexTask]
+    merges: List[OptimizeIndexMerge]
+
+    def json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> OptimizeIndicesPlan: ...
+
+class OptimizeIndices:
+    @staticmethod
+    def plan(
+        dataset: "LanceDataset", options: Optional[Dict[str, Any]] = None
+    ) -> OptimizeIndicesPlan: ...
+    @staticmethod
+    def commit(
+        dataset: "LanceDataset", results: List[Optional[IndexSegmentResult]]
+    ) -> None: ...

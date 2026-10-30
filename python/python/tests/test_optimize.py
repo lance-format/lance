@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import json
+import multiprocessing
 import pickle
 import random
 import re
@@ -13,7 +14,12 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from lance.lance import Compaction
-from lance.optimize import RewriteResult
+from lance.optimize import (
+    OptimizeIndexMerge,
+    OptimizeIndexTask,
+    OptimizeIndices,
+    RewriteResult,
+)
 from lance.vector import vec_to_table
 
 
@@ -1221,3 +1227,85 @@ def test_remap_row_addrs(tmp_path: Path):
         pa.array([old[i] for i in sample], pa.uint64())
     ).to_pylist()
     assert remapped == [new[i] for i in sample]
+
+
+def test_optimize_indices_distributed(tmp_path: Path):
+    """The plan's tasks and merges travel to worker processes by pickle and
+    their results travel back, while the table keeps taking writes."""
+
+    def table(start: int, rows: int) -> pa.Table:
+        vectors = np.random.default_rng(start).random((rows, 8), dtype=np.float32)
+        return vec_to_table(vectors).append_column(
+            "id", pa.array(range(start, start + rows))
+        )
+
+    # A vector index and a BTree index over fragment 0 (256 rows), then four
+    # unindexed fragments 1..4 of 64 rows each.
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(table(0, 256), uri)
+    dataset.create_index(
+        "vector", index_type="IVF_FLAT", num_partitions=2, name="vector_idx"
+    )
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    dataset = lance.write_dataset(
+        table(256, 256), uri, mode="append", max_rows_per_file=64
+    )
+    version = dataset.version
+
+    # Two tasks of two fragments per index, each index merged by one merge.
+    plan = OptimizeIndices.plan(dataset, {"max_rows_per_task": 128})
+    assert {(task.index_name, tuple(task.fragments)) for task in plan.tasks} == {
+        ("vector_idx", (1, 2)),
+        ("vector_idx", (3, 4)),
+        ("id_idx", (1, 2)),
+        ("id_idx", (3, 4)),
+    }
+    assert len(plan.merges) == 2
+
+    # Each worker rebuilds its own dataset handle from the pickled one, as a
+    # worker on another machine would; a unit reads the version it was
+    # planned from, whatever version the handle is at.
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(2) as pool:
+        built = pool.starmap_async(
+            OptimizeIndexTask.execute, [(task, dataset) for task in plan.tasks]
+        ).get(timeout=300)
+        assert len(built) == 4 and None not in built
+        # An append lands while the workers run: the commit still goes
+        # through, and the new fragment waits for the next optimize.
+        lance.write_dataset(table(512, 10), uri, mode="append")
+        # Every merge may be given every task result.
+        merged = pool.starmap_async(
+            OptimizeIndexMerge.execute,
+            [(merge, dataset, built) for merge in plan.merges],
+        ).get(timeout=300)
+    assert {result.group for result in merged} == {merge.group for merge in plan.merges}
+
+    OptimizeIndices.commit(dataset, merged)
+    assert dataset.version == version + 2
+    # The vector tasks appended a segment; the BTree merge absorbed the old one.
+    assert dataset.stats.index_stats("vector_idx")["num_indices"] == 2
+    assert dataset.stats.index_stats("id_idx")["num_indices"] == 1
+    for name in ["vector_idx", "id_idx"]:
+        stats = dataset.stats.index_stats(name)
+        assert stats["num_indexed_rows"] == 512
+        assert stats["num_unindexed_rows"] == 10
+    assert dataset.to_table(filter="id = 300")["id"].to_pylist() == [300]
+    # Rows of the new fragments find themselves through one partition: the
+    # segments the tasks built put them where the reference model says.
+    sample = dataset.to_table(
+        columns=["id", "vector"], filter="id >= 256 and id < 512 and id % 16 = 0"
+    )
+    assert sample.num_rows == 16
+    hits = 0
+    for id_, vector in zip(sample["id"].to_pylist(), sample["vector"].to_pylist()):
+        nearest = dataset.to_table(
+            columns=["id"],
+            nearest={"column": "vector", "q": vector, "k": 1, "nprobes": 1},
+        )
+        hits += nearest["id"].to_pylist() == [id_]
+    assert hits / sample.num_rows == 1.0
+
+    # Only the fragment appended meanwhile is left to plan.
+    plan = OptimizeIndices.plan(dataset, {"max_rows_per_task": 128})
+    assert {tuple(task.fragments) for task in plan.tasks} == {(5,)}

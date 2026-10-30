@@ -104,7 +104,7 @@ fn parse_compaction_options(
     Ok(opts)
 }
 
-fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
+pub(crate) fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
     let ds = dataset.getattr("_ds")?;
     Ok(ds.cast::<Dataset>()?.clone())
 }
