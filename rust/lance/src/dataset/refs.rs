@@ -664,9 +664,32 @@ impl Branches<'_> {
                 );
                 return Ok(());
             }
+            let mut canonical_dataset_dirs = Vec::with_capacity(DATASET_DIRS.len());
+            if has_local_paths {
+                // Dataset directories can be symlinks outside the branch root.
+                // Protect their own identities, including dynamically named MemWAL directories.
+                for name in self.object_store().read_dir(path.clone()).await? {
+                    if !is_dataset_dir(&name) {
+                        continue;
+                    }
+                    let dataset_path = path.clone().join(name);
+                    let Some(canonical_dir) = self
+                        .object_store()
+                        .canonicalize_local_path(&dataset_path)
+                        .await?
+                    else {
+                        log::warn!(
+                            "Keeping branch directories after deleting {branch}: cannot resolve surviving dataset directory at {dataset_path}"
+                        );
+                        return Ok(());
+                    };
+                    canonical_dataset_dirs.push(canonical_dir);
+                }
+            }
             remaining_paths.push(RemainingBranchPath {
                 path,
                 canonical_path,
+                canonical_dataset_dirs,
             });
         }
 
@@ -675,15 +698,6 @@ impl Branches<'_> {
                 BranchCleanup::Recursive(path) | BranchCleanup::Selective(path) => path,
                 BranchCleanup::Skip => return Ok(()),
             };
-            if self
-                .overlaps_local_dataset_dir(path, &remaining_paths)
-                .await?
-            {
-                log::warn!(
-                    "Keeping branch directory after deleting {branch}: cleanup path overlaps a surviving parent's dataset directory"
-                );
-                return Ok(());
-            }
             cleanup = match self
                 .classify_shared_branch_path(path, &remaining_paths)
                 .await?
@@ -751,31 +765,6 @@ impl Branches<'_> {
                 Ok(())
             }
         }
-    }
-
-    async fn overlaps_local_dataset_dir(
-        &self,
-        path: &Path,
-        remaining_paths: &[RemainingBranchPath],
-    ) -> Result<bool> {
-        let Some(canonical_path) = self.object_store().canonicalize_local_path(path).await? else {
-            return Ok(true);
-        };
-        for remaining in remaining_paths {
-            let Some(canonical_remaining) = &remaining.canonical_path else {
-                return Ok(true);
-            };
-            let Ok(relative) = canonical_path.strip_prefix(canonical_remaining) else {
-                continue;
-            };
-            let Some(component) = relative.components().next() else {
-                continue;
-            };
-            if component.as_os_str().to_str().is_some_and(is_dataset_dir) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn get_cleanup_path(
@@ -856,8 +845,19 @@ impl Branches<'_> {
                 (Some(path), Some(remaining)) if path == remaining => {
                     return Ok(SharedBranchPath::Remaining);
                 }
-                (Some(path), Some(remaining)) => {
-                    is_ancestor |= remaining.starts_with(path);
+                (Some(path), Some(canonical_remaining)) => {
+                    if remaining
+                        .canonical_dataset_dirs
+                        .iter()
+                        .any(|directory| path.starts_with(directory))
+                    {
+                        return Ok(SharedBranchPath::Remaining);
+                    }
+                    is_ancestor |= canonical_remaining.starts_with(path)
+                        || remaining
+                            .canonical_dataset_dirs
+                            .iter()
+                            .any(|directory| directory.starts_with(path));
                 }
                 _ if &remaining.path == path => return Ok(SharedBranchPath::Remaining),
                 _ => is_ancestor |= remaining.path.prefix_matches(path),
@@ -885,6 +885,7 @@ impl Branches<'_> {
 struct RemainingBranchPath {
     path: Path,
     canonical_path: Option<PathBuf>,
+    canonical_dataset_dirs: Vec<PathBuf>,
 }
 
 enum SharedBranchPath {

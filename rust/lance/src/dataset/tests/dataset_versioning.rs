@@ -1637,6 +1637,93 @@ async fn test_delete_branch_preserves_unicode_aliased_parent_data() {
     assert_eq!(parent.count_rows(None).await.unwrap(), 3);
 }
 
+#[cfg(unix)]
+#[rstest]
+#[case::data("data", "data")]
+#[case::unicode_versions("_versions", "_ver\u{017f}ions")]
+#[tokio::test]
+async fn test_delete_branch_preserves_relocated_parent_data(
+    #[case] dataset_dir: &str,
+    #[case] alias: &str,
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("A", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+
+    let owned_path = tempdir.std_path().join("tree/A").join(dataset_dir);
+    let relocated_path = tempdir.std_path().join("relocated");
+    std::fs::rename(&owned_path, &relocated_path).unwrap();
+    std::os::unix::fs::symlink(&relocated_path, &owned_path).unwrap();
+    let alias_path = tempdir.std_path().join("tree/A").join(alias);
+    if !alias_path.exists() {
+        std::os::unix::fs::symlink(&owned_path, &alias_path).unwrap();
+    }
+    if !tempdir.std_path().join("tree/a").exists() {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("tree/A"),
+            tempdir.std_path().join("tree/a"),
+        )
+        .unwrap();
+    }
+    let deleted_branch = format!("a/{alias}");
+    create_branch_before_name_check(&parent, &deleted_branch).await;
+    // Keep cleanup rooted at the dataset directory even without a child branch.
+    root.create_branch("a/sibling", 1, None).await.unwrap();
+    let child_branch = format!("{deleted_branch}/x");
+    if has_child {
+        create_branch_before_name_check(&root, &child_branch).await;
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch(&deleted_branch).await.unwrap();
+            let branches = root.list_branches().await.unwrap();
+            assert!(!branches.contains_key(&deleted_branch));
+            assert!(branches.contains_key("A"));
+            assert!(branches.contains_key("a/sibling"));
+            assert_eq!(branches.contains_key(&child_branch), has_child);
+        }
+        let mut parent = Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("A")
+            .await
+            .unwrap();
+        let batch = parent.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            parent.append(id_rows(20, 1), None).await.unwrap();
+            assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+        }
+    }
+    for branch in [
+        Some("a/sibling"),
+        has_child.then_some(child_branch.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut survivor = root.checkout_branch(branch).await.unwrap();
+        survivor.append(id_rows(30, 1), None).await.unwrap();
+        let batch = survivor.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 30]
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
