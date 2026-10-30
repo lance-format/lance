@@ -36,7 +36,7 @@ use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -810,15 +810,21 @@ impl<'a> TransactionRebase<'a> {
         let theirs = Footprint::committed(other_transaction, before, after);
         let overlaps =
             match ours.compare_through_moves(&theirs, &|fragment| self.moved_to(fragment)) {
-                Verdict::Compatible => return Ok(()),
+                Verdict::Compatible => Vec::new(),
                 Verdict::Rebase(overlaps) => overlaps,
                 Verdict::Conflict => {
                     return Err(self.retryable_conflict_err(other_transaction, other_version));
                 }
             };
+        // Also when the footprints are compatible: a compaction of an earlier
+        // compaction's output names none of the fragments the segment covers.
+        let overlaps = self.withdraw_folded_overlays(overlaps, before, other_transaction);
+        if overlaps.is_empty() {
+            return Ok(());
+        }
         if !overlaps
             .iter()
-            .all(|overlap| self.can_rebase_past(overlap, before, other_transaction))
+            .all(|overlap| self.can_rebase_past(overlap, other_transaction))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
@@ -921,8 +927,7 @@ impl<'a> TransactionRebase<'a> {
         Some(moved.into_iter().map(u64::from).collect())
     }
 
-    /// Whether the rebase can resolve `overlap`, given the manifest `before`
-    /// the commit it overlaps.
+    /// Whether the rebase can resolve `overlap`, which `committed` caused.
     ///
     /// A compaction under a legacy `CreateIndex`'s segment is resolvable only
     /// as legacy resolves it: the move deferred its index remap and the latest
@@ -931,20 +936,14 @@ impl<'a> TransactionRebase<'a> {
     /// reuse history's own rule instead, that removal isn't staleness: its
     /// coverage of the moved rows translates through a recorded transition, or
     /// is lost and the rows are scanned. Either way, an NGram segment refuses
-    /// retired coverage at query time, and an overlay newer than the segment
-    /// that the compaction folded into base data would no longer be masked out
-    /// of it; legacy withdraws the latter from coverage, and this conflicts
-    /// instead.
+    /// retired coverage at query time. A compaction that folded in a newer
+    /// overlay was already turned into a withdrawal by
+    /// [`Self::withdraw_folded_overlays`].
     ///
     /// Rows this transaction moved out from under an overlay `committed`
     /// added are resolvable where they miss the overlay's coverage, as
     /// `check_update_txn` decides it for a named `Update`.
-    fn can_rebase_past(
-        &self,
-        overlap: &Overlap,
-        before: &Manifest,
-        committed: &Transaction,
-    ) -> bool {
+    fn can_rebase_past(&self, overlap: &Overlap, committed: &Transaction) -> bool {
         let (segment, fragment) = match overlap {
             Overlap::CompactedUnderIndex { segment, fragment } => (segment, fragment),
             Overlap::RowsMovedUnderOverlay { fragment }
@@ -957,36 +956,105 @@ impl<'a> TransactionRebase<'a> {
         let Some(built) = added_segment(&self.transaction, *segment) else {
             return false;
         };
-        let recorded = matches!(self.transaction.operation, Operation::CompositeOperation(_))
-            || match (&self.current_lineage, &self.untagged_reuse) {
-                (Some(_), _) => self
-                    .moved_to(*fragment)
-                    .is_some_and(|moved| !moved.is_empty()),
-                (None, Some(reuse)) => reuse
-                    .groups
-                    .iter()
-                    .any(|sources| sources.contains(fragment)),
-                (None, None) => false,
-            };
         let is_ngram = built
             .index_details
             .as_ref()
             .is_some_and(|details| details.type_url.ends_with("NGramIndexDetails"));
-        let folds_newer_overlay = before
-            .fragments
-            .iter()
-            .find(|candidate| candidate.id == *fragment)
-            .is_some_and(|compacted| {
-                compacted.overlays.iter().any(|overlay| {
-                    overlay_affects_index(
-                        overlay,
-                        &built.fields,
-                        built.dataset_version,
-                        &before.schema,
-                    )
+        self.records_move_of(*fragment) && !is_ngram
+    }
+
+    /// Whether the segment this transaction adds over `fragment` can keep
+    /// covering it once a compaction moves its rows: always for an action
+    /// set's segment, and for a legacy `CreateIndex`'s only where the fragment
+    /// reuse history recorded the move.
+    fn records_move_of(&self, fragment: u64) -> bool {
+        matches!(self.transaction.operation, Operation::CompositeOperation(_))
+            || match (&self.current_lineage, &self.untagged_reuse) {
+                (Some(_), _) => self
+                    .moved_to(fragment)
+                    .is_some_and(|moved| !moved.is_empty()),
+                (None, Some(reuse)) => reuse
+                    .groups
+                    .iter()
+                    .any(|sources| sources.contains(&fragment)),
+                (None, None) => false,
+            }
+    }
+
+    /// Withdraw a segment this transaction adds from the fragments whose rows
+    /// `committed` compacted together with an overlay newer than the segment,
+    /// folding the overlay into base data: nothing is left to mask the stale
+    /// values the segment holds for those rows. Legacy withdraws the rewrite
+    /// group; here that is every covered fragment whose rows reach a fragment
+    /// the folded one moved into, which also catches an overlay that landed on
+    /// an earlier compaction's output and is folded by a later one. Coverage
+    /// loss is always legal; the rows are scanned.
+    ///
+    /// Only where the move would otherwise translate, so a legacy
+    /// `CreateIndex` over an unrecorded compaction still conflicts.
+    fn withdraw_folded_overlays(
+        &self,
+        overlaps: Vec<Overlap>,
+        before: &Manifest,
+        committed: &Transaction,
+    ) -> Vec<Overlap> {
+        let mut withdrawn = BTreeSet::new();
+        for (segment, covered) in added_segment_coverage(&self.transaction) {
+            let Some(built) = added_segment(&self.transaction, segment) else {
+                continue;
+            };
+            let folded: HashSet<u64> = before
+                .fragments
+                .iter()
+                .filter(|fragment| {
+                    moves_rows_out_of(&committed.operation, fragment.id)
+                        && fragment.overlays.iter().any(|overlay| {
+                            overlay_affects_index(
+                                overlay,
+                                &built.fields,
+                                built.dataset_version,
+                                &before.schema,
+                            )
+                        })
                 })
-            });
-        recorded && !is_ngram && !folds_newer_overlay
+                .map(|fragment| fragment.id)
+                .collect();
+            if folded.is_empty() {
+                continue;
+            }
+            let mut reached_by_folded = folded.clone();
+            for fragment in &folded {
+                reached_by_folded.extend(self.moved_to(*fragment).unwrap_or_default());
+            }
+            for fragment in covered {
+                let reaches_folded = match self.moved_to(fragment) {
+                    Some(moved) => moved
+                        .into_iter()
+                        .chain([fragment])
+                        .any(|reached| reached_by_folded.contains(&reached)),
+                    None => true,
+                };
+                if reaches_folded && self.records_move_of(fragment) {
+                    withdrawn.insert((segment, fragment));
+                }
+            }
+        }
+        let mut overlaps: Vec<Overlap> = overlaps
+            .into_iter()
+            .filter(|overlap| match overlap {
+                Overlap::CompactedUnderIndex { segment, fragment }
+                | Overlap::UpdatedUnderIndex { segment, fragment } => {
+                    !withdrawn.contains(&(*segment, *fragment))
+                }
+                _ => true,
+            })
+            .collect();
+        overlaps.extend(
+            withdrawn
+                .into_iter()
+                .map(|(segment, fragment)| Overlap::UpdatedUnderIndex { segment, fragment }),
+        );
+        overlaps
     }
 
     /// Whether the rows this transaction moved out of `fragment` miss every
@@ -3955,6 +4023,60 @@ fn overlay_coverage(operation: &Operation, fragment: u64) -> Option<RoaringBitma
         _ => Vec::new(),
     };
     coverage.into_iter().reduce(|union, more| union | more)
+}
+
+/// Each segment `transaction` adds, with the committed fragments it covers.
+/// A segment with no stated coverage covers nothing a commit could fold.
+fn added_segment_coverage(transaction: &Transaction) -> Vec<(uuid::Uuid, Vec<u64>)> {
+    match &transaction.operation {
+        Operation::CreateIndex { new_indices, .. } => new_indices
+            .iter()
+            .map(|index| {
+                let covered = index
+                    .fragment_bitmap
+                    .iter()
+                    .flat_map(|bitmap| bitmap.iter().map(u64::from))
+                    .collect();
+                (index.uuid, covered)
+            })
+            .collect(),
+        Operation::CompositeOperation(composite_operation) => composite_operation
+            .iter_actions()
+            .filter_map(|action| match action {
+                Action::AddIndexSegment(segment) => Some((
+                    segment.uuid,
+                    segment
+                        .covered_fragments
+                        .iter()
+                        .flatten()
+                        .filter_map(|fragment| fragment.committed())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `operation` moves the rows of committed `fragment` into fragments of
+/// its own, as a compaction does, rather than deleting them.
+fn moves_rows_out_of(operation: &Operation, fragment: u64) -> bool {
+    match operation {
+        Operation::Rewrite { groups, .. } => groups
+            .iter()
+            .any(|group| group.old_fragments.iter().any(|old| old.id == fragment)),
+        Operation::CompositeOperation(composite_operation) => {
+            composite_operation.iter_actions().any(|action| {
+                matches!(
+                    action,
+                    Action::RemoveFragment(remove)
+                        if remove.fragment == ActionRef::Committed(fragment) && !remove.data_change
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 /// What a rebase needs to know about a segment a transaction adds.
