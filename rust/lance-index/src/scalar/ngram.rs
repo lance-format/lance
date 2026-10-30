@@ -39,7 +39,10 @@ use async_trait::async_trait;
 use datafusion_execution::SendableRecordBatchStream;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+    KeyBuilder, LanceCache, WeakLanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -203,6 +206,23 @@ impl DeepSizeOf for NGramPostingList {
     }
 }
 
+impl CacheCodecImpl for NGramPostingList {
+    const TYPE_ID: &'static str = "lance.scalar.NGramPostingList";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+        // Roaring's portable serialization frames the entire cache body.
+        self.bitmap.serialize_into(writer.raw_writer())?;
+        Ok(())
+    }
+
+    fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+        Ok(Self {
+            bitmap: RoaringTreemap::deserialize_from(reader.body().as_ref())?,
+        })
+    }
+}
+
 // Cache key implementation for type-safe cache access
 #[derive(Debug, Clone)]
 pub struct NGramPostingListKey {
@@ -218,6 +238,10 @@ impl CacheKey for NGramPostingListKey {
 
     fn type_name() -> &'static str {
         "NGramPostingList"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<NGramPostingList>())
     }
 
     fn schema() -> CacheKeySchema {
@@ -1982,6 +2006,7 @@ mod tests {
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt, stream};
     use itertools::Itertools;
+    use lance_core::cache::{CacheDecode, CacheEntry, CacheKey};
     use lance_core::{Error, ROW_ID, Result, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_file::version::ConcreteFileVersion;
@@ -2002,10 +2027,48 @@ mod tests {
     use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
 
     use super::{
-        MAX_POSTING_LIST_BATCH_BYTES, NGRAM_TOKENIZER, NGramIndexSpillState,
-        POSTING_LIST_READ_BATCH_ROWS, POSTINGS_FILENAME, POSTINGS_SCHEMA, ngram_to_token,
-        tokenize_visitor,
+        MAX_POSTING_LIST_BATCH_BYTES, NGRAM_TOKENIZER, NGramIndexSpillState, NGramPostingList,
+        NGramPostingListKey, POSTING_LIST_READ_BATCH_ROWS, POSTINGS_FILENAME, POSTINGS_SCHEMA,
+        ngram_to_token, tokenize_visitor,
     };
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::sparse(vec![0, 7, u32::MAX as u64, 1_u64 << 32, u64::MAX])]
+    #[case::dense((0..8192).collect())]
+    fn test_posting_list_cache_codec(#[case] row_ids: Vec<u64>) {
+        let codec = NGramPostingListKey::codec().expect("posting lists must support disk caching");
+        let expected = RoaringTreemap::from_iter(row_ids);
+        let entry: CacheEntry = Arc::new(NGramPostingList {
+            bitmap: expected.clone(),
+        });
+        let dir = TempDir::default();
+        let path = dir.std_path().join("posting.cache");
+        let mut file = std::fs::File::create(&path).unwrap();
+        codec.serialize(&entry, &mut file).unwrap();
+        drop(file);
+        drop(entry);
+
+        let bytes = bytes::Bytes::from(std::fs::read(path).unwrap());
+        let restored = codec.deserialize(&bytes).hit().unwrap();
+        let restored = restored.downcast_ref::<NGramPostingList>().unwrap();
+        assert_eq!(restored.bitmap, expected);
+        assert_eq!(
+            NGramPostingList::intersect([
+                restored,
+                &NGramPostingList {
+                    bitmap: RoaringTreemap::from_iter([7, u64::MAX]),
+                }
+            ]),
+            &expected & RoaringTreemap::from_iter([7, u64::MAX])
+        );
+        for len in 0..bytes.len() {
+            assert!(matches!(
+                codec.deserialize(&bytes.slice(..len)),
+                CacheDecode::Miss(_)
+            ));
+        }
+    }
 
     struct StreamCountingReader {
         inner: Arc<dyn IndexReader>,

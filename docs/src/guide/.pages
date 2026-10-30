@@ -2,14 +2,20 @@ nav:
   - Read and Write: read_and_write.md
   - Data Types: data_types.md
   - Data Evolution: data_evolution.md
+  - Stable Row IDs and Lineage: row_ids.md
   - Blob API: blob.md
   - JSON Support: json.md
   - Tags and Branches: tags_and_branches.md
+  - Indexing and Search:
+    - Overview: indexing.md
+    - Scalar Indexes: scalar_indexing.md
+    - Full-Text Search: full_text_search.md
+    - Vector Search: vector_search.md
+    - Tokenizers: tokenizer.md
   - Object Store Configuration: object_store.md
   - Observability: observability.md
   - Distributed Write: distributed_write.md
   - Distributed Indexing: distributed_indexing.md
   - Migration Guide: migration.md
   - Performance Guide: performance.md
-  - Tokenizer: tokenizer.md
   - Extension Arrays: arrays.md

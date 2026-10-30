@@ -10,6 +10,8 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+use arrow_array::StructArray;
+use arrow_schema::Fields;
 use futures::future::BoxFuture;
 
 use super::*;
@@ -1050,4 +1052,188 @@ async fn test_staged_index_commits_past_a_deferred_compaction(#[case] update: bo
     assert_lookups_match_scan(uri, probes(24, [999])).await;
     let expected = if update { Some(0) } else { None };
     assert_covers_all_but_the_fragment_of(uri, expected).await;
+}
+
+fn packed_parent_field() -> (ArrowField, Fields) {
+    use lance_encoding::constants::PACKED_STRUCT_META_KEY;
+
+    let children = Fields::from(vec![ArrowField::new("x", DataType::Int32, false)]);
+    let mut packed = ArrowField::new("s", DataType::Struct(children.clone()), false);
+    packed.set_metadata([(PACKED_STRUCT_META_KEY.to_string(), "true".to_string())].into());
+    (packed, children)
+}
+
+async fn packed_parent_dataset(uri: &str) -> Dataset {
+    let (packed, children) = packed_parent_field();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("spare", DataType::Int32, false),
+        packed,
+    ]));
+    let ids = Arc::new(Int32Array::from_iter_values(0..12)) as ArrayRef;
+    let xs = Arc::new(StructArray::new(children, vec![ids.clone()], None)) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids.clone(), ids, xs]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    build_index(&mut dataset, "id", "id_idx", false)
+        .await
+        .unwrap();
+    dataset
+}
+
+async fn commit_data_replacement(uri: &str, column: &str, values: ArrayRef) {
+    let table = open_in_new_session(uri).await;
+    let schema = table.schema().project(&[column]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(ArrowSchema::from(&schema)), vec![values]).unwrap();
+    let replacement = table.get_fragments()[0]
+        .write_columns(futures::stream::iter([Ok(batch)]), &schema)
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement.1.fields.as_ref(),
+        &[table.schema().field(column).unwrap().id]
+    );
+    let read_version = table.manifest.version;
+    Dataset::commit(
+        crate::dataset::WriteDestination::Dataset(Arc::new(table)),
+        Operation::DataReplacement {
+            replacements: vec![replacement],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+}
+
+async fn replace_packed_parent(uri: &str, children: Fields) {
+    let values = Arc::new(StructArray::new(
+        children,
+        vec![Arc::new(Int32Array::from_iter_values(
+            (0..ROWS_PER_FRAGMENT).map(|id| if id == 3 { 333 } else { id }),
+        )) as ArrayRef],
+        None,
+    )) as ArrayRef;
+    commit_data_replacement(uri, "s", values).await;
+}
+
+async fn replace_spare(uri: &str) {
+    let values = Arc::new(Int32Array::from(vec![99; ROWS_PER_FRAGMENT as usize])) as ArrayRef;
+    commit_data_replacement(uri, "spare", values).await;
+}
+
+async fn count_filter_rows(dataset: &Dataset, filter: &str, use_index: bool) -> usize {
+    let mut scan = dataset.scan();
+    scan.use_scalar_index(use_index).filter(filter).unwrap();
+    scan.try_into_batch().await.unwrap().num_rows()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PackedChildIndexCase {
+    CreateIndex,
+    StagedSegment,
+    UnrelatedColumn,
+}
+
+/// A packed-child index rejects replacements of the parent and accepts a
+/// replacement of an unrelated column.
+#[rstest]
+#[case::create_index(PackedChildIndexCase::CreateIndex)]
+#[case::staged_segment(PackedChildIndexCase::StagedSegment)]
+#[case::unrelated_column(PackedChildIndexCase::UnrelatedColumn)]
+#[tokio::test]
+async fn packed_parent_data_replacement_races_have_expected_outcomes(
+    #[case] case: PackedChildIndexCase,
+) {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str().to_string();
+    let _dataset = packed_parent_dataset(&uri).await;
+    let mut builder = open_in_new_session(&uri).await;
+    let staged_segment = match case {
+        PackedChildIndexCase::StagedSegment => Some(
+            builder
+                .create_index_builder(&["s.x"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("x_idx".into())
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        ),
+        _ => None,
+    };
+    let hook: Hook = match case {
+        PackedChildIndexCase::UnrelatedColumn => {
+            let hook_uri = uri.clone();
+            Box::pin(async move {
+                replace_spare(&hook_uri).await;
+            })
+        }
+        _ => {
+            let (_, children) = packed_parent_field();
+            let hook_uri = uri.clone();
+            Box::pin(async move {
+                replace_packed_parent(&hook_uri, children).await;
+            })
+        }
+    };
+    let (mut publisher, race) = builder_racing(&uri, hook).await;
+    let result = match staged_segment {
+        Some(segment) => {
+            publisher
+                .commit_existing_index_segments("x_idx", "s.x", vec![segment])
+                .await
+        }
+        None => publisher
+            .create_index(
+                &["s.x"],
+                IndexType::BTree,
+                Some("x_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .map(|_| ()),
+    };
+    match (case, result) {
+        (PackedChildIndexCase::UnrelatedColumn, Ok(())) => {
+            let dataset = open_in_new_session(&uri).await;
+            assert!(dataset.load_index_by_name("x_idx").await.unwrap().is_some());
+            let indexed_3 = count_filter_rows(&dataset, "s.x = 3", true).await;
+            let scanned_3 = count_filter_rows(&dataset, "s.x = 3", false).await;
+            assert_eq!(indexed_3, scanned_3);
+        }
+        (PackedChildIndexCase::UnrelatedColumn, Err(error)) => {
+            panic!("unrelated column replacement conflicted: {error:?}")
+        }
+        (_, Err(error)) => {
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "expected RetryableCommitConflict, got: {error:?}"
+            );
+            assert!(error.to_string().contains("DataReplacement"), "{error}");
+            let dataset = open_in_new_session(&uri).await;
+            assert!(dataset.load_index_by_name("x_idx").await.unwrap().is_none());
+        }
+        (case, Ok(())) => {
+            let dataset = open_in_new_session(&uri).await;
+            let indexed_3 = count_filter_rows(&dataset, "s.x = 3", true).await;
+            let scanned_3 = count_filter_rows(&dataset, "s.x = 3", false).await;
+            panic!(
+                "{case:?} committed over DataReplacement: indexed/scan s.x = 3 = \
+                 {indexed_3}/{scanned_3}"
+            )
+        }
+    }
+    assert!(race.attempts.load(Ordering::SeqCst) > 0);
 }

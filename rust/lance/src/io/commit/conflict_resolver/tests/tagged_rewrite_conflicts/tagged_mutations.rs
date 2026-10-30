@@ -1473,6 +1473,7 @@ mod mem_wal_state {
             dataset,
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, generation)],
             },
         )

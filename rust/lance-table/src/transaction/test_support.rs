@@ -31,6 +31,7 @@ pub fn default_build_config() -> ManifestBuildConfig {
         disable_transaction_file: false,
         migration_next_row_id: None,
         activate_non_reusable_field_ids: false,
+        clustering_definitions: None,
         spilled_row_lineage: Default::default(),
     }
 }
@@ -58,6 +59,8 @@ pub fn sample_index_metadata(name: &str) -> IndexMetadata {
         created_at: Some(Utc::now()),
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     }
 }
 
@@ -93,6 +96,7 @@ pub fn update_txn(new_fragments: Vec<Fragment>) -> Transaction {
             updated_fragments: vec![],
             new_fragments,
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: vec![],
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,

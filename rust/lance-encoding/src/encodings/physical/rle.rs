@@ -691,9 +691,9 @@ impl RleEncoder {
 
         let values_start = all_values.len();
         let all_remaining_values_fit = values_remaining <= max_by_count;
-        let encoded_size = self.encoded_size(&typed_data[..max_values]);
+        // Size the whole remainder only when it could become the last chunk
         let (values_to_encode, is_last_chunk) = if all_remaining_values_fit
-            && encoded_size <= MAX_MINIBLOCK_BYTES as usize
+            && self.encoded_size(&typed_data[..max_values]) <= MAX_MINIBLOCK_BYTES as usize
         {
             (max_values, true)
         } else if let Some(values_to_encode) = self.largest_power_of_two_prefix::<T>(typed_data) {
