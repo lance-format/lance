@@ -144,6 +144,10 @@ pub(super) enum Scenario {
     /// deletions as `SetDeletionFile`, their new fragment as `AddFragment` +
     /// `AddDataFile`, and the inserted keys as `AssertUniqueKeys`.
     ActionUpdate,
+    /// [`Scenario::Rewrite`]'s compaction as a `RemoveFragment` of the old
+    /// fragment and an `AddFragment` + `AddDataFile` of the new one, none of
+    /// them a data change.
+    ActionRewrite,
 }
 
 /// What a staged `theirs` touches, relative to what every `ours` in the matrix
@@ -203,7 +207,7 @@ impl Placement {
 }
 
 impl Scenario {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Append,
         Self::Delete,
         Self::DeleteWholeFragment,
@@ -231,6 +235,7 @@ impl Scenario {
         Self::ActionDelete,
         Self::ActionDeleteWholeFragment,
         Self::ActionUpdate,
+        Self::ActionRewrite,
     ];
 
     /// Two-letter column heading for the matrix grid in `cases`.
@@ -263,6 +268,7 @@ impl Scenario {
             Self::ActionDelete => "vd",
             Self::ActionDeleteWholeFragment => "vf",
             Self::ActionUpdate => "vu",
+            Self::ActionRewrite => "vw",
         }
     }
 
@@ -295,6 +301,7 @@ impl Scenario {
             Self::ActionDelete => "action_delete",
             Self::ActionDeleteWholeFragment => "action_delete_whole_fragment",
             Self::ActionUpdate => "action_update",
+            Self::ActionRewrite => "action_rewrite",
         }
     }
 
@@ -317,6 +324,7 @@ impl Scenario {
             Self::ActionDelete => vec![Self::Delete],
             Self::ActionDeleteWholeFragment => vec![Self::DeleteWholeFragment],
             Self::ActionUpdate => vec![Self::UpdateRewriteRows],
+            Self::ActionRewrite => vec![Self::Rewrite],
             legacy => vec![legacy],
         }
     }
@@ -351,6 +359,7 @@ impl Scenario {
                 | Self::ActionDelete
                 | Self::ActionDeleteWholeFragment
                 | Self::ActionUpdate
+                | Self::ActionRewrite
         )
     }
 
@@ -422,6 +431,7 @@ impl Scenario {
             Self::ActionUpdate => {
                 as_action_set(dataset, stage_update_rewrite_rows(dataset, fragment).await?)
             }
+            Self::ActionRewrite => as_action_set(dataset, stage_rewrite(dataset, fragment).await?),
         }
     }
 }
@@ -765,20 +775,28 @@ async fn stage_action_create_index(dataset: &Arc<Dataset>, with_append: bool) ->
     Ok(stage_action_set(dataset, actions))
 }
 
-/// A staged legacy `Delete` or row-moving `Update`, re-expressed as actions
-/// that write the same files and carry the same affected rows.
+/// A staged legacy `Delete`, row-moving `Update` or `Rewrite`, re-expressed
+/// as actions that write the same files and carry the same affected rows.
 ///
 /// Rows removed from a fragment in place become a `SetDeletionFile`, a
-/// fragment emptied a `RemoveFragment`, and an update's new fragments an
-/// `AddFragment` + `AddDataFile`, keeping the moved rows' ids and versions.
-/// The inserted-key filter becomes an `AssertUniqueKeys`.
+/// fragment emptied a `RemoveFragment`, and an update's or a rewrite's new
+/// fragments an `AddFragment` + `AddDataFile`, keeping the moved rows' ids and
+/// versions. The inserted-key filter becomes an `AssertUniqueKeys`. None of a
+/// rewrite's actions is a data change: it moves rows rather than deleting
+/// them and writing them anew.
 pub(super) fn as_action_set(dataset: &Dataset, staged: Staged) -> Result<Staged> {
-    let (updated, removed, added, filter) = match staged.transaction.operation {
+    let (updated, removed, added, filter, data_change) = match staged.transaction.operation {
         Operation::Delete {
             updated_fragments,
             deleted_fragment_ids,
             ..
-        } => (updated_fragments, deleted_fragment_ids, Vec::new(), None),
+        } => (
+            updated_fragments,
+            deleted_fragment_ids,
+            Vec::new(),
+            None,
+            true,
+        ),
         Operation::Update {
             updated_fragments,
             removed_fragment_ids,
@@ -790,10 +808,27 @@ pub(super) fn as_action_set(dataset: &Dataset, staged: Staged) -> Result<Staged>
             removed_fragment_ids,
             new_fragments,
             inserted_rows_filter,
+            true,
         ),
+        Operation::Rewrite { groups, .. } => {
+            let (old, new): (Vec<_>, Vec<_>) = groups
+                .into_iter()
+                .map(|group| (group.old_fragments, group.new_fragments))
+                .unzip();
+            (
+                Vec::new(),
+                old.into_iter()
+                    .flatten()
+                    .map(|fragment| fragment.id)
+                    .collect(),
+                new.into_iter().flatten().collect(),
+                None,
+                false,
+            )
+        }
         other => {
             return Err(crate::Error::invalid_input(format!(
-                "only a Delete or an Update re-expresses as a delete-and-append, not {other}"
+                "only a Delete, an Update or a Rewrite re-expresses as actions, not {other}"
             )));
         }
     };
@@ -809,7 +844,7 @@ pub(super) fn as_action_set(dataset: &Dataset, staged: Staged) -> Result<Staged>
     for fragment in removed {
         actions.push(Action::RemoveFragment(RemoveFragment {
             fragment: Ref::Committed(fragment),
-            data_change: true,
+            data_change,
         }));
     }
     for (token, fragment) in (0u32..).zip(added) {
@@ -822,7 +857,7 @@ pub(super) fn as_action_set(dataset: &Dataset, staged: Staged) -> Result<Staged>
             row_id_meta: fragment.row_id_meta,
             last_updated_at_version_meta: fragment.last_updated_at_version_meta,
             created_at_version_meta: fragment.created_at_version_meta,
-            data_change: true,
+            data_change,
         }));
         for mut file in fragment.files {
             let field_ids = file
@@ -836,7 +871,7 @@ pub(super) fn as_action_set(dataset: &Dataset, staged: Staged) -> Result<Staged>
                 fragment: Ref::Local(token),
                 file,
                 field_ids,
-                data_change: true,
+                data_change,
                 base: None,
             }));
         }
