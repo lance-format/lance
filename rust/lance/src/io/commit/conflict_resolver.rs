@@ -798,8 +798,7 @@ impl<'a> TransactionRebase<'a> {
                 // Rebased as each committed set is checked, so the next one is
                 // compared against what this set has become.
                 Operation::CompositeOperation(composite_operation) => {
-                    *composite_operation = std::mem::take(composite_operation).rebase(overlaps)?;
-                    Ok(())
+                    composite_operation.rebase(&overlaps)
                 }
                 _ => Err(self.retryable_conflict_err(other_transaction, other_version)),
             },

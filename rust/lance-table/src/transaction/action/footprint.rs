@@ -392,6 +392,12 @@ pub struct Footprint {
     /// set that needs the field to hold no new values cannot commit after
     /// either.
     values_written: HashSet<i32>,
+    /// Committed fields this set writes values for in fragments it mints.
+    /// Unlike the same values written into a committed fragment, these do not
+    /// require the field to still exist: a drop that landed first is an
+    /// [`Overlap::FieldDropped`], as a drop landing second leaves the values
+    /// unread.
+    fields_in_new_fragments: HashSet<i32>,
     /// Whether this set adds a fragment.
     rows_added: bool,
     /// Committed fields this set adds a child under. A fact for
@@ -572,10 +578,15 @@ pub enum Verdict {
 /// One way two sets overlap that the pending set can be rewritten around.
 ///
 /// Named after what overlaps, not after the pair of operations that produced
-/// it, so that each overlap is handled once however many pairs reach it. There
-/// are none yet: every overlap is a [`Verdict::Conflict`].
-#[derive(Debug)]
-pub enum Overlap {}
+/// it, so that each overlap is handled once however many pairs reach it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overlap {
+    /// The pending set writes values for `field` into fragments it mints, and
+    /// the committed set dropped the field. The new files leave the field out,
+    /// so its column is there but unread, as it is in every fragment the drop
+    /// found, and as a legacy `Append` landing over a `Project` leaves it.
+    FieldDropped { field: i32 },
+}
 
 impl Footprint {
     /// The footprint of `transaction`, which has not committed yet and read
@@ -604,10 +615,36 @@ impl Footprint {
     /// landed after this one read.
     pub fn compare(&self, committed: &Self) -> Verdict {
         if self.conflicts_with(committed) {
-            Verdict::Conflict
-        } else {
-            Verdict::Compatible
+            return Verdict::Conflict;
         }
+        let overlaps = self.dropped_field_overlaps(committed);
+        if overlaps.is_empty() {
+            Verdict::Compatible
+        } else {
+            Verdict::Rebase(overlaps)
+        }
+    }
+
+    /// The fields `committed` dropped that this set writes into fragments it
+    /// mints. Anything else naming a dropped field requires its existence, and
+    /// has already collided.
+    fn dropped_field_overlaps(&self, committed: &Self) -> Vec<Overlap> {
+        let mut dropped: Vec<i32> = self
+            .fields_in_new_fragments
+            .iter()
+            .copied()
+            .filter(|field| {
+                committed.claims.get(&Coordinate::FieldDefinition {
+                    field: *field,
+                    facet: FieldFacet::Existence,
+                }) == Some(&Mode::Writes)
+            })
+            .collect();
+        dropped.sort_unstable();
+        dropped
+            .into_iter()
+            .map(|field| Overlap::FieldDropped { field })
+            .collect()
     }
 
     /// Whether this set can still commit on top of `committed`, a set that
@@ -1021,6 +1058,13 @@ impl Footprint {
     /// Record that this set depends on `facet` of `field`'s definition still
     /// being what it read, without changing it: a child added under the field
     /// needs it to exist, an index over it needs its type.
+    /// Record that this set writes values for `fields` into a fragment it
+    /// mints. See [`Self::fields_in_new_fragments`].
+    pub(super) fn write_into_new_fragment(&mut self, fields: impl IntoIterator<Item = FieldRef>) {
+        self.fields_in_new_fragments
+            .extend(fields.into_iter().filter_map(committed_field));
+    }
+
     pub(super) fn require_field_facet(&mut self, field: FieldRef, facet: FieldFacet) {
         if let Some(field) = committed_field(field) {
             self.require_facet(field, facet);
@@ -1773,10 +1817,15 @@ mod tests {
         append(1),
         false,
     )]
-    // Apply rejects a file naming a field the schema no longer has, even in a
-    // fragment the append mints.
+    // Values for a dropped field in a fragment the append mints are rebased
+    // out rather than colliding; see `test_new_fragment_data_rebases_past_a_drop`.
     #[case::an_append_landing_after_a_drop(
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        vec![drop_field(1)],
+        false,
+    )]
+    #[case::a_column_write_landing_after_a_drop(
+        vec![add_data_file(Ref::Committed(7), &[1])],
         vec![drop_field(1)],
         true,
     )]
@@ -1821,7 +1870,7 @@ mod tests {
     // the child's own drop rather than slipping past the parent's. Landing
     // second, the drop tombstones the child's new data on apply.
     #[case::a_write_to_a_child_landing_after_its_struct_was_dropped(
-        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
+        vec![add_data_file(Ref::Committed(7), &[2])],
         vec![drop_field(2), drop_field(1)],
         true,
     )]
@@ -1885,5 +1934,37 @@ mod tests {
             footprint(ours).conflicts_with(&footprint(committed)),
             expected
         );
+    }
+
+    #[rstest]
+    #[case::one_field(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1, 2])],
+        vec![drop_field(1)],
+        vec![1],
+    )]
+    #[case::a_struct_and_its_child(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1, 2, 3])],
+        vec![drop_field(2), drop_field(1)],
+        vec![1, 2],
+    )]
+    #[case::a_field_the_set_does_not_write(
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
+        vec![drop_field(2)],
+        vec![],
+    )]
+    fn test_new_fragment_data_rebases_past_a_drop(
+        #[case] ours: Vec<Action>,
+        #[case] committed: Vec<Action>,
+        #[case] dropped: Vec<i32>,
+    ) {
+        let expected: Vec<Overlap> = dropped
+            .into_iter()
+            .map(|field| Overlap::FieldDropped { field })
+            .collect();
+        match footprint(ours).compare(&footprint(committed)) {
+            Verdict::Compatible => assert!(expected.is_empty()),
+            Verdict::Rebase(overlaps) => assert_eq!(overlaps, expected),
+            Verdict::Conflict => panic!("expected {expected:?}, got a conflict"),
+        }
     }
 }

@@ -1018,9 +1018,9 @@ mod tests {
     /// everything it restated.
     #[rstest]
     // Legacy lands an append over a projection, leaving the dropped column in
-    // the new fragment's file unread, but an action append naming the dropped
-    // field is rejected at apply, so it has to conflict.
-    #[case::an_append_over_a_project(append_a_and_c(), project_without_c(&two_column_manifest()), true)]
+    // the new fragment's file unread. An action append is rebased to the same
+    // file, binding only the fields that are left.
+    #[case::an_append_over_a_project(append_a_and_c(), project_without_c(&two_column_manifest()), false)]
     #[case::a_rename_over_an_update_restating_the_fragment(
         vec![rename_c()],
         update(vec![{
