@@ -968,15 +968,20 @@ pub(super) async fn alter_columns(
         let affected: Vec<&lance_table::format::IndexMetadata> = indices
             .iter()
             .filter(|idx| {
+                let dependency_fields = idx.dependency_fields();
                 cast_fields
                     .iter()
-                    .any(|(old, _)| idx.fields.contains(&old.id))
+                    .any(|(old, _)| dependency_fields.contains(&old.id))
             })
             .collect();
         if !affected.is_empty() {
             let affected_cols: Vec<String> = cast_fields
                 .iter()
-                .filter(|(old, _)| affected.iter().any(|i| i.fields.contains(&old.id)))
+                .filter(|(old, _)| {
+                    affected
+                        .iter()
+                        .any(|i| i.dependency_fields().contains(&old.id))
+                })
                 .map(|(old, _)| old.name.clone())
                 .collect();
             let affected_idx_names: Vec<String> = affected.iter().map(|i| i.name.clone()).collect();
@@ -1320,6 +1325,9 @@ mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
 
     use crate::index::DatasetIndexExt;
+    use crate::session::index_caches::IndexMetadataKey;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::Int32Type;
 
     /// What the `add_columns` guard refuses, and what it lets through.
     ///
@@ -5850,6 +5858,67 @@ mod test {
         );
 
         Ok(())
+    }
+
+    /// The index goes into the session's index cache because decode and
+    /// commit reject a `fields` that omits a carried column.
+    #[rstest]
+    #[case::suffix(&["key", "carried"])]
+    #[case::keys_only(&["key"])]
+    #[tokio::test]
+    async fn test_alter_columns_cast_fails_with_covering_index(#[case] fields: &[&str]) {
+        for (column, refused) in [("key", true), ("carried", true), ("other", false)] {
+            let dataset = lance_datagen::gen_batch()
+                .col("key", lance_datagen::array::step::<Int32Type>())
+                .col("carried", lance_datagen::array::step::<Int32Type>())
+                .col("other", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+                .await
+                .unwrap();
+            let field_id = |name: &str| dataset.schema().field_id(name).unwrap();
+            let covered = lance_table::format::IndexMetadata {
+                uuid: uuid::Uuid::new_v4(),
+                name: "covered".to_string(),
+                fields: fields.iter().map(|name| field_id(name)).collect(),
+                covering_fields: vec![field_id("carried")],
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: Default::default(),
+            };
+            let metadata_key = IndexMetadataKey {
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            };
+            dataset
+                .index_cache
+                .insert_with_key(&metadata_key, Arc::new(vec![covered]))
+                .await;
+
+            let mut dataset = dataset;
+            let error = dataset
+                .alter_columns(&[ColumnAlteration::new(column.into()).cast_to(DataType::Int64)])
+                .await
+                .err()
+                .map(|err| err.to_string());
+            if refused {
+                let names_both = error.as_ref().is_some_and(|msg| {
+                    msg.contains(&format!("[{column}]")) && msg.contains("[covered]")
+                });
+                assert!(
+                    names_both,
+                    "fields {fields:?}: casting {column} should name it and the index, got {error:?}"
+                );
+            } else {
+                assert_eq!(error, None, "fields {fields:?}: casting {column}");
+            }
+        }
     }
 
     #[test]

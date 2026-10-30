@@ -684,14 +684,18 @@ async fn build_provenance(
 /// must each match the version their entries describe
 /// ([`indexed_data_differs`]). A changed input, or a manifest the comparison
 /// needs that was cleaned up, leaves out every fragment its group produced.
-async fn fresh_fragments(
+pub(crate) async fn fresh_fragments(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
 ) -> Result<RoaringBitmap> {
     let mut indexed = HashSet::new();
     for segment in segments {
-        indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
+        indexed.extend(indexed_field_ids(
+            dataset,
+            &segment.fields,
+            &segment.covering_fields,
+        )?);
     }
     let mut history = History::new(dataset).await?;
     // Each followed fragment's version, or `None` once it cannot be shown fresh.
@@ -788,9 +792,9 @@ async fn fresh_fragments(
 /// segment's carried columns can go stale independently of its keyed column, so
 /// checking only the keyed subtree would leave a fragment covered after a carried
 /// column was rewritten, and the segment would answer with the obsolete value.
-fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
+fn indexed_field_ids(dataset: &Dataset, fields: &[i32], carried: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
-    for field_id in fields {
+    for field_id in fields.iter().chain(carried) {
         let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
@@ -805,7 +809,7 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
 /// since it was built. `historically_missing_exempt` names fragments compaction
 /// created after the segments were built, whose absence from a segment's
 /// history is expected rather than stale.
-async fn prune_stale_segment_coverage(
+pub(crate) async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
     prune_historically_missing: bool,
@@ -866,7 +870,8 @@ async fn prune_stale_segment_coverage(
             .iter_mut()
             .filter(|segment| segment.dataset_version() == version)
         {
-            let indexed_field_ids = indexed_field_ids(dataset, segment.fields())?;
+            let indexed_field_ids =
+                indexed_field_ids(dataset, segment.fields(), segment.covering_fields())?;
             let stale_fragments = segment
                 .fragment_bitmap()
                 .iter()
@@ -3955,9 +3960,8 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
-        let fri_key = FragReuseIndexKey {
-            uuid: &frag_reuse_index_meta.uuid,
-        };
+        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
+        let fri_key = FragReuseIndexKey { uuid: &identity };
         let frag_reuse_index = dataset
             .index_cache
             .get_or_insert_with_key(fri_key, || async move {
@@ -4105,7 +4109,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
-/// The FRI UUID that belongs in the vector cache keys before any remapping
+/// The FRI identity that belongs in the vector cache keys before any remapping
 /// is resolved: only a v0 history, whose remapper is applied while the index
 /// is decoded, identifies cached content (see [`frag_reuse::fri_cache_id`]).
 async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
@@ -4114,7 +4118,22 @@ async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
         .ok()?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 0)
-        .map(|idx| idx.uuid)
+        .map(|idx| frag_reuse::v0_cache_identity(dataset, idx))
+}
+
+/// The FRI part of a cache key for content read alongside the dataset's
+/// history: [`frag_reuse::v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history, which every change to that history replaces.
+pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
+    load_all_indices(dataset)
+        .await
+        .ok()?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .map(|idx| match idx.index_version {
+            0 => frag_reuse::v0_cache_identity(dataset, idx),
+            _ => idx.uuid,
+        })
 }
 
 impl Dataset {
@@ -4824,9 +4843,8 @@ impl DatasetIndexInternalExt for Dataset {
                 };
             }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
-            let frag_reuse_key = FragReuseIndexKey {
-                uuid: &frag_reuse_uuid,
-            };
+            let identity = frag_reuse::v0_cache_identity(self, &frag_reuse_index_meta);
+            let frag_reuse_key = FragReuseIndexKey { uuid: &identity };
 
             let index = self
                 .index_cache
@@ -4858,7 +4876,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let frag_reuse_uuid = frag_reuse_cache_scope(self).await;
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
@@ -9943,24 +9961,21 @@ mod tests {
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
         if column_name == "text" {
-            // Inverted indexes will still appear to be used in FTS queries.
-            // TODO: once metrics are working on FTS queries, we can check the
-            // analyze plan output instead for index usage.
-            let _plan_after_delete = dataset
-                .scan()
-                .project(&[column_name])
+            // The retained index has no live fragments, so an empty snapshot
+            // needs no index scan to return an empty FTS result.
+            let mut scan = dataset.scan();
+            scan.project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
-                .unwrap()
-                .explain_plan(false)
-                .await
                 .unwrap();
+            let plan_after_delete = scan.explain_plan(false).await.unwrap();
             assert_index_usage(
-                &_plan_after_delete,
+                &plan_after_delete,
                 column_name,
-                true,
+                false,
                 "after delete (empty bitmap)",
             );
+            assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
         } else {
             // Use equality filter for btree/bitmap indices
             let _plan_after_delete = dataset

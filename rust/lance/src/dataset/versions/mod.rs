@@ -232,6 +232,13 @@ pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -
             "max_rows_per_file must be greater than zero",
         ));
     }
+    if params.max_rows_per_file > u32::MAX as usize {
+        return Err(Error::invalid_input(format!(
+            "max_rows_per_file cannot exceed the fragment row capacity of {} rows, got {}",
+            u32::MAX,
+            params.max_rows_per_file
+        )));
+    }
     if matches!(version, ConcreteFileVersion::V1) && params.max_rows_per_group == 0 {
         return Err(Error::invalid_input(
             "max_rows_per_group must be greater than zero",
@@ -257,10 +264,19 @@ pub async fn write_fragments_direct(
 ) -> Result<Vec<Fragment>> {
     validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
-        if file_row_counts.contains(&0) {
-            return Err(Error::invalid_input(
-                "File row counts must be greater than zero",
-            ));
+        if let Some(rows) = file_row_counts.iter().find(|rows| **rows == 0) {
+            return Err(Error::invalid_input(format!(
+                "File row counts must be greater than zero, got {rows}"
+            )));
+        }
+        if let Some(rows) = file_row_counts
+            .iter()
+            .find(|rows| **rows > u32::MAX as usize)
+        {
+            return Err(Error::invalid_input(format!(
+                "File row counts cannot exceed the fragment row capacity of {} rows, got {rows}",
+                u32::MAX
+            )));
         }
         match version {
             ConcreteFileVersion::V1 => {
@@ -1188,5 +1204,22 @@ mod tests {
         assert_eq!(user.fields, vec![key, named_like_lineage]);
         // Split out with its reserved id intact.
         assert_eq!(lineage, vec![hidden]);
+    }
+
+    #[test]
+    fn rejects_file_limit_above_fragment_row_capacity() {
+        let params = WriteParams {
+            max_rows_per_file: u32::MAX as usize + 1,
+            ..Default::default()
+        };
+
+        let error = validate_row_limits(ConcreteFileVersion::V2_0, &params).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot exceed the fragment row capacity"),
+            "{error}"
+        );
     }
 }
