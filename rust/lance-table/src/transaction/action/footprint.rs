@@ -431,8 +431,8 @@ pub struct Footprint {
     /// indices over them along, through a remap it computed at its read
     /// version. An index segment over one of them committed since would be
     /// left describing rows that are no longer there. Checked one way: an index
-    /// built after the move landed requires the moved data, and so collides
-    /// through its own claims.
+    /// built before the move landed overlaps it (see
+    /// [`Overlap::CompactedUnderIndex`]).
     remaps_indices_over: HashSet<u64>,
     /// Whether this set brings rows into the dataset that were not there
     /// before. Coordinates cannot answer what the key assertions ask: two
@@ -456,6 +456,28 @@ pub struct Footprint {
     /// coordinate, but the thing two writers can collide over is the index the
     /// segment joins, which is not a set of ids -- see [`IndexClaim`].
     index_claims: Vec<IndexClaim>,
+    /// What each segment this set adds was built from. A segment describes
+    /// the values it read, and nothing in the format lets a reader notice that
+    /// they were replaced underneath it, so a committed set that moved or
+    /// rewrote them is an [`Overlap`] rather than a coordinate collision: the
+    /// segment can still land once its coverage is rewritten past the change.
+    index_builds: Vec<IndexBuild>,
+    /// Committed fragments this set removes after moving their rows into
+    /// fragments of its own, as a compaction does, rather than deleting them.
+    rows_moved_from: HashSet<u64>,
+}
+
+/// The data one index segment was built from.
+#[derive(Debug, Clone, PartialEq)]
+struct IndexBuild {
+    segment: Uuid,
+    /// Keyed and carried fields alike: a carried column rewritten while the
+    /// keyed one is untouched leaves the segment answering from an obsolete
+    /// value.
+    fields: Vec<i32>,
+    /// The committed fragments the segment covers. One this operation mints
+    /// cannot have been changed by a concurrent writer.
+    fragments: Vec<u64>,
 }
 
 /// A claim about which keys an action set inserts, and over which columns.
@@ -586,6 +608,19 @@ pub enum Overlap {
     /// so its column is there but unread, as it is in every fragment the drop
     /// found, and as a legacy `Append` landing over a `Project` leaves it.
     FieldDropped { field: i32 },
+    /// An index segment the pending set adds covers `fragment`, whose rows the
+    /// committed set moved into fragments of its own.
+    ///
+    /// The segment's entries still describe the rows, under the addresses they
+    /// had. It can keep its coverage only where a fragment reuse index
+    /// recorded the move, which translates that coverage and those addresses
+    /// for a reader; nothing in a footprint says whether one did, so the
+    /// caller settles that before rebasing.
+    CompactedUnderIndex { segment: Uuid, fragment: u64 },
+    /// An index segment the pending set adds covers `fragment`, where the
+    /// committed set rewrote the values of a field the segment was built from.
+    /// The segment gives up the fragment, whose rows a reader then scans.
+    UpdatedUnderIndex { segment: Uuid, fragment: u64 },
 }
 
 impl Footprint {
@@ -617,7 +652,8 @@ impl Footprint {
         if self.conflicts_with(committed) {
             return Verdict::Conflict;
         }
-        let overlaps = self.dropped_field_overlaps(committed);
+        let mut overlaps = self.index_overlaps(committed);
+        overlaps.extend(self.dropped_field_overlaps(committed));
         if overlaps.is_empty() {
             Verdict::Compatible
         } else {
@@ -645,6 +681,44 @@ impl Footprint {
             .into_iter()
             .map(|field| Overlap::FieldDropped { field })
             .collect()
+    }
+
+    /// Where `committed` changed the data a segment this set adds was built
+    /// from.
+    ///
+    /// A covered fragment `committed` removed without moving its rows needs no
+    /// rewrite: its rows are gone, and the segment's entries for them are
+    /// never returned, as legacy lets a `CreateIndex` land over a `Delete`.
+    /// Nor does an overlay: the segment is stamped with the version it read,
+    /// the overlay with the later one it committed at, and the read path masks
+    /// overlaid cells out of any segment older than the overlay.
+    fn index_overlaps(&self, committed: &Self) -> Vec<Overlap> {
+        let mut overlaps = Vec::new();
+        for build in &self.index_builds {
+            for fragment in build.fragments.iter().copied() {
+                let segment = build.segment;
+                let removed = committed
+                    .claims
+                    .get(&Coordinate::FragmentExistence(fragment))
+                    == Some(&Mode::Writes);
+                if removed {
+                    if committed.rows_moved_from.contains(&fragment) {
+                        overlaps.push(Overlap::CompactedUnderIndex { segment, fragment });
+                    }
+                    continue;
+                }
+                let rewritten = build.fields.iter().any(|field| {
+                    committed.claims.get(&Coordinate::FieldData {
+                        fragment,
+                        field: *field,
+                    }) == Some(&Mode::Writes)
+                });
+                if rewritten {
+                    overlaps.push(Overlap::UpdatedUnderIndex { segment, fragment });
+                }
+            }
+        }
+        overlaps
     }
 
     /// Whether this set can still commit on top of `committed`, a set that
@@ -1046,6 +1120,33 @@ impl Footprint {
                 Mode::RequiresUnlessRemoved,
             );
         }
+    }
+
+    /// Record that `segment` was built from `fields` in `fragments`. See
+    /// [`Overlap`] for what a concurrent change to them does.
+    ///
+    /// A fragment or field this operation mints records nothing: no concurrent
+    /// writer can have replaced data that did not exist when they planned.
+    pub(super) fn build_index_from(
+        &mut self,
+        segment: Uuid,
+        fields: impl IntoIterator<Item = FieldRef>,
+        fragments: impl IntoIterator<Item = Ref>,
+    ) {
+        let mut fragments: Vec<u64> = committed_fragments(fragments).into_iter().collect();
+        fragments.sort_unstable();
+        self.index_builds.push(IndexBuild {
+            segment,
+            fields: fields.into_iter().filter_map(committed_field).collect(),
+            fragments,
+        });
+    }
+
+    /// Record that this set removes `fragment` after moving its rows into a
+    /// fragment of its own.
+    pub(super) fn move_rows_out_of(&mut self, fragment: u64) {
+        self.remove_fragment(fragment);
+        self.rows_moved_from.insert(fragment);
     }
 
     /// Record that this set changes `facet` of `field`'s definition.

@@ -4182,16 +4182,21 @@ mod composite {
             .await
             .expect("the segment lands over the recorded compaction");
 
-        assert_eq!(index_coverage(&committed, "val_idx").await, vec![0, 1]);
+        // Read through the fragment reuse index, the coverage of the
+        // fragments the segment was built over is the fragment they became.
+        let compacted = committed.fragments()[0].id as u32;
+        assert_eq!(index_coverage(&committed, "val_idx").await, vec![compacted]);
         assert_eq!(indexed_a(&committed, "val = 30").await, vec![3]);
         assert_eq!(indexed_a(&committed, "val >= 70").await, vec![7, 8, 9]);
     }
 
     /// Without a fragment reuse index nothing translates the segment's
-    /// coverage onto the compacted fragment, so the build has to be redone, as
-    /// legacy `CreateIndex` has to over an eager compaction.
+    /// coverage onto the compacted fragment. Removal isn't staleness, so the
+    /// build still lands, where legacy `CreateIndex` has to be redone over an
+    /// eager compaction: the segment loses that coverage and the rows are
+    /// scanned.
     #[tokio::test]
-    async fn test_an_index_segment_conflicts_with_an_unrecorded_compaction() {
+    async fn test_an_index_segment_loses_coverage_over_an_unrecorded_compaction() {
         let mut dataset = two_fragment_dataset().await;
         let staged = dataset
             .create_index_builder(&["val"], IndexType::BTree, &ScalarIndexParams::default())
@@ -4212,13 +4217,12 @@ mod composite {
         .await
         .unwrap();
 
-        let error = commit_from_stale(stale, vec![add_built_segment(staged)])
+        let committed = commit_from_stale(stale, vec![add_built_segment(staged)])
             .await
-            .expect_err("nothing records where the covered rows went");
-        assert!(
-            matches!(error, Error::RetryableCommitConflict { .. }),
-            "{error:?}"
-        );
+            .expect("removal isn't staleness");
+
+        assert_eq!(indexed_a(&committed, "val = 30").await, vec![3]);
+        assert_eq!(indexed_a(&committed, "val >= 70").await, vec![7, 8, 9]);
     }
 
     #[tokio::test]

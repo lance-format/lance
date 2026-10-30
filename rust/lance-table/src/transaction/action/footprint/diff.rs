@@ -62,6 +62,7 @@ impl Footprint {
             .collect();
         for fragment in before.fragments.iter() {
             match after_by_id.get(&fragment.id) {
+                None if moves_rows => self.move_rows_out_of(fragment.id),
                 None => self.remove_fragment(fragment.id),
                 Some(changed) => self.changes_within(&before.schema, fragment, changed),
             }
