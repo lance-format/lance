@@ -295,8 +295,34 @@ mod tests {
 
         assert_eq!(
             canonical,
-            std::fs::canonicalize(dataset).unwrap(),
+            std::fs::canonicalize(&dataset).unwrap(),
             "canonicalization must use the store's filesystem root"
+        );
+        assert!(!store.has_direct_local_paths());
+        #[cfg(unix)]
+        {
+            symlink(&dataset, root.join("alias")).unwrap();
+            assert_eq!(
+                store
+                    .canonicalize_local_path(&Path::from("alias"))
+                    .await
+                    .unwrap(),
+                Some(canonical)
+            );
+        }
+        assert!(
+            store
+                .canonicalize_local_path(&Path::from("missing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ObjectStore::memory()
+                .canonicalize_local_path(&Path::from("dataset"))
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

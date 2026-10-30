@@ -1463,17 +1463,47 @@ async fn test_delete_branch_with_shared_directory(
     );
 }
 
+#[rstest]
+#[case::direct(false, false)]
+#[case::object_store(true, false)]
+#[case::rooted(false, true)]
 #[tokio::test]
-async fn test_delete_branch_preserves_case_aliased_shared_directories() {
+async fn test_delete_branch_preserves_case_aliased_shared_directories(
+    #[case] use_object_store: bool,
+    #[case] is_rooted_store: bool,
+) {
     let tempdir = TempDir::default();
-    let uri = tempdir.path_str();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
     let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
     let mut deleted = root.create_branch("a", 1, None).await.unwrap();
     deleted.append(id_rows(10, 1), None).await.unwrap();
+    // Exercise physical aliases on case-sensitive hosts as well as Windows.
+    #[cfg(unix)]
+    if !tempdir.std_path().join("tree/A").exists() {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("tree/a"),
+            tempdir.std_path().join("tree/A"),
+        )
+        .unwrap();
+    }
     let mut lower_child = root.create_branch("a/b", 1, None).await.unwrap();
     lower_child.append(id_rows(20, 1), None).await.unwrap();
     let mut case_child = root.create_branch("A/c", 1, None).await.unwrap();
     case_child.append(id_rows(30, 1), None).await.unwrap();
+    if is_rooted_store {
+        // A provider without native path resolution must preserve ambiguous subtrees.
+        let mut store = root.object_store.as_ref().clone();
+        store.store_prefix = "file$rooted-test".to_owned();
+        assert!(!store.has_direct_local_paths());
+        let store = Arc::new(store);
+        root.object_store = store.clone();
+        root.refs.object_store = store;
+    }
 
     root.delete_branch("a").await.unwrap();
 
@@ -1509,6 +1539,55 @@ async fn test_delete_branch_preserves_case_aliased_shared_directories() {
             &expected_after
         );
     }
+}
+
+#[rstest]
+#[case::same_name(false, false)]
+#[case::alias(true, false)]
+#[case::alias_object_store(true, true)]
+#[tokio::test]
+async fn test_delete_branch_preserves_aliased_parent_data(
+    #[case] has_alias: bool,
+    #[case] use_object_store: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let parent_branch = if has_alias { "A" } else { "a" };
+    let mut parent = root.create_branch(parent_branch, 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+    #[cfg(unix)]
+    if has_alias && !tempdir.std_path().join("tree/a").exists() {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("tree/A"),
+            tempdir.std_path().join("tree/a"),
+        )
+        .unwrap();
+    }
+    create_branch_before_name_check(&parent, "a/data").await;
+    create_branch_before_name_check(&root, "a/data/x").await;
+
+    root.delete_branch("a/data").await.unwrap();
+
+    let mut parent = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch(parent_branch)
+        .await
+        .unwrap();
+    let batch = parent.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+    parent.append(id_rows(20, 1), None).await.unwrap();
+    assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+    assert!(root.list_branches().await.unwrap().contains_key("a/data/x"));
 }
 
 #[tokio::test]
