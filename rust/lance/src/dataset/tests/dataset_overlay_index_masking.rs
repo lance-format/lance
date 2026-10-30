@@ -432,6 +432,29 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_overlay_visibility_is_snapshot_scoped(#[values(false, true)] stable_row_ids: bool) {
+    let mut original = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut original).await;
+    let updated = overlay_age(original.clone(), "snapshot_age", 0, &[(2, Some(999))]).await;
+    let mut deleted = updated.clone();
+    deleted.delete("id = 2 OR id = 0").await.unwrap();
+
+    assert_ids_match_oracle(&original, "age = 20", &[2]).await;
+    assert_ids_match_oracle(&original, "age = 999", &[]).await;
+    assert_ids_match_oracle(&updated, "age = 20", &[]).await;
+    assert_ids_match_oracle(&updated, "age = 999", &[2]).await;
+    assert_ids_match_oracle(&deleted, "age = 999", &[]).await;
+    assert_ids_match_oracle(&deleted, "age = 70", &[7]).await;
+    // Reusing the same session after newer reads must not cache a snapshot mask.
+    assert_ids_match_oracle(&original, "age = 20", &[2]).await;
+    assert_eq!(
+        ids_matching_opts(&updated, "age = 999", true).await,
+        vec![2]
+    );
+}
+
 /// The scalar-index stale-row replay is a second read branch. A physical row selection must
 /// constrain it too, otherwise an overlaid row outside the requested slice can be reintroduced.
 #[rstest]

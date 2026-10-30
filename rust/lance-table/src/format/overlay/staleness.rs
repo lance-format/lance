@@ -454,4 +454,60 @@ mod tests {
             "fragment absent from bitmap contributes no rows"
         );
     }
+
+    #[test]
+    fn test_selected_segments_keep_their_own_freshness() {
+        let schema = flat_test_schema();
+        let fragments = [
+            fragment_with_overlay(0, dense_overlay(vec![3], [1], 9)),
+            fragment_with_overlay(1, dense_overlay(vec![3], [2], 9)),
+        ];
+        let overlaid = overlaid_fragments(&fragments);
+        let older = segment(vec![3], 5, Some(bitmap([0])));
+        let newer = segment(vec![3], 9, Some(bitmap([1])));
+        let mut stale = HashMap::new();
+        for selected in [&newer, &older] {
+            collect_overlay_stale_rows_for_segment(selected, &overlaid, &mut stale, &schema)
+                .unwrap();
+        }
+        assert_eq!(stale, HashMap::from([(0, bitmap([1]))]));
+
+        // Selecting just the newer segment cannot inherit another segment's stale rows.
+        stale.clear();
+        collect_overlay_stale_rows_for_segment(&newer, &overlaid, &mut stale, &schema).unwrap();
+        assert!(stale.is_empty());
+
+        let withdrawn = segment(vec![3], 5, Some(RoaringBitmap::new()));
+        collect_overlay_stale_rows_for_segment(&withdrawn, &overlaid, &mut stale, &schema).unwrap();
+        assert!(
+            stale.is_empty(),
+            "empty coverage is different from unknown coverage"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::parent("outer", "outer.middle.a", true)]
+    #[case::child("outer.middle.a", "outer", true)]
+    #[case::middle("outer.middle", "outer.middle.a", true)]
+    #[case::sibling("outer.middle.a", "outer.middle.b", false)]
+    fn test_overlay_dependency_checks_agree_for_ancestors_and_siblings(
+        #[case] changed: &str,
+        #[case] indexed: &str,
+        #[case] expected: bool,
+    ) {
+        let schema = nested_struct_schema();
+        let changed = schema.field(changed).unwrap().id;
+        let indexed = schema.field(indexed).unwrap().id;
+        let overlay = dense_overlay(vec![changed], [1], 9);
+        assert_eq!(
+            overlay_affects_index(&overlay, &[indexed], 5, &schema),
+            expected
+        );
+        assert_eq!(
+            !overlay_exclusion_offsets(&[overlay], &[indexed], 5, &schema)
+                .unwrap()
+                .is_empty(),
+            expected
+        );
+    }
 }
