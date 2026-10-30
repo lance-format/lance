@@ -28,6 +28,10 @@ support these flags must upgrade before accessing the catalog. Existing
 unescaped `$` keys retain their historical interpretation as namespace levels;
 the original name boundaries cannot be recovered from those keys.
 
+Directory migration preserves each `.lance` directory name as a single root
+table name, including literal `$`. Register an explicit multipart ID to
+place an existing table in a nested namespace.
+
 Supported storage backends:
 - Local filesystem (always available)
 - AWS S3 (feature: `dir-aws`)
