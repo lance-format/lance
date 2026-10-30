@@ -884,10 +884,9 @@ impl Branches<'_> {
                                 target.display()
                             )));
                         };
-                        if !protected.iter().any(|parent| owned.starts_with(parent)) {
-                            protected.retain(|child| !child.starts_with(&owned));
-                            protected.insert(owned);
-                        }
+                        // A deduplicated superset is sufficient and avoids quadratic
+                        // prefix pruning when many external aliases are present.
+                        protected.insert(owned);
                     }
                 }
             }
