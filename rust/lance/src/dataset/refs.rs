@@ -671,35 +671,19 @@ impl Branches<'_> {
         }
 
         if has_local_paths {
-            // A legacy dataset-directory name can belong to a surviving parent
-            // reached through a different spelling or symbolic link.
-            let deleted_branch = BranchRelativePath::new(branch);
-            for index in 1..deleted_branch.segments.len() {
-                if !is_dataset_dir(deleted_branch.segments[index]) {
-                    continue;
-                }
-                let owner = deleted_branch.segments[..index].join("/");
-                let owner_path = self.refs.base_location.find_branch(Some(&owner))?.path;
-                let canonical_owner = self
-                    .object_store()
-                    .canonicalize_local_path(&owner_path)
-                    .await?;
-                if canonical_owner.is_none()
-                    || remaining_paths
-                        .iter()
-                        .any(|remaining| remaining.canonical_path == canonical_owner)
-                {
-                    log::warn!(
-                        "Keeping branch directory after deleting {branch}: dataset-directory ownership at {owner_path} cannot be excluded"
-                    );
-                    return Ok(());
-                }
-            }
-
             let path = match &cleanup {
                 BranchCleanup::Recursive(path) | BranchCleanup::Selective(path) => path,
                 BranchCleanup::Skip => return Ok(()),
             };
+            if self
+                .overlaps_local_dataset_dir(path, &remaining_paths)
+                .await?
+            {
+                log::warn!(
+                    "Keeping branch directory after deleting {branch}: cleanup path overlaps a surviving parent's dataset directory"
+                );
+                return Ok(());
+            }
             cleanup = match self
                 .classify_shared_branch_path(path, &remaining_paths)
                 .await?
@@ -767,6 +751,31 @@ impl Branches<'_> {
                 Ok(())
             }
         }
+    }
+
+    async fn overlaps_local_dataset_dir(
+        &self,
+        path: &Path,
+        remaining_paths: &[RemainingBranchPath],
+    ) -> Result<bool> {
+        let Some(canonical_path) = self.object_store().canonicalize_local_path(path).await? else {
+            return Ok(true);
+        };
+        for remaining in remaining_paths {
+            let Some(canonical_remaining) = &remaining.canonical_path else {
+                return Ok(true);
+            };
+            let Ok(relative) = canonical_path.strip_prefix(canonical_remaining) else {
+                continue;
+            };
+            let Some(component) = relative.components().next() else {
+                continue;
+            };
+            if component.as_os_str().to_str().is_some_and(is_dataset_dir) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn get_cleanup_path(

@@ -1590,6 +1590,53 @@ async fn test_delete_branch_preserves_aliased_parent_data(
     assert!(root.list_branches().await.unwrap().contains_key("a/data/x"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_delete_branch_preserves_unicode_aliased_parent_data() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("a", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+
+    let versions = tempdir.std_path().join("tree/a/_versions");
+    let unicode_alias = tempdir.std_path().join("tree/a/_ver\u{017f}ions");
+    if !unicode_alias.exists() {
+        std::os::unix::fs::symlink(&versions, &unicode_alias).unwrap();
+    }
+
+    let middle_name = "a/_ver\u{017f}ions";
+    let mut middle = root.create_branch(middle_name, 1, None).await.unwrap();
+    middle.append(id_rows(20, 1), None).await.unwrap();
+    let mut leaf = root
+        .create_branch("a/_ver\u{017f}ions/x", 1, None)
+        .await
+        .unwrap();
+    leaf.append(id_rows(30, 1), None).await.unwrap();
+
+    root.delete_branch(middle_name).await.unwrap();
+
+    assert!(
+        root.list_branches()
+            .await
+            .unwrap()
+            .contains_key("a/_ver\u{017f}ions/x")
+    );
+    let mut parent = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("a")
+        .await
+        .unwrap();
+    let batch = parent.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+    parent.append(id_rows(40, 1), None).await.unwrap();
+    assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
