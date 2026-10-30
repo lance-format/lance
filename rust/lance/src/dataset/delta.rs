@@ -1043,6 +1043,7 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::stream::RecordBatchStream;
     use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+    use lance_table::io::commit::write_manifest_file_to_path;
     use lance_table::rowids::version::{
         RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
     };
@@ -2442,8 +2443,20 @@ mod tests {
         let (begin_version, unsupported_version) = if has_unsupported_end {
             let stable_version = dataset.manifest.version;
             dataset.delete("false").await.unwrap();
-            // Current writers forbid disabling stable ids; exercise the end flag independently.
-            Arc::make_mut(&mut dataset.manifest).reader_feature_flags &= !FLAG_STABLE_ROW_IDS;
+            // Current writers forbid disabling stable ids. Persist the test flag so
+            // endpoint checkouts also see it when the commit handler reloads the manifest.
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags &= !FLAG_STABLE_ROW_IDS;
+            write_manifest_file_to_path(
+                dataset.object_store.as_ref(),
+                manifest,
+                None,
+                &dataset.manifest_location.path,
+                None,
+            )
+            .await
+            .unwrap();
+            dataset = Dataset::open(&dir).await.unwrap();
             (stable_version, dataset.manifest.version)
         } else {
             (1, 1)
