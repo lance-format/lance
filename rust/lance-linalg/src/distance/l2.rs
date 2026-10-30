@@ -1100,6 +1100,8 @@ mod tests {
         assert!(std::panic::catch_unwind(|| l2(&short, &long)).is_err());
         assert!(std::panic::catch_unwind(|| l2_f32(&short, &long)).is_err());
         assert!(std::panic::catch_unwind(|| f32::l2(&short, &long)).is_err());
+        assert!(std::panic::catch_unwind(|| l2(&[1.0_f64], &[1.0_f64, 2.0])).is_err());
+        assert!(std::panic::catch_unwind(|| f64::l2(&[1.0_f64], &[1.0_f64, 2.0])).is_err());
         assert!(std::panic::catch_unwind(|| l2_distance(&short, &long)).is_err());
         assert!(std::panic::catch_unwind(|| l2_distance_batch_vec(&short, &long, 2)).is_err());
         assert!(
@@ -1361,18 +1363,24 @@ mod tests {
 
     /// Every host-supported f64 kernel must agree with an f64 reference, and
     /// each batch kernel must match its tier's pair kernel bit for bit.
-    /// Prefixes of length 8 and 16 pin the portable batch kernel's PQ-width
-    /// fast paths regardless of the generated dimension.
+    /// Prefixes of length 0 to 3 are all tail, and 8 and 16 pin the portable
+    /// batch kernel's PQ-width fast paths regardless of the generated dimension.
+    /// A longer second input checks that each pair kernel reads only the
+    /// shorter length.
     #[rstest::rstest]
     fn test_l2_f64_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
-            for dimension in [8, 16, x.len()].into_iter().filter(|&d| d <= x.len()) {
+            for dimension in [0, 1, 2, 3, 8, 16, x.len()]
+                .into_iter()
+                .filter(|&d| d <= x.len())
+            {
                 let (x, y) = (&x[..dimension], &y[..dimension]);
                 let want = l2_distance_reference(x, y) as f32;
                 // The second vector equals the key, so its distance is exactly 0.
                 let batch = [y, x].concat();
+                let longer_y = [y, &[f64::MAX]].concat();
                 for (pair, batch_candidate) in
                     L2_F64.candidates().iter().zip(L2_F64_BATCH.candidates())
                 {
@@ -1387,7 +1395,17 @@ mod tests {
                         "{} at dim {dimension}: {got} != {want}",
                         pair.name()
                     );
+                    prop_assert!(
+                        pair_kernel.call(x, &longer_y).to_bits() == got.to_bits()
+                            && pair_kernel.call(&longer_y, x).to_bits() == got.to_bits(),
+                        "{} read past the shorter input at dim {dimension}",
+                        pair.name()
+                    );
 
+                    // Batch entry points reject dimension 0.
+                    if dimension == 0 {
+                        continue;
+                    }
                     let mut got_batch = [f32::NAN; 2];
                     batch_kernel.call(x, &batch, dimension, &mut got_batch);
                     prop_assert!(
