@@ -5657,12 +5657,10 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
                 total_steps,
                 has_decoupled_budget,
             );
-            // Preserve enough of the partition budget across the remaining steps.
-            // Empty or undersized steps cannot reserve summaries they never build.
-            let remaining_steps = total_steps.saturating_sub(step - 1).max(1);
-            let partition_floor = num_partitions
-                .saturating_sub(algorithm.coreset_len(&coreset))
-                .div_ceil(remaining_steps);
+            // Per-step null density is not known in advance. Retain enough summaries
+            // to reach the partition target before returning to the normal local budget.
+            let partition_floor =
+                num_partitions.saturating_sub(algorithm.coreset_len(&coreset));
             let local_k = local_k.max(partition_floor).min(training_data.len());
             let mut chunk_coreset = algorithm.new_coreset(dimension, local_k);
             algorithm.append_local_coreset(
@@ -8343,6 +8341,7 @@ mod tests {
     #[case::fixed_l2_empty_first_step(MetricType::L2, false, 262, 1_050, None, 2)]
     #[case::nullable_l2_steps_below_partition_count(MetricType::L2, true, 0, 600, None, 4)]
     #[case::nullable_dot_small_remainder(MetricType::Dot, true, 0, 1_050, None, 4)]
+    #[case::nullable_dot_boundary(MetricType::Dot, true, 0, 520, None, 2)]
     #[case::nullable_dot_fragments(MetricType::Dot, true, 0, 4_000, Some(vec![0, 1, 3]), 2)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_coreset_trains_on_fewer_rows_than_sample(
