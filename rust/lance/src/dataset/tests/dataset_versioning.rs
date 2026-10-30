@@ -1656,12 +1656,13 @@ async fn test_gatekeeper_delete_contains_surviving_data(
         tempdir.path_str()
     };
     let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
-    let mut parent = root.create_branch("A", 1, None).await.unwrap();
-    parent.append(id_rows(10, 1), None).await.unwrap();
-    root.create_branch("a", 1, None).await.unwrap();
+    let mut parent = root.create_branch("parent", 1, None).await.unwrap();
+    let mut deleted = root.create_branch("a", 1, None).await.unwrap();
+    deleted.append(id_rows(20, 1), None).await.unwrap();
     root.create_branch("a/b", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
 
-    let parent_data = tempdir.std_path().join("tree/A/data");
+    let parent_data = tempdir.std_path().join("tree/parent/data");
     let container = if deep_alias {
         "tree/a/container"
     } else {
@@ -1679,7 +1680,7 @@ async fn test_gatekeeper_delete_contains_surviving_data(
     let before = Dataset::open(&uri)
         .await
         .unwrap()
-        .checkout_branch("A")
+        .checkout_branch("parent")
         .await
         .unwrap();
     let batch = before.scan().try_into_batch().await.unwrap();
@@ -1693,7 +1694,7 @@ async fn test_gatekeeper_delete_contains_surviving_data(
     let after = Dataset::open(&uri)
         .await
         .unwrap()
-        .checkout_branch("A")
+        .checkout_branch("parent")
         .await
         .unwrap();
     let batch = after.scan().try_into_batch().await.unwrap();

@@ -850,7 +850,7 @@ impl Branches<'_> {
         path: &Path,
         remaining_paths: &[RemainingBranchPath],
     ) -> Result<bool> {
-        let mut entries = self.object_store().read_dir_all(path.clone(), None);
+        let mut entries = self.object_store().read_dir_all(path, None);
         while let Some(entry) = entries.next().await {
             let entry = entry?;
             let Some(canonical_file) = self
