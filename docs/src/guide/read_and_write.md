@@ -470,7 +470,7 @@ means storage grows with each operation — inserts, updates, and deletes alike.
 Keeping old versions has important benefits: readers that opened an older version
 can continue reading it without interference from concurrent writers, providing
 snapshot isolation. Old versions also enable time travel queries, letting you
-read the dataset as it existed at any prior point in time.
+read snapshots from the retained version history.
 
 `cleanup_old_versions` deletes old version metadata and any data files that are
 no longer referenced by any version, reclaiming the accumulated storage.
@@ -480,6 +480,14 @@ no longer referenced by any version, reclaiming the accumulated storage.
     Once old versions are cleaned up, time travel queries to those versions are
     no longer possible. Choose your retention window (`older_than`) accordingly —
     any version removed by cleanup cannot be recovered.
+
+    `lance.dataset(uri, asof=t)` selects the latest retained version created before
+    `t`. If the version that was current at `t` has been removed, it can return an
+    older retained version, including one kept by a tag or branch. For example,
+    if `t` falls between versions 2 and 3 and cleanup removes version 2 but keeps
+    version 1, `asof=t` returns version 1. It raises `ValueError` only when no
+    retained version predates `t`. Use `version=N` to request a specific snapshot;
+    opening that version fails if it has been removed.
 
 ```python
 import lance

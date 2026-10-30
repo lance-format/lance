@@ -593,6 +593,45 @@ def test_asof_checkout(tmp_path: Path):
     assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
 
 
+@pytest.mark.parametrize("cleanup", ["explicit", "branch", "tag", "all_older"])
+def test_asof_checkout_after_cleanup(tmp_path: Path, cleanup):
+    ds = lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+    for value in [2, 3]:
+        ds = lance.write_dataset(pa.table({"x": [value]}), tmp_path, mode="append")
+
+    versions = ds.versions()
+    ts_2, ts_3 = (v["timestamp"] for v in versions[1:])
+    cutoff = ts_2 + (ts_3 - ts_2) / 2
+    before_cleanup = lance.dataset(tmp_path, asof=cutoff)
+    assert before_cleanup.version == 2
+    assert before_cleanup.to_table()["x"].to_pylist() == [1, 2]
+    assert len(before_cleanup.get_fragments()) == 2
+
+    if cleanup == "explicit":
+        ds.cleanup_old_versions(versions=[2])
+    else:
+        if cleanup == "branch":
+            ds.create_branch("keep-v1", 1)
+        elif cleanup == "tag":
+            ds.tags.create("keep-v1", 1)
+        ds.cleanup_old_versions(
+            older_than=timedelta(0), error_if_tagged_old_versions=cleanup != "tag"
+        )
+
+    with pytest.raises(ValueError, match="[Vv]ersion.*not found"):
+        lance.dataset(tmp_path, version=2)
+
+    if cleanup == "all_older":
+        assert [v["version"] for v in ds.versions()] == [3]
+        with pytest.raises(ValueError, match="earlier than the first version"):
+            lance.dataset(tmp_path, asof=cutoff)
+    else:
+        assert [v["version"] for v in ds.versions()] == [1, 3]
+        after_cleanup = lance.dataset(tmp_path, asof=cutoff)
+        assert after_cleanup.version == 1
+        assert after_cleanup.to_table()["x"].to_pylist() == [1]
+
+
 @pytest.mark.parametrize(
     "ts", ["2026-01-01", pd.Timestamp("2026-01-01"), datetime(2026, 1, 1)]
 )
