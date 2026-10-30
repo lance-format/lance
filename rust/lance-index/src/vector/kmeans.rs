@@ -1923,6 +1923,17 @@ fn dot_f16_partitions_amx(centroids: &[f16], query: &[f16]) -> Option<Vec<f32>> 
     Some(dists)
 }
 
+/// The centroid count is `centroids.len() / query.len()`, so an empty query
+/// must be rejected before that division.
+fn check_query_not_empty(centroids_len: usize, query_len: usize) -> arrow::error::Result<()> {
+    if query_len == 0 {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "kmeans partition search got an empty query (centroids length {centroids_len})"
+        )));
+    }
+    Ok(())
+}
+
 /// - *centroids*: a `k * dimension` floating array.
 /// - *query*: a `dimension` floating array.
 /// - *nprobes*: the number of partitions to find.
@@ -1937,6 +1948,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     nprobes: usize,
     distance_type: DistanceType,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
+    check_query_not_empty(centroids.len(), query.len())?;
     let mut dists = vec![0.0; centroids.len() / query.len()];
     match distance_type {
         DistanceType::L2 => l2_distance_batch_into(query, centroids, query.len(), &mut dists),
@@ -1958,6 +1970,7 @@ pub fn kmeans_find_partitions_binary(
     nprobes: usize,
     distance_type: DistanceType,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
+    check_query_not_empty(centroids.len(), query.len())?;
     let dists: Vec<f32> = match distance_type {
         DistanceType::Hamming => {
             let mut dists = vec![0.0; centroids.len() / query.len()];
