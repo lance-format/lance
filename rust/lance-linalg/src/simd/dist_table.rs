@@ -238,6 +238,11 @@ pub fn sum_4bit_dist_table_scalar(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
+    if code_len == 0 {
+        dists.fill(0);
+        return;
+    }
+
     let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
     dists[..num_full_vectors].fill(0);
 
@@ -447,6 +452,11 @@ pub fn sum_4bit_hacc_dist_table_scalar(
     hacc_dist_table: &[u8],
     dists: &mut [u32],
 ) {
+    if code_len == 0 {
+        dists.fill(0);
+        return;
+    }
+
     let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
     dists[..num_full_vectors].fill(0);
 
@@ -487,6 +497,11 @@ pub fn sum_4bit_dist_table_u16_scalar(
     dist_table: &[u16],
     dists: &mut [u32],
 ) {
+    if code_len == 0 {
+        dists.fill(0);
+        return;
+    }
+
     let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
     dists[..num_full_vectors].fill(0);
 
