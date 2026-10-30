@@ -820,20 +820,27 @@ impl Branches<'_> {
         deleted_branch: &str,
     ) -> Result<Option<Vec<PathBuf>>> {
         let mut canonical_retained_dirs = Vec::with_capacity(DATASET_DIRS.len() + 1);
+        let mut owned_paths = Vec::with_capacity(DATASET_DIRS.len() + 1);
+        owned_paths.extend(
+            DATASET_DIRS
+                .iter()
+                .copied()
+                .chain(std::iter::once(REFS_DIR))
+                .map(|name| path.clone().join(name)),
+        );
         for name in self.object_store().read_dir(path.clone()).await? {
-            if !name.eq_ignore_ascii_case(REFS_DIR) && !is_dataset_dir(&name) {
-                continue;
+            if is_mem_wal_dir_name(&name) {
+                owned_paths.push(path.clone().join(name));
             }
-            let owned_path = path.clone().join(name);
+        }
+        for owned_path in owned_paths {
             let Some(canonical_dir) = self
                 .object_store()
                 .canonicalize_local_path(&owned_path)
                 .await?
             else {
-                log::warn!(
-                    "Keeping branch directories after deleting {deleted_branch}: cannot resolve retained directory at {owned_path}"
-                );
-                return Ok(None);
+                // Optional dataset directories may not exist for this branch.
+                continue;
             };
             let Some(owned_dirs) = Self::collect_local_owned_directories(canonical_dir).await?
             else {
