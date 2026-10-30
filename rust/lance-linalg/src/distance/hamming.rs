@@ -94,13 +94,12 @@ lance_core::dispatch! {
 
 /// Bytes the NEON kernel sums into its 16-bit lanes before widening them.
 ///
-/// Each 64-byte step adds four `vcntq_u8` vectors (each byte lane at most 8,
-/// so at most 32 per byte lane, which fits `u8`) and pairwise-widens them with
-/// `vpadalq_u8`, adding at most `2 * 32 = 64` to each of the 8 `u16` lanes.
-/// A block of `1023 * 64` bytes takes at most 1023 such steps, so a lane
-/// reaches at most `1023 * 64 = 65472 <= u16::MAX`. A trailing 16-byte step
-/// adds at most 16 per lane, and replaces 16 of the 64 bytes a full step would
-/// take, so it never raises that bound.
+/// A 64-byte step adds four `vcntq_u8` vectors (at most `4 * 8 = 32` per byte
+/// lane, which fits `u8`) and pairwise-widens them into the 8 `u16` lanes with
+/// `vpadalq_u8`, adding at most `2 * 32 = 64` per lane; a 16-byte step adds at
+/// most `2 * 8 = 16`. Either way a lane gains at most 1 per input byte, so a
+/// block of at most `1023 * 64` bytes keeps every lane at most
+/// `65472 <= u16::MAX`.
 #[cfg_attr(not(any(target_arch = "aarch64", test)), allow(dead_code))]
 const HAMMING_NEON_FLUSH_BYTES: usize = 1023 * 64;
 
@@ -596,7 +595,7 @@ lance_core::target_kernel! {
     /// A plain zip lets LLVM vectorize the popcount (NEON `cnt` on aarch64)
     /// with no per-element bounds checks.
     #[inline]
-    fn hamming_batch_portable(query: u64, targets: &[u64], results: &mut [u32]) {
+    fn hamming_batch_u64_portable(query: u64, targets: &[u64], results: &mut [u32]) {
         for (result, &target) in results.iter_mut().zip(targets) {
             *result = (query ^ target).count_ones();
         }
@@ -651,7 +650,7 @@ mod x86 {
         #[target_features("avx512f", "avx512vpopcntdq")]
         #[candidate(pub(super) HAMMING_BATCH_U64_AVX512: HammingBatchU64Kernel)]
         /// AVX-512 VPOPCNTDQ: Process 8 x 64-bit values at once.
-        pub(super) fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32]) {
+        pub(super) fn hamming_batch_u64_avx512(query: u64, targets: &[u64], results: &mut [u32]) {
             // The chunk loop loads and stores through raw pointers, so `n`
             // bounds both slices, as a safe function must.
             let n = targets.len().min(results.len());
@@ -691,8 +690,8 @@ mod x86 {
         #[target_features("avx2")]
         #[candidate(pub(super) HAMMING_BATCH_U64_AVX2: HammingBatchU64Kernel)]
         /// AVX2 popcount using a PSHUFB nibble lookup table.
-        pub(super) fn hamming_batch_avx2(query: u64, targets: &[u64], results: &mut [u32]) {
-            // See `hamming_batch_avx512`.
+        pub(super) fn hamming_batch_u64_avx2(query: u64, targets: &[u64], results: &mut [u32]) {
+            // See `hamming_batch_u64_avx512`.
             let n = targets.len().min(results.len());
 
             let lookup = _mm256_setr_epi8(
@@ -1561,7 +1560,7 @@ mod tests {
 
     #[rstest]
     // Fewer slots than targets is the case that used to write out of bounds: on a
-    // host that takes the AVX2 path, `hamming_batch_avx2` wrote 28 bytes past a
+    // host that takes the AVX2 path, `hamming_batch_u64_avx2` wrote 28 bytes past a
     // one-slot `results`.
     #[case::eight_targets_one_slot(8, 1)]
     // On the same path this one overran by 4 bytes instead of 28.
