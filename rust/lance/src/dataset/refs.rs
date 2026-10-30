@@ -24,6 +24,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -667,12 +668,12 @@ impl Branches<'_> {
                 );
                 return Ok(());
             }
-            let mut canonical_dataset_dirs = Vec::with_capacity(DATASET_DIRS.len());
+            let mut canonical_owned_dirs = Vec::with_capacity(DATASET_DIRS.len() + 1);
             if has_local_paths {
-                // Dataset directories can be symlinks outside the branch root.
-                // Protect their own identities, including dynamically named MemWAL directories.
+                // Dataset directories and shared refs can contain aliases at any depth.
                 for name in self.object_store().read_dir(path.clone()).await? {
-                    if !is_dataset_dir(&name) {
+                    let is_shared_refs = remaining.is_none() && name.eq_ignore_ascii_case("_refs");
+                    if !is_dataset_dir(&name) && !is_shared_refs {
                         continue;
                     }
                     let dataset_path = path.clone().join(name);
@@ -686,13 +687,21 @@ impl Branches<'_> {
                         );
                         return Ok(());
                     };
-                    canonical_dataset_dirs.push(canonical_dir);
+                    let Some(owned_dirs) =
+                        Self::collect_local_owned_directories(canonical_dir).await?
+                    else {
+                        log::warn!(
+                            "Keeping branch directories after deleting {branch}: cannot resolve retained storage below {dataset_path}"
+                        );
+                        return Ok(());
+                    };
+                    canonical_owned_dirs.extend(owned_dirs);
                 }
             }
             remaining_paths.push(RemainingBranchPath {
                 path,
                 canonical_path,
-                canonical_dataset_dirs,
+                canonical_owned_dirs,
             });
         }
 
@@ -782,6 +791,67 @@ impl Branches<'_> {
         }
     }
 
+    async fn collect_local_owned_directories(
+        canonical_root: PathBuf,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        let root_description = canonical_root.display().to_string();
+        // Stream filesystem entries: object listings would buffer every file in flat data
+        // directories. The provider has already mapped the root to a canonical local path.
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<PathBuf>> {
+            let mut protected = HashSet::from([canonical_root.clone()]);
+            let mut pending = vec![canonical_root];
+            let mut visited = HashSet::new();
+            while let Some(directory) = pending.pop() {
+                if !visited.insert(directory.clone()) {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    let file_type = entry.file_type()?;
+                    if !file_type.is_dir() && !file_type.is_symlink() {
+                        continue;
+                    }
+                    let target = std::fs::canonicalize(entry.path())?;
+                    let is_directory = file_type.is_dir() || std::fs::metadata(&target)?.is_dir();
+                    if is_directory {
+                        pending.push(target.clone());
+                    }
+                    if !target.starts_with(&directory) {
+                        let owned = if is_directory {
+                            target
+                        } else if let Some(parent) = target.parent() {
+                            // Protect a file alias before cleanup reaches its payload.
+                            parent.to_path_buf()
+                        } else {
+                            return Err(std::io::Error::other(format!(
+                                "Retained file alias has no containing directory: {}",
+                                target.display()
+                            )));
+                        };
+                        if !protected.iter().any(|parent| owned.starts_with(parent)) {
+                            protected.retain(|child| !child.starts_with(&owned));
+                            protected.insert(owned);
+                        }
+                    }
+                }
+            }
+            Ok(protected.into_iter().collect())
+        })
+        .await
+        .map_err(|error| {
+            Error::io(format!(
+                "retained directory inspection task failed: {error}"
+            ))
+        })?;
+        match result {
+            Ok(directories) => Ok(Some(directories)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::io(format!(
+                "Cannot inspect retained storage below {root_description}: {error}"
+            ))),
+        }
+    }
+
     fn get_cleanup_path(
         branch: &str,
         remaining_branches: &[&str],
@@ -854,7 +924,7 @@ impl Branches<'_> {
                 }
                 (Some(path), Some(canonical_remaining)) => {
                     if remaining
-                        .canonical_dataset_dirs
+                        .canonical_owned_dirs
                         .iter()
                         .any(|directory| path.starts_with(directory))
                     {
@@ -862,7 +932,7 @@ impl Branches<'_> {
                     }
                     is_ancestor |= canonical_remaining.starts_with(path)
                         || remaining
-                            .canonical_dataset_dirs
+                            .canonical_owned_dirs
                             .iter()
                             .any(|directory| directory.starts_with(path));
                 }
@@ -892,7 +962,7 @@ impl Branches<'_> {
 struct RemainingBranchPath {
     path: Path,
     canonical_path: Option<PathBuf>,
-    canonical_dataset_dirs: Vec<PathBuf>,
+    canonical_owned_dirs: Vec<PathBuf>,
 }
 
 enum SharedBranchPath {
