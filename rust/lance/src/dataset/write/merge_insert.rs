@@ -690,6 +690,8 @@ struct MergeInsertParams {
     retry_timeout: Duration,
     // MemWAL SSTables to mark as compacted when this commit succeeds.
     compacted_sstables: Vec<CompactedSsTable>,
+    // The `dir_id` of the MemWAL `compacted_sstables` belongs to.
+    mem_wal_dir_id: Option<String>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -957,6 +959,7 @@ impl MergeInsertBuilder {
                 spill_for_retry: true,
                 retry_timeout: Duration::from_secs(30),
                 compacted_sstables: Vec::new(),
+                mem_wal_dir_id: None,
                 skip_auto_cleanup: false,
                 use_index: true,
                 write_mode: MergeInsertWriteMode::default(),
@@ -1106,7 +1109,16 @@ impl MergeInsertBuilder {
     /// so it cannot enforce this: if a delete pass carried the marker and the
     /// process then died before the matching upsert, the recorded generation
     /// would claim rows were copied in that never were.
-    pub fn mark_sstables_as_compacted(&mut self, sstables: Vec<CompactedSsTable>) -> &mut Self {
+    ///
+    /// `dir_id` names the MemWAL the SSTables belong to; the commit fails with
+    /// [`Error::StaleMemWal`] if it was since disabled or replaced. Pass an
+    /// empty `sstables` on passes that record no progress so they are checked too.
+    pub fn mark_sstables_as_compacted(
+        &mut self,
+        dir_id: impl Into<String>,
+        sstables: Vec<CompactedSsTable>,
+    ) -> &mut Self {
+        self.params.mem_wal_dir_id = Some(dir_id.into());
         self.params.compacted_sstables.extend(sstables);
         self
     }
@@ -3565,6 +3577,8 @@ impl MergeInsertJob {
             ))
     }
 
+    /// Build the uncommitted merge-insert transaction, using the v2 plan when
+    /// it supports the source and the legacy path otherwise.
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,
@@ -3699,6 +3713,7 @@ impl MergeInsertJob {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields_pre_order()
                     .map(|f| f.id as u32)
@@ -3749,6 +3764,7 @@ impl MergeInsertJob {
                 new_fragments,
                 fields_modified,
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
@@ -3860,6 +3876,7 @@ impl MergeInsertJob {
                 // modify any field values.
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields_pre_order()
                     .map(|f| f.id as u32)

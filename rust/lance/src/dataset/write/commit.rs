@@ -162,28 +162,37 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Commit, together with an `UpdateConfig` transaction, the COMPLETE list of
-    /// clustering definitions the next manifest must hold: the target list.
-    /// A current definition the list keeps is unchanged, one it omits is
-    /// removed, and the new ones continue `max_clustering_id` in order; the
-    /// watermark never moves backwards. A definition can be removed only while
-    /// no fragment or index segment in the manifest the commit lands on
-    /// references it; otherwise the whole commit is refused. Applied against
-    /// that landing manifest, so a list built from a stale snapshot is a
-    /// non-retryable commit conflict (reload, rebuild the list, resubmit); a
-    /// list identical to the current one is a no-op. The transaction file
-    /// stays a plain `UpdateConfig`; the manifest is the durable record of the
-    /// definitions. Any other operation refuses this input, and so does a
-    /// detached commit.
+    /// Commit the complete list of clustering definitions this writer wants
+    /// the table to hold, planned against the manifest it read. Only an
+    /// `UpdateConfig` may carry it: the list rides alongside the metadata it
+    /// publishes and the commit stays a plain `UpdateConfig`; the manifest is
+    /// the durable record of the definitions. Any other operation refuses this
+    /// input, and so does a detached commit.
+    ///
+    /// The list is applied against the landing manifest on every attempt: a
+    /// definition allocated or removed underneath it, or one whose identity
+    /// changed, refuses the commit so the writer plans again. Every definition
+    /// the list allocates (each id above the read manifest's allocation mark,
+    /// not only the highest) is checked against the landing schema from the
+    /// schema the writer read: every key field must still be the same typed
+    /// field by id (same logical type along its path and in its subtree, a
+    /// timestamp's unit and timezone included). A same-id rename keeps a key;
+    /// a retype, a drop or a cast under a new id refuses the commit, and with
+    /// it every other allocation in the list. Retained definitions are not
+    /// checked.
     ///
     /// Definitions key on schema field ids, so allocating the first one on a
     /// table with reusable field ids activates non-reusable field ids in the
     /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
     /// dropped key field's id is never handed to a later column, and an
-    /// overwrite assigns ids above the mark. Activation is permanent: clearing
-    /// the definitions does not undo it, and under that contract the versions
-    /// from before the activating commit can no longer be restored (they stay
-    /// readable). A table already under the contract is unaffected.
+    /// overwrite assigns ids above the mark. Until that activation lands, a
+    /// stricter fence in the conflict resolver refuses concurrent schema
+    /// replacements that could reassign a key's id; it compares names too and
+    /// is deliberately separate from the typed check above. Activation is
+    /// permanent: clearing the definitions does not undo it, and under that
+    /// contract the versions from before the activating commit can no longer
+    /// be restored (they stay readable). A table already under the contract is
+    /// unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
         self.clustering_definitions = Some(definitions);
         self
@@ -1448,6 +1457,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,

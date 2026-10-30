@@ -1583,6 +1583,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    ///
     /// # Arguments
     ///
     /// * `older_than` - Versions older than this will be deleted.
@@ -1623,6 +1625,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    ///
     /// # Arguments
     ///
     /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
@@ -1642,6 +1646,8 @@ impl Dataset {
     ///
     /// The returned operation can be explained without deleting files, or
     /// executed to re-evaluate the current dataset state and remove files.
+    /// Both return an invalid-input error when this dataset is checked out at a
+    /// detached version.
     pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
         CleanupOperation::new(self, policy)
     }
@@ -1978,6 +1984,34 @@ impl Dataset {
         column: impl AsRef<str>,
     ) -> Result<Vec<Option<BlobFile>>> {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
+    }
+
+    /// Scan every row of this dataset with its blob v2 columns as values another
+    /// dataset can be written from: the payload bytes of every blob this dataset
+    /// stores, and an External blob's absolute URI and byte range, at any depth.
+    ///
+    /// Each batch holds the payloads of its blobs in memory.
+    pub async fn scan_blobs_as_logical(self: &Arc<Self>) -> Result<DatasetRecordBatchStream> {
+        let mut scan = self.scan();
+        scan.with_row_address();
+        let batches = scan.try_into_stream().await?;
+        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+            self.schema(),
+            lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
+            false,
+            false,
+        )?);
+        let schema = plan.output_schema().clone();
+        let dataset = self.clone();
+        let batches = batches
+            .and_then(move |batch| {
+                let (plan, dataset) = (plan.clone(), dataset.clone());
+                async move { plan.transform_batch(&dataset, batch).await }
+            })
+            .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)));
+        Ok(DatasetRecordBatchStream::new(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches),
+        )))
     }
 
     /// Take [BlobFile] by row indices (offsets in the dataset).
@@ -2714,23 +2748,6 @@ impl Dataset {
         index: &IndexMetadata,
     ) -> Result<Arc<ObjectStore>> {
         self.object_store(index.base_id).await
-    }
-
-    /// This table as a reader of `manifest`, another manifest of it, sees its
-    /// files: through that manifest's base paths, with base stores opened
-    /// afresh when those differ, since `base_object_stores` caches by id alone.
-    pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
-        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
-            self.base_object_stores.clone()
-        } else {
-            Default::default()
-        };
-        Self {
-            fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
-            manifest,
-            base_object_stores,
-            ..self.clone()
-        }
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
@@ -4598,6 +4615,11 @@ pub(crate) async fn write_manifest_file(
         // this write with their index section but without a build, and a clone
         // starts from a masked writer word.
         apply_index_object_metadata_flag(manifest, indices.as_deref().unwrap_or_default());
+    }
+    // Restore and clone bypass build_manifest and may copy an older snapshot
+    // that predates the writer fence.
+    if let Some(indices) = &indices {
+        lance_table::feature_flags::apply_row_addr_index_feature_flag(manifest, indices);
     }
     // After the flag reset, so it judges the flags being published. Here rather
     // than in `build_manifest`, which restore and clone bypass.

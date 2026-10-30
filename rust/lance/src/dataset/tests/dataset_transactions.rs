@@ -8,14 +8,14 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR,
+    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR, UpdateBuilder,
     write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_file::version::LanceFileVersion;
-use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+use lance_table::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_ROW_ADDR_INDICES};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::ManifestNamingScheme;
 use roaring::RoaringBitmap;
@@ -43,6 +43,8 @@ use crate::datafusion::LanceTableProvider;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance_datafusion::udf::register_functions;
+use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_io::utils::tracking_store::IoStats;
 use object_store::ObjectStoreExt;
 
@@ -1551,6 +1553,7 @@ async fn test_build_manifest_partial_last_updated_rewrite_columns_stable_row_ids
         updated_fragments: vec![u.fragment],
         new_fragments: vec![],
         fields_modified: u.fields_modified,
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: Some(UpdateMode::RewriteColumns),
@@ -2159,6 +2162,88 @@ async fn test_shallow_clone_preserves_the_covering_fence() {
         0,
         "a clone of a covered table must stay fenced for writers"
     );
+}
+
+#[tokio::test]
+async fn test_row_addr_index_writer_fence_survives_dataset_operations() {
+    let dir = TempStrDir::default();
+    let reader = lance_datagen::gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("value", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(12), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        dir.as_str(),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let indexed_version = dataset.version().version;
+    let assert_fenced = |dataset: &Dataset| {
+        let flag = FLAG_ROW_ADDR_INDICES;
+        assert_ne!(dataset.manifest.writer_feature_flags & flag, 0);
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, 0);
+    };
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_fenced(&dataset);
+
+    let dataset = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id < 2")
+        .unwrap()
+        .set("value", "value + 100")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset;
+    assert_fenced(&dataset);
+    assert_eq!(
+        dataset
+            .scan()
+            .filter("id < 2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+
+    let mut dataset = dataset.as_ref().clone();
+    let clone_dir = TempStrDir::default();
+    let cloned = dataset
+        .shallow_clone(clone_dir.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+    assert_fenced(&cloned);
+
+    dataset.drop_index("id_idx").await.unwrap();
+    assert_eq!(
+        dataset.manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES,
+        0
+    );
+
+    let mut dataset = dataset.checkout_version(indexed_version).await.unwrap();
+    dataset.restore().await.unwrap();
+    let restored = Dataset::open(dir.as_str()).await.unwrap();
+    assert_fenced(&restored);
 }
 
 /// Covering redefines what `fields` means, so a build that predates it would

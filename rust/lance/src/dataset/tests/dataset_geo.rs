@@ -330,6 +330,7 @@ async fn test_staged_rtree_after_rewrite_columns(
                     fields_modified,
                     removed_fragment_ids: vec![],
                     new_fragments: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode,

@@ -18,7 +18,7 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, ScheduledScanLine, SchedulerContext,
+        DecodedArray, DrainLimit, FilterExpression, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
         StructuralSchedulingJob,
     },
@@ -226,6 +226,57 @@ impl StructuralFixedSizeListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        let dimension = match &self.data_type {
+            DataType::FixedSizeList(_, dimension) => *dimension as u64,
+            _ => {
+                return Err(Error::internal(
+                    "FixedSizeListDecoder has non-FSL data type".to_string(),
+                ));
+            }
+        };
+        if dimension == 0 {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: None,
+            });
+        }
+
+        let child_rows = num_rows.checked_mul(dimension).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Planning {} FixedSizeList rows with dimension {} overflows child row count",
+                num_rows, dimension
+            ))
+        })?;
+        let child_limit = self.child.max_rows_to_drain(child_rows, byte_budget)?;
+        let safe_rows = child_limit.rows / dimension;
+        let dictionary_rows = child_limit
+            .dictionary_rows
+            .map(|dictionary_rows| dictionary_rows / dimension);
+        if safe_rows == 0 {
+            return Ok(DrainLimit {
+                rows: 0,
+                bytes: 0,
+                dictionary_rows,
+            });
+        }
+
+        let planned_child_rows = safe_rows * dimension;
+        let bytes = if planned_child_rows == child_limit.rows {
+            child_limit.bytes
+        } else {
+            self.child
+                .max_rows_to_drain(planned_child_rows, byte_budget)?
+                .bytes
+        };
+        Ok(DrainLimit {
+            rows: safe_rows,
+            bytes,
+            dictionary_rows,
+        })
+    }
+
     fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }

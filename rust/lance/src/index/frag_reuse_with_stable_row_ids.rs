@@ -20,8 +20,6 @@ use prost_types::Any;
 use super::scalar::IndexDetails;
 use super::{index_is_usable, unsupported_index_version};
 
-pub mod history;
-
 fn details_type_name(details: &Any) -> &str {
     details
         .type_url
@@ -394,8 +392,7 @@ mod tests {
     #[rstest]
     #[case::zone_map(details(&pbold::ZoneMapIndexDetails::default()), 0, true)]
     #[case::bloom_filter(details(&pb::BloomFilterIndexDetails::default()), 0, true)]
-    #[case::btree(details(&pbold::BTreeIndexDetails::default()), 1, true)]
-    #[case::legacy_btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
+    #[case::btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
     #[case::bitmap(details(&pbold::BitmapIndexDetails::default()), 0, false)]
     #[case::label_list(details(&pbold::LabelListIndexDetails::default()), 0, false)]
     #[case::ngram(details(&pbold::NGramIndexDetails::default()), 0, false)]
@@ -697,7 +694,6 @@ mod tests {
         .await
         .unwrap();
         assert!(!has_flag(&dataset));
-        let without_entry = dataset.version().version;
 
         let frag_reuse = empty_frag_reuse_index(&dataset, RoaringBitmap::new()).await;
         commit_new_indices(&mut dataset, vec![frag_reuse])
@@ -724,12 +720,8 @@ mod tests {
         assert!(deep.manifest.uses_stable_row_ids());
         assert!(has_flag(&deep));
 
-        let error = dataset.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        assert!(has_flag(&dataset));
-        let mut restored = dataset.checkout_version(without_entry).await.unwrap();
-        restored.restore().await.unwrap();
-        assert!(!has_flag(&restored));
+        dataset.drop_index(FRAG_REUSE_INDEX_NAME).await.unwrap();
+        assert!(!has_flag(&dataset));
     }
 
     #[tokio::test]

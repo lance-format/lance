@@ -3181,26 +3181,33 @@ async fn test_index(
 ) {
     match params.metric_type {
         DistanceType::Hamming => {
-            test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..4, dataset).await;
+            Box::pin(test_index_impl::<UInt8Type>(
+                params,
+                nlist,
+                recall_requirement,
+                0..4,
+                dataset,
+            ))
+            .await;
         }
         _ => {
-            test_index_impl::<Float32Type>(
+            Box::pin(test_index_impl::<Float32Type>(
                 params.clone(),
                 nlist,
                 recall_requirement,
                 0.0..1.0,
                 dataset.clone(),
-            )
+            ))
             .await;
 
             if dataset.is_none() {
-                test_index_impl::<Float64Type>(
+                Box::pin(test_index_impl::<Float64Type>(
                     params,
                     nlist,
                     recall_requirement,
                     0.0..1.0,
                     dataset,
-                )
+                ))
                 .await;
             }
         }
@@ -3736,7 +3743,14 @@ async fn test_build_ivf_sq_dot_with_negative_values() {
     let sq_params = SQBuildParams::default();
     let params = VectorIndexParams::with_ivf_sq_params(DistanceType::Dot, ivf_params, sq_params);
 
-    test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
+    Box::pin(test_index_impl::<Float32Type>(
+        params,
+        nlist,
+        0.75,
+        -1.0..1.0,
+        None,
+    ))
+    .await;
 }
 
 // These queries probe every partition, so recall here measures RaBitQ quantization
@@ -3929,7 +3943,14 @@ async fn test_create_ivf_hnsw_sq_dot_with_negative_values() {
         sq_params,
     );
 
-    test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
+    Box::pin(test_index_impl::<Float32Type>(
+        params,
+        nlist,
+        0.75,
+        -1.0..1.0,
+        None,
+    ))
+    .await;
 }
 
 #[rstest]

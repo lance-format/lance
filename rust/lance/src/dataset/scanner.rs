@@ -792,7 +792,7 @@ impl FilterPlan {
                     plan = scanner.flat_fts_filter(plan, fts_query).await?;
                 }
                 Some(QueryFilter::Vector(vector_query)) => {
-                    plan = scanner.flat_knn(plan, vector_query)?;
+                    plan = scanner.flat_knn(plan, vector_query).await?;
                 }
                 None => {}
             }
@@ -2683,10 +2683,9 @@ impl Scanner {
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
     ///
     /// When unset, the search ranks by the metric of the vector index it chooses for the
-    /// column, also where it falls back to flat KNN over fragments that index does not
-    /// cover. A search that chooses no index, such as one with [`Self::use_index`] false
-    /// or a full-text filter under [`Self::prefilter`], uses the column type's default:
-    /// Hamming for uint8 vectors and L2 otherwise.
+    /// column, including when it falls back to flat KNN for filtered rows or fragments
+    /// that index does not cover. A search with [`Self::use_index`] false uses the column
+    /// type's default: Hamming for uint8 vectors and L2 otherwise.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = Some(metric_type)
@@ -4957,7 +4956,7 @@ impl Scanner {
                         .union_column(&query.column, OnMissing::Error)?;
                     let plan = self.take(fts_plan, projection)?;
 
-                    self.flat_knn(plan, query)?
+                    self.flat_knn(plan, query).await?
                 }
                 None => {
                     self.vector_search(&filter_plan.expr_filter_plan, query)
@@ -5462,7 +5461,7 @@ impl Scanner {
         // retain their existing scoring and approximation contracts.
         if let FtsQuery::Match(match_query) = query
             && let Some(plan) = self
-                .plan_restricted_match_query(match_query, &params, filter_plan, &prefilter_source)
+                .plan_corpus_match_query(match_query, &params, filter_plan, &prefilter_source)
                 .await?
         {
             return Ok(plan);
@@ -6119,9 +6118,9 @@ impl Scanner {
     }
 
     /// Use global append-only corpus statistics independently of the selected candidates.
-    /// This entry is called only for a root scalar-text Match with a user prefilter or
-    /// explicit fragment selection. Other query shapes retain their existing planner.
-    async fn plan_restricted_match_query(
+    /// Exact root scalar-text matches share this corpus with and without candidate
+    /// restrictions. Other query shapes retain their existing planner.
+    async fn plan_corpus_match_query(
         &self,
         query: &MatchQuery,
         params: &FtsSearchParams,
@@ -6131,13 +6130,8 @@ impl Scanner {
         let is_primary_fts = self.full_text_query.is_some()
             && self.nearest.is_none()
             && self.filter.query_filter.is_none();
-        let has_postfilter = !self.prefilter && self.filter.expr_filter.is_some();
-        let has_restriction =
-            self.fragments.is_some() || (self.prefilter && !filter_plan.is_empty());
         if !is_primary_fts
             || self.fast_search
-            || has_postfilter
-            || !has_restriction
             || params.wand_factor != 1.0
             || params.phrase_slop.is_some()
             || query.fuzziness != Some(0)
@@ -6603,6 +6597,14 @@ impl Scanner {
             ))));
         }
 
+        // Candidate fragments do not define the corpus: even an index-only
+        // selection needs statistics from unindexed rows outside that selection.
+        let corpus_fragments = if self.fast_search {
+            target_fragments
+        } else {
+            self.dataset.fragments()
+        };
+
         // Kept per column; see `FlatStatsCoverage`.
         let mut per_column_coverage = Vec::with_capacity(query.column_names().len());
         let mut uncovered = RoaringBitmap::new();
@@ -6631,7 +6633,7 @@ impl Scanner {
                         .collect()
                 }
                 // No index on this column at all, so no fragment is covered for it.
-                None => target_fragments
+                None => corpus_fragments
                     .iter()
                     .map(|fragment| fragment.id as u32)
                     .collect(),
@@ -6645,7 +6647,7 @@ impl Scanner {
             // reaches `docFreq_f`.
             let mut column_stale_rows = RowAddrTreeMap::new();
             match self
-                .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
+                .fts_overlay_plan(column, DocumentGranularity::Row, corpus_fragments)
                 .await?
             {
                 FtsOverlayPlan::Unchanged(_) => {}
@@ -6658,7 +6660,7 @@ impl Scanner {
                 // A legacy segment reports no fragment coverage, so no target fragment
                 // can be proven free of stale entries and no row can be named as one.
                 FtsOverlayPlan::FullScan => {
-                    uncovered.extend(target_fragments.iter().map(|fragment| fragment.id as u32));
+                    uncovered.extend(corpus_fragments.iter().map(|fragment| fragment.id as u32));
                     needs_whole_corpus = true;
                 }
             }
@@ -6685,7 +6687,7 @@ impl Scanner {
         stale_addresses.retain(|fragment_id, _| !uncovered.contains(*fragment_id));
         let overlay_block = self.stale_rows_block_mask(&stale_addresses).await?;
 
-        let uncovered_fragments: Vec<Fragment> = target_fragments
+        let uncovered_fragments: Vec<Fragment> = corpus_fragments
             .iter()
             .filter(|fragment| uncovered.contains(fragment.id as u32))
             .cloned()
@@ -6757,7 +6759,7 @@ impl Scanner {
         // index and the corpus has to be re-measured from every target fragment. That
         // is a full scan, so it stays confined to that case.
         let (flat_fragments, stats_scope) = if needs_whole_corpus {
-            (target_fragments.to_vec(), FlatStatsScope::WholeCorpus)
+            (corpus_fragments.to_vec(), FlatStatsScope::WholeCorpus)
         } else {
             (
                 uncovered_fragments,
@@ -6785,7 +6787,7 @@ impl Scanner {
             .await?;
         // Only a plan with both children needs the two to agree on a corpus, and a
         // whole-corpus scan leaves no fragment for an indexed child.
-        let is_mixed = !needs_whole_corpus && flat_fragments.len() != target_fragments.len();
+        let is_mixed = !needs_whole_corpus && !covered.is_empty();
         let shared_scorer = is_mixed.then(|| Arc::new(SharedFtsScorer::new()));
         let flat_plan = self
             .plan_flat_combined_fields_query(
@@ -6804,20 +6806,26 @@ impl Scanner {
         let scored_plan = if !is_mixed {
             flat_plan
         } else {
-            let union =
-                UnionExec::try_new(vec![index_exec(Some(covered), shared_scorer), flat_plan])?;
+            let union = UnionExec::try_new(vec![
+                index_exec(Some(covered), shared_scorer.clone()),
+                flat_plan,
+            ])?;
             Arc::new(RepartitionExec::try_new(
                 union,
                 Partitioning::RoundRobinBatch(1),
             )?)
         };
-        Ok(Arc::new(
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(
                 Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
                 scored_plan,
             )
             .with_fetch(params.limit),
-        ))
+        );
+        Ok(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new_combined(plan, shared_scorer)),
+            None => plan,
+        })
     }
 
     /// Plan the flat (unindexed) side of a `combined_fields` query: one scan over
@@ -7184,7 +7192,7 @@ impl Scanner {
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
                 let knn_node_with_vector = self.take(ann_node, vector_projection)?;
-                self.flat_knn(knn_node_with_vector, &q)?
+                self.flat_knn(knn_node_with_vector, &q).await?
             } else {
                 ann_node
             }; // vector, _distance, _rowid
@@ -7253,7 +7261,7 @@ impl Scanner {
             if let Some(mask) = self.external_row_mask.clone() {
                 plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
             }
-            Ok(self.flat_knn(plan, &q)?)
+            self.flat_knn(plan, &q).await
         }
     }
 
@@ -7573,7 +7581,7 @@ impl Scanner {
                 Some(mask) => Arc::new(RowAddrMaskFilterExec::new(scan_node, mask)) as _,
                 None => scan_node,
             };
-            let topk_fallback = self.flat_knn(scan_node, &q)?;
+            let topk_fallback = self.flat_knn(scan_node, &q).await?;
             let topk_fallback: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_fallback);
@@ -7598,7 +7606,7 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
-            let topk_stale = self.flat_knn(stale_node, &q)?;
+            let topk_stale = self.flat_knn(stale_node, &q).await?;
             let topk_stale: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_stale, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_stale);
@@ -7611,7 +7619,7 @@ impl Scanner {
             unioned,
             datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
         )?;
-        self.flat_knn(Arc::new(unioned), &q)
+        self.flat_knn(Arc::new(unioned), &q).await
     }
 
     #[async_recursion]
@@ -8350,15 +8358,40 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        // Resolve metric_type if not set (use default for the column's element type)
-        let metric_type = match q.metric_type {
-            Some(m) => m,
-            None => {
-                let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
-                default_distance_type_for(&element_type)
+    async fn flat_knn(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
+        let mut metric_type = q.metric_type;
+        // Ranking FTS hits still needs the index's metric, even though the rows
+        // are scored directly instead of being retrieved through ANN.
+        if metric_type.is_none() && q.use_index {
+            let column_id = self.dataset.schema().field_id(&q.column)?;
+            let indices = self.dataset.load_indices().await?;
+            if let Some(index) = indices.iter().find(|index| {
+                index.fields.first() == Some(&column_id) && crate::index::index_type_is_known(index)
+            }) {
+                let index_metric = if let Some(metric) =
+                    crate::index::vector::details::metric_type_from_index_metadata(index)
+                {
+                    metric
+                } else {
+                    self.dataset
+                        .open_vector_index(&q.column, &index.uuid, &NoOpMetricsCollector)
+                        .await?
+                        .metric_type()
+                };
+                // Match the flat fallback in vector_search for untrained indices
+                // whose recorded metric is incompatible with the column type.
+                if validate_distance_type_for(index_metric, &element_type).is_ok() {
+                    metric_type = Some(index_metric);
+                }
             }
-        };
+        }
+        let metric_type = metric_type.unwrap_or_else(|| default_distance_type_for(&element_type));
+        validate_distance_type_for(metric_type, &element_type)?;
         let input = if self.is_batch_nearest {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
@@ -13240,6 +13273,7 @@ mod test {
                 updated_fragments: vec![updated.fragment],
                 new_fragments: vec![],
                 fields_modified: updated.fields_modified,
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -20228,29 +20262,30 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows");
-        // The flat-FTS path now reads through `FilteredReadExec`, matching the
-        // brute-force KNN path. With no prefilter the scan still produces no
-        // pushdown, but the operator differs by storage version: legacy emits
-        // a `LanceScan`, v2 emits a `LanceRead` with empty filters.
+        // MatchCorpus initializes shared BM25 statistics before either child scores
+        // candidates. The flat input reads through FilteredReadExec: legacy emits
+        // a LanceScan, v2 emits a LanceRead with empty filters.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
+      MatchCorpus
+        SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+          CoalescePartitionsExec
+            UnionExec
+              MatchQuery: column=s, query=[hello]
+              FlatMatchQuery: column=s, query=hello
+                LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
+        } else {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    MatchCorpus
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
             FlatMatchQuery: column=s, query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-      CoalescePartitionsExec
-        UnionExec
-          MatchQuery: column=s, query=[hello]
-          FlatMatchQuery: column=s, query=hello
-            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
         };
         dataset.append_new_data().await?;
         assert_plan_equals(
