@@ -373,6 +373,35 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
 }
 
 #[rstest]
+#[case::no_probes(vec![0, 0, 0], 4, vec![])]
+#[case::too_few_to_split(vec![1, 2, 3], 4, vec![0..3])]
+#[case::even(vec![8; 4], 2, vec![0..2, 2..4])]
+#[case::capped_by_tasks(vec![8; 6], 2, vec![0..3, 3..6])]
+#[case::skewed(vec![30, 1, 1, 0, 16], 3, vec![0..1, 1..5])]
+#[case::trailing_queries_without_probes(vec![16, 16, 0, 0], 4, vec![0..1, 1..2])]
+fn test_balanced_query_ranges(
+    #[case] probes_per_query: Vec<usize>,
+    #[case] max_tasks: usize,
+    #[case] expected: Vec<std::ops::Range<usize>>,
+) {
+    let ranges = super::balanced_query_ranges(&probes_per_query, max_tasks);
+    assert_eq!(ranges, expected);
+    assert!(ranges.len() <= max_tasks);
+    // Ranges are ordered and disjoint, and cover every query that has probes.
+    assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
+    for (query_index, &count) in probes_per_query.iter().enumerate() {
+        let owners = ranges
+            .iter()
+            .filter(|range| range.contains(&query_index))
+            .count();
+        assert!(owners <= 1, "query {query_index} is in {owners} ranges");
+        if count > 0 {
+            assert_eq!(owners, 1, "query {query_index} must be scored by one task");
+        }
+    }
+}
+
+#[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
 #[case::pq8(Some(8))]
