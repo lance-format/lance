@@ -131,7 +131,7 @@ pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use drop_index::DropIndex;
-pub use footprint::{ConfigMap, Coordinate, Footprint};
+pub use footprint::{ConfigMap, Coordinate, Footprint, Overlap, Verdict};
 pub use refresh_row_version_metadata::RefreshRowVersionMetadata;
 pub use remove_fragment::RemoveFragment;
 pub use remove_index_segment::RemoveIndexSegment;
@@ -348,6 +348,15 @@ impl CompositeOperation {
     /// Every action in every step, in application order.
     pub fn iter_actions(&self) -> impl Iterator<Item = &Action> {
         self.steps.iter().flat_map(|step| step.actions.iter())
+    }
+
+    /// Rewrite this operation past `overlaps`, the ways it overlaps a set that
+    /// committed after it read, as a [`Verdict::Rebase`] named them.
+    pub fn rebase(self, overlaps: Vec<Overlap>) -> Result<Self> {
+        match overlaps.into_iter().next() {
+            None => Ok(self),
+            Some(overlap) => match overlap {},
+        }
     }
 }
 

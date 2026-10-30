@@ -2425,7 +2425,7 @@ mod composite {
     use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{
-        BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
+        BasePath, DataFile, DeletionFile, DeletionFileType, Fragment, IndexMetadata, RowIdMeta,
     };
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::system_index::mem_wal::{
@@ -4595,7 +4595,7 @@ mod composite {
     #[rstest::rstest]
     #[case::overlapping_keys(Some(&[2, 3][..]), true)]
     #[case::disjoint_keys(Some(&[3, 4][..]), false)]
-    #[case::unqualified_append(None, true)]
+    #[case::unqualified_append(None, false)]
     #[tokio::test]
     async fn test_a_concurrent_insert_is_checked_against_a_key_assertion(
         #[case] stale_key_hashes: Option<&'static [u64]>,
@@ -4616,6 +4616,53 @@ mod composite {
                 .unwrap();
             assert_eq!(landed.fragments().len(), committed.fragments().len() + 1);
         }
+    }
+
+    /// A key assertion is a precondition on its own commit, as legacy merge
+    /// insert's inserted-key filter is: a legacy append that landed first fails
+    /// it, since the append does not say which keys it inserted, and one that
+    /// lands after it is not held to it.
+    #[tokio::test]
+    async fn test_a_key_assertion_against_a_concurrent_legacy_append() {
+        fn asserting(dataset: &Dataset) -> Vec<Action> {
+            let mut actions = append_with_field_zero(dataset);
+            actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(0)],
+                filter: KeyExistenceFilter {
+                    field_ids: vec![0],
+                    filter: FilterType::ExactSet([11u64].into_iter().collect()),
+                },
+            }));
+            actions
+        }
+        fn legacy_append(dataset: &Dataset) -> Transaction {
+            let mut fragment = Fragment::new(0);
+            fragment.physical_rows = Some(5);
+            fragment.files.push(existing_overlay_file(dataset, 0));
+            Transaction::new(
+                dataset.version().version,
+                Operation::Append {
+                    fragments: vec![fragment],
+                },
+                None,
+            )
+        }
+
+        let original = test_dataset(false).await;
+        let appended = CommitBuilder::new(Arc::new(original.clone()))
+            .execute(legacy_append(&original))
+            .await
+            .unwrap();
+        commit_expecting_conflict(&appended, original.version().version, asserting(&original))
+            .await;
+
+        let original = test_dataset(false).await;
+        let asserted = commit(original.clone(), asserting(&original)).await;
+        let landed = CommitBuilder::new(Arc::new(asserted))
+            .execute(legacy_append(&original))
+            .await
+            .unwrap();
+        assert_eq!(landed.fragments().len(), original.fragments().len() + 2);
     }
 
     fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {

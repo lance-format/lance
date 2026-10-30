@@ -999,8 +999,9 @@ async fn replay_staged_segments_from(
     let snapshot = dataset.manifest.version;
     let window: Vec<_> = transactions
         .into_iter()
-        .filter(|(version, _)| *version <= snapshot)
+        .filter(|(version, _, _)| *version <= snapshot)
         .collect();
+    rebase.record_manifests(window.iter().map(|(_, _, manifest)| manifest.clone()));
     // The listing only knows the manifests that still exist. A version
     // cleaned up between the build and the snapshot leaves no trace in it,
     // and whatever that commit did to the indexed columns cannot be
@@ -1011,7 +1012,7 @@ async fn replay_staged_segments_from(
         )
     };
     let mut expected = read_version + 1;
-    for (version, _) in &window {
+    for (version, _, _) in &window {
         if *version != expected {
             return Err(rebuild(expected, &gone()));
         }
@@ -1020,7 +1021,7 @@ async fn replay_staged_segments_from(
     if expected != snapshot + 1 {
         return Err(rebuild(expected, &gone()));
     }
-    for (version, transaction) in &window {
+    for (version, transaction, _) in &window {
         rebase
             .check_txn(transaction, *version)
             .map_err(|error| match error {

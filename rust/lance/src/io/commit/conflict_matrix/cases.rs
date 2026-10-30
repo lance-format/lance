@@ -29,9 +29,8 @@ use crate::{Dataset, Error};
 /// cell among its legacy analogues' pairs (see [`Scenario::analogues`] and
 /// [`legacy_bar`]). A cell suffixed `*` is a known parity gap, stricter than
 /// that bar, and must have a reason in [`PARITY_GAPS`]; the suffix is checked,
-/// so closing a gap means dropping it. Today every action set against a legacy
-/// operation fails closed in `check_action_txn`, so those cells are retryable
-/// and every one where legacy does better is a gap.
+/// so closing a gap means dropping it. A mixed pair is settled by comparing
+/// footprints, the legacy side's read straight from the operation.
 ///
 /// This grid is the expectation table, not a rendering of one: it is parsed at
 /// run time, so there is a single place to read and a single place to change.
@@ -43,25 +42,25 @@ use crate::{Dataset, Error};
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
                           | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+
-append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  R* R* R*
-delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  R* R* R*
-delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  R* R* R*
-update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  R* R* R*
-update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  R* R* R*
-data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  R* R* R*
-data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  R* R* R*
+append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  L  L  L
+delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L
+delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L
+update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L
+update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L
+data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L
+data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L
 project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  R* R* R*
 project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  R  R* R
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
-create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  R* R* R*
-rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  R* R* R*
-overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  R* R* R*
-restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  R* R  R
-update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  R* R  R
-action_append             | R* R* R* R* R* R* R* R* R  R* R  R* R* R  R  R* L  L  L
-action_update_config      | R* R* R* R* R* R* R* R* R* R  R  R* R* R  R  R  L  R  R
-action_append_and_config  | R* R* R* R* R* R* R* R* R  R  R  R* R* R  R  R  L  R  R
+create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L
+rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L
+overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L
+restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R
+update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R  R
+action_append             | L  L  L  L  L  L  L  R* R  R* R  L  L  R  R  L  L  L  L
+action_update_config      | L  L  L  L  L  L  L  R* R* R  R  L  L  R  R  R  L  R  R
+action_append_and_config  | L  L  L  L  L  L  L  R* R  R  R  L  L  R  R  R  L  R  R
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -188,20 +187,21 @@ pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str
         .map(|(_, _, reason)| *reason)
 }
 
-/// Why an action set's `*` cells in [`MATRIX`] fall short of [`legacy_bar`],
-/// keyed by the action scenario on either side of the pair.
+/// Why the `*` cells in [`MATRIX`] fall short of [`legacy_bar`], keyed by a
+/// scenario on either side of the pair.
 ///
 /// Keyed by scenario rather than by cell because a gap comes from how the
-/// resolver treats a kind of action set, not from one particular pairing. When
+/// resolver treats a kind of operation, not from one particular pairing. When
 /// the last `*` cell involving a scenario is closed, its entry goes too.
 const PARITY_GAPS: &[(Scenario, &str)] = &[
-    (Scenario::ActionAppend, MIXED_PAIRS_FAIL_CLOSED),
-    (Scenario::ActionUpdateConfig, MIXED_PAIRS_FAIL_CLOSED),
-    (Scenario::ActionAppendAndConfig, MIXED_PAIRS_FAIL_CLOSED),
+    (Scenario::Project, SCHEMA_RESTATED),
+    (Scenario::ProjectAlterNullability, SCHEMA_RESTATED),
+    (Scenario::Merge, SCHEMA_RESTATED),
 ];
 
-const MIXED_PAIRS_FAIL_CLOSED: &str = "check_action_txn fails every mixed pair closed; \
-     conflict parity 1/5 (Append + ConfigUpdate) gives legacy operations footprints";
+const SCHEMA_RESTATED: &str = "a legacy Project or Merge restates the whole schema, which no \
+     footprint coordinate describes, so it fails closed against an action set; conflict \
+     parity 2/5 diffs its manifests instead";
 
 fn parity_gap_reason(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
     [ours, theirs].into_iter().find_map(|scenario| {
