@@ -1046,10 +1046,20 @@ where
                     .as_ref()
                     .and_then(|options| options.data_cache_bytes)
                     .unwrap_or(8 * 1024 * 1024);
-                if reaches_row_limit && input_memory > data_cache_bytes as usize {
+                let flush_last =
+                    reaches_row_limit && input_memory > data_cache_bytes as usize;
+                if flush_last {
+                    let (last, prefix) = batch_chunk
+                        .split_last()
+                        .ok_or_else(|| Error::internal("empty writer batch chunk"))?;
+                    if !prefix.is_empty() {
+                        active_writer.write(prefix).await?;
+                    }
                     active_writer.prepare_for_flush();
+                    active_writer.write(std::slice::from_ref(last)).await?;
+                } else {
+                    active_writer.write(&batch_chunk).await?;
                 }
-                active_writer.write(&batch_chunk).await?;
                 for batch in &batch_chunk {
                     seeds.observe(batch)?;
                 }
@@ -2651,7 +2661,7 @@ mod tests {
 
     use arrow_array::{
         Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
-        StringViewArray, StructArray,
+        StringViewArray, StructArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
@@ -5588,6 +5598,67 @@ mod tests {
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
         let reopened = Dataset::open(&create_uri).await.unwrap();
         assert_eq!(scan_sorted_ids(&reopened).await, (0..9).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_file_boundary_keeps_one_page_per_file() {
+        use lance_file::reader::FileReaderOptions;
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+        use lance_io::utils::CachedFileSize;
+
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let values = Arc::new(UInt64Array::from_iter_values(0..4096));
+        let batches = (0..12)
+            .map(|batch_index| {
+                let slice = values.slice(batch_index * 32, 32);
+                RecordBatch::try_from_iter([("value", Arc::new(slice) as ArrayRef)]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let schema = batches[0].schema();
+        let reader =
+            RecordBatchIterator::new(batches.into_iter().map(Ok).collect::<Vec<_>>(), schema);
+        let params = WriteParams {
+            max_rows_per_file: 128,
+            max_rows_per_group: 32,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_0),
+            file_writer_options: Some(FileWriterOptions {
+                data_cache_bytes: Some(4096),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, tmpdir.as_str(), Some(params))
+            .await
+            .unwrap();
+
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+        for fragment in fragments {
+            let data_file = fragment.metadata.files.first().unwrap();
+            let path = dataset
+                .base
+                .clone()
+                .join(super::DATA_DIR)
+                .join(data_file.path.as_str());
+            let file_scheduler = scheduler
+                .open_file(&path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = lance_file::reader::FileReader::try_open(
+                file_scheduler,
+                None,
+                Default::default(),
+                &dataset.metadata_cache.file_metadata_cache(&path),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reader.metadata().column_infos[0].page_infos.len(), 1);
+        }
     }
 
     #[tokio::test]
