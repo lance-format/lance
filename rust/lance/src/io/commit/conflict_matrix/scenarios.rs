@@ -23,8 +23,8 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::transaction::action::{
-    Action, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation, ConfigUpdate,
-    FieldRef, Ref, RefreshRowVersionMetadata, TombstoneFieldData, UserStep,
+    Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, CompositeOperation,
+    ConfigUpdate, FieldRef, Ref, RefreshRowVersionMetadata, TombstoneFieldData, UserStep,
 };
 use lance_table::transaction::{UpdateMap, UpdateMapEntry};
 
@@ -124,6 +124,16 @@ pub(super) enum Scenario {
     ActionReplaceColumn,
     /// A rename of `c`, which legacy commits as a `Project`.
     ActionRenameColumn,
+    /// [`Scenario::CreateIndex`]'s segment as an `AddIndexSegment`.
+    ActionCreateIndex,
+    /// [`Scenario::ActionAppend`] and [`Scenario::ActionCreateIndex`] in one
+    /// commit.
+    ///
+    /// The segment covers a committed fragment rather than the appended one:
+    /// an index built before the commit cannot know the ids the appended rows
+    /// will get. A segment over a minted fragment claims no committed coverage,
+    /// so the dataset-free tier covers that shape instead.
+    ActionAppendAndIndex,
 }
 
 /// What a staged `theirs` touches, relative to what every `ours` in the matrix
@@ -183,7 +193,7 @@ impl Placement {
 }
 
 impl Scenario {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 24] = [
         Self::Append,
         Self::Delete,
         Self::DeleteWholeFragment,
@@ -206,6 +216,8 @@ impl Scenario {
         Self::ActionAddColumn,
         Self::ActionReplaceColumn,
         Self::ActionRenameColumn,
+        Self::ActionCreateIndex,
+        Self::ActionAppendAndIndex,
     ];
 
     /// Two-letter column heading for the matrix grid in `cases`.
@@ -233,6 +245,8 @@ impl Scenario {
             Self::ActionAddColumn => "vn",
             Self::ActionReplaceColumn => "vr",
             Self::ActionRenameColumn => "vm",
+            Self::ActionCreateIndex => "vi",
+            Self::ActionAppendAndIndex => "vj",
         }
     }
 
@@ -260,6 +274,8 @@ impl Scenario {
             Self::ActionAddColumn => "action_add_column",
             Self::ActionReplaceColumn => "action_replace_column",
             Self::ActionRenameColumn => "action_rename_column",
+            Self::ActionCreateIndex => "action_create_index",
+            Self::ActionAppendAndIndex => "action_append_and_index",
         }
     }
 
@@ -277,6 +293,8 @@ impl Scenario {
             Self::ActionAddColumn => vec![Self::Merge],
             Self::ActionReplaceColumn => vec![Self::DataReplacement],
             Self::ActionRenameColumn => vec![Self::Project],
+            Self::ActionCreateIndex => vec![Self::CreateIndex],
+            Self::ActionAppendAndIndex => vec![Self::Append, Self::CreateIndex],
             legacy => vec![legacy],
         }
     }
@@ -369,6 +387,8 @@ impl Scenario {
             Self::ActionAddColumn => stage_action_add_column(dataset).await,
             Self::ActionReplaceColumn => stage_action_replace_column(dataset).await,
             Self::ActionRenameColumn => stage_action_rename_column(dataset),
+            Self::ActionCreateIndex => stage_action_create_index(dataset, false).await,
+            Self::ActionAppendAndIndex => stage_action_create_index(dataset, true).await,
         }
     }
 }
@@ -661,6 +681,51 @@ fn stage_action_rename_column(dataset: &Dataset) -> Result<Staged> {
             nullable: None,
         })],
     ))
+}
+
+/// [`stage_create_index`]'s segment, committed as an `AddIndexSegment`, after
+/// [`stage_action_append`]'s actions when `with_append` is set.
+async fn stage_action_create_index(dataset: &Arc<Dataset>, with_append: bool) -> Result<Staged> {
+    let Operation::CreateIndex { new_indices, .. } =
+        stage_create_index(dataset, 0).await?.transaction.operation
+    else {
+        unreachable!("an uncommitted index build stages Operation::CreateIndex");
+    };
+    let mut actions = if with_append {
+        let Operation::CompositeOperation(appended) = stage_action_append(dataset, false)
+            .await?
+            .transaction
+            .operation
+        else {
+            unreachable!("an action append stages a composite operation");
+        };
+        appended.iter_actions().cloned().collect()
+    } else {
+        Vec::new()
+    };
+    for index in new_indices {
+        actions.push(Action::AddIndexSegment(AddIndexSegment {
+            uuid: index.uuid,
+            name: index.name,
+            fields: index
+                .fields
+                .iter()
+                .map(|id| FieldRef::Committed(*id))
+                .collect(),
+            covering_fields: Vec::new(),
+            index_details: index.index_details,
+            index_version: index.index_version,
+            covered_fragments: index
+                .fragment_bitmap
+                .map(|ids| ids.iter().map(|id| Ref::Committed(u64::from(id))).collect()),
+            files: index.files.unwrap_or_default(),
+            base: None,
+            created_at: index.created_at,
+            dataset_version: Some(index.dataset_version),
+            data_change: false,
+        }));
+    }
+    Ok(stage_action_set(dataset, actions))
 }
 
 /// The id of the field called `name`. An error rather than a panic, so a

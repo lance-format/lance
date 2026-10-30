@@ -3744,8 +3744,8 @@ mod tests {
     use lance_table::format::{InlineRowIds, RowIdMeta};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
     use lance_table::transaction::action::{
-        Action as TxnAction, CompositeOperation, FieldRef, Ref as ActionRef, TombstoneFieldData,
-        UserStep,
+        Action as TxnAction, AddFragment, CompositeOperation, FieldRef, Ref as ActionRef,
+        RemoveFragment, TombstoneFieldData, UserStep,
     };
 
     use super::*;
@@ -6773,6 +6773,93 @@ mod tests {
         );
 
         assert_conflict_each_way(&dataset, tombstone_txn(0, 0), delete, false, true).await;
+    }
+
+    fn create_index_txn(fragments: impl IntoIterator<Item = u32>) -> Transaction {
+        Transaction::new_from_version(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![IndexMetadata {
+                    uuid: Uuid::new_v4(),
+                    name: "by_i".to_string(),
+                    fields: vec![0],
+                    covering_fields: vec![],
+                    dataset_version: 1,
+                    fragment_bitmap: Some(RoaringBitmap::from_iter(fragments)),
+                    index_details: None,
+                    index_version: 0,
+                    created_at: None,
+                    base_id: None,
+                    files: None,
+                    clustering_id: None,
+                    metadata: HashMap::new(),
+                }],
+                removed_indices: vec![],
+            },
+        )
+    }
+
+    /// A legacy index build landing over an action set that rewrote an indexed
+    /// column gives up the rewritten fragment, as it does over a legacy
+    /// `Update` in `test_create_index_rebase_prunes_updated_field_coverage`.
+    #[rstest::rstest]
+    #[case::indexed_field_rewritten(0, vec![1])]
+    #[case::other_field_rewritten(1, vec![0, 1])]
+    #[tokio::test]
+    async fn test_a_legacy_index_build_prunes_a_column_an_action_set_rewrote(
+        #[case] field: i32,
+        #[case] expected_fragment_ids: Vec<u32>,
+    ) {
+        let dataset = test_dataset(10, 2).await;
+        let mut committed = dataset.manifest.as_ref().clone();
+        committed.version = 2;
+        let mut rebase = TransactionRebase::try_new(&dataset, create_index_txn([0, 1]), None)
+            .await
+            .unwrap();
+        rebase.record_manifests([Arc::new(committed)]);
+
+        rebase.check_txn(&tombstone_txn(0, field), 2).unwrap();
+
+        let Operation::CreateIndex { new_indices, .. } = &rebase.transaction.operation else {
+            panic!("expected CreateIndex operation");
+        };
+        assert_eq!(
+            new_indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter(expected_fragment_ids)
+        );
+    }
+
+    /// An action set moving a covered fragment's rows records no fragment
+    /// reuse index, so nothing would translate the build's coverage, as over
+    /// an eager legacy compaction.
+    #[tokio::test]
+    async fn test_a_legacy_index_build_conflicts_with_an_action_compaction() {
+        let dataset = test_dataset(10, 2).await;
+        let compaction = action_txn(vec![
+            TxnAction::RemoveFragment(RemoveFragment {
+                fragment: ActionRef::Committed(0),
+                data_change: false,
+            }),
+            TxnAction::AddFragment(AddFragment {
+                id: ActionRef::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: false,
+            }),
+        ]);
+
+        let mut committed = dataset.manifest.as_ref().clone();
+        committed.version = 2;
+        let mut rebase = TransactionRebase::try_new(&dataset, create_index_txn([0]), None)
+            .await
+            .unwrap();
+        rebase.record_manifests([Arc::new(committed)]);
+        assert!(matches!(
+            rebase.check_txn(&compaction, 2),
+            Err(Error::RetryableCommitConflict { .. })
+        ));
     }
 
     /// Without the manifests either side of the concurrent commit there is
