@@ -9108,6 +9108,9 @@ class VectorIndexReader:
 class VectorSearchQuery:
     """Vector search parameters, including continuous ``search_effort`` in [0, 1].
 
+    If metric is omitted and use_index is True, use the column's index metric
+    when an index exists. Otherwise, use the default for the vector's element type.
+
     Effort defaults to None, which resolves to 0.5 (Auto). Explicit effort
     ignores nprobes. See :meth:`ScannerBuilder.nearest` for probe bounds and
     other search parameters.

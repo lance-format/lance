@@ -510,6 +510,24 @@ pub fn validate_supplied_codebook(
     Ok(())
 }
 
+/// Check that a user-supplied PQ codebook has the value type of the vectors it
+/// will quantize. Quantization reads both as the vector type, so a mismatch
+/// would panic on the first batch instead of failing here.
+pub fn validate_codebook_value_type(
+    codebook_type: &DataType,
+    vector_type: &DataType,
+) -> Result<()> {
+    // Non-float columns are quantized as f32 residuals, so only a float
+    // column's own type is a contract here.
+    if vector_type.is_floating() && codebook_type != vector_type {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook value type {codebook_type} does not match the vector value type \
+             {vector_type}"
+        )));
+    }
+    Ok(())
+}
+
 impl Quantization for ProductQuantizer {
     type BuildParams = PQBuildParams;
     type Metadata = ProductQuantizationMetadata;
@@ -528,6 +546,7 @@ impl Quantization for ProductQuantizer {
 
         if let Some(codebook) = params.codebook.as_ref() {
             let dimension = fsl.value_length() as usize;
+            validate_codebook_value_type(codebook.data_type(), &fsl.value_type())?;
             validate_supplied_codebook(
                 codebook.len(),
                 dimension,
@@ -940,6 +959,29 @@ mod tests {
                 .values()
                 .as_primitive::<UInt8Type>()
                 .values()
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_codebook_value_type_mismatch() {
+        use arrow_array::Float16Array;
+        const DIM: usize = 8;
+
+        // An f16 column with an f32 flat codebook: the length check passes
+        // and the quantizer builds, but every later `as_primitive::<T>` panics
+        // (or trains on garbage), so the mismatch must be rejected at the boundary.
+        let values = Float16Array::from_iter((0..64 * DIM).map(|v| half::f16::from_f32(v as f32)));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let codebook =
+            Arc::new(Float32Array::from_iter((0..256 * DIM).map(|v| v as f32))) as ArrayRef;
+
+        let params = PQBuildParams::with_codebook(8, 8, codebook);
+        let error =
+            <ProductQuantizer as Quantization>::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("codebook"),
+            "the error must name the codebook: {error}"
         );
     }
 
