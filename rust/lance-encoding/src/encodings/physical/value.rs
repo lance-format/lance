@@ -320,7 +320,7 @@ struct PerValueFslValidityIter {
 /// It's easier than mini-block.  All we need to do is flatten the FSL layers into a single buffer.
 /// This includes any validity buffers we encounter on the way.
 impl ValueEncoder {
-    fn fsl_to_encoding(fsl: &FixedSizeListBlock) -> CompressiveEncoding {
+    pub(crate) fn fsl_to_encoding(fsl: &FixedSizeListBlock) -> CompressiveEncoding {
         let mut inner = fsl.child.as_ref();
         let mut has_validity = false;
         if let DataBlock::Nullable(nullable) = inner {

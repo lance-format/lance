@@ -28,8 +28,8 @@ use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
     DICT_MAX_SIZE_META_KEY, DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
-    DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-    STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
+    DICT_VALUES_COMPRESSION_META_KEY, PCODEC_COMPRESSION, STRUCTURAL_ENCODING_FULLZIP,
+    STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
 };
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock};
 use crate::decoder::PageEncoding;
@@ -1610,6 +1610,16 @@ impl PrimitiveStructuralEncoder {
     ) -> Option<DictEncodingBudget> {
         const DEFAULT_SAMPLE_SIZE: usize = 4096;
         const DEFAULT_SAMPLE_UNIQUE_RATIO: f64 = 0.98;
+
+        // pcodec encodes repeated values cheaply and compresses far better than a
+        // dictionary of float vectors, so an explicit pcodec request wins.
+        if field
+            .metadata
+            .get(COMPRESSION_META_KEY)
+            .is_some_and(|scheme| scheme == PCODEC_COMPRESSION)
+        {
+            return None;
+        }
 
         // Since we only dictionary encode FixedWidth and VariableWidth blocks for now, we skip
         // estimating the size for other types.
